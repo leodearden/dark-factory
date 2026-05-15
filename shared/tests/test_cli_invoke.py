@@ -1834,7 +1834,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, 'my-task', prompt='hi', cap_wait_sanity_secs=None)
 
-        cap_wait_lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        cap_wait_lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert cap_wait_lines, f'Expected cap_wait log line; got messages: {caplog.messages}'
         data = json.loads(cap_wait_lines[0])
         assert data['event'] == 'cap_wait'
@@ -1856,7 +1856,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, label, prompt='hi', cap_wait_sanity_secs=None)
 
-        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert lines
         assert json.loads(lines[0])['task_id'] == label
 
@@ -1873,7 +1873,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, 'task-x', prompt='hi', cap_wait_sanity_secs=None)
 
-        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert lines
         assert json.loads(lines[0])['soonest_open_at'] == reset_dt.isoformat()
 
@@ -1889,7 +1889,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, 'task-x', prompt='hi', cap_wait_sanity_secs=None)
 
-        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert lines
         assert json.loads(lines[0])['soonest_open_at'] is None
 
@@ -1906,7 +1906,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, 'task', prompt='hi', cap_wait_sanity_secs=None)
 
-        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert len(lines) == 1, (
             f'Expected exactly 1 cap_wait log within 600 s window, got {len(lines)}: {lines}'
         )
@@ -1933,7 +1933,7 @@ class TestCapWaitPeriodicLog:
         ):
             await invoke_with_cap_retry(gate, 'task', prompt='hi', cap_wait_sanity_secs=None)
 
-        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert len(lines) == 2, (
             f'Expected 2 cap_wait logs (first at t=0, second after t=700), '
             f'got {len(lines)}: {lines}'
