@@ -27,6 +27,30 @@ class DbPool:
     Call :meth:`get` to obtain a connection for a given path.  The connection
     is created on first access and reused thereafter.  Call :meth:`close_all`
     during shutdown.
+
+    **_open_locks growth is bounded by construction.**
+    Every path passed to :meth:`get` is ``root / <fixed-rel-path>`` where
+    ``root`` ∈ ``{config.project_root} ∪ config.known_project_roots``.
+    Both sets are fixed once at startup (``DashboardConfig.from_env`` reads
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
+    are never mutated at runtime).  The ``rel-path`` values are fixed literals
+    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
+    six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
+    paths (``reconciliation_db``, ``tickets_db``, ``metrics_db``,
+    ``write_journal_db``, etc.) are called only with ``config.project_root``,
+    never with each root in ``known_project_roots``, so they contribute a
+    flat ``+6`` rather than a per-root multiplier.  Therefore::
+
+        |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
+
+    Per-path lock entries are retained for the process lifetime (cleared only
+    in :meth:`close_all`) — this is *intentional*: evicting an entry while
+    another coroutine holds the lock reintroduces an absent→present race that
+    would require refcount machinery to make safe.
+
+    **Guardrail**: any future caller that passes per-run or otherwise-unbounded
+    paths to :meth:`get` MUST revisit lock eviction with a refcount-gated
+    scheme, because naive per-path deletion is not safe under concurrent access.
     """
 
     def __init__(self) -> None:
@@ -35,6 +59,7 @@ class DbPool:
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
         # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
 
@@ -57,10 +82,17 @@ class DbPool:
             # Re-check after acquiring: a racing coroutine may have opened it.
             if resolved in self._conns:
                 return self._conns[resolved]
-            # Refuse to open new connections once close_all() has been called.
-            # Fully aligns with SqliteTaskBackend._get_connection _closed convention:
-            # a concurrent get() that is mid-open when close_all() runs will see
-            # this flag after acquiring the per-path lock and abort cleanly.
+            # Two _closed guards are needed:
+            # (a) Pre-connect fast-abort — if close_all() already finished before
+            #     we acquired this lock, exit immediately without touching aiosqlite.
+            # (b) Post-connect re-check — close_all() does NOT hold the per-path
+            #     lock, so it can run to completion while this coroutine is
+            #     suspended inside `await aiosqlite.connect()`.  Without (b), the
+            #     resumed get() would install a fresh connection into an already-
+            #     drained pool, leaking the aiosqlite worker thread indefinitely.
+            #     DbPool closes that window here; note the mirrored
+            #     SqliteTaskBackend._get_connection convention has the same window
+            #     (not closed there — callers must not race close and get).
             if self._closed:
                 return None
             try:
@@ -71,6 +103,14 @@ class DbPool:
                     f'{resolved.as_uri()}?mode=ro',
                     uri=True,
                 )
+                # (b) Post-connect re-check: close_all() may have completed while
+                # we were suspended inside aiosqlite.connect() above.
+                if self._closed:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        logger.debug('DbPool: error closing mid-open conn after pool closed', exc_info=True)
+                    return None
                 conn.row_factory = aiosqlite.Row
                 self._conns[resolved] = conn
                 return conn
