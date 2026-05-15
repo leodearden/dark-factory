@@ -553,6 +553,29 @@ class TestWriteStateSnapshot:
             'Expected snapshot file to be created even when parent dirs are missing'
         )
 
+    def test_write_state_snapshot_raw_propagates_disk_errors(
+        self, tmp_path, monkeypatch
+    ):
+        """_write_state_snapshot_raw propagates OSError from os.replace (does not swallow).
+
+        This pins the corrected exception-propagation contract: the private
+        primitive must let disk errors bubble up to the caller
+        (_write_snapshot_best_effort), which swallows them in its own
+        try/except.  Swallowing here would silently advance bookkeeping for a
+        write that never persisted.
+        """
+        import orchestrator.scheduler as scheduler_module
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        path = tmp_path / 'scheduler_state.json'
+
+        # Inject a disk-full error at the os.replace boundary so the test
+        # exercises the propagation path inside the primitive itself.
+        monkeypatch.setattr(scheduler_module.os, 'replace', lambda *_: (_ for _ in ()).throw(OSError('disk full')))
+
+        with pytest.raises(OSError):
+            scheduler._write_state_snapshot_raw(path)
+
 
 # ===========================================================================
 # Step-17: acquire_next writes snapshot to default path
