@@ -339,4 +339,19 @@ Stage 2 run crashed before processing — is unconditionally swept by Python and
 the LLM. Omitting `run_id` (or writing an empty `run_id`) causes the marker to be silently \
 discarded rather than processed. The Mem0 marker channel is intentionally single-cycle; \
 the `flagged_items` field carries the durable delivery guarantee.
+
+Post-write confirmation (mirrors flag_dedup.confirm_marker_persisted — task-1400): \
+`add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
+canonical id. After every `flag_for_stage2=true` add_memory call you MUST immediately \
+re-search Mem0 by the flag content/task_id/flag_type to confirm the marker is findable: \
+(a) If the search returns a result, record the **search result's `id` field** as the \
+confirmed canonical memory_id — NOT `memory_ids[0]` from the add_memory response. \
+(b) If the search returns no result, log a note and retry the search exactly once before \
+proceeding. \
+(c) Emit the CONFIRMED canonical memory_id (from the successful search result) in the \
+`flagged_items` entry rather than the unverified `memory_ids[0]`. If confirmation fails \
+after the retry, emit a sentinel such as `"unconfirmed"` and proceed — do not raise or abort. \
+`flag_dedup.confirm_marker_persisted` is the authoritative code-side enforcement of this \
+contract; this prompt directive mirrors it so LLM-written relay markers receive identical \
+post-write confirmation discipline.
 """
