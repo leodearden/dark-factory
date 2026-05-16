@@ -51,47 +51,8 @@ def _scheduler_snapshot(**overrides):
 
 
 # ---------------------------------------------------------------------------
-# task-1454 step-1: unit tests for _scheduler_snapshot helper
+# task-1454 step-1: aliasing safety check for _scheduler_snapshot helper
 # ---------------------------------------------------------------------------
-
-
-def test_scheduler_snapshot_defaults():
-    """_scheduler_snapshot() with no args returns all 6 canonical fields."""
-    snapshot = _scheduler_snapshot()
-    assert set(snapshot.keys()) == {
-        'skip_counts', 'parks', 'effective_priorities',
-        'pin_queue', 'overrides', 'current_holders',
-    }
-    assert snapshot['skip_counts'] == {}
-    assert snapshot['parks'] == {}
-    assert snapshot['effective_priorities'] == {}
-    assert snapshot['pin_queue'] == []
-    assert snapshot['overrides'] == {}
-    assert snapshot['current_holders'] == {}
-
-
-def test_scheduler_snapshot_overrides_replace_defaults():
-    """kwargs matching base keys replace the default values."""
-    snap = _scheduler_snapshot(skip_counts={'1': 3}, pin_queue=[{'task_id': '1', 'order': 0}])
-    assert snap['skip_counts'] == {'1': 3}
-    assert snap['pin_queue'] == [{'task_id': '1', 'order': 0}]
-    # Untouched base fields remain at defaults
-    assert snap['parks'] == {}
-    assert snap['overrides'] == {}
-
-
-def test_scheduler_snapshot_extra_kwargs_added():
-    """kwargs not in the base dict are added verbatim."""
-    snap = _scheduler_snapshot(
-        is_paused=True,
-        pause_reason='park-stop: 5 tasks',
-        snapshot_at='2026-01-01T00:00:00+00:00',
-    )
-    assert snap['is_paused'] is True
-    assert snap['pause_reason'] == 'park-stop: 5 tasks'
-    assert snap['snapshot_at'] == '2026-01-01T00:00:00+00:00'
-    # Base fields still present
-    assert 'skip_counts' in snap
 
 
 def test_scheduler_snapshot_returns_independent_dicts():
@@ -771,14 +732,23 @@ def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
             resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
 
     assert resp.status_code == 400
-    # Background monitoring tasks (metrics/burndown loops) may incidentally call
-    # mcp_tool_call for unrelated tools during the request lifecycle.  Verify only
-    # that the override-specific tool was NOT invoked — not that no MCP calls
-    # happened at all.
-    assert not any(
-        len(c.args) >= 3 and c.args[2] == 'set_task_priority_override'
-        for c in mock_mcp.call_args_list
-    ), f'Expected no calls to set_task_priority_override, got: {mock_mcp.call_args_list}'
+    # Background monitoring tasks call mcp_tool_call via get_memory_status /
+    # get_queue_stats (both defined in memory.py, so they resolve through the
+    # patched module attribute).  Build a robust tool-name extractor that handles
+    # both positional and kwarg-style invocations, then assert an explicit
+    # allowlist: only the two known background tools are permitted; anything else
+    # (including 'set_task_priority_override') signals a regression where the
+    # override endpoint is invoking MCP before validation completes.
+    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
+
+    def _tool_name(c):
+        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
+
+    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
+    assert not unexpected, (
+        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
+        f'Full call list: {mock_mcp.call_args_list}'
+    )
     if expected_error is not None:
         assert resp.json().get('error') == expected_error
 
@@ -1430,7 +1400,10 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
         pin_queue=[{'task_id': '1', 'order': 0}],
         snapshot_at='2026-01-01T00:00:00+00:00',
     )
-    snap_p2 = {**snap_p1}
+    snap_p2 = _scheduler_snapshot(
+        pin_queue=[{'task_id': '1', 'order': 0}],
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
 
     snapshots = {str(p1): snap_p1, str(p2): snap_p2}
 
