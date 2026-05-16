@@ -82,6 +82,12 @@ def _mock_gate(**overrides) -> MagicMock:
     asynccontextmanager behaviour and keeps the ``release_probe_slot``
     assertions in ``TestReleaseProbeSlotOnException`` /
     ``TestCancelledErrorReleaseProbeSlot`` meaningful.
+
+    Sister helper: ``orchestrator/tests/_orch_helpers.py::make_mock_gate`` —
+    same shape but without the ``invoke_slot()`` async-CM wiring (orchestrator
+    tests use ``_attach_invoke_slot`` separately for that layer).  Cannot be
+    unified here: ``shared`` cannot import from ``orchestrator/tests``
+    (that would invert the package layering direction).
     """
     gate = MagicMock()
     gate.account_count = overrides.pop('account_count', 1)

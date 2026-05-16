@@ -8,6 +8,8 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
+from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.usage_gate import InvokeSlot
 
@@ -80,57 +82,6 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     slot.confirm = MagicMock()
     slot.settle = MagicMock()
     return slot
-
-
-def _make_gate(**overrides) -> MagicMock:
-    """Build a MagicMock UsageGate with all required attribute defaults initialised.
-
-    Ensures every gate attribute that UsageGate exposes is set to a sensible
-    default so that a new attribute added to UsageGate only needs to be updated
-    here rather than at every construction site.  Accepts ``**overrides`` so
-    callers can pin specific values without re-specifying the rest.
-
-    Mirrors the ``_mock_gate`` helper in ``shared/tests/test_cap_retry.py``.
-    """
-    gate = MagicMock()
-    gate.account_count = overrides.pop('account_count', 1)
-    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
-    gate.active_account_name = overrides.pop('active_account_name', 'acct-a')
-    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
-    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
-    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
-    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
-    for k, v in overrides.items():
-        setattr(gate, k, v)
-    return gate
-
-
-def _make_gate_yielding(slots, *, active_account_name=None):
-    """UsageGate mock whose successive invoke_slot() calls yield the given slots.
-
-    Without this helper, `gate = MagicMock()` yields an unconstrained slot whose
-    detect_cap_hit returns a truthy coroutine — production's `while` loop never
-    exits and the test hangs until pytest-timeout fires.
-    """
-    slot_iter = iter(slots)
-
-    def _new_cm(*args, **kwargs):
-        slot = next(slot_iter)
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(return_value=slot)
-        cm.__aexit__ = AsyncMock(return_value=False)
-        return cm
-
-    gate = _make_gate(
-        account_count=len(slots),
-        active_account_name=(
-            active_account_name if active_account_name is not None
-            else slots[0].account_name
-        ),
-        before_invoke=AsyncMock(return_value=slots[0].token),
-    )
-    gate.invoke_slot = MagicMock(side_effect=_new_cm)
-    return gate
 
 
 @pytest.mark.asyncio
@@ -586,24 +537,60 @@ class TestMakeGateFactory:
     so a new attribute addition only requires one edit here.
     """
 
-    def test_make_gate_defaults(self):
-        """_make_gate() returns a MagicMock with all required attribute defaults."""
+    def test_make_gate_covers_usage_gate_public_property_surface(self):
+        """_make_gate() sets a default for every known UsageGate @property.
+
+        Uses a hardcoded checklist so that adding a new @property to UsageGate
+        without also updating ``_GATE_PROPERTY_DEFAULTS`` in ``_orch_helpers.py``
+        causes a genuine test failure (a self-referential inspect call cannot catch
+        this — it passes by construction).  Regression for the 122-error cascade
+        (tasks 1313/1339) where soonest_resets_at was missed at construction sites.
+
+        When UsageGate gains a new @property, update the set below AND
+        ``_GATE_PROPERTY_DEFAULTS`` in ``orchestrator/tests/_orch_helpers.py``.
+        """
+        expected_props = {
+            'account_count',
+            'active_account_name',
+            'cumulative_cost',
+            'is_paused',
+            'paused_reason',
+            'project_id',
+            'run_id',
+            'soonest_resets_at',
+            'total_pause_secs',
+        }
         gate = _make_gate()
         assert isinstance(gate, MagicMock)
-        assert gate.account_count == 1
-        assert gate.active_account_name == 'acct-a'
-        assert gate.soonest_resets_at is None
+        gate_vars = vars(gate)
+        missing = expected_props - gate_vars.keys()
+        assert not missing, (
+            f'_make_gate() is missing defaults for UsageGate @property members: {missing!r}. '
+            'Add them to _GATE_PROPERTY_DEFAULTS in _orch_helpers.py so every '
+            'construction site stays in sync.'
+        )
 
     def test_make_gate_override_and_passthrough(self):
         """Named overrides are applied; arbitrary kwargs are set via setattr."""
-        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x')
+        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x',
+                          paused_reason='X')
         assert gate.soonest_resets_at == 123
         assert gate.account_count == 3
         assert gate.custom_attr == 'x'
+        assert gate.paused_reason == 'X'
         # Non-overridden defaults remain
         assert gate.active_account_name == 'acct-a'
 
-    def test_make_gate_yielding_routes_through_factory(self):
-        """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
-        gate = _make_gate_yielding([_make_slot()])
-        assert gate.soonest_resets_at is None
+    def test_make_gate_yielding_propagates_factory_defaults(self):
+        """_make_gate_yielding routes through _make_gate: factory defaults present.
+
+        Every key that make_mock_gate() normally sets must also appear on a gate
+        produced by _make_gate_yielding, proving that _make_gate_yielding uses
+        the factory rather than a bare MagicMock().
+        """
+        factory_keys = set(vars(_make_gate()).keys())
+        yielding_keys = set(vars(_make_gate_yielding([_make_slot()])).keys())
+        assert factory_keys <= yielding_keys, (
+            f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
+        )
+

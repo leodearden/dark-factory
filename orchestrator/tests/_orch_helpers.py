@@ -128,6 +128,128 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     )
 
 
+_GATE_PROPERTY_DEFAULTS: dict[str, object] = {
+    # Known-good values for every UsageGate @property.
+    # This dict is the *single* fix-point for property defaults: update here when
+    # UsageGate gains a new @property, and every make_mock_gate() call site picks
+    # it up automatically.  Motivation: the 122-error cascade (tasks 1313/1339)
+    # where soonest_resets_at was added to UsageGate but not to every mock factory.
+    'account_count': 1,
+    'active_account_name': 'acct-a',
+    'soonest_resets_at': None,
+    'paused_reason': '',
+    'cumulative_cost': 0.0,
+    'total_pause_secs': 0.0,
+    'is_paused': False,
+    'project_id': None,
+    'run_id': None,
+}
+# Guard: catch stale keys in _GATE_PROPERTY_DEFAULTS (e.g. renamed @property).
+# Runs at import time so a typo or post-rename ghost key surfaces immediately.
+_GATE_VALID_PROPS: frozenset[str] = frozenset(
+    n for n, _ in inspect.getmembers(UsageGate, lambda v: isinstance(v, property))
+)
+assert set(_GATE_PROPERTY_DEFAULTS) <= _GATE_VALID_PROPS, (
+    f'_GATE_PROPERTY_DEFAULTS contains keys that are not UsageGate @properties: '
+    f'{set(_GATE_PROPERTY_DEFAULTS) - _GATE_VALID_PROPS!r}. '
+    'Remove the stale entries from the dict.'
+)
+
+
+def make_mock_gate(**overrides) -> MagicMock:
+    """Build a MagicMock UsageGate with all public @property defaults initialised.
+
+    Property defaults are driven by introspecting UsageGate's @property surface via
+    ``inspect.getmembers(UsageGate, property)`` so that new @property additions
+    auto-propagate to every ``make_mock_gate()`` call without manual edits.  The
+    canonical regression test (``TestMakeGateFactory.test_make_gate_covers_usage_gate_public_property_surface``
+    in ``orchestrator/tests/test_invoke.py``) asserts that ``vars(make_mock_gate())``
+    covers the full @property set, catching any future drift at test time.
+
+    Known-good values for each property are stored in ``_GATE_PROPERTY_DEFAULTS``
+    (the single fix-point).  Any future property not yet in that dict falls back
+    to ``None``.
+
+    Method mocks (``before_invoke``, ``on_agent_complete``, ``confirm_account_ok``,
+    ``release_probe_slot``) are kept explicit because they require typed mock
+    instances (``AsyncMock`` vs ``MagicMock``) that cannot be inferred from
+    introspection alone.
+
+    Accepts ``**overrides`` so callers can pin specific values without
+    re-specifying the rest.
+
+    Sister helper: ``shared/tests/test_cap_retry.py::_mock_gate`` — same shape
+    but with extra ``invoke_slot()`` async-CM wiring for shared-layer tests.
+    Cannot be unified here: ``shared`` cannot import from ``orchestrator/tests``
+    (that would invert the package layering direction).
+
+    Imported into ``orchestrator/tests/test_invoke.py`` and
+    ``orchestrator/tests/test_steward.py`` as ``_make_gate`` via::
+
+        from _orch_helpers import make_mock_gate as _make_gate
+
+    so existing call sites (≈20 across both files) remain unchanged.
+    """
+    gate = MagicMock()
+    # Set all known @property defaults; unknown future ones fall back to None.
+    for prop_name, _ in inspect.getmembers(UsageGate, lambda v: isinstance(v, property)):
+        default = _GATE_PROPERTY_DEFAULTS.get(prop_name)
+        setattr(gate, prop_name, overrides.pop(prop_name, default))
+    # Explicit method mocks (need typed mock instances).
+    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
+    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
+    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
+    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
+    gate.detect_cap_hit = overrides.pop('detect_cap_hit', MagicMock(return_value=False))
+    for k, v in overrides.items():
+        setattr(gate, k, v)
+    return gate
+
+
+def make_gate_yielding(slots, *, active_account_name=None) -> MagicMock:
+    """Build a mock UsageGate whose successive invoke_slot() calls yield *slots* in order.
+
+    Each element of *slots* is returned by ``gate.invoke_slot().__aenter__``, so
+    production code that does ``async with gate.invoke_slot() as slot:`` gets a
+    real slot object with a controlled ``detect_cap_hit`` on each iteration of the
+    cap-retry while-loop.
+
+    Without this helper, ``gate = MagicMock()`` yields an unconstrained slot whose
+    ``detect_cap_hit`` returns a truthy coroutine — production's ``while`` loop
+    never exits and the test hangs until pytest-timeout fires.
+
+    Always routes through ``make_mock_gate`` so the gate carries the full property
+    default surface (guards against bare-MagicMock drift).
+
+    Imported into ``orchestrator/tests/test_invoke.py`` and
+    ``orchestrator/tests/test_steward.py`` as ``_make_gate_yielding`` via::
+
+        from _orch_helpers import make_gate_yielding as _make_gate_yielding
+
+    Sister helper: ``shared/tests/test_cap_retry.py::_mock_gate`` — cannot be
+    unified here due to package layering (shared cannot import from orchestrator).
+    """
+    slot_iter = iter(slots)
+
+    def _new_cm(*args, **kwargs):
+        slot = next(slot_iter)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=slot)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    gate = make_mock_gate(
+        account_count=len(slots),
+        active_account_name=(
+            active_account_name if active_account_name is not None
+            else slots[0].account_name
+        ),
+        before_invoke=AsyncMock(return_value=slots[0].token),
+    )
+    gate.invoke_slot = MagicMock(side_effect=_new_cm)
+    return gate
+
+
 def build_usage_gate(
     account_configs: list[AccountConfig],
     tokens: Sequence[str | None],
