@@ -2800,7 +2800,6 @@ class TestCuratorConfigBlocklistPath:
     def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
         """FusedMemoryConfig round-trips cancelled_premise_blocklist_path via YAML."""
         import yaml
-        from fused_memory.config.schema import FusedMemoryConfig
 
         raw = {"curator": {"cancelled_premise_blocklist_path": "/tmp/blocklist.yaml"}}
         yaml_path = tmp_path / "config.yaml"
@@ -3016,8 +3015,6 @@ class TestCuratorBatchBlocklistShortCircuit:
 
 def _make_create_mocks():
     """Return (fake_exact_match, fake_corpus, fake_llm_result) for a pass-through curate."""
-    import logging
-
     async def fake_exact_match(*a, **k):
         return None
 
@@ -3136,6 +3133,7 @@ class TestCuratorBlocklistDisabledOrMissing:
     async def test_empty_yaml_no_warning(self, tmp_path, caplog):
         """(d) Valid YAML with zero entries → curate() proceeds with NO WARNING."""
         import logging
+
         import yaml
 
         empty_yaml = tmp_path / "empty.yaml"

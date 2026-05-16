@@ -661,7 +661,7 @@ class TaskCurator:
 
     async def _maybe_blocklist_drop(
         self, candidate: CandidateTask, payload_hash: str,
-    ) -> 'CuratorDecision | None':
+    ) -> CuratorDecision | None:
         """Return a drop decision if the candidate matches the cancelled-premise blocklist.
 
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
