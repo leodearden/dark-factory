@@ -13,12 +13,13 @@ and the same tmp_path isolation as test_server_dedupe.py.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from escalation.dedupe import DedupeConfig
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -184,6 +185,128 @@ class TestTerminalAutoResolve:
         esc = queue.get(esc_id)
         assert esc is not None
         assert esc.status == 'resolved'
+
+    # --- Item 4: dedupe-vs-terminal gate-priority characterization ---
+
+    @pytest.mark.asyncio
+    async def test_dedupe_eligible_terminal_task_auto_resolves(self, tmp_path: Path):
+        """dedupe-eligible infra_issue + terminal task → auto-resolve wins over dedupe.
+
+        Characterization test: the explicit _submit_or_dedupe bypass at
+        server.py:153-155 (inside the status-in-done/cancelled branch) ensures
+        that even when DedupeConfig is active and a matching pending parent exists,
+        Gate 4 auto-resolve fires first and the child is NOT folded into the parent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, dedupe_config=DedupeConfig(), task_status_lookup=lookup)
+
+        # Pre-seed a pending infra_issue parent for the same task
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='parent infra issue',
+        )
+        queue.submit(parent)
+
+        # Child call: same category, same task_id — would dedupe if task were not terminal
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='child infra issue similar',
+        )
+
+        assert result['status'] == 'resolved', (
+            f"Expected 'resolved' (auto-resolve wins over dedupe), got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedupe_eligible_terminal_task_parent_unchanged(self, tmp_path: Path):
+        """dedupe-eligible + terminal → pre-seeded parent's dedupe_count stays 0 (not folded).
+
+        Characterization test: the bypass ensures the child is auto-resolved via
+        submit_resolved (or submit+resolve), never routed through _submit_or_dedupe,
+        so the parent's dedupe_children and dedupe_count remain at their initial values.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, dedupe_config=DedupeConfig(), task_status_lookup=lookup)
+
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='parent infra issue',
+        )
+        queue.submit(parent)
+        parent_id = parent.id
+
+        await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='child infra issue similar',
+        )
+
+        # Parent must be unmodified — child was NOT folded into it
+        updated_parent = queue.get(parent_id)
+        assert updated_parent is not None, f"Parent {parent_id} not found after call"
+        assert updated_parent.dedupe_count == 0, (
+            f"Expected dedupe_count==0 (auto-resolve bypassed dedupe), "
+            f"got: {updated_parent.dedupe_count}"
+        )
+        assert len(updated_parent.dedupe_children) == 0, (
+            f"Expected no dedupe_children (auto-resolve bypassed dedupe), "
+            f"got: {updated_parent.dedupe_children}"
+        )
+
+    # --- Item 2: minimal-key-set contract (RED until step-2 impl) ---
+
+    @pytest.mark.asyncio
+    async def test_blocker_response_has_only_minimal_keys(self, tmp_path: Path):
+        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,action}.
+
+        RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
+        which is a 20-field Escalation dump. After step-2, the shape is normalized to
+        the minimal four-field contract plus 'action' from the blocker wrapper.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'action'}
+        assert set(result.keys()) == expected_keys, (
+            f"Expected minimal keys {expected_keys}, got: {set(result.keys())}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_info_response_has_only_minimal_keys(self, tmp_path: Path):
+        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by} (no 'action').
+
+        RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
+        which is a 20-field dump. After step-2, the shape is normalized to the minimal
+        four-field contract — no 'action' key (that is blocker-only).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('cancelled')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by'}
+        assert set(result.keys()) == expected_keys, (
+            f"Expected minimal keys {expected_keys} (no 'action'), got: {set(result.keys())}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -416,55 +539,71 @@ class TestBypassGates:
 
 
 # ---------------------------------------------------------------------------
-# Characterization: resolve() → None on the terminal auto-resolve path
+# Step-5 RED tests: auto-resolve must fire only _resolve_callback, not _notify
 # ---------------------------------------------------------------------------
 
 
-class TestResolveNoneFallback:
-    """Characterize behavior when queue.resolve() returns None after auto-resolve submit.
+class TestAutoResolveSingleNotification:
+    """Auto-resolve fires _resolve_callback once and _notify_callback zero times.
 
-    Unlikely in production (record is written by submit() immediately before
-    resolve() is called), but the edge case is observable: the fallback returns
-    esc.to_dict() with status='pending' and logs a warning.  The escalation is
-    NOT dropped (fail-safe).
+    The old two-call path (submit then resolve) fires _notify_callback once
+    and _resolve_callback once — spurious double-count.  After step-6 wires
+    queue.submit_resolved, only _resolve_callback fires.
+
+    Both tests FAIL until step-6 switches the server to submit_resolved.
     """
 
     @pytest.mark.asyncio
-    async def test_resolve_none_returns_pending_status(
-        self, tmp_path: Path, monkeypatch
-    ):
-        """queue.resolve()→None → fallback dict has status='pending' (pre-resolve value)."""
+    async def test_auto_resolve_fires_resolve_callback_only_no_notify(self, tmp_path: Path):
+        """escalate_blocker auto-resolve: _resolve_callback fires once, _notify_callback zero times."""
         queue = EscalationQueue(tmp_path / 'esc')
+
+        notify_fired: list[str] = []
+        resolve_fired: list[str] = []
+        queue.set_notify_callback(lambda e: notify_fired.append(e.id))
+        queue.set_resolve_callback(lambda e: resolve_fired.append(e.id))
+
         lookup = await _make_lookup('done')
         server = create_server(queue, task_status_lookup=lookup)
 
-        monkeypatch.setattr(queue, 'resolve', lambda *args, **kwargs: None)
+        await _blocker(server, **_COMMON_KWARGS)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
-
-        # Fallback to esc.to_dict(): status is still 'pending' (the Escalation
-        # dataclass default — submit() does not mutate the in-memory object).
-        assert result['status'] == 'pending', (
-            f"Expected 'pending' fallback when resolve()→None, got: {result['status']}"
+        assert notify_fired == [], (
+            f"Expected _notify_callback NOT fired on auto-resolve, got: {notify_fired}"
         )
-        # blocker contract: action='terminate_cleanly' must still be present
-        assert result.get('action') == 'terminate_cleanly'
+        assert len(resolve_fired) == 1, (
+            f"Expected _resolve_callback fired exactly once, got: {resolve_fired}"
+        )
 
     @pytest.mark.asyncio
-    async def test_resolve_none_logs_warning(
-        self, tmp_path: Path, monkeypatch, caplog
-    ):
-        """queue.resolve()→None → a WARNING is emitted so the inconsistency is observable."""
+    async def test_auto_resolve_info_path_fires_resolve_callback_only(self, tmp_path: Path):
+        """escalate_info auto-resolve: _resolve_callback fires once, _notify_callback zero times."""
         queue = EscalationQueue(tmp_path / 'esc')
-        lookup = await _make_lookup('done')
+
+        notify_fired: list[str] = []
+        resolve_fired: list[str] = []
+        queue.set_notify_callback(lambda e: notify_fired.append(e.id))
+        queue.set_resolve_callback(lambda e: resolve_fired.append(e.id))
+
+        lookup = await _make_lookup('cancelled')
         server = create_server(queue, task_status_lookup=lookup)
 
-        monkeypatch.setattr(queue, 'resolve', lambda *args, **kwargs: None)
+        await _info(server, **_COMMON_KWARGS)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(server, **_COMMON_KWARGS)
-
-        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('resolve' in m and 'None' in m for m in warning_msgs), (
-            f'Expected a warning about resolve()→None, got records: {warning_msgs}'
+        assert notify_fired == [], (
+            f"Expected _notify_callback NOT fired on auto-resolve, got: {notify_fired}"
         )
+        assert len(resolve_fired) == 1, (
+            f"Expected _resolve_callback fired exactly once, got: {resolve_fired}"
+        )
+
+
+# TestResolveNoneFallback was removed in step-6 (commit: switch to submit_resolved).
+#
+# Those tests characterised the queue.submit(esc) + queue.resolve()→None fallback
+# at server.py.  With submit_resolved, the server no longer calls queue.resolve at
+# all — the monkeypatch on queue.resolve became a no-op and the asserted fallback
+# behaviour (status='pending' + warning log) was unreachable.  Leaving vacuous-green
+# tests would mislead future readers into thinking the fallback is covered.
+# See design decision: "Remove TestResolveNoneFallback … in the impl step that
+# switches the server to submit_resolved."

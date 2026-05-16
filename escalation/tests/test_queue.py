@@ -458,6 +458,164 @@ class TestResolveArchives:
         )
 
 
+class TestSubmitResolved:
+    """EscalationQueue.submit_resolved() — atomic single-write, single-callback resolution.
+
+    Writes the escalation directly in resolved state (no transient pending file),
+    fires only _resolve_callback (not _notify_callback), and archives the file.
+
+    All five tests FAIL until submit_resolved is added to EscalationQueue (step-4).
+    """
+
+    def test_submit_resolved_writes_file_with_resolved_status(self, tmp_path: Path):
+        """(a) After submit_resolved, queue.get(id) returns status='resolved'."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check')
+
+        result = queue.get(esc.id)
+        assert result is not None, f"Escalation {esc.id} not found after submit_resolved"
+        assert result.status == 'resolved', f"Expected 'resolved', got: {result.status}"
+
+    def test_submit_resolved_returns_escalation_with_resolved_fields(self, tmp_path: Path):
+        """(b) submit_resolved returns the Escalation with all resolved fields populated."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        result = queue.submit_resolved(
+            esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check'
+        )
+
+        assert result.status == 'resolved', f"Expected status='resolved', got: {result.status}"
+        assert result.resolution == 'auto: terminal', (
+            f"Expected resolution='auto: terminal', got: {result.resolution}"
+        )
+        assert result.resolved_by == 'escalation-mcp-pre-submit-check', (
+            f"Expected resolved_by='escalation-mcp-pre-submit-check', got: {result.resolved_by}"
+        )
+        assert result.resolved_at is not None, "Expected resolved_at to be set (ISO 8601 string)"
+        # Sanity-check ISO 8601 prefix: YYYY-MM-DD
+        assert result.resolved_at[:4].isdigit() and result.resolved_at[4] == '-', (
+            f"resolved_at does not look like ISO 8601: {result.resolved_at!r}"
+        )
+
+    def test_submit_resolved_fires_resolve_callback(self, tmp_path: Path):
+        """(c) submit_resolved fires _resolve_callback exactly once with the escalation."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        fired: list[str] = []
+        queue.set_resolve_callback(lambda e: fired.append(e.id))
+
+        queue.submit_resolved(esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check')
+
+        assert fired == [esc.id], (
+            f"Expected resolve callback fired once with {esc.id!r}, got: {fired}"
+        )
+
+    def test_submit_resolved_does_not_fire_notify_callback(self, tmp_path: Path):
+        """(d) submit_resolved must NOT fire _notify_callback (single-callback contract)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        notified: list[str] = []
+        queue.set_notify_callback(lambda e: notified.append(e.id))
+
+        queue.submit_resolved(esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check')
+
+        assert notified == [], (
+            f"Expected notify callback NOT fired, but got: {notified}"
+        )
+
+    def test_submit_resolved_archives_file(self, tmp_path: Path):
+        """(e) After submit_resolved, file is moved to archive/YYYY-MM-DD/, not in queue root."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(esc, 'auto: terminal', resolved_by='escalation-mcp-pre-submit-check')
+
+        # File must not be in queue root
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            f"Expected {esc.id}.json to be moved to archive, but still in queue root"
+        )
+
+        # File must be in the archive under a dated subdir
+        archived_files = list((queue.queue_dir / 'archive').rglob(f'{esc.id}.json'))
+        assert len(archived_files) == 1, (
+            f"Expected exactly 1 archive file for {esc.id}, got: {archived_files}"
+        )
+        # Parent dir name must match the date prefix of resolved_at
+        archived_path = archived_files[0]
+        expected_date = esc.resolved_at[:10]  # YYYY-MM-DD
+        assert archived_path.parent.name == expected_date, (
+            f"Expected archive dir '{expected_date}', got '{archived_path.parent.name}'"
+        )
+
+    def test_submit_resolved_archive_failure_keeps_file_in_queue_dir(
+        self, tmp_path: Path, caplog,
+    ):
+        """When the archive os.replace fails, submit_resolved still succeeds.
+
+        Contract (mirrors TestResolveArchives.test_resolve_archive_failure_*):
+        - submit_resolved() returns the resolved Escalation.
+        - The file stays in queue_dir root (readable by get()).
+        - A WARNING is emitted naming the escalation ID.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        with patch('os.replace', side_effect=OSError('cross-device link')), \
+             caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.submit_resolved(esc, 'auto: terminal', resolved_by='test')
+
+        # submit_resolved must return the updated escalation despite the OSError
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'auto: terminal'
+
+        # File must remain readable from queue root (archive move failed → stayed)
+        from_queue = queue.get('esc-1-1')
+        assert from_queue is not None
+        assert from_queue.status == 'resolved'
+
+        # A warning naming the escalation ID must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
+        )
+
+    def test_submit_resolved_resolve_callback_exception_does_not_propagate(
+        self, tmp_path: Path, caplog,
+    ):
+        """A raising _resolve_callback is swallowed; submit_resolved still returns normally.
+
+        Contract (mirrors analogous coverage in resolve() tests): the except-warn
+        guard at queue.py guarantees that a misbehaving callback cannot abort the
+        resolution — the caller gets the resolved Escalation back regardless.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        def _bad_callback(e: Escalation) -> None:
+            raise RuntimeError('callback boom')
+
+        queue.set_resolve_callback(_bad_callback)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.submit_resolved(esc, 'auto: terminal')
+
+        # Must return normally despite the callback raising
+        assert result is not None
+        assert result.status == 'resolved'
+
+        # A warning must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning about callback failure; got: {warning_messages}'
+        )
+
+
 class TestResolveIdempotent:
     """EscalationQueue.resolve() is idempotent: a second call returns the first resolution unchanged."""
 

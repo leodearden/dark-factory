@@ -122,7 +122,9 @@ def create_server(
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
           4. await task_status_lookup(task_id):
-               done/cancelled → auto-resolve: submit + resolve, return resolved record
+               done/cancelled → auto-resolve via submit_resolved (single write,
+                              single callback), return minimal {id, status,
+                              resolution, resolved_by} dict; blocker adds 'action'
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
@@ -149,27 +151,22 @@ def create_server(
             return _submit_or_dedupe(esc)
 
         if status in {'done', 'cancelled'}:
-            # Submit then immediately resolve — gives a precise audit record.
-            # Bypass _submit_or_dedupe to avoid folding into a dedupe parent
-            # and resolving the wrong record.
-            queue.submit(esc)
-            resolved = queue.resolve(
-                esc.id,
+            # Atomic submit-as-resolved: single file write, single resolve callback,
+            # no transient pending intermediate.  Bypass _submit_or_dedupe to avoid
+            # folding into a dedupe parent and resolving the wrong record.
+            # Returns minimal shape: {id, status, resolution, resolved_by}.
+            # The blocker wrapper adds 'action' separately.
+            resolved = queue.submit_resolved(
+                esc,
                 f'auto-resolved: task already terminal (status={status})',
                 resolved_by='escalation-mcp-pre-submit-check',
             )
-            if resolved is None:
-                # resolve() could not re-read the record immediately after submit.
-                # Unlikely in practice, but the escalation may remain pending.
-                # Fail-safe: return esc.to_dict() (status='pending') rather than
-                # dropping the escalation.  The inconsistency is logged here.
-                logger.warning(
-                    'task %s: queue.resolve() returned None after terminal auto-resolve '
-                    'submit for escalation %s; escalation may remain pending. '
-                    'Returning pre-resolve record as fallback.',
-                    esc.task_id, esc.id,
-                )
-            return (resolved or esc).to_dict()
+            return {
+                'id': resolved.id,
+                'status': resolved.status,
+                'resolution': resolved.resolution,
+                'resolved_by': resolved.resolved_by,
+            }
 
         # Non-terminal or unknown status → submit normally
         return _submit_or_dedupe(esc)
@@ -195,6 +192,12 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
+
+        Response shape:
+        - Queued (task alive):    ``{id, status}``  where status='queued'
+        - Deduped (folded):       ``{id, status, parent_id, child_id}``
+        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
+          Callers needing the full record can call get_escalation(id).
         """
         esc = Escalation(
             id=queue.make_id(task_id),
@@ -234,6 +237,12 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
+
+        Response shape always includes ``action='terminate_cleanly'`` plus:
+        - Queued:        ``{id, status, action}``  where status='queued'
+        - Deduped:       ``{id, status, parent_id, child_id, action}``
+        - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
+          Callers needing the full record can call get_escalation(id).
         """
         esc = Escalation(
             id=queue.make_id(task_id),
