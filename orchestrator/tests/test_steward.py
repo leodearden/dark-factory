@@ -2482,28 +2482,26 @@ class TestStewardEmptyOutputRecovery:
         assert steward._retry_counts.get('esc-42-1', 0) == 0
 
 
-# ── pre-triage gate helper contract (relocated to TestMakePreTriageGate in step-9) ──
+# ── _make_pre_triage_gate helper contract ────────────────────────────────────
 
 
-class TestMakeGateFactory:
-    """Temporary home for pre-triage-specific gate tests.
+class TestMakePreTriageGate:
+    """Contract tests for the module-level _make_pre_triage_gate helper.
 
-    The three make_mock_gate contract tests (test_make_gate_covers_usage_gate_public_property_surface,
-    test_make_gate_override_and_passthrough, test_make_gate_yielding_propagates_factory_defaults)
-    have been removed — they now live in test_invoke.py::TestMakeGateFactory since
-    make_mock_gate is centralized in _orch_helpers.  The two pre-triage tests below
-    will be moved to TestMakePreTriageGate in step-9.
+    _make_pre_triage_gate is the lifted replacement for the private
+    TestPreTriageUsageGateCleanup._gate static method (step-9).  These tests
+    give the helper dedicated contract coverage so it can't silently regress.
     """
 
-    def test_pre_triage_gate_default_detect_cap_hit(self):
-        """TestPreTriageUsageGateCleanup._gate() routes through _make_gate."""
-        gate = TestPreTriageUsageGateCleanup._gate()
+    def test_make_pre_triage_gate_default_detect_cap_hit(self):
+        """_make_pre_triage_gate() default: soonest_resets_at is None, detect_cap_hit is False."""
+        gate = _make_pre_triage_gate()
         assert gate.soonest_resets_at is None
         # default detect_cap_hit returns False
         assert gate.detect_cap_hit() is False
 
-    def test_pre_triage_gate_cap_effects_side_effect(self):
+    def test_make_pre_triage_gate_cap_effects_side_effect(self):
         """cap_effects sequence is wired as side_effect on detect_cap_hit."""
-        gate = TestPreTriageUsageGateCleanup._gate(cap_effects=[True, False])
+        gate = _make_pre_triage_gate(cap_effects=[True, False])
         assert gate.detect_cap_hit() is True
         assert gate.detect_cap_hit() is False
