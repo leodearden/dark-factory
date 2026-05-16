@@ -149,36 +149,21 @@ def create_server(
             return _submit_or_dedupe(esc)
 
         if status in {'done', 'cancelled'}:
-            # Submit then immediately resolve — gives a precise audit record.
-            # Bypass _submit_or_dedupe to avoid folding into a dedupe parent
-            # and resolving the wrong record.
+            # Atomic submit-as-resolved: single file write, single resolve callback,
+            # no transient pending intermediate.  Bypass _submit_or_dedupe to avoid
+            # folding into a dedupe parent and resolving the wrong record.
             # Returns minimal shape: {id, status, resolution, resolved_by}.
             # The blocker wrapper adds 'action' separately.
-            queue.submit(esc)
-            resolved = queue.resolve(
-                esc.id,
+            resolved = queue.submit_resolved(
+                esc,
                 f'auto-resolved: task already terminal (status={status})',
                 resolved_by='escalation-mcp-pre-submit-check',
             )
-            if resolved is None:
-                # resolve() could not re-read the record immediately after submit.
-                # Unlikely in practice, but the escalation may remain pending.
-                # Fail-safe: return esc fields (status='pending') rather than
-                # dropping the escalation.  The inconsistency is logged here.
-                logger.warning(
-                    'task %s: queue.resolve() returned None after terminal auto-resolve '
-                    'submit for escalation %s; escalation may remain pending. '
-                    'Returning pre-resolve record as fallback.',
-                    esc.task_id, esc.id,
-                )
-                src = esc
-            else:
-                src = resolved
             return {
-                'id': src.id,
-                'status': src.status,
-                'resolution': src.resolution,
-                'resolved_by': src.resolved_by,
+                'id': resolved.id,
+                'status': resolved.status,
+                'resolution': resolved.resolution,
+                'resolved_by': resolved.resolved_by,
             }
 
         # Non-terminal or unknown status → submit normally

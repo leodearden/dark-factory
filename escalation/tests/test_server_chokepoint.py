@@ -599,56 +599,12 @@ class TestAutoResolveSingleNotification:
         )
 
 
-# ---------------------------------------------------------------------------
-# Characterization: resolve() → None on the terminal auto-resolve path
-# ---------------------------------------------------------------------------
-
-
-class TestResolveNoneFallback:
-    """Characterize behavior when queue.resolve() returns None after auto-resolve submit.
-
-    Unlikely in production (record is written by submit() immediately before
-    resolve() is called), but the edge case is observable: the fallback returns
-    esc.to_dict() with status='pending' and logs a warning.  The escalation is
-    NOT dropped (fail-safe).
-    """
-
-    @pytest.mark.asyncio
-    async def test_resolve_none_returns_pending_status(
-        self, tmp_path: Path, monkeypatch
-    ):
-        """queue.resolve()→None → fallback dict has status='pending' (pre-resolve value)."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        lookup = await _make_lookup('done')
-        server = create_server(queue, task_status_lookup=lookup)
-
-        monkeypatch.setattr(queue, 'resolve', lambda *args, **kwargs: None)
-
-        result = await _blocker(server, **_COMMON_KWARGS)
-
-        # Fallback to esc.to_dict(): status is still 'pending' (the Escalation
-        # dataclass default — submit() does not mutate the in-memory object).
-        assert result['status'] == 'pending', (
-            f"Expected 'pending' fallback when resolve()→None, got: {result['status']}"
-        )
-        # blocker contract: action='terminate_cleanly' must still be present
-        assert result.get('action') == 'terminate_cleanly'
-
-    @pytest.mark.asyncio
-    async def test_resolve_none_logs_warning(
-        self, tmp_path: Path, monkeypatch, caplog
-    ):
-        """queue.resolve()→None → a WARNING is emitted so the inconsistency is observable."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        lookup = await _make_lookup('done')
-        server = create_server(queue, task_status_lookup=lookup)
-
-        monkeypatch.setattr(queue, 'resolve', lambda *args, **kwargs: None)
-
-        with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(server, **_COMMON_KWARGS)
-
-        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('resolve' in m and 'None' in m for m in warning_msgs), (
-            f'Expected a warning about resolve()→None, got records: {warning_msgs}'
-        )
+# TestResolveNoneFallback was removed in step-6 (commit: switch to submit_resolved).
+#
+# Those tests characterised the queue.submit(esc) + queue.resolve()→None fallback
+# at server.py.  With submit_resolved, the server no longer calls queue.resolve at
+# all — the monkeypatch on queue.resolve became a no-op and the asserted fallback
+# behaviour (status='pending' + warning log) was unreachable.  Leaving vacuous-green
+# tests would mislead future readers into thinking the fallback is covered.
+# See design decision: "Remove TestResolveNoneFallback … in the impl step that
+# switches the server to submit_resolved."
