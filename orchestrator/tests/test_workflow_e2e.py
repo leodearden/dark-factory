@@ -1046,6 +1046,7 @@ class TestReviewLoop:
 
 
 @pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
 class TestBaseCommitDiff:
     """Verify review uses base_commit diff, not moving main ref."""
 
