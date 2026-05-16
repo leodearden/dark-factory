@@ -269,3 +269,45 @@ async def test_handle_wip_recovery_no_advance_releases_halt_on_cancel(
     assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
         f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 7: _handle_unmerged_state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_unmerged_state_releases_halt_on_cancel(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Cancel mid-await in _handle_unmerged_state releases halt owner.
+
+    _handle_unmerged_state fires when project_root already had pre-existing
+    UU/AA/DD markers before the merge attempt.  Same pattern, same risk.
+
+    Must fail today (pre-fix): the handler has no try/except around the await.
+    """
+    fake_worker.halt_for_wip('unmerged_state')
+
+    task = asyncio.create_task(
+        workflow._handle_unmerged_state(
+            MergeOutcome(status='unmerged_state'),
+            'task/1448',
+        )
+    )
+
+    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_worker.halt_owner_esc_id is None, (
+        'step-7: halt_owner_esc_id must be cleared after workflow cancellation'
+    )
+    assert fake_worker.is_wip_halted is False, (
+        'step-7: is_wip_halted must be False after workflow cancellation'
+    )
+    assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
+        f'step-7: expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
+    )
