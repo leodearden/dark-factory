@@ -1473,7 +1473,7 @@ class TestCapRetrySanityGuardLogging:
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
 
-    async def test_error_log_includes_label_on_sanity_raise(self, caplog):
+    async def test_error_log_includes_elapsed_time_on_sanity_raise(self, caplog):
         """logger.error includes elapsed-time diagnostic info on sanity-bound raise.
 
         Distinct from test_error_logged_before_sanity_raise (which checks label +
