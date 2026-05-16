@@ -75,6 +75,7 @@ class _StewardReescalated(Exception):
         self.escalations = escalations
 
 if TYPE_CHECKING:
+    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
     from orchestrator.usage_gate import UsageGate
@@ -3375,7 +3376,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
 
-    async def _submit_halt_escalation_and_wait(self, esc) -> None:
+    async def _submit_halt_escalation_and_wait(self, esc: "Escalation") -> None:
         """Submit a halt-owning escalation, register ownership, and wait for resolution.
 
         Order is significant: set_halt_owner MUST follow a successful submit.
@@ -3384,9 +3385,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         raises, the exception propagates before set_halt_owner is reached and
         no orphan halt is registered.
 
-        On cancellation or any other BaseException, releases the halt via
-        unhalt_wip(reason='workflow_cancelled') iff this workflow still owns
-        it, then re-raises so the cancellation propagates to the caller's Task.
+        On cancellation or any other BaseException raised after set_halt_owner
+        (including event_store.emit failures or task cancellation during the
+        await), releases the halt via unhalt_wip(reason='workflow_cancelled')
+        iff this workflow still owns it, then re-raises so the cancellation
+        propagates to the caller's Task.
         """
         assert self.escalation_queue is not None, (
             '_submit_halt_escalation_and_wait requires escalation_queue; '
@@ -3395,21 +3398,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
         if self.merge_worker is not None:
             self.merge_worker.set_halt_owner(esc.id)
-        if self.event_store:
-            self.event_store.emit(
-                EventType.escalation_created,
-                task_id=self.task_id, phase=self.state.value,
-                data={
-                    'escalation_id': esc.id,
-                    'category': esc.category,
-                    'severity': esc.severity,
-                    'summary': esc.summary[:200],
-                },
-            )
-        if self._escalation_event is None:
-            self._escalation_event = asyncio.Event()
-        self._escalation_event.clear()
+        # try/except starts here so emit, event setup, AND the await are all
+        # protected — any BaseException after set_halt_owner triggers cleanup.
         try:
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={
+                        'escalation_id': esc.id,
+                        'category': esc.category,
+                        'severity': esc.severity,
+                        'summary': esc.summary[:200],
+                    },
+                )
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
             await self._escalation_event.wait()
         except BaseException:
             if (
