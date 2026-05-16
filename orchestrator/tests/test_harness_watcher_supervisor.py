@@ -896,7 +896,7 @@ class TestWatcherCrashloopTrip:
     async def test_old_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
         """Unclean exits older than watcher_crashloop_window_secs are evicted
         so they do not contribute to the crashloop count."""
-    
+
         from shared.cli_invoke import AgentResult
 
         max_restarts = 3
@@ -965,7 +965,7 @@ class TestWatcherCrashloopTrip:
         previously swallowed pause_scheduler failures, causing the loop to restart
         the agent indefinitely instead of stopping.
         """
-    
+
         from shared.cli_invoke import AgentResult
 
         max_restarts = 3
@@ -1031,7 +1031,7 @@ class TestWatcherMisconfiguredGuard:
     @pytest.mark.asyncio
     async def test_fast_clean_exit_appends_degenerate_deque(self, tmp_path: Path) -> None:
         """A fast clean exit (duration < min_rotation_secs) appends to _watcher_degenerate_clean_exits."""
-    
+
         from shared.cli_invoke import AgentResult
 
         h = _make_loop_harness(tmp_path)
@@ -1076,7 +1076,7 @@ class TestWatcherMisconfiguredGuard:
     @pytest.mark.asyncio
     async def test_slow_clean_exit_does_not_append(self, tmp_path: Path) -> None:
         """A slow clean exit (duration >= min_rotation_secs) does NOT append to the degenerate deque."""
-    
+
         from shared.cli_invoke import AgentResult
 
         h = _make_loop_harness(tmp_path)
@@ -1123,7 +1123,7 @@ class TestWatcherMisconfiguredGuard:
     async def test_misconfigured_trips_pause_scheduler(self, tmp_path: Path) -> None:
         """After watcher_max_misconfigured_clean_exits fast-clean exits in the window,
         pause_scheduler is called once with 'watcher_misconfigured' and the loop exits."""
-    
+
         from shared.cli_invoke import AgentResult
 
         max_misconfig = 3
@@ -1196,7 +1196,7 @@ class TestWatcherMisconfiguredGuard:
         impl used iter_count tracking which made iteration 2's duration ≈ window+2s,
         so only 1 old entry was actually added instead of the intended 2).
         """
-    
+
         from shared.cli_invoke import AgentResult
 
         max_misconfig = 3
@@ -1295,7 +1295,7 @@ class TestWatcherMisconfiguredGuard:
         added in step-6 around pause_scheduler('watcher_misconfigured') must
         return regardless of whether pause_scheduler itself raises.
         """
-    
+
         from shared.cli_invoke import AgentResult
 
         max_misconfig = 3
