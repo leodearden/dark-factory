@@ -375,7 +375,10 @@ class EscalationQueue:
         path emits before the resolve callback fires.
 
         Contract:
-        - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by).
+        - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
+          **before** the disk write.  If the write raises (e.g. ENOSPC), the in-memory
+          object is already in resolved state — callers must not reuse it after catching
+          the exception.  Treat the input as consumed on call.
         - Writes the resolved JSON atomically to ``queue_dir/{id}.json`` using
           the same tmp+rename pattern as ``submit()``.
         - Best-effort archives via ``os.replace`` into the dated archive subdir

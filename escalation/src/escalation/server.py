@@ -122,7 +122,9 @@ def create_server(
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
           4. await task_status_lookup(task_id):
-               done/cancelled → auto-resolve: submit + resolve, return resolved record
+               done/cancelled → auto-resolve via submit_resolved (single write,
+                              single callback), return minimal {id, status,
+                              resolution, resolved_by} dict; blocker adds 'action'
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
@@ -190,6 +192,12 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
+
+        Response shape:
+        - Queued (task alive):    ``{id, status}``  where status='queued'
+        - Deduped (folded):       ``{id, status, parent_id, child_id}``
+        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
+          Callers needing the full record can call get_escalation(id).
         """
         esc = Escalation(
             id=queue.make_id(task_id),
@@ -229,6 +237,12 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
+
+        Response shape always includes ``action='terminate_cleanly'`` plus:
+        - Queued:        ``{id, status, action}``  where status='queued'
+        - Deduped:       ``{id, status, parent_id, child_id, action}``
+        - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
+          Callers needing the full record can call get_escalation(id).
         """
         esc = Escalation(
             id=queue.make_id(task_id),
