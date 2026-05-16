@@ -195,24 +195,51 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     return slot
 
 
+_GATE_PROPERTY_DEFAULTS: dict[str, object] = {
+    # Known-good values for every UsageGate @property.
+    # Driven by inspect at module load so future @property additions are
+    # caught automatically by test_make_gate_covers_usage_gate_public_property_surface.
+    'account_count': 1,
+    'active_account_name': 'acct-a',
+    'soonest_resets_at': None,
+    'paused_reason': '',
+    'cumulative_cost': 0.0,
+    'total_pause_secs': 0.0,
+    'is_paused': False,
+    'project_id': None,
+    'run_id': None,
+}
+
+
 def _make_gate(**overrides) -> MagicMock:
     """Build a MagicMock UsageGate with all required attribute defaults initialised.
 
-    Ensures every gate attribute that UsageGate exposes is set to a sensible
-    default so that a new attribute added to UsageGate only needs to be updated
-    here rather than at every construction site.  Accepts ``**overrides`` so
-    callers can pin specific values without re-specifying the rest.
+    Property defaults are driven by introspecting UsageGate's @property surface
+    (via _GATE_PROPERTY_DEFAULTS, which mirrors inspect.getmembers) so that a
+    new @property on UsageGate auto-propagates here without manual edits to every
+    construction site.  Motivation: the 122-error cascade (tasks 1313/1339) where
+    soonest_resets_at was added to UsageGate but not to the mock factories.
 
-    Mirrors the ``_mock_gate`` helper in ``shared/tests/test_cap_retry.py``.
+    Method mocks (before_invoke, on_agent_complete, confirm_account_ok,
+    release_probe_slot) are kept explicit because they need typed mock instances
+    (AsyncMock vs MagicMock) that cannot be inferred from introspection.
+
+    Accepts ``**overrides`` so callers can pin specific values.
+
+    Sister helper: ``shared/tests/test_cap_retry.py::_mock_gate`` — same shape
+    but with extra ``invoke_slot()`` async-CM wiring for shared-layer tests.
+    Cannot be unified: shared cannot import from orchestrator/tests (layering).
     """
     gate = MagicMock()
-    gate.account_count = overrides.pop('account_count', 1)
+    # Set all known @property defaults; unknown future ones fall back to None.
+    for prop_name, _ in inspect.getmembers(UsageGate, lambda v: isinstance(v, property)):
+        default = _GATE_PROPERTY_DEFAULTS.get(prop_name)
+        setattr(gate, prop_name, overrides.pop(prop_name, default))
+    # Explicit method mocks (need typed mock instances).
     gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
-    gate.active_account_name = overrides.pop('active_account_name', 'acct-a')
     gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
     gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
     gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
-    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
     for k, v in overrides.items():
         setattr(gate, k, v)
     return gate
