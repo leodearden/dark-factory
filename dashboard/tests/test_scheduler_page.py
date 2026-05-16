@@ -22,6 +22,64 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 # ---------------------------------------------------------------------------
+# task-1454 step-1: unit tests for _scheduler_snapshot helper
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_snapshot_defaults():
+    """_scheduler_snapshot() with no args returns all 6 canonical fields."""
+    snapshot = _scheduler_snapshot()
+    assert set(snapshot.keys()) == {
+        'skip_counts', 'parks', 'effective_priorities',
+        'pin_queue', 'overrides', 'current_holders',
+    }
+    assert snapshot['skip_counts'] == {}
+    assert snapshot['parks'] == {}
+    assert snapshot['effective_priorities'] == {}
+    assert snapshot['pin_queue'] == []
+    assert snapshot['overrides'] == {}
+    assert snapshot['current_holders'] == {}
+
+
+def test_scheduler_snapshot_overrides_replace_defaults():
+    """kwargs matching base keys replace the default values."""
+    snap = _scheduler_snapshot(skip_counts={'1': 3}, pin_queue=[{'task_id': '1', 'order': 0}])
+    assert snap['skip_counts'] == {'1': 3}
+    assert snap['pin_queue'] == [{'task_id': '1', 'order': 0}]
+    # Untouched base fields remain at defaults
+    assert snap['parks'] == {}
+    assert snap['overrides'] == {}
+
+
+def test_scheduler_snapshot_extra_kwargs_added():
+    """kwargs not in the base dict are added verbatim."""
+    snap = _scheduler_snapshot(
+        is_paused=True,
+        pause_reason='park-stop: 5 tasks',
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
+    assert snap['is_paused'] is True
+    assert snap['pause_reason'] == 'park-stop: 5 tasks'
+    assert snap['snapshot_at'] == '2026-01-01T00:00:00+00:00'
+    # Base fields still present
+    assert 'skip_counts' in snap
+
+
+def test_scheduler_snapshot_returns_independent_dicts():
+    """Successive calls return independent dicts; mutating one doesn't affect another."""
+    snap1 = _scheduler_snapshot()
+    snap2 = _scheduler_snapshot()
+    snap1['skip_counts']['1'] = 99
+    assert snap2['skip_counts'] == {}, (
+        'snap2 was mutated by modifying snap1 — base dict is being aliased'
+    )
+    snap1['pin_queue'].append('X')
+    assert snap2['pin_queue'] == [], (
+        'snap2 pin_queue was mutated by modifying snap1 — base list is being aliased'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-1: pure-function test for _module_contention_counts
 # ---------------------------------------------------------------------------
 
