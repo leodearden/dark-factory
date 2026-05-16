@@ -552,6 +552,69 @@ class TestSubmitResolved:
             f"Expected archive dir '{expected_date}', got '{archived_path.parent.name}'"
         )
 
+    def test_submit_resolved_archive_failure_keeps_file_in_queue_dir(
+        self, tmp_path: Path, caplog,
+    ):
+        """When the archive os.replace fails, submit_resolved still succeeds.
+
+        Contract (mirrors TestResolveArchives.test_resolve_archive_failure_*):
+        - submit_resolved() returns the resolved Escalation.
+        - The file stays in queue_dir root (readable by get()).
+        - A WARNING is emitted naming the escalation ID.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        with patch('os.replace', side_effect=OSError('cross-device link')), \
+             caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.submit_resolved(esc, 'auto: terminal', resolved_by='test')
+
+        # submit_resolved must return the updated escalation despite the OSError
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'auto: terminal'
+
+        # File must remain readable from queue root (archive move failed → stayed)
+        from_queue = queue.get('esc-1-1')
+        assert from_queue is not None
+        assert from_queue.status == 'resolved'
+
+        # A warning naming the escalation ID must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
+        )
+
+    def test_submit_resolved_resolve_callback_exception_does_not_propagate(
+        self, tmp_path: Path, caplog,
+    ):
+        """A raising _resolve_callback is swallowed; submit_resolved still returns normally.
+
+        Contract (mirrors analogous coverage in resolve() tests): the except-warn
+        guard at queue.py guarantees that a misbehaving callback cannot abort the
+        resolution — the caller gets the resolved Escalation back regardless.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        def _bad_callback(e: Escalation) -> None:
+            raise RuntimeError('callback boom')
+
+        queue.set_resolve_callback(_bad_callback)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.submit_resolved(esc, 'auto: terminal')
+
+        # Must return normally despite the callback raising
+        assert result is not None
+        assert result.status == 'resolved'
+
+        # A warning must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning about callback failure; got: {warning_messages}'
+        )
+
 
 class TestResolveIdempotent:
     """EscalationQueue.resolve() is idempotent: a second call returns the first resolution unchanged."""
