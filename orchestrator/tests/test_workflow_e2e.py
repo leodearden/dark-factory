@@ -5369,7 +5369,7 @@ class TestDryRunUnblockE2EGuardOptOut:
         import orchestrator.workflow as _wf  # noqa: PLC0415
 
         with pytest.raises(AssertionError, match=r'TestDryRunUnblockE2EGuardOptOut') as exc_info:
-            _wf.run_dry_run_unblock(
+            _wf.run_dry_run_unblock(  # type: ignore[reportUnusedCoroutine]
                 task_id='t',
                 worktree='/tmp',
                 reason='r',
