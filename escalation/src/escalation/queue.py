@@ -359,6 +359,78 @@ class EscalationQueue:
 
         return esc
 
+    def submit_resolved(
+        self,
+        escalation: Escalation,
+        resolution: str,
+        *,
+        resolved_by: str | None = None,
+    ) -> Escalation:
+        """Atomically write *escalation* directly in resolved state.
+
+        Unlike the two-call ``submit()`` + ``resolve()`` pattern, this helper
+        performs a single file write (no transient pending intermediate) and
+        fires only ``_resolve_callback`` — never ``_notify_callback``.  This
+        eliminates the spurious "pending escalation" wake that the two-call
+        path emits before the resolve callback fires.
+
+        Contract:
+        - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by).
+        - Writes the resolved JSON atomically to ``queue_dir/{id}.json`` using
+          the same tmp+rename pattern as ``submit()``.
+        - Best-effort archives via ``os.replace`` into the dated archive subdir
+          (same two-step design as ``resolve()``): if the archive move fails,
+          the resolved file stays in ``queue_dir`` where ``get()`` can find it.
+        - Fires ``_resolve_callback`` once (if set); never fires ``_notify_callback``.
+        - Returns *escalation* (non-Optional — disk failures raise, no None case).
+        """
+        # Step 1: mutate in memory
+        escalation.status = 'resolved'
+        escalation.resolution = resolution
+        escalation.resolved_at = datetime.now(UTC).isoformat()
+        if resolved_by is not None:
+            escalation.resolved_by = resolved_by
+
+        # Step 2: atomic write to queue_dir root
+        path = self.queue_dir / f'{escalation.id}.json'
+        fd, tmp_path = tempfile.mkstemp(
+            suffix='.tmp', prefix=escalation.id, dir=str(self.queue_dir)
+        )
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(escalation.to_json())
+            os.rename(tmp_path, str(path))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+        # Step 3: best-effort archive move (same two-step design as resolve())
+        try:
+            archive_dir = archive.archive_dir_for_date(self.queue_dir, escalation.resolved_at)
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(archive_dir / f'{escalation.id}.json'))
+        except OSError as exc:
+            logger.warning(
+                f'Failed to archive escalation {escalation.id}: {exc}; '
+                'file remains in queue_dir'
+            )
+
+        # Step 4: log
+        logger.info(
+            'Escalation submit_resolved: %s [%s]: %s',
+            escalation.id, escalation.severity, resolution[:100],
+        )
+
+        # Step 5: fire resolve callback only — never notify callback
+        if self._resolve_callback:
+            try:
+                self._resolve_callback(escalation)
+            except Exception as e:
+                logger.warning(f'Resolve callback failed for {escalation.id}: {e}')
+
+        return escalation
+
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
