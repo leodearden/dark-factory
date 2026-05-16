@@ -2499,3 +2499,113 @@ class TestCuratorCapWaitSanityBound:
 
         assert result.action == 'create'
         assert result.justification == 'all-accounts-capped'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-1 RED: TestCancelledPremiseBlocklistLoader
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistLoader:
+    """Tests for load_blocklist() and BlocklistEntry from
+    fused_memory.middleware.cancelled_premise_blocklist.
+    """
+
+    def test_load_valid_yaml_returns_entries(self, tmp_path):
+        """(a) Valid YAML returns a list of BlocklistEntry dataclasses."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            load_blocklist,
+        )
+
+        yaml_content = """
+- name: test_entry
+  reason: A test reason for blocking
+  title_substrings:
+    - "search-then-delete"
+    - "fix c"
+  description_substrings:
+    - "fixc_flags_deleted_not_found"
+    - "stage1_flag_marker"
+"""
+        p = tmp_path / "blocklist.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        entries = load_blocklist(p)
+
+        assert len(entries) == 1
+        e = entries[0]
+        assert isinstance(e, BlocklistEntry)
+        assert e.name == "test_entry"
+        assert e.reason == "A test reason for blocking"
+        assert e.title_substrings == ["search-then-delete", "fix c"]
+        assert e.description_substrings == ["fixc_flags_deleted_not_found", "stage1_flag_marker"]
+
+    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
+        """(b) Missing file returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        missing = tmp_path / "does_not_exist.yaml"
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(missing)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+
+    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c) Malformed YAML returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(bad_yaml)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+
+    def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
+        """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            load_blocklist,
+        )
+
+        yaml_content = """
+- name: good_entry
+  reason: A good entry
+  title_substrings:
+    - "pattern"
+  description_substrings:
+    - "description match"
+- name: bad_entry
+  reason: Missing title_substrings
+  description_substrings:
+    - "description match"
+"""
+        p = tmp_path / "mixed.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(p)
+
+        assert len(entries) == 1
+        assert entries[0].name == "good_entry"
+        assert isinstance(entries[0], BlocklistEntry)
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 1
+
+    def test_load_none_path_returns_empty_no_warning(self, caplog):
+        """(bonus) path=None returns [] without any warnings."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(None)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 0
