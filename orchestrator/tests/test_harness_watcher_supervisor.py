@@ -21,7 +21,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
