@@ -8,6 +8,7 @@ No live systemd runtime is needed — all subprocess.run calls are monkeypatched
 
 import importlib.util
 import pathlib
+import re
 import subprocess
 import types
 
@@ -462,11 +463,27 @@ def _extract_escalation_port(cfg: object, config_path: pathlib.Path) -> int:
     return port
 
 
-def test_extract_escalation_port_happy_path() -> None:
-    """_extract_escalation_port returns the int port from a well-formed config dict."""
-    cfg = {"escalation": {"port": 8102}}
-    result = _extract_escalation_port(cfg, pathlib.Path("/fake/config.yaml"))
-    assert result == 8102
+def test_extract_escalation_port_error_paths() -> None:
+    """_extract_escalation_port raises AssertionError naming the config file on bad schema.
+
+    The key behavioral contract: the error message includes the config_path so a schema
+    rename (e.g. 'escalation' -> 'escalation_mcp') surfaces as a named-file diagnostic
+    instead of a bare KeyError. Verified by matching only on re.escape(str(config_path)).
+    """
+    config_path = pathlib.Path("/fake/orchestrator/config.yaml")
+    path_pattern = re.escape(str(config_path))
+
+    # Missing 'escalation' key at top level
+    with pytest.raises(AssertionError, match=path_pattern):
+        _extract_escalation_port({"other_key": 5}, config_path)
+
+    # 'escalation' present but missing 'port'
+    with pytest.raises(AssertionError, match=path_pattern):
+        _extract_escalation_port({"escalation": {"queue_dir": "data/escalations"}}, config_path)
+
+    # Non-dict cfg (e.g. YAML parsed to None or a list)
+    with pytest.raises(AssertionError, match=path_pattern):
+        _extract_escalation_port(None, config_path)
 
 
 def test_watched_ports_match_configured_escalation_ports() -> None:
