@@ -118,22 +118,7 @@ class EscalationQueue:
 
     def submit(self, escalation: Escalation) -> str:
         """Atomic write: {id}.tmp -> rename to {id}.json."""
-        path = self.queue_dir / f'{escalation.id}.json'
-
-        # Write to tmp file first
-        fd, tmp_path = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation.id, dir=str(self.queue_dir)
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(escalation.to_json())
-            os.rename(tmp_path, str(path))
-        except Exception:
-            # Clean up tmp on failure
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
-
+        self._atomic_write(escalation.id, escalation.to_json())
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
 
         if self._notify_callback:
@@ -317,38 +302,8 @@ class EscalationQueue:
         if resolution_turns is not None:
             esc.resolution_turns = resolution_turns
 
-        path = self.queue_dir / f'{escalation_id}.json'
-        fd, tmp_path = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation_id, dir=str(self.queue_dir)
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(esc.to_json())
-            os.rename(tmp_path, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
-
-        # Best-effort: move resolved file into dated archive subdir.
-        #
-        # Two-step design (write-to-root then os.replace to archive) is
-        # intentional: if the archive move fails, the *resolved* file remains in
-        # queue_dir so get() can still return it — no data is lost.  Writing
-        # directly to the archive dir would leave the file as *pending* in
-        # queue_dir on failure, which is a worse fallback state.
-        #
-        # Failure logs a warning but does not abort the resolution.
-        try:
-            archive_dir = archive.archive_dir_for_date(self.queue_dir, esc.resolved_at)
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(str(path), str(archive_dir / f'{escalation_id}.json'))
-        except OSError as exc:
-            logger.warning(
-                f'Failed to archive escalation {escalation_id}: {exc}; '
-                'file remains in queue_dir'
-            )
-
+        self._atomic_write(escalation_id, esc.to_json())
+        self._archive_resolved(escalation_id, esc.resolved_at)
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
 
         if self._resolve_callback:
@@ -394,30 +349,10 @@ class EscalationQueue:
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
 
-        # Step 2: atomic write to queue_dir root
-        path = self.queue_dir / f'{escalation.id}.json'
-        fd, tmp_path = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation.id, dir=str(self.queue_dir)
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(escalation.to_json())
-            os.rename(tmp_path, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
-
-        # Step 3: best-effort archive move (same two-step design as resolve())
-        try:
-            archive_dir = archive.archive_dir_for_date(self.queue_dir, escalation.resolved_at)
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(str(path), str(archive_dir / f'{escalation.id}.json'))
-        except OSError as exc:
-            logger.warning(
-                f'Failed to archive escalation {escalation.id}: {exc}; '
-                'file remains in queue_dir'
-            )
+        # Step 2: atomic write then best-effort archive (delegates to shared helpers)
+        self._atomic_write(escalation.id, escalation.to_json())
+        # Step 3: best-effort archive move
+        self._archive_resolved(escalation.id, escalation.resolved_at)
 
         # Step 4: log
         logger.info(
@@ -489,18 +424,50 @@ class EscalationQueue:
 
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
         """Atomically rewrite an escalation's JSON file."""
+        self._atomic_write(escalation_id, escalation.to_json())
+
+    def _atomic_write(self, escalation_id: str, json_text: str) -> None:
+        """Write *json_text* atomically to ``queue_dir/{escalation_id}.json``.
+
+        Uses the tmp+rename pattern: write to a temp file in the same directory
+        then rename over the target path.  On failure the tmp file is cleaned up
+        and the exception propagates unchanged.
+
+        Callers: submit(), resolve(), submit_resolved(), _rewrite().
+        """
         path = self.queue_dir / f'{escalation_id}.json'
         fd, tmp_path = tempfile.mkstemp(
             suffix='.tmp', prefix=escalation_id, dir=str(self.queue_dir)
         )
         try:
             with os.fdopen(fd, 'w') as f:
-                f.write(escalation.to_json())
+                f.write(json_text)
             os.rename(tmp_path, str(path))
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
             raise
+
+    def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
+        """Best-effort move ``queue_dir/{escalation_id}.json`` into the dated archive subdir.
+
+        Two-step design (write-to-root then os.replace to archive) is intentional:
+        if the archive move fails, the resolved file remains in ``queue_dir`` so
+        ``get()`` can still return it — no data is lost.  Failure logs a warning
+        but does not abort the resolution.
+
+        Callers: resolve(), submit_resolved().
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        try:
+            archive_dir = archive.archive_dir_for_date(self.queue_dir, resolved_at)
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(archive_dir / f'{escalation_id}.json'))
+        except OSError as exc:
+            logger.warning(
+                f'Failed to archive escalation {escalation_id}: {exc}; '
+                'file remains in queue_dir'
+            )
 
     def dismiss_all_pending(self, resolution: str) -> int:
         """Dismiss all pending L0 escalations with the given resolution message.
