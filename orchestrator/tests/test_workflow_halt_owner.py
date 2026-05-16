@@ -180,3 +180,48 @@ async def test_handle_wip_conflict_releases_halt_on_cancel(
     assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
         f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: _handle_wip_recovery
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_wip_recovery_releases_halt_on_cancel(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Cancel mid-await in _handle_wip_recovery releases halt owner.
+
+    _handle_wip_recovery fires when the merge landed on main but the stash pop
+    conflicted.  It submits an escalation and waits — same risk as wip_conflict.
+
+    Must fail today (pre-fix): the handler has no try/except around the await.
+    """
+    fake_worker.halt_for_wip('done_wip_recovery')
+
+    task = asyncio.create_task(
+        workflow._handle_wip_recovery(
+            MergeOutcome(
+                status='done_wip_recovery',
+                recovery_branch='wip/r1',
+                merge_sha='deadbeef',
+            ),
+        )
+    )
+
+    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must be cleared after workflow cancellation'
+    )
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False after workflow cancellation'
+    )
+    assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
+        f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
+    )
