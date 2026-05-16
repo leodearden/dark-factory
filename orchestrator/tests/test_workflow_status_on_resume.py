@@ -450,6 +450,7 @@ class TestRealPromptPassedToCliInvokeOnResume:
             await workflow._invoke(IMPLEMENTER, 'REAL TASK PROMPT', cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
+        assert mock_cap_retry.await_args is not None, 'await_args must not be None'
         call_kwargs = mock_cap_retry.await_args.kwargs
         assert call_kwargs.get('prompt') == 'REAL TASK PROMPT', (
             f"Expected prompt='REAL TASK PROMPT' but got {call_kwargs.get('prompt')!r}. "
