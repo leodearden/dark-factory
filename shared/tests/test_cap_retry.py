@@ -11,6 +11,7 @@ import itertools
 import json
 import logging
 import os
+import re
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
@@ -1473,7 +1474,7 @@ class TestCapRetrySanityGuardLogging:
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
 
-    async def test_error_log_includes_label_on_sanity_raise(self, caplog):
+    async def test_error_log_includes_elapsed_time_on_sanity_raise(self, caplog):
         """logger.error includes elapsed-time diagnostic info on sanity-bound raise.
 
         Distinct from test_error_logged_before_sanity_raise (which checks label +
@@ -1505,9 +1506,11 @@ class TestCapRetrySanityGuardLogging:
             )
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
-        # Verify the diagnostic elapsed-time content (not just the label):
-        assert any('4000.0s' in m for m in error_msgs), (
-            f'Error log should include elapsed time (4000.0s). Got: {error_msgs}'
+        # Verify the diagnostic elapsed-time content (not just the label).
+        # Use a regex to pin the stable phrase from _check_cap_wait without
+        # coupling to the exact float-format precision (e.g. .1f vs .2f).
+        assert any(re.search(r'cap-wait sanity bound exceeded after \d+\.\d+s', m) for m in error_msgs), (
+            f'Error log should include sanity-bound diagnostic phrase with float-formatted elapsed time. Got: {error_msgs}'
         )
 
 

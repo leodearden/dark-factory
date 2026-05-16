@@ -36,30 +36,40 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def _patch_dry_run_unblock(monkeypatch):
-    """Prevent _spawn_dry_run_unblock from hanging BLOCKED-outcome tests.
+@pytest.fixture(autouse=True)
+def _dry_run_unblock_e2e_guard(request, monkeypatch):
+    """File-local autouse fail-fast guard for run_dry_run_unblock.
 
     _mark_blocked fires asyncio.create_task(run_dry_run_unblock(...)) when
     unblock_auto.enabled=True (the default).  In e2e tests the real
     invoke_agent call inside run_dry_run_unblock has no Claude CLI available
     and blocks indefinitely, causing every BLOCKED test to hit the 60 s
-    per-test timeout and the whole file to exceed 1200 s.  Patch to a no-op
-    so the background task completes instantly and the workflow state machine
-    is what gets tested here.  test_workflow_dry_run_hook.py pins the hook
-    behaviour with its own explicit patches.
+    per-test timeout and the whole file to exceed 1200 s.
 
-    NOTE: This fixture is applied via class-level
-    ``@pytest.mark.usefixtures('_patch_dry_run_unblock')`` on each Test class
-    whose tests can drive the workflow into the BLOCKED state.  It is NOT
-    module-wide autouse, so the scope is explicit and auditable.
+    Two modes, selected by marker:
 
-    MAINTENANCE: If you add or edit a test class that drives the workflow to
-    BLOCKED and forget to add the marker, the failure is loud — the test hits
-    the 60 s pytest-timeout (timeout_method=thread) rather than hanging
-    silently.  Add ``@pytest.mark.usefixtures('_patch_dry_run_unblock')`` to
-    that class and re-run.  For dry-run-unblock behaviour tests, use
-    test_workflow_dry_run_hook.py instead of this file.
+    Opt-in (``@pytest.mark.mocks_dry_run_unblock`` on the test class):
+        Installs ``AsyncMock(return_value=None)`` so BLOCKED-driving tests
+        complete immediately without hanging.
+
+    Default (no marker):
+        Installs a synchronous stub that records every invocation and raises
+        ``AssertionError`` with a message that names the calling test class and
+        points to ``test_workflow_dry_run_hook.py``.  A fixture teardown also
+        calls ``pytest.fail(...)`` if any invocations were recorded, ensuring
+        the failure propagates even when workflow.py's ``try/except Exception``
+        around ``asyncio.create_task(run_dry_run_unblock(...))`` swallows the
+        synchronous raise.
+
+    MAINTENANCE: If you add a test class that drives the workflow to BLOCKED,
+    decorate it with ``@pytest.mark.mocks_dry_run_unblock``.  For dry-run-unblock
+    behaviour tests use test_workflow_dry_run_hook.py, not this file.
+
+    NOTE: The conftest-level ``_no_dry_run_unblock`` autouse fixture already
+    installs a plain async no-op across the whole orchestrator test suite.
+    This file-local fixture overrides that with either an AsyncMock (opt-in)
+    or the stricter fail-fast stub (default), providing an auditable per-class
+    opt-in contract rather than silent no-ops.
     """
     import orchestrator.workflow as _wf  # local import to avoid circular at module level
 
@@ -67,10 +77,50 @@ def _patch_dry_run_unblock(monkeypatch):
         "run_dry_run_unblock not found in orchestrator.workflow — "
         "update this fixture's patch target if the symbol was renamed."
     )
-    monkeypatch.setattr(
-        'orchestrator.workflow.run_dry_run_unblock',
-        AsyncMock(return_value=None),
-    )
+
+    if request.node.get_closest_marker('mocks_dry_run_unblock'):
+        # Opt-in: install a proper AsyncMock so BLOCKED-driving tests pass.
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_dry_run_unblock',
+            AsyncMock(return_value=None),
+        )
+        yield
+        return
+
+    # Default: fail-fast stub — records invocations and raises immediately.
+    calls: list[dict] = []
+    cls_name = request.node.cls.__name__ if request.node.cls else '<module-level>'
+
+    def _fail_fast_stub(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError(
+            f'run_dry_run_unblock was called in {cls_name} without '
+            f'@pytest.mark.mocks_dry_run_unblock. '
+            f'BLOCKED-driving tests must opt in. '
+            f'For hook behaviour tests use test_workflow_dry_run_hook.py.'
+        )
+
+    monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _fail_fast_stub)
+
+    yield
+
+    # Guard self-tests deliberately invoke the stub via pytest.raises — skip teardown
+    # check for those classes so they don't trigger a false-positive failure.
+    # Using a marker (rather than a hardcoded class-name set) means renaming the
+    # self-test class never accidentally re-triggers this teardown assertion.
+    if calls and not request.node.get_closest_marker('guard_self_test'):
+        # Teardown is the authoritative failure point: workflow.py wraps the call site
+        # in `try: asyncio.create_task(run_dry_run_unblock(...)) except Exception:
+        # logger.warning(...)` which swallows the synchronous AssertionError raised by
+        # the stub.  The stub's raise is defense-in-depth (visible traceback when the
+        # workflow path doesn't catch it), but this teardown assertion guarantees a test
+        # failure regardless of whether workflow's broad except swallowed the stub's raise.
+        pytest.fail(
+            f'run_dry_run_unblock was called {len(calls)} time(s) in {cls_name} '
+            f'without @pytest.mark.mocks_dry_run_unblock. '
+            f'Add the marker or move the test to test_workflow_dry_run_hook.py.',
+            pytrace=False,
+        )
 
 
 @pytest.fixture
@@ -814,7 +864,7 @@ class TestCompletionJudge:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestVerifyDebugfixLoop:
     """Verification fails, debugger fixes, re-verify passes."""
 
@@ -1003,6 +1053,7 @@ class TestReviewLoop:
 
 
 @pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
 class TestBaseCommitDiff:
     """Verify review uses base_commit diff, not moving main ref."""
 
@@ -1698,7 +1749,7 @@ def _make_resolve_then_dismiss_chained_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
 
@@ -1991,7 +2042,7 @@ class TestCorruptedIterationLogEscalation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestDoneIsTerminal:
     """_mark_blocked must be a no-op when workflow.state is already DONE."""
 
@@ -2058,7 +2109,7 @@ class TestDoneIsTerminal:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestReviewerErrors:
     """Reviewer failures are detected, retried, and escalated."""
 
@@ -2342,7 +2393,7 @@ class TestGhostLoopGuard:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestWipRecoveryNoAdvance:
     """wip_recovery_no_advance outcome creates L1 wip_conflict escalation and returns BLOCKED."""
 
@@ -2492,7 +2543,7 @@ class StringPrereqsArchitectStub(AgentStub):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestPrerequisitesValidation:
     """Workflow blocks with descriptive error when architect writes string prerequisites."""
 
@@ -2539,7 +2590,7 @@ class TestPrerequisitesValidation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedFalseDoneGuard:
     """_mark_blocked's requeue-on-steward-resolution contract.
 
@@ -4145,7 +4196,7 @@ class TestFileStructureInvariants:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestPlanDoneEarlyReturn:
     """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
 
@@ -4242,7 +4293,7 @@ def _make_l1_escalating_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedPreservesStewardStatus:
     """Regression: _mark_blocked must not overwrite steward-set deferred/blocked.
 
@@ -4328,7 +4379,7 @@ class TestMarkBlockedPreservesStewardStatus:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedRespectsOpenL1:
     """Regression: _mark_blocked must not auto-requeue when L1 is open.
 
@@ -4667,7 +4718,7 @@ class TestStaleL1DoesNotSinkRun:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
 
@@ -4728,7 +4779,7 @@ class TestAllAccountsCappedExceptionBoundary:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedEscalationLevel:
     """Verify AllAccountsCappedException creates an L0 (not L1) with
     suggested_action='cap_wait_exceeded_sanity_bound'.
@@ -4794,7 +4845,7 @@ class TestAllAccountsCappedEscalationLevel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestSessionBudgetExhaustionEscalation:
     """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
 
@@ -4914,7 +4965,7 @@ class TestSessionBudgetExhaustionEscalation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestFirstInvocationBudgetExhaustion:
     """When SessionBudgetExhausted fires before any role completes, the escalation
     uses the 'last_completed_role' label and resolves to 'n/a' (None fallback).
@@ -5012,7 +5063,7 @@ def _make_done_setting_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedPhantomDone:
     """Regression: steward marking task done out-of-band must return DONE.
 
@@ -5056,7 +5107,7 @@ class TestMarkBlockedPhantomDone:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedBypassDetection:
     """Detect ``update_task(status='done')`` bypass when set_task_status('blocked') is rejected.
 
@@ -5305,6 +5356,72 @@ class TestCleanupVerificationGate:
             'cleanup_worktree MUST run when branch HEAD is on main — '
             'no work to preserve'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestDryRunUnblockE2EGuard — pins the two modes of the file-local autouse guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.guard_self_test
+class TestDryRunUnblockE2EGuardOptOut:
+    """Guard (opt-out mode): stub raises AssertionError when called.
+
+    No mocks_dry_run_unblock marker on this class — the file-level autouse guard
+    should install a synchronous fail-fast stub.  Calling the stub must raise
+    AssertionError.  The guard_self_test marker suppresses the fixture's teardown
+    assertion so the deliberate stub invocation inside pytest.raises here does not
+    produce a false-positive failure.
+    """
+
+    async def test_stub_raises_assertion_error_on_call(self):
+        """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
+        import orchestrator.workflow as _wf  # noqa: PLC0415
+
+        # The guard installs a synchronous stub (not a coroutine), so the call
+        # raises AssertionError immediately.  Pin the marker name as the stable
+        # token — it names the contract rather than a class name or filename that
+        # could change without breaking the guard's behavior.
+        with pytest.raises(AssertionError, match=r'mocks_dry_run_unblock'):
+            _wf.run_dry_run_unblock(  # type: ignore[unused-coroutine]
+                task_id='t',
+                worktree='/tmp',
+                reason='r',
+                detail='d',
+                scheduler=None,
+                mcp=None,
+                config=None,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestDryRunUnblockE2EGuardOptIn:
+    """Guard (opt-in mode): AsyncMock installed when mocks_dry_run_unblock marker present.
+
+    This class opts in via @pytest.mark.mocks_dry_run_unblock.  The guard
+    fixture should install AsyncMock(return_value=None) so BLOCKED-driving
+    tests work without hanging.
+    """
+
+    async def test_async_mock_installed_when_marker_present(self):
+        """run_dry_run_unblock is an AsyncMock when mocks_dry_run_unblock marker is set."""
+        import orchestrator.workflow as _wf  # noqa: PLC0415
+
+        assert isinstance(_wf.run_dry_run_unblock, AsyncMock), (
+            f'Expected AsyncMock, got {type(_wf.run_dry_run_unblock)!r}'
+        )
+        result = await _wf.run_dry_run_unblock(
+            task_id='t',
+            worktree='/tmp',
+            reason='r',
+            detail='d',
+            scheduler=None,
+            mcp=None,
+            config=None,
+        )
+        assert result is None
 
 
 if TYPE_CHECKING:
