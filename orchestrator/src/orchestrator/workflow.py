@@ -3376,7 +3376,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
 
-    async def _submit_halt_escalation_and_wait(self, esc: "Escalation") -> None:
+    async def _submit_halt_escalation_and_wait(self, esc: Escalation) -> None:
         """Submit a halt-owning escalation, register ownership, and wait for resolution.
 
         Order is significant: set_halt_owner MUST follow a successful submit.
