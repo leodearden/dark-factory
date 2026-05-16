@@ -173,10 +173,7 @@ def _unit_start_elapsed_secs(unit: str) -> float | None:
                 return None
             if start_mono_us == 0:
                 return None  # unit has never started (or no PID recorded)
-            try:
-                now_secs = time.clock_gettime(time.CLOCK_MONOTONIC)
-            except OSError:
-                return None
+            now_secs = time.clock_gettime(time.CLOCK_MONOTONIC)
             return max(0.0, now_secs - start_mono_us / 1_000_000)
         return None
     except Exception:  # noqa: BLE001
