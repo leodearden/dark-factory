@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import TaskReport
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
@@ -171,3 +172,103 @@ class TestRunStorePragmas:
         assert isinstance(result2, CheckpointResult)
         assert result1.busy == 0
         assert result2.busy == 0
+
+
+# ---------------------------------------------------------------------------
+# TestEventStorePragmas
+# ---------------------------------------------------------------------------
+
+
+class TestEventStorePragmas:
+    """EventStore applies the full pragma triad to every connection."""
+
+    def test_init_applies_full_pragma_triad(self, tmp_path: Path) -> None:
+        """Constructing EventStore initialises WAL mode; _connect() applies full triad."""
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-x')
+        _assert_pragma_triad(store)
+
+    def test_emit_connection_applies_triad(self, tmp_path: Path) -> None:
+        """After emit(), a fresh _connect() still applies the full pragma triad.
+
+        Verifies that _connect() consistently applies all five pragmas on the
+        connection used by emit(), not just during _ensure_schema().
+        """
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-x')
+        store.emit(EventType.task_started, task_id='1')
+
+        # Verify that a fresh connection via _connect() has all five pragmas applied.
+        _assert_pragma_triad(store)
+
+    def test_checkpoint_returns_result_with_busy_zero(self, tmp_path: Path) -> None:
+        """checkpoint() on a fresh store returns CheckpointResult with busy==0."""
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-x')
+        result = store.checkpoint()
+        assert isinstance(result, CheckpointResult)
+        assert result.busy == 0
+
+    def test_checkpoint_truncates_wal_after_emits(self, tmp_path: Path) -> None:
+        """After emits that grow the WAL, checkpoint() truncates it to ≤32 bytes."""
+        db_path = tmp_path / 'events.db'
+        wal_path = Path(str(db_path) + '-wal')
+
+        store = EventStore(db_path, 'run-x')
+
+        # Long-lived writer: keeps the connection open across commits so the WAL
+        # accumulates without the PASSIVE close-checkpoint truncating it.
+        writer = sqlite3.connect(str(db_path))
+        try:
+            writer.execute('PRAGMA journal_mode=WAL')
+            for i in range(10):
+                writer.execute(
+                    'INSERT INTO events '
+                    '(timestamp, run_id, event_type, data) VALUES (?, ?, ?, ?)',
+                    (f'2026-01-01T{i:02d}:00:00+00:00', 'run-x', 'task_started', '{}'),
+                )
+            writer.commit()
+
+            before_size = wal_path.stat().st_size if wal_path.exists() else 0
+            assert before_size > 0, (
+                'Expected WAL frames to exist while writer connection is still open'
+            )
+        finally:
+            writer.close()
+
+        result = store.checkpoint()
+        assert result.busy == 0
+        after_size = wal_path.stat().st_size if wal_path.exists() else 0
+        assert after_size <= 32, (
+            f'WAL file should be ≤32 bytes after TRUNCATE checkpoint; got {after_size}'
+        )
+
+    def test_emit_does_not_raise_on_checkpoint_failure(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """emit() is fire-and-forget: failures must not propagate to callers.
+
+        The existing `except Exception` inside emit() already swallows errors.
+        This test regression-pins that contract so a failing helper cannot break
+        callers.
+        """
+        import logging
+
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-x')
+
+        # Corrupt the DB path so any future connection attempt fails.
+        # Replace the db_path with a directory (non-file) so sqlite3.connect raises.
+        bad_path = tmp_path / 'not_a_file'
+        bad_path.mkdir()
+        store.db_path = bad_path  # type: ignore[assignment]
+
+        # emit() must not raise even though the connection will fail.
+        with caplog.at_level(logging.WARNING):
+            store.emit(EventType.task_started, task_id='t1')
+
+        # A warning must have been logged (existing contract).
+        assert any('emit' in r.message.lower() or 'event_store' in r.message.lower()
+                   for r in caplog.records), (
+            f'Expected a warning log from emit() failure; got: {caplog.records}'
+        )
