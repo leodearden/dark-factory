@@ -658,3 +658,13 @@ class TestMakeGateFactory:
         assert factory_keys <= yielding_keys, (
             f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
         )
+
+    def test_make_mock_gate_is_centralized(self):
+        """_make_gate is the centralized make_mock_gate imported from _orch_helpers.
+
+        Asserts identity: the local `_make_gate` name must be the same object as
+        `_orch_helpers.make_mock_gate`.  Fails with ImportError until step-6 moves
+        the body into _orch_helpers and replaces the local definition with an alias.
+        """
+        from _orch_helpers import make_mock_gate
+        assert _make_gate is make_mock_gate
