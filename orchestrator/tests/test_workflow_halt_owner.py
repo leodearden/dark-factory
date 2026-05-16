@@ -23,13 +23,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
 from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
-
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 
 
 class _FakeMergeWorker:
@@ -338,6 +337,7 @@ async def test_submit_failure_does_not_register_halt_owner(
     """
     # Inject a failing submit — no halt_for_wip call needed, we're only testing
     # that a submit failure cannot corrupt the halt-owner state.
+    assert workflow.escalation_queue is not None
     original_submit = workflow.escalation_queue.submit
 
     def _raise_on_submit(esc):

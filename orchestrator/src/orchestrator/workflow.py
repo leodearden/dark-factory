@@ -75,6 +75,8 @@ class _StewardReescalated(Exception):
         self.escalations = escalations
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
     from orchestrator.usage_gate import UsageGate
 
 
@@ -255,7 +257,7 @@ class TaskWorkflow:
         scheduler: _SchedulerLike,
         briefing: _BriefingLike,
         mcp: _McpLike | None,
-        escalation_queue=None,
+        escalation_queue: EscalationQueue | None = None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
         initial_plan: dict | None = None,
@@ -3386,6 +3388,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         unhalt_wip(reason='workflow_cancelled') iff this workflow still owns
         it, then re-raises so the cancellation propagates to the caller's Task.
         """
+        assert self.escalation_queue is not None, (
+            '_submit_halt_escalation_and_wait requires escalation_queue; '
+            'callers must guard with `if self.escalation_queue:`'
+        )
         self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
         if self.merge_worker is not None:
             self.merge_worker.set_halt_owner(esc.id)
@@ -3906,12 +3912,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             raise _StewardReescalated(pending_l1)
 
-        # Collect resolutions
-        resolved = [
-            e for e in self.escalation_queue.get_by_task(self.task_id)
-            if e.status == 'resolved' and e.resolution
+        # Collect resolutions (filter ensures resolution is non-None str for join)
+        resolutions = [
+            e.resolution
+            for e in self.escalation_queue.get_by_task(self.task_id)
+            if e.status == 'resolved' and e.resolution is not None
         ]
-        return '\n'.join(e.resolution for e in resolved)
+        return '\n'.join(resolutions)
 
     async def _get_head_commit(self) -> str:
         """Return the HEAD commit SHA for the current worktree."""
