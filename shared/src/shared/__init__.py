@@ -6,6 +6,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     apply_wal_pragmas,
 )
+from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentFailureClass,
@@ -29,6 +30,7 @@ __all__ = [
     'CheckpointResult',
     'apply_wal_pragmas',
     'apply_full_durability_pragmas',
+    'apply_full_durability_pragmas_sync',
     'CAP_HIT_RESUME_PROMPT',
     'AgentFailureClass',
     'AgentFailureKind',
