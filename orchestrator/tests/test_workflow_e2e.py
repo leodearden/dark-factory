@@ -106,8 +106,15 @@ def _dry_run_unblock_e2e_guard(request, monkeypatch):
 
     # Guard self-tests deliberately invoke the stub via pytest.raises — skip teardown
     # check for those classes so they don't trigger a false-positive failure.
-    _guard_self_test_classes = {'TestDryRunUnblockE2EGuardOptOut'}
-    if calls and cls_name not in _guard_self_test_classes:
+    # Using a marker (rather than a hardcoded class-name set) means renaming the
+    # self-test class never accidentally re-triggers this teardown assertion.
+    if calls and not request.node.get_closest_marker('guard_self_test'):
+        # Teardown is the authoritative failure point: workflow.py wraps the call site
+        # in `try: asyncio.create_task(run_dry_run_unblock(...)) except Exception:
+        # logger.warning(...)` which swallows the synchronous AssertionError raised by
+        # the stub.  The stub's raise is defense-in-depth (visible traceback when the
+        # workflow path doesn't catch it), but this teardown assertion guarantees a test
+        # failure regardless of whether workflow's broad except swallowed the stub's raise.
         pytest.fail(
             f'run_dry_run_unblock was called {len(calls)} time(s) in {cls_name} '
             f'without @pytest.mark.mocks_dry_run_unblock. '
@@ -5357,20 +5364,27 @@ class TestCleanupVerificationGate:
 
 
 @pytest.mark.asyncio
+@pytest.mark.guard_self_test
 class TestDryRunUnblockE2EGuardOptOut:
     """Guard (opt-out mode): stub raises AssertionError when called.
 
-    No marker on this class — the file-level autouse guard should install a
-    synchronous fail-fast stub.  Calling the stub must raise AssertionError
-    whose message names this class and points to test_workflow_dry_run_hook.py.
+    No mocks_dry_run_unblock marker on this class — the file-level autouse guard
+    should install a synchronous fail-fast stub.  Calling the stub must raise
+    AssertionError.  The guard_self_test marker suppresses the fixture's teardown
+    assertion so the deliberate stub invocation inside pytest.raises here does not
+    produce a false-positive failure.
     """
 
     async def test_stub_raises_assertion_error_on_call(self):
         """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
         import orchestrator.workflow as _wf  # noqa: PLC0415
 
-        with pytest.raises(AssertionError, match=r'TestDryRunUnblockE2EGuardOptOut') as exc_info:
-            _wf.run_dry_run_unblock(  # type: ignore[reportUnusedCoroutine]
+        # The guard installs a synchronous stub (not a coroutine), so the call
+        # raises AssertionError immediately.  Pin the marker name as the stable
+        # token — it names the contract rather than a class name or filename that
+        # could change without breaking the guard's behavior.
+        with pytest.raises(AssertionError, match=r'mocks_dry_run_unblock'):
+            _wf.run_dry_run_unblock(
                 task_id='t',
                 worktree='/tmp',
                 reason='r',
@@ -5379,7 +5393,6 @@ class TestDryRunUnblockE2EGuardOptOut:
                 mcp=None,
                 config=None,
             )
-        assert 'test_workflow_dry_run_hook.py' in str(exc_info.value)
 
 
 @pytest.mark.asyncio
