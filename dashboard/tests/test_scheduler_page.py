@@ -21,6 +21,36 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+
+# ---------------------------------------------------------------------------
+# task-1454: helper — centralises the 6-field scheduler-state snapshot literal
+# ---------------------------------------------------------------------------
+
+
+def _scheduler_snapshot(**overrides):
+    """Return a base scheduler-state snapshot dict with the 6 standard fields.
+
+    Canonical base fields (all empty/default):
+      skip_counts, parks, effective_priorities, pin_queue, overrides,
+      current_holders
+
+    Any kwargs override a matching base key or add an extra key verbatim
+    (e.g. ``is_paused``, ``pause_reason``, ``snapshot_at``).
+
+    Each call returns a fresh dict — no cross-test aliasing.
+    """
+    base = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+    }
+    base.update(overrides)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # task-1454 step-1: unit tests for _scheduler_snapshot helper
 # ---------------------------------------------------------------------------
