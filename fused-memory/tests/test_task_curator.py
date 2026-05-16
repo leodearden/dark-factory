@@ -3164,3 +3164,100 @@ class TestCuratorBlocklistDisabledOrMissing:
             and r.levelno == logging.WARNING
         ]
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
+
+
+# step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistPinsFixCRegression:
+    """Regression-pin: the SHIPPED blocklist catches the 1376/1432 hallucination."""
+
+    # Path to the shipped YAML, resolved relative to this test file.
+    BLOCKLIST_PATH = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "config"
+        / "cancelled_premise_blocklist.yaml"
+    )
+    ENTRY_NAME = "fixc_flag_marker_search_then_delete"
+
+    def _load(self):
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+        entries = load_blocklist(self.BLOCKLIST_PATH)
+        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
+        return entries
+
+    def test_fixture_1_task1376_style_matches(self):
+        """Task-1376-style title + fixc_flags_deleted_not_found in description → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion in task_knowledge_sync.py: search-then-delete",
+            description=(
+                "The metric fixc_flags_deleted_not_found shows that delete-by-id fails "
+                "when the id is not in the store. Rework to search-then-delete."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for task-1376-style fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_fixture_2_task1432_style_with_stage1_marker_matches(self):
+        """Task-1432-style title + stage1_flag_marker in description → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="FIX C: convert flag-marker search-then-delete in knowledge sync",
+            description=(
+                "The stage1_flag_marker source entries accumulate without cleanup. "
+                "Switch from delete-by-id to a search-then-delete pattern."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for task-1432-style fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_fixture_3_paraphrased_title_matches(self):
+        """Paraphrased title variant + any description substring → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="Refactor FIX C stale-flag deletion from delete-by-id to search-then-delete",
+            description=(
+                "The fixc_flags_deleted_not_found counter reveals delete-by-recorded-id "
+                "misses entries added after the marker was created."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for paraphrased fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_control_unrelated_fixc_task_does_not_match(self):
+        """Control: a legitimate FIX C task without the fictional premise → no match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        # This touches FIX C but doesn't mention search-then-delete or fictional metrics
+        candidate = CandidateTask(
+            title="Improve FIX C relay-flag logging granularity",
+            description=(
+                "Add structured log fields to the FIX C relay-flag sweep so operators "
+                "can trace which flags were cleaned up in each reconciliation cycle."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is None, (
+            f"Control fixture should NOT match blocklist, but hit: {hit}"
+        )
