@@ -2499,3 +2499,758 @@ class TestCuratorCapWaitSanityBound:
 
         assert result.action == 'create'
         assert result.justification == 'all-accounts-capped'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-1 RED: TestCancelledPremiseBlocklistLoader
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistLoader:
+    """Tests for load_blocklist() and BlocklistEntry from
+    fused_memory.middleware.cancelled_premise_blocklist.
+    """
+
+    def test_load_valid_yaml_returns_entries(self, tmp_path):
+        """(a) Valid YAML returns a list of BlocklistEntry dataclasses."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            load_blocklist,
+        )
+
+        yaml_content = """
+- name: test_entry
+  reason: A test reason for blocking
+  title_substrings:
+    - "search-then-delete"
+    - "fix c"
+  description_substrings:
+    - "fixc_flags_deleted_not_found"
+    - "stage1_flag_marker"
+"""
+        p = tmp_path / "blocklist.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        entries = load_blocklist(p)
+
+        assert len(entries) == 1
+        e = entries[0]
+        assert isinstance(e, BlocklistEntry)
+        assert e.name == "test_entry"
+        assert e.reason == "A test reason for blocking"
+        assert e.title_substrings == ["search-then-delete", "fix c"]
+        assert e.description_substrings == ["fixc_flags_deleted_not_found", "stage1_flag_marker"]
+
+    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
+        """(b) Missing file returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        missing = tmp_path / "does_not_exist.yaml"
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(missing)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+
+    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c) Malformed YAML returns [] and emits exactly one WARNING."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(bad_yaml)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+
+    def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
+        """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            load_blocklist,
+        )
+
+        yaml_content = """
+- name: good_entry
+  reason: A good entry
+  title_substrings:
+    - "pattern"
+  description_substrings:
+    - "description match"
+- name: bad_entry
+  reason: Missing title_substrings
+  description_substrings:
+    - "description match"
+"""
+        p = tmp_path / "mixed.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(p)
+
+        assert len(entries) == 1
+        assert entries[0].name == "good_entry"
+        assert isinstance(entries[0], BlocklistEntry)
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 1
+
+    def test_load_none_path_returns_empty_no_warning(self, caplog):
+        """(bonus) path=None returns [] without any warnings."""
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(None)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-3 RED: TestCancelledPremiseBlocklistMatcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistMatcher:
+    """Tests for match_candidate() from fused_memory.middleware.cancelled_premise_blocklist.
+
+    Candidate fixtures mirror task 1376's actual title/description to pin the regression.
+    """
+
+    def _make_entry(
+        self,
+        name: str = "test_entry",
+        title_subs: list | None = None,
+        desc_subs: list | None = None,
+        reason: str = "test reason",
+    ):
+        from fused_memory.middleware.cancelled_premise_blocklist import BlocklistEntry
+        return BlocklistEntry(
+            name=name,
+            reason=reason,
+            title_substrings=title_subs or ["search-then-delete", "fix c"],
+            description_substrings=desc_subs or ["fixc_flags_deleted_not_found"],
+        )
+
+    def _make_candidate(self, title: str, description: str = "", details: str = ""):
+        return CandidateTask(title=title, description=description, details=details)
+
+    def test_match_all_title_subs_and_one_desc_sub(self):
+        """(a) Matches when ALL title_substrings AND at least one description_substring hit."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is missing from dashboard.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_no_match_when_title_substring_missing(self):
+        """(b) Returns None when any title_substring is absent."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        # Title has 'fix c' but NOT 'search-then-delete'
+        candidate = self._make_candidate(
+            title="FIX C: improve flag deletion",
+            description="Includes fixc_flags_deleted_not_found metric check.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_no_description_substring_hits(self):
+        """(c) Returns None when none of description_substrings appear."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        # Title matches but description has neither substring
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Completely unrelated description about something else.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_blocklist_empty(self):
+        """(d) Returns None when entries list is empty."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is missing.",
+        )
+        result = match_candidate(candidate, [])
+        assert result is None
+
+    def test_returns_first_match_in_list_order(self):
+        """(e) When multiple entries match, returns the first one."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry_a = self._make_entry(
+            name="entry_a",
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        entry_b = self._make_entry(
+            name="entry_b",
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["stage1_flag_marker"],
+        )
+        # Candidate matches both
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="fixc_flags_deleted_not_found and stage1_flag_marker both present.",
+        )
+        result = match_candidate(candidate, [entry_a, entry_b])
+        assert result is entry_a
+
+    def test_case_insensitive_matching(self):
+        """Match is case-insensitive for both title and description."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["SEARCH-THEN-DELETE", "FIX C"],
+            desc_subs=["FIXC_FLAGS_DELETED_NOT_FOUND"],
+        )
+        candidate = self._make_candidate(
+            title="convert fix c relay-flag deletion: search-then-delete",
+            description="metric fixc_flags_deleted_not_found is not found.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_desc_substring_can_appear_in_details(self):
+        """Description_substrings are matched against description + details combined."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["stage1_flag_marker"],
+        )
+        # Match is in details, not description
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Unrelated description.",
+            details="Adds stage1_flag_marker source lookup for deleted flags.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_task_1376_title_variant_matches(self):
+        """Pin regression: actual task 1376 title/description matches the blocklist entry."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            match_candidate,
+        )
+
+        entry = BlocklistEntry(
+            name="fixc_flag_marker_search_then_delete",
+            reason="Fictional metric — reverted ae58a59d81f1, tasks 1376/1432",
+            title_substrings=["fix c", "search-then-delete"],
+            description_substrings=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        # Mirrors task 1376's actual fields
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion in task_knowledge_sync.py from delete-by-recorded-ID to search-then-delete",
+            description="The _sweep_stale_fixc_markers function fails silently.",
+            details="Adds fixc_flags_deleted_not_found metric to surface the bug.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is not None
+        assert result.name == "fixc_flag_marker_search_then_delete"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-5 RED: TestCuratorConfigBlocklistPath
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorConfigBlocklistPath:
+    """Tests that CuratorConfig has cancelled_premise_blocklist_path field
+    and that FusedMemoryConfig round-trips it via YAML.
+    """
+
+    def test_curator_config_has_field_default_none(self):
+        """CuratorConfig has cancelled_premise_blocklist_path field, default None."""
+        cfg = CuratorConfig()
+        assert hasattr(cfg, "cancelled_premise_blocklist_path")
+        assert cfg.cancelled_premise_blocklist_path is None
+
+    def test_curator_config_accepts_string_path(self):
+        """CuratorConfig accepts a string path for cancelled_premise_blocklist_path."""
+        cfg = CuratorConfig(cancelled_premise_blocklist_path="/tmp/blocklist.yaml")
+        assert cfg.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
+
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
+        """FusedMemoryConfig round-trips cancelled_premise_blocklist_path via YAML."""
+        import yaml
+
+        raw = {"curator": {"cancelled_premise_blocklist_path": "/tmp/blocklist.yaml"}}
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+        monkeypatch.setenv("CONFIG_PATH", str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.curator.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-7 RED: TestCuratorBlocklistShortCircuit
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_blocklist_yaml(tmp_path, title_subs, desc_subs, name="test_entry"):
+    """Write a minimal blocklist YAML and return the path."""
+    import yaml
+    content = [{
+        "name": name,
+        "reason": "test reason",
+        "title_substrings": title_subs,
+        "description_substrings": desc_subs,
+    }]
+    p = tmp_path / "blocklist.yaml"
+    p.write_text(yaml.dump(content), encoding="utf-8")
+    return p
+
+
+def _make_config_with_blocklist(blocklist_path_str: str) -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(cancelled_premise_blocklist_path=blocklist_path_str)
+    return cfg
+
+
+@pytest.mark.asyncio
+class TestCuratorBlocklistShortCircuit:
+    """Tests that a blocklist match returns drop BEFORE corpus/LLM calls."""
+
+    async def test_blocklist_match_returns_drop_without_llm(self, tmp_path):
+        """(a) curate() returns drop with blocklist justification prefix."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))) as mock_llm, \
+             patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification.startswith("cancelled-premise-blocklist:")
+        mock_corpus.assert_not_called()
+        mock_llm.assert_not_called()
+        mock_exact.assert_not_called()
+
+    async def test_blocklist_decision_stored_in_cache(self, tmp_path):
+        """(e) The decision is stored in _decision_cache under payload_hash."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        payload_hash = candidate.payload_hash()
+        assert payload_hash in curator._decision_cache
+        cached_dec, _ = curator._decision_cache[payload_hash]
+        assert cached_dec.action == "drop"
+        assert cached_dec.justification == decision.justification
+
+    async def test_blocklist_non_matching_candidate_falls_through(self, tmp_path):
+        """Non-matching candidate still reaches corpus/LLM (no false-positive blocking)."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Title does NOT contain "search-then-delete"
+        candidate = CandidateTask(
+            title="Improve FIX C flag cleanup logic",
+            description="No fictional metrics here.",
+        )
+
+        # Patch exact-match to return None; corpus + LLM to return create
+        async def fake_exact_match(*a, **k):
+            return None
+
+        async def fake_corpus(*a, **k):
+            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+
+        create_result = AgentResult(
+            success=True,
+            output="",
+            structured_output={"action": "create", "justification": "genuinely new"},
+        )
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+
+# step-9 RED: TestCuratorBatchBlocklistShortCircuit
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorBatchBlocklistShortCircuit:
+    """Batch path: blocklist matches are removed from LLM dispatch set."""
+
+    async def test_batch_blocklist_match_excluded_from_llm(self, tmp_path):
+        """candidates[0] matches blocklist → excluded from LLM; decisions[0].action=='drop'."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # candidates[0] matches the blocklist
+        c0 = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+        # candidates[1] and [2] do not match
+        c1 = CandidateTask(title="Improve FIX C flag cleanup logic", description="Normal task")
+        c2 = CandidateTask(title="Add telemetry to recon pipeline", description="Normal task 2")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        # LLM returns create for each candidate it receives
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="new-1",
+                            pool_sizes=empty_sizes, latency_ms=0),
+            CuratorDecision(action="create", justification="new-2",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        # (a) Three decisions returned, one per prepared candidate
+        assert len(decisions) == 3
+
+        # (b) decisions[0] is a blocklist drop — NOT a batch_target_index drop
+        assert decisions[0].action == "drop"
+        assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
+        assert decisions[0].batch_target_index is None, (
+            "blocklist drops are real drops, not sibling-substitution drops"
+        )
+
+        # (c) LLM was called with only candidates[1] and [2], not [0]
+        assert len(llm_candidates_received) == 2
+        assert llm_candidates_received[0] is c1
+        assert llm_candidates_received[1] is c2
+
+        # (d) decisions[1] and [2] reflect the mocked LLM result
+        assert decisions[1].action == "create"
+        assert decisions[1].justification == "new-1"
+        assert decisions[2].action == "create"
+        assert decisions[2].justification == "new-2"
+
+
+# step-11 RED: TestCuratorBlocklistDisabledOrMissing
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_create_mocks():
+    """Return (fake_exact_match, fake_corpus, fake_llm_result) for a pass-through curate."""
+    async def fake_exact_match(*a, **k):
+        return None
+
+    async def fake_corpus(*a, **k):
+        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+
+    create_result = AgentResult(
+        success=True,
+        output="",
+        structured_output={"action": "create", "justification": "genuinely new"},
+    )
+    return fake_exact_match, fake_corpus, create_result
+
+
+@pytest.mark.asyncio
+class TestCuratorBlocklistDisabledOrMissing:
+    """Blocklist degradation: misconfigured or absent blocklist must not block task creation."""
+
+    async def test_path_none_no_warning(self, caplog):
+        """(a) cancelled_premise_blocklist_path=None → curate() proceeds with NO WARNING."""
+        import logging
+
+        config = _make_config()  # default CuratorConfig has path=None
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision is not None
+        assert decision.action == "create"
+        # No WARNING from the blocklist module (path=None is a deliberate opt-out)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 0, f"Expected no blocklist warnings, got: {blocklist_warns}"
+
+    async def test_nonexistent_path_one_warning_then_silent(self, tmp_path, caplog):
+        """(b) Non-existent path → curate() proceeds, exactly one WARNING on first call."""
+        import logging
+
+        nonexistent = str(tmp_path / "does_not_exist.yaml")
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=nonexistent)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
+            decision2 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision1 is not None
+        assert decision1.action == "create"
+        assert decision2 is not None
+
+        # Exactly one WARNING from the blocklist module (not repeated on second call)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 1, (
+            f"Expected exactly 1 blocklist WARNING on first call only, got {len(blocklist_warns)}"
+        )
+
+    async def test_malformed_yaml_one_warning_then_silent(self, tmp_path, caplog):
+        """(c) Malformed YAML → curate() proceeds, exactly one WARNING on first call."""
+        import logging
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("{{not: valid: yaml", encoding="utf-8")
+
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=str(bad_yaml))
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
+            decision2 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision1 is not None
+        assert decision1.action == "create"
+        assert decision2 is not None
+
+        # Exactly one WARNING from the blocklist module (not repeated)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 1, (
+            f"Expected exactly 1 blocklist WARNING, got {len(blocklist_warns)}"
+        )
+
+    async def test_empty_yaml_no_warning(self, tmp_path, caplog):
+        """(d) Valid YAML with zero entries → curate() proceeds with NO WARNING."""
+        import logging
+
+        import yaml
+
+        empty_yaml = tmp_path / "empty.yaml"
+        empty_yaml.write_text(yaml.dump([]), encoding="utf-8")
+
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=str(empty_yaml))
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision is not None
+        assert decision.action == "create"
+        # No WARNING (empty file is a valid config — not a misconfiguration)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
+
+
+# step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistPinsFixCRegression:
+    """Regression-pin: the SHIPPED blocklist catches the 1376/1432 hallucination."""
+
+    # Path to the shipped YAML, resolved relative to this test file.
+    BLOCKLIST_PATH = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "config"
+        / "cancelled_premise_blocklist.yaml"
+    )
+    ENTRY_NAME = "fixc_flag_marker_search_then_delete"
+
+    def _load(self):
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+        entries = load_blocklist(self.BLOCKLIST_PATH)
+        assert entries, f"Shipped blocklist is empty — path: {self.BLOCKLIST_PATH}"
+        return entries
+
+    def test_fixture_1_task1376_style_matches(self):
+        """Task-1376-style title + fixc_flags_deleted_not_found in description → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion in task_knowledge_sync.py: search-then-delete",
+            description=(
+                "The metric fixc_flags_deleted_not_found shows that delete-by-id fails "
+                "when the id is not in the store. Rework to search-then-delete."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for task-1376-style fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_fixture_2_task1432_style_with_stage1_marker_matches(self):
+        """Task-1432-style title + stage1_flag_marker in description → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="FIX C: convert flag-marker search-then-delete in knowledge sync",
+            description=(
+                "The stage1_flag_marker source entries accumulate without cleanup. "
+                "Switch from delete-by-id to a search-then-delete pattern."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for task-1432-style fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_fixture_3_paraphrased_title_matches(self):
+        """Paraphrased title variant + any description substring → match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        candidate = CandidateTask(
+            title="Refactor FIX C stale-flag deletion from delete-by-id to search-then-delete",
+            description=(
+                "The fixc_flags_deleted_not_found counter reveals delete-by-recorded-id "
+                "misses entries added after the marker was created."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is not None, (
+            f"Expected blocklist hit for paraphrased fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert hit.name == self.ENTRY_NAME
+
+    def test_control_unrelated_fixc_task_does_not_match(self):
+        """Control: a legitimate FIX C task without the fictional premise → no match."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+        entries = self._load()
+
+        # This touches FIX C but doesn't mention search-then-delete or fictional metrics
+        candidate = CandidateTask(
+            title="Improve FIX C relay-flag logging granularity",
+            description=(
+                "Add structured log fields to the FIX C relay-flag sweep so operators "
+                "can trace which flags were cleaned up in each reconciliation cycle."
+            ),
+        )
+        hit = match_candidate(candidate, entries)
+        assert hit is None, (
+            f"Control fixture should NOT match blocklist, but hit: {hit}"
+        )

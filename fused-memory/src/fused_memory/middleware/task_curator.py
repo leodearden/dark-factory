@@ -463,6 +463,10 @@ class TaskCurator:
         # Catches the common "two triages race to create identical tasks"
         # case cheaply — skips embedding + LLM entirely on the second call.
         self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
+        # Cancelled-premise blocklist — lazy-loaded on first curate() call.
+        # None means "not yet attempted"; [] means "loaded but empty or failed".
+        self._blocklist: list | None = None
+        self._blocklist_load_attempted: bool = False
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -655,6 +659,72 @@ class TaskCurator:
         bucket = self._recent_creates.setdefault(project_id, {})
         bucket[self._normalize_key(candidate)] = (task_id, time.monotonic())
 
+    async def _maybe_blocklist_drop(
+        self, candidate: CandidateTask, payload_hash: str,
+    ) -> CuratorDecision | None:
+        """Return a drop decision if the candidate matches the cancelled-premise blocklist.
+
+        Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
+        on the first call and caches it for the lifetime of this :class:`TaskCurator`
+        instance (no hot-reload; a server restart is required to pick up YAML changes).
+
+        Returns ``None`` when:
+        - The blocklist path is not configured (``None``).
+        - The blocklist file is missing, unreadable, or unparseable (one WARNING logged).
+        - The blocklist is empty.
+        - No entry matches the candidate.
+
+        Never raises.
+        """
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            load_blocklist,
+            match_candidate,
+        )
+
+        cfg_path = self._config.curator.cancelled_premise_blocklist_path
+        if cfg_path is None:
+            return None
+
+        # Lazy load — run at most once per TaskCurator instance.
+        if not self._blocklist_load_attempted:
+            self._blocklist_load_attempted = True
+            raw_path = Path(cfg_path)
+            if not raw_path.is_absolute():
+                if self._cwd is not None:
+                    raw_path = self._cwd / raw_path
+                else:
+                    logger.warning(
+                        'task_curator: cancelled_premise_blocklist_path %r is relative but '
+                        'TaskCurator was constructed without cwd — resolving against process '
+                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
+                        cfg_path,
+                    )
+            self._blocklist = load_blocklist(raw_path)
+
+        entries = self._blocklist
+        if not entries:
+            return None
+
+        entry = match_candidate(candidate, entries)
+        if entry is None:
+            return None
+
+        decision = CuratorDecision(
+            action='drop',
+            target_id=None,
+            target_fingerprint=None,
+            rewritten_task=None,
+            justification=f'cancelled-premise-blocklist: {entry.name}: {entry.reason}',
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            latency_ms=0,
+        )
+        self._store_cache(payload_hash, decision)
+        logger.info(
+            'task_curator: blocklist drop entry=%s candidate=%r',
+            entry.name, candidate.title,
+        )
+        return decision
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -668,6 +738,13 @@ class TaskCurator:
         """
         start = time.monotonic()
         payload_hash = candidate.payload_hash()
+
+        # Cancelled-premise blocklist short-circuit — runs BEFORE exact-match and
+        # LLM so blocklist hits skip embedding + corpus assembly cost entirely.
+        # Stores result in the idempotency cache so identical retries don't reload YAML.
+        blocklist_decision = await self._maybe_blocklist_drop(candidate, payload_hash)
+        if blocklist_decision is not None:
+            return blocklist_decision
 
         # Pre-LLM exact-match short-circuit comes FIRST. The payload_hash
         # idempotency cache below can only return drop/combine safely — a
@@ -895,12 +972,30 @@ class TaskCurator:
                 unique_indices.append(i)
         # ── End pre-batch dedup ────────────────────────────────────────────────
 
+        # ── Cancelled-premise blocklist check ─────────────────────────────────
+        # For each unique candidate, check the operator-curated blocklist BEFORE
+        # corpus assembly or any LLM call.  Blocklist hits are dropped
+        # deterministically and their decisions stored in the idempotency cache
+        # so identical retries short-circuit without re-loading the YAML.
+        blocklist_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
+        non_blocklist_unique: list[int] = []
+        for i in unique_indices:
+            bl_decision = await self._maybe_blocklist_drop(
+                candidates[i], candidates[i].payload_hash(),
+            )
+            if bl_decision is not None:
+                blocklist_decisions[i] = bl_decision
+            else:
+                non_blocklist_unique.append(i)
+        unique_indices = non_blocklist_unique
+        # ── End blocklist check ───────────────────────────────────────────────
+
         # ── Decision cache check ───────────────────────────────────────────────
-        # Consult the idempotency cache for each unique candidate before issuing
-        # an LLM call.  Under steady-state load (the same candidates repeat),
-        # cache-hit items are resolved without an LLM round-trip.
-        # `llm_k_list` holds positions *within unique_indices* (k values) for
-        # candidates that were NOT in the cache.
+        # Consult the idempotency cache for each unique (non-blocklist) candidate
+        # before issuing an LLM call.  Under steady-state load (the same
+        # candidates repeat), cache-hit items are resolved without an LLM
+        # round-trip.  `llm_k_list` holds positions *within unique_indices*
+        # (k values) for candidates that were NOT in the cache.
         llm_k_list: list[int] = []
         cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
         for k, original_i in enumerate(unique_indices):
@@ -976,7 +1071,11 @@ class TaskCurator:
         }
 
         decisions = [
-            pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
+            pre_dedup_decisions[i]
+            if i in pre_dedup_decisions
+            else blocklist_decisions[i]
+            if i in blocklist_decisions
+            else unique_decision_map[i]
             for i in range(len(candidates))
         ]
 
