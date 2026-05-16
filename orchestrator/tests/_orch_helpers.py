@@ -92,8 +92,6 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     # OrchestratorConfig.overrides_db_path) — exclude properties inherited
     # from BaseModel (model_extra, model_fields_set, __fields_set__) so the
     # existing "BaseModel API is not exposed" invariant is preserved.
-    # _BASEMODEL_PROPS is computed once at module scope (constant for the process
-    # lifetime); see the module-level constant above.
     for name, _ in inspect.getmembers(model, lambda v: isinstance(v, property)):
         if name in _BASEMODEL_PROPS:
             continue
@@ -105,8 +103,6 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     # between BaseModel and the target model) are also included.  This is
     # intentional: spec_set should permit access to any non-BaseModel callable
     # the real object exposes, including helpers inherited from mixins.
-    # _BASEMODEL_ATTRS is computed once at module scope (constant for the process
-    # lifetime); see the module-level constant above.
     for name, _ in inspect.getmembers(model, callable):
         if name.startswith('_'):
             continue
