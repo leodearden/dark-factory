@@ -26,7 +26,8 @@ class TestTerminateProcessGroup:
         Spawn bash with start_new_session=True so it leads its own process
         group. After terminate_process_group returns:
         - proc.returncode must be set (process reaped)
-        - os.killpg(pgid, 0) must raise ProcessLookupError (group gone)
+        - os.killpg(pgid, 0) must eventually raise ProcessLookupError once
+          the kernel reaps any reparented grandchild zombies (bounded 5 s poll)
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 30',
@@ -41,8 +42,31 @@ class TestTerminateProcessGroup:
         assert proc.returncode is not None, (
             f'Process group {pgid} not reaped: proc.returncode is None'
         )
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+        # Poll: after terminate_process_group reaps the bash leader, the grandchild
+        # `sleep` is reparented to the user's systemd --user subreaper and becomes
+        # a zombie until the subreaper waitpids it. Until that happens, the pgid
+        # still has a member and os.killpg(pgid, 0) returns 0 rather than raising
+        # ProcessLookupError. Observed subreaper latency is 0-500 ms in isolation
+        # but stretches under 32-worker xdist load. 5 s is comfortably longer than
+        # any observed reap latency; a genuine leak (regression) falls through and
+        # the assert fires.
+        #
+        # PermissionError (EPERM): in the theoretically possible case where the
+        # kernel recycles pgid to a process owned by another user during the poll
+        # window, os.killpg(pgid, 0) raises EPERM rather than ESRCH. Both mean
+        # "no longer our group to worry about".
+        group_gone = False
+        for _ in range(50):  # 50 × 0.1 s = 5 s budget
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                group_gone = True
+                break
+            await asyncio.sleep(0.1)
+        assert group_gone, (
+            f'Process group {pgid} was not fully reaped within 5 s — '
+            f'kernel zombie-reap race or genuine leak.'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
