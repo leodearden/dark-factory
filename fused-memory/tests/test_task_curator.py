@@ -2774,3 +2774,42 @@ class TestCancelledPremiseBlocklistMatcher:
         result = match_candidate(candidate, [entry])
         assert result is not None
         assert result.name == "fixc_flag_marker_search_then_delete"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-5 RED: TestCuratorConfigBlocklistPath
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorConfigBlocklistPath:
+    """Tests that CuratorConfig has cancelled_premise_blocklist_path field
+    and that FusedMemoryConfig round-trips it via YAML.
+    """
+
+    def test_curator_config_has_field_default_none(self):
+        """CuratorConfig has cancelled_premise_blocklist_path field, default None."""
+        cfg = CuratorConfig()
+        assert hasattr(cfg, "cancelled_premise_blocklist_path")
+        assert cfg.cancelled_premise_blocklist_path is None
+
+    def test_curator_config_accepts_string_path(self):
+        """CuratorConfig accepts a string path for cancelled_premise_blocklist_path."""
+        cfg = CuratorConfig(cancelled_premise_blocklist_path="/tmp/blocklist.yaml")
+        assert cfg.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
+
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path):
+        """FusedMemoryConfig round-trips cancelled_premise_blocklist_path via YAML."""
+        import yaml
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        raw = {"curator": {"cancelled_premise_blocklist_path": "/tmp/blocklist.yaml"}}
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+        cfg = FusedMemoryConfig.from_yaml(str(yaml_path))
+        assert cfg.curator.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
+
+    def test_curator_config_none_value_explicit(self):
+        """Explicitly passing None is accepted."""
+        cfg = CuratorConfig(cancelled_premise_blocklist_path=None)
+        assert cfg.cancelled_premise_blocklist_path is None
