@@ -857,7 +857,7 @@ class TestCompletionJudge:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestVerifyDebugfixLoop:
     """Verification fails, debugger fixes, re-verify passes."""
 
@@ -1741,7 +1741,7 @@ def _make_resolve_then_dismiss_chained_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
 
@@ -2034,7 +2034,7 @@ class TestCorruptedIterationLogEscalation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestDoneIsTerminal:
     """_mark_blocked must be a no-op when workflow.state is already DONE."""
 
@@ -2101,7 +2101,7 @@ class TestDoneIsTerminal:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestReviewerErrors:
     """Reviewer failures are detected, retried, and escalated."""
 
@@ -2385,7 +2385,7 @@ class TestGhostLoopGuard:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestWipRecoveryNoAdvance:
     """wip_recovery_no_advance outcome creates L1 wip_conflict escalation and returns BLOCKED."""
 
@@ -2535,7 +2535,7 @@ class StringPrereqsArchitectStub(AgentStub):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestPrerequisitesValidation:
     """Workflow blocks with descriptive error when architect writes string prerequisites."""
 
@@ -2582,7 +2582,7 @@ class TestPrerequisitesValidation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedFalseDoneGuard:
     """_mark_blocked's requeue-on-steward-resolution contract.
 
@@ -4188,7 +4188,7 @@ class TestFileStructureInvariants:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestPlanDoneEarlyReturn:
     """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
 
@@ -4285,7 +4285,7 @@ def _make_l1_escalating_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedPreservesStewardStatus:
     """Regression: _mark_blocked must not overwrite steward-set deferred/blocked.
 
@@ -4371,7 +4371,7 @@ class TestMarkBlockedPreservesStewardStatus:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedRespectsOpenL1:
     """Regression: _mark_blocked must not auto-requeue when L1 is open.
 
@@ -4710,7 +4710,7 @@ class TestStaleL1DoesNotSinkRun:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
 
@@ -4771,7 +4771,7 @@ class TestAllAccountsCappedExceptionBoundary:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedEscalationLevel:
     """Verify AllAccountsCappedException creates an L0 (not L1) with
     suggested_action='cap_wait_exceeded_sanity_bound'.
@@ -4837,7 +4837,7 @@ class TestAllAccountsCappedEscalationLevel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestSessionBudgetExhaustionEscalation:
     """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
 
@@ -4957,7 +4957,7 @@ class TestSessionBudgetExhaustionEscalation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestFirstInvocationBudgetExhaustion:
     """When SessionBudgetExhausted fires before any role completes, the escalation
     uses the 'last_completed_role' label and resolves to 'n/a' (None fallback).
@@ -5055,7 +5055,7 @@ def _make_done_setting_steward(
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedPhantomDone:
     """Regression: steward marking task done out-of-band must return DONE.
 
@@ -5099,7 +5099,7 @@ class TestMarkBlockedPhantomDone:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('_patch_dry_run_unblock')
+@pytest.mark.mocks_dry_run_unblock
 class TestMarkBlockedBypassDetection:
     """Detect ``update_task(status='done')`` bypass when set_task_status('blocked') is rejected.
 
