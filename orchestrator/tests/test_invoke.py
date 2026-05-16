@@ -9,6 +9,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.usage_gate import InvokeSlot, UsageGate
 
@@ -81,9 +82,6 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     slot.confirm = MagicMock()
     slot.settle = MagicMock()
     return slot
-
-
-from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 
 
 def _make_gate_yielding(slots, *, active_account_name=None):

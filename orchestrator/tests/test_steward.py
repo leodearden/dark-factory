@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
-from shared.usage_gate import InvokeSlot, UsageGate
+from shared.usage_gate import InvokeSlot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.steward import (
@@ -193,9 +193,6 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     slot.confirm = MagicMock()
     slot.settle = MagicMock()
     return slot
-
-
-from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 
 
 def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
