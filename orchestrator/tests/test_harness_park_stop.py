@@ -419,8 +419,9 @@ class TestHarnessCostCeiling:
             f'Expected 200.0; got {config.orch_daily_cost_ceiling_usd!r}'
         )
 
-    def test_config_overridable(self, tmp_path: Path) -> None:
+    def test_config_overridable(self, monkeypatch, tmp_path: Path) -> None:
         """Both ceiling fields accept custom values."""
+        monkeypatch.chdir(tmp_path)
         config = OrchestratorConfig(
             project_root=tmp_path,
             watcher_daily_cost_ceiling_usd=7.0,
