@@ -424,7 +424,7 @@ class TestRealPromptPassedToCliInvokeOnResume:
     """
 
     async def test_invoke_passes_real_prompt_when_resuming_via_sidecar(
-        self, config, git_ops, task_assignment, tmp_path,
+        self, config, git_ops, task_assignment,
     ):
         """_invoke forwards the real task prompt to invoke_with_cap_retry alongside resume_session_id."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)

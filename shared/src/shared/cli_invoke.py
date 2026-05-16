@@ -423,6 +423,13 @@ async def invoke_with_cap_retry(
     # existing non-cap-hit resume-failure branch (below) then correctly restores
     # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
     if invoke_kwargs.get('resume_session_id'):
+        if not original_prompt:
+            raise TypeError(
+                "invoke_with_cap_retry: 'prompt' must be a non-empty string when "
+                "'resume_session_id' is set.  The prompt is the real task context used "
+                "for fresh-fallback recovery if the resume invocation fails; passing an "
+                "empty or missing prompt silently corrupts that fallback."
+            )
         invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
@@ -470,7 +477,13 @@ async def invoke_with_cap_retry(
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
 
-    # Fast path: no usage gate → single invocation, no cap retry
+    # Fast path: no usage gate → single invocation, no cap retry.
+    # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
+    # this fast path will attempt the resume but cannot fall back to a fresh
+    # invocation on failure — the non-cap-hit resume→fresh-fallback branch in
+    # the while-loop below only runs when usage_gate is provided.  In practice
+    # the orchestrator always supplies a gate, but callers without one should be
+    # aware that a failed resume returns the failure result directly.
     if not usage_gate:
         started_at = datetime.now(UTC).isoformat()
         result = await invoke(
