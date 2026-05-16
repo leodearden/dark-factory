@@ -3496,22 +3496,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
             )
-            self.escalation_queue.submit(esc)
-            if self.merge_worker is not None:
-                self.merge_worker.set_halt_owner(esc.id)
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.escalation_created,
-                    task_id=self.task_id, phase=self.state.value,
-                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
-                          'severity': 'blocking', 'summary': esc.summary[:200]},
-                )
-
-            # Wait for human resolution before returning DONE
-            if self._escalation_event is None:
-                self._escalation_event = asyncio.Event()
-            self._escalation_event.clear()
-            await self._escalation_event.wait()
+            await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
 
         return WorkflowOutcome.DONE
