@@ -3737,12 +3737,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
-        # via --resume <uuid> with a "continue" prompt.  Otherwise, allocate
-        # a fresh UUID up-front via --session-id so a future restart can
-        # find and resume this session.  The sidecar is written before the
+        # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
+        # allocate a fresh UUID up-front via --session-id so a future restart
+        # can find and resume this session.  The sidecar is written before the
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
-        invoke_prompt = prompt
+        #
+        # Prompt-substitution ownership: cli_invoke owns the resume-continuation
+        # prompt swap (CRASH_RECOVERY_RESUME_PROMPT = 'continue').  Workflow
+        # always passes the real task prompt so that cli_invoke's
+        # original_prompt capture is correct for any fresh-fallback invocation.
         resume_session_id: str | None = None
         if (
             self._pending_resume_session_id
@@ -3750,7 +3754,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ):
             session_id_val = self._pending_resume_session_id
             resume_session_id = session_id_val
-            invoke_prompt = 'continue'
             self._pending_resume_session_id = None
             self._pending_resume_role = None
             logger.info(
@@ -3772,7 +3775,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 label=f'Task {self.task_id} [{role.name}]',
                 config_dir=self._config_dir,
                 invoke_fn=invoke_agent,
-                prompt=invoke_prompt,
+                prompt=prompt,
                 system_prompt=role.system_prompt,
                 cwd=cwd,
                 model=model,
