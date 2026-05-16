@@ -120,11 +120,51 @@ class OverrideStore:
         """
         return cls(config.overrides_db_path)
 
+    def _connect(
+        self,
+        *,
+        timeout: float | None = None,
+        isolation_level: str | None | object = _UNSET,
+    ) -> sqlite3.Connection:
+        """Open a connection with the full pragma triad applied.
+
+        The default path (no kwargs) is used by all read-path methods and
+        write-path methods that use sqlite3's default isolation_level.
+
+        The autocommit path (``isolation_level=None, timeout=30``) is used
+        exclusively by ``set_override`` to support the ``BEGIN IMMEDIATE``
+        explicit-transaction pattern — see the docstring on that method for
+        the rationale.  Pragmas are applied before returning regardless of
+        the isolation mode; they are not transactional.
+        """
+        kwargs: dict[str, object] = {}
+        if timeout is not None:
+            kwargs['timeout'] = timeout
+        if isolation_level is not _UNSET:
+            kwargs['isolation_level'] = isolation_level
+        conn = sqlite3.connect(str(self.db_path), **kwargs)
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
     def _ensure_schema(self) -> None:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
-            conn.execute('PRAGMA journal_mode=WAL')
             conn.executescript(_SCHEMA)
+        finally:
+            conn.close()
+
+    def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
+
+        Best-effort: callers (e.g. harness shutdown) should wrap this in
+        ``try/except`` so a failure cannot block clean shutdown.
+        """
+        conn = self._connect()
+        try:
+            busy, log, checkpointed = conn.execute(
+                'PRAGMA wal_checkpoint(TRUNCATE)'
+            ).fetchone()
+            return CheckpointResult(busy=busy, log=log, checkpointed=checkpointed)
         finally:
             conn.close()
 
@@ -199,7 +239,7 @@ class OverrideStore:
         # deferred-mode auto-begin.  This makes the pattern safe even if future
         # edits add DML before BEGIN IMMEDIATE (which would silently break with
         # the default isolation_level on Python <3.12).
-        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
+        conn = self._connect(timeout=30, isolation_level=None)
         try:
             # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
             # read and the subsequent UPSERT are serialized with respect to
@@ -307,7 +347,7 @@ class OverrideStore:
         """
         _VALID_FIELDS = {'boost_tier', 'pinned', 'reserve_now', 'ttl'}
         now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             if field is None:
                 cur = conn.execute(
@@ -380,7 +420,7 @@ class OverrideStore:
             )
 
         now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             # Wrap in a single transaction so a mid-loop failure (interrupt,
             # OS error, SQLite lock contention) rolls back all updates atomically.
@@ -413,7 +453,7 @@ class OverrideStore:
             return []
 
         placeholders = ','.join('?' * len(terminal_task_ids))
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 f'DELETE FROM overrides '
@@ -444,7 +484,7 @@ class OverrideStore:
         if now is None:
             now = datetime.now(UTC)
 
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'DELETE FROM overrides '
@@ -467,7 +507,7 @@ class OverrideStore:
 
     def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
         """Return all override rows for *project_root*, keyed by task_id."""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
@@ -490,7 +530,7 @@ class OverrideStore:
         Returns a list of ``(task_id, OverrideRow)`` tuples filtered to
         ``pinned=1`` and ordered by ``pin_order ASC``.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
