@@ -87,9 +87,15 @@ CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
 )
+# Prompt sent to a session that the orchestrator is resuming after a crash.
+# Kept separate from CAP_HIT_RESUME_PROMPT because the cause differs
+# (orchestrator restart, not a usage-cap interrupt) and the agent message
+# should stay a plain "continue" rather than mentioning usage limits.
+CRASH_RECOVERY_RESUME_PROMPT = 'continue'
 
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
+    'CRASH_RECOVERY_RESUME_PROMPT',
     'AgentFailureClass',
     'AgentFailureKind',
     'AgentResult',
@@ -409,6 +415,15 @@ async def invoke_with_cap_retry(
     """
     model = invoke_kwargs.get('model', 'opus')
     original_prompt = invoke_kwargs.get('prompt', '')
+    # Caller-initiated resume contract: when the caller pre-sets resume_session_id
+    # (e.g. orchestrator crash recovery), they pass the real task prompt as `prompt`
+    # so that `original_prompt` captures it for fresh-fallback restoration.  We
+    # immediately overwrite `invoke_kwargs['prompt']` with CRASH_RECOVERY_RESUME_PROMPT
+    # so the first subprocess invocation uses the short continuation string.  The
+    # existing non-cap-hit resume-failure branch (below) then correctly restores
+    # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
+    if invoke_kwargs.get('resume_session_id'):
+        invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
