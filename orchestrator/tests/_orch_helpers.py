@@ -144,6 +144,16 @@ _GATE_PROPERTY_DEFAULTS: dict[str, object] = {
     'project_id': None,
     'run_id': None,
 }
+# Guard: catch stale keys in _GATE_PROPERTY_DEFAULTS (e.g. renamed @property).
+# Runs at import time so a typo or post-rename ghost key surfaces immediately.
+_GATE_VALID_PROPS: frozenset[str] = frozenset(
+    n for n, _ in inspect.getmembers(UsageGate, lambda v: isinstance(v, property))
+)
+assert set(_GATE_PROPERTY_DEFAULTS) <= _GATE_VALID_PROPS, (
+    f'_GATE_PROPERTY_DEFAULTS contains keys that are not UsageGate @properties: '
+    f'{set(_GATE_PROPERTY_DEFAULTS) - _GATE_VALID_PROPS!r}. '
+    'Remove the stale entries from the dict.'
+)
 
 
 def make_mock_gate(**overrides) -> MagicMock:
@@ -190,8 +200,53 @@ def make_mock_gate(**overrides) -> MagicMock:
     gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
     gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
     gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
+    gate.detect_cap_hit = overrides.pop('detect_cap_hit', MagicMock(return_value=False))
     for k, v in overrides.items():
         setattr(gate, k, v)
+    return gate
+
+
+def make_gate_yielding(slots, *, active_account_name=None) -> MagicMock:
+    """Build a mock UsageGate whose successive invoke_slot() calls yield *slots* in order.
+
+    Each element of *slots* is returned by ``gate.invoke_slot().__aenter__``, so
+    production code that does ``async with gate.invoke_slot() as slot:`` gets a
+    real slot object with a controlled ``detect_cap_hit`` on each iteration of the
+    cap-retry while-loop.
+
+    Without this helper, ``gate = MagicMock()`` yields an unconstrained slot whose
+    ``detect_cap_hit`` returns a truthy coroutine — production's ``while`` loop
+    never exits and the test hangs until pytest-timeout fires.
+
+    Always routes through ``make_mock_gate`` so the gate carries the full property
+    default surface (guards against bare-MagicMock drift).
+
+    Imported into ``orchestrator/tests/test_invoke.py`` and
+    ``orchestrator/tests/test_steward.py`` as ``_make_gate_yielding`` via::
+
+        from _orch_helpers import make_gate_yielding as _make_gate_yielding
+
+    Sister helper: ``shared/tests/test_cap_retry.py::_mock_gate`` — cannot be
+    unified here due to package layering (shared cannot import from orchestrator).
+    """
+    slot_iter = iter(slots)
+
+    def _new_cm(*args, **kwargs):
+        slot = next(slot_iter)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=slot)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    gate = make_mock_gate(
+        account_count=len(slots),
+        active_account_name=(
+            active_account_name if active_account_name is not None
+            else slots[0].account_name
+        ),
+        before_invoke=AsyncMock(return_value=slots[0].token),
+    )
+    gate.invoke_slot = MagicMock(side_effect=_new_cm)
     return gate
 
 

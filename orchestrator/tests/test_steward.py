@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
@@ -221,33 +222,6 @@ def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
         ),
     )
     return _attach_invoke_slot(gate)
-
-
-def _make_gate_yielding(slots):
-    """Build a mock UsageGate whose successive invoke_slot() calls yield the
-    given slots in order (one per iteration of the while-loop in production).
-
-    The key subtlety this helper hides: production code reads slot.detect_cap_hit
-    (not gate.detect_cap_hit), and slot comes from entering the async context
-    manager returned by gate.invoke_slot(). Without wiring __aenter__ to return
-    the slot, a naive `gate = MagicMock()` yields an unconstrained slot whose
-    detect_cap_hit always returns truthy — infinite loop.
-    """
-    slot_iter = iter(slots)
-
-    def _new_cm(*args, **kwargs):
-        slot = next(slot_iter)
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(return_value=slot)
-        cm.__aexit__ = AsyncMock(return_value=False)
-        return cm
-
-    gate = _make_gate(
-        active_account_name=slots[0].account_name,
-        before_invoke=AsyncMock(return_value=slots[0].token),
-    )
-    gate.invoke_slot = MagicMock(side_effect=_new_cm)
-    return gate
 
 
 # ---------------------------------------------------------------------------

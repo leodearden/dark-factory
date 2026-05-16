@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
-from shared.usage_gate import InvokeSlot, UsageGate
+from shared.usage_gate import InvokeSlot
 
 from orchestrator.agents.invoke import (
     _invoke_claude_with_sandbox,
@@ -82,34 +82,6 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     slot.confirm = MagicMock()
     slot.settle = MagicMock()
     return slot
-
-
-def _make_gate_yielding(slots, *, active_account_name=None):
-    """UsageGate mock whose successive invoke_slot() calls yield the given slots.
-
-    Without this helper, `gate = MagicMock()` yields an unconstrained slot whose
-    detect_cap_hit returns a truthy coroutine — production's `while` loop never
-    exits and the test hangs until pytest-timeout fires.
-    """
-    slot_iter = iter(slots)
-
-    def _new_cm(*args, **kwargs):
-        slot = next(slot_iter)
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(return_value=slot)
-        cm.__aexit__ = AsyncMock(return_value=False)
-        return cm
-
-    gate = _make_gate(
-        account_count=len(slots),
-        active_account_name=(
-            active_account_name if active_account_name is not None
-            else slots[0].account_name
-        ),
-        before_invoke=AsyncMock(return_value=slots[0].token),
-    )
-    gate.invoke_slot = MagicMock(side_effect=_new_cm)
-    return gate
 
 
 @pytest.mark.asyncio
@@ -566,24 +538,36 @@ class TestMakeGateFactory:
     """
 
     def test_make_gate_covers_usage_gate_public_property_surface(self):
-        """_make_gate() sets every @property that UsageGate exposes.
+        """_make_gate() sets a default for every known UsageGate @property.
 
-        Drives defaults from inspect so future @property additions to UsageGate
-        are caught here automatically (no manual update required).  Regression
-        for the 122-error cascade (tasks 1313/1339) where soonest_resets_at was
-        missed at construction sites.
+        Uses a hardcoded checklist so that adding a new @property to UsageGate
+        without also updating ``_GATE_PROPERTY_DEFAULTS`` in ``_orch_helpers.py``
+        causes a genuine test failure (a self-referential inspect call cannot catch
+        this — it passes by construction).  Regression for the 122-error cascade
+        (tasks 1313/1339) where soonest_resets_at was missed at construction sites.
+
+        When UsageGate gains a new @property, update the set below AND
+        ``_GATE_PROPERTY_DEFAULTS`` in ``orchestrator/tests/_orch_helpers.py``.
         """
-        usage_gate_props = {
-            name
-            for name, val in inspect.getmembers(UsageGate, lambda v: isinstance(v, property))
+        expected_props = {
+            'account_count',
+            'active_account_name',
+            'cumulative_cost',
+            'is_paused',
+            'paused_reason',
+            'project_id',
+            'run_id',
+            'soonest_resets_at',
+            'total_pause_secs',
         }
         gate = _make_gate()
         assert isinstance(gate, MagicMock)
         gate_vars = vars(gate)
-        missing = usage_gate_props - gate_vars.keys()
+        missing = expected_props - gate_vars.keys()
         assert not missing, (
             f'_make_gate() is missing defaults for UsageGate @property members: {missing!r}. '
-            'Add them to _make_gate so every construction site stays in sync.'
+            'Add them to _GATE_PROPERTY_DEFAULTS in _orch_helpers.py so every '
+            'construction site stays in sync.'
         )
 
     def test_make_gate_override_and_passthrough(self):
@@ -610,12 +594,3 @@ class TestMakeGateFactory:
             f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
         )
 
-    def test_make_mock_gate_is_centralized(self):
-        """_make_gate is the centralized make_mock_gate imported from _orch_helpers.
-
-        Asserts identity: the local `_make_gate` name must be the same object as
-        `_orch_helpers.make_mock_gate`.  Fails with ImportError until step-6 moves
-        the body into _orch_helpers and replaces the local definition with an alias.
-        """
-        from _orch_helpers import make_mock_gate
-        assert _make_gate is make_mock_gate
