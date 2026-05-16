@@ -3008,3 +3008,159 @@ class TestCuratorBatchBlocklistShortCircuit:
         assert decisions[1].justification == "new-1"
         assert decisions[2].action == "create"
         assert decisions[2].justification == "new-2"
+
+
+# step-11 RED: TestCuratorBlocklistDisabledOrMissing
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_create_mocks():
+    """Return (fake_exact_match, fake_corpus, fake_llm_result) for a pass-through curate."""
+    import logging
+
+    async def fake_exact_match(*a, **k):
+        return None
+
+    async def fake_corpus(*a, **k):
+        return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+
+    create_result = AgentResult(
+        success=True,
+        output="",
+        structured_output={"action": "create", "justification": "genuinely new"},
+    )
+    return fake_exact_match, fake_corpus, create_result
+
+
+@pytest.mark.asyncio
+class TestCuratorBlocklistDisabledOrMissing:
+    """Blocklist degradation: misconfigured or absent blocklist must not block task creation."""
+
+    async def test_path_none_no_warning(self, caplog):
+        """(a) cancelled_premise_blocklist_path=None → curate() proceeds with NO WARNING."""
+        import logging
+
+        config = _make_config()  # default CuratorConfig has path=None
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision is not None
+        assert decision.action == "create"
+        # No WARNING from the blocklist module (path=None is a deliberate opt-out)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 0, f"Expected no blocklist warnings, got: {blocklist_warns}"
+
+    async def test_nonexistent_path_one_warning_then_silent(self, tmp_path, caplog):
+        """(b) Non-existent path → curate() proceeds, exactly one WARNING on first call."""
+        import logging
+
+        nonexistent = str(tmp_path / "does_not_exist.yaml")
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=nonexistent)
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
+            decision2 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision1 is not None
+        assert decision1.action == "create"
+        assert decision2 is not None
+
+        # Exactly one WARNING from the blocklist module (not repeated on second call)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 1, (
+            f"Expected exactly 1 blocklist WARNING on first call only, got {len(blocklist_warns)}"
+        )
+
+    async def test_malformed_yaml_one_warning_then_silent(self, tmp_path, caplog):
+        """(c) Malformed YAML → curate() proceeds, exactly one WARNING on first call."""
+        import logging
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("{{not: valid: yaml", encoding="utf-8")
+
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=str(bad_yaml))
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
+            decision2 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision1 is not None
+        assert decision1.action == "create"
+        assert decision2 is not None
+
+        # Exactly one WARNING from the blocklist module (not repeated)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 1, (
+            f"Expected exactly 1 blocklist WARNING, got {len(blocklist_warns)}"
+        )
+
+    async def test_empty_yaml_no_warning(self, tmp_path, caplog):
+        """(d) Valid YAML with zero entries → curate() proceeds with NO WARNING."""
+        import logging
+        import yaml
+
+        empty_yaml = tmp_path / "empty.yaml"
+        empty_yaml.write_text(yaml.dump([]), encoding="utf-8")
+
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path=str(empty_yaml))
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with caplog.at_level(logging.WARNING, logger="fused_memory.middleware.cancelled_premise_blocklist"), \
+             patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision is not None
+        assert decision.action == "create"
+        # No WARNING (empty file is a valid config — not a misconfiguration)
+        blocklist_warns = [
+            r for r in caplog.records
+            if r.name == "fused_memory.middleware.cancelled_premise_blocklist"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
