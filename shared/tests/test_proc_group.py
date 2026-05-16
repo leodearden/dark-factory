@@ -15,6 +15,38 @@ import pytest
 from shared.proc_group import terminate_process_group
 
 
+async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
+    """Poll until a process group is fully reaped by the kernel.
+
+    After terminate_process_group reaps the bash leader, any grandchild
+    processes are reparented to the user's ``systemd --user`` subreaper
+    (or pid 1) and become zombies until that subreaper waitpids them.
+    Until that happens, ``os.killpg(pgid, 0)`` still returns 0 rather
+    than raising ProcessLookupError.  Observed subreaper latency is
+    0–500 ms in isolation but stretches under 32-worker xdist load.
+    The default 5 s budget is comfortably longer than any observed reap
+    latency; a genuine leak (regression) causes the caller's assert to
+    fire.
+
+    PermissionError (EPERM): in the theoretically possible (though
+    practically negligible) case where the kernel recycles *pgid* to a
+    process owned by another user during the poll window,
+    ``os.killpg(pgid, 0)`` raises EPERM rather than ESRCH.  Both mean
+    "no longer our group to worry about", so EPERM is treated as success.
+    This cannot mask a genuine leak: EPERM only fires once the pgid has
+    been assigned to a different user's process, at which point the group
+    we spawned is definitively gone.
+    """
+    iterations = max(1, int(timeout / step))
+    for _ in range(iterations):
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
@@ -26,7 +58,8 @@ class TestTerminateProcessGroup:
         Spawn bash with start_new_session=True so it leads its own process
         group. After terminate_process_group returns:
         - proc.returncode must be set (process reaped)
-        - os.killpg(pgid, 0) must raise ProcessLookupError (group gone)
+        - os.killpg(pgid, 0) must eventually raise ProcessLookupError once
+          the kernel reaps any reparented grandchild zombies (bounded 5 s poll)
         """
         proc = await asyncio.create_subprocess_shell(
             'sleep 30',
@@ -41,8 +74,10 @@ class TestTerminateProcessGroup:
         assert proc.returncode is not None, (
             f'Process group {pgid} not reaped: proc.returncode is None'
         )
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+        assert await _pgid_gone_within(pgid), (
+            f'Process group {pgid} was not fully reaped within 5 s — '
+            f'kernel zombie-reap race or genuine leak.'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -96,30 +131,7 @@ class TestTerminateProcessGroup:
 
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
-        # Poll: terminate_process_group's contract is best-effort — it
-        # signals the group and waits for the *leader* (bash) to be reaped
-        # via proc.wait(), but does NOT explicitly waitpid grandchildren.
-        # When bash exits, the OS reparents its background sleeps to the
-        # user's systemd --user subreaper (or pid 1), which reaps them on
-        # its own schedule — a non-deterministic 0–500 ms window.  5 s is
-        # comfortably longer than any observed subreaper latency on Linux;
-        # if the group genuinely leaks (regression), the loop falls through
-        # and the assert fires.
-        #
-        # We also catch PermissionError (EPERM): in the theoretically
-        # possible (though practically negligible) case where the kernel
-        # recycles pgid to a process owned by another user during the poll
-        # window, os.killpg(pgid, 0) raises EPERM rather than ESRCH.  Both
-        # mean "no longer our group to worry about".
-        group_gone = False
-        for _ in range(50):  # 50 × 0.1 s = 5 s budget
-            try:
-                os.killpg(pgid, 0)
-            except (ProcessLookupError, PermissionError):
-                group_gone = True
-                break
-            await asyncio.sleep(0.1)
-        assert group_gone, (
+        assert await _pgid_gone_within(pgid), (
             f'Process group {pgid} was not fully reaped within 5 s — '
             f'grandchildren leaked.'
         )
