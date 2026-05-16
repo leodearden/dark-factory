@@ -449,6 +449,20 @@ def test_elapsed_systemctl_not_found_returns_none(monkeypatch: pytest.MonkeyPatc
 # ---------------------------------------------------------------------------
 
 
+def _extract_escalation_port(cfg: object, config_path: pathlib.Path) -> int:
+    """Extract escalation.port from a parsed YAML config with an informative diagnostic.
+
+    Uses .get() chaining (no raw [] indexing) so a schema rename surfaces as an
+    AssertionError naming the offending config file path, not a bare KeyError.
+    """
+    escalation = cfg.get("escalation") if isinstance(cfg, dict) else None
+    port = escalation.get("port") if isinstance(escalation, dict) else None
+    assert port is not None, (
+        f"{config_path}: missing 'escalation.port' (schema may have changed)"
+    )
+    return port
+
+
 def test_extract_escalation_port_happy_path() -> None:
     """_extract_escalation_port returns the int port from a well-formed config dict."""
     cfg = {"escalation": {"port": 8102}}
@@ -501,7 +515,7 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
     # --- dark-factory orchestrator ---
     df_config_path = REPO_ROOT / "orchestrator" / "config.yaml"
     df_cfg = yaml.safe_load(df_config_path.read_text())
-    df_port = df_cfg["escalation"]["port"]
+    df_port = _extract_escalation_port(df_cfg, df_config_path)
     assert unit_to_port["dark-factory-orchestrator.service"] == df_port, (
         f"WATCHED port for dark-factory-orchestrator.service "
         f"({unit_to_port['dark-factory-orchestrator.service']}) != "
@@ -513,7 +527,7 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
     if not reify_config_path.exists():
         pytest.skip("reify orchestrator.yaml not reachable in this environment")
     reify_cfg = yaml.safe_load(reify_config_path.read_text())
-    reify_port = reify_cfg["escalation"]["port"]
+    reify_port = _extract_escalation_port(reify_cfg, reify_config_path)
     assert unit_to_port["reify-orchestrator.service"] == reify_port, (
         f"WATCHED port for reify-orchestrator.service "
         f"({unit_to_port['reify-orchestrator.service']}) != "
