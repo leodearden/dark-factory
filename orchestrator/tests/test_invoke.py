@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
-from shared.usage_gate import InvokeSlot
+from shared.usage_gate import InvokeSlot, UsageGate
 
 from orchestrator.agents.invoke import (
     _invoke_claude_with_sandbox,
@@ -586,24 +587,47 @@ class TestMakeGateFactory:
     so a new attribute addition only requires one edit here.
     """
 
-    def test_make_gate_defaults(self):
-        """_make_gate() returns a MagicMock with all required attribute defaults."""
+    def test_make_gate_covers_usage_gate_public_property_surface(self):
+        """_make_gate() sets every @property that UsageGate exposes.
+
+        Drives defaults from inspect so future @property additions to UsageGate
+        are caught here automatically (no manual update required).  Regression
+        for the 122-error cascade (tasks 1313/1339) where soonest_resets_at was
+        missed at construction sites.
+        """
+        usage_gate_props = {
+            name
+            for name, val in inspect.getmembers(UsageGate, lambda v: isinstance(v, property))
+        }
         gate = _make_gate()
         assert isinstance(gate, MagicMock)
-        assert gate.account_count == 1
-        assert gate.active_account_name == 'acct-a'
-        assert gate.soonest_resets_at is None
+        gate_vars = vars(gate)
+        missing = usage_gate_props - gate_vars.keys()
+        assert not missing, (
+            f'_make_gate() is missing defaults for UsageGate @property members: {missing!r}. '
+            'Add them to _make_gate so every construction site stays in sync.'
+        )
 
     def test_make_gate_override_and_passthrough(self):
         """Named overrides are applied; arbitrary kwargs are set via setattr."""
-        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x')
+        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x',
+                          paused_reason='X')
         assert gate.soonest_resets_at == 123
         assert gate.account_count == 3
         assert gate.custom_attr == 'x'
+        assert gate.paused_reason == 'X'
         # Non-overridden defaults remain
         assert gate.active_account_name == 'acct-a'
 
-    def test_make_gate_yielding_routes_through_factory(self):
-        """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
-        gate = _make_gate_yielding([_make_slot()])
-        assert gate.soonest_resets_at is None
+    def test_make_gate_yielding_propagates_factory_defaults(self):
+        """_make_gate_yielding routes through _make_gate: factory defaults present.
+
+        Every key that make_mock_gate() normally sets must also appear on a gate
+        produced by _make_gate_yielding, proving that _make_gate_yielding uses
+        the factory rather than a bare MagicMock().
+        """
+        factory_keys = set(vars(_make_gate()).keys())
+        yielding_keys = set(vars(_make_gate_yielding([_make_slot()])).keys())
+        assert factory_keys <= yielding_keys, (
+            f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
+        )
