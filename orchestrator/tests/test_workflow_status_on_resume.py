@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _workflow_helpers import (
@@ -33,6 +33,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import (
+    IMPLEMENTER,
     TaskWorkflow,
     WorkflowOutcome,
     WorkflowState,
@@ -402,4 +403,59 @@ class TestStatusPreservationOnResume:
         )
         assert invoke_mock.await_count == 0, (
             'No implementer resume on the already-on-main path.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: workflow passes real prompt (not 'continue') to invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRealPromptPassedToCliInvokeOnResume:
+    """Regression for task 1462: workflow must pass the real task prompt to
+    invoke_with_cap_retry even when resuming via a recovered sidecar session.
+
+    Before the fix, workflow.py:3753 overwrote invoke_prompt = 'continue' and
+    passed that as prompt= to invoke_with_cap_retry.  cli_invoke then captured
+    original_prompt = 'continue', so on fresh-fallback the agent started with
+    zero context.  After the fix, workflow always passes the real prompt and
+    cli_invoke owns the substitution.
+    """
+
+    async def test_invoke_passes_real_prompt_when_resuming_via_sidecar(
+        self, config, git_ops, task_assignment,
+    ):
+        """_invoke forwards the real task prompt to invoke_with_cap_retry alongside resume_session_id."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        cwd = wt_info.path
+
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=None,
+            resume_session_id={'session_id': 'sid-1', 'role': 'implementer'},
+        )
+        # Ensure artifacts is None so write_agent_session is skipped.
+        workflow.artifacts = None
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_cap_retry:
+            await workflow._invoke(IMPLEMENTER, 'REAL TASK PROMPT', cwd)
+
+        assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
+        assert mock_cap_retry.await_args is not None, 'await_args must not be None'
+        call_kwargs = mock_cap_retry.await_args.kwargs
+        assert call_kwargs.get('prompt') == 'REAL TASK PROMPT', (
+            f"Expected prompt='REAL TASK PROMPT' but got {call_kwargs.get('prompt')!r}. "
+            'workflow._invoke must pass the real task prompt, not the continuation string.'
+        )
+        assert call_kwargs.get('resume_session_id') == 'sid-1', (
+            f"Expected resume_session_id='sid-1' but got {call_kwargs.get('resume_session_id')!r}."
         )

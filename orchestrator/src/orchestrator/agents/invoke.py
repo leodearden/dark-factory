@@ -21,6 +21,7 @@ from typing import Any
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
+    CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
     _parse_claude_output,
     _run_subprocess,

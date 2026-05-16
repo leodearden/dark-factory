@@ -8,6 +8,7 @@ from shared.async_sqlite_base import (
 )
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
+    CRASH_RECOVERY_RESUME_PROMPT,
     AgentFailureClass,
     AgentFailureKind,
     AgentResult,
@@ -32,6 +33,7 @@ __all__ = [
     'apply_full_durability_pragmas',
     'apply_full_durability_pragmas_sync',
     'CAP_HIT_RESUME_PROMPT',
+    'CRASH_RECOVERY_RESUME_PROMPT',
     'AgentFailureClass',
     'AgentFailureKind',
     'AgentResult',
