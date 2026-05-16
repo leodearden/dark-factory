@@ -4007,6 +4007,15 @@ class TestRunFullVerificationReuse:
         review-checkpoint path; mid-run subproject additions are excluded until restart or
         an explicit force_rediscover=True call.
         """
+        # Coverage-overlap note:
+        # The call_count == 0, mock_run_verification.call_count == 1, and
+        # called_mc.prefix == 'dashboard' assertions below intentionally mirror
+        # `test_reuses_populated_config_module_configs_when_root_matches` (3768).
+        # That overlap is preserved on purpose: the unique invariant under test
+        # HERE is the trailing `'newmod' not in prefixes` mid-run-staleness lock,
+        # but the duplicated assertions still catch regressions in which the
+        # reuse path itself collapses (e.g. snapshot dropped, fresh walk
+        # reintroduced) — a distinct failure mode from "newmod silently snuck in".
         import yaml
 
         from orchestrator.config import _discover_module_configs as real_discover
