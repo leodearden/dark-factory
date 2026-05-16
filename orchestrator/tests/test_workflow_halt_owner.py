@@ -311,3 +311,56 @@ async def test_handle_unmerged_state_releases_halt_on_cancel(
     assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
         f'step-7: expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 9: submit failure must not register a halt owner
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_submit_failure_does_not_register_halt_owner(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """If escalation_queue.submit() raises, set_halt_owner must never be called.
+
+    The helper orders: submit → set_halt_owner.  A registered owner with no
+    pending escalation cannot be resolved by _on_escalation_resolved, so the
+    halt would be permanent.  This pin ensures submit-first ordering is
+    preserved through any future refactor of _submit_halt_escalation_and_wait.
+
+    The test replaces submit with a function that raises RuntimeError and calls
+    _handle_wip_conflict directly (no asyncio.Task wrapper) — the RuntimeError
+    must propagate and halt_owner_esc_id must remain None.
+
+    This test must pass immediately after step-2 (helper preserves the
+    submit-before-set_halt_owner ordering that gives this property for free).
+    """
+    # Inject a failing submit — no halt_for_wip call needed, we're only testing
+    # that a submit failure cannot corrupt the halt-owner state.
+    original_submit = workflow.escalation_queue.submit
+
+    def _raise_on_submit(esc):
+        raise RuntimeError('disk full')
+
+    workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
+
+    try:
+        with pytest.raises(RuntimeError, match='disk full'):
+            await workflow._handle_wip_conflict(
+                MergeOutcome(status='wip_halted', overlap_files=['x.py']),
+                'task/1448',
+            )
+    finally:
+        workflow.escalation_queue.submit = original_submit  # type: ignore[method-assign]
+
+    # (a) No halt owner must have been registered — submit raised before set_halt_owner.
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must remain None when submit() raises — '
+        'a registered owner with no pending escalation blocks the merge queue forever'
+    )
+    # (b) Merge queue must remain un-halted — unhalt_wip was never called.
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False when submit() raises — '
+        'no escalation was registered so the halt state must be clean'
+    )
