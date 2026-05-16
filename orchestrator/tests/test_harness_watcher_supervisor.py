@@ -1984,7 +1984,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # so the four digest counters are absent.
         h.config = OrchestratorConfig(project_root=tmp_path)
 
-        with pytest.raises(AttributeError):
+        with pytest.raises(AttributeError, match='_escalation_event_count'):
             await h._maybe_write_digest()
 
     @pytest.mark.asyncio
@@ -2036,6 +2036,52 @@ class TestMaybeWriteDigestSurfacesMissingState:
         with (
             patch('orchestrator.harness.time.monotonic', return_value=0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
-            pytest.raises(AttributeError),
+            pytest.raises(AttributeError, match='_escalation_event_count'),
+        ):
+            await h._watcher_supervisor_loop()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_loop_wrapper_surfaces_non_counter_attribute_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """Supervisor wrapper re-raises ANY AttributeError, not just _escalation_event_count.
+
+        Documents the full blast radius of the narrowed catch-all (task 1449):
+        ``except AttributeError: raise`` in the supervisor wrapper fires for
+        any ``AttributeError`` raised inside ``_maybe_write_digest``, not only
+        the missing digest-counter case.  This is intentional — all
+        programming-error ``AttributeError``\\s (missing state due to any
+        ``__init__``-gap, renamed attribute, deleted dependency) surface to
+        the test suite rather than being silently converted to a warning log.
+
+        A future refactor that removes or renames an attribute accessed later
+        in ``_maybe_write_digest`` (e.g. ``self.scheduler``) will be caught
+        here: the test asserts the error propagates with the correct message,
+        not a misleading green result.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = Harness.__new__(Harness)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._watcher_supervisor_task = None
+        h._watcher_unclean_exits = deque()
+        h._watcher_degenerate_clean_exits = deque()
+
+        async def fake_rotation() -> AgentResult:
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        # Simulate a non-counter AttributeError inside _maybe_write_digest —
+        # e.g. a future refactor removes self.scheduler or renames it.
+        # Patching _maybe_write_digest directly isolates the supervisor-wrapper
+        # layer: we confirm the wrapper's ``except AttributeError: raise``
+        # propagates the error regardless of its origin.
+        digest_mock = AsyncMock(side_effect=AttributeError('scheduler'))
+        with (
+            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
+            patch.object(h, '_maybe_write_digest', digest_mock),
+            pytest.raises(AttributeError, match='scheduler'),
         ):
             await h._watcher_supervisor_loop()

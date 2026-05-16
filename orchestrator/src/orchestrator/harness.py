@@ -314,16 +314,9 @@ class Harness:
         self._orphan_reaper_task: asyncio.Task | None = None
 
         # Digest + EWA trip counters (task 1327 AFK hardening).
-        # _escalation_event_count: incremented on every escalation submit/resolve callback.
-        # _last_digest_event_count: snapshot of the count at the last digest write.
-        # _ewa_value: current EWA state (process-local; resets on restart).
-        # _last_digest_window_end_iso: ISO timestamp of the last digest window's end.
-        # Note: done_count comes from EventStore (count_done_in_window) as the
-        # single source of truth — no scheduler-delta counter needed (task 1421).
-        self._escalation_event_count: int = 0
-        self._last_digest_event_count: int = 0
-        self._ewa_value: float = 0.0
-        self._last_digest_window_end_iso: str = ''  # set to start time on first run
+        # Delegated to _init_digest_state() so test helpers can call the same
+        # canonical code without duplicating the counter names by value (task 1449).
+        self._init_digest_state()
 
         # Soft-cancel registry — keyed by task_id, set externally to abort
         # long workflow waits (merge queue future, steward grace period).
@@ -398,6 +391,37 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    def _init_digest_state(self) -> None:
+        """Initialise task-1327 AFK-hardening digest counters.
+
+        Called from ``__init__`` and from the test helper
+        ``_init_harness_state_for_test`` (orchestrator/tests/_orch_helpers.py)
+        so that fixtures constructing ``Harness`` via ``Harness.__new__`` call
+        canonical code rather than duplicating counter names by value.
+
+        When new digest-related counters are added to ``_maybe_write_digest``
+        in the future, add them HERE — ``__init__``, the test helper, and all
+        seven ``Harness.__new__``-based fixtures pick them up automatically.
+
+        Attributes
+        ----------
+        _escalation_event_count:
+            Incremented on every escalation submit/resolve callback.
+        _last_digest_event_count:
+            Snapshot of the count at the last digest write.
+        _ewa_value:
+            Current EWA state (process-local; resets on restart).
+        _last_digest_window_end_iso:
+            ISO timestamp of the last digest window's end; set to start time
+            on first run.  Note: done_count comes from EventStore
+            (count_done_in_window) as the single source of truth — no
+            scheduler-delta counter needed (task 1421).
+        """
+        self._escalation_event_count: int = 0
+        self._last_digest_event_count: int = 0
+        self._ewa_value: float = 0.0
+        self._last_digest_window_end_iso: str = ''
 
     async def run(
         self,

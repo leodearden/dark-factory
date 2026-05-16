@@ -38,16 +38,15 @@ def _init_harness_state_for_test(h: Harness) -> None:
     step-4) so ``AttributeError`` is re-raised rather than swallowed — missing
     state now surfaces as a test failure rather than a silent warning log.
 
-    Implementation mirrors the digest-counter block in ``Harness.__init__``
-    (harness.py:323-326).  When new ``__init__``-only state is added to
-    ``_maybe_write_digest`` in the future, add it here as the single fix-point
-    so all seven ``Harness.__new__``-based fixtures pick it up automatically.
+    Delegates to ``Harness._init_digest_state()`` (task 1449 amend) so this
+    helper calls the same canonical code as ``Harness.__init__`` rather than
+    duplicating counter names by value.  When new state is added to
+    ``_maybe_write_digest`` in the future, update ``_init_digest_state`` as the
+    single fix-point — all seven ``Harness.__new__``-based fixtures pick it up
+    automatically via this helper.
     """
-    # task 1449: mirrors Harness.__init__ lines 323-326
-    h._escalation_event_count = 0
-    h._last_digest_event_count = 0
-    h._ewa_value = 0.0
-    h._last_digest_window_end_iso = ''
+    # task 1449: delegates to canonical method so no values are duplicated here
+    h._init_digest_state()
 
 
 def pydantic_spec(model: type[BaseModel]) -> type:
