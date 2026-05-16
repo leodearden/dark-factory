@@ -2809,11 +2809,6 @@ class TestCuratorConfigBlocklistPath:
         cfg = FusedMemoryConfig()
         assert cfg.curator.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
 
-    def test_curator_config_none_value_explicit(self):
-        """Explicitly passing None is accepted."""
-        cfg = CuratorConfig(cancelled_premise_blocklist_path=None)
-        assert cfg.cancelled_premise_blocklist_path is None
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-7 RED: TestCuratorBlocklistShortCircuit

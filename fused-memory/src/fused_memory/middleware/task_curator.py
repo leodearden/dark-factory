@@ -689,8 +689,16 @@ class TaskCurator:
         if not self._blocklist_load_attempted:
             self._blocklist_load_attempted = True
             raw_path = Path(cfg_path)
-            if not raw_path.is_absolute() and self._cwd is not None:
-                raw_path = self._cwd / raw_path
+            if not raw_path.is_absolute():
+                if self._cwd is not None:
+                    raw_path = self._cwd / raw_path
+                else:
+                    logger.warning(
+                        'task_curator: cancelled_premise_blocklist_path %r is relative but '
+                        'TaskCurator was constructed without cwd — resolving against process '
+                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
+                        cfg_path,
+                    )
             self._blocklist = load_blocklist(raw_path)
 
         entries = self._blocklist
@@ -711,6 +719,10 @@ class TaskCurator:
             latency_ms=0,
         )
         self._store_cache(payload_hash, decision)
+        logger.info(
+            'task_curator: blocklist drop entry=%s candidate=%r',
+            entry.name, candidate.title,
+        )
         return decision
 
     async def curate(

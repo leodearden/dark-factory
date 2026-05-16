@@ -10,6 +10,15 @@
 #   title_substrings      : list[str]  — ALL must appear in candidate title (case-insensitive)
 #   description_substrings: list[str]  — AT LEAST ONE must appear in
 #                           candidate description+details (case-insensitive)
+#
+# Guidance for operators adding new entries:
+#   - Use a tight title anchor: prefer 3+ specific tokens over generic 2-token
+#     phrases to minimize false positives.  A title-only gate is never enough
+#     on its own — always pair it with specific description_substrings.
+#   - When a re-proposed hallucination slips through by paraphrasing, add the
+#     new phrasing as an additional description_substrings entry here (e.g.
+#     hyphens vs. underscores, spaces vs. underscores, alternate word order).
+#     The blocklist is the canonical record of all known forms of a premise.
 # ============================================================
 
 - name: fixc_flag_marker_search_then_delete
@@ -25,6 +34,9 @@
     - "search-then-delete"
   description_substrings:
     - "fixc_flags_deleted_not_found"
+    - "flags_deleted_not_found"
     - "stage1_flag_marker"
+    - "stage 1 flag marker"
+    - "stage-1 flag marker"
     - "delete-by-recorded-id"
     - "delete by recorded id"
