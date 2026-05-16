@@ -2930,3 +2930,81 @@ class TestCuratorBlocklistShortCircuit:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
         assert decision.action == "create"
+
+
+# step-9 RED: TestCuratorBatchBlocklistShortCircuit
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorBatchBlocklistShortCircuit:
+    """Batch path: blocklist matches are removed from LLM dispatch set."""
+
+    async def test_batch_blocklist_match_excluded_from_llm(self, tmp_path):
+        """candidates[0] matches blocklist → excluded from LLM; decisions[0].action=='drop'."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # candidates[0] matches the blocklist
+        c0 = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+        # candidates[1] and [2] do not match
+        c1 = CandidateTask(title="Improve FIX C flag cleanup logic", description="Normal task")
+        c2 = CandidateTask(title="Add telemetry to recon pipeline", description="Normal task 2")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        # LLM returns create for each candidate it receives
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="new-1",
+                            pool_sizes=empty_sizes, latency_ms=0),
+            CuratorDecision(action="create", justification="new-2",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        # (a) Three decisions returned, one per prepared candidate
+        assert len(decisions) == 3
+
+        # (b) decisions[0] is a blocklist drop — NOT a batch_target_index drop
+        assert decisions[0].action == "drop"
+        assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
+        assert decisions[0].batch_target_index is None, (
+            "blocklist drops are real drops, not sibling-substitution drops"
+        )
+
+        # (c) LLM was called with only candidates[1] and [2], not [0]
+        assert len(llm_candidates_received) == 2
+        assert llm_candidates_received[0] is c1
+        assert llm_candidates_received[1] is c2
+
+        # (d) decisions[1] and [2] reflect the mocked LLM result
+        assert decisions[1].action == "create"
+        assert decisions[1].justification == "new-1"
+        assert decisions[2].action == "create"
+        assert decisions[2].justification == "new-2"
