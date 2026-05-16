@@ -532,9 +532,12 @@ class MergeWorker:
             and self._halt_owner_esc_id == esc_id
         )
 
-    def unhalt_wip(self) -> None:
+    def unhalt_wip(self, reason: str | None = None) -> None:
         """Resume the merge queue after WIP conflict resolution."""
-        logger.info('Merge queue un-halted (WIP conflict resolved)')
+        logger.info(
+            'Merge queue un-halted (WIP conflict resolved%s)',
+            f', reason={reason!r}' if reason else '',
+        )
         self._wip_halt.set()
         self._halt_owner_esc_id = None
 
@@ -1062,9 +1065,12 @@ class SpeculativeMergeWorker:
             and self._halt_owner_esc_id == esc_id
         )
 
-    def unhalt_wip(self) -> None:
+    def unhalt_wip(self, reason: str | None = None) -> None:
         """Resume the merge queue after WIP conflict resolution."""
-        logger.info('Merge queue un-halted (WIP conflict resolved)')
+        logger.info(
+            'Merge queue un-halted (WIP conflict resolved%s)',
+            f', reason={reason!r}' if reason else '',
+        )
         self._wip_halt.set()
         self._halt_owner_esc_id = None
 

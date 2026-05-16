@@ -3373,6 +3373,46 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
 
+    async def _submit_halt_escalation_and_wait(self, esc) -> None:
+        """Submit a halt-owning escalation, register ownership, and wait for resolution.
+
+        Order is significant: set_halt_owner MUST follow a successful submit.
+        A registered owner with no pending escalation cannot be resolved by
+        _on_escalation_resolved, so the halt would be permanent.  If submit
+        raises, the exception propagates before set_halt_owner is reached and
+        no orphan halt is registered.
+
+        On cancellation or any other BaseException, releases the halt via
+        unhalt_wip(reason='workflow_cancelled') iff this workflow still owns
+        it, then re-raises so the cancellation propagates to the caller's Task.
+        """
+        self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
+        if self.merge_worker is not None:
+            self.merge_worker.set_halt_owner(esc.id)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={
+                    'escalation_id': esc.id,
+                    'category': esc.category,
+                    'severity': esc.severity,
+                    'summary': esc.summary[:200],
+                },
+            )
+        if self._escalation_event is None:
+            self._escalation_event = asyncio.Event()
+        self._escalation_event.clear()
+        try:
+            await self._escalation_event.wait()
+        except BaseException:
+            if (
+                self.merge_worker is not None
+                and self.merge_worker.is_halt_owner(esc.id)
+            ):
+                self.merge_worker.unhalt_wip(reason='workflow_cancelled')
+            raise
+
     async def _handle_wip_conflict(
         self, result, branch_name: str,
     ) -> WorkflowOutcome:
@@ -3408,22 +3448,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
             )
-            self.escalation_queue.submit(esc)
-            if self.merge_worker is not None:
-                self.merge_worker.set_halt_owner(esc.id)
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.escalation_created,
-                    task_id=self.task_id, phase=self.state.value,
-                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
-                          'severity': 'blocking', 'summary': esc.summary[:200]},
-                )
-
-            # Wait for human resolution
-            if self._escalation_event is None:
-                self._escalation_event = asyncio.Event()
-            self._escalation_event.clear()
-            await self._escalation_event.wait()
+            await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
 
         return WorkflowOutcome.REQUEUED
