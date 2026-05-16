@@ -540,6 +540,66 @@ class TestBypassGates:
 
 
 # ---------------------------------------------------------------------------
+# Step-5 RED tests: auto-resolve must fire only _resolve_callback, not _notify
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResolveSingleNotification:
+    """Auto-resolve fires _resolve_callback once and _notify_callback zero times.
+
+    The old two-call path (submit then resolve) fires _notify_callback once
+    and _resolve_callback once — spurious double-count.  After step-6 wires
+    queue.submit_resolved, only _resolve_callback fires.
+
+    Both tests FAIL until step-6 switches the server to submit_resolved.
+    """
+
+    @pytest.mark.asyncio
+    async def test_auto_resolve_fires_resolve_callback_only_no_notify(self, tmp_path: Path):
+        """escalate_blocker auto-resolve: _resolve_callback fires once, _notify_callback zero times."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        notify_fired: list[str] = []
+        resolve_fired: list[str] = []
+        queue.set_notify_callback(lambda e: notify_fired.append(e.id))
+        queue.set_resolve_callback(lambda e: resolve_fired.append(e.id))
+
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        await _blocker(server, **_COMMON_KWARGS)
+
+        assert notify_fired == [], (
+            f"Expected _notify_callback NOT fired on auto-resolve, got: {notify_fired}"
+        )
+        assert len(resolve_fired) == 1, (
+            f"Expected _resolve_callback fired exactly once, got: {resolve_fired}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_resolve_info_path_fires_resolve_callback_only(self, tmp_path: Path):
+        """escalate_info auto-resolve: _resolve_callback fires once, _notify_callback zero times."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        notify_fired: list[str] = []
+        resolve_fired: list[str] = []
+        queue.set_notify_callback(lambda e: notify_fired.append(e.id))
+        queue.set_resolve_callback(lambda e: resolve_fired.append(e.id))
+
+        lookup = await _make_lookup('cancelled')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        await _info(server, **_COMMON_KWARGS)
+
+        assert notify_fired == [], (
+            f"Expected _notify_callback NOT fired on auto-resolve, got: {notify_fired}"
+        )
+        assert len(resolve_fired) == 1, (
+            f"Expected _resolve_callback fired exactly once, got: {resolve_fired}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Characterization: resolve() → None on the terminal auto-resolve path
 # ---------------------------------------------------------------------------
 
