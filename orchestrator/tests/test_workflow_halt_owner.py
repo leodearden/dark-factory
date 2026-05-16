@@ -225,3 +225,47 @@ async def test_handle_wip_recovery_releases_halt_on_cancel(
     assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
         f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 5: _handle_wip_recovery_no_advance
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_wip_recovery_no_advance_releases_halt_on_cancel(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Cancel mid-await in _handle_wip_recovery_no_advance releases halt owner.
+
+    This handler fires on the CAS-failure path where main was NOT advanced.
+    Same escalation-submit + await pattern, same cancellation risk.
+
+    Must fail today (pre-fix): the handler has no try/except around the await.
+    """
+    fake_worker.halt_for_wip('wip_recovery_no_advance')
+
+    task = asyncio.create_task(
+        workflow._handle_wip_recovery_no_advance(
+            MergeOutcome(
+                status='wip_recovery_no_advance',
+                recovery_branch='wip/r2',
+            ),
+        )
+    )
+
+    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must be cleared after workflow cancellation'
+    )
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False after workflow cancellation'
+    )
+    assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
+        f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
+    )
