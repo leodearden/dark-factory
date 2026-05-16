@@ -22,6 +22,54 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 # ---------------------------------------------------------------------------
+# task-1454: helper — centralises the 6-field scheduler-state snapshot literal
+# ---------------------------------------------------------------------------
+
+
+def _scheduler_snapshot(**overrides):
+    """Return a base scheduler-state snapshot dict with the 6 standard fields.
+
+    Canonical base fields (all empty/default):
+      skip_counts, parks, effective_priorities, pin_queue, overrides,
+      current_holders
+
+    Any kwargs override a matching base key or add an extra key verbatim
+    (e.g. ``is_paused``, ``pause_reason``, ``snapshot_at``).
+
+    Each call returns a fresh dict — no cross-test aliasing.
+    """
+    base = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+    }
+    base.update(overrides)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# task-1454 step-1: aliasing safety check for _scheduler_snapshot helper
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_snapshot_returns_independent_dicts():
+    """Successive calls return independent dicts; mutating one doesn't affect another."""
+    snap1 = _scheduler_snapshot()
+    snap2 = _scheduler_snapshot()
+    snap1['skip_counts']['1'] = 99
+    assert snap2['skip_counts'] == {}, (
+        'snap2 was mutated by modifying snap1 — base dict is being aliased'
+    )
+    snap1['pin_queue'].append('X')
+    assert snap2['pin_queue'] == [], (
+        'snap2 pin_queue was mutated by modifying snap1 — base list is being aliased'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-1: pure-function test for _module_contention_counts
 # ---------------------------------------------------------------------------
 
@@ -96,19 +144,19 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
         },
     ]
 
-    snapshot = {
-        'skip_counts': {'1': 3, '2': 0},
-        'parks': {
+    snapshot = _scheduler_snapshot(
+        skip_counts={'1': 3, '2': 0},
+        parks={
             '1': {
                 'modules': ['src/a.py'],
                 'installed_at': now_iso,
             }
         },
-        'effective_priorities': {
+        effective_priorities={
             '1': 'critical',  # differs from 'high'
             '2': 'medium',    # same as declared
         },
-        'overrides': {
+        overrides={
             '1': {
                 'boost_tier': 'critical',
                 'pinned': False,
@@ -116,9 +164,8 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
                 'ttl_until': None,
             }
         },
-        'current_holders': {'src/a.py': '1'},
-        'pin_queue': [],
-    }
+        current_holders={'src/a.py': '1'},
+    )
 
     rows = _compose_rows(active_tasks, snapshot)
 
@@ -246,12 +293,11 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     project = dummy_config.project_root.name  # _project_label result
 
-    snapshot = {
-        'skip_counts': {'1': 2},
-        'parks': {},
-        'effective_priorities': {'1': 'high'},
-        'pin_queue': [{'task_id': '1', 'order': 0}],
-        'overrides': {
+    snapshot = _scheduler_snapshot(
+        skip_counts={'1': 2},
+        effective_priorities={'1': 'high'},
+        pin_queue=[{'task_id': '1', 'order': 0}],
+        overrides={
             '1': {
                 'boost_tier': 'high',
                 'pinned': True,
@@ -259,9 +305,9 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
                 'ttl_until': None,
             }
         },
-        'current_holders': {'src/a.py': '1'},
-        'snapshot_at': '2026-01-01T00:00:00+00:00',
-    }
+        current_holders={'src/a.py': '1'},
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
     now_iso = datetime.now(UTC).isoformat()
     events = [
         {'event_type': 'task_skipped', 'task_id': '1', 'timestamp': now_iso},
@@ -387,17 +433,11 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     pause_reason = 'park-stop: 5 tasks parked in 1h'
 
     # --- Snapshot with is_paused=True ---
-    paused_snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'is_paused': True,
-        'pause_reason': pause_reason,
-        'snapshot_at': '2026-05-15T00:00:00+00:00',
-    }
+    paused_snapshot = _scheduler_snapshot(
+        is_paused=True,
+        pause_reason=pause_reason,
+        snapshot_at='2026-05-15T00:00:00+00:00',
+    )
 
     mock_mcp_paused = AsyncMock(side_effect=[paused_snapshot, []])
     mock_active = AsyncMock(return_value=([], {}, []))
@@ -414,17 +454,11 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
     # --- Snapshot with is_paused=False (or absent) must yield empty list ---
-    not_paused_snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'is_paused': False,
-        'pause_reason': None,
-        'snapshot_at': '2026-05-15T00:00:00+00:00',
-    }
+    not_paused_snapshot = _scheduler_snapshot(
+        is_paused=False,
+        pause_reason=None,
+        snapshot_at='2026-05-15T00:00:00+00:00',
+    )
 
     mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, []])
     mock_active2 = AsyncMock(return_value=([], {}, []))
@@ -441,15 +475,9 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
     # --- Snapshot with is_paused absent (pre-upgrade on-disk) must yield empty list ---
-    legacy_snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'snapshot_at': '2026-05-15T00:00:00+00:00',
-    }
+    legacy_snapshot = _scheduler_snapshot(
+        snapshot_at='2026-05-15T00:00:00+00:00',
+    )
 
     mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, []])
     mock_active3 = AsyncMock(return_value=([], {}, []))
@@ -489,28 +517,16 @@ async def test_collect_scheduler_state_isolates_paused_across_projects(
     config = DashboardConfig(project_root=p1, known_project_roots=[p2])
 
     pause_reason = 'park-stop: 5 tasks parked in 1h'
-    snap_A = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'is_paused': True,
-        'pause_reason': pause_reason,
-        'snapshot_at': '2026-05-15T00:00:00+00:00',
-    }
-    snap_B = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'is_paused': False,
-        'pause_reason': None,
-        'snapshot_at': '2026-05-15T00:00:00+00:00',
-    }
+    snap_A = _scheduler_snapshot(
+        is_paused=True,
+        pause_reason=pause_reason,
+        snapshot_at='2026-05-15T00:00:00+00:00',
+    )
+    snap_B = _scheduler_snapshot(
+        is_paused=False,
+        pause_reason=None,
+        snapshot_at='2026-05-15T00:00:00+00:00',
+    )
     snapshots = {str(p1.resolve()): snap_A, str(p2.resolve()): snap_B}
 
     async def mock_mcp_call(client, url, tool, args):
@@ -716,7 +732,23 @@ def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
             resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
 
     assert resp.status_code == 400
-    assert mock_mcp.call_count == 0
+    # Background monitoring tasks call mcp_tool_call via get_memory_status /
+    # get_queue_stats (both defined in memory.py, so they resolve through the
+    # patched module attribute).  Build a robust tool-name extractor that handles
+    # both positional and kwarg-style invocations, then assert an explicit
+    # allowlist: only the two known background tools are permitted; anything else
+    # (including 'set_task_priority_override') signals a regression where the
+    # override endpoint is invoking MCP before validation completes.
+    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
+
+    def _tool_name(c):
+        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
+
+    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
+    assert not unexpected, (
+        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
+        f'Full call list: {mock_mcp.call_args_list}'
+    )
     if expected_error is not None:
         assert resp.json().get('error') == expected_error
 
@@ -948,12 +980,7 @@ def test_compose_rows_propagates_project_and_project_root():
         },
     ]
 
-    snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-    }
+    snapshot = _scheduler_snapshot()
 
     rows = _compose_rows(active_tasks, snapshot)
 
@@ -994,15 +1021,9 @@ async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
         known_project_roots=[p2],
     )
 
-    snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-        'current_holders': {},
-        'pin_queue': [],
-        'snapshot_at': '2026-01-01T00:00:00+00:00',
-    }
+    snapshot = _scheduler_snapshot(
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
 
     # Track which project_root each get_scheduler_state call received
     recorded_roots: list[str] = []
@@ -1105,12 +1126,7 @@ def test_compose_rows_supports_project_filter_isolation():
         },
     ]
 
-    snapshot = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-    }
+    snapshot = _scheduler_snapshot()
 
     rows = _compose_rows(active_tasks, snapshot)
     assert len(rows) == 3
@@ -1379,17 +1395,15 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
 
     config = DashboardConfig(project_root=p1, known_project_roots=[p2])
 
-    snap_p1 = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-        'current_holders': {},
+    snap_p1 = _scheduler_snapshot(
         # Both projects have a pin with task_id='1' — the collision case
-        'pin_queue': [{'task_id': '1', 'order': 0}],
-        'snapshot_at': '2026-01-01T00:00:00+00:00',
-    }
-    snap_p2 = {**snap_p1}
+        pin_queue=[{'task_id': '1', 'order': 0}],
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
+    snap_p2 = _scheduler_snapshot(
+        pin_queue=[{'task_id': '1', 'order': 0}],
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
 
     snapshots = {str(p1): snap_p1, str(p2): snap_p2}
 
@@ -1438,24 +1452,14 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
 
     config = DashboardConfig(project_root=p1, known_project_roots=[p2])
 
-    snap_p1 = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-        'current_holders': {'src/utils.py': '1'},
-        'pin_queue': [],
-        'snapshot_at': '2026-01-01T00:00:00+00:00',
-    }
-    snap_p2 = {
-        'skip_counts': {},
-        'parks': {},
-        'effective_priorities': {},
-        'overrides': {},
-        'current_holders': {'src/utils.py': '5'},
-        'pin_queue': [],
-        'snapshot_at': '2026-01-01T00:00:00+00:00',
-    }
+    snap_p1 = _scheduler_snapshot(
+        current_holders={'src/utils.py': '1'},
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
+    snap_p2 = _scheduler_snapshot(
+        current_holders={'src/utils.py': '5'},
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
     snapshots = {str(p1): snap_p1, str(p2): snap_p2}
 
     async def mock_mcp_call(client, url, tool, args):
@@ -1548,18 +1552,16 @@ def test_compose_rows_tolerates_non_string_installed_at():
     }]
 
     # Number for installed_at — used to crash on .replace(...)
-    snapshot_num = {
-        'parks': {'1': {'installed_at': 12345}},
-        'effective_priorities': {}, 'overrides': {}, 'skip_counts': {},
-    }
+    snapshot_num = _scheduler_snapshot(
+        parks={'1': {'installed_at': 12345}},
+    )
     rows_num = _compose_rows(active_tasks, snapshot_num)
     assert rows_num[0]['age_seconds'] == 0
 
     # Dict for installed_at — same crash path
-    snapshot_dict = {
-        'parks': {'1': {'installed_at': {'nested': 'oops'}}},
-        'effective_priorities': {}, 'overrides': {}, 'skip_counts': {},
-    }
+    snapshot_dict = _scheduler_snapshot(
+        parks={'1': {'installed_at': {'nested': 'oops'}}},
+    )
     rows_dict = _compose_rows(active_tasks, snapshot_dict)
     assert rows_dict[0]['age_seconds'] == 0
 
