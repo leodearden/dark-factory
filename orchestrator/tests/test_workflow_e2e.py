@@ -5307,6 +5307,66 @@ class TestCleanupVerificationGate:
         )
 
 
+# ---------------------------------------------------------------------------
+# TestDryRunUnblockE2EGuard — pins the two modes of the file-local autouse guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDryRunUnblockE2EGuardOptOut:
+    """Guard (opt-out mode): stub raises AssertionError when called.
+
+    No marker on this class — the file-level autouse guard should install a
+    synchronous fail-fast stub.  Calling the stub must raise AssertionError
+    whose message names this class and points to test_workflow_dry_run_hook.py.
+    """
+
+    async def test_stub_raises_assertion_error_on_call(self):
+        """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
+        import orchestrator.workflow as _wf  # noqa: PLC0415
+
+        with pytest.raises(AssertionError, match=r'TestDryRunUnblockE2EGuardOptOut') as exc_info:
+            _wf.run_dry_run_unblock(
+                task_id='t',
+                worktree='/tmp',
+                reason='r',
+                detail='d',
+                scheduler=None,
+                mcp=None,
+                config=None,
+            )
+        assert 'test_workflow_dry_run_hook.py' in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestDryRunUnblockE2EGuardOptIn:
+    """Guard (opt-in mode): AsyncMock installed when mocks_dry_run_unblock marker present.
+
+    This class opts in via @pytest.mark.mocks_dry_run_unblock.  The guard
+    fixture should install AsyncMock(return_value=None) so BLOCKED-driving
+    tests work without hanging.
+    """
+
+    async def test_async_mock_installed_when_marker_present(self):
+        """run_dry_run_unblock is an AsyncMock when mocks_dry_run_unblock marker is set."""
+        import orchestrator.workflow as _wf  # noqa: PLC0415
+
+        assert isinstance(_wf.run_dry_run_unblock, AsyncMock), (
+            f'Expected AsyncMock, got {type(_wf.run_dry_run_unblock)!r}'
+        )
+        result = await _wf.run_dry_run_unblock(
+            task_id='t',
+            worktree='/tmp',
+            reason='r',
+            detail='d',
+            scheduler=None,
+            mcp=None,
+            config=None,
+        )
+        assert result is None
+
+
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler
     from orchestrator.workflow import _SchedulerLike
