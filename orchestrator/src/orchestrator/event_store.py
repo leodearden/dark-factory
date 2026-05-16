@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA = """\
@@ -171,11 +173,31 @@ class EventStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
+    def _connect(self) -> sqlite3.Connection:
+        """Open a connection to the store's DB with the full durability pragma triad applied."""
+        conn = sqlite3.connect(str(self.db_path))
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
+    def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
+
+        Returns:
+            A :class:`CheckpointResult` named-tuple ``(busy, log, checkpointed)``.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+
     def _ensure_schema(self) -> None:
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = self._connect()
             try:
-                conn.execute('PRAGMA journal_mode=WAL')
                 conn.executescript(_SCHEMA)
             finally:
                 conn.close()
@@ -195,7 +217,7 @@ class EventStore:
     ) -> None:
         """Write a single event row.  Never raises."""
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = self._connect()
             try:
                 conn.execute(
                     'INSERT INTO events '
