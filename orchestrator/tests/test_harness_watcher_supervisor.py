@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -450,9 +451,8 @@ def _build_monotonic_timestamps(
     clean/unclean sequences).  Eliminates the risk of off-by-one errors
     when the sequence is hand-built in multiple places.
     """
-    import time as _time_mod
 
-    t0 = _time_mod.monotonic()
+    t0 = time.monotonic()
     timestamps: list[float] = []
     for dur in durations:
         timestamps.extend([t0, t0 + dur])
@@ -841,8 +841,7 @@ class TestWatcherCrashloopTrip:
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
 
         # patch monotonic to return a stable time (all exits within the window)
-        import time as _time_mod
-        stable_time = _time_mod.monotonic()
+        stable_time = time.monotonic()
         with patch('orchestrator.harness.asyncio.sleep', fake_sleep), \
              patch('orchestrator.harness.time.monotonic', return_value=stable_time):
             # Loop should exit after max_restarts unclean exits
@@ -897,7 +896,6 @@ class TestWatcherCrashloopTrip:
     async def test_old_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
         """Unclean exits older than watcher_crashloop_window_secs are evicted
         so they do not contribute to the crashloop count."""
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -918,7 +916,7 @@ class TestWatcherCrashloopTrip:
         # (max_restarts - 1) exits (insufficient alone to trip), then cancel.
         # Each loop iteration makes 2 monotonic calls (start + end); sequences
         # are [start1, end1, start2, end2, ...] pairs.
-        old_time = _time_mod.monotonic()
+        old_time = time.monotonic()
         new_time = old_time + window + 1  # beyond the window
         time_sequence = iter(
             [old_time] * 4              # 2 old iterations × (start, end) each
@@ -967,7 +965,6 @@ class TestWatcherCrashloopTrip:
         previously swallowed pause_scheduler failures, causing the loop to restart
         the agent indefinitely instead of stopping.
         """
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -998,7 +995,7 @@ class TestWatcherCrashloopTrip:
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
         h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
 
-        stable_time = _time_mod.monotonic()
+        stable_time = time.monotonic()
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
             patch('orchestrator.harness.time.monotonic', return_value=stable_time),
@@ -1034,7 +1031,6 @@ class TestWatcherMisconfiguredGuard:
     @pytest.mark.asyncio
     async def test_fast_clean_exit_appends_degenerate_deque(self, tmp_path: Path) -> None:
         """A fast clean exit (duration < min_rotation_secs) appends to _watcher_degenerate_clean_exits."""
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -1045,7 +1041,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         # Rotation duration 1.0s — well under default 120s threshold
-        t0 = _time_mod.monotonic()
+        t0 = time.monotonic()
         time_seq = iter([t0, t0 + 1.0])  # start, end for one rotation
 
         def fake_monotonic() -> float:
@@ -1080,7 +1076,6 @@ class TestWatcherMisconfiguredGuard:
     @pytest.mark.asyncio
     async def test_slow_clean_exit_does_not_append(self, tmp_path: Path) -> None:
         """A slow clean exit (duration >= min_rotation_secs) does NOT append to the degenerate deque."""
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -1092,7 +1087,7 @@ class TestWatcherMisconfiguredGuard:
         })
 
         # Rotation duration 200s — above the 120s threshold
-        t0 = _time_mod.monotonic()
+        t0 = time.monotonic()
         time_seq = iter([t0, t0 + 200.0])  # start, end for one rotation
 
         def fake_monotonic() -> float:
@@ -1128,7 +1123,6 @@ class TestWatcherMisconfiguredGuard:
     async def test_misconfigured_trips_pause_scheduler(self, tmp_path: Path) -> None:
         """After watcher_max_misconfigured_clean_exits fast-clean exits in the window,
         pause_scheduler is called once with 'watcher_misconfigured' and the loop exits."""
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -1148,7 +1142,7 @@ class TestWatcherMisconfiguredGuard:
         # All rotations are fast-clean (duration 1s < 120s).
         # Guard: cancel after max_misconfig * 2 rotations to prevent an infinite loop
         # when the threshold trip is not yet implemented (makes RED state fail fast).
-        t0 = _time_mod.monotonic()
+        t0 = time.monotonic()
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
@@ -1202,7 +1196,6 @@ class TestWatcherMisconfiguredGuard:
         impl used iter_count tracking which made iteration 2's duration ≈ window+2s,
         so only 1 old entry was actually added instead of the intended 2).
         """
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -1222,7 +1215,7 @@ class TestWatcherMisconfiguredGuard:
 
         # Drive 2 fast-clean exits at old_time, then jump past window,
         # then drive 2 more fast-clean exits (< max_misconfig=3), then cancel.
-        old_time = _time_mod.monotonic()
+        old_time = time.monotonic()
         new_time = old_time + window + 1  # beyond the window
 
         # Paired iterator: (start, end) per iteration — both calls within one
@@ -1302,7 +1295,6 @@ class TestWatcherMisconfiguredGuard:
         added in step-6 around pause_scheduler('watcher_misconfigured') must
         return regardless of whether pause_scheduler itself raises.
         """
-        import time as _time_mod
 
         from shared.cli_invoke import AgentResult
 
@@ -1335,7 +1327,7 @@ class TestWatcherMisconfiguredGuard:
         h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
         h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
 
-        t0 = _time_mod.monotonic()
+        t0 = time.monotonic()
         call_count = 0
 
         def fake_monotonic() -> float:
