@@ -405,8 +405,12 @@ class TestHarnessCostCeiling:
     # Step 1 — config fields
     # ------------------------------------------------------------------
 
-    def test_config_defaults(self, tmp_path: Path) -> None:
+    def test_config_defaults(self, monkeypatch, tmp_path: Path) -> None:
         """OrchestratorConfig exposes the two ceiling fields with correct defaults."""
+        # Isolate cwd so YamlSettingsSource's cwd-relative Path('config.yaml')
+        # fallback doesn't pick up orchestrator/config.yaml when tests run from
+        # that directory (mirrors the TestDefaults idiom in tests/test_config.py).
+        monkeypatch.chdir(tmp_path)
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_daily_cost_ceiling_usd == 50.0, (
             f'Expected 50.0; got {config.watcher_daily_cost_ceiling_usd!r}'
@@ -415,8 +419,9 @@ class TestHarnessCostCeiling:
             f'Expected 200.0; got {config.orch_daily_cost_ceiling_usd!r}'
         )
 
-    def test_config_overridable(self, tmp_path: Path) -> None:
+    def test_config_overridable(self, monkeypatch, tmp_path: Path) -> None:
         """Both ceiling fields accept custom values."""
+        monkeypatch.chdir(tmp_path)
         config = OrchestratorConfig(
             project_root=tmp_path,
             watcher_daily_cost_ceiling_usd=7.0,
