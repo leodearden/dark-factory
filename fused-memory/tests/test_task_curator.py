@@ -2814,3 +2814,119 @@ class TestCuratorConfigBlocklistPath:
         """Explicitly passing None is accepted."""
         cfg = CuratorConfig(cancelled_premise_blocklist_path=None)
         assert cfg.cancelled_premise_blocklist_path is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-7 RED: TestCuratorBlocklistShortCircuit
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_blocklist_yaml(tmp_path, title_subs, desc_subs, name="test_entry"):
+    """Write a minimal blocklist YAML and return the path."""
+    import yaml
+    content = [{
+        "name": name,
+        "reason": "test reason",
+        "title_substrings": title_subs,
+        "description_substrings": desc_subs,
+    }]
+    p = tmp_path / "blocklist.yaml"
+    p.write_text(yaml.dump(content), encoding="utf-8")
+    return p
+
+
+def _make_config_with_blocklist(blocklist_path_str: str) -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(cancelled_premise_blocklist_path=blocklist_path_str)
+    return cfg
+
+
+@pytest.mark.asyncio
+class TestCuratorBlocklistShortCircuit:
+    """Tests that a blocklist match returns drop BEFORE corpus/LLM calls."""
+
+    async def test_blocklist_match_returns_drop_without_llm(self, tmp_path):
+        """(a) curate() returns drop with blocklist justification prefix."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))) as mock_llm, \
+             patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification.startswith("cancelled-premise-blocklist:")
+        mock_corpus.assert_not_called()
+        mock_llm.assert_not_called()
+        mock_exact.assert_not_called()
+
+    async def test_blocklist_decision_stored_in_cache(self, tmp_path):
+        """(e) The decision is stored in _decision_cache under payload_hash."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        payload_hash = candidate.payload_hash()
+        assert payload_hash in curator._decision_cache
+        cached_dec, _ = curator._decision_cache[payload_hash]
+        assert cached_dec.action == "drop"
+        assert cached_dec.justification == decision.justification
+
+    async def test_blocklist_non_matching_candidate_falls_through(self, tmp_path):
+        """Non-matching candidate still reaches corpus/LLM (no false-positive blocking)."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Title does NOT contain "search-then-delete"
+        candidate = CandidateTask(
+            title="Improve FIX C flag cleanup logic",
+            description="No fictional metrics here.",
+        )
+
+        # Patch exact-match to return None; corpus + LLM to return create
+        async def fake_exact_match(*a, **k):
+            return None
+
+        async def fake_corpus(*a, **k):
+            return [], {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+
+        create_result = AgentResult(
+            success=True,
+            output="",
+            structured_output={"action": "create", "justification": "genuinely new"},
+        )
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
