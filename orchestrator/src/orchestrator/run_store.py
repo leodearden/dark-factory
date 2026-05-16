@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
+
 if TYPE_CHECKING:
     from orchestrator.harness import HarnessReport, TaskReport
 
@@ -67,8 +69,29 @@ class RunStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
-    def _ensure_schema(self) -> None:
+    def _connect(self) -> sqlite3.Connection:
+        """Open a connection to the store's DB with the full durability pragma triad applied."""
         conn = sqlite3.connect(str(self.db_path))
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
+    def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
+
+        Returns:
+            A :class:`CheckpointResult` named-tuple ``(busy, log, checkpointed)``.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+
+    def _ensure_schema(self) -> None:
+        conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
         finally:
@@ -86,7 +109,7 @@ class RunStore:
         The row is updated with final aggregates via :meth:`finish_run`
         when the run completes.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR IGNORE INTO runs '
@@ -106,7 +129,7 @@ class RunStore:
         project_id: str,
     ) -> None:
         """Persist a single TaskReport row immediately on task completion."""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR REPLACE INTO task_results '
@@ -147,7 +170,7 @@ class RunStore:
         ``(run_id, task_id)`` — prior requeue attempts are overwritten.
         Returns ``0.0`` when no row exists.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             cur = conn.execute(
                 'SELECT cost_usd, steward_cost_usd FROM task_results '
@@ -168,7 +191,7 @@ class RunStore:
         report: HarnessReport,
     ) -> None:
         """Update the runs row with final aggregates at shutdown."""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'UPDATE runs SET '
@@ -206,7 +229,7 @@ class RunStore:
         Returns the generated run_id.
         """
         run_id = f'run-{uuid.uuid4().hex[:12]}'
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'INSERT INTO runs '
@@ -280,7 +303,7 @@ class RunStore:
         Uses INSERT OR REPLACE so repeated saves are idempotent — the most
         recent call wins, matching UPSERT semantics.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR REPLACE INTO scheduler_state '
@@ -297,7 +320,7 @@ class RunStore:
 
         Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -317,7 +340,7 @@ class RunStore:
 
     def clear_scheduler_pause(self, project_id: str) -> None:
         """Remove any persisted pause state for *project_id*."""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             conn.execute(
                 'DELETE FROM scheduler_state WHERE project_id = ?',
