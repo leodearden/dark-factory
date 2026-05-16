@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import _WATCHER_MAX_BACKOFF_SECS, _WATCHER_TIMEOUT_GRACE_SECS, Harness
@@ -98,6 +99,7 @@ def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     config = config.model_copy(update={'watcher_supervisor_enabled': enabled})
     h.config = config
@@ -199,6 +201,7 @@ def _make_rotation_harness(tmp_path: Path) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None
@@ -411,6 +414,7 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None
@@ -1939,3 +1943,145 @@ class TestWatcherSupervisorRunWiring:
             f'_stop_terminal_status_watcher (idx={stop_terminal_idx}); '
             f'calls: {call_strs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 1449: regression guard — _maybe_write_digest must surface AttributeError
+# ---------------------------------------------------------------------------
+
+class TestMaybeWriteDigestSurfacesMissingState:
+    """Regression guard: both _maybe_write_digest and the supervisor wrapper
+    must re-raise AttributeError instead of swallowing it.
+
+    Task 1449 narrowed the catch-all ``except Exception`` at two layers:
+
+    * ``_maybe_write_digest``'s own catch-all (harness.py:3390-3393): now
+      re-raises ``AttributeError`` so programming-error drift surfaces to tests.
+    * The supervisor wrapper (harness.py:2762-2769): applies the same pattern
+      so the re-raised error is not re-swallowed at the outer layer.
+
+    Without the narrowing, both layers silently convert the ``AttributeError``
+    raised by the missing ``_escalation_event_count`` access to a
+    ``logger.warning(...)`` call — tests pass, the bug goes undetected.
+
+    After the narrowing (step-4), both tests below pass: the ``AttributeError``
+    propagates to the test runner unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_maybe_write_digest_surfaces_attribute_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """_maybe_write_digest raises AttributeError when digest counters are absent.
+
+        This test FAILS before step-4 because _maybe_write_digest's catch-all
+        (harness.py:3390-3393) swallows the AttributeError and converts it to
+        logger.warning(..., exc_info=True).  After step-4 inserts
+        ``except AttributeError: raise``, the error propagates.
+        """
+        h = Harness.__new__(Harness)
+        # Provide only config — deliberately omit _init_harness_state_for_test
+        # so the four digest counters are absent.
+        h.config = OrchestratorConfig(project_root=tmp_path)
+
+        with pytest.raises(AttributeError, match='_escalation_event_count'):
+            await h._maybe_write_digest()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_loop_wrapper_surfaces_attribute_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """_watcher_supervisor_loop's wrapper re-raises AttributeError from _maybe_write_digest.
+
+        This test FAILS before step-4 because the supervisor wrapper at
+        harness.py:2762-2769 swallows the AttributeError (even after step-4
+        narrows _maybe_write_digest's own catch-all — two layers must both be
+        narrowed).
+
+        Strategy: patch _run_watcher_rotation to return a clean AgentResult
+        on the first call, then raise CancelledError on the second call.
+        Before step-4: AttributeError is swallowed; the loop continues through
+        the degenerate-clean path, sleeps (patched to be instant), and
+        terminates with CancelledError — pytest.raises(AttributeError) FAILS.
+        After step-4: AttributeError propagates immediately from the first
+        iteration's _maybe_write_digest call — pytest.raises(AttributeError)
+        PASSES.
+        """
+        from collections import deque
+
+        from shared.cli_invoke import AgentResult
+
+        # Build same shape as _make_loop_harness but WITHOUT the digest counters.
+        h = Harness.__new__(Harness)
+        # NOTE: intentionally no _init_harness_state_for_test(h) call here.
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._watcher_supervisor_task = None
+        h._watcher_unclean_exits = deque()
+        h._watcher_degenerate_clean_exits = deque()
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        # time.monotonic: return 0.0 for all calls (start=end=0.0, duration=0).
+        # asyncio.sleep: instant no-op so the degenerate-clean backoff floor
+        # doesn't actually sleep.
+        with (
+            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
+            pytest.raises(AttributeError, match='_escalation_event_count'),
+        ):
+            await h._watcher_supervisor_loop()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_loop_wrapper_surfaces_non_counter_attribute_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """Supervisor wrapper re-raises ANY AttributeError, not just _escalation_event_count.
+
+        Documents the full blast radius of the narrowed catch-all (task 1449):
+        ``except AttributeError: raise`` in the supervisor wrapper fires for
+        any ``AttributeError`` raised inside ``_maybe_write_digest``, not only
+        the missing digest-counter case.  This is intentional — all
+        programming-error ``AttributeError``\\s (missing state due to any
+        ``__init__``-gap, renamed attribute, deleted dependency) surface to
+        the test suite rather than being silently converted to a warning log.
+
+        A future refactor that removes or renames an attribute accessed later
+        in ``_maybe_write_digest`` (e.g. ``self.scheduler``) will be caught
+        here: the test asserts the error propagates with the correct message,
+        not a misleading green result.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = Harness.__new__(Harness)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._watcher_supervisor_task = None
+        h._watcher_unclean_exits = deque()
+        h._watcher_degenerate_clean_exits = deque()
+
+        async def fake_rotation() -> AgentResult:
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        # Simulate a non-counter AttributeError inside _maybe_write_digest —
+        # e.g. a future refactor removes self.scheduler or renames it.
+        # Patching _maybe_write_digest directly isolates the supervisor-wrapper
+        # layer: we confirm the wrapper's ``except AttributeError: raise``
+        # propagates the error regardless of its origin.
+        digest_mock = AsyncMock(side_effect=AttributeError('scheduler'))
+        with (
+            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
+            patch.object(h, '_maybe_write_digest', digest_mock),
+            pytest.raises(AttributeError, match='scheduler'),
+        ):
+            await h._watcher_supervisor_loop()

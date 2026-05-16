@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -278,6 +279,7 @@ def _make_harness(config: OrchestratorConfig):
     from orchestrator.harness import Harness
 
     harness = Harness.__new__(Harness)
+    _init_harness_state_for_test(harness)  # task 1449: initialise digest counters
     harness.config = config
     harness.scheduler = Scheduler(config)
     harness._escalation_queue = None

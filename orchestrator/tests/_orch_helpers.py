@@ -10,11 +10,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
+
+if TYPE_CHECKING:
+    from orchestrator.harness import Harness
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -22,6 +26,27 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
     name for name, v in inspect.getmembers(BaseModel) if isinstance(v, property)
 )
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
+
+
+def _init_harness_state_for_test(h: Harness) -> None:
+    """Initialise task-1327 AFK-hardening digest counters on a __new__-built Harness.
+
+    Fixtures that construct ``Harness`` via ``Harness.__new__(Harness)`` and
+    manually set only the attributes their tests exercise must call this helper
+    to avoid silent ``AttributeError`` in ``_maybe_write_digest``.  The catch-all
+    in that method (and in the supervisor wrapper) has been narrowed (task 1449,
+    step-4) so ``AttributeError`` is re-raised rather than swallowed — missing
+    state now surfaces as a test failure rather than a silent warning log.
+
+    Delegates to ``Harness._init_digest_state()`` (task 1449 amend) so this
+    helper calls the same canonical code as ``Harness.__init__`` rather than
+    duplicating counter names by value.  When new state is added to
+    ``_maybe_write_digest`` in the future, update ``_init_digest_state`` as the
+    single fix-point — all seven ``Harness.__new__``-based fixtures pick it up
+    automatically via this helper.
+    """
+    # task 1449: delegates to canonical method so no values are duplicated here
+    h._init_digest_state()
 
 
 def pydantic_spec(model: type[BaseModel]) -> type:
