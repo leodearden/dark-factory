@@ -48,6 +48,13 @@ max_turns:
 fairness:
   scheduler_v2: true
 
+# Trailing-24h spend ceiling. Default $200 was a backstop from before the
+# multi-account failover landed — with Anthropic's per-account caps as the
+# real spend governor, the orch-level dollar guard just trips during normal
+# operation. Raised to effectively-disabled. The watcher ceiling
+# (watcher_daily_cost_ceiling_usd, default $50) is left at its default for now.
+orch_daily_cost_ceiling_usd: 10000.0
+
 # Usage cap / multi-account failover
 usage_cap:
   enabled: true
