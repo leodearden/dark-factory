@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 
+from escalation.dedupe import DedupeConfig
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -184,6 +186,128 @@ class TestTerminalAutoResolve:
         esc = queue.get(esc_id)
         assert esc is not None
         assert esc.status == 'resolved'
+
+    # --- Item 4: dedupe-vs-terminal gate-priority characterization ---
+
+    @pytest.mark.asyncio
+    async def test_dedupe_eligible_terminal_task_auto_resolves(self, tmp_path: Path):
+        """dedupe-eligible infra_issue + terminal task → auto-resolve wins over dedupe.
+
+        Characterization test: the explicit _submit_or_dedupe bypass at
+        server.py:153-155 (inside the status-in-done/cancelled branch) ensures
+        that even when DedupeConfig is active and a matching pending parent exists,
+        Gate 4 auto-resolve fires first and the child is NOT folded into the parent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, dedupe_config=DedupeConfig(), task_status_lookup=lookup)
+
+        # Pre-seed a pending infra_issue parent for the same task
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='parent infra issue',
+        )
+        queue.submit(parent)
+
+        # Child call: same category, same task_id — would dedupe if task were not terminal
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='child infra issue similar',
+        )
+
+        assert result['status'] == 'resolved', (
+            f"Expected 'resolved' (auto-resolve wins over dedupe), got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedupe_eligible_terminal_task_parent_unchanged(self, tmp_path: Path):
+        """dedupe-eligible + terminal → pre-seeded parent's dedupe_count stays 0 (not folded).
+
+        Characterization test: the bypass ensures the child is auto-resolved via
+        submit_resolved (or submit+resolve), never routed through _submit_or_dedupe,
+        so the parent's dedupe_children and dedupe_count remain at their initial values.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, dedupe_config=DedupeConfig(), task_status_lookup=lookup)
+
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='parent infra issue',
+        )
+        queue.submit(parent)
+        parent_id = parent.id
+
+        await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='child infra issue similar',
+        )
+
+        # Parent must be unmodified — child was NOT folded into it
+        updated_parent = queue.get(parent_id)
+        assert updated_parent is not None, f"Parent {parent_id} not found after call"
+        assert updated_parent.dedupe_count == 0, (
+            f"Expected dedupe_count==0 (auto-resolve bypassed dedupe), "
+            f"got: {updated_parent.dedupe_count}"
+        )
+        assert len(updated_parent.dedupe_children) == 0, (
+            f"Expected no dedupe_children (auto-resolve bypassed dedupe), "
+            f"got: {updated_parent.dedupe_children}"
+        )
+
+    # --- Item 2: minimal-key-set contract (RED until step-2 impl) ---
+
+    @pytest.mark.asyncio
+    async def test_blocker_response_has_only_minimal_keys(self, tmp_path: Path):
+        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,action}.
+
+        RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
+        which is a 20-field Escalation dump. After step-2, the shape is normalized to
+        the minimal four-field contract plus 'action' from the blocker wrapper.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'action'}
+        assert set(result.keys()) == expected_keys, (
+            f"Expected minimal keys {expected_keys}, got: {set(result.keys())}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_info_response_has_only_minimal_keys(self, tmp_path: Path):
+        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by} (no 'action').
+
+        RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
+        which is a 20-field dump. After step-2, the shape is normalized to the minimal
+        four-field contract — no 'action' key (that is blocker-only).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('cancelled')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by'}
+        assert set(result.keys()) == expected_keys, (
+            f"Expected minimal keys {expected_keys} (no 'action'), got: {set(result.keys())}"
+        )
 
 
 # ---------------------------------------------------------------------------
