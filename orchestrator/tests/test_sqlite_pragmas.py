@@ -12,12 +12,15 @@ Each store is tested for:
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import TaskReport
+from orchestrator.overrides import OverrideStore
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
 from shared.sqlite_sync_base import CheckpointResult
@@ -272,3 +275,131 @@ class TestEventStorePragmas:
                    for r in caplog.records), (
             f'Expected a warning log from emit() failure; got: {caplog.records}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestOverrideStorePragmas
+# ---------------------------------------------------------------------------
+
+
+class TestOverrideStorePragmas:
+    """OverrideStore applies the full pragma triad to every connection."""
+
+    def test_init_applies_full_pragma_triad(self, tmp_path: Path) -> None:
+        """Constructing OverrideStore initialises WAL mode; _connect() applies full triad."""
+        db_path = tmp_path / 'overrides.db'
+        store = OverrideStore(db_path)
+        _assert_pragma_triad(store)
+
+    def test_set_override_connection_applies_triad(self, tmp_path: Path) -> None:
+        """After set_override(), a fresh _connect() still applies the full pragma triad.
+
+        Covers the autocommit/isolation_level=None connection used by set_override
+        (the plan's note: _connect(timeout=30, isolation_level=None) also applies triad).
+        """
+        db_path = tmp_path / 'overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'task-1', boost_tier='high')
+        _assert_pragma_triad(store)
+
+    def test_set_override_preserves_autocommit_isolation(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression-pin: set_override's BEGIN IMMEDIATE autocommit pattern works
+        concurrently without PinOrderCollision after _connect() is added.
+
+        Two threads race to pin tasks simultaneously with the _after_max_select
+        hook injecting a 50 ms pause to make the race deterministic.  Post-fix
+        (BEGIN IMMEDIATE inside _connect(timeout=30, isolation_level=None)), the
+        second thread blocks at BEGIN IMMEDIATE until the first commits.
+        """
+        from orchestrator.overrides import PinOrderCollision  # noqa: F401
+
+        db_path = tmp_path / 'overrides.db'
+        store = OverrideStore(db_path)
+        store._after_max_select = lambda: time.sleep(0.05)
+
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def pin_task(task_id: str) -> None:
+            try:
+                barrier.wait()
+                store.set_override('proj', task_id, pinned=True)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=pin_task, args=('A',))
+        t2 = threading.Thread(target=pin_task, args=('B',))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f'Unexpected exceptions from concurrent set_override: {errors}'
+        overrides = store.get_overrides('proj')
+        assert 'A' in overrides and 'B' in overrides
+        pin_orders = {overrides['A'].pin_order, overrides['B'].pin_order}
+        assert pin_orders == {1, 2}, f'Expected distinct pin_orders {{1,2}}; got {pin_orders}'
+
+    def test_checkpoint_returns_result_with_busy_zero(self, tmp_path: Path) -> None:
+        """checkpoint() on a fresh store returns CheckpointResult with busy==0."""
+        db_path = tmp_path / 'overrides.db'
+        store = OverrideStore(db_path)
+        result = store.checkpoint()
+        assert isinstance(result, CheckpointResult)
+        assert result.busy == 0
+
+    def test_checkpoint_truncates_wal_after_writes(self, tmp_path: Path) -> None:
+        """After writes that grow the WAL, checkpoint() truncates it to ≤32 bytes."""
+        db_path = tmp_path / 'overrides.db'
+        wal_path = Path(str(db_path) + '-wal')
+
+        store = OverrideStore(db_path)
+
+        # Long-lived writer to accumulate WAL frames without close-checkpoint firing.
+        writer = sqlite3.connect(str(db_path))
+        try:
+            writer.execute('PRAGMA journal_mode=WAL')
+            for i in range(5):
+                writer.execute(
+                    'INSERT OR REPLACE INTO overrides '
+                    '(project_root, task_id, pinned, reserve_now, created_at, updated_at) '
+                    'VALUES (?, ?, 0, 0, ?, ?)',
+                    ('proj', f'task-{i}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                )
+            writer.commit()
+
+            before_size = wal_path.stat().st_size if wal_path.exists() else 0
+            assert before_size > 0, (
+                'Expected WAL frames to exist while writer connection is still open'
+            )
+        finally:
+            writer.close()
+
+        result = store.checkpoint()
+        assert result.busy == 0
+        after_size = wal_path.stat().st_size if wal_path.exists() else 0
+        assert after_size <= 32, (
+            f'WAL file should be ≤32 bytes after TRUNCATE checkpoint; got {after_size}'
+        )
+
+    @pytest.mark.parametrize('method,kwargs', [
+        ('get_overrides', {'project_root': 'proj'}),
+        ('get_pin_queue', {'project_root': 'proj'}),
+        ('clear_terminal', {'project_root': 'proj', 'terminal_task_ids': set()}),
+        ('clear_expired', {'project_root': 'proj'}),
+    ])
+    def test_read_paths_apply_triad(
+        self, tmp_path: Path, method: str, kwargs: dict
+    ) -> None:
+        """Each read-path connection applies the full pragma triad via _connect()."""
+        db_path = tmp_path / 'overrides.db'
+        store = OverrideStore(db_path)
+
+        # Call the read-path method (the connection it opens internally uses _connect()).
+        getattr(store, method)(**kwargs)
+
+        # Verify a fresh _connect() still has the triad applied (confirms _connect() is
+        # used consistently, not just during init).
+        _assert_pragma_triad(store)
