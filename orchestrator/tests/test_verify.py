@@ -3838,8 +3838,8 @@ class TestRunFullVerificationReuse:
             await run_full_verification(tmp_path, config)
 
         assert call_count >= 1, (
-            f'Expected _discover_module_configs to be called when config._module_configs is empty; '
-            f'called {call_count} time(s)'
+            f'Expected _discover_module_configs to be called when config._module_configs is None '
+            f'(never-discovered sentinel); called {call_count} time(s)'
         )
 
     @pytest.mark.asyncio
