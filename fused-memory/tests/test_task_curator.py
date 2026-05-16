@@ -2609,3 +2609,168 @@ class TestCancelledPremiseBlocklistLoader:
         assert entries == []
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-3 RED: TestCancelledPremiseBlocklistMatcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCancelledPremiseBlocklistMatcher:
+    """Tests for match_candidate() from fused_memory.middleware.cancelled_premise_blocklist.
+
+    Candidate fixtures mirror task 1376's actual title/description to pin the regression.
+    """
+
+    def _make_entry(
+        self,
+        name: str = "test_entry",
+        title_subs: list | None = None,
+        desc_subs: list | None = None,
+        reason: str = "test reason",
+    ):
+        from fused_memory.middleware.cancelled_premise_blocklist import BlocklistEntry
+        return BlocklistEntry(
+            name=name,
+            reason=reason,
+            title_substrings=title_subs or ["search-then-delete", "fix c"],
+            description_substrings=desc_subs or ["fixc_flags_deleted_not_found"],
+        )
+
+    def _make_candidate(self, title: str, description: str = "", details: str = ""):
+        return CandidateTask(title=title, description=description, details=details)
+
+    def test_match_all_title_subs_and_one_desc_sub(self):
+        """(a) Matches when ALL title_substrings AND at least one description_substring hit."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is missing from dashboard.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_no_match_when_title_substring_missing(self):
+        """(b) Returns None when any title_substring is absent."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        # Title has 'fix c' but NOT 'search-then-delete'
+        candidate = self._make_candidate(
+            title="FIX C: improve flag deletion",
+            description="Includes fixc_flags_deleted_not_found metric check.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_no_description_substring_hits(self):
+        """(c) Returns None when none of description_substrings appear."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        # Title matches but description has neither substring
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Completely unrelated description about something else.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_blocklist_empty(self):
+        """(d) Returns None when entries list is empty."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is missing.",
+        )
+        result = match_candidate(candidate, [])
+        assert result is None
+
+    def test_returns_first_match_in_list_order(self):
+        """(e) When multiple entries match, returns the first one."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry_a = self._make_entry(
+            name="entry_a",
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        entry_b = self._make_entry(
+            name="entry_b",
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["stage1_flag_marker"],
+        )
+        # Candidate matches both
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="fixc_flags_deleted_not_found and stage1_flag_marker both present.",
+        )
+        result = match_candidate(candidate, [entry_a, entry_b])
+        assert result is entry_a
+
+    def test_case_insensitive_matching(self):
+        """Match is case-insensitive for both title and description."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["SEARCH-THEN-DELETE", "FIX C"],
+            desc_subs=["FIXC_FLAGS_DELETED_NOT_FOUND"],
+        )
+        candidate = self._make_candidate(
+            title="convert fix c relay-flag deletion: search-then-delete",
+            description="metric fixc_flags_deleted_not_found is not found.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_desc_substring_can_appear_in_details(self):
+        """Description_substrings are matched against description + details combined."""
+        from fused_memory.middleware.cancelled_premise_blocklist import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["stage1_flag_marker"],
+        )
+        # Match is in details, not description
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Unrelated description.",
+            details="Adds stage1_flag_marker source lookup for deleted flags.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_task_1376_title_variant_matches(self):
+        """Pin regression: actual task 1376 title/description matches the blocklist entry."""
+        from fused_memory.middleware.cancelled_premise_blocklist import (
+            BlocklistEntry,
+            match_candidate,
+        )
+
+        entry = BlocklistEntry(
+            name="fixc_flag_marker_search_then_delete",
+            reason="Fictional metric — reverted ae58a59d81f1, tasks 1376/1432",
+            title_substrings=["fix c", "search-then-delete"],
+            description_substrings=["fixc_flags_deleted_not_found", "stage1_flag_marker"],
+        )
+        # Mirrors task 1376's actual fields
+        candidate = self._make_candidate(
+            title="Convert FIX C relay-flag deletion in task_knowledge_sync.py from delete-by-recorded-ID to search-then-delete",
+            description="The _sweep_stale_fixc_markers function fails silently.",
+            details="Adds fixc_flags_deleted_not_found metric to surface the bug.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is not None
+        assert result.name == "fixc_flag_marker_search_then_delete"
