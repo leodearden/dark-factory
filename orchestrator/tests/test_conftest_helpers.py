@@ -303,4 +303,3 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
     assert db_path.suffix == '.db', (
         f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
     )
-
