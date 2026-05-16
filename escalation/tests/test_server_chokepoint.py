@@ -13,7 +13,6 @@ and the same tmp_path isolation as test_server_dedupe.py.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
