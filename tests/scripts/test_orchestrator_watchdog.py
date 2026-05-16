@@ -12,7 +12,6 @@ import subprocess
 import types
 
 import pytest
-import yaml
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
@@ -507,6 +506,7 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
     fails if WATCHED or either config file drifts to a different port number.
     The reify config is skipped gracefully if it is not reachable (e.g. CI).
     """
+    yaml = pytest.importorskip("yaml")
     wdog = _load_watchdog()
 
     # Build a unit→port map from WATCHED for convenient lookup
