@@ -781,6 +781,12 @@ class Harness:
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
 
+            # Checkpoint all SQLite WAL files while the event loop is still
+            # healthy — truncates the WAL so a subsequent crash cannot leave
+            # the stores in a half-written state.  Best-effort: failures are
+            # logged as warnings but never block shutdown.
+            self._checkpoint_stores()
+
             # Save HarnessReport alongside review checkpoint reports
             if self.report.review_checkpoints > 0:
                 self._save_harness_report()
@@ -2296,6 +2302,39 @@ Output JSON matching the schema. Every task must appear in the output.
                     logger.warning(f'Post-review module tagging failed: {tag_err}')
         except Exception as e:
             logger.error(f'Review checkpoint failed: {e}')
+
+    def _checkpoint_stores(self) -> None:
+        """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
+
+        Called from the shutdown ``finally:`` block after ``finish_run()`` so
+        the WAL is truncated while the event loop is still healthy.  Each store
+        is checkpointed independently; a failure in one does not prevent the
+        others from running.  Stores that were never created (None) are skipped
+        silently — mirrors the init-failure guard at lines 437-453.
+
+        Follows the existing harness shutdown try/except pattern used by
+        ``usage_gate.shutdown()``, ``cost_store.close()``, etc.
+        """
+        if self._run_store:
+            try:
+                result = self._run_store.checkpoint()
+                logger.info(f'run_store checkpoint: {result}')
+            except Exception as e:
+                logger.warning(f'run_store.checkpoint() failed: {e}')
+
+        if self.event_store:
+            try:
+                result = self.event_store.checkpoint()
+                logger.info(f'event_store checkpoint: {result}')
+            except Exception as e:
+                logger.warning(f'event_store.checkpoint() failed: {e}')
+
+        if self.scheduler and getattr(self.scheduler, 'override_store', None):
+            try:
+                result = self.scheduler.override_store.checkpoint()
+                logger.info(f'override_store checkpoint: {result}')
+            except Exception as e:
+                logger.warning(f'override_store.checkpoint() failed: {e}')
 
     def _save_harness_report(self) -> None:
         """Persist HarnessReport as JSON alongside review checkpoint reports."""
