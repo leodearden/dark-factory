@@ -11,15 +11,17 @@ Each store is tested for:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.harness import TaskReport
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.overrides import OverrideStore
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
@@ -403,3 +405,137 @@ class TestOverrideStorePragmas:
         # Verify a fresh _connect() still has the triad applied (confirms _connect() is
         # used consistently, not just during init).
         _assert_pragma_triad(store)
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessShutdownCheckpoint
+# ---------------------------------------------------------------------------
+
+_SENTINEL_RESULT = CheckpointResult(busy=0, log=0, checkpointed=0)
+
+
+def _make_harness_with_mock_stores() -> tuple[Harness, MagicMock, MagicMock, MagicMock]:
+    """Build a minimal Harness (via __new__) with mock stores injected.
+
+    Returns (harness, mock_run_store, mock_event_store, mock_override_store).
+    The three stores each have a `checkpoint()` returning _SENTINEL_RESULT.
+    """
+    harness = Harness.__new__(Harness)
+
+    mock_run_store = MagicMock(spec=RunStore)
+    mock_run_store.checkpoint.return_value = _SENTINEL_RESULT
+
+    mock_event_store = MagicMock(spec=EventStore)
+    mock_event_store.checkpoint.return_value = _SENTINEL_RESULT
+
+    mock_override_store = MagicMock(spec=OverrideStore)
+    mock_override_store.checkpoint.return_value = _SENTINEL_RESULT
+
+    harness._run_store = mock_run_store
+    harness.event_store = mock_event_store
+
+    # Harness.scheduler is a Scheduler whose .override_store attribute is the
+    # OverrideStore instance (see harness.py:273).
+    mock_scheduler = MagicMock()
+    mock_scheduler.override_store = mock_override_store
+    harness.scheduler = mock_scheduler
+
+    return harness, mock_run_store, mock_event_store, mock_override_store
+
+
+class TestHarnessShutdownCheckpoint:
+    """Harness._checkpoint_stores() calls checkpoint() on each store best-effort.
+
+    These tests exercise the helper that the harness shutdown path calls after
+    finish_run() and before usage_gate.shutdown() (step-10 implementation).
+    The helper is tested in isolation (via __new__) rather than running the
+    full async run() to keep the tests fast and deterministic.
+    """
+
+    def test_checkpoint_calls_all_three_stores(self) -> None:
+        """_checkpoint_stores() calls checkpoint() exactly once on each store."""
+        harness, mock_run_store, mock_event_store, mock_override_store = (
+            _make_harness_with_mock_stores()
+        )
+
+        harness._checkpoint_stores()
+
+        mock_run_store.checkpoint.assert_called_once()
+        mock_event_store.checkpoint.assert_called_once()
+        mock_override_store.checkpoint.assert_called_once()
+
+    def test_checkpoint_handles_run_store_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An OperationalError from _run_store.checkpoint() is caught and logged as warning."""
+        harness, mock_run_store, _, _ = _make_harness_with_mock_stores()
+        err = sqlite3.OperationalError('disk I/O error')
+        mock_run_store.checkpoint.side_effect = err
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            harness._checkpoint_stores()  # must not raise
+
+        assert any(
+            'run_store.checkpoint() failed' in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), f'Expected run_store.checkpoint() failed warning; got: {caplog.records}'
+
+    def test_checkpoint_handles_event_store_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An OperationalError from event_store.checkpoint() is caught and logged as warning."""
+        harness, _, mock_event_store, _ = _make_harness_with_mock_stores()
+        err = sqlite3.OperationalError('disk I/O error')
+        mock_event_store.checkpoint.side_effect = err
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            harness._checkpoint_stores()  # must not raise
+
+        assert any(
+            'event_store.checkpoint() failed' in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), f'Expected event_store.checkpoint() failed warning; got: {caplog.records}'
+
+    def test_checkpoint_handles_override_store_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An OperationalError from override_store.checkpoint() is caught and logged as warning."""
+        harness, _, _, mock_override_store = _make_harness_with_mock_stores()
+        err = sqlite3.OperationalError('disk I/O error')
+        mock_override_store.checkpoint.side_effect = err
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            harness._checkpoint_stores()  # must not raise
+
+        assert any(
+            'override_store.checkpoint() failed' in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), f'Expected override_store.checkpoint() failed warning; got: {caplog.records}'
+
+    def test_checkpoint_skips_none_run_store(self) -> None:
+        """When _run_store is None (init-failure path), checkpoint is skipped — no error."""
+        harness, _, mock_event_store, mock_override_store = (
+            _make_harness_with_mock_stores()
+        )
+        harness._run_store = None
+
+        harness._checkpoint_stores()  # must not raise AttributeError
+
+        # The other two stores still run.
+        mock_event_store.checkpoint.assert_called_once()
+        mock_override_store.checkpoint.assert_called_once()
+
+    def test_checkpoint_skips_none_event_store(self) -> None:
+        """When event_store is None (init-failure path), checkpoint is skipped — no error."""
+        harness, mock_run_store, _, mock_override_store = (
+            _make_harness_with_mock_stores()
+        )
+        harness.event_store = None
+
+        harness._checkpoint_stores()  # must not raise AttributeError
+
+        mock_run_store.checkpoint.assert_called_once()
+        mock_override_store.checkpoint.assert_called_once()
