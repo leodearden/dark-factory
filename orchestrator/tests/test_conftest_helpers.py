@@ -220,6 +220,67 @@ def test_pydantic_spec_exposes_private_attributes():
     m._module_configs = {}             # write must not raise AttributeError
 
 
+class TestInitHarnessStateForTest:
+    """Contract tests for the ``_init_harness_state_for_test`` helper.
+
+    Guards two invariants:
+
+    1. **Digest counters initialised** — after ``Harness.__new__(Harness)``
+       followed by ``_init_harness_state_for_test(h)``, the four task-1327
+       AFK-hardening digest counters exist at their ``Harness.__init__``
+       defaults.  Without the helper the attributes are absent and
+       ``_maybe_write_digest`` raises ``AttributeError`` (now surfaced by the
+       narrowed catch-all added in step-4; previously silently swallowed).
+
+    2. **Safe on already-initialised harness** — calling the helper a second
+       time on a harness that already has the four counters set does NOT raise.
+       Idempotence on *pre-existing values* is NOT required (the helper
+       unconditionally overwrites with defaults), but it must not crash so that
+       stacked helpers remain safe in future fixtures.
+    """
+
+    def test_digest_counters_set_to_init_defaults(self, tmp_path) -> None:
+        """Four task-1327 digest counters are present at their __init__ defaults.
+
+        This test FAILS before step-2 because ``_init_harness_state_for_test``
+        does not yet exist in ``_orch_helpers``.
+        """
+        from _orch_helpers import _init_harness_state_for_test
+
+        from orchestrator.harness import Harness
+
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)
+
+        assert h._escalation_event_count == 0, (
+            f'_escalation_event_count expected 0, got {h._escalation_event_count!r}'
+        )
+        assert h._last_digest_event_count == 0, (
+            f'_last_digest_event_count expected 0, got {h._last_digest_event_count!r}'
+        )
+        assert h._ewa_value == 0.0, (
+            f'_ewa_value expected 0.0, got {h._ewa_value!r}'
+        )
+        assert h._last_digest_window_end_iso == '', (
+            f'_last_digest_window_end_iso expected \'\', got {h._last_digest_window_end_iso!r}'
+        )
+
+    def test_helper_does_not_crash_on_already_initialised_harness(self, tmp_path) -> None:
+        """Calling the helper twice does not raise.
+
+        Idempotence on pre-existing values is NOT guaranteed (the helper may
+        reset them to defaults), but the call must succeed without exception so
+        that future fixtures can safely stack helpers.
+        """
+        from _orch_helpers import _init_harness_state_for_test
+
+        from orchestrator.harness import Harness
+
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)    # first call — sets defaults
+        _init_harness_state_for_test(h)    # second call — must not raise
+
+
 def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
     """mock_orch_config seeds overrides_db_path with a real Path under tmp_path.
 
