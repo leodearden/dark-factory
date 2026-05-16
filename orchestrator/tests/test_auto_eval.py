@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import _init_harness_state_for_test, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -57,6 +57,7 @@ def _make(
     config.auto_eval_phases = auto_eval_phases
 
     harness = Harness.__new__(Harness)  # bypass full Harness init
+    _init_harness_state_for_test(harness)  # task 1449: initialise digest counters
     harness.config = config
     harness.event_store = MagicMock()
     harness.event_store.emit = MagicMock()

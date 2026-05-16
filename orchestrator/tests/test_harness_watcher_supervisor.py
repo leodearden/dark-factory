@@ -22,6 +22,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from _orch_helpers import _init_harness_state_for_test
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import _WATCHER_MAX_BACKOFF_SECS, _WATCHER_TIMEOUT_GRACE_SECS, Harness
 
@@ -98,6 +100,7 @@ def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     config = config.model_copy(update={'watcher_supervisor_enabled': enabled})
     h.config = config
@@ -199,6 +202,7 @@ def _make_rotation_harness(tmp_path: Path) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None
@@ -411,6 +415,7 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     from collections import deque
 
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None

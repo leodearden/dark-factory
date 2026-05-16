@@ -16,12 +16,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from _orch_helpers import _init_harness_state_for_test
+
 from orchestrator.harness import Harness
 
 
 @pytest.fixture
 def harness() -> Harness:
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     h._workflow_cancel_events = {}
     # cancel_workflow stamps wall-clock for the reconcile sweep grace
     # window (R3 race guard) — match the real Harness attribute set.

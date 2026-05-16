@@ -13,6 +13,8 @@ import asyncio
 
 import pytest
 
+from _orch_helpers import _init_harness_state_for_test
+
 from orchestrator.harness import Harness
 
 
@@ -22,6 +24,7 @@ def harness() -> Harness:
     # Building a full Harness requires a real OrchestratorConfig; bypass __init__
     # and populate only the fields we exercise.
     h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     h._workflow_cancel_events = {}
     # cancel_workflow stamps wall-clock for the reconcile sweep's grace
     # window (R3 race guard).  Initialise here so the bypass-__init__
