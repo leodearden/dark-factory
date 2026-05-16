@@ -2756,11 +2756,15 @@ Output JSON matching the schema. Every task must appear in the output.
             # Best-effort digest check after each rotation (task 1327).
             # Single call site — applies to both clean and unclean paths.
             # Never allowed to break the supervisor: CancelledError re-raised,
-            # every other exception logged and swallowed.
+            # AttributeError re-raised (task 1449: surfaces state-init drift to
+            # tests rather than converting it to a silent warning log),
+            # every other runtime exception logged and swallowed.
             try:
                 await self._maybe_write_digest()
             except asyncio.CancelledError:
                 raise
+            except AttributeError:
+                raise  # task 1449: surface fixture-drift / state-init bugs to tests
             except Exception:
                 logger.warning(
                     '_maybe_write_digest raised unexpectedly in supervisor loop '
@@ -3389,5 +3393,7 @@ Output JSON matching the schema. Every task must appear in the output.
 
         except asyncio.CancelledError:
             raise
+        except AttributeError:
+            raise  # task 1449: surface fixture-drift / state-init bugs to tests
         except Exception:
             logger.warning('_maybe_write_digest: unexpected error (fail-open)', exc_info=True)
