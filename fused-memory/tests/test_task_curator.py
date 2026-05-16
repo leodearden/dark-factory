@@ -2797,7 +2797,7 @@ class TestCuratorConfigBlocklistPath:
         cfg = CuratorConfig(cancelled_premise_blocklist_path="/tmp/blocklist.yaml")
         assert cfg.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
 
-    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path):
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
         """FusedMemoryConfig round-trips cancelled_premise_blocklist_path via YAML."""
         import yaml
         from fused_memory.config.schema import FusedMemoryConfig
@@ -2806,7 +2806,8 @@ class TestCuratorConfigBlocklistPath:
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
 
-        cfg = FusedMemoryConfig.from_yaml(str(yaml_path))
+        monkeypatch.setenv("CONFIG_PATH", str(yaml_path))
+        cfg = FusedMemoryConfig()
         assert cfg.curator.cancelled_premise_blocklist_path == "/tmp/blocklist.yaml"
 
     def test_curator_config_none_value_explicit(self):

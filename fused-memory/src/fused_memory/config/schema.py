@@ -521,6 +521,19 @@ class CuratorConfig(BaseModel):
     # Background janitor that surfaces failed tickets to the orchestrator.
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
+    # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
+    # of a YAML file listing premises proven wrong by revert. Matching
+    # candidates are dropped before any LLM call. None disables the guard.
+    # See fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
+    cancelled_premise_blocklist_path: str | None = Field(
+        default=None,
+        description=(
+            "Path (absolute or relative to server cwd) of a YAML file listing "
+            "premises proven wrong by revert; matching candidates are dropped "
+            "before any LLM call. None disables the guard."
+        ),
+    )
+
 
 # --- Top-level ---
 
