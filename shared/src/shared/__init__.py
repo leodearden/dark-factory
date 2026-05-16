@@ -6,7 +6,6 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     apply_wal_pragmas,
 )
-from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentFailureClass,
@@ -21,6 +20,7 @@ from shared.cli_invoke import (
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.locking import files_to_modules, normalize_lock
+from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import AccountState, InvokeSlot, SessionBudgetExhausted, UsageGate
 
 __version__ = '0.1.0'

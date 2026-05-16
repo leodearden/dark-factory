@@ -19,14 +19,13 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from shared.sqlite_sync_base import CheckpointResult
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.overrides import OverrideStore
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
-from shared.sqlite_sync_base import CheckpointResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers

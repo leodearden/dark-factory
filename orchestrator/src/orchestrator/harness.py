@@ -2329,9 +2329,10 @@ Output JSON matching the schema. Every task must appear in the output.
             except Exception as e:
                 logger.warning(f'event_store.checkpoint() failed: {e}')
 
-        if self.scheduler and getattr(self.scheduler, 'override_store', None):
+        override_store = self.scheduler.override_store if self.scheduler else None
+        if override_store is not None:
             try:
-                result = self.scheduler.override_store.checkpoint()
+                result = override_store.checkpoint()
                 logger.info(f'override_store checkpoint: {result}')
             except Exception as e:
                 logger.warning(f'override_store.checkpoint() failed: {e}')

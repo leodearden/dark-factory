@@ -723,6 +723,8 @@ class Scheduler:
         self._last_effective_priorities: dict[str, str] = {}
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
+        # Public alias for shutdown-path callers (harness checkpoint) — read-only.
+        self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
         # and emit the priority_override_* / task_pinned / pin_queue_reordered events.
         self._prev_overrides_snapshot: dict[str, OverrideRow] = {}

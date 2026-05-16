@@ -30,11 +30,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
-# Sentinel used to distinguish "not supplied" from None for isolation_level.
-_UNSET: object = object()
+from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS overrides (
@@ -120,29 +118,27 @@ class OverrideStore:
         """
         return cls(config.overrides_db_path)
 
-    def _connect(
-        self,
-        *,
-        timeout: float | None = None,
-        isolation_level: str | None | object = _UNSET,
-    ) -> sqlite3.Connection:
-        """Open a connection with the full pragma triad applied.
+    def _connect(self) -> sqlite3.Connection:
+        """Open a default-isolation connection with the full pragma triad applied.
 
-        The default path (no kwargs) is used by all read-path methods and
-        write-path methods that use sqlite3's default isolation_level.
-
-        The autocommit path (``isolation_level=None, timeout=30``) is used
-        exclusively by ``set_override`` to support the ``BEGIN IMMEDIATE``
-        explicit-transaction pattern — see the docstring on that method for
-        the rationale.  Pragmas are applied before returning regardless of
-        the isolation mode; they are not transactional.
+        Used by all read-path methods and write-path methods that rely on
+        sqlite3's default isolation_level.  For the autocommit pattern used
+        by ``set_override`` see :meth:`_connect_autocommit`.
         """
-        kwargs: dict[str, object] = {}
-        if timeout is not None:
-            kwargs['timeout'] = timeout
-        if isolation_level is not _UNSET:
-            kwargs['isolation_level'] = isolation_level
-        conn = sqlite3.connect(str(self.db_path), **kwargs)
+        conn = sqlite3.connect(str(self.db_path))
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
+    def _connect_autocommit(self, *, timeout: float) -> sqlite3.Connection:
+        """Open an autocommit connection (isolation_level=None) for ``set_override``.
+
+        Pragmas are applied before returning; they are not transactional and
+        are safe to set before ``BEGIN IMMEDIATE``.  The caller owns the
+        explicit transaction boundaries.
+        """
+        conn = sqlite3.connect(
+            str(self.db_path), timeout=timeout, isolation_level=None
+        )
         apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
         return conn
 
@@ -239,7 +235,7 @@ class OverrideStore:
         # deferred-mode auto-begin.  This makes the pattern safe even if future
         # edits add DML before BEGIN IMMEDIATE (which would silently break with
         # the default isolation_level on Python <3.12).
-        conn = self._connect(timeout=30, isolation_level=None)
+        conn = self._connect_autocommit(timeout=30)
         try:
             # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
             # read and the subsequent UPSERT are serialized with respect to
