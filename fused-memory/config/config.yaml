@@ -129,6 +129,11 @@ reconciliation:
     accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
 
 curator:
+  # Cancelled-premise blocklist: YAML file listing premises proven wrong by
+  # revert. Matching candidates are dropped before any LLM call. See
+  # fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
+  cancelled_premise_blocklist_path: "config/cancelled_premise_blocklist.yaml"
+
   # Background ticket janitor — see middleware/ticket_janitor.py.
   # Replaces per-call resolve_ticket waits with a server-side sweep that
   # batches failed tickets into one info-severity ticket_failure escalation

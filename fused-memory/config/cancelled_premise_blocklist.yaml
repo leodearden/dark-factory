@@ -1,0 +1,30 @@
+# Cancelled Premise Blocklist
+# ============================================================
+# Each entry documents a premise that was tried, shipped, and reverted.
+# The curator matches incoming candidates against this list *before* any
+# LLM call. A match returns action='drop' with the operator reason below.
+#
+# Schema per entry:
+#   name                  : str  — stable identifier for the entry
+#   reason                : str  — human-readable explanation (cite revert SHA + task IDs)
+#   title_substrings      : list[str]  — ALL must appear in candidate title (case-insensitive)
+#   description_substrings: list[str]  — AT LEAST ONE must appear in
+#                           candidate description+details (case-insensitive)
+# ============================================================
+
+- name: fixc_flag_marker_search_then_delete
+  reason: >
+    The premise that _sweep_stale_fixc_markers deletes by a "recorded ID" instead
+    of by search result is fictional. The function at task_knowledge_sync.py:893
+    already deletes by search-result id. There is no stage1_flag_marker source and
+    no fixc_flags_deleted_not_found metric anywhere in the codebase. This task was
+    proposed as task 1376 and re-proposed as task 1432 after revert ae58a59d81f1.
+    Any future recurrence must be dropped without an LLM call.
+  title_substrings:
+    - "fix c"
+    - "search-then-delete"
+  description_substrings:
+    - "fixc_flags_deleted_not_found"
+    - "stage1_flag_marker"
+    - "delete-by-recorded-id"
+    - "delete by recorded id"
