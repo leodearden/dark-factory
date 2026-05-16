@@ -449,6 +449,43 @@ def test_elapsed_systemctl_not_found_returns_none(monkeypatch: pytest.MonkeyPatc
 # ---------------------------------------------------------------------------
 
 
+def test_extract_escalation_port_happy_path() -> None:
+    """_extract_escalation_port returns the int port from a well-formed config dict."""
+    cfg = {"escalation": {"port": 8102}}
+    result = _extract_escalation_port(cfg, pathlib.Path("/fake/config.yaml"))
+    assert result == 8102
+
+
+def test_extract_escalation_port_missing_escalation_key_names_path() -> None:
+    """_extract_escalation_port raises AssertionError naming the path when 'escalation' is absent."""
+    cfg = {"other_top_key": 5}
+    fake_path = pathlib.Path("/fake/orchestrator/config.yaml")
+    with pytest.raises(AssertionError) as exc_info:
+        _extract_escalation_port(cfg, fake_path)
+    msg = str(exc_info.value)
+    assert "/fake/orchestrator/config.yaml" in msg, (
+        f"AssertionError message must name the config path; got: {msg!r}"
+    )
+    assert "escalation.port" in msg, (
+        f"AssertionError message must mention 'escalation.port'; got: {msg!r}"
+    )
+
+
+def test_extract_escalation_port_missing_port_key_names_path() -> None:
+    """_extract_escalation_port raises AssertionError naming the path when 'port' is absent."""
+    cfg = {"escalation": {"queue_dir": "data/escalations"}}
+    fake_path = pathlib.Path("/fake/orchestrator/config.yaml")
+    with pytest.raises(AssertionError) as exc_info:
+        _extract_escalation_port(cfg, fake_path)
+    msg = str(exc_info.value)
+    assert "/fake/orchestrator/config.yaml" in msg, (
+        f"AssertionError message must name the config path; got: {msg!r}"
+    )
+    assert "escalation.port" in msg, (
+        f"AssertionError message must mention 'escalation.port'; got: {msg!r}"
+    )
+
+
 def test_watched_ports_match_configured_escalation_ports() -> None:
     """WATCHED ports must equal the escalation.port values in each orchestrator's config.
 
