@@ -152,6 +152,8 @@ def create_server(
             # Submit then immediately resolve — gives a precise audit record.
             # Bypass _submit_or_dedupe to avoid folding into a dedupe parent
             # and resolving the wrong record.
+            # Returns minimal shape: {id, status, resolution, resolved_by}.
+            # The blocker wrapper adds 'action' separately.
             queue.submit(esc)
             resolved = queue.resolve(
                 esc.id,
@@ -161,7 +163,7 @@ def create_server(
             if resolved is None:
                 # resolve() could not re-read the record immediately after submit.
                 # Unlikely in practice, but the escalation may remain pending.
-                # Fail-safe: return esc.to_dict() (status='pending') rather than
+                # Fail-safe: return esc fields (status='pending') rather than
                 # dropping the escalation.  The inconsistency is logged here.
                 logger.warning(
                     'task %s: queue.resolve() returned None after terminal auto-resolve '
@@ -169,7 +171,15 @@ def create_server(
                     'Returning pre-resolve record as fallback.',
                     esc.task_id, esc.id,
                 )
-            return (resolved or esc).to_dict()
+                src = esc
+            else:
+                src = resolved
+            return {
+                'id': src.id,
+                'status': src.status,
+                'resolution': src.resolution,
+                'resolved_by': src.resolved_by,
+            }
 
         # Non-terminal or unknown status → submit normally
         return _submit_or_dedupe(esc)
