@@ -384,6 +384,15 @@ class TestGetSchedulerEventsTool:
         assert '?' not in path_portion, (
             f'Unencoded ? in path portion of URI: {captured_uri!r}'
         )
+        # Canonicalization check: path portion must equal the *resolved* db path URI.
+        # If .resolve() were dropped from production, this would catch the regression on
+        # platforms where tmp_path contains symlink components (e.g. /tmp -> /private/tmp
+        # on macOS).
+        resolved_db = (tmp_path / 'data' / 'orchestrator' / 'runs.db').resolve()
+        assert path_portion == resolved_db.as_uri(), (
+            f'URI path portion does not match resolved-path URI; '
+            f'got {path_portion!r}, want {resolved_db.as_uri()!r}'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('fragment', ['has?question', 'has#hash', 'has%41literal'])

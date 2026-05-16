@@ -254,6 +254,14 @@ class TestDbPool:
             assert '?' not in path_portion, (
                 f'Unencoded ? in path portion of URI: {captured_uri!r}'
             )
+            # Canonicalization check: path portion must equal the *resolved* db path URI.
+            # If .resolve() were dropped from production, this would catch the regression on
+            # platforms where db_path contains symlink components.
+            resolved_db = db_path.resolve()
+            assert path_portion == resolved_db.as_uri(), (
+                f'URI path portion does not match resolved-path URI; '
+                f'got {path_portion!r}, want {resolved_db.as_uri()!r}'
+            )
         finally:
             await pool.close_all()
 

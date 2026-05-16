@@ -75,8 +75,7 @@ async def read_scheduler_events(
     **Path canonicalization**: the runs.db path is passed through
     ``Path.resolve()`` before the SQLite URI is constructed, mirroring the
     ``resolve()``-then-``as_uri()`` pattern used by ``DbPool.get`` in
-    ``dashboard/src/dashboard/data/db.py`` (line 72 ``resolved = db_path.resolve()``;
-    line 103 ``f'{resolved.as_uri()}?mode=ro'``).  This ensures that symlinks in
+    ``dashboard/src/dashboard/data/db.py``.  This ensures that symlinks in
     the path are expanded before the URI is built, so the connection always targets
     the real file.  **Symlink deployments beware**: if ``project_root`` is itself
     a symlink (or contains symlink components), the SQLite connection will target
