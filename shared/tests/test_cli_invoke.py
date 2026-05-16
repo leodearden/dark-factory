@@ -641,6 +641,58 @@ class TestCapHitResume:
             assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
 
+# ── Caller-initiated resume (crash recovery) ───────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCallerInitiatedResume:
+    """Regression for crash-recovery prompt-loss at workflow ↔ cli_invoke boundary.
+
+    When the orchestrator resumes a crashed agent, it now passes the real task
+    prompt + resume_session_id to invoke_with_cap_retry.  cli_invoke must
+    substitute CRASH_RECOVERY_RESUME_PROMPT for the first subprocess call and
+    restore the real task prompt on any non-cap resume failure fallback.
+    """
+
+    async def test_caller_resume_substitutes_continuation_prompt_and_restores_real_prompt_on_fresh_fallback(self):
+        """cli_invoke swaps in CRASH_RECOVERY_RESUME_PROMPT then restores real prompt on fallback."""
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT  # noqa: PLC0415
+
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok-1', 'tok-2']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+
+        failed_resume = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            side_effect=[failed_resume, ok_result],
+        ) as mock_invoke:
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='real task prompt',
+                resume_session_id='sess-xyz',
+            )
+
+        assert got.success is True
+        assert mock_invoke.call_count == 2
+
+        # First call: resume attempt — cli_invoke must substitute the continuation prompt
+        first_call = mock_invoke.call_args_list[0]
+        assert first_call.kwargs.get('prompt') == CRASH_RECOVERY_RESUME_PROMPT
+        assert first_call.kwargs.get('resume_session_id') == 'sess-xyz'
+
+        # Second call: fresh fallback — real task prompt restored, no resume_session_id
+        second_call = mock_invoke.call_args_list[1]
+        assert 'resume_session_id' not in second_call.kwargs
+        assert second_call.kwargs.get('prompt') == 'real task prompt'
+
+
 # ── ARG_MAX protection ─────────────────────────────────────────────────
 
 
