@@ -320,12 +320,13 @@ class TestGetSchedulerEventsTool:
     async def test_read_scheduler_events_builds_uri_via_path_as_uri(
         self, tmp_path, mcp_server
     ):
-        """read_scheduler_events must build the SQLite connect URI using Path.as_uri().
+        """read_scheduler_events must build the SQLite connect URI in canonical file:/// form.
 
-        The connect string passed to aiosqlite.connect must be exactly
-        ``f'{db_path.as_uri()}?mode=ro'`` — the canonical ``file:///`` form.
-        This is the behavioral contract test for task 1351; it is RED on the
-        old ``file:/...`` form and GREEN after the swap to as_uri().
+        Verifies that the connect string passed to aiosqlite.connect starts with
+        ``file:///``, ends with ``?mode=ro``, carries ``uri=True``, and that the
+        path portion contains no unencoded ``?`` characters.  Exact formula is not
+        re-derived (that would be a change-detector); the implementation-independent
+        checks below fully enforce the URI canonicalization contract.
         """
         from unittest.mock import patch
 
@@ -342,9 +343,6 @@ class TestGetSchedulerEventsTool:
                 }
             ],
         )
-
-        db_path = tmp_path / 'data' / 'orchestrator' / 'runs.db'
-        expected_uri = f'{db_path.as_uri()}?mode=ro'
 
         real_connect = _aiosqlite.connect
         captured_uri = None
@@ -370,9 +368,6 @@ class TestGetSchedulerEventsTool:
             f"Expected 'count' key (got error envelope instead): {result!r}"
         )
         assert result['count'] == 1, f'Expected count=1, got {result!r}'
-        assert captured_uri == expected_uri, (
-            f'Expected URI {expected_uri!r}, got {captured_uri!r}'
-        )
         assert captured_uri is not None
         assert captured_uri.startswith('file:///'), (
             f'Expected file:/// form (Path.as_uri()), got {captured_uri!r}'
@@ -388,6 +383,15 @@ class TestGetSchedulerEventsTool:
         path_portion = captured_uri.removesuffix('?mode=ro')
         assert '?' not in path_portion, (
             f'Unencoded ? in path portion of URI: {captured_uri!r}'
+        )
+        # Canonicalization check: path portion must equal the *resolved* db path URI.
+        # If .resolve() were dropped from production, this would catch the regression on
+        # platforms where tmp_path contains symlink components (e.g. /tmp -> /private/tmp
+        # on macOS).
+        resolved_db = (tmp_path / 'data' / 'orchestrator' / 'runs.db').resolve()
+        assert path_portion == resolved_db.as_uri(), (
+            f'URI path portion does not match resolved-path URI; '
+            f'got {path_portion!r}, want {resolved_db.as_uri()!r}'
         )
 
     @pytest.mark.asyncio

@@ -71,6 +71,17 @@ async def read_scheduler_events(
     ``data`` is the JSON-parsed payload (dict), never a raw string.
 
     Returns ``{'events': [], 'count': 0}`` when the database is missing.
+
+    **Path canonicalization**: the runs.db path is passed through
+    ``Path.resolve()`` before the SQLite URI is constructed, mirroring the
+    ``resolve()``-then-``as_uri()`` pattern used by ``DbPool.get`` in
+    ``dashboard/src/dashboard/data/db.py``.  This ensures that symlinks in
+    the path are expanded before the URI is built, so the connection always targets
+    the real file.  **Symlink deployments beware**: if ``project_root`` is itself
+    a symlink (or contains symlink components), the SQLite connection will target
+    the resolved (canonical) path rather than the symlinked one.  This is
+    intentional — it avoids URI-encoding ambiguity — but it is a silent behavioral
+    change relative to a raw path open.
     """
     import aiosqlite
 
