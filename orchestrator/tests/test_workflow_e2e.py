@@ -5384,7 +5384,7 @@ class TestDryRunUnblockE2EGuardOptOut:
         # token — it names the contract rather than a class name or filename that
         # could change without breaking the guard's behavior.
         with pytest.raises(AssertionError, match=r'mocks_dry_run_unblock'):
-            _wf.run_dry_run_unblock(
+            _wf.run_dry_run_unblock(  # type: ignore[unused-coroutine]
                 task_id='t',
                 worktree='/tmp',
                 reason='r',
