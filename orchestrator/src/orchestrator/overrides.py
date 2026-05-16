@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
+
 from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 
 _SCHEMA = """\
@@ -116,11 +118,49 @@ class OverrideStore:
         """
         return cls(config.overrides_db_path)
 
-    def _ensure_schema(self) -> None:
+    def _connect(self) -> sqlite3.Connection:
+        """Open a default-isolation connection with the full pragma triad applied.
+
+        Used by all read-path methods and write-path methods that rely on
+        sqlite3's default isolation_level.  For the autocommit pattern used
+        by ``set_override`` see :meth:`_connect_autocommit`.
+        """
         conn = sqlite3.connect(str(self.db_path))
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
+    def _connect_autocommit(self, *, timeout: float) -> sqlite3.Connection:
+        """Open an autocommit connection (isolation_level=None) for ``set_override``.
+
+        Pragmas are applied before returning; they are not transactional and
+        are safe to set before ``BEGIN IMMEDIATE``.  The caller owns the
+        explicit transaction boundaries.
+        """
+        conn = sqlite3.connect(
+            str(self.db_path), timeout=timeout, isolation_level=None
+        )
+        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+        return conn
+
+    def _ensure_schema(self) -> None:
+        conn = self._connect()
         try:
-            conn.execute('PRAGMA journal_mode=WAL')
             conn.executescript(_SCHEMA)
+        finally:
+            conn.close()
+
+    def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
+
+        Best-effort: callers (e.g. harness shutdown) should wrap this in
+        ``try/except`` so a failure cannot block clean shutdown.
+        """
+        conn = self._connect()
+        try:
+            busy, log, checkpointed = conn.execute(
+                'PRAGMA wal_checkpoint(TRUNCATE)'
+            ).fetchone()
+            return CheckpointResult(busy=busy, log=log, checkpointed=checkpointed)
         finally:
             conn.close()
 
@@ -195,7 +235,7 @@ class OverrideStore:
         # deferred-mode auto-begin.  This makes the pattern safe even if future
         # edits add DML before BEGIN IMMEDIATE (which would silently break with
         # the default isolation_level on Python <3.12).
-        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
+        conn = self._connect_autocommit(timeout=30)
         try:
             # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
             # read and the subsequent UPSERT are serialized with respect to
@@ -303,7 +343,7 @@ class OverrideStore:
         """
         _VALID_FIELDS = {'boost_tier', 'pinned', 'reserve_now', 'ttl'}
         now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             if field is None:
                 cur = conn.execute(
@@ -376,7 +416,7 @@ class OverrideStore:
             )
 
         now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             # Wrap in a single transaction so a mid-loop failure (interrupt,
             # OS error, SQLite lock contention) rolls back all updates atomically.
@@ -409,7 +449,7 @@ class OverrideStore:
             return []
 
         placeholders = ','.join('?' * len(terminal_task_ids))
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 f'DELETE FROM overrides '
@@ -440,7 +480,7 @@ class OverrideStore:
         if now is None:
             now = datetime.now(UTC)
 
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'DELETE FROM overrides '
@@ -463,7 +503,7 @@ class OverrideStore:
 
     def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
         """Return all override rows for *project_root*, keyed by task_id."""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
@@ -486,7 +526,7 @@ class OverrideStore:
         Returns a list of ``(task_id, OverrideRow)`` tuples filtered to
         ``pinned=1`` and ordered by ``pin_order ASC``.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()
         try:
             rows = conn.execute(
                 'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '

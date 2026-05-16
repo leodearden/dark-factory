@@ -115,6 +115,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            sqlite_sync_base,
             usage_gate,
         )
 
@@ -125,6 +126,7 @@ class TestInitAllCompleteness:
             | set(cost_store.__all__)
             | set(async_sqlite_base.__all__)
             | set(locking.__all__)
+            | set(sqlite_sync_base.__all__)
         )
         assert set(shared.__all__) == union, (
             f'shared.__all__ must equal union of submodule __all__.\n'
@@ -140,6 +142,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            sqlite_sync_base,
             usage_gate,
         )
 
@@ -151,6 +154,7 @@ class TestInitAllCompleteness:
             (cost_store, 'cost_store'),
             (async_sqlite_base, 'async_sqlite_base'),
             (locking, 'locking'),
+            (sqlite_sync_base, 'sqlite_sync_base'),
         ]:
             private = [s for s in module.__all__ if s.startswith('_')]
             assert private == [], (
