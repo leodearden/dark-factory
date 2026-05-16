@@ -198,6 +198,34 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 
 
+def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
+    """Build a pre-triage-flavoured mock gate wired with a real InvokeSlot.
+
+    Lifted from ``TestPreTriageUsageGateCleanup._gate`` (task 1458 step-9) to
+    module scope so that ``TestMakePreTriageGate`` can exercise it as a
+    standalone contract and any future test can call it directly without
+    inheriting from the fixture class.
+
+    Parameters
+    ----------
+    token:
+        OAuth token returned by ``gate.before_invoke()``.
+    cap_effects:
+        Optional list of bool values used as ``side_effect`` on
+        ``gate.detect_cap_hit``.  When ``None`` (the default), a
+        ``MagicMock(return_value=False)`` is used instead.
+    """
+    gate = _make_gate(
+        before_invoke=AsyncMock(return_value=token),
+        detect_cap_hit=(
+            MagicMock(side_effect=cap_effects)
+            if cap_effects is not None
+            else MagicMock(return_value=False)
+        ),
+    )
+    return _attach_invoke_slot(gate)
+
+
 def _make_gate_yielding(slots):
     """Build a mock UsageGate whose successive invoke_slot() calls yield the
     given slots in order (one per iteration of the while-loop in production).
@@ -1763,25 +1791,13 @@ class TestPreTriageUsageGateCleanup:
         ]
         return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
 
-    @staticmethod
-    def _gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
-        gate = _make_gate(
-            before_invoke=AsyncMock(return_value=token),
-            detect_cap_hit=(
-                MagicMock(side_effect=cap_effects)
-                if cap_effects is not None
-                else MagicMock(return_value=False)
-            ),
-        )
-        return _attach_invoke_slot(gate)
-
     async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
         """After successful _pre_triage_suggestions, gate.confirm_account_ok('tok-a') is called.
 
         FAILS with current code because _pre_triage_suggestions never calls confirm_account_ok.
         PASSES after refactor to invoke_with_cap_retry which calls it on the success path.
         """
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.5, session_id='sess-triage')
 
@@ -1798,7 +1814,7 @@ class TestPreTriageUsageGateCleanup:
         around invoke_agent that calls release_probe_slot.
         PASSES after refactor to invoke_with_cap_retry which has the BaseException handler.
         """
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
 
         with (
@@ -1817,7 +1833,7 @@ class TestPreTriageUsageGateCleanup:
         FAILS with current code because _pre_triage_suggestions never calls detect_cap_hit.
         PASSES after refactor to invoke_with_cap_retry which loops on cap hits.
         """
-        gate = self._gate(cap_effects=[True, False])
+        gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.3, session_id='sess-triage')
 
@@ -1838,7 +1854,7 @@ class TestPreTriageUsageGateCleanup:
         resume_session_id so the capped session is resumed rather than restarted fresh.
         """
         steward.config.backends.triage = 'claude'
-        gate = self._gate(cap_effects=[True, False])
+        gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
 
         cap_result = _make_result(cost=0.1, session_id='sess-cap')
@@ -1859,7 +1875,7 @@ class TestPreTriageUsageGateCleanup:
 
     async def test_cancelled_error_releases_probe_slot(self, steward: TaskSteward):
         """CancelledError (BaseException, not Exception) also triggers release_probe_slot."""
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
 
         with (
@@ -1874,7 +1890,7 @@ class TestPreTriageUsageGateCleanup:
 
     async def test_confirm_account_ok_not_called_on_exception(self, steward: TaskSteward):
         """On exception, confirm_account_ok is NOT called — only release_probe_slot is."""
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
 
         with (
@@ -1892,7 +1908,7 @@ class TestPreTriageUsageGateCleanup:
 
         Previously called explicitly; now delegated to invoke_with_cap_retry.
         """
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.42, session_id='sess-triage')
 
@@ -1904,7 +1920,7 @@ class TestPreTriageUsageGateCleanup:
 
     async def test_metrics_tracked_after_refactor(self, steward: TaskSteward):
         """steward.metrics are updated from the invoke_with_cap_retry result."""
-        gate = self._gate()
+        gate = _make_pre_triage_gate()
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.77, duration_ms=3500, session_id='sess-triage')
 
