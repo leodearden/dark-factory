@@ -960,12 +960,30 @@ class TaskCurator:
                 unique_indices.append(i)
         # ── End pre-batch dedup ────────────────────────────────────────────────
 
+        # ── Cancelled-premise blocklist check ─────────────────────────────────
+        # For each unique candidate, check the operator-curated blocklist BEFORE
+        # corpus assembly or any LLM call.  Blocklist hits are dropped
+        # deterministically and their decisions stored in the idempotency cache
+        # so identical retries short-circuit without re-loading the YAML.
+        blocklist_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
+        non_blocklist_unique: list[int] = []
+        for i in unique_indices:
+            bl_decision = await self._maybe_blocklist_drop(
+                candidates[i], candidates[i].payload_hash(),
+            )
+            if bl_decision is not None:
+                blocklist_decisions[i] = bl_decision
+            else:
+                non_blocklist_unique.append(i)
+        unique_indices = non_blocklist_unique
+        # ── End blocklist check ───────────────────────────────────────────────
+
         # ── Decision cache check ───────────────────────────────────────────────
-        # Consult the idempotency cache for each unique candidate before issuing
-        # an LLM call.  Under steady-state load (the same candidates repeat),
-        # cache-hit items are resolved without an LLM round-trip.
-        # `llm_k_list` holds positions *within unique_indices* (k values) for
-        # candidates that were NOT in the cache.
+        # Consult the idempotency cache for each unique (non-blocklist) candidate
+        # before issuing an LLM call.  Under steady-state load (the same
+        # candidates repeat), cache-hit items are resolved without an LLM
+        # round-trip.  `llm_k_list` holds positions *within unique_indices*
+        # (k values) for candidates that were NOT in the cache.
         llm_k_list: list[int] = []
         cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
         for k, original_i in enumerate(unique_indices):
@@ -1041,7 +1059,11 @@ class TaskCurator:
         }
 
         decisions = [
-            pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
+            pre_dedup_decisions[i]
+            if i in pre_dedup_decisions
+            else blocklist_decisions[i]
+            if i in blocklist_decisions
+            else unique_decision_map[i]
             for i in range(len(candidates))
         ]
 
