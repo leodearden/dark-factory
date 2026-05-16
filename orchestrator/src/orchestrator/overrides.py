@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
+
+# Sentinel used to distinguish "not supplied" from None for isolation_level.
+_UNSET: object = object()
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS overrides (
