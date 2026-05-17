@@ -19,7 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dashboard.app import app, lifespan
+from dashboard.app import _BurndownStore, _MetricsStore, _burndown_loop, _metrics_loop, app, lifespan
+from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
+from shared.async_sqlite_base import CheckpointResult
 
 
 # ---------------------------------------------------------------------------
@@ -140,4 +143,61 @@ async def test_metrics_store_applies_full_pragma_triad_after_lifespan(
     # After lifespan exits the store must be closed.
     assert app.state.metrics_store._conn is None, (
         'metrics_store._conn should be None after lifespan exit (store not closed)'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: burndown loop invokes periodic checkpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
+    """_burndown_loop calls store.checkpoint() on the periodic interval timer.
+
+    Drives _burndown_loop directly (no lifespan), patches _CHECKPOINT_INTERVAL_SECONDS
+    to 0 so the checkpoint fires on the first loop body iteration, and asserts that
+    store.checkpoint was called at least once before the task is cancelled.
+    """
+    store = _BurndownStore(tmp_path / 'burndown.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # Replace checkpoint with an AsyncMock so we can count invocations.
+    checkpoint_mock = AsyncMock(return_value=CheckpointResult(0, 0, 0))
+    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
+
+    # Build a minimal config (no network needed — collect_snapshot is patched).
+    config = DashboardConfig(project_root=tmp_path)
+
+    called_event = asyncio.Event()
+    call_count = 0
+
+    async def _snapshot_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            called_event.set()
+
+    mock_collect = AsyncMock(side_effect=_snapshot_side_effect)
+
+    try:
+        with (
+            patch('dashboard.app.collect_snapshot', mock_collect),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(return_value=None)),
+            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
+        ):
+            task = asyncio.create_task(
+                _burndown_loop(store, config, MagicMock())
+            )
+            try:
+                await asyncio.wait_for(called_event.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    assert checkpoint_mock.called, (
+        '_burndown_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
     )
