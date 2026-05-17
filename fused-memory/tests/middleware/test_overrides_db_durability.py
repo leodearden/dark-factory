@@ -76,6 +76,22 @@ class TestOpenOverridesDbPragmas:
         assert checkpoint_row is not None and checkpoint_row[0] == 100
         assert size_row is not None and size_row[0] == 67108864
 
+        # Verify that journal_mode=WAL persists in the DB file header — not just
+        # on the returned connection.  Re-open via raw sqlite3 (a fresh
+        # connection that never called PRAGMA journal_mode=WAL) and confirm the
+        # mode is still 'wal'.  This guards against a regression where
+        # _open_overrides_db sets the pragma on one connection but returns a
+        # different connection without it.
+        db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        raw = sqlite3.connect(str(db_file))
+        try:
+            (raw_journal,) = raw.execute('PRAGMA journal_mode').fetchone()
+        finally:
+            raw.close()
+        assert raw_journal == 'wal', (
+            f'Expected journal_mode=wal to persist in DB file; got {raw_journal!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestCheckpointOverridesDb
@@ -121,9 +137,13 @@ class TestCheckpointOverridesDb:
 
         # Long-lived writer: keeps the connection open across commits so the WAL
         # accumulates without the PASSIVE close-checkpoint truncating it.
+        # Pin wal_autocheckpoint=0 to prevent SQLite from auto-checkpointing
+        # on commit (the default threshold of 1000 is safe in practice, but
+        # explicit pinning removes an implicit dependency on the platform default).
         writer = sqlite3.connect(str(db_path))
         try:
             writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
             for i in range(5):
                 writer.execute(
                     'INSERT OR REPLACE INTO overrides '

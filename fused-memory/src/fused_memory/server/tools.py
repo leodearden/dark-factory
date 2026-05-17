@@ -115,12 +115,51 @@ async def _open_overrides_db(
     return db
 
 
+async def _connect_overrides_db(
+    project_root: str,
+    *,
+    autocommit: bool = False,
+) -> aiosqlite.Connection:
+    """Open scheduler_overrides.db with the full durability pragma triad — no DDL.
+
+    Thinner sibling to :func:`_open_overrides_db`.  Applies the same five
+    Phase-3 pragmas (via ``apply_full_durability_pragmas``) but skips the
+    ``_OVERRIDE_SCHEMA`` DDL step.  Use when the schema is guaranteed to
+    exist already (e.g. :func:`_checkpoint_overrides_db`, which only needs a
+    live connection with correct pragmas — re-running DDL on every checkpoint
+    tick is wasted IO and can produce spurious write-lock contention).
+
+    When ``autocommit=True`` the connection is opened with
+    ``isolation_level=None`` and ``timeout=30``, matching the semantics of
+    :func:`_open_overrides_db`.
+    """
+    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if autocommit:
+        db = await aiosqlite.connect(
+            str(db_path),
+            timeout=30,
+            isolation_level=None,
+        )
+    else:
+        db = await aiosqlite.connect(str(db_path))
+    busy_ms = 30000 if autocommit else 5000
+    await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
+    return db
+
+
 async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
     """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on the scheduler_overrides.db.
 
-    Opens a fresh connection via ``_open_overrides_db``, executes a TRUNCATE
-    checkpoint, parses the result row into a ``CheckpointResult`` named-tuple,
-    and closes the connection.
+    Opens a fresh connection via :func:`_connect_overrides_db` (no DDL —
+    schema must already exist), executes a TRUNCATE checkpoint, parses the
+    result row into a ``CheckpointResult`` named-tuple, and closes the
+    connection.
+
+    Using :func:`_connect_overrides_db` rather than :func:`_open_overrides_db`
+    avoids re-running ``_OVERRIDE_SCHEMA`` DDL on every checkpoint tick, which
+    would be wasted IO and could produce spurious write-lock contention in a
+    periodic-checkpoint loop.
 
     Callers (e.g. a future periodic-checkpoint wiring task) drive this helper
     to bound WAL growth on the override DB.  Wiring into
@@ -139,7 +178,7 @@ async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
             happen in normal operation; mirrors ``AsyncSqliteBase.checkpoint``
             at ``shared/src/shared/async_sqlite_base.py:199-200``).
     """
-    db = await _open_overrides_db(project_root)
+    db = await _connect_overrides_db(project_root)
     try:
         async with db.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cur:
             row = await cur.fetchone()
