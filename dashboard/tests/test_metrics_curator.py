@@ -18,7 +18,7 @@ import aiosqlite
 import httpx
 import pytest
 
-from dashboard.app import _metrics_loop
+from dashboard.app import _MetricsStore, _metrics_loop
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
@@ -787,9 +787,9 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         MagicMock()
     )  # collect_metrics_snapshot is patched; client never used
 
-    metrics_conn = await aiosqlite.connect(':memory:')
-    await metrics_conn.executescript(METRICS_SCHEMA)
-    await metrics_conn.commit()
+    # _metrics_loop now takes a _MetricsStore, not a raw aiosqlite.Connection.
+    metrics_store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await metrics_store.open()
 
     expected_conn = None
     loop_opened = False
@@ -797,7 +797,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
             # aligned-sleep loop.  We cancel the task once the event fires.
-            task = asyncio.create_task(_metrics_loop(metrics_conn, mock_app))
+            task = asyncio.create_task(_metrics_loop(metrics_store, mock_app))
             try:
                 # 2 s is generous for a single fast AsyncMock _run_once() cycle.
                 await asyncio.wait_for(called_event.wait(), timeout=2.0)
@@ -814,7 +814,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         # DbPool.get() is idempotent: returns the same cached object on repeat call.
         expected_conn = await pool.get(fixed_config.tickets_db)
     finally:
-        await metrics_conn.close()
+        await metrics_store.close()
         await pool.close_all()
 
     assert mock_collect.called, 'collect_metrics_snapshot was never called'
