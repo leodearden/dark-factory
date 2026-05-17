@@ -143,6 +143,11 @@ class _BurndownStore(AsyncSqliteBase):
     def _schema(self) -> str:
         return BURNDOWN_SCHEMA
 
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """Public accessor for the open connection; raises RuntimeError if not opened."""
+        return self._require_conn()
+
 
 class _MetricsStore(AsyncSqliteBase):
     """Writable WAL-mode store for the metrics snapshot collector.
@@ -155,6 +160,11 @@ class _MetricsStore(AsyncSqliteBase):
     @property
     def _schema(self) -> str:
         return METRICS_SCHEMA
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """Public accessor for the open connection; raises RuntimeError if not opened."""
+        return self._require_conn()
 
 
 async def _sleep_to_aligned_tick(interval: int) -> None:
@@ -175,7 +185,7 @@ async def _burndown_loop(
     client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot task status counts into the burndown DB."""
-    conn = store._require_conn()
+    conn = store.connection
     try:
         await collect_snapshot(conn, config, client)
     except Exception:
@@ -184,7 +194,7 @@ async def _burndown_loop(
     last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
-        conn = store._require_conn()
+        conn = store.connection
         try:
             await collect_snapshot(conn, config, client)
             now = time.monotonic()
@@ -192,8 +202,10 @@ async def _burndown_loop(
                 await downsample(conn)
                 last_downsample = now
             if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
-                with contextlib.suppress(Exception):
+                try:
                     await store.checkpoint()
+                except Exception:
+                    logger.warning('Periodic WAL checkpoint failed (burndown)', exc_info=True)
                 last_checkpoint = now
         except Exception:
             logger.warning('Burndown snapshot error', exc_info=True)
@@ -212,7 +224,7 @@ async def _metrics_loop(
     """
 
     async def _run_once() -> None:
-        conn = store._require_conn()
+        conn = store.connection
         config: DashboardConfig = app.state.config
         pool: DbPool = app.state.db
         http_client: httpx.AsyncClient = app.state.http_client
@@ -242,14 +254,16 @@ async def _metrics_loop(
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         try:
             await _run_once()
-            conn = store._require_conn()
+            conn = store.connection
             now = time.monotonic()
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample_metrics(conn)
                 last_downsample = now
             if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
-                with contextlib.suppress(Exception):
+                try:
                     await store.checkpoint()
+                except Exception:
+                    logger.warning('Periodic WAL checkpoint failed (metrics)', exc_info=True)
                 last_checkpoint = now
         except Exception:
             logger.warning('Metrics snapshot error', exc_info=True)
