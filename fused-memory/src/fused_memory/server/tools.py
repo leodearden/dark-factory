@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
@@ -73,6 +74,46 @@ _PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish
 # Mirrors orchestrator.overrides.OverrideStore.clear_override validation at
 # orchestrator/src/orchestrator/overrides.py:258.
 _VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
+
+async def _open_overrides_db(
+    project_root: str,
+    *,
+    autocommit: bool = False,
+) -> aiosqlite.Connection:
+    """Open (and initialise) the scheduler_overrides.db for project_root.
+
+    Creates parent directories on first call, runs idempotent DDL, and
+    applies the full Phase-3 durability pragma triad (journal_mode=WAL,
+    busy_timeout, synchronous=FULL, wal_autocheckpoint=100,
+    journal_size_limit=64MiB) via ``apply_full_durability_pragmas``.
+    See ``docs/task-recovery-2026-05-13/`` for the production incident that
+    mandated this convention across all fused-memory SQLite stores.
+
+    When ``autocommit=True`` the connection is opened with
+    ``isolation_level=None`` and ``timeout=30`` so callers can use explicit
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` to serialize
+    read-then-write sequences against concurrent writers.  Mirrors the
+    source-of-truth concurrency contract at
+    orchestrator/src/orchestrator/overrides.py:177-195 which documents
+    why ``set_override`` MUST use this pattern.
+    """
+    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if autocommit:
+        db = await aiosqlite.connect(
+            str(db_path),
+            timeout=30,
+            isolation_level=None,
+        )
+    else:
+        db = await aiosqlite.connect(str(db_path))
+    # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
+    # to 30s for the write lock (matches source-of-truth timeout=30 above).
+    busy_ms = 30000 if autocommit else 5000
+    await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
+    await db.executescript(_OVERRIDE_SCHEMA)
+    return db
+
 
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
@@ -2300,45 +2341,6 @@ def create_mcp_server(
     #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
     #   (2) cross-store separation — override row survives the status transition.
     # ------------------------------------------------------------------
-
-    async def _open_overrides_db(
-        project_root: str,
-        *,
-        autocommit: bool = False,
-    ) -> aiosqlite.Connection:
-        """Open (and initialise) the scheduler_overrides.db for project_root.
-
-        Creates parent directories on first call, runs idempotent DDL, and
-        sets PRAGMA journal_mode=WAL / busy_timeout / synchronous=FULL.
-
-        When ``autocommit=True`` the connection is opened with
-        ``isolation_level=None`` and ``timeout=30`` so callers can use explicit
-        ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` to serialize
-        read-then-write sequences against concurrent writers.  Mirrors the
-        source-of-truth concurrency contract at
-        orchestrator/src/orchestrator/overrides.py:177-195 which documents
-        why ``set_override`` MUST use this pattern.
-        """
-        from pathlib import Path as _Path
-
-        db_path = _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        if autocommit:
-            db = await aiosqlite.connect(
-                str(db_path),
-                timeout=30,
-                isolation_level=None,
-            )
-        else:
-            db = await aiosqlite.connect(str(db_path))
-        await db.execute('PRAGMA journal_mode=WAL')
-        # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
-        # to 30s for the write lock (matches source-of-truth timeout=30 above).
-        busy_ms = 30000 if autocommit else 5000
-        await db.execute(f'PRAGMA busy_timeout={busy_ms}')
-        await db.execute('PRAGMA synchronous=FULL')
-        await db.executescript(_OVERRIDE_SCHEMA)
-        return db
 
     async def _emit_override_audit(
         project_root: str,
