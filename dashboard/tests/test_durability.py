@@ -18,12 +18,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from dashboard.app import _BurndownStore, _MetricsStore, _burndown_loop, _metrics_loop, app, lifespan
-from dashboard.config import DashboardConfig
-from dashboard.data.db import DbPool
 from shared.async_sqlite_base import CheckpointResult
 
+from dashboard.app import (
+    _burndown_loop,
+    _BurndownStore,
+    _metrics_loop,
+    _MetricsStore,
+    app,
+    lifespan,
+)
+from dashboard.config import DashboardConfig
 
 # ---------------------------------------------------------------------------
 # Step-1: burndown store pragma triad
