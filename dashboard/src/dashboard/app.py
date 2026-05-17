@@ -24,6 +24,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from shared.async_sqlite_base import AsyncSqliteBase
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -128,6 +129,20 @@ _SAMPLE_INTERVAL_SECONDS = 600  # 10 minutes
 _DOWNSAMPLE_INTERVAL_SECONDS = 3600  # 1 hour
 
 
+class _BurndownStore(AsyncSqliteBase):
+    """Writable WAL-mode store for the burndown snapshot collector.
+
+    Subclasses AsyncSqliteBase so that open() applies the full Phase-3
+    durability pragma triad (synchronous=FULL, wal_autocheckpoint=100,
+    journal_size_limit=64 MiB) and checkpoint() is available for periodic
+    use by _burndown_loop.
+    """
+
+    @property
+    def _schema(self) -> str:
+        return BURNDOWN_SCHEMA
+
+
 async def _sleep_to_aligned_tick(interval: int) -> None:
     """Sleep until the next wall-clock-aligned interval boundary.
 
@@ -141,11 +156,12 @@ async def _sleep_to_aligned_tick(interval: int) -> None:
 
 
 async def _burndown_loop(
-    conn: aiosqlite.Connection,
+    store: _BurndownStore,
     config: DashboardConfig,
     client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot task status counts into the burndown DB."""
+    conn = store._require_conn()
     try:
         await collect_snapshot(conn, config, client)
     except Exception:
@@ -153,6 +169,7 @@ async def _burndown_loop(
     last_downsample = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
+        conn = store._require_conn()
         try:
             await collect_snapshot(conn, config, client)
             now = time.monotonic()
@@ -220,16 +237,14 @@ async def lifespan(app: FastAPI):
     app.state.db = DbPool()
     app.state.start_time = time.monotonic()
 
-    # Burndown snapshot collector (writable connection, WAL mode).
+    # Burndown snapshot collector (writable WAL connection with full durability triad).
     burndown_path = app.state.config.burndown_db
-    burndown_path.parent.mkdir(parents=True, exist_ok=True)
-    burndown_conn = await aiosqlite.connect(str(burndown_path))
-    await burndown_conn.execute('PRAGMA journal_mode=WAL')
-    await burndown_conn.executescript(BURNDOWN_SCHEMA)
-    await burndown_conn.commit()
+    burndown_store = _BurndownStore(burndown_path, busy_timeout_ms=5000)
+    await burndown_store.open()
+    app.state.burndown_store = burndown_store
     collector_task = asyncio.create_task(
         _burndown_loop(
-            burndown_conn,
+            burndown_store,
             app.state.config,
             app.state.http_client,
         )
@@ -252,7 +267,7 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await burndown_conn.close()
+    await app.state.burndown_store.close()
     await metrics_conn.close()
     await app.state.db.close_all()
     await app.state.http_client.aclose()
