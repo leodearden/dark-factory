@@ -18,7 +18,7 @@ import aiosqlite
 import httpx
 import pytest
 
-from dashboard.app import _MetricsStore, _metrics_loop
+from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
