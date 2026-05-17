@@ -7,6 +7,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -926,37 +927,80 @@ class TestPerTaskLogFiles:
 # ---------------------------------------------------------------------------
 
 # Bind real time.sleep BEFORE _patch_pod_infra monkeypatches launcher.time.sleep,
-# so the delay helper actually blocks instead of being a no-op.
+# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision,
+# test_concurrent_stop_on_first_failure_drains, etc.) actually block.
 _REAL_SLEEP = time.sleep
 
 
-def _patch_subprocess_run_with_delay(monkeypatch, results_dir: Path, delay_s: float):
-    """Like _patch_subprocess_run_success but adds a real sleep so worker
-    threads overlap in time. Used to verify parallelism via wall-clock.
+def _patch_subprocess_concurrency_probe(
+    monkeypatch, results_dir: Path, expected_concurrency: int
+) -> dict:
+    """Patch launcher.subprocess.run to measure peak in-flight concurrency.
+
+    Uses a threading.Event sentinel instead of a wall-clock budget:
+    each fake worker blocks until ``expected_concurrency`` threads have arrived
+    simultaneously (success path) or 5 s elapses (failure path).  The state
+    dict returned to the caller carries:
+
+    * ``max_in_flight`` — peak observed in-flight count across all waves.
+    * ``arrived`` — True iff the target concurrency was reached at least once.
+      For the windowed test (e.g. 5 tasks at concurrency=2) this reflects only
+      the first wave; subsequent waves pass through the already-latched event.
+    * ``timed_out`` — True if any fake_run invocation hit the 5 s barrier
+      without the event being set, indicating the executor never scheduled
+      ``expected_concurrency`` threads simultaneously.
+
+    Writes the same fake result files expected by result-collection paths in
+    main() so that the launcher can finish without errors.
     """
     real_run = subprocess.run
+
+    lock = threading.Lock()
+    in_flight = [0]
+    state: dict = {"max_in_flight": 0, "arrived": False, "timed_out": False}
+    event = threading.Event()
 
     def fake_run(cmd, *args, **kwargs):
         if (
             isinstance(cmd, list)
             and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
         ):
-            _REAL_SLEEP(delay_s)  # noqa — intentional, exercises threading
+            with lock:
+                in_flight[0] += 1
+                if in_flight[0] > state["max_in_flight"]:
+                    state["max_in_flight"] = in_flight[0]
+                if in_flight[0] >= expected_concurrency:
+                    state["arrived"] = True
+                    event.set()
+
+            # Block until the target concurrency is observed (or timeout).
+            arrived = event.wait(timeout=5.0)
+            if not arrived:
+                # Sticky flag: executor never scheduled expected_concurrency
+                # threads simultaneously before the deadline.
+                state["timed_out"] = True
+
+            # Write the fake result AFTER all threads have arrived so the
+            # peak counter is captured before any thread exits.
             task_arg = cmd[cmd.index("--task") + 1]
             config_name = cmd[cmd.index("--config-name") + 1]
             task_id = Path(task_arg).stem
             results_dir.mkdir(parents=True, exist_ok=True)
             run_id = uuid4().hex[:8]
             _write_result(results_dir, task_id, config_name, run_id)
-            # Honor the redirect target so the per-task log file is non-empty.
             fh = kwargs.get("stdout")
             if fh is not None and hasattr(fh, "write"):
                 fh.write(f"fake subprocess for {task_id}\n")
                 fh.flush()
+
+            with lock:
+                in_flight[0] -= 1
+
             return SimpleNamespace(returncode=0)
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return state
 
 
 def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
@@ -977,8 +1021,12 @@ class TestConcurrentLoop:
     """Windowed-submission ThreadPoolExecutor path in main()."""
 
     def test_concurrent_runs_three_tasks_in_parallel(self, monkeypatch, tmp_path):
-        """3 tasks at concurrency=3 with a 0.3s fake-subprocess delay should
-        finish in ~0.3s wall-clock, not ~0.9s."""
+        """3 tasks at concurrency=3: the launcher must schedule all 3 worker
+        threads in-flight simultaneously (peak concurrency == 3).
+
+        Verified via a threading.Event sentinel instead of a wall-clock budget;
+        deterministic on any CPU load.
+        """
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
@@ -989,9 +1037,8 @@ class TestConcurrentLoop:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         fake_client = _patch_pod_infra(monkeypatch)
-        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+        state = _patch_subprocess_concurrency_probe(monkeypatch, results, expected_concurrency=3)
 
-        t0 = time.monotonic()
         rc = launcher.main(
             [
                 "--config",
@@ -1004,16 +1051,13 @@ class TestConcurrentLoop:
                 "3",
             ]
         )
-        wall_clock = time.monotonic() - t0
 
         assert rc == 0
         assert len(fake_client.create_calls) == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Parallel: ~0.3s; serial: ~1.2s+. Allow 0.9s for thread spinup overhead.
-        assert wall_clock < 0.9, (
-            f"expected ~0.3s parallel wall-clock, got {wall_clock:.2f}s "
-            f"(serial would be ~1.2s+)"
-        )
+        # All 3 worker threads must have been in-flight simultaneously.
+        assert state["arrived"], "3 threads never arrived simultaneously within 5 s"
+        assert state["max_in_flight"] == 3
         # All 3 result files written
         result_files = sorted(p.name for p in results.glob("*.json"))
         assert len(result_files) == 3
@@ -1021,7 +1065,18 @@ class TestConcurrentLoop:
     def test_concurrent_with_higher_count_than_concurrency(
         self, monkeypatch, tmp_path
     ):
-        """5 tasks, concurrency=2 → wall-clock ≈ ⌈5/2⌉ × 0.3s = 0.9s."""
+        """5 tasks at concurrency=2: windowed submission must cap in-flight
+        workers at exactly 2 — never 3+ (cap not enforced) and never just 1
+        (parallelism not happening).
+
+        Verified via peak in-flight counter instead of a wall-clock window;
+        deterministic on any CPU load.
+
+        Note: the threading.Event is latching — it is set once when the first
+        wave of 2 threads arrives and stays set for all subsequent waves.  The
+        ``arrived`` / ``max_in_flight`` assertions therefore prove the cap on
+        wave 1; later waves pass through the already-open event immediately.
+        """
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
@@ -1032,9 +1087,8 @@ class TestConcurrentLoop:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         fake_client = _patch_pod_infra(monkeypatch)
-        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+        state = _patch_subprocess_concurrency_probe(monkeypatch, results, expected_concurrency=2)
 
-        t0 = time.monotonic()
         rc = launcher.main(
             [
                 "--config",
@@ -1047,18 +1101,13 @@ class TestConcurrentLoop:
                 "2",
             ]
         )
-        wall_clock = time.monotonic() - t0
 
         assert rc == 0
         assert len(fake_client.create_calls) == 1
         assert len(list(results.glob("*.json"))) == 5
-        # 3 waves × 0.3s = 0.9s. Allow 1.5s for overhead.
-        assert wall_clock < 1.5, f"wall-clock {wall_clock:.2f}s too high"
-        # And > 0.6s — anything less means we somehow ran > 2 in parallel.
-        assert wall_clock > 0.6, (
-            f"wall-clock {wall_clock:.2f}s too low; concurrency cap "
-            f"may not be enforced"
-        )
+        # Peak must be exactly 2: cap enforced (≤2) and parallelism occurs (≥2).
+        assert state["arrived"], "2 threads never arrived simultaneously within 5 s"
+        assert state["max_in_flight"] == 2
 
     def test_concurrent_no_result_collision(self, monkeypatch, tmp_path):
         """4 result files written with the same mtime — each task must
