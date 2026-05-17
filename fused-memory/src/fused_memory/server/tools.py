@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas
 
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
@@ -73,6 +74,120 @@ _PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish
 # Mirrors orchestrator.overrides.OverrideStore.clear_override validation at
 # orchestrator/src/orchestrator/overrides.py:258.
 _VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
+
+async def _open_overrides_db(
+    project_root: str,
+    *,
+    autocommit: bool = False,
+) -> aiosqlite.Connection:
+    """Open (and initialise) the scheduler_overrides.db for project_root.
+
+    Creates parent directories on first call, runs idempotent DDL, and
+    applies the full Phase-3 durability pragma triad (journal_mode=WAL,
+    busy_timeout, synchronous=FULL, wal_autocheckpoint=100,
+    journal_size_limit=64MiB) via ``apply_full_durability_pragmas``.
+    See ``docs/task-recovery-2026-05-13/`` for the production incident that
+    mandated this convention across all fused-memory SQLite stores.
+
+    When ``autocommit=True`` the connection is opened with
+    ``isolation_level=None`` and ``timeout=30`` so callers can use explicit
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` to serialize
+    read-then-write sequences against concurrent writers.  Mirrors the
+    source-of-truth concurrency contract at
+    orchestrator/src/orchestrator/overrides.py:177-195 which documents
+    why ``set_override`` MUST use this pattern.
+    """
+    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if autocommit:
+        db = await aiosqlite.connect(
+            str(db_path),
+            timeout=30,
+            isolation_level=None,
+        )
+    else:
+        db = await aiosqlite.connect(str(db_path))
+    # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
+    # to 30s for the write lock (matches source-of-truth timeout=30 above).
+    busy_ms = 30000 if autocommit else 5000
+    await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
+    await db.executescript(_OVERRIDE_SCHEMA)
+    return db
+
+
+async def _connect_overrides_db(
+    project_root: str,
+    *,
+    autocommit: bool = False,
+) -> aiosqlite.Connection:
+    """Open scheduler_overrides.db with the full durability pragma triad — no DDL.
+
+    Thinner sibling to :func:`_open_overrides_db`.  Applies the same five
+    Phase-3 pragmas (via ``apply_full_durability_pragmas``) but skips the
+    ``_OVERRIDE_SCHEMA`` DDL step.  Use when the schema is guaranteed to
+    exist already (e.g. :func:`_checkpoint_overrides_db`, which only needs a
+    live connection with correct pragmas — re-running DDL on every checkpoint
+    tick is wasted IO and can produce spurious write-lock contention).
+
+    When ``autocommit=True`` the connection is opened with
+    ``isolation_level=None`` and ``timeout=30``, matching the semantics of
+    :func:`_open_overrides_db`.
+    """
+    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if autocommit:
+        db = await aiosqlite.connect(
+            str(db_path),
+            timeout=30,
+            isolation_level=None,
+        )
+    else:
+        db = await aiosqlite.connect(str(db_path))
+    busy_ms = 30000 if autocommit else 5000
+    await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
+    return db
+
+
+async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
+    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on the scheduler_overrides.db.
+
+    Opens a fresh connection via :func:`_connect_overrides_db` (no DDL —
+    schema must already exist), executes a TRUNCATE checkpoint, parses the
+    result row into a ``CheckpointResult`` named-tuple, and closes the
+    connection.
+
+    Using :func:`_connect_overrides_db` rather than :func:`_open_overrides_db`
+    avoids re-running ``_OVERRIDE_SCHEMA`` DDL on every checkpoint tick, which
+    would be wasted IO and could produce spurious write-lock contention in a
+    periodic-checkpoint loop.
+
+    Callers (e.g. a future periodic-checkpoint wiring task) drive this helper
+    to bound WAL growth on the override DB.  Wiring into
+    ``server.main._collect_checkpoint_targets`` / ``_periodic_checkpoint_loop``
+    is intentionally deferred: the override DB is per-project_root whereas the
+    periodic loop currently operates on singleton stores, so adding multi-project
+    iteration is a separate design decision outside this task's scope.
+
+    Returns:
+        ``CheckpointResult(busy, log, checkpointed)`` — same shape as
+        ``AsyncSqliteBase.checkpoint()`` so future wiring slots in with no
+        adapter.  ``busy == 0`` means all WAL frames were checkpointed.
+
+    Raises:
+        RuntimeError: if ``PRAGMA wal_checkpoint`` returns no rows (should not
+            happen in normal operation; mirrors ``AsyncSqliteBase.checkpoint``
+            at ``shared/src/shared/async_sqlite_base.py:199-200``).
+    """
+    db = await _connect_overrides_db(project_root)
+    try:
+        async with db.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+    finally:
+        await db.close()
+
 
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
@@ -2300,45 +2415,6 @@ def create_mcp_server(
     #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
     #   (2) cross-store separation — override row survives the status transition.
     # ------------------------------------------------------------------
-
-    async def _open_overrides_db(
-        project_root: str,
-        *,
-        autocommit: bool = False,
-    ) -> aiosqlite.Connection:
-        """Open (and initialise) the scheduler_overrides.db for project_root.
-
-        Creates parent directories on first call, runs idempotent DDL, and
-        sets PRAGMA journal_mode=WAL / busy_timeout / synchronous=FULL.
-
-        When ``autocommit=True`` the connection is opened with
-        ``isolation_level=None`` and ``timeout=30`` so callers can use explicit
-        ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` to serialize
-        read-then-write sequences against concurrent writers.  Mirrors the
-        source-of-truth concurrency contract at
-        orchestrator/src/orchestrator/overrides.py:177-195 which documents
-        why ``set_override`` MUST use this pattern.
-        """
-        from pathlib import Path as _Path
-
-        db_path = _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        if autocommit:
-            db = await aiosqlite.connect(
-                str(db_path),
-                timeout=30,
-                isolation_level=None,
-            )
-        else:
-            db = await aiosqlite.connect(str(db_path))
-        await db.execute('PRAGMA journal_mode=WAL')
-        # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
-        # to 30s for the write lock (matches source-of-truth timeout=30 above).
-        busy_ms = 30000 if autocommit else 5000
-        await db.execute(f'PRAGMA busy_timeout={busy_ms}')
-        await db.execute('PRAGMA synchronous=FULL')
-        await db.executescript(_OVERRIDE_SCHEMA)
-        return db
 
     async def _emit_override_audit(
         project_root: str,
