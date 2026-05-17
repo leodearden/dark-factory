@@ -18,10 +18,12 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "pyyaml>=6.0",
     "escalation>=0.1",
+    "dark-factory-shared",
 ]
 
 [tool.uv.sources]
 escalation = { workspace = true }
+dark-factory-shared = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]

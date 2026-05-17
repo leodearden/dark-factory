@@ -24,6 +24,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from shared.async_sqlite_base import AsyncSqliteBase
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -126,6 +127,44 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 
 _SAMPLE_INTERVAL_SECONDS = 600  # 10 minutes
 _DOWNSAMPLE_INTERVAL_SECONDS = 3600  # 1 hour
+_CHECKPOINT_INTERVAL_SECONDS = 3600  # 1 hour
+
+
+class _BurndownStore(AsyncSqliteBase):
+    """Writable WAL-mode store for the burndown snapshot collector.
+
+    Subclasses AsyncSqliteBase so that open() applies the full Phase-3
+    durability pragma triad (synchronous=FULL, wal_autocheckpoint=100,
+    journal_size_limit=64 MiB) and checkpoint() is available for periodic
+    use by _burndown_loop.
+    """
+
+    @property
+    def _schema(self) -> str:
+        return BURNDOWN_SCHEMA
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """Public accessor for the open connection; raises RuntimeError if not opened."""
+        return self._require_conn()
+
+
+class _MetricsStore(AsyncSqliteBase):
+    """Writable WAL-mode store for the metrics snapshot collector.
+
+    Mirrors _BurndownStore — subclasses AsyncSqliteBase so that open()
+    applies the full Phase-3 durability pragma triad and checkpoint() is
+    available for periodic use by _metrics_loop.
+    """
+
+    @property
+    def _schema(self) -> str:
+        return METRICS_SCHEMA
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """Public accessor for the open connection; raises RuntimeError if not opened."""
+        return self._require_conn()
 
 
 async def _sleep_to_aligned_tick(interval: int) -> None:
@@ -141,30 +180,39 @@ async def _sleep_to_aligned_tick(interval: int) -> None:
 
 
 async def _burndown_loop(
-    conn: aiosqlite.Connection,
+    store: _BurndownStore,
     config: DashboardConfig,
     client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot task status counts into the burndown DB."""
+    conn = store.connection
     try:
         await collect_snapshot(conn, config, client)
     except Exception:
         logger.warning('Initial burndown snapshot failed', exc_info=True)
     last_downsample = 0.0
+    last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
+        conn = store.connection
         try:
             await collect_snapshot(conn, config, client)
             now = time.monotonic()
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample(conn)
                 last_downsample = now
+            if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
+                try:
+                    await store.checkpoint()
+                except Exception:
+                    logger.warning('Periodic WAL checkpoint failed (burndown)', exc_info=True)
+                last_checkpoint = now
         except Exception:
             logger.warning('Burndown snapshot error', exc_info=True)
 
 
 async def _metrics_loop(
-    conn: aiosqlite.Connection,
+    store: _MetricsStore,
     app: FastAPI,
 ) -> None:
     """Periodically snapshot ephemeral system metrics into metrics.db.
@@ -176,6 +224,7 @@ async def _metrics_loop(
     """
 
     async def _run_once() -> None:
+        conn = store.connection
         config: DashboardConfig = app.state.config
         pool: DbPool = app.state.db
         http_client: httpx.AsyncClient = app.state.http_client
@@ -200,14 +249,22 @@ async def _metrics_loop(
     except Exception:
         logger.warning('Initial metrics snapshot failed', exc_info=True)
     last_downsample = 0.0
+    last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         try:
             await _run_once()
+            conn = store.connection
             now = time.monotonic()
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample_metrics(conn)
                 last_downsample = now
+            if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
+                try:
+                    await store.checkpoint()
+                except Exception:
+                    logger.warning('Periodic WAL checkpoint failed (metrics)', exc_info=True)
+                last_checkpoint = now
         except Exception:
             logger.warning('Metrics snapshot error', exc_info=True)
 
@@ -220,30 +277,26 @@ async def lifespan(app: FastAPI):
     app.state.db = DbPool()
     app.state.start_time = time.monotonic()
 
-    # Burndown snapshot collector (writable connection, WAL mode).
+    # Burndown snapshot collector (writable WAL connection with full durability triad).
     burndown_path = app.state.config.burndown_db
-    burndown_path.parent.mkdir(parents=True, exist_ok=True)
-    burndown_conn = await aiosqlite.connect(str(burndown_path))
-    await burndown_conn.execute('PRAGMA journal_mode=WAL')
-    await burndown_conn.executescript(BURNDOWN_SCHEMA)
-    await burndown_conn.commit()
+    burndown_store = _BurndownStore(burndown_path, busy_timeout_ms=5000)
+    await burndown_store.open()
+    app.state.burndown_store = burndown_store
     collector_task = asyncio.create_task(
         _burndown_loop(
-            burndown_conn,
+            burndown_store,
             app.state.config,
             app.state.http_client,
         )
     )
 
-    # Metrics snapshot collector (separate WAL writer for sparse-history signals).
+    # Metrics snapshot collector (separate WAL writer with full durability triad).
     metrics_path = app.state.config.metrics_db
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_conn = await aiosqlite.connect(str(metrics_path))
-    await metrics_conn.execute('PRAGMA journal_mode=WAL')
-    await metrics_conn.executescript(METRICS_SCHEMA)
-    await metrics_conn.commit()
-    metrics_task = asyncio.create_task(_metrics_loop(metrics_conn, app))
-    app.state.metrics_db_path = metrics_path
+    metrics_store = _MetricsStore(metrics_path, busy_timeout_ms=5000)
+    await metrics_store.open()
+    app.state.metrics_store = metrics_store
+    app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
+    metrics_task = asyncio.create_task(_metrics_loop(metrics_store, app))
 
     yield
 
@@ -252,8 +305,8 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await burndown_conn.close()
-    await metrics_conn.close()
+    await app.state.burndown_store.close()
+    await app.state.metrics_store.close()
     await app.state.db.close_all()
     await app.state.http_client.aclose()
 
