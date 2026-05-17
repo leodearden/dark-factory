@@ -14,6 +14,7 @@ Contract source: server.py:88-90 pointer → DESIGN.md
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -336,9 +337,15 @@ class TestHarnessTaskStatusLookup:
         mock_task = MagicMock()
         mock_task.done.return_value = False
 
+        captured_coros: list = []
+
+        def _capture_create_task(coro, *, name=None):
+            captured_coros.append(coro)
+            return mock_task
+
         with (
             patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
-            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.create_task', side_effect=_capture_create_task),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await harness._start_escalation_server()
@@ -348,6 +355,12 @@ class TestHarnessTaskStatusLookup:
         )
         assert captured_kwargs['task_status_lookup'] is not None, (
             'task_status_lookup passed to create_server must not be None'
+        )
+        assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
+        assert inspect.getcoroutinestate(captured_coros[0]) != inspect.CORO_CREATED, (
+            'test must consume the _serve coroutine (close or await it) to prevent '
+            'PytestUnraisableExceptionWarning leaking to later tests in the xdist worker; '
+            'see test_harness_watcher_supervisor.py:140-142 for the canonical pattern'
         )
 
     @pytest.mark.asyncio
@@ -372,9 +385,15 @@ class TestHarnessTaskStatusLookup:
         mock_task = MagicMock()
         mock_task.done.return_value = False
 
+        captured_coros: list = []
+
+        def _capture_create_task(coro, *, name=None):
+            captured_coros.append(coro)
+            return mock_task
+
         with (
             patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
-            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.create_task', side_effect=_capture_create_task),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await harness._start_escalation_server()
@@ -384,3 +403,9 @@ class TestHarnessTaskStatusLookup:
         result = await captured_lookup('task-99')
         harness.scheduler.get_status.assert_called_once_with('task-99')
         assert result == 'pending'
+        assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
+        assert inspect.getcoroutinestate(captured_coros[0]) != inspect.CORO_CREATED, (
+            'test must consume the _serve coroutine (close or await it) to prevent '
+            'PytestUnraisableExceptionWarning leaking to later tests in the xdist worker; '
+            'see test_harness_watcher_supervisor.py:140-142 for the canonical pattern'
+        )
