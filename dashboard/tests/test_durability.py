@@ -219,20 +219,22 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
     """_metrics_loop calls store.checkpoint() on the periodic interval timer.
 
     Drives _metrics_loop directly (no lifespan), patches _CHECKPOINT_INTERVAL_SECONDS
-    to 0 so the checkpoint fires on the first loop body iteration.
-
-    Uses the *second* collect_metrics_snapshot invocation (initial _run_once + 1
-    loop body) to signal that at least one loop body has run and the checkpoint gate
-    had a chance to fire.  _sleep_to_aligned_tick is given a side_effect that does
-    ``await asyncio.sleep(0)`` so the mock actually yields to the event loop between
-    iterations, allowing the snapshot_event wakeup to be processed and the assertion
-    to be racefree.
+    to 0 so the checkpoint fires on the first loop body iteration. Waits on the
+    checkpoint mock's own asyncio.Event so the assertion is racefree: the event is
+    set inside store.checkpoint, meaning the checkpoint has actually fired before we
+    cancel the task.
     """
     store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
     await store.open()
 
-    # Replace checkpoint with an AsyncMock we can assert on.
-    checkpoint_mock = AsyncMock(return_value=CheckpointResult(0, 0, 0))
+    # Replace checkpoint with an AsyncMock that sets an event when called.
+    checkpoint_called = asyncio.Event()
+
+    async def _checkpoint_side_effect(*args: object, **kwargs: object) -> CheckpointResult:
+        checkpoint_called.set()
+        return CheckpointResult(0, 0, 0)
+
+    checkpoint_mock = AsyncMock(side_effect=_checkpoint_side_effect)
     store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
 
     # Minimal app-state stub — pool.get() returns None because collect_metrics_snapshot
@@ -245,19 +247,7 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
     mock_app.state.db = mock_pool
     mock_app.state.http_client = MagicMock()
 
-    # snapshot_event is set on the *second* collect_metrics_snapshot call (initial
-    # _run_once + 1 loop body), guaranteeing at least one full while-loop body ran
-    # and the checkpoint condition was evaluated.
-    snapshot_calls = 0
-    snapshot_event = asyncio.Event()
-
-    async def _snapshot_side_effect(*args: object, **kwargs: object) -> None:
-        nonlocal snapshot_calls
-        snapshot_calls += 1
-        if snapshot_calls >= 2:
-            snapshot_event.set()
-
-    # _sleep_to_aligned_tick must yield to the event loop so snapshot_event.set()
+    # _sleep_to_aligned_tick must yield to the event loop so checkpoint_called.set()
     # (scheduled via loop.call_soon inside asyncio.Event.set) is processed between
     # iterations.  A plain AsyncMock(return_value=None) never suspends, creating a
     # tight synchronous loop that starves asyncio.wait_for of event-loop cycles.
@@ -268,16 +258,16 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
         with (
             patch(
                 'dashboard.app.collect_metrics_snapshot',
-                new=AsyncMock(side_effect=_snapshot_side_effect),
+                new=AsyncMock(return_value=None),
             ),
             patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
             patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
             task = asyncio.create_task(_metrics_loop(store, mock_app))
             try:
-                # snapshot_event fires after 2 collect_metrics_snapshot calls, meaning
-                # the loop body ran once — checkpoint had a chance to fire if implemented.
-                await asyncio.wait_for(snapshot_event.wait(), timeout=2.0)
+                # Wait until store.checkpoint() is actually called — this is racefree
+                # because the event is set inside the checkpoint mock itself.
+                await asyncio.wait_for(checkpoint_called.wait(), timeout=2.0)
             finally:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

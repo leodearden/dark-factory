@@ -237,6 +237,7 @@ async def _metrics_loop(
     except Exception:
         logger.warning('Initial metrics snapshot failed', exc_info=True)
     last_downsample = 0.0
+    last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         try:
@@ -246,6 +247,10 @@ async def _metrics_loop(
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample_metrics(conn)
                 last_downsample = now
+            if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
+                with contextlib.suppress(Exception):
+                    await store.checkpoint()
+                last_checkpoint = now
         except Exception:
             logger.warning('Metrics snapshot error', exc_info=True)
 
