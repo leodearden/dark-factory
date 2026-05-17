@@ -29,7 +29,6 @@ from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 from fused_memory.services.write_journal import WriteJournal
 
-
 # ---------------------------------------------------------------------------
 # TestTicketStorePragmaDelegation
 # ---------------------------------------------------------------------------
@@ -162,6 +161,7 @@ class TestSqliteTaskBackendPragmaDelegation:
             assert conn is not None
             cursor = await conn.execute('PRAGMA foreign_keys')
             row = await cursor.fetchone()
+            assert row is not None, 'PRAGMA foreign_keys returned no rows'
             assert row[0] == 0, f'Expected foreign_keys=0 (OFF); got {row[0]}'
             await backend.close()
 
