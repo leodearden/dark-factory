@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas
 
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
@@ -113,6 +113,41 @@ async def _open_overrides_db(
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     await db.executescript(_OVERRIDE_SCHEMA)
     return db
+
+
+async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
+    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on the scheduler_overrides.db.
+
+    Opens a fresh connection via ``_open_overrides_db``, executes a TRUNCATE
+    checkpoint, parses the result row into a ``CheckpointResult`` named-tuple,
+    and closes the connection.
+
+    Callers (e.g. a future periodic-checkpoint wiring task) drive this helper
+    to bound WAL growth on the override DB.  Wiring into
+    ``server.main._collect_checkpoint_targets`` / ``_periodic_checkpoint_loop``
+    is intentionally deferred: the override DB is per-project_root whereas the
+    periodic loop currently operates on singleton stores, so adding multi-project
+    iteration is a separate design decision outside this task's scope.
+
+    Returns:
+        ``CheckpointResult(busy, log, checkpointed)`` — same shape as
+        ``AsyncSqliteBase.checkpoint()`` so future wiring slots in with no
+        adapter.  ``busy == 0`` means all WAL frames were checkpointed.
+
+    Raises:
+        RuntimeError: if ``PRAGMA wal_checkpoint`` returns no rows (should not
+            happen in normal operation; mirrors ``AsyncSqliteBase.checkpoint``
+            at ``shared/src/shared/async_sqlite_base.py:199-200``).
+    """
+    db = await _open_overrides_db(project_root)
+    try:
+        async with db.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+    finally:
+        await db.close()
 
 
 FUSED_MEMORY_INSTRUCTIONS = """\
