@@ -127,6 +127,7 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 
 _SAMPLE_INTERVAL_SECONDS = 600  # 10 minutes
 _DOWNSAMPLE_INTERVAL_SECONDS = 3600  # 1 hour
+_CHECKPOINT_INTERVAL_SECONDS = 3600  # 1 hour
 
 
 class _BurndownStore(AsyncSqliteBase):
@@ -180,6 +181,7 @@ async def _burndown_loop(
     except Exception:
         logger.warning('Initial burndown snapshot failed', exc_info=True)
     last_downsample = 0.0
+    last_checkpoint = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         conn = store._require_conn()
@@ -189,6 +191,10 @@ async def _burndown_loop(
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample(conn)
                 last_downsample = now
+            if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
+                with contextlib.suppress(Exception):
+                    await store.checkpoint()
+                last_checkpoint = now
         except Exception:
             logger.warning('Burndown snapshot error', exc_info=True)
 
