@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -106,19 +107,13 @@ class EventBuffer:
         """Open SQLite connection and ensure schema exists."""
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=FULL: per-commit fsync. Costs ~1-5ms/commit but
-        # makes deferred-write rows durable on disk regardless of WAL
-        # checkpoint progress. EventBuffer shares reconciliation.db with
-        # ReconciliationJournal (separate aiosqlite.Connection) — if one
-        # used NORMAL while the other used FULL, NORMAL commits between
-        # FULL commits would still be at risk on a crash, so we keep
-        # both at FULL for consistent recovery semantics.
-        # See docs/task-recovery-2026-05-13/ for the prod incident.
-        await self._db.execute('PRAGMA synchronous=FULL')
-        await self._db.execute('PRAGMA wal_autocheckpoint=100')
-        await self._db.execute('PRAGMA journal_size_limit=67108864')
+        # WAL mode cannot be enabled on ':memory:' DBs — SQLite returns
+        # 'memory' from PRAGMA journal_mode=WAL which would trigger the
+        # helper's RuntimeError guard.  The ':memory:' path is used by
+        # server/main.py:580 and server/tools.py:1598 as a Taskmaster-
+        # disabled fallback; skip the helper for those callers.
+        if self._db_path != ':memory:':
+            await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
         # Idempotent migration: add claimed_at column for pre-existing DBs.
