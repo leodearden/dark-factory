@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
 from shared.async_sqlite_base import CheckpointResult
 
 from dashboard.app import (
@@ -25,7 +26,6 @@ from dashboard.app import (
     _BurndownStore,
     _metrics_loop,
     _MetricsStore,
-    app,
     lifespan,
 )
 from dashboard.config import DashboardConfig
@@ -41,29 +41,31 @@ async def test_burndown_store_applies_full_pragma_triad_after_lifespan(
 ):
     """_BurndownStore open() applies the full Phase-3 durability pragma triad.
 
-    Calls lifespan(app) directly as an async context manager so that the
-    pragma assertions can run inside an async scope with access to the live
-    writer connection. The five per-connection PRAGMAs cannot be verified by
-    opening a fresh reader — they must be checked on the connection that set them.
+    Calls lifespan() directly as an async context manager so that the pragma
+    assertions can run inside an async scope with access to the live writer
+    connection. The five per-connection PRAGMAs cannot be verified by opening a
+    fresh reader — they must be checked on the connection that set them.
 
-    collect_snapshot and collect_metrics_snapshot are patched to AsyncMock so
-    the lifespan startup does not hit the network or per-project DBs.
+    A fresh FastAPI instance is created per test to avoid shared app.state
+    pollution between test runs. collect_snapshot and collect_metrics_snapshot
+    are patched to AsyncMock so the lifespan startup does not hit the network
+    or per-project DBs.
     """
     monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(tmp_path))
+    local_app = FastAPI(lifespan=lifespan)
 
     with (
         patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
         patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
-        async with lifespan(app):
-            # app.state.burndown_store must exist after lifespan startup.
-            assert hasattr(app.state, 'burndown_store'), (
-                'app.state.burndown_store not set after lifespan startup — '
+        async with lifespan(local_app):
+            # local_app.state.burndown_store must exist after lifespan startup.
+            assert hasattr(local_app.state, 'burndown_store'), (
+                'local_app.state.burndown_store not set after lifespan startup — '
                 '_BurndownStore wrapper not yet implemented in lifespan()'
             )
-            store = app.state.burndown_store
-            assert store._conn is not None, 'burndown_store._conn is None — store was not opened'
-            conn = store._require_conn()
+            store = local_app.state.burndown_store
+            conn = store.connection  # raises RuntimeError if not opened
 
             async with conn.execute('PRAGMA journal_mode') as cur:
                 row = await cur.fetchone()
@@ -87,10 +89,10 @@ async def test_burndown_store_applies_full_pragma_triad_after_lifespan(
                 f'journal_size_limit: expected 67108864, got {row[0]}'
             )
 
-    # After lifespan exits the store must be closed.
-    assert app.state.burndown_store._conn is None, (
-        'burndown_store._conn should be None after lifespan exit (store not closed)'
-    )
+    # After lifespan exits the store must be closed — verified via the public
+    # checkpoint() method: it raises RuntimeError('not opened') on a closed store.
+    with pytest.raises(RuntimeError, match='not opened'):
+        await store.checkpoint()
 
 
 # ---------------------------------------------------------------------------
@@ -105,23 +107,25 @@ async def test_metrics_store_applies_full_pragma_triad_after_lifespan(
     """_MetricsStore open() applies the full Phase-3 durability pragma triad.
 
     Mirrors test_burndown_store_applies_full_pragma_triad_after_lifespan but
-    targets app.state.metrics_store and the metrics writer connection.
+    targets local_app.state.metrics_store and the metrics writer connection.
+    A fresh FastAPI instance is created per test to prevent shared app.state
+    pollution.
     """
     monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(tmp_path))
+    local_app = FastAPI(lifespan=lifespan)
 
     with (
         patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
         patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
-        async with lifespan(app):
-            # app.state.metrics_store must exist after lifespan startup.
-            assert hasattr(app.state, 'metrics_store'), (
-                'app.state.metrics_store not set after lifespan startup — '
+        async with lifespan(local_app):
+            # local_app.state.metrics_store must exist after lifespan startup.
+            assert hasattr(local_app.state, 'metrics_store'), (
+                'local_app.state.metrics_store not set after lifespan startup — '
                 '_MetricsStore wrapper not yet implemented in lifespan()'
             )
-            store = app.state.metrics_store
-            assert store._conn is not None, 'metrics_store._conn is None — store was not opened'
-            conn = store._require_conn()
+            store = local_app.state.metrics_store
+            conn = store.connection  # raises RuntimeError if not opened
 
             async with conn.execute('PRAGMA journal_mode') as cur:
                 row = await cur.fetchone()
@@ -145,10 +149,9 @@ async def test_metrics_store_applies_full_pragma_triad_after_lifespan(
                 f'journal_size_limit: expected 67108864, got {row[0]}'
             )
 
-    # After lifespan exits the store must be closed.
-    assert app.state.metrics_store._conn is None, (
-        'metrics_store._conn should be None after lifespan exit (store not closed)'
-    )
+    # After lifespan exits the store must be closed — verified via checkpoint().
+    with pytest.raises(RuntimeError, match='not opened'):
+        await store.checkpoint()
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +214,69 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
 
     assert checkpoint_mock.called, (
         '_burndown_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
+    )
+
+
+@pytest.mark.asyncio
+async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
+    """_burndown_loop calls store.checkpoint() at most once per interval window.
+
+    Runs the loop with _CHECKPOINT_INTERVAL_SECONDS=3600 for several iterations
+    and asserts checkpoint is called at most once. The first iteration fires because
+    time.monotonic() >> 3600s (system uptime); subsequent iterations are suppressed
+    by the interval gate (now - last_checkpoint is only milliseconds).
+    A regression that called checkpoint() on every iteration would show
+    checkpoint_count >> 1, catching the gate logic being bypassed.
+    """
+    store = _BurndownStore(tmp_path / 'burndown_gate.db', busy_timeout_ms=5000)
+    await store.open()
+
+    checkpoint_count = 0
+
+    async def _counting_checkpoint(*args, **kwargs):
+        nonlocal checkpoint_count
+        checkpoint_count += 1
+        return CheckpointResult(0, 0, 0)
+
+    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
+
+    config = DashboardConfig(project_root=tmp_path)
+
+    # Count collect_snapshot calls to know when enough loop-body iterations have run.
+    collect_calls = 0
+    many_iters_done = asyncio.Event()
+
+    async def _counting_collect(*a: object, **kw: object) -> None:
+        nonlocal collect_calls
+        collect_calls += 1
+        if collect_calls >= 6:  # 1 initial + 5 in-loop body
+            many_iters_done.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(side_effect=_counting_collect)),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 3600),
+        ):
+            task = asyncio.create_task(_burndown_loop(store, config, MagicMock()))
+            try:
+                await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    # With 3600s interval and 5 in-loop iterations completing in milliseconds,
+    # checkpoint fires at most once (first iteration where monotonic() >> 3600s),
+    # then the gate suppresses it for the remainder of the test.
+    assert checkpoint_count <= 1, (
+        f'Expected checkpoint_count <= 1 with 3600s interval over 5 iterations, '
+        f'got {checkpoint_count}. Interval gate not working correctly.'
     )
 
 
@@ -282,4 +348,72 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
 
     assert checkpoint_mock.called, (
         '_metrics_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
+    )
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
+    """_metrics_loop calls store.checkpoint() at most once per interval window.
+
+    Mirrors test_burndown_loop_checkpoint_respects_interval_gate for _metrics_loop.
+    Runs with _CHECKPOINT_INTERVAL_SECONDS=3600 for several iterations and asserts
+    checkpoint is called at most once, verifying the interval gate works correctly.
+    """
+    store = _MetricsStore(tmp_path / 'metrics_gate.db', busy_timeout_ms=5000)
+    await store.open()
+
+    checkpoint_count = 0
+
+    async def _counting_checkpoint(*args: object, **kwargs: object) -> CheckpointResult:
+        nonlocal checkpoint_count
+        checkpoint_count += 1
+        return CheckpointResult(0, 0, 0)
+
+    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
+
+    config = DashboardConfig(project_root=tmp_path)
+    mock_pool = MagicMock()
+    mock_pool.get = AsyncMock(return_value=None)
+    mock_app = MagicMock()
+    mock_app.state.config = config
+    mock_app.state.db = mock_pool
+    mock_app.state.http_client = MagicMock()
+
+    collect_calls = 0
+    many_iters_done = asyncio.Event()
+
+    async def _counting_collect(*a: object, **kw: object) -> None:
+        nonlocal collect_calls
+        collect_calls += 1
+        if collect_calls >= 6:  # 1 initial + 5 in-loop body
+            many_iters_done.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_counting_collect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 3600),
+        ):
+            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            try:
+                await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    # With 3600s interval and 5 in-loop iterations completing in milliseconds,
+    # checkpoint fires at most once (first iteration where monotonic() >> 3600s),
+    # then the gate suppresses it for the remainder of the test.
+    assert checkpoint_count <= 1, (
+        f'Expected checkpoint_count <= 1 with 3600s interval over 5 iterations, '
+        f'got {checkpoint_count}. Interval gate not working correctly.'
     )
