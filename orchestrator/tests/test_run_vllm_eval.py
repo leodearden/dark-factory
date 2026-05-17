@@ -977,8 +977,12 @@ class TestConcurrentLoop:
     """Windowed-submission ThreadPoolExecutor path in main()."""
 
     def test_concurrent_runs_three_tasks_in_parallel(self, monkeypatch, tmp_path):
-        """3 tasks at concurrency=3 with a 0.3s fake-subprocess delay should
-        finish in ~0.3s wall-clock, not ~0.9s."""
+        """3 tasks at concurrency=3: the launcher must schedule all 3 worker
+        threads in-flight simultaneously (peak concurrency == 3).
+
+        Verified via a threading.Event sentinel instead of a wall-clock budget;
+        deterministic on any CPU load.
+        """
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
@@ -989,9 +993,8 @@ class TestConcurrentLoop:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         fake_client = _patch_pod_infra(monkeypatch)
-        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+        state = _patch_subprocess_concurrency_probe(monkeypatch, results, expected_concurrency=3)
 
-        t0 = time.monotonic()
         rc = launcher.main(
             [
                 "--config",
@@ -1004,16 +1007,12 @@ class TestConcurrentLoop:
                 "3",
             ]
         )
-        wall_clock = time.monotonic() - t0
 
         assert rc == 0
         assert len(fake_client.create_calls) == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Parallel: ~0.3s; serial: ~1.2s+. Allow 0.9s for thread spinup overhead.
-        assert wall_clock < 0.9, (
-            f"expected ~0.3s parallel wall-clock, got {wall_clock:.2f}s "
-            f"(serial would be ~1.2s+)"
-        )
+        # All 3 worker threads must have been in-flight simultaneously.
+        assert state["max_in_flight"] == 3
         # All 3 result files written
         result_files = sorted(p.name for p in results.glob("*.json"))
         assert len(result_files) == 3
