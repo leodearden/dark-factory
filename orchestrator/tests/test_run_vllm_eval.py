@@ -927,37 +927,9 @@ class TestPerTaskLogFiles:
 # ---------------------------------------------------------------------------
 
 # Bind real time.sleep BEFORE _patch_pod_infra monkeypatches launcher.time.sleep,
-# so the delay helper actually blocks instead of being a no-op.
+# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision,
+# test_concurrent_stop_on_first_failure_drains, etc.) actually block.
 _REAL_SLEEP = time.sleep
-
-
-def _patch_subprocess_run_with_delay(monkeypatch, results_dir: Path, delay_s: float):
-    """Like _patch_subprocess_run_success but adds a real sleep so worker
-    threads overlap in time. Used to verify parallelism via wall-clock.
-    """
-    real_run = subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        if (
-            isinstance(cmd, list)
-            and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
-        ):
-            _REAL_SLEEP(delay_s)  # noqa — intentional, exercises threading
-            task_arg = cmd[cmd.index("--task") + 1]
-            config_name = cmd[cmd.index("--config-name") + 1]
-            task_id = Path(task_arg).stem
-            results_dir.mkdir(parents=True, exist_ok=True)
-            run_id = uuid4().hex[:8]
-            _write_result(results_dir, task_id, config_name, run_id)
-            # Honor the redirect target so the per-task log file is non-empty.
-            fh = kwargs.get("stdout")
-            if fh is not None and hasattr(fh, "write"):
-                fh.write(f"fake subprocess for {task_id}\n")
-                fh.flush()
-            return SimpleNamespace(returncode=0)
-        return real_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
 
 
 def _patch_subprocess_concurrency_probe(
@@ -971,8 +943,8 @@ def _patch_subprocess_concurrency_probe(
     dict returned to the caller carries ``max_in_flight`` (peak observed) and
     ``arrived`` (whether the target concurrency was reached).
 
-    Writes the same fake result files as ``_patch_subprocess_run_with_delay``
-    so that downstream result-collection paths in main() continue to work.
+    Writes the same fake result files expected by result-collection paths in
+    main() so that the launcher can finish without errors.
     """
     real_run = subprocess.run
 
