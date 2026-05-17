@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 if TYPE_CHECKING:
     pass
@@ -67,13 +68,7 @@ class PlannedEpisodeRegistry:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'planned_episodes.db'
         self._db = await aiosqlite.connect(str(db_path))
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=FULL: per-commit fsync. See docs/task-recovery-2026-05-13/
-        # for the prod incident that drove this across all SQLite stores.
-        await self._db.execute('PRAGMA synchronous=FULL')
-        await self._db.execute('PRAGMA wal_autocheckpoint=100')
-        await self._db.execute('PRAGMA journal_size_limit=67108864')
+        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.execute(_CREATE_TABLE)
         await self._db.execute(_CREATE_INDEX)
         await self._db.commit()

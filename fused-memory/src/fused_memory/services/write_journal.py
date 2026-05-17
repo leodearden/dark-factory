@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +65,7 @@ class WriteJournal:
         db_path = self.data_dir / 'write_journal.db'
         self._db = await aiosqlite.connect(str(db_path))
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=FULL: per-commit fsync. See docs/task-recovery-2026-05-13/
-        # for the prod incident that drove this across all SQLite stores.
-        await self._db.execute('PRAGMA synchronous=FULL')
-        await self._db.execute('PRAGMA wal_autocheckpoint=100')
-        await self._db.execute('PRAGMA journal_size_limit=67108864')
+        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
         await self._migrate()

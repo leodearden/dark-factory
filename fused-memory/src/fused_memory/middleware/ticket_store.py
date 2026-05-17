@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 # Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
 _CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -91,15 +92,7 @@ class TicketStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
-        # win is crash durability without relying on WAL checkpoints. See
-        # docs/task-recovery-2026-05-13/ for the prod incident that drove
-        # this change across all fused-memory SQLite stores.
-        await self._db.execute('PRAGMA synchronous=FULL')
-        await self._db.execute('PRAGMA wal_autocheckpoint=100')
-        await self._db.execute('PRAGMA journal_size_limit=67108864')
+        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         # Tables first, then in-place migrate, then indexes — the
         # escalated_at index references the column added by the migration.
         await self._db.executescript(TABLE_SQL)

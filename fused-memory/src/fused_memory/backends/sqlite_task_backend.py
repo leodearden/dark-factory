@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -362,25 +363,7 @@ class SqliteTaskBackend:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = await aiosqlite.connect(str(db_path))
             conn.row_factory = aiosqlite.Row
-            await conn.execute('PRAGMA journal_mode=WAL')
-            await conn.execute('PRAGMA busy_timeout=5000')
-            # synchronous=FULL: per-commit fsync. Costs ~1-5ms/commit but
-            # makes committed data durable on disk regardless of checkpoint
-            # progress. The 2026-05-13 incident (60h of uncheckpointed WAL
-            # → SIGABRT → ~150 task rows lost) was the trigger for the
-            # NORMAL → FULL switch — see docs/task-recovery-2026-05-13/.
-            await conn.execute('PRAGMA synchronous=FULL')
-            # wal_autocheckpoint=100: cap the pre-checkpoint risk window at
-            # ~100 pages (vs SQLite's 1000-page default). Combined with the
-            # periodic explicit wal_checkpoint(TRUNCATE) loop in main.py,
-            # the WAL is kept short and the main DB advances on a known
-            # cadence even if PASSIVE auto-checkpoints stall under reader
-            # pressure.
-            await conn.execute('PRAGMA wal_autocheckpoint=100')
-            # journal_size_limit caps the on-disk WAL after a TRUNCATE
-            # checkpoint — 64 MiB is generous for our row sizes but stops
-            # runaway growth if periodic checkpoint stops firing.
-            await conn.execute('PRAGMA journal_size_limit=67108864')
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
             await conn.execute('PRAGMA foreign_keys=OFF')
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()

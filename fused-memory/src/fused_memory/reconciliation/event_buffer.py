@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
+from shared.async_sqlite_base import apply_full_durability_pragmas
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -90,6 +91,12 @@ class EventBuffer:
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
     ):
+        # _in_memory is derived from the caller's intent (db_path is None),
+        # not from the resolved string ':memory:'.  This means explicitly
+        # passing db_path=Path(':memory:') is treated as a file path and
+        # would hit the helper's RuntimeError — that is intentional: callers
+        # who want in-memory mode must pass None, not a string constant.
+        self._in_memory = db_path is None
         self._db_path = str(db_path) if db_path else ':memory:'
         self.buffer_size_threshold = buffer_size_threshold
         self.max_staleness_seconds = max_staleness_seconds
@@ -106,19 +113,16 @@ class EventBuffer:
         """Open SQLite connection and ensure schema exists."""
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=FULL: per-commit fsync. Costs ~1-5ms/commit but
-        # makes deferred-write rows durable on disk regardless of WAL
-        # checkpoint progress. EventBuffer shares reconciliation.db with
-        # ReconciliationJournal (separate aiosqlite.Connection) — if one
-        # used NORMAL while the other used FULL, NORMAL commits between
-        # FULL commits would still be at risk on a crash, so we keep
-        # both at FULL for consistent recovery semantics.
-        # See docs/task-recovery-2026-05-13/ for the prod incident.
-        await self._db.execute('PRAGMA synchronous=FULL')
-        await self._db.execute('PRAGMA wal_autocheckpoint=100')
-        await self._db.execute('PRAGMA journal_size_limit=67108864')
+        # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
+        # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
+        # the helper's RuntimeError guard.  The in-memory path is used by
+        # server/main.py:580 and server/tools.py:1598 as a Taskmaster-
+        # disabled fallback.  We guard on _in_memory (set from db_path is
+        # None at construction time) rather than comparing _db_path to the
+        # literal ':memory:' string, so that the contract is tied to the
+        # caller's intent rather than to a particular string representation.
+        if not self._in_memory:
+            await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
         # Idempotent migration: add claimed_at column for pre-existing DBs.
