@@ -1081,7 +1081,13 @@ class TestConcurrentLoop:
     def test_concurrent_with_higher_count_than_concurrency(
         self, monkeypatch, tmp_path
     ):
-        """5 tasks, concurrency=2 → wall-clock ≈ ⌈5/2⌉ × 0.3s = 0.9s."""
+        """5 tasks at concurrency=2: windowed submission must cap in-flight
+        workers at exactly 2 — never 3+ (cap not enforced) and never just 1
+        (parallelism not happening).
+
+        Verified via peak in-flight counter instead of a wall-clock window;
+        deterministic on any CPU load.
+        """
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
@@ -1092,9 +1098,8 @@ class TestConcurrentLoop:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         fake_client = _patch_pod_infra(monkeypatch)
-        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+        state = _patch_subprocess_concurrency_probe(monkeypatch, results, expected_concurrency=2)
 
-        t0 = time.monotonic()
         rc = launcher.main(
             [
                 "--config",
@@ -1107,18 +1112,12 @@ class TestConcurrentLoop:
                 "2",
             ]
         )
-        wall_clock = time.monotonic() - t0
 
         assert rc == 0
         assert len(fake_client.create_calls) == 1
         assert len(list(results.glob("*.json"))) == 5
-        # 3 waves × 0.3s = 0.9s. Allow 1.5s for overhead.
-        assert wall_clock < 1.5, f"wall-clock {wall_clock:.2f}s too high"
-        # And > 0.6s — anything less means we somehow ran > 2 in parallel.
-        assert wall_clock > 0.6, (
-            f"wall-clock {wall_clock:.2f}s too low; concurrency cap "
-            f"may not be enforced"
-        )
+        # Peak must be exactly 2: cap enforced (≤2) and parallelism occurs (≥2).
+        assert state["max_in_flight"] == 2
 
     def test_concurrent_no_result_collision(self, monkeypatch, tmp_path):
         """4 result files written with the same mtime — each task must
