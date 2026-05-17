@@ -7,6 +7,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -957,6 +958,66 @@ def _patch_subprocess_run_with_delay(monkeypatch, results_dir: Path, delay_s: fl
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+
+def _patch_subprocess_concurrency_probe(
+    monkeypatch, results_dir: Path, expected_concurrency: int
+) -> dict:
+    """Patch launcher.subprocess.run to measure peak in-flight concurrency.
+
+    Uses a threading.Event sentinel instead of a wall-clock budget:
+    each fake worker blocks until ``expected_concurrency`` threads have arrived
+    simultaneously (success path) or 5 s elapses (failure path).  The state
+    dict returned to the caller carries ``max_in_flight`` (peak observed) and
+    ``arrived`` (whether the target concurrency was reached).
+
+    Writes the same fake result files as ``_patch_subprocess_run_with_delay``
+    so that downstream result-collection paths in main() continue to work.
+    """
+    real_run = subprocess.run
+
+    lock = threading.Lock()
+    in_flight = [0]
+    state: dict = {"max_in_flight": 0, "arrived": False}
+    event = threading.Event()
+
+    def fake_run(cmd, *args, **kwargs):
+        if (
+            isinstance(cmd, list)
+            and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+        ):
+            with lock:
+                in_flight[0] += 1
+                if in_flight[0] > state["max_in_flight"]:
+                    state["max_in_flight"] = in_flight[0]
+                if in_flight[0] >= expected_concurrency:
+                    state["arrived"] = True
+                    event.set()
+
+            # Block until the target concurrency is observed (or timeout).
+            event.wait(timeout=5.0)
+
+            # Write the fake result AFTER all threads have arrived so the
+            # peak counter is captured before any thread exits.
+            task_arg = cmd[cmd.index("--task") + 1]
+            config_name = cmd[cmd.index("--config-name") + 1]
+            task_id = Path(task_arg).stem
+            results_dir.mkdir(parents=True, exist_ok=True)
+            run_id = uuid4().hex[:8]
+            _write_result(results_dir, task_id, config_name, run_id)
+            fh = kwargs.get("stdout")
+            if fh is not None and hasattr(fh, "write"):
+                fh.write(f"fake subprocess for {task_id}\n")
+                fh.flush()
+
+            with lock:
+                in_flight[0] -= 1
+
+            return SimpleNamespace(returncode=0)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return state
 
 
 def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
