@@ -6,7 +6,35 @@ This is where the review earns its keep. Per-task verification can't catch the c
 
 You (Opus) do the architectural reasoning. Spawn Sonnet sub-agents for the mechanical scanning, then synthesise their findings with your own analysis.
 
-## Step 1: Stub and placeholder audit
+## Step 1: Run the project's `/audit` skill (if available)
+
+Some projects ship an `/audit` slash command — an automated architecture-coherence detector suite. (Reify, for example, runs `reify-audit` covering P1 producer-orphan, P2 consumer-stub, and P5 phantom-done patterns.) When present, `/audit` is the first Phase 2 step: it does the mechanical scanning that would otherwise be ad-hoc, and frees the rest of Phase 2 to focus on judgment-heavy work.
+
+### Detect and invoke
+
+1. **Detect.** Check whether `.claude/skills/audit/SKILL.md` exists at project root. If absent, skip this step and record `f_infra_findings.audit_skill_present: false` in the report.
+
+2. **Compute the window.** Use `audit.window_days` from the briefing (default 14). The `--since` argument is an ISO-8601 timestamp `now - window_days`. If a previous Phase 2 report exists under `review/reports/phase2-*.json` and is newer than `now - window_days`, use *its* timestamp instead — sweeps should not redundantly re-scan ranges already covered.
+
+3. **Invoke.** Call the skill: `Skill(audit, args="--pattern P1,P2,P5 --since <iso>")`. The skill shells out to the project's detector binary, writes a per-run JSON artifact under `data/audit-runs/<ts>.json`, applies its own severity ladder (high → `escalate_info`, medium → `submit_task`, low → log-only), and updates `data/audit-runs/index.json` (its dedupe store).
+
+4. **Parse the artifact.** Read the newest file under `data/audit-runs/` (or the path the skill returns). Each entry is a `Finding` with `pattern`, `severity`, `subject`, `location`, `evidence`, and — for medium-severity findings the audit already filed — a `filed_task_id`.
+
+### Fold into the Phase 2 report
+
+Render an "F-infra automated findings" section grouped by severity:
+
+- **High** — already escalated by `/audit` via `escalate_info`. List them in the report with the escalation IDs; do not re-escalate from Phase 2.
+- **Medium** — already filed as tasks by `/audit`. Capture `filed_task_id` for each. Phase 3 triage MUST skip these (see Phase 3 dedupe note).
+- **Low** — logged-only by `/audit`. List them in the report for the audit trail; no follow-up action.
+
+Carry these into the Phase 2 JSON report under `f_infra_findings` (schema in Step 8). Phase 3's task-creation loop reads `f_infra_findings.medium.filed_task_ids` to avoid double-filing.
+
+### Why this step runs first
+
+`/audit`'s detectors (especially P2 consumer-stub and P1 producer-orphan) overlap with Step 2's stub audit but operate at task-graph scope instead of grep scope. Running `/audit` first means Step 2 can downweight findings that the automated detector already classified, and concentrate on the patterns no detector covers (TODOs without owners, abstract-class stubs in unusual places, etc).
+
+## Step 2: Stub and placeholder audit
 
 ### Mechanical scan (delegate to Sonnet agent)
 
@@ -47,7 +75,7 @@ For each potential stub, check three sources:
 | Structural | ABC, Protocol, type stub | Skip |
 | Unknown | No context found — needs human judgment | Warning |
 
-## Step 2: Critical path tracing (requires briefing)
+## Step 3: Critical path tracing (requires briefing)
 
 If no review briefing exists, skip this step. Without defined critical paths, path tracing is speculative — better to focus on the other steps.
 
@@ -87,9 +115,9 @@ For each critical path issue:
 - Evidence (the specific code lines)
 - Suggested fix
 
-## Step 3: Deep read of high-risk modules
+## Step 4: Deep read of high-risk modules
 
-Steps 1–2 find structural issues (stubs, broken paths). This step finds behavioral bugs — the kind that only surface when you actually read the code and think about what it does at runtime. These are the highest-value findings because they're the hardest to catch with automated tools or checklist-driven scanning.
+Steps 2–3 find structural issues (stubs, broken paths). This step finds behavioral bugs — the kind that only surface when you actually read the code and think about what it does at runtime. These are the highest-value findings because they're the hardest to catch with automated tools or checklist-driven scanning.
 
 ### Identify high-risk modules
 
@@ -121,7 +149,7 @@ Read each high-risk module carefully — not scanning for patterns, but thinking
 
 This step is where unstructured deep reading pays off. Don't rush it — the bugs found here are typically higher severity than anything from the structural scans.
 
-## Step 4: Cross-module consistency (renumbered from Step 3)
+## Step 5: Cross-module consistency
 
 ### API surface consistency
 
@@ -154,7 +182,7 @@ Trace how data structures transform as they cross module boundaries:
 - Missing transitive dependencies in `pyproject.toml`
 - Modules that import from internal paths of other packages (fragile coupling)
 
-## Step 5: Dead code and orphan detection
+## Step 6: Dead code and orphan detection
 
 ### Delegate scanning to Sonnet agent
 
@@ -175,7 +203,7 @@ Not everything that looks dead is actually dead:
 
 Check each candidate before flagging it. When in doubt, flag as "possibly dead — verify before removing" rather than definitively.
 
-## Step 6: Test coverage analysis (qualitative)
+## Step 7: Test coverage analysis (qualitative)
 
 This is not about line-coverage percentages. It's about whether the things that matter are tested in ways that would actually catch breakage.
 
@@ -198,7 +226,7 @@ Flag areas where:
 - Mocks are so thorough that the tests would pass even if the real integration is completely broken
 - Critical paths have no dedicated integration/e2e test
 
-## Step 7: Compile Phase 2 report
+## Step 8: Compile Phase 2 report
 
 Write to `review/reports/phase2-{timestamp}.json`:
 
@@ -207,6 +235,36 @@ Write to `review/reports/phase2-{timestamp}.json`:
   "phase": 2,
   "timestamp": "2026-03-24T14:45:00Z",
   "scope": "full | subproject-name | focused:mod1,mod2",
+  "f_infra_findings": {
+    "audit_skill_present": true,
+    "window_since_iso": "2026-03-10T14:45:00Z",
+    "high": {
+      "count": 1,
+      "findings": [
+        {
+          "pattern": "P5",
+          "subject": "task 3520 marked done — metadata.files lists `reify-stdlib/src/loop.rs` but file is empty",
+          "evidence": "reify-stdlib/src/loop.rs:1 — file is 0 bytes",
+          "escalation_id": "esc-3520-2"
+        }
+      ]
+    },
+    "medium": {
+      "count": 2,
+      "filed_task_ids": [3681, 3682],
+      "findings": [
+        {
+          "pattern": "P1",
+          "subject": "reify-eval::SnapshotCache pub since 2026-04-30, no consumer task in flight",
+          "filed_task_id": 3681
+        }
+      ]
+    },
+    "low": {
+      "count": 3,
+      "findings": []
+    }
+  },
   "stubs": {
     "total": 8,
     "unintended": 3,
@@ -270,9 +328,12 @@ Write to `review/reports/phase2-{timestamp}.json`:
 
 ```markdown
 ### Phase 2: Architectural Coherence
+- F-infra automated findings: 1 high (escalated), 2 medium (filed: 3681, 3682), 3 low
 - Stubs: 3 unintended (tasks claimed done), 2 known gaps, 1 accepted
 - Critical paths: 1 issue — classifier returns without calling Mem0 store
 - Cross-module: no issues
 - Dead code: 2 orphan modules
 - Test gaps: no integration test for cross-store search
 ```
+
+If the project ships no `/audit` skill, omit the "F-infra automated findings" line (or render `audit skill not present` in its place).

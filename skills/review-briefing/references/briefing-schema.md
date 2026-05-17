@@ -13,6 +13,11 @@ The briefing captures durable truths — purpose, intent, priorities, decisions,
 
 project: dark-factory
 
+# Optional /audit integration knobs. /review Phase 2 reads these when the
+# project ships an /audit slash command (e.g. Reify's reify-audit).
+audit:
+  window_days: 14   # How far back Phase 2's /audit sweep looks. Default 14.
+
 # Conventions and rules with teeth — violations are always bugs.
 # Include rationale so reviewers understand WHY, not just WHAT.
 conventions:
@@ -113,6 +118,14 @@ subprojects:
 ```
 
 ## Field reference
+
+### `audit` (optional)
+
+Knobs for `/review` Phase 2's invocation of the project's `/audit` slash command (if any). Only consumed when `.claude/skills/audit/SKILL.md` exists at project root.
+
+- `window_days` — how many days back Phase 2's sweep looks. Default `14`. Phase 2 computes `--since = max(now - window_days, last_phase2_timestamp)` so re-runs don't redundantly re-scan ranges already covered. Tune higher for projects with infrequent reviews (catch slower drift), lower for fast-cadence projects (keep reports focused).
+
+If the project has no `/audit` skill, this block is inert — leave it absent or empty. Adding `window_days` does not on its own change `/review`'s behaviour; the `/audit` skill must exist for the knob to matter.
 
 ### `conventions[]`
 

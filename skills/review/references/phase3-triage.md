@@ -75,6 +75,12 @@ Suggest unblocking these.
 
 ## Step 4: Create tasks
 
+### Skip F-infra-filed findings first
+
+Before creating any task, check Phase 2's `f_infra_findings.medium.filed_task_ids`. If a finding originated from the project's `/audit` skill (Phase 2 Step 1), the audit's severity ladder already filed it as a task via `submit_task(planning_mode=True)`. Phase 3 MUST NOT re-file these — record the existing `filed_task_id` in the review summary and proceed to the next finding. High-severity F-infra findings were already escalated by `/audit` (and listed in `f_infra_findings.high`); do not re-escalate. Low-severity F-infra findings are logged-only by design.
+
+### Create tasks for the remaining findings
+
 For each finding classified as "auto-fix" or "clear-cut issue":
 
 ```

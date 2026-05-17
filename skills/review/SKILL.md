@@ -115,16 +115,17 @@ This is the expensive, high-value phase. You (Opus) do the architectural reasoni
 Read `references/phase2-architecture.md` for the detailed step-by-step process.
 
 **Summary of steps:**
-1. Stub and placeholder audit — find TODOs, NotImplementedError, pass bodies, etc. Cross-reference against task tree, briefing known gaps, and memory
-2. Critical path tracing — follow each critical path from the briefing through actual code, checking wiring at every module boundary
-3. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift
-4. Cross-module consistency — API naming, data flow across boundaries, config coherence, import health
-5. Dead code and orphan detection
-6. Test coverage analysis (qualitative — are critical paths tested end-to-end?)
+1. Run the project audit (if available) — if the project ships an `/audit` slash command (e.g. Reify's `reify-audit` detector suite), invoke it as the first Phase 2 step with `--pattern P1,P2,P5 --since <window-start>`. Fold its findings into the Phase 2 report under "F-infra automated findings"
+2. Stub and placeholder audit — find TODOs, NotImplementedError, pass bodies, etc. Cross-reference against task tree, briefing known gaps, and memory
+3. Critical path tracing — follow each critical path from the briefing through actual code, checking wiring at every module boundary
+4. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift
+5. Cross-module consistency — API naming, data flow across boundaries, config coherence, import health
+6. Dead code and orphan detection
+7. Test coverage analysis (qualitative — are critical paths tested end-to-end?)
 
 **Agent allocation:**
 - Spawn Sonnet agents for: stub scanning (grep patterns), import graph mapping, dead code enumeration
-- Do the reasoning yourself: path tracing, deep read, cross-module analysis, coverage judgment
+- Do the reasoning yourself: project audit invocation + result folding, path tracing, deep read, cross-module analysis, coverage judgment
 
 **Output:** Save report to `review/reports/phase2-{timestamp}.json` and display a summary before proceeding.
 
