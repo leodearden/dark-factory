@@ -14,7 +14,6 @@ Contract source: server.py:88-90 pointer → DESIGN.md
 from __future__ import annotations
 
 import asyncio
-import inspect
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
