@@ -336,9 +336,22 @@ class TestHarnessTaskStatusLookup:
         mock_task = MagicMock()
         mock_task.done.return_value = False
 
+        captured_coros: list = []
+
+        # Close the captured coroutine to prevent it from leaking as an
+        # unawaited coroutine — pytest's sys.unraisablehook would otherwise
+        # convert the GC-time RuntimeWarning into a PytestUnraisableException-
+        # Warning attributed to whichever later test happens to be running
+        # (non-deterministic xdist failure mode — task 1468).  Canonical
+        # pattern: test_harness_watcher_supervisor.py:140-142.
+        def _capture_create_task(coro, *, name=None):
+            captured_coros.append(coro)
+            coro.close()  # prevent 'coroutine was never awaited' RuntimeWarning during GC
+            return mock_task
+
         with (
             patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
-            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.create_task', side_effect=_capture_create_task),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await harness._start_escalation_server()
@@ -348,6 +361,11 @@ class TestHarnessTaskStatusLookup:
         )
         assert captured_kwargs['task_status_lookup'] is not None, (
             'task_status_lookup passed to create_server must not be None'
+        )
+        assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
+        assert captured_coros[0].__qualname__.endswith('_serve'), (
+            'asyncio.create_task must be called with the _serve coroutine; '
+            f'got {captured_coros[0].__qualname__!r} instead'
         )
 
     @pytest.mark.asyncio
@@ -372,9 +390,22 @@ class TestHarnessTaskStatusLookup:
         mock_task = MagicMock()
         mock_task.done.return_value = False
 
+        captured_coros: list = []
+
+        # Close the captured coroutine to prevent it from leaking as an
+        # unawaited coroutine — pytest's sys.unraisablehook would otherwise
+        # convert the GC-time RuntimeWarning into a PytestUnraisableException-
+        # Warning attributed to whichever later test happens to be running
+        # (non-deterministic xdist failure mode — task 1468).  Canonical
+        # pattern: test_harness_watcher_supervisor.py:140-142.
+        def _capture_create_task(coro, *, name=None):
+            captured_coros.append(coro)
+            coro.close()  # prevent 'coroutine was never awaited' RuntimeWarning during GC
+            return mock_task
+
         with (
             patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
-            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.create_task', side_effect=_capture_create_task),
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await harness._start_escalation_server()
@@ -384,3 +415,8 @@ class TestHarnessTaskStatusLookup:
         result = await captured_lookup('task-99')
         harness.scheduler.get_status.assert_called_once_with('task-99')
         assert result == 'pending'
+        assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
+        assert captured_coros[0].__qualname__.endswith('_serve'), (
+            'asyncio.create_task must be called with the _serve coroutine; '
+            f'got {captured_coros[0].__qualname__!r} instead'
+        )
