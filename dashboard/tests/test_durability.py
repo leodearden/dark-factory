@@ -177,10 +177,17 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
     # Build a minimal config (no network needed — collect_snapshot is patched).
     config = DashboardConfig(project_root=tmp_path)
 
+    # _sleep_to_aligned_tick must yield to the event loop so checkpoint_called.set()
+    # (scheduled via loop.call_soon inside asyncio.Event.set) is processed between
+    # iterations.  A plain AsyncMock(return_value=None) never suspends, creating a
+    # tight synchronous loop that starves asyncio.wait_for of event-loop cycles.
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        await asyncio.sleep(0)
+
     try:
         with (
             patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
-            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(return_value=None)),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
             patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
             task = asyncio.create_task(
