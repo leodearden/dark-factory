@@ -207,3 +207,84 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
     assert checkpoint_mock.called, (
         '_burndown_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: metrics loop invokes periodic checkpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
+    """_metrics_loop calls store.checkpoint() on the periodic interval timer.
+
+    Drives _metrics_loop directly (no lifespan), patches _CHECKPOINT_INTERVAL_SECONDS
+    to 0 so the checkpoint fires on the first loop body iteration.
+
+    Uses the *second* collect_metrics_snapshot invocation (initial _run_once + 1
+    loop body) to signal that at least one loop body has run and the checkpoint gate
+    had a chance to fire.  _sleep_to_aligned_tick is given a side_effect that does
+    ``await asyncio.sleep(0)`` so the mock actually yields to the event loop between
+    iterations, allowing the snapshot_event wakeup to be processed and the assertion
+    to be racefree.
+    """
+    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # Replace checkpoint with an AsyncMock we can assert on.
+    checkpoint_mock = AsyncMock(return_value=CheckpointResult(0, 0, 0))
+    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
+
+    # Minimal app-state stub — pool.get() returns None because collect_metrics_snapshot
+    # is patched and never inspects the connections it receives.
+    config = DashboardConfig(project_root=tmp_path)
+    mock_pool = MagicMock()
+    mock_pool.get = AsyncMock(return_value=None)
+    mock_app = MagicMock()
+    mock_app.state.config = config
+    mock_app.state.db = mock_pool
+    mock_app.state.http_client = MagicMock()
+
+    # snapshot_event is set on the *second* collect_metrics_snapshot call (initial
+    # _run_once + 1 loop body), guaranteeing at least one full while-loop body ran
+    # and the checkpoint condition was evaluated.
+    snapshot_calls = 0
+    snapshot_event = asyncio.Event()
+
+    async def _snapshot_side_effect(*args: object, **kwargs: object) -> None:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls >= 2:
+            snapshot_event.set()
+
+    # _sleep_to_aligned_tick must yield to the event loop so snapshot_event.set()
+    # (scheduled via loop.call_soon inside asyncio.Event.set) is processed between
+    # iterations.  A plain AsyncMock(return_value=None) never suspends, creating a
+    # tight synchronous loop that starves asyncio.wait_for of event-loop cycles.
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_snapshot_side_effect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.app._CHECKPOINT_INTERVAL_SECONDS', 0),
+        ):
+            task = asyncio.create_task(_metrics_loop(store, mock_app))
+            try:
+                # snapshot_event fires after 2 collect_metrics_snapshot calls, meaning
+                # the loop body ran once — checkpoint had a chance to fire if implemented.
+                await asyncio.wait_for(snapshot_event.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    assert checkpoint_mock.called, (
+        '_metrics_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
+    )
