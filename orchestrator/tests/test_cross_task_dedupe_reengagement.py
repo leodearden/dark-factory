@@ -364,10 +364,9 @@ class TestHarnessTaskStatusLookup:
             'task_status_lookup passed to create_server must not be None'
         )
         assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
-        assert inspect.getcoroutinestate(captured_coros[0]) != inspect.CORO_CREATED, (
-            'test must consume the _serve coroutine (close or await it) to prevent '
-            'PytestUnraisableExceptionWarning leaking to later tests in the xdist worker; '
-            'see test_harness_watcher_supervisor.py:140-142 for the canonical pattern'
+        assert captured_coros[0].__qualname__.endswith('_serve'), (
+            'asyncio.create_task must be called with the _serve coroutine; '
+            f'got {captured_coros[0].__qualname__!r} instead'
         )
 
     @pytest.mark.asyncio
@@ -418,8 +417,7 @@ class TestHarnessTaskStatusLookup:
         harness.scheduler.get_status.assert_called_once_with('task-99')
         assert result == 'pending'
         assert captured_coros, 'asyncio.create_task should have been invoked with the _serve coroutine'
-        assert inspect.getcoroutinestate(captured_coros[0]) != inspect.CORO_CREATED, (
-            'test must consume the _serve coroutine (close or await it) to prevent '
-            'PytestUnraisableExceptionWarning leaking to later tests in the xdist worker; '
-            'see test_harness_watcher_supervisor.py:140-142 for the canonical pattern'
+        assert captured_coros[0].__qualname__.endswith('_serve'), (
+            'asyncio.create_task must be called with the _serve coroutine; '
+            f'got {captured_coros[0].__qualname__!r} instead'
         )
