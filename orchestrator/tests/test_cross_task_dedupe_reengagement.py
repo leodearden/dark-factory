@@ -339,8 +339,15 @@ class TestHarnessTaskStatusLookup:
 
         captured_coros: list = []
 
+        # Close the captured coroutine to prevent it from leaking as an
+        # unawaited coroutine — pytest's sys.unraisablehook would otherwise
+        # convert the GC-time RuntimeWarning into a PytestUnraisableException-
+        # Warning attributed to whichever later test happens to be running
+        # (non-deterministic xdist failure mode — task 1468).  Canonical
+        # pattern: test_harness_watcher_supervisor.py:140-142.
         def _capture_create_task(coro, *, name=None):
             captured_coros.append(coro)
+            coro.close()  # prevent 'coroutine was never awaited' RuntimeWarning during GC
             return mock_task
 
         with (
@@ -387,8 +394,15 @@ class TestHarnessTaskStatusLookup:
 
         captured_coros: list = []
 
+        # Close the captured coroutine to prevent it from leaking as an
+        # unawaited coroutine — pytest's sys.unraisablehook would otherwise
+        # convert the GC-time RuntimeWarning into a PytestUnraisableException-
+        # Warning attributed to whichever later test happens to be running
+        # (non-deterministic xdist failure mode — task 1468).  Canonical
+        # pattern: test_harness_watcher_supervisor.py:140-142.
         def _capture_create_task(coro, *, name=None):
             captured_coros.append(coro)
+            coro.close()  # prevent 'coroutine was never awaited' RuntimeWarning during GC
             return mock_task
 
         with (
