@@ -940,8 +940,15 @@ def _patch_subprocess_concurrency_probe(
     Uses a threading.Event sentinel instead of a wall-clock budget:
     each fake worker blocks until ``expected_concurrency`` threads have arrived
     simultaneously (success path) or 5 s elapses (failure path).  The state
-    dict returned to the caller carries ``max_in_flight`` (peak observed) and
-    ``arrived`` (whether the target concurrency was reached).
+    dict returned to the caller carries:
+
+    * ``max_in_flight`` — peak observed in-flight count across all waves.
+    * ``arrived`` — True iff the target concurrency was reached at least once.
+      For the windowed test (e.g. 5 tasks at concurrency=2) this reflects only
+      the first wave; subsequent waves pass through the already-latched event.
+    * ``timed_out`` — True if any fake_run invocation hit the 5 s barrier
+      without the event being set, indicating the executor never scheduled
+      ``expected_concurrency`` threads simultaneously.
 
     Writes the same fake result files expected by result-collection paths in
     main() so that the launcher can finish without errors.
@@ -950,7 +957,7 @@ def _patch_subprocess_concurrency_probe(
 
     lock = threading.Lock()
     in_flight = [0]
-    state: dict = {"max_in_flight": 0, "arrived": False}
+    state: dict = {"max_in_flight": 0, "arrived": False, "timed_out": False}
     event = threading.Event()
 
     def fake_run(cmd, *args, **kwargs):
@@ -967,7 +974,11 @@ def _patch_subprocess_concurrency_probe(
                     event.set()
 
             # Block until the target concurrency is observed (or timeout).
-            event.wait(timeout=5.0)
+            arrived = event.wait(timeout=5.0)
+            if not arrived:
+                # Sticky flag: executor never scheduled expected_concurrency
+                # threads simultaneously before the deadline.
+                state["timed_out"] = True
 
             # Write the fake result AFTER all threads have arrived so the
             # peak counter is captured before any thread exits.
@@ -1045,6 +1056,7 @@ class TestConcurrentLoop:
         assert len(fake_client.create_calls) == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
         # All 3 worker threads must have been in-flight simultaneously.
+        assert state["arrived"], "3 threads never arrived simultaneously within 5 s"
         assert state["max_in_flight"] == 3
         # All 3 result files written
         result_files = sorted(p.name for p in results.glob("*.json"))
@@ -1059,6 +1071,11 @@ class TestConcurrentLoop:
 
         Verified via peak in-flight counter instead of a wall-clock window;
         deterministic on any CPU load.
+
+        Note: the threading.Event is latching — it is set once when the first
+        wave of 2 threads arrives and stays set for all subsequent waves.  The
+        ``arrived`` / ``max_in_flight`` assertions therefore prove the cap on
+        wave 1; later waves pass through the already-open event immediately.
         """
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
@@ -1089,6 +1106,7 @@ class TestConcurrentLoop:
         assert len(fake_client.create_calls) == 1
         assert len(list(results.glob("*.json"))) == 5
         # Peak must be exactly 2: cap enforced (≤2) and parallelism occurs (≥2).
+        assert state["arrived"], "2 threads never arrived simultaneously within 5 s"
         assert state["max_in_flight"] == 2
 
     def test_concurrent_no_result_collision(self, monkeypatch, tmp_path):
