@@ -782,8 +782,10 @@ class ReconciliationHarness:
                     await self._notify_judge_halt(
                         project_id, reason='judge halted reconciliation',
                     )
-                    await self.buffer.mark_run_complete(project_id)
-                    await self._replay_deferred_writes(project_id)
+                    try:
+                        await self._replay_deferred_writes(project_id)
+                    finally:
+                        await self.buffer.mark_run_complete(project_id)
                     return  # Don't keep spinning on a halted project
 
                 # Decrement post-unhalt grace counter. A just-unhalted project
