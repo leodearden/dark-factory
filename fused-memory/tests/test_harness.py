@@ -4959,3 +4959,74 @@ class TestKnownProjectsInjection:
         )
         expected = build_known_projects_map(harness._project_root)
         assert harness._known_projects == expected
+
+
+# ── Deferred-write ordering tests (task 1474) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_project_loop_replays_deferred_writes_before_releasing_lock(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (finally path) must replay deferred writes WHILE the lock is held.
+
+    Bug: mark_run_complete (which deletes the lock row) was called BEFORE
+    _replay_deferred_writes, opening a window where a second process could claim
+    the same deferred rows.  The fix: replay first, release lock second.
+
+    Verification: spy on both methods to record call order, and probe
+    buffer.is_full_recon_active inside the replay spy to confirm the lock is
+    still held at replay time.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Push enough events to trigger a cycle
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Seed one deferred write so replay has something to claim
+    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
+
+    # Build a completed ReconciliationRun for the fake cycle
+    async def fake_rfc(*_a, **_k):
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+        )
+
+    call_order: list[str] = []
+    lock_held_during_replay: list[bool] = []
+
+    original_replay = harness._replay_deferred_writes
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_replay(pid):
+        call_order.append('replay')
+        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
+        return await original_replay(pid)
+
+    async def spy_complete(pid):
+        call_order.append('complete')
+        return await original_complete(pid)
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+        patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+
+    assert call_order == ['replay', 'complete'], (
+        f'Expected replay-then-complete, got {call_order!r}. '
+        'Bug: lock released (mark_run_complete) before deferred writes are replayed.'
+    )
+    assert lock_held_during_replay == [True], (
+        f'Expected lock held during replay, got {lock_held_during_replay!r}. '
+        'Bug: mark_run_complete deleted the lock row before _replay_deferred_writes ran.'
+    )
