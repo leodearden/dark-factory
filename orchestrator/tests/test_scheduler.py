@@ -86,6 +86,17 @@ class TestModuleLockTable:
         # Already holds both — should succeed without double-acquiring
         assert lock_table.try_acquire_additional('task-1', ['backend', 'server'])
 
+    def test_try_acquire_additional_creates_entry_when_absent(
+        self, lock_table: ModuleLockTable
+    ):
+        # Call try_acquire_additional for a task that has never called try_acquire.
+        # Before the fix, line 656 (`self._held[task_id].update(...)`) raises KeyError
+        # because task-new is absent from _held.  After the fix (setdefault), it
+        # creates the entry and returns True.
+        result = lock_table.try_acquire_additional('task-new', ['backend'])
+        assert result is True
+        assert lock_table.is_held('task-new') is True
+
     def test_release_nonexistent_task(self, lock_table: ModuleLockTable):
         # Should not raise
         lock_table.release('nonexistent')
@@ -1546,6 +1557,57 @@ class TestDispatchCooldownGate:
         # _last_dispatch_at must be cleared after observing the terminal status
         assert '42' not in scheduler._last_dispatch_at, (
             f'_last_dispatch_at must be cleared when task is {terminal_status!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+    async def test_terminal_status_clears_skip_count_and_module_cache(
+        self, monkeypatch, terminal_status
+    ):
+        """When acquire_next observes a task in done/cancelled, both _skip_count
+        and _module_cache must be evicted for that task so a future re-dispatch or
+        id-reuse starts from a clean slate."""
+        import json as _json
+
+        task = {
+            'id': '42',
+            'title': 'Terminal sweep test',
+            'status': terminal_status,
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        # Prime both dicts as if task '42' has been scheduled before
+        scheduler._skip_count['42'] = 5
+        scheduler._module_cache['42'] = ['somemod']
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        # acquire_next returns None (task is terminal, not pending)
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        # Both caches must be cleared after observing the terminal status
+        assert '42' not in scheduler._skip_count, (
+            f'_skip_count must be cleared when task is {terminal_status!r}'
+        )
+        assert '42' not in scheduler._module_cache, (
+            f'_module_cache must be cleared when task is {terminal_status!r}'
         )
 
     @pytest.mark.asyncio

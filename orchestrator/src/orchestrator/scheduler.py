@@ -653,7 +653,7 @@ class ModuleLockTable:
             if self._is_parked_blocks(module, task_id):
                 return False
 
-        self._held[task_id].update(new_modules)
+        self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
         return True
 
@@ -2031,13 +2031,17 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at entries for tasks now in a terminal status so
-        # a future legitimate re-dispatch (e.g. cancelled -> pending re-architect,
-        # or a freshly-created task reusing the id) starts from a clean slate.
+        # Drop _last_dispatch_at, _skip_count, and _module_cache entries for tasks
+        # now in a terminal status so a future legitimate re-dispatch (e.g.
+        # cancelled -> pending re-architect, or a freshly-created task reusing the
+        # id) starts from a clean slate.  Resurrection-safe: a re-queued task
+        # re-derives modules and re-accumulates its skip count fresh.
         # Mirrors the _pending_anchor clearing in _update_age_anchors.
         for tid_str, status in status_map.items():
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
+                self._skip_count.pop(tid_str, None)
+                self._module_cache.pop(tid_str, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
@@ -2084,8 +2088,12 @@ class Scheduler:
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
         # fire-and-forget — the parks will survive until the owner-GC sweep evicts
-        # them (or the task completes).  Only pending tasks with satisfied deps are
-        # processed so a reserve on a blocked or terminal task is a no-op.
+        # them (owner goes terminal/missing or its deps lapse).  The loop skips
+        # only tasks that are absent from the task list entirely, or that are
+        # already in TERMINAL_STATUSES (done/cancelled).  A blocked-but-non-terminal
+        # task DOES get parks installed — reserve_now is an explicit user override
+        # so holding the modules for it is intentional.  The park-GC sweep
+        # (_park_gc) reclaims those parks once the owner transitions to terminal.
         if self._override_store:
             for rid, rrow in list(current_overrides.items()):
                 if not rrow.reserve_now:
