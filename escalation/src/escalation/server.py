@@ -325,7 +325,16 @@ def create_server(
         if orch_config is None:
             return {'error': 'Merge queue available but no orchestrator config — cannot verify'}
 
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
+        # Runtime-only reverse import: orchestrator depends on escalation, not
+        # vice versa, so this lazy import deliberately avoids a static cycle. It
+        # resolves at runtime because the escalation server is hosted inside the
+        # orchestrator process; it is unresolvable in escalation's standalone
+        # typecheck env (orchestrator is not on its path), hence the suppression.
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            MergeRequest,
+            enqueue_merge_request,
+        )
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).

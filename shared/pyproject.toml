@@ -17,6 +17,7 @@ vllm = ["aiohttp>=3.9"]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.404",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=7.1.0",
@@ -37,6 +38,12 @@ asyncio_mode = "auto"
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
 timeout = 60
 timeout_method = "signal"
+
+[tool.pyright]
+include = ["src", "tests"]
+extraPaths = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
 
 [tool.ruff]
 line-length = 100
