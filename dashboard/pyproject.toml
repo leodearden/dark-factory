@@ -27,7 +27,7 @@ dark-factory-shared = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../escalation/src"]
+extraPaths = ["src", "../shared/src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 venvPath = ".."
