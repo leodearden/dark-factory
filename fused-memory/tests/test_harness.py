@@ -4959,3 +4959,193 @@ class TestKnownProjectsInjection:
         )
         expected = build_known_projects_map(harness._project_root)
         assert harness._known_projects == expected
+
+
+# ── Deferred-write ordering tests (task 1474) ──────────────────────────────
+
+# -- shared helpers -----------------------------------------------------------
+
+
+async def _seed_recon_state(
+    event_buffer: EventBuffer,
+    project_id: str = 'test-project',
+    n_events: int = 3,
+) -> None:
+    """Push n_events so should_trigger fires, then seed one deferred write."""
+    for _ in range(n_events):
+        await event_buffer.push(_make_event(project_id))
+    await event_buffer.defer_write(project_id, 'some content', 'observations_and_summaries', {})
+
+
+def _make_fake_rfc(project_id: str = 'test-project'):
+    """Return a coroutine function that yields a completed ReconciliationRun."""
+    async def fake_rfc(*_a, **_k):
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+        )
+    return fake_rfc
+
+
+def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
+    """Build replay/complete spies that record call order and lock state.
+
+    Returns ``(spy_replay, spy_complete, call_order, lock_held_during_replay)``.
+    ``call_order`` accumulates ``'replay'``/``'complete'`` strings in the order
+    the spied methods are invoked.  ``lock_held_during_replay`` records whether
+    ``event_buffer.is_full_recon_active(project_id)`` returned True inside each
+    ``spy_replay`` call — i.e. whether the per-project lock was still held at
+    replay time.
+    """
+    call_order: list[str] = []
+    lock_held_during_replay: list[bool] = []
+    original_replay = harness._replay_deferred_writes
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_replay(pid):
+        call_order.append('replay')
+        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
+        return await original_replay(pid)
+
+    async def spy_complete(pid):
+        call_order.append('complete')
+        return await original_complete(pid)
+
+    return spy_replay, spy_complete, call_order, lock_held_during_replay
+
+
+# -- tests --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_project_loop_replays_deferred_writes_before_releasing_lock(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (finally path) must replay deferred writes WHILE the lock is held.
+
+    Bug: mark_run_complete (which deletes the lock row) was called BEFORE
+    _replay_deferred_writes, opening a window where a second process could claim
+    the same deferred rows.  The fix: replay first, release lock second.
+
+    Verification: spy on both methods to record call order, and probe
+    buffer.is_full_recon_active inside the replay spy to confirm the lock is
+    still held at replay time.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await _seed_recon_state(event_buffer)
+    spy_replay, spy_complete, call_order, lock_held_during_replay = _make_order_spies(
+        harness, event_buffer
+    )
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
+        patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+
+    assert call_order == ['replay', 'complete'], (
+        f'Expected replay-then-complete, got {call_order!r}. '
+        'Bug: lock released (mark_run_complete) before deferred writes are replayed.'
+    )
+    assert lock_held_during_replay == [True], (
+        f'Expected lock held during replay, got {lock_held_during_replay!r}. '
+        'Bug: mark_run_complete deleted the lock row before _replay_deferred_writes ran.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_releases_lock_when_replay_raises(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (finally path) must release the lock even when replay raises.
+
+    A bare statement reorder (_replay_deferred_writes then mark_run_complete)
+    would leak the lock if _replay_deferred_writes raises.  The correct fix
+    wraps the pair as try/finally so mark_run_complete always runs.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await _seed_recon_state(event_buffer)
+
+    complete_called: list[bool] = []
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_complete(pid):
+        complete_called.append(True)
+        return await original_complete(pid)
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
+        patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+
+    assert complete_called, (
+        'mark_run_complete was never called after replay raised. '
+        'Bug: a bare reorder leaks the lock when _replay_deferred_writes raises.'
+    )
+    assert not await event_buffer.is_full_recon_active('test-project'), (
+        'Lock was not released after replay raised. '
+        'Bug: mark_run_complete must always run even if replay raises.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_replays_before_releasing_lock_on_halt(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (halt path) must replay deferred writes WHILE the lock is held.
+
+    The halt early-return path has the same release-before-replay bug as the
+    finally path: mark_run_complete was called before _replay_deferred_writes.
+    The fix applies the same try/finally shape to this exit path.
+
+    Verification: pre-halt the project, spy both methods, drive _project_loop
+    directly (it returns naturally when halted), assert order and lock state.
+    """
+    from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.reconciliation.judge import Judge
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Wire a judge with the project pre-halted
+    judge_config = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    mock_j = AsyncMock()
+    mock_j.get_run = AsyncMock(return_value=None)
+    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge._halted_projects.add('test-project')
+    harness._notify_judge_halt = AsyncMock()  # suppress escalation side effects
+
+    await _seed_recon_state(event_buffer)
+    spy_replay, spy_complete, call_order, lock_held_during_replay = _make_order_spies(
+        harness, event_buffer
+    )
+
+    with (
+        patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+    ):
+        # Halt path returns naturally — no wait_for/suppress needed
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=1.0)
+
+    assert call_order == ['replay', 'complete'], (
+        f'Expected replay-then-complete on halt path, got {call_order!r}. '
+        'Bug: halt path releases lock before replaying deferred writes.'
+    )
+    assert lock_held_during_replay == [True], (
+        f'Expected lock held during replay on halt path, got {lock_held_during_replay!r}. '
+        'Bug: halt path calls mark_run_complete before _replay_deferred_writes.'
+    )

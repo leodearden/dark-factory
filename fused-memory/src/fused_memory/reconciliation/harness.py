@@ -782,8 +782,10 @@ class ReconciliationHarness:
                     await self._notify_judge_halt(
                         project_id, reason='judge halted reconciliation',
                     )
-                    await self.buffer.mark_run_complete(project_id)
-                    await self._replay_deferred_writes(project_id)
+                    try:
+                        await self._replay_deferred_writes(project_id)
+                    finally:
+                        await self.buffer.mark_run_complete(project_id)
                     return  # Don't keep spinning on a halted project
 
                 # Decrement post-unhalt grace counter. A just-unhalted project
@@ -816,11 +818,17 @@ class ReconciliationHarness:
                     )
                     await self.buffer.restore_drained(project_id)
                 finally:
-                    heartbeat_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await heartbeat_task
-                    await self.buffer.mark_run_complete(project_id)
-                    await self._replay_deferred_writes(project_id)
+                    try:
+                        await self._replay_deferred_writes(project_id)
+                    finally:
+                        # Cancel heartbeat only after replay so the lock heartbeat
+                        # keeps the per-project lock alive for the full replay
+                        # duration, preventing a concurrent instance from claiming
+                        # the lock as stale mid-replay.
+                        heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await heartbeat_task
+                        await self.buffer.mark_run_complete(project_id)
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown
