@@ -1,9 +1,16 @@
-"""Tests for Stage 1 Memory Consolidator payload behaviour — task 1174.
+"""Tests for Stage 1 Memory Consolidator payload behaviour and cross-stage prompt contracts.
 
 Covers:
 - project_root threading through assemble_payload / _format_assembled_payload
   (TestStage1PayloadThreadsProjectRootLegacy, TestStage1PayloadThreadsProjectRootAssembled)
 - project_root omitted when empty (TestStage1PayloadOmitsProjectRootWhenUnset)
+- STAGE2_SYSTEM_PROMPT mandates uniqueness_token in every per-cycle summary to defeat
+  Mem0 cosine-similarity dedup of zero-flag/zero-task cycles (task 1473)
+  (TestStage2PromptMandatesUniquenessToken)
+- STAGE1_SYSTEM_PROMPT pre-checks for already-reconstructed Stage 2 summaries before
+  emitting a missing-summary finding, preventing double-reconstruction in back-to-back
+  remediation passes (task 1473)
+  (TestStage1PromptPrechecksReconstructedSummaries)
 """
 
 from __future__ import annotations
@@ -150,4 +157,68 @@ class TestStage1PayloadOmitsProjectRootWhenUnset:
         )
         assert 'Use project_root=""' not in result
 
+
+# ---------------------------------------------------------------------------
+# Step 1 (task-1473): STAGE2 prompt mandates uniqueness_token in cycle summaries
+# ---------------------------------------------------------------------------
+
+
+class TestStage2PromptMandatesUniquenessToken:
+    """STAGE2_SYSTEM_PROMPT mandates a uniqueness_token in every per-cycle summary.
+
+    Covers the fix for zero-flag/zero-task cycle summary deduplication (task 1473):
+    a SHA-256-derived 8-hex-char token folds in the ISO timestamp so even empty
+    cycles produce a distinct content string, defeating Mem0 cosine-similarity dedup.
+    """
+
+    def test_uniqueness_token_literal_present(self):
+        """'uniqueness_token' must appear in STAGE2_SYSTEM_PROMPT."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'uniqueness_token' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mandate a 'uniqueness_token' field in every "
+            "per-cycle summary to defeat Mem0 cosine-similarity dedup of "
+            "zero-flag/zero-task cycles."
+        )
+
+    def test_sha256_algorithm_named(self):
+        """SHA-256 must be named as the derivation algorithm."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'sha256' in STAGE2_SYSTEM_PROMPT.lower(), (
+            "STAGE2_SYSTEM_PROMPT must specify SHA-256 as the algorithm for computing "
+            "uniqueness_token."
+        )
+
+    def test_formula_inputs_named(self):
+        """iso_timestamp and sorted flag_ids must appear as formula inputs."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'iso_timestamp' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must name 'iso_timestamp' as a formula input for "
+            "uniqueness_token (folding in the timestamp ensures empty cycles differ)."
+        )
+        assert 'sorted' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must reference sorted(flag_ids) as a formula input "
+            "for deterministic ordering."
+        )
+
+    def test_eight_char_prefix_specified(self):
+        """The [:8] first-8-hex-chars truncation must be specified."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert '[:8]' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must specify '[:8]' (first 8 hex chars) for "
+            "uniqueness_token so the prompt is actionable as a hashlib one-liner."
+        )
+
+    def test_build_stage2_system_prompt_exposes_uniqueness_token(self):
+        """build_stage2_system_prompt('dark_factory') must also expose uniqueness_token."""
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        result = build_stage2_system_prompt('dark_factory')
+        assert 'uniqueness_token' in result, (
+            "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
+            "(it returns STAGE2_SYSTEM_PROMPT unmodified for non-autopilot projects)."
+        )
 
