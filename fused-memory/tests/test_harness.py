@@ -5085,3 +5085,75 @@ async def test_project_loop_releases_lock_when_replay_raises(
         'Lock was not released after replay raised. '
         'Bug: mark_run_complete must always run even if replay raises.'
     )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_replays_before_releasing_lock_on_halt(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (halt path) must replay deferred writes WHILE the lock is held.
+
+    The halt early-return path has the same release-before-replay bug as the
+    finally path: mark_run_complete was called before _replay_deferred_writes.
+    The fix applies the same try/finally shape to this exit path.
+
+    Verification: pre-halt the project, spy both methods, drive _project_loop
+    directly (it returns naturally when halted), assert order and lock state.
+    """
+    from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.reconciliation.judge import Judge
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Wire a judge with the project pre-halted
+    judge_config = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    mock_j = AsyncMock()
+    mock_j.get_run = AsyncMock(return_value=None)
+    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge._halted_projects.add('test-project')
+
+    # Suppress escalation side effects from _notify_judge_halt
+    harness._notify_judge_halt = AsyncMock()
+
+    # Push enough events to acquire the lock
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Seed one deferred write
+    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
+
+    call_order: list[str] = []
+    lock_held_during_replay: list[bool] = []
+
+    original_replay = harness._replay_deferred_writes
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_replay(pid):
+        call_order.append('replay')
+        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
+        return await original_replay(pid)
+
+    async def spy_complete(pid):
+        call_order.append('complete')
+        return await original_complete(pid)
+
+    with (
+        patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+    ):
+        # Halt path returns naturally — no wait_for/suppress needed
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=1.0)
+
+    assert call_order == ['replay', 'complete'], (
+        f'Expected replay-then-complete on halt path, got {call_order!r}. '
+        'Bug: halt path releases lock before replaying deferred writes.'
+    )
+    assert lock_held_during_replay == [True], (
+        f'Expected lock held during replay on halt path, got {lock_held_during_replay!r}. '
+        'Bug: halt path calls mark_run_complete before _replay_deferred_writes.'
+    )
