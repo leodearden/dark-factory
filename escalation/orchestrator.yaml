@@ -4,3 +4,4 @@
 # Verification commands
 test_command: "uv run --project escalation --directory escalation pytest tests/ --tb=short -q"
 lint_command: "uv run --project escalation --directory escalation ruff check src/ tests/"
+type_check_command: "uv run --project escalation --directory escalation pyright src/ tests/"

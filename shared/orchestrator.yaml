@@ -1,6 +1,7 @@
 # Shared orchestrator configuration
-# Scopes verification to shared's own venv. Lint only — no tests or pyright.
+# Scopes verification to shared's own venv. Runs lint, tests, and pyright on src/+tests/.
 
 # Verification commands
-lint_command: "uv run --project shared --directory shared ruff check src/"
+lint_command: "uv run --project shared --directory shared ruff check src/ tests/"
 test_command: "uv run --project shared --directory shared pytest tests/ --tb=short -q"
+type_check_command: "uv run --project shared --directory shared pyright src/ tests/"
