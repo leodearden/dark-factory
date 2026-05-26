@@ -3340,6 +3340,49 @@ class TaskInterceptor:
 
         return mapping
 
+    async def search_tasks(
+        self,
+        project_root: str,
+        query: str,
+        *,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> dict[str, Any]:
+        """Semantic search over already-filed tasks, enriched with live status.
+
+        Delegates the nearest-neighbour lookup to the task curator's corpus
+        (the same Qdrant collection populated during ``submit_task``), then
+        annotates each hit with its current Taskmaster status so callers can
+        tell whether a near-match is already complete.
+
+        Args:
+            project_root: Absolute path to project root.
+            query: Free-text query to embed and match against filed tasks.
+            limit: Max number of hits to return.
+            score_threshold: Drop hits below this cosine score (0–1).
+
+        Returns:
+            ``{'results': [...]}`` on success, where each hit carries a
+            ``status`` key (``None`` if the task no longer exists). Returns a
+            ``ConfigurationError`` shape when the curator is disabled.
+        """
+        curator = await self._get_curator()
+        if curator is None:
+            return {
+                'error': 'Task curator is not enabled',
+                'error_type': 'ConfigurationError',
+                'results': [],
+            }
+        project_id = resolve_project_id(project_root)
+        hits = await curator.search_corpus(
+            query, project_id, limit=limit, score_threshold=score_threshold,
+        )
+        # Enrich with live status via a single status read for the whole set.
+        statuses = await self.get_statuses(project_root)
+        for hit in hits:
+            hit['status'] = statuses.get(str(hit.get('task_id')))
+        return {'results': hits}
+
     async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)

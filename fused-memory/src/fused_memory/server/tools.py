@@ -214,6 +214,7 @@ Read operations:
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers
+- search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / add_subtask / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -2040,6 +2041,57 @@ def create_mcp_server(
         rows = result.pop('rows', [])
         result['tickets'] = [_summarise_ticket_row(r) for r in rows]
         return result
+
+    @mcp.tool()
+    async def search_tasks(
+        project_root: str,
+        query: str,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> dict[str, Any]:
+        """Semantic search over already-filed tasks (NOT memories — use `search` for those).
+
+        Answers "was a task like X already filed?" by matching ``query`` against
+        the curator's corpus of every filed task's title+description+files.
+        Returns matches ranked by cosine similarity, each enriched with its
+        current ``status`` (done/pending/cancelled/…) so you can tell whether a
+        near-match is already complete. A ``status`` of ``null`` means the task
+        no longer exists.
+
+        Each result carries: ``task_id``, ``title``, ``description``,
+        ``files_to_modify``, ``priority``, ``updated_at``, ``score`` (cosine
+        similarity, higher = more similar), and ``status``.
+
+        Args:
+            project_root: Absolute path to project root.
+            query: Free-text query (e.g. a paraphrase of the task you're about to file).
+            limit: Max number of matches to return (clamped to [1, 100]).
+            score_threshold: Minimum cosine similarity in 0–1 (default 0.3).
+                Weak matches are dropped server-side; raise it (e.g. 0.7) for
+                near-duplicates only, lower it for broader recall.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        if not query or not query.strip():
+            return {'error': 'query must be non-empty', 'error_type': 'ValidationError'}
+        if limit <= 0:
+            return {'error': 'limit must be positive', 'error_type': 'ValidationError'}
+        if limit > 100:
+            limit = 100
+        try:
+            return await task_interceptor.search_tasks(
+                project_root=project_root,
+                query=query,
+                limit=limit,
+                score_threshold=score_threshold,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'search_tasks error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:

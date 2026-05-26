@@ -1175,6 +1175,68 @@ class TaskCurator:
             )
             return 0
 
+    async def search_corpus(
+        self,
+        query: str,
+        project_id: str,
+        *,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> list[dict[str, Any]]:
+        """Semantic nearest-neighbour search over the curator corpus.
+
+        Read-only: embeds the raw ``query`` string and returns the most
+        similar filed tasks for ``project_id`` ranked by cosine similarity
+        (higher score = more similar). Never creates the collection — a
+        missing collection (no tasks ever filed) yields ``[]``.
+
+        Args:
+            query: Free-text query, embedded as-is (NOT passed through
+                ``_embedding_text``, which composes stored-task fields).
+            project_id: Project identifier selecting the collection.
+            limit: Max number of hits to return.
+            score_threshold: Drop hits below this cosine score server-side.
+
+        Returns:
+            List of dicts ``{task_id, title, description, files_to_modify,
+            priority, updated_at, score}``. Returns ``[]`` on any error
+            (Qdrant/embedder unavailable), mirroring corpus_count's
+            best-effort degradation.
+        """
+        try:
+            client = await self._get_qdrant()
+            name = self._collection_name(project_id)
+            if not await client.collection_exists(name):
+                return []
+            embedding = await (await self._get_embedder()).create(query)
+            results = await client.query_points(
+                collection_name=name,
+                query=embedding,
+                limit=limit,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+            hits: list[dict[str, Any]] = []
+            for point in results.points:
+                payload = point.payload or {}
+                hits.append(
+                    {
+                        'task_id': payload.get('task_id'),
+                        'title': payload.get('title'),
+                        'description': payload.get('description'),
+                        'files_to_modify': payload.get('files_to_modify', []),
+                        'priority': payload.get('priority'),
+                        'updated_at': payload.get('updated_at'),
+                        'score': point.score,
+                    },
+                )
+            return hits
+        except Exception:
+            logger.warning(
+                'task_curator: search_corpus failed for project %s', project_id, exc_info=True,
+            )
+            return []
+
     async def backfill_corpus(
         self,
         tasks: list[dict],
