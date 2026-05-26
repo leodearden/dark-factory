@@ -136,14 +136,12 @@ processed this cycle (from active-query flags, FIX C deletions, and FIX D \
 escalations — or "none" if zero), (3) the task IDs created or modified this cycle \
 (via `set_task_status`, `update_task`, `submit_task`, or `resolve_ticket` — including \
 newly-created task_ids returned from `submit_task`/`resolve_ticket`), and (4) a \
-`uniqueness_token` computed as the first 8 hex chars of SHA-256 over \
-`run_id + iso_timestamp + ''.join(sorted(flag_ids))`: \
-`hashlib.sha256((run_id + iso_timestamp + ''.join(sorted(flag_ids))).encode()).hexdigest()[:8]` \
-where `iso_timestamp` is the current cycle start time in ISO 8601 format (e.g. \
-`"2026-05-26T11:59:24+00:00"`). Example output line: `uniqueness_token: a3f7c901`. \
+`uniqueness_token` set to the cycle-start time in ISO 8601 format \
+(e.g. `"2026-05-26T11:59:24+00:00"`). Example output line: \
+`uniqueness_token: 2026-05-26T11:59:24+00:00`. \
 Rationale: Mem0 deduplicates near-duplicate writes by cosine similarity — multiple \
 confirmed cycles had their summaries silently dropped (`memory_ids=[]`) because the \
-content was too uniform across cycles. Folding in the ISO timestamp guarantees a \
+content was too uniform across cycles. Embedding the ISO timestamp guarantees a \
 semantically-distinct content string even for zero-flag/zero-task cycles, defeating \
 cosine-similarity dedup that previously dropped structurally-empty summaries \
 (confirmed reconstructions: b5c39ab7, 2310b354, d72a0203, run e4b1ebfa).

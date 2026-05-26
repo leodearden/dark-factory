@@ -279,7 +279,9 @@ reconstruction." Rationale: back-to-back remediation passes otherwise trigger \
 double-reconstruction of the same Stage 2 summary, producing duplicate per-cycle \
 entries that a later cycle must clean up. This pre-check closes that loop; it mirrors \
 the Flag Suppression Check below, which also confirms an existing Mem0 record before \
-emitting a finding.
+emitting a finding. Note: this is a best-effort heuristic — semantic search may miss \
+an existing summary due to ranking or limit=10 truncation; any duplicates that slip \
+through can be cleaned up in a later consolidation cycle.
 
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
