@@ -659,7 +659,8 @@ class TestCrossTaskChildResumeContract:
 
         # (5) Resolve the parent.
         resolve_tool = await server.get_tool('resolve_issue')
-        resolved = resolve_tool.fn(escalation_id=parent_id, resolution='fused-memory restarted')
+        assert resolve_tool is not None
+        resolved = resolve_tool.fn(escalation_id=parent_id, resolution='fused-memory restarted')  # type: ignore[attr-defined]
         assert resolved.get('status') in ('resolved', 'dismissed')
 
         # (6) Still no pending escalation under task 99 after the parent resolves.

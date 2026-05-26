@@ -547,6 +547,7 @@ class TestSubmitResolved:
         )
         # Parent dir name must match the date prefix of resolved_at
         archived_path = archived_files[0]
+        assert esc.resolved_at is not None
         expected_date = esc.resolved_at[:10]  # YYYY-MM-DD
         assert archived_path.parent.name == expected_date, (
             f"Expected archive dir '{expected_date}', got '{archived_path.parent.name}'"
@@ -1498,7 +1499,7 @@ class TestAttachDedupeChild:
 
         assert result is not None
         assert result.severity == 'info'
-        assert queue.get('esc-1-1').severity == 'info'
+        assert queue.get('esc-1-1').severity == 'info'  # type: ignore[union-attr]
 
     def test_attach_blocker_into_info_parent_promotes_to_blocker(self, tmp_path: Path):
         """(f) blocking child into info parent: parent.severity promoted to 'blocking'."""
@@ -1512,7 +1513,7 @@ class TestAttachDedupeChild:
         assert result is not None
         assert result.severity == 'blocking'
         # Verify promotion is persisted to disk
-        assert queue.get('esc-1-1').severity == 'blocking'
+        assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
     def test_attach_info_into_blocker_parent_keeps_blocker(self, tmp_path: Path):
         """(g) info child into blocking parent: parent.severity stays 'blocking'."""
@@ -1525,7 +1526,7 @@ class TestAttachDedupeChild:
 
         assert result is not None
         assert result.severity == 'blocking'
-        assert queue.get('esc-1-1').severity == 'blocking'
+        assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
     def test_attach_blocker_into_blocker_parent_keeps_blocker(self, tmp_path: Path):
         """(h) blocking child into blocking parent: parent.severity stays 'blocking'."""
@@ -1538,5 +1539,5 @@ class TestAttachDedupeChild:
 
         assert result is not None
         assert result.severity == 'blocking'
-        assert queue.get('esc-1-1').severity == 'blocking'
+        assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
