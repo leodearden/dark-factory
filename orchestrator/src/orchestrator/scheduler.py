@@ -2088,8 +2088,12 @@ class Scheduler:
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
         # fire-and-forget — the parks will survive until the owner-GC sweep evicts
-        # them (or the task completes).  Only pending tasks with satisfied deps are
-        # processed so a reserve on a blocked or terminal task is a no-op.
+        # them (owner goes terminal/missing or its deps lapse).  The loop skips
+        # only tasks that are absent from the task list entirely, or that are
+        # already in TERMINAL_STATUSES (done/cancelled).  A blocked-but-non-terminal
+        # task DOES get parks installed — reserve_now is an explicit user override
+        # so holding the modules for it is intentional.  The park-GC sweep
+        # (_park_gc) reclaims those parks once the owner transitions to terminal.
         if self._override_store:
             for rid, rrow in list(current_overrides.items()):
                 if not rrow.reserve_now:
