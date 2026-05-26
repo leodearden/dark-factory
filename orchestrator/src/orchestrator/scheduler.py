@@ -2031,13 +2031,17 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at entries for tasks now in a terminal status so
-        # a future legitimate re-dispatch (e.g. cancelled -> pending re-architect,
-        # or a freshly-created task reusing the id) starts from a clean slate.
+        # Drop _last_dispatch_at, _skip_count, and _module_cache entries for tasks
+        # now in a terminal status so a future legitimate re-dispatch (e.g.
+        # cancelled -> pending re-architect, or a freshly-created task reusing the
+        # id) starts from a clean slate.  Resurrection-safe: a re-queued task
+        # re-derives modules and re-accumulates its skip count fresh.
         # Mirrors the _pending_anchor clearing in _update_age_anchors.
         for tid_str, status in status_map.items():
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
+                self._skip_count.pop(tid_str, None)
+                self._module_cache.pop(tid_str, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
