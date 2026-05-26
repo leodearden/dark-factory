@@ -2065,9 +2065,9 @@ class TestVestigialParamsRemoved:
     def test_default_max_cap_retries_not_importable(self):
         """_DEFAULT_MAX_CAP_RETRIES must NOT be importable from shared.cli_invoke."""
         with pytest.raises(ImportError):
-            from shared.cli_invoke import _DEFAULT_MAX_CAP_RETRIES  # noqa: PLC0415, F401
+            from shared.cli_invoke import _DEFAULT_MAX_CAP_RETRIES  # type: ignore[attr-defined]  # noqa: PLC0415, F401, I001
 
     def test_default_cap_retry_deadline_secs_not_importable(self):
         """_DEFAULT_CAP_RETRY_DEADLINE_SECS must NOT be importable from shared.cli_invoke."""
         with pytest.raises(ImportError):
-            from shared.cli_invoke import _DEFAULT_CAP_RETRY_DEADLINE_SECS  # noqa: PLC0415, F401
+            from shared.cli_invoke import _DEFAULT_CAP_RETRY_DEADLINE_SECS  # type: ignore[attr-defined]  # noqa: PLC0415, F401, I001
