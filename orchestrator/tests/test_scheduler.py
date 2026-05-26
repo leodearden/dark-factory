@@ -86,6 +86,17 @@ class TestModuleLockTable:
         # Already holds both — should succeed without double-acquiring
         assert lock_table.try_acquire_additional('task-1', ['backend', 'server'])
 
+    def test_try_acquire_additional_creates_entry_when_absent(
+        self, lock_table: ModuleLockTable
+    ):
+        # Call try_acquire_additional for a task that has never called try_acquire.
+        # Before the fix, line 656 (`self._held[task_id].update(...)`) raises KeyError
+        # because task-new is absent from _held.  After the fix (setdefault), it
+        # creates the entry and returns True.
+        result = lock_table.try_acquire_additional('task-new', ['backend'])
+        assert result is True
+        assert lock_table.is_held('task-new') is True
+
     def test_release_nonexistent_task(self, lock_table: ModuleLockTable):
         # Should not raise
         lock_table.release('nonexistent')
