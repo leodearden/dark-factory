@@ -130,15 +130,23 @@ was created — count it as a no-op, not a successful addition. Your stats \
 {_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
 
 **Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
-`add_memory`, the content string MUST include all three of: (1) the reconciliation \
+`add_memory`, the content string MUST include all four of: (1) the reconciliation \
 `run_id` (provided in the payload context), (2) the full list of `flag_id` UUIDs \
 processed this cycle (from active-query flags, FIX C deletions, and FIX D \
-escalations — or "none" if zero), and (3) the task IDs created or modified this cycle \
+escalations — or "none" if zero), (3) the task IDs created or modified this cycle \
 (via `set_task_status`, `update_task`, `submit_task`, or `resolve_ticket` — including \
-newly-created task_ids returned from `submit_task`/`resolve_ticket`). Rationale: \
-Mem0 deduplicates near-duplicate writes by cosine similarity — multiple confirmed cycles \
-had their summaries silently dropped (`memory_ids=[]`) because the content was too \
-uniform across cycles.
+newly-created task_ids returned from `submit_task`/`resolve_ticket`), and (4) a \
+`uniqueness_token` computed as the first 8 hex chars of SHA-256 over \
+`run_id + iso_timestamp + ''.join(sorted(flag_ids))`: \
+`hashlib.sha256((run_id + iso_timestamp + ''.join(sorted(flag_ids))).encode()).hexdigest()[:8]` \
+where `iso_timestamp` is the current cycle start time in ISO 8601 format (e.g. \
+`"2026-05-26T11:59:24+00:00"`). Example output line: `uniqueness_token: a3f7c901`. \
+Rationale: Mem0 deduplicates near-duplicate writes by cosine similarity — multiple \
+confirmed cycles had their summaries silently dropped (`memory_ids=[]`) because the \
+content was too uniform across cycles. Folding in the ISO timestamp guarantees a \
+semantically-distinct content string even for zero-flag/zero-task cycles, defeating \
+cosine-similarity dedup that previously dropped structurally-empty summaries \
+(confirmed reconstructions: b5c39ab7, 2310b354, d72a0203, run e4b1ebfa).
 
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
