@@ -819,8 +819,10 @@ class ReconciliationHarness:
                     heartbeat_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await heartbeat_task
-                    await self._replay_deferred_writes(project_id)
-                    await self.buffer.mark_run_complete(project_id)
+                    try:
+                        await self._replay_deferred_writes(project_id)
+                    finally:
+                        await self.buffer.mark_run_complete(project_id)
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown
