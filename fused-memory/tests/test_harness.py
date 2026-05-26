@@ -5030,3 +5030,58 @@ async def test_project_loop_replays_deferred_writes_before_releasing_lock(
         f'Expected lock held during replay, got {lock_held_during_replay!r}. '
         'Bug: mark_run_complete deleted the lock row before _replay_deferred_writes ran.'
     )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_releases_lock_when_replay_raises(
+    journal, event_buffer, mock_memory_service
+):
+    """_project_loop (finally path) must release the lock even when replay raises.
+
+    A bare statement reorder (_replay_deferred_writes then mark_run_complete)
+    would leak the lock if _replay_deferred_writes raises.  The correct fix
+    wraps the pair as try/finally so mark_run_complete always runs.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Push enough events to trigger a cycle
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Seed one deferred write
+    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
+
+    async def fake_rfc(*_a, **_k):
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+        )
+
+    complete_called: list[bool] = []
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_complete(pid):
+        complete_called.append(True)
+        return await original_complete(pid)
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+        patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+
+    assert complete_called, (
+        'mark_run_complete was never called after replay raised. '
+        'Bug: a bare reorder leaks the lock when _replay_deferred_writes raises.'
+    )
+    assert not await event_buffer.is_full_recon_active('test-project'), (
+        'Lock was not released after replay raised. '
+        'Bug: mark_run_complete must always run even if replay raises.'
+    )
