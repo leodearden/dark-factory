@@ -4963,6 +4963,64 @@ class TestKnownProjectsInjection:
 
 # ── Deferred-write ordering tests (task 1474) ──────────────────────────────
 
+# -- shared helpers -----------------------------------------------------------
+
+
+async def _seed_recon_state(
+    event_buffer: EventBuffer,
+    project_id: str = 'test-project',
+    n_events: int = 3,
+) -> None:
+    """Push n_events so should_trigger fires, then seed one deferred write."""
+    for _ in range(n_events):
+        await event_buffer.push(_make_event(project_id))
+    await event_buffer.defer_write(project_id, 'some content', 'observations_and_summaries', {})
+
+
+def _make_fake_rfc(project_id: str = 'test-project'):
+    """Return a coroutine function that yields a completed ReconciliationRun."""
+    async def fake_rfc(*_a, **_k):
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+        )
+    return fake_rfc
+
+
+def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
+    """Build replay/complete spies that record call order and lock state.
+
+    Returns ``(spy_replay, spy_complete, call_order, lock_held_during_replay)``.
+    ``call_order`` accumulates ``'replay'``/``'complete'`` strings in the order
+    the spied methods are invoked.  ``lock_held_during_replay`` records whether
+    ``event_buffer.is_full_recon_active(project_id)`` returned True inside each
+    ``spy_replay`` call — i.e. whether the per-project lock was still held at
+    replay time.
+    """
+    call_order: list[str] = []
+    lock_held_during_replay: list[bool] = []
+    original_replay = harness._replay_deferred_writes
+    original_complete = harness.buffer.mark_run_complete
+
+    async def spy_replay(pid):
+        call_order.append('replay')
+        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
+        return await original_replay(pid)
+
+    async def spy_complete(pid):
+        call_order.append('complete')
+        return await original_complete(pid)
+
+    return spy_replay, spy_complete, call_order, lock_held_during_replay
+
+
+# -- tests --------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_project_loop_replays_deferred_writes_before_releasing_lock(
@@ -4979,43 +5037,13 @@ async def test_project_loop_replays_deferred_writes_before_releasing_lock(
     still held at replay time.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-    # Push enough events to trigger a cycle
-    for _ in range(3):
-        await event_buffer.push(_make_event())
-
-    # Seed one deferred write so replay has something to claim
-    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
-
-    # Build a completed ReconciliationRun for the fake cycle
-    async def fake_rfc(*_a, **_k):
-        return ReconciliationRun(
-            id=str(uuid.uuid4()),
-            project_id='test-project',
-            run_type=RunType.full,
-            trigger_reason='buffer_size:3',
-            started_at=datetime.now(UTC),
-            events_processed=3,
-            status=RunStatus.completed,
-        )
-
-    call_order: list[str] = []
-    lock_held_during_replay: list[bool] = []
-
-    original_replay = harness._replay_deferred_writes
-    original_complete = harness.buffer.mark_run_complete
-
-    async def spy_replay(pid):
-        call_order.append('replay')
-        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
-        return await original_replay(pid)
-
-    async def spy_complete(pid):
-        call_order.append('complete')
-        return await original_complete(pid)
+    await _seed_recon_state(event_buffer)
+    spy_replay, spy_complete, call_order, lock_held_during_replay = _make_order_spies(
+        harness, event_buffer
+    )
 
     with (
-        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
         contextlib.suppress(TimeoutError),
@@ -5043,24 +5071,7 @@ async def test_project_loop_releases_lock_when_replay_raises(
     wraps the pair as try/finally so mark_run_complete always runs.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-    # Push enough events to trigger a cycle
-    for _ in range(3):
-        await event_buffer.push(_make_event())
-
-    # Seed one deferred write
-    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
-
-    async def fake_rfc(*_a, **_k):
-        return ReconciliationRun(
-            id=str(uuid.uuid4()),
-            project_id='test-project',
-            run_type=RunType.full,
-            trigger_reason='buffer_size:3',
-            started_at=datetime.now(UTC),
-            events_processed=3,
-            status=RunStatus.completed,
-        )
+    await _seed_recon_state(event_buffer)
 
     complete_called: list[bool] = []
     original_complete = harness.buffer.mark_run_complete
@@ -5070,7 +5081,7 @@ async def test_project_loop_releases_lock_when_replay_raises(
         return await original_complete(pid)
 
     with (
-        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
         contextlib.suppress(TimeoutError),
@@ -5116,31 +5127,12 @@ async def test_project_loop_replays_before_releasing_lock_on_halt(
     mock_j.get_run = AsyncMock(return_value=None)
     harness.judge = Judge(config=judge_config, journal=mock_j)
     harness.judge._halted_projects.add('test-project')
+    harness._notify_judge_halt = AsyncMock()  # suppress escalation side effects
 
-    # Suppress escalation side effects from _notify_judge_halt
-    harness._notify_judge_halt = AsyncMock()
-
-    # Push enough events to acquire the lock
-    for _ in range(3):
-        await event_buffer.push(_make_event())
-
-    # Seed one deferred write
-    await event_buffer.defer_write('test-project', 'some content', 'observations_and_summaries', {})
-
-    call_order: list[str] = []
-    lock_held_during_replay: list[bool] = []
-
-    original_replay = harness._replay_deferred_writes
-    original_complete = harness.buffer.mark_run_complete
-
-    async def spy_replay(pid):
-        call_order.append('replay')
-        lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
-        return await original_replay(pid)
-
-    async def spy_complete(pid):
-        call_order.append('complete')
-        return await original_complete(pid)
+    await _seed_recon_state(event_buffer)
+    spy_replay, spy_complete, call_order, lock_held_during_replay = _make_order_spies(
+        harness, event_buffer
+    )
 
     with (
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),

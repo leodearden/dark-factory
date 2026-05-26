@@ -818,12 +818,16 @@ class ReconciliationHarness:
                     )
                     await self.buffer.restore_drained(project_id)
                 finally:
-                    heartbeat_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await heartbeat_task
                     try:
                         await self._replay_deferred_writes(project_id)
                     finally:
+                        # Cancel heartbeat only after replay so the lock heartbeat
+                        # keeps the per-project lock alive for the full replay
+                        # duration, preventing a concurrent instance from claiming
+                        # the lock as stale mid-replay.
+                        heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await heartbeat_task
                         await self.buffer.mark_run_complete(project_id)
 
             except asyncio.CancelledError:
