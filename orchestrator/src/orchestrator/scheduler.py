@@ -653,7 +653,7 @@ class ModuleLockTable:
             if self._is_parked_blocks(module, task_id):
                 return False
 
-        self._held[task_id].update(new_modules)
+        self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
         return True
 
