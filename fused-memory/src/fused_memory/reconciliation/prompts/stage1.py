@@ -263,6 +263,26 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - If a finding cannot be resolved (e.g., ambiguous data, missing context), flag it for Stage 2.
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
+## Pre-Check: Already-Reconstructed Stage 2 Summaries
+Before emitting a "missing Stage 2 summary" finding for a run, search Mem0 for an \
+existing Stage 2 summary written by a prior remediation pass:
+
+  search(query="run_id: <run_id>", project_id=..., \
+  categories=['observations_and_summaries'], stores=['mem0'], limit=10)
+
+where `<run_id>` is the run_id value from the `## Reconciliation Context` section \
+(the same run_id used for flag markers). If the search returns a result whose content \
+contains `run_id: <run_id>`, do NOT emit the missing-summary finding — Stage 2 already \
+wrote the per-cycle summary for that run. Note in your cycle report that the summary \
+already exists, e.g. "Stage 2 summary for run_id=<run_id> already present — skipping \
+reconstruction." Rationale: back-to-back remediation passes otherwise trigger \
+double-reconstruction of the same Stage 2 summary, producing duplicate per-cycle \
+entries that a later cycle must clean up. This pre-check closes that loop; it mirrors \
+the Flag Suppression Check below, which also confirms an existing Mem0 record before \
+emitting a finding. Note: this is a best-effort heuristic — semantic search may miss \
+an existing summary due to ranking or limit=10 truncation; any duplicates that slip \
+through can be cleaned up in a later consolidation cycle.
+
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
