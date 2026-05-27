@@ -304,7 +304,7 @@ async def collect_scheduler_state(
     since = datetime.now(UTC) - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles)
-    all_active, _file_locks, active_offline = await collect_active_tasks(client, config)
+    all_active, active_offline = await collect_active_tasks(client, config)
 
     offline_projects: list[str] = list(active_offline)
 

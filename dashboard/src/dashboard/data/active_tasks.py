@@ -18,12 +18,12 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'loops': 2,                 # iterations.jsonl line count
         'attempts': 3,              # review files count
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
-        'locks': ['src/...py', ...],  # plan.json files list
+        'meta_files': ['src/...py', ...],  # taskmaster metadata.files (module lock source)
     }
 
-The companion ``FILE_LOCKS`` dict is derived by inverting ``ACTIVE_TASKS``:
-
-    {project: {filepath: {'holder': task_uid_or_None}}}
+Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).
+The bespoke FILE_LOCKS derivation has been removed; all lock display routes through
+``D.SCHEDULER.{rows,modules}`` on the frontend.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_tasks
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending'}
-_HOLDER_STATUSES = {'in-progress', 'blocked'}
 
 
 def _project_label(root: Path) -> str:
@@ -93,8 +92,8 @@ async def _shape_one_project(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: Path,
-) -> tuple[list[dict], dict[str, dict], bool]:
-    """Build (active_tasks, file_locks, offline) for a single project root.
+) -> tuple[list[dict], bool]:
+    """Build (active_tasks, offline) for a single project root.
 
     *offline* is True when the MCP fetch failed for this project; the
     caller surfaces that in the API payload so the React Tasks tab can
@@ -103,10 +102,10 @@ async def _shape_one_project(
     project = _project_label(project_root)
     fetched = await fetch_tasks(client, config, project_root)
     if isinstance(fetched, dict) and fetched.get('offline'):
-        return [], {}, True
+        return [], True
     tasks = fetched if isinstance(fetched, list) else []
     if not tasks:
-        return [], {}, False
+        return [], False
 
     worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
 
@@ -114,7 +113,6 @@ async def _shape_one_project(
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
 
     active: list[dict] = []
-    locks: dict[str, dict] = {}
 
     for task in tasks:
         status = task.get('status')
@@ -136,14 +134,9 @@ async def _shape_one_project(
                 'done': dep_task.get('status') == 'done',
             })
 
-        task_locks: list[str] = list(wt.get('files') or [])
-
         # Footprint the scheduler actually locks on: taskmaster metadata.files.
-        # Unlike `locks` (worktree plan.json file paths, absent for pending
-        # tasks with no worktree yet), this is present for every task and is
-        # the same source the scheduler derives its module locks from.  Kept as
-        # an additive field so the Tasks tab can stay on `locks` (file
-        # granularity) while the scheduler tab normalizes `meta_files`.
+        # This is the same source the scheduler derives its module locks from;
+        # lock display is routed through D.SCHEDULER.{rows,modules} on the frontend.
         meta_files = list((task.get('metadata') or {}).get('files') or [])
 
         uid = _task_uid(project, task_id)
@@ -160,49 +153,30 @@ async def _shape_one_project(
             'loops': int(wt.get('iteration_count') or 0),
             'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
             'deps': deps,
-            'locks': task_locks,
             'meta_files': meta_files,
         })
 
-        # File locks: only in-flight statuses are considered holders.  Pending
-        # tasks may declare module footprints but shouldn't appear as the
-        # current holder of a file.
-        if status in _HOLDER_STATUSES:
-            for path in task_locks:
-                # First in-flight task wins; later ones are ignored to avoid
-                # showing two holders for the same file.
-                locks.setdefault(path, {'holder': uid})
-
-    # Surface every lock-mentioned file even when no in-flight task holds it
-    # currently — this matches the mock shape's null-holder entries.
-    for entry in active:
-        if entry['status'] != 'pending':
-            continue
-        for path in entry['locks']:
-            locks.setdefault(path, {'holder': None})
-
-    return active, locks, False
+    return active, False
 
 
 async def collect_active_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-) -> tuple[list[dict], dict[str, dict[str, dict]], list[str]]:
-    """Collect active tasks and derived file locks across all known projects.
+) -> tuple[list[dict], list[str]]:
+    """Collect active tasks across all known projects.
 
-    Returns ``(active_tasks, file_locks, offline_projects)`` where
-    *offline_projects* is the list of project labels whose MCP fetch failed.
-    The handler turns a non-empty *offline_projects* into ``offline: True``
-    on the dashboard payload.
+    Returns ``(active_tasks, offline_projects)`` where *offline_projects* is
+    the list of project labels whose MCP fetch failed.  The handler turns a
+    non-empty *offline_projects* into ``offline: True`` on the dashboard payload.
+
+    Lock state is surfaced via the scheduler endpoint — see
+    /api/v2/dashboard/scheduler.
     """
     all_active: list[dict] = []
-    all_locks: dict[str, dict[str, dict]] = {}
     offline_projects: list[str] = []
     for root in _all_project_roots(config):
-        active, locks, offline = await _shape_one_project(client, config, root)
+        active, offline = await _shape_one_project(client, config, root)
         if offline:
             offline_projects.append(_project_label(root))
         all_active.extend(active)
-        if locks:
-            all_locks[_project_label(root)] = locks
-    return all_active, all_locks, offline_projects
+    return all_active, offline_projects

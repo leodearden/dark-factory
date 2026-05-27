@@ -326,7 +326,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
     ]
 
     mock_mcp = AsyncMock(side_effect=[snapshot, events])
-    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+    mock_active = AsyncMock(return_value=(active_tasks, []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
@@ -394,7 +394,7 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
     ]
 
     mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
-    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+    mock_active = AsyncMock(return_value=(active_tasks, []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
@@ -440,7 +440,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
     mock_mcp_paused = AsyncMock(side_effect=[paused_snapshot, []])
-    mock_active = AsyncMock(return_value=([], {}, []))
+    mock_active = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_paused),
@@ -461,7 +461,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
     mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, []])
-    mock_active2 = AsyncMock(return_value=([], {}, []))
+    mock_active2 = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_not_paused),
@@ -480,7 +480,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
     mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, []])
-    mock_active3 = AsyncMock(return_value=([], {}, []))
+    mock_active3 = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_legacy),
@@ -534,7 +534,7 @@ async def test_collect_scheduler_state_isolates_paused_across_projects(
             return snapshots[args.get('project_root')]
         return []
 
-    mock_active = AsyncMock(return_value=([], {}, []))
+    mock_active = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
@@ -1056,7 +1056,7 @@ async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
         },
     ]
 
-    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+    mock_active = AsyncMock(return_value=(active_tasks, []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
@@ -1440,7 +1440,7 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
             return snapshots[args.get('project_root')]
         return []
 
-    mock_active = AsyncMock(return_value=([], {}, []))
+    mock_active = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
@@ -1515,7 +1515,7 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
             'locks': ['src/utils.py'],
         },
     ]
-    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+    mock_active = AsyncMock(return_value=(active_tasks, []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
@@ -1612,7 +1612,7 @@ async def test_collect_scheduler_state_normalises_non_dict_snapshot(
 
     # MCP returns a list (buggy/older server) instead of a dict
     mock_mcp = AsyncMock(side_effect=[['unexpected'], []])
-    mock_active = AsyncMock(return_value=([], {}, []))
+    mock_active = AsyncMock(return_value=([], []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
@@ -1780,7 +1780,7 @@ async def test_collect_scheduler_state_uses_meta_files_for_deep_path(
     ]
 
     mock_mcp = AsyncMock(side_effect=[snapshot, []])
-    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+    mock_active = AsyncMock(return_value=(active_tasks, []))
 
     with (
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
