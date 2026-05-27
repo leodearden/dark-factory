@@ -1171,6 +1171,36 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
+def _normalize_legacy_memory_hints_value(value: object) -> object:
+    """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
+
+    The canonical shape is ``{"entities": [...], "queries": [...]}``.
+    The legacy shape is ``[{"entity": <str>, "query": <str>}, ...]``.
+
+    When *value* is a list each element that is a dict is inspected:
+    * ``entity`` is appended to ``entities`` only when it is a non-empty string.
+    * ``query`` is appended to ``queries`` only when it is a non-empty string.
+    * Non-dict items and entries with missing / empty / non-string keys are skipped.
+
+    Any non-list input (dict, scalar, None) is returned unchanged — the function is
+    a no-op for already-canonical values and for any shape it does not recognise.
+    """
+    if not isinstance(value, list):
+        return value
+    entities: list[str] = []
+    queries: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        entity = item.get("entity")
+        if isinstance(entity, str) and entity:
+            entities.append(entity)
+        query = item.get("query")
+        if isinstance(query, str) and query:
+            queries.append(query)
+    return {"entities": entities, "queries": queries}
+
+
 def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) -> str:
     """Merge ``incoming`` metadata JSON into ``existing_raw``.
 
@@ -1186,6 +1216,12 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
 
     If either side fails to JSON-decode, the new value replaces the old
     verbatim — matches Taskmaster's "last write wins" fallback.
+
+    Special case — ``memory_hints``:  when either side carries the legacy
+    list-of-dicts shape (``[{"entity": ..., "query": ...}, ...]``) it is
+    normalised to the canonical dict shape before ``_merge_values`` runs, so
+    the merge falls into the dict-vs-dict recursive union path rather than the
+    type-mismatch OLD-wins path.  All other keys are unaffected.
     """
     if existing_raw is None or not append:
         return incoming
@@ -1196,6 +1232,11 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
         return incoming
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
+    # Normalize legacy memory_hints list shape on both sides before merging.
+    if "memory_hints" in old:
+        old = {**old, "memory_hints": _normalize_legacy_memory_hints_value(old["memory_hints"])}
+    if "memory_hints" in new:
+        new = {**new, "memory_hints": _normalize_legacy_memory_hints_value(new["memory_hints"])}
     try:
         merged = _merge_values(old, new)
     except RecursionError:
