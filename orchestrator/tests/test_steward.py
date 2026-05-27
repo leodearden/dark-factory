@@ -667,8 +667,8 @@ class TestStewardTimeoutPassthrough:
             )
 
         assert mock_invoke.call_count == 2
-        for call in mock_invoke.call_args_list:
-            assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+        for mock_call in mock_invoke.call_args_list:
+            assert mock_call.kwargs['timeout_seconds'] == pytest.approx(900.0)
 
 
 # ---------------------------------------------------------------------------
