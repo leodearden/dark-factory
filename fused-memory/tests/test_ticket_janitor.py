@@ -625,6 +625,53 @@ async def test_repeated_probe_raises_surface_infra_issue_escalation(store, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_probe_defect_escalation_is_rate_limited(store, tmp_path):
+    """Post-threshold probe raises must not flood the escalation queue.
+
+    With probe_defect_threshold=1 the first raise surfaces immediately.
+    Subsequent raises within the cooldown window must be suppressed so that
+    only a single esc-*.json file exists across multiple ticks.  The pending
+    ticket remains status='pending' throughout.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='still stranded'),
+        )
+
+        def _always_raises(pid: str) -> bool:
+            raise RuntimeError('probe still broken')
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_always_raises,
+            probe_defect_threshold=1,
+            cooldown_secs=3600.0,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # 4 ticks — first one surfaces at threshold=1, rest must be suppressed
+        for _ in range(4):
+            await janitor.tick()
+
+        files = sorted(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Cooldown must suppress duplicate probe-defect escalations; '
+            f'got {[f.name for f in files]}'
+        )
+        # Ticket is still pending the entire time
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending'
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):
