@@ -188,9 +188,10 @@ def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
     Uses mocked memory/journal/event_buffer so _escalate can be exercised
     without any I/O other than the queue filesystem writes under tmp_path.
     """
+    from escalation.queue import EscalationQueue
+
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.reconciliation.harness import ReconciliationHarness
-    from escalation.queue import EscalationQueue
 
     config = FusedMemoryConfig(
         reconciliation=ReconciliationConfig(
@@ -388,6 +389,7 @@ class TestReconEscalationDedup:
         from datetime import UTC, datetime
 
         from escalation.dedupe import compute_content_fingerprint
+
         from fused_memory.models.reconciliation import (
             ReconciliationRun,
             RunStatus,
@@ -499,6 +501,7 @@ class TestReconEscalationDedup:
         from unittest.mock import AsyncMock as AM
 
         from escalation.dedupe import compute_content_fingerprint
+
         from fused_memory.models.reconciliation import StageId, StageReport
         from fused_memory.reconciliation.harness import TierConfig
 
