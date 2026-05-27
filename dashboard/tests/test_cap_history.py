@@ -825,6 +825,60 @@ class TestComputeCappedNowAndWindows:
             f'Got {windows1} vs {windows2}'
         )
 
+    def test_mixed_availability_returns_capped_now_zero(self):
+        """(a) mixed: 'a' open-ended, 'b' closed → capped_now=0.
+
+        With all-accounts-capped semantics: total=2, capped=1, available=1 → 0.
+        Under old any-account semantics this would return 1 (a is open).
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('a', t1, None),  # open-ended
+            CapInterval('b', t1, t2),    # closed
+        ]
+        capped_now, _ = compute_capped_now_and_windows(intervals)
+        assert capped_now == 0, (
+            f"mixed availability: 'b' is uncapped so capped_now must be 0; "
+            f"==1 means old any-account semantics still active (got {capped_now})"
+        )
+
+    def test_account_count_denominator_returns_capped_now_zero(self):
+        """(b) 1 open cap of 3 configured accounts → capped_now=0.
+
+        This is THE reported-bug case at helper level: one account has a stale
+        open-ended cap_hit while 2 healthy accounts have no cap events at all.
+        Without total_accounts the universe would be 1 (all capped) → capped_now=1.
+        With total_accounts=3: total=3, capped=1, available=2 → capped_now=0.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(minutes=10)
+        intervals = [CapInterval('a', t1, None)]
+        capped_now, _ = compute_capped_now_and_windows(intervals, total_accounts=3)
+        assert capped_now == 0, (
+            f'account_count denominator case: 1 capped of 3 total must return '
+            f'capped_now=0 (2 available). Got {capped_now}. '
+            f'Bug: if account_count ignored then total=1, available=0 → capped_now=1 '
+            f'(the original 3-uncapped-accounts bug).'
+        )
+
+    def test_all_accounts_open_ended_returns_capped_now_one(self):
+        """(c) both accounts open-ended → capped_now=1.
+
+        Sanity check: all-accounts-capped semantics still returns 1 when ALL are capped.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('a', t1, None),
+            CapInterval('b', t1, None),
+        ]
+        capped_now, _ = compute_capped_now_and_windows(intervals)
+        assert capped_now == 1, (
+            f'Both accounts open-ended: expected capped_now=1, got {capped_now}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSummarizeAccounts — pure helper summarize_accounts
