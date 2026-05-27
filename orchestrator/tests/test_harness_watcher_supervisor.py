@@ -2381,6 +2381,136 @@ class TestStartWatcherSupervisorDisabledFilesL2:
 
 
 # ---------------------------------------------------------------------------
+# task 1501: _enforce_cost_ceilings watcher ceiling trip must file outage L2
+# ---------------------------------------------------------------------------
+
+class TestEnforceCostCeilingsFilesL2:
+    """_enforce_cost_ceilings watcher ceiling trip must file an L2 outage escalation."""
+
+    @pytest.mark.asyncio
+    async def test_watcher_ceiling_trip_files_outage_l2(self, tmp_path: Path) -> None:
+        """When the watcher 24h cost ceiling trips, an L2 outage escalation is filed.
+
+        Build a Harness with a real EscalationQueue, stub cost_store whose
+        cost_totals_in_window returns (0.0, watcher_ceiling + 1.0) so the
+        watcher branch trips.  Stub pause_scheduler as AsyncMock and scheduler
+        with is_paused=False.  Assert:
+        - pause_scheduler was awaited once with 'cost_ceiling_watcher_exceeded'
+        - queue.get_pending() contains an L2 with root_cause='watcher_supervisor_down'
+          and summary containing 'cost_ceiling_watcher_exceeded'
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        watcher_ceiling = h.config.watcher_daily_cost_ceiling_usd
+        # Stub scheduler with is_paused=False so the early return is not triggered
+        h.scheduler = MagicMock()
+        h.scheduler.is_paused = False
+        # Stub cost_store so the watcher branch trips
+        h.cost_store = MagicMock()
+        h.cost_store.cost_totals_in_window = AsyncMock(
+            return_value=(0.0, watcher_ceiling + 1.0)
+        )
+        h.pause_scheduler = AsyncMock()
+
+        await h._enforce_cost_ceilings()
+
+        h.pause_scheduler.assert_awaited_once_with('cost_ceiling_watcher_exceeded')
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 outage escalation after watcher ceiling trip; got {len(l2s)}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE, (
+            f'Expected root_cause={h._WATCHER_OUTAGE_ROOT_CAUSE!r}; got {l2s[0].root_cause!r}'
+        )
+        assert 'cost_ceiling_watcher_exceeded' in l2s[0].summary, (
+            f'L2 summary must contain "cost_ceiling_watcher_exceeded"; got {l2s[0].summary!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _watcher_supervisor_loop healthy-clean branch resolves outage L2
+# ---------------------------------------------------------------------------
+
+def _make_loop_harness_with_queue(tmp_path: Path) -> tuple['Harness', 'EscalationQueue']:
+    """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
+    h = _make_loop_harness(tmp_path)
+    queue = EscalationQueue(tmp_path / 'esc')
+    h._escalation_queue = queue
+    return h, queue
+
+
+class TestWatcherSupervisorLoopRecoveryResolvesL2:
+    """_watcher_supervisor_loop healthy-clean branch resolves the open outage L2."""
+
+    @pytest.mark.asyncio
+    async def test_healthy_clean_rotation_resolves_outage_l2(self, tmp_path: Path) -> None:
+        """A healthy-clean rotation (duration >= min) resolves the open outage L2.
+
+        Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
+        lasting >= watcher_misconfigured_min_rotation_secs (healthy-clean path),
+        then assert the L2 is no longer pending (it was resolved).
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-file the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        # Drive with one healthy-clean rotation (duration > min_secs)
+        await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 0, (
+            f'Expected outage L2 to be resolved after healthy-clean rotation; '
+            f'still pending: {pending_after}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_does_NOT_resolve_outage_l2(self, tmp_path: Path) -> None:
+        """A degenerate-clean rotation (duration < min) does NOT resolve the open outage L2.
+
+        Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
+        lasting < watcher_misconfigured_min_rotation_secs (degenerate-clean path),
+        and assert the outage L2 remains pending.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-file the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        # Drive with one degenerate-clean rotation (duration < min_secs)
+        await _run_supervisor_with_rotation_durations(h, [min_secs - 1.0])
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 1, (
+            f'Expected outage L2 to remain pending after degenerate-clean rotation; '
+            f'got {len(pending_after)} pending'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
 # ---------------------------------------------------------------------------
 
