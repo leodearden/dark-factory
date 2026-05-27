@@ -556,6 +556,75 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
 
 
 @pytest.mark.asyncio
+async def test_repeated_probe_raises_surface_infra_issue_escalation(store, tmp_path):
+    """Consecutive probe raises accumulate and surface an infra_issue at the threshold.
+
+    Below the threshold (3) no escalation is emitted.  At the threshold,
+    exactly one infra_issue escalation is submitted.  The pending ticket must
+    remain status='pending' throughout — fail-open is preserved; the reaper
+    never fires and the ticket is never stamped.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+
+        def _always_raises(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_always_raises,
+            probe_defect_threshold=3,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # Tick 1 — below threshold, no escalation
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Expected no escalation after 1st tick; got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', f'ticket must stay pending after 1st tick; got {row}'
+        assert row['reason'] is None
+
+        # Tick 2 — below threshold, still no escalation
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Expected no escalation after 2nd tick; got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', f'ticket must stay pending after 2nd tick; got {row}'
+        assert row['reason'] is None
+
+        # Tick 3 — at threshold, exactly one infra_issue escalation surfaced
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Expected exactly 1 escalation after 3rd tick; got {[f.name for f in files]}'
+        )
+        body = json.loads(files[0].read_text())
+        assert body['category'] == 'infra_issue'
+        assert body['severity'] == 'info'
+        assert body['agent_role'] == 'fused-memory/ticket-janitor'
+        # Fail-open preserved: ticket is still pending, never reaped, never stamped
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', (
+            f'Ticket must stay pending (fail-open); got {row}'
+        )
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):
