@@ -30,6 +30,14 @@ ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
 Environment=CONFIG_PATH=/home/leo/src/dark-factory/fused-memory/config/config.yaml
 Environment=PROJECT_ROOT=/home/leo/src/dark-factory
 Environment=TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai
+# Defense-in-depth: pin mem0 Posthog telemetry OFF at the systemd/process layer.
+# mem0 telemetry historically spawned ~8000 threads/day and 1400% CPU (worst incident
+# class). The in-process load_dotenv() suppression in server/main.py works today but
+# is contingent on import ordering — a future refactor could silently re-enable it.
+# This Environment= directive removes that dependency: systemd injects the var before
+# execve(), independent of Python startup order. Both mechanisms remain active
+# (belt-and-suspenders). NOTE: the live/deployed unit must carry this identical line.
+Environment=MEM0_TELEMETRY=false
 
 # Restart policy: always restart on failure (including watchdog-triggered),
 # back off up to 60s. main() in fused_memory/server/main.py exits 0 only when
