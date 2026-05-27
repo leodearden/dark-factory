@@ -391,6 +391,60 @@ class TestForceExitWatchdog:
         )
 
 
+class TestRunUntilIdleFlag:
+    """The --until-idle flag must thread through to harness.run(until_idle=...).
+
+    Default (flag absent) is run-forever (until_idle=False); the flag opts into
+    legacy exit-on-drain (until_idle=True).
+    """
+
+    def _setup(self, monkeypatch, fake_report):
+        """Wire mocks so the real _main coroutine runs and calls harness.run once."""
+        # Stub the watchdog so no real daemon timer thread is spawned.
+        monkeypatch.setattr(
+            cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock()
+        )
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        # AsyncMock so `await harness.run(...)` inside the real _main resolves.
+        from unittest.mock import AsyncMock
+        fake_harness.run = AsyncMock(return_value=fake_report)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        return fake_harness
+
+    def test_flag_threads_until_idle_true(self, monkeypatch):
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'ok'
+        fake_harness = self._setup(monkeypatch, fake_report)
+
+        result = CliRunner().invoke(
+            main, ['run', '--config', '/dev/null', '--until-idle']
+        )
+
+        assert result.exit_code == 0, result.output
+        assert fake_harness.run.call_args.kwargs.get('until_idle') is True, (
+            f'--until-idle must pass until_idle=True; '
+            f'kwargs={fake_harness.run.call_args.kwargs!r}'
+        )
+
+    def test_default_threads_until_idle_false(self, monkeypatch):
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'ok'
+        fake_harness = self._setup(monkeypatch, fake_report)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 0, result.output
+        assert fake_harness.run.call_args.kwargs.get('until_idle') is False, (
+            f'default run must pass until_idle=False (run forever); '
+            f'kwargs={fake_harness.run.call_args.kwargs!r}'
+        )
+
+
 class TestRunArmsWatchdog:
     """run() must arm the shutdown watchdog and disarm it on both exit paths."""
 
