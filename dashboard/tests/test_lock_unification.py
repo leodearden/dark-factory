@@ -106,3 +106,40 @@ def test_tab_overview_jsx_shows_module_locks_from_scheduler(client):
     assert 'FILE_LOCKS' not in body, (
         "tab_overview.jsx must not reference FILE_LOCKS"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11: tabs.jsx LocksCell rewired to read locks from D.SCHEDULER
+# ---------------------------------------------------------------------------
+
+
+def test_tabs_jsx_locks_cell_uses_scheduler_not_file_locks(client):
+    resp = client.get('/static/redux/tabs.jsx')
+    assert resp.status_code == 200
+    body = resp.text
+
+    # (a) No stale FILE_LOCKS lookups.
+    assert 'DF.FILE_LOCKS' not in body, (
+        "tabs.jsx LocksCell still reads from DF.FILE_LOCKS — remove this dependency"
+    )
+    assert 'fileLocks' not in body, (
+        "tabs.jsx still has a fileLocks variable — remove FILE_LOCKS dependency"
+    )
+
+    # (b) LocksCell must reference DF.SCHEDULER and use rows/modules arrays.
+    assert 'DF.SCHEDULER' in body or 'D.SCHEDULER' in body, (
+        "tabs.jsx LocksCell must read from DF.SCHEDULER (the unified lock source)"
+    )
+    assert '.rows' in body, "tabs.jsx must access .rows from SCHEDULER"
+    assert '.modules' in body, "tabs.jsx must access .modules from SCHEDULER"
+
+    # (c) LockChip props carry a holder resolved through the scheduler join —
+    #     holder_project qualifier must be present (same join as tab_tasks.jsx).
+    assert 'holder_project' in body, (
+        "tabs.jsx LockChip must receive holder_project from the scheduler module entry"
+    )
+
+    # (d) Lock chip CSS palette classes preserved.
+    assert 'lock-free' in body
+    assert 'lock-mine' in body
+    assert 'lock-taken' in body
