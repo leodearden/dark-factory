@@ -25,6 +25,8 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
+from escalation.queue import EscalationQueue
+
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
     _WATCHER_MAX_BACKOFF_SECS,
@@ -2082,6 +2084,106 @@ class TestMaybeWriteDigestSurfacesMissingState:
             pytest.raises(AttributeError, match='scheduler'),
         ):
             await h._watcher_supervisor_loop()
+
+
+# ---------------------------------------------------------------------------
+# task 1501: supervisor-failsafe — file/dedup/resolve L2 outage escalation
+# ---------------------------------------------------------------------------
+
+def _make_harness_with_queue(tmp_path: Path) -> tuple['Harness', 'EscalationQueue']:
+    """Build a Harness with a real EscalationQueue for outage-L2 tests.
+
+    Uses the same __new__ + _init_harness_state_for_test pattern as
+    _make_loop_harness / _make_lifecycle_harness, but also attaches a real
+    EscalationQueue rooted at tmp_path / 'esc' so submit / find_pending_l2_by_root_cause
+    / resolve execute the real disk path without mocking queue internals.
+    """
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    config = OrchestratorConfig(project_root=tmp_path)
+    h.config = config
+    h._watcher_supervisor_task = None
+    h._watcher_unclean_exits = deque()
+    h._watcher_degenerate_clean_exits = deque()
+
+    queue = EscalationQueue(tmp_path / 'esc')
+    h._escalation_queue = queue
+    return h, queue
+
+
+def _submit_sample_l1(queue: 'EscalationQueue', task_id: str = 'task-sample-1') -> str:
+    """Submit a minimal L1 escalation and return its id."""
+    from escalation.models import Escalation
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='test-agent',
+        severity='blocking',
+        category='infra_issue',
+        summary='sample L1 for outage test',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc.id
+
+
+class TestFileWatcherOutageL2:
+    """_file_watcher_outage_l2: creates an L2 outage escalation."""
+
+    def test_creates_new_l2_when_none_exists(self, tmp_path: Path) -> None:
+        """First call files exactly one L2 with the expected attributes.
+
+        Pre-submit 2 sample L1 escalations so the pending-L1 count is non-zero,
+        then verify the filed L2 includes the reason string and the L1 count.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # Pre-populate queue with 2 L1 escalations so count is non-zero
+        _submit_sample_l1(queue, 'task-a')
+        _submit_sample_l1(queue, 'task-b')
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+        pending = queue.get_pending()
+        l2s = [e for e in pending if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected exactly 1 L2 escalation after first call; got {len(l2s)}: {l2s}'
+        )
+        l2 = l2s[0]
+        assert l2.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE, (
+            f'root_cause must be {h._WATCHER_OUTAGE_ROOT_CAUSE!r}; got {l2.root_cause!r}'
+        )
+        assert l2.task_id == h._WATCHER_OUTAGE_SENTINEL, (
+            f'task_id must be {h._WATCHER_OUTAGE_SENTINEL!r}; got {l2.task_id!r}'
+        )
+        assert l2.severity == 'urgent', (
+            f'severity must be "urgent"; got {l2.severity!r}'
+        )
+        assert l2.agent_role == 'orchestrator-watcher-supervisor', (
+            f'agent_role must be "orchestrator-watcher-supervisor"; got {l2.agent_role!r}'
+        )
+        assert 'watcher_crashloop' in l2.summary, (
+            f'summary must contain the reason "watcher_crashloop"; got {l2.summary!r}'
+        )
+        # L1 count: 2 pre-submitted L1s
+        assert '2' in l2.summary, (
+            f'summary must mention pending-L1 count (2); got {l2.summary!r}'
+        )
+
+    def test_noop_when_queue_is_none(self, tmp_path: Path) -> None:
+        """When _escalation_queue is None, _file_watcher_outage_l2 must be a no-op.
+
+        Bare-Harness unit tests (no queue attached) must stay green.
+        """
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._watcher_supervisor_task = None
+        h._watcher_unclean_exits = deque()
+        h._escalation_queue = None  # bare-Harness
+
+        # Must not raise
+        h._file_watcher_outage_l2('watcher_crashloop')
 
 
 # ---------------------------------------------------------------------------
