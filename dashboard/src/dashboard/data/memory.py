@@ -263,3 +263,27 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
     if not per_server:
         return {'offline': True, 'error': '; '.join(errors)}
     return {'stores': per_server}
+
+
+async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+    """Fetch the curator UsageGate state from the fused-memory server.
+
+    Returns the first successful result from any configured URL; on all-fail
+    returns ``{'offline': True, 'error': ...}``. First-success semantics are
+    correct because the curator UsageGate lives on a single fused-memory
+    instance per the singleton-lock invariant.
+
+    Result shape (on success):
+      ``{'paused': bool, 'paused_reason': str | None,
+         'soonest_open_at': str | None, 'account_count': int}``
+    """
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            return await mcp_tool_call(client, url, 'get_curator_state', {})
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('get_curator_state failed for %s: %s', url, e)
+            errors.append(f'{url}: {e}')
+            invalidate_session(url)
+    return {'offline': True, 'error': '; '.join(errors)}
