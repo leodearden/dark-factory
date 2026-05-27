@@ -96,8 +96,28 @@ class TestFindPaths:
         assert find_paths('see corpus/x', ('corpus/',)) == ['corpus/']
 
     def test_dot_preceded_no_match(self):
-        """A prefix immediately preceded by '.' must NOT match (task-1494)."""
+        """A prefix immediately preceded by '.' must NOT match (task-1494).
+
+        '.' is excluded from the left-boundary class specifically to prevent a
+        dotted-namespace or dotted-package form like ``pkg.corpus/foo`` from
+        triggering a leading-prefix match.  Note that ``./corpus/x`` is already
+        covered by the '/' exclusion (the char immediately before ``corpus/`` is
+        '/'), so '.' only adds value for the standalone-dotted-name case.
+        """
+        # Contrived single-char prefix: a.corpus/x
         assert find_paths('a.corpus/x', ('corpus/',)) == []
+        # More realistic: a package/namespace separator before the prefix
+        assert find_paths('pkg.corpus/grammar.js', ('corpus/',)) == []
+
+    def test_relative_path_prefix_dot_slash_not_a_boundary(self):
+        """'./corpus/x' is already excluded by the '/' rule (char before 'corpus/' is '/').
+
+        The '.' in the boundary class is NOT responsible for this case — it only
+        adds value for purely-dotted forms like 'pkg.corpus/'.  This test
+        documents that ./... is handled by '/' exclusion and guards that we
+        don't accidentally re-introduce it.
+        """
+        assert find_paths('./corpus/x', ('corpus/',)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +237,29 @@ class TestCheckCandidateForScope:
         v = check_candidate_for_scope(c, 'reify', registry)
         assert v.outcome == 'rejection'
         assert v.suggested_project == 'know_live'
+
+    def test_project_root_prefixed_path_under_reify_is_ok(self, tmp_path):
+        """A project-root-prefixed path (e.g. 'know-live/corpus/x') filed under reify
+        must NOT trigger a rejection: 'corpus/' is mid-path (preceded by '/'), so the
+        tightened lookbehind does NOT match it.
+
+        This is the intentional task-1494 tradeoff — the guard now detects only
+        BARE LEADING references.  A mis-filing that specifies the full project-root
+        path ('know-live/corpus/wordlist.txt') is a false-negative here; it relies
+        on downstream LLM Stage-2 routing rather than the regex guard.
+
+        Explicitly documented so the narrowing is locked in and understood, rather
+        than appearing as an accidental gap.  Compare with
+        test_bare_leading_corpus_under_reify_is_rejection: once 'know-live/' is
+        prepended, the guard yields 'ok'.
+        """
+        registry = self._know_live_reify_registry(tmp_path)
+        # Full project-root path: 'know-live/corpus/x' — 'corpus/' is mid-path
+        c = _candidate(details='Edit know-live/corpus/wordlist.txt to add entries')
+        v = check_candidate_for_scope(c, 'reify', registry)
+        assert v.outcome == 'ok'
+        assert v.matched_paths == ()
+        assert v.suggested_project is None
 
 
 # ---------------------------------------------------------------------------
