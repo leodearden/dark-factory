@@ -258,8 +258,20 @@ Agent found it depends on work that isn't done yet.
    ```
    Add to digest: `DISPATCHED: dependency_discovered — <task_id> → depends on <dep_id>`
 
-3. **If no matching task exists:** Surface in digest (do NOT spawn /unblock):
-   Add to digest: `PENDING (human): dependency_discovered — <task_id> — no matching task for: <dep_description>`
+3. **If no matching task exists:** Promote to L2 — do NOT spawn /unblock, do NOT leave pending:
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<escalation_id>],
+     root_cause="dependency-no-task:" + <dep_description_slug>,
+     evidence=<dep_description>,
+     options=["A: create the missing prerequisite task", "B: remove dependency and let agent continue", "C: terminate and defer", "D: something else"],
+     summary="dependency_discovered — no matching task for: " + <dep_description>,
+     category="dependency_discovered",
+   )
+   ```
+   Add to digest: `PROMOTED (L2): dependency_discovered — <task_id> — no matching task for: <dep_description>`
 
 #### `cleanup_needed`
 
@@ -278,42 +290,104 @@ Technical debt or cleanup discovered during development.
 
 ---
 
-### Surface-in-digest categories (leave pending for human)
+### Promote-to-L2 categories (require human judgment)
+
+For all categories below, **promote rather than leave pending**. Check for a causal cluster first (see [Shallow-by-default RCA](#shallow-by-default--deepen-on-signal-rca)): if multiple escalations share a root cause, promote them together as one L2 cluster. Otherwise, promote each as a 1-member L2.
 
 #### `task_failure` / `wip_conflict`
 
-The task is blocked. The `/unblock-auto` hook (task 1325) runs dry-run proposals at block time.
+The task is blocked. The `/unblock-auto` hook runs dry-run proposals at block time — use the latest proposal as L2 evidence but **do NOT execute it**.
 
 1. Fetch the current proposal (if any):
-   ```
+   ```python
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
    proposals = task.metadata.get("dry_run_proposals", [])
    latest_proposal = proposals[-1] if proposals else None
    ```
-2. Add to digest: `PENDING (human): <category> — <task_id> — <summary>`
-   If a proposal exists, include it verbatim: `  Proposal: <latest_proposal.proposal_text> [risk: <latest_proposal.risk_label>]`
-3. **Do NOT execute the proposal.** Leave the escalation pending.
+2. Apply shallow RCA: check whether other pending `task_failure` escalations touch the same module or recent merge commit (check with `git log --oneline -10`, `git diff main -- <module>`). If yes, cluster them under a single L2.
+3. Promote to L2:
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<esc_id>, ...],
+     root_cause="task-failure:<module-or-merge-slug>",  # or per-task if isolated
+     evidence=(
+       f"Task {task_id}: {summary}. "
+       + (f"Dry-run proposal: {latest_proposal.proposal_text} [risk: {latest_proposal.risk_label}]" if latest_proposal else "No proposal available.")
+     ),
+     options=["A: apply dry-run proposal", "B: investigate and fix manually", "C: terminate and reschedule", "D: something else"],
+     summary=<escalation summary>,
+     category="task_failure",
+   )
+   ```
+4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
 
 #### `infra_issue`
 
 Infrastructure problem. Do NOT attempt automated fixes.
 
-Add to digest: `PENDING (human/urgent): infra_issue — <task_id or N/A> — <summary>`
-Leave escalation pending.
+Apply shallow RCA: check whether this is part of a burst (multiple `infra_issue` escalations in the current drain cycle or across unrelated tasks). If yes, cluster them under one L2 with an infra root-cause key.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id or "infra">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="infra-outage:<symptom-slug>",  # e.g. "infra-outage:neo4j-connection-refused"
+  evidence=<summary + any burst pattern observed>,
+  options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
+  summary="Infrastructure issue: " + <summary>,
+  category="infra_issue",
+  severity="blocking",
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): infra_issue — <task_id or N/A> — <summary>`
 
 #### `design_concern` / `risk_identified` / `missing_premise`
 
-These require human judgment.
+These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
 
-Add to digest: `PENDING (human): <category> — <task_id> — <summary>`
-Leave escalation pending.
+Root_cause hint:
+- `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
+- `risk_identified`: `"risk:<module-or-area-slug>"`
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id>,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause=<root_cause_key>,
+  evidence=<detail or summary>,
+  options=["A: accept/acknowledge and continue", "B: redesign the affected area", "C: defer until more context available", "D: something else"],
+  summary=<escalation summary>,
+  category=<category>,
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
 
 #### `curator_failure` / `recon_failure` / `recon_backlog_overflow` / `recon_stale_run` / `recon_integrity_issue`
 
-Fused-memory reconciliation or curator problems — may indicate systematic issues.
+Fused-memory reconciliation or curator problems — may indicate systematic issues. These often cluster under one infra-level root cause.
 
-Add to digest: `PENDING (human): <category> — <task_id or N/A> — <summary>`
-Leave escalation pending.
+Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:curator_failure"`, `"recon-issue:backlog-overflow"`)
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id or "fused-memory">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="recon-issue:<category-slug>",
+  evidence=<summary>,
+  options=["A: restart fused-memory service", "B: manually drain reconciliation backlog", "C: investigate and fix root cause", "D: something else"],
+  summary=<category> + ": " + <summary>,
+  category=<category>,
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): <category> — <task_id or N/A> — <summary>`
 
 ---
 
