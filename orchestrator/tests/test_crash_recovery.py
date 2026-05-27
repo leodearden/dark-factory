@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 
 
@@ -21,10 +22,18 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler = MagicMock()
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.set_task_status = AsyncMock()
+    # Fix C identity guard: get_task feeds the live title.  Default returns a
+    # title-less dict ({} is non-None → no defer; no title → identities_match
+    # fails open → adopt), so the pre-Fix-C recovery tests behave unchanged.
+    h.scheduler.get_task = AsyncMock(return_value={})
+    h.scheduler._dispatched = set()
 
-    # Replace git_ops cleanup with async mock but keep worktree_base real
+    # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
     h.git_ops.cleanup_worktree = AsyncMock()
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    # Exercise the (best-effort) event emits without a real store.
+    h.event_store = MagicMock()
 
     return h
 
@@ -411,3 +420,105 @@ class TestRecoverCrashedTasks:
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
         assert len(cleanup_calls) == 2
+
+
+def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
+    """Worktree with a plan AND a .task/metadata.json carrying ``title``."""
+    wt = _setup_worktree(base, task_id, plan)
+    (wt / '.task' / 'metadata.json').write_text(
+        json.dumps({'task_id': task_id, 'title': title})
+    )
+    return wt
+
+
+@pytest.mark.asyncio
+class TestRecoverIdentityGuard:
+    """Fix C: semantic identity guard on the crash-recovery path.
+
+    The numeric guard only proves ``plan.task_id == dirname``; for a recycled
+    id both equal the new task's id.  These tests cover the title comparison
+    against the live DB task — the exact check that would have caught reify
+    task 3770.
+    """
+
+    async def test_quarantines_on_title_mismatch(self, harness: Harness):
+        """The 3770 scenario: worktree holds a trajectory plan but the live
+        (recycled-id) task is the cycle-breaker → quarantine, do not adopt."""
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='3770')
+        wt = _setup_worktree_with_meta(
+            harness.git_ops.worktree_base, '3770', plan,
+            title='Trajectory beta: spline solver',
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '3770', 'title': 'Cycle-breaker beta: dedup edges'},
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert '3770' not in harness._recovered_plans
+        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            wt, '3770', 'recovery-identity-mismatch',
+        )
+        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
+        assert EventType.worktree_quarantined in emitted
+
+    async def test_adopts_on_match_with_autoeval_prefix(self, harness: Harness):
+        """A benign ``[auto-eval redo] `` prefix normalises away → adopt."""
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='40')
+        _setup_worktree_with_meta(
+            harness.git_ops.worktree_base, '40', plan, title='Fix the widget',
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '40', 'title': '[auto-eval redo] Fix the widget'},
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert '40' in harness._recovered_plans
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_defers_when_get_task_none(self, harness: Harness):
+        """get_task None (deleted OR transient error) → no adopt, no destroy."""
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='41')
+        wt = _setup_worktree_with_meta(
+            harness.git_ops.worktree_base, '41', plan, title='Whatever',
+        )
+        harness.scheduler.get_task = AsyncMock(return_value=None)
+
+        await harness._recover_crashed_tasks()
+
+        assert '41' not in harness._recovered_plans
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert wt.exists()  # deferred to the reaper, untouched
+
+    async def test_adopts_when_no_stored_title(self, harness: Harness):
+        """No readable stored title → identities_match fails open → adopt."""
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        plan.pop('title', None)
+        _setup_worktree(harness.git_ops.worktree_base, '42', plan)  # no metadata.json
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'title': 'Some live title'},
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_plans
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_disabled_flag_skips_check(self, harness: Harness):
+        """Flag off → the title comparison is skipped entirely (get_task unused)."""
+        harness.config.worktree_identity_guard_enabled = False
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='43')
+        _setup_worktree_with_meta(
+            harness.git_ops.worktree_base, '43', plan, title='Mismatch A',
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '43', 'title': 'Mismatch B'},
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert '43' in harness._recovered_plans  # adopted despite mismatch
+        harness.scheduler.get_task.assert_not_called()
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]

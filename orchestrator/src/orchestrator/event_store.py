@@ -163,6 +163,12 @@ class EventType(StrEnum):
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
 
+    # Worktree hygiene (Fix B/C) — emitted when an orphaned or identity-
+    # mismatched worktree is relocated to the sibling ``-orphaned`` base
+    # (quarantine, WIP preserved) or removed (reap, provably-empty/clean).
+    worktree_quarantined = 'worktree_quarantined'
+    worktree_reaped = 'worktree_reaped'
+
 
 class EventStore:
     """Append-only SQLite event store.

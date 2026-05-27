@@ -87,6 +87,21 @@ CREATE TABLE IF NOT EXISTS dependencies (
     depends_on INTEGER NOT NULL,
     PRIMARY KEY (tag, parent_id, task_id, depends_on)
 );
+
+-- Monotonic id high-water marks per (tag, parent_id) sequence.  ``add_task`` /
+-- ``add_subtask`` allocate ``max(MAX(tasks.id), max_id) + 1`` so a deleted
+-- top-level id is NEVER reissued (the counter holds the line after the row is
+-- gone).  Applied idempotently via executescript on every connection open; old
+-- code that ignores this table still reads/writes ``tasks`` correctly, so the
+-- change is backward-compatible.  ``parent_id`` mirrors the tasks sentinel:
+-- ``_TOP_LEVEL_SENTINEL`` (0) for the top-level sequence, the parent's int id
+-- for a per-parent subtask sequence.
+CREATE TABLE IF NOT EXISTS id_counters (
+    tag        TEXT NOT NULL DEFAULT 'master',
+    parent_id  INTEGER NOT NULL DEFAULT 0,
+    max_id     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tag, parent_id)
+);
 """
 
 DEFAULT_TAG = 'master'
@@ -574,13 +589,26 @@ class SqliteTaskBackend:
         deps_list = _parse_dependency_list(dependencies)
 
         async with self._write_lock(project_root), self._txn(project_root) as conn:
+            # High-water across BOTH live rows and the persisted counter, so a
+            # deleted top-level id is never reissued (see id_counters in the
+            # schema).  max(MAX(tasks.id), stored)+1 self-heals legacy DBs that
+            # predate the counter: the existing row high-water is honoured on
+            # the first post-upgrade alloc, then the counter holds the line.
             cursor = await conn.execute(
-                'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
-                (tag, _TOP_LEVEL_SENTINEL),
+                """
+                SELECT MAX(highwater) FROM (
+                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
+                        WHERE tag = ? AND parent_id = ?
+                    UNION ALL
+                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
+                        WHERE tag = ? AND parent_id = ?
+                )
+                """,
+                (tag, _TOP_LEVEL_SENTINEL, tag, _TOP_LEVEL_SENTINEL),
             )
             _max_row = await cursor.fetchone()
-            assert _max_row is not None  # COALESCE(MAX(id), 0) always returns a row
-            next_id = _max_row[0] + 1
+            assert _max_row is not None  # aggregate MAX always returns one row
+            next_id = (_max_row[0] or 0) + 1
             await conn.execute(
                 """
                     INSERT INTO tasks (tag, id, parent_id, title, description,
@@ -600,6 +628,14 @@ class SqliteTaskBackend:
                     '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
                     (tag, next_id, _TOP_LEVEL_SENTINEL, dep),
                 )
+            await conn.execute(
+                """
+                INSERT INTO id_counters (tag, parent_id, max_id) VALUES (?, ?, ?)
+                    ON CONFLICT(tag, parent_id) DO UPDATE SET max_id = excluded.max_id
+                        WHERE excluded.max_id > id_counters.max_id
+                """,
+                (tag, _TOP_LEVEL_SENTINEL, next_id),
+            )
         return {
             'id': str(next_id),
             'message': f'Successfully added new task #{next_id}',
@@ -784,13 +820,25 @@ class SqliteTaskBackend:
                     f'Parent task not found: {parent_id}',
                 )
 
+            # Per-parent subtask sequence: high-water across live subtask rows
+            # AND the persisted counter (parent_id = the parent's int id), so a
+            # deleted subtask id is never reissued.  Self-heals legacy DBs the
+            # same way as add_task.
             max_cursor = await conn.execute(
-                'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
-                (tag, parent_tid),
+                """
+                SELECT MAX(highwater) FROM (
+                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
+                        WHERE tag = ? AND parent_id = ?
+                    UNION ALL
+                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
+                        WHERE tag = ? AND parent_id = ?
+                )
+                """,
+                (tag, parent_tid, tag, parent_tid),
             )
             _max_row = await max_cursor.fetchone()
-            assert _max_row is not None  # COALESCE(MAX(id), 0) always returns a row
-            next_id = _max_row[0] + 1
+            assert _max_row is not None  # aggregate MAX always returns one row
+            next_id = (_max_row[0] or 0) + 1
             await conn.execute(
                 """
                     INSERT INTO tasks (tag, id, parent_id, title, description,
@@ -802,6 +850,14 @@ class SqliteTaskBackend:
                     tag, next_id, parent_tid, title, description or '',
                     details or '', _now(),
                 ),
+            )
+            await conn.execute(
+                """
+                INSERT INTO id_counters (tag, parent_id, max_id) VALUES (?, ?, ?)
+                    ON CONFLICT(tag, parent_id) DO UPDATE SET max_id = excluded.max_id
+                        WHERE excluded.max_id > id_counters.max_id
+                """,
+                (tag, parent_tid, next_id),
             )
 
             refreshed_cursor = await conn.execute(
