@@ -738,17 +738,25 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     def _patch_resolution_metadata(self, escalation_id: str, result) -> None:
-        """Post-fill resolved_by and resolution_turns if the agent resolved it."""
+        """Post-fill resolved_by and resolution_turns if the agent resolved the escalation
+        WITHOUT attributing themselves.
+
+        Delegates to the archive-aware queue.patch_resolution_metadata so the file is
+        updated in place (root or archive) and never resurrected to the queue root.
+        Preserves an existing resolved_by — only steward-fills when attribution is missing.
+        """
         updated = self.escalation_queue.get(escalation_id)
         if (
             updated
             and updated.status in ('resolved', 'dismissed')
             and not updated.resolved_by
         ):
-            updated.resolved_by = 'steward'
-            updated.resolution_turns = result.turns
             try:
-                self.escalation_queue._rewrite(escalation_id, updated)  # noqa: SLF001
+                self.escalation_queue.patch_resolution_metadata(
+                    escalation_id,
+                    resolved_by='steward',
+                    resolution_turns=result.turns,
+                )
             except Exception as e:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'

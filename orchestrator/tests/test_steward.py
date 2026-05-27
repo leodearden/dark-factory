@@ -7,13 +7,15 @@ import contextlib
 import json
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
+from escalation import archive
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.usage_gate import InvokeSlot
 
 from orchestrator.config import OrchestratorConfig
@@ -121,17 +123,26 @@ def mock_briefing():
     return briefing
 
 
-@pytest.fixture
-def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
+def _build_steward(worktree, config, mcp, briefing, escalation_queue):
+    """Shared factory used by both `steward` and `steward_with_real_queue` fixtures.
+
+    Centralises TaskSteward construction so that if new required constructor
+    parameters are added later, only this one place needs updating.
+    """
     return TaskSteward(
         task_id='42',
         task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
         worktree=worktree,
-        config=mock_config,
-        mcp=mock_mcp,
-        escalation_queue=mock_queue,
-        briefing=mock_briefing,
+        config=config,
+        mcp=mcp,
+        escalation_queue=escalation_queue,
+        briefing=briefing,
     )
+
+
+@pytest.fixture
+def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
+    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, mock_queue)
 
 
 def _make_result(
@@ -656,8 +667,8 @@ class TestStewardTimeoutPassthrough:
             )
 
         assert mock_invoke.call_count == 2
-        for call in mock_invoke.call_args_list:
-            assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+        for mock_call in mock_invoke.call_args_list:
+            assert mock_call.kwargs['timeout_seconds'] == pytest.approx(900.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2492,3 +2503,128 @@ class TestMakePreTriageGate:
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         assert gate.detect_cap_hit() is True
         assert gate.detect_cap_hit() is False
+
+
+# ---------------------------------------------------------------------------
+# Defect-2 regression: _patch_resolution_metadata must not resurrect archived
+# escalations into the queue root.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def steward_with_real_queue(tmp_path, worktree, mock_config, mock_mcp, mock_briefing):
+    """TaskSteward using a REAL EscalationQueue backed by tmp_path.
+
+    Replaces mock_queue with a real filesystem-backed queue so that the
+    on-disk write location (queue root vs archive) can be directly asserted.
+    """
+    real_queue = EscalationQueue(tmp_path / 'escalations')
+    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, real_queue)
+
+
+class TestPatchResolutionMetadataDefect2:
+    """Regression tests for Defect-2: _patch_resolution_metadata must not resurrect
+    archived escalations into the queue root."""
+
+    def test_patches_archived_escalation_in_place_and_root_stays_empty(
+        self, steward_with_real_queue
+    ):
+        """After patching, the queue root must be empty and the archive copy must
+        carry resolved_by='steward' with the correct resolution_turns.
+
+        This test FAILS on the current _rewrite-based implementation because
+        _rewrite always writes to queue_dir/{id}.json (the root), resurrecting
+        an escalation that resolve() already moved to the archive.
+        """
+        steward = steward_with_real_queue
+        queue = steward.escalation_queue
+
+        # Setup: submit then resolve without attribution (simulates the
+        # agent-resolved-without-attribution edge case).
+        esc = _make_escalation(id='esc-42-7')
+        queue.submit(esc)
+        queue.resolve('esc-42-7', 'agent fixed it')
+
+        # Pre-conditions: file should now be in the archive, not the root.
+        assert not (queue.queue_dir / 'esc-42-7.json').exists(), (
+            'queue root must be empty after resolve() archives the file'
+        )
+        archive_files = list((queue.queue_dir / archive.ARCHIVE_SUBDIR).rglob('esc-42-7.json'))
+        assert len(archive_files) == 1, 'exactly one archive copy must exist after resolve()'
+        archived_data = json.loads(archive_files[0].read_text())
+        assert archived_data['resolved_by'] is None, (
+            'archive copy must have resolved_by=None before patching'
+        )
+
+        # Action: call the method under test.
+        steward._patch_resolution_metadata('esc-42-7', _make_result(turns=5))
+
+        # Post-condition (a): NO RESURRECTION to queue root — this is the headline
+        # assertion that fails on the _rewrite-based implementation.
+        assert not (queue.queue_dir / 'esc-42-7.json').exists(), (
+            'DEFECT-2 REGRESSION: _patch_resolution_metadata resurrected the file '
+            'into the queue root (should have updated the archive copy in place)'
+        )
+        # Post-condition (b): archive still has exactly one copy (no duplication).
+        post_archive_files = list((queue.queue_dir / archive.ARCHIVE_SUBDIR).rglob('esc-42-7.json'))
+        assert len(post_archive_files) == 1, 'archive must still have exactly one copy'
+        # Post-condition (c): archive copy carries the patched fields.
+        patched = json.loads(post_archive_files[0].read_text())
+        assert patched['resolved_by'] == 'steward'
+        assert patched['resolution_turns'] == 5
+        assert patched['status'] == 'resolved'
+        assert patched['resolution'] == 'agent fixed it'
+
+    # ------------------------------------------------------------------
+    # Mock-level contract tests (use the existing mock_queue fixture)
+    # ------------------------------------------------------------------
+
+    def test_calls_patch_resolution_metadata_not_rewrite(self, steward):
+        """patch_resolution_metadata is called with the expected kwargs and _rewrite
+        is NOT called — guards against regressing back to the resurrecting _rewrite."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by=None
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=7))
+        # Assert the FULL method call list — this positively verifies which methods
+        # were called AND implicitly confirms _rewrite (or any other unwanted private
+        # method) was NOT called, which is stronger than a bare _rewrite.assert_not_called().
+        assert steward.escalation_queue.method_calls == [
+            call.get('esc-42-1'),
+            call.patch_resolution_metadata('esc-42-1', resolved_by='steward', resolution_turns=7),
+        ]
+
+    def test_skips_when_status_pending(self, steward):
+        """When the escalation is still pending, patch_resolution_metadata is NOT called."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending', resolved_by=None
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_skips_when_already_attributed(self, steward):
+        """When resolved_by is already set, patch_resolution_metadata is NOT called
+        — preserves any existing agent attribution (e.g. resolved_by='interactive')."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by='interactive'
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_skips_when_get_returns_none(self, steward):
+        """When get() returns None (escalation missing), patch_resolution_metadata
+        is NOT called — avoids errors on unknown IDs."""
+        steward.escalation_queue.get.return_value = None
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_exception_in_patch_is_logged_not_raised(self, steward, caplog):
+        """An exception from patch_resolution_metadata is caught and logged as a
+        warning — it must not propagate to the caller."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by=None
+        )
+        steward.escalation_queue.patch_resolution_metadata.side_effect = OSError('disk full')
+        with caplog.at_level(logging.WARNING):
+            steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        assert 'Failed to patch steward metadata on esc-42-1' in caplog.text
