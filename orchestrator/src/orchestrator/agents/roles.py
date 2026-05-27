@@ -138,6 +138,13 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    - Steps alternate: write a failing test, then implement to make it pass.
 4. Call `add_design_decision(decision, rationale)` for non-obvious choices.
 5. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
+6. Call `confirm_plan()` as your FINAL plan-tools action, once every step and
+   prerequisite has been added. This marks the plan COMPLETE. Call it
+   immediately after the last `add_plan_step` — before any other work (extra
+   reads, memory writes) — so a complete plan is on record even if you then run
+   low on budget or turns. A plan with no `confirm_plan()` call is treated as
+   incomplete and will NOT advance to execution (a later session may resume and
+   finish it, but this run's effort is wasted).
 
 ## Rules
 
@@ -156,7 +163,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    If you call `escalate_blocker` and will NOT subsequently call `create_plan`, you MUST also call `report_unactionable_task` (or `report_blocking_dependency` / `report_task_already_done` if either fits) so the orchestrator routes to a clean L1 instead of retrying you.
 
    Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow. If none of the rejection paths apply and premises check out, proceed with `create_plan`.
-3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward.
+3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward. Conversely, if you HAVE finished the plan, call `confirm_plan()` right away and stop — a finalized plan survives even if the run is later cut off by a budget/turn cap, but an unfinalized one is treated as incomplete.
 4. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
 5. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:
    - Assert on `__doc__` strings, docstring prose, comment contents, or module-level string literals

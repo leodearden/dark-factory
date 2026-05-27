@@ -160,6 +160,10 @@ class _BriefingLike(Protocol):
         changed_files: list[str], worktree: Path | None = ...,
         context: str | None = ...,
     ) -> str: ...
+    async def build_plan_completion_prompt(
+        self, task: dict, partial_plan: dict,
+        worktree: Path | None = ..., context: str | None = ...,
+    ) -> str: ...
     async def build_plan_tightening_prompt(
         self, task: dict, plan: dict, not_touched: list[str],
         worktree: Path | None = ..., context: str | None = ...,
@@ -1200,11 +1204,21 @@ class TaskWorkflow:
                 )
                 await self.scheduler.set_task_status(self.task_id, 'pending')
                 return WorkflowOutcome.REQUEUED
-            # Lock was stale and cleared.  If the plan has provenance
-            # (complete plan from a prior session, e.g. blast-radius requeue),
-            # keep it for revalidation.  If not (crashed mid-planning), delete.
+            # Lock was stale and cleared.  Decide what to keep:
+            #  - provenance-stamped or finalized → a complete plan from a prior
+            #    session (e.g. blast-radius requeue) → keep for revalidation.
+            #  - has steps but not finalized → a prior session was interrupted
+            #    mid-build → keep the partial; the completion pass below finishes
+            #    it instead of re-planning from scratch.
+            #  - no steps, no provenance, not finalized → nothing recoverable →
+            #    delete.
             existing = self.artifacts.read_plan()
-            if existing and not existing.get('_session_id'):
+            if (
+                existing
+                and not existing.get('_session_id')
+                and not existing.get('_finalized_at')
+                and not existing.get('steps')
+            ):
                 plan_path = self.artifacts.root / 'plan.json'
                 if plan_path.exists():
                     plan_path.unlink()
@@ -1217,6 +1231,25 @@ class TaskWorkflow:
         revalidation_changed_files: list[str] = []
         existing_plan = self.artifacts.read_plan()
         if (
+            existing_plan
+            and existing_plan.get('steps')
+            and not existing_plan.get('_finalized_at')
+            and not existing_plan.get('_session_id')
+        ):
+            # ── Completion pass ───────────────────────────────────────
+            # A prior session wrote steps but never finalized the plan
+            # (it was cut off mid-build by a budget/turn cap or crash).
+            # Hand the partial back to the architect to finish rather than
+            # discard the work and re-plan from scratch.
+            logger.info(
+                'Task %s: resuming a partial plan (%d steps, not finalized) '
+                'via the completion pass',
+                self.task_id, len(existing_plan.get('steps', [])),
+            )
+            prompt = await self.briefing.build_plan_completion_prompt(
+                self.task, existing_plan, worktree=self.worktree,
+            )
+        elif (
             existing_plan
             and existing_plan.get('steps')
             and existing_plan.get('_session_id')
@@ -1285,6 +1318,41 @@ class TaskWorkflow:
 
                 if not result.success:
                     cls = classify_agent_failure(result)
+                    # Salvage: the architect may have finalized a complete plan
+                    # on disk before the CLI run hit a budget/turn cap (or was
+                    # otherwise cut off).  A plan carrying ``_finalized_at`` was
+                    # explicitly declared complete, so it is safe to use despite
+                    # the run-level failure — the same validation gates below
+                    # still apply.  Without the marker the plan is an unfinished
+                    # partial; block and let the next session's completion pass
+                    # finish it.
+                    salvaged = self.artifacts.read_plan()
+                    if (
+                        salvaged
+                        and salvaged.get('_finalized_at')
+                        and salvaged.get('steps')
+                    ):
+                        logger.warning(
+                            'Task %s: architect run failed (%s) but a finalized '
+                            'plan (%d steps) is on disk — salvaging instead of '
+                            'discarding',
+                            self.task_id, cls.kind.value,
+                            len(salvaged.get('steps', [])),
+                        )
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.plan_salvaged,
+                                task_id=self.task_id,
+                                phase='plan',
+                                data={
+                                    'failure_kind': cls.kind.value,
+                                    'cost_usd': result.cost_usd,
+                                    'turns': result.turns,
+                                    'steps': len(salvaged.get('steps', [])),
+                                },
+                            )
+                        self.plan = salvaged
+                        break  # fall through to validation / provenance / lock
                     logger.error(
                         'Task %s: architect failed (%s): %s',
                         self.task_id, cls.kind.value, cls.summary,
@@ -1400,6 +1468,27 @@ class TaskWorkflow:
             return await self._handle_no_plan_failure(
                 'Planning failed: plan missing "steps"',
                 detail=f'Plan content:\n{plan_dump[:4000]}',
+            )
+
+        # Hard-require the completeness marker.  The architect must call
+        # confirm_plan() as its final action; a plan with steps but no
+        # _finalized_at is an unfinished partial — either the run was cut off
+        # mid-build, or the architect skipped the final call.  Route it through
+        # the no-plan failure handler (which has cycle detection).  The partial
+        # is left on disk, so the next session's completion pass can resume it.
+        #
+        # This runs BEFORE stamp_plan_provenance so a missing confirm_plan is
+        # caught here rather than masked by the marker that stamping backfills.
+        if not self.plan.get('_finalized_at'):
+            return await self._handle_no_plan_failure(
+                'Planning failed: plan not finalized '
+                '(architect did not call confirm_plan)',
+                detail=(
+                    'The plan on disk has steps but no _finalized_at marker. '
+                    'The architect must call confirm_plan() as its final action '
+                    'to mark the plan complete. Treating as an incomplete plan; '
+                    'a later session will resume and finish it.'
+                ),
             )
 
         if outcome := await self._validate_prerequisites_or_block('initial plan'):
@@ -1853,6 +1942,14 @@ class TaskWorkflow:
 
         repaired_plan = self.artifacts.read_plan()
         if repaired_plan.get('steps'):
+            # The repair restructures an existing complete plan into valid
+            # schema (the architect was told not to redesign), so the repaired
+            # plan is complete by construction.  Stamp the completeness marker
+            # — the repair prompt writes plan.json via the Write tool rather
+            # than confirm_plan, so the _finalized_at gate would otherwise
+            # reject this plan.
+            repaired_plan.setdefault('_finalized_at', datetime.now(UTC).isoformat())
+            self.artifacts.write_plan(repaired_plan)
             logger.info(
                 'Task %s: repair prompt succeeded — plan now has %d steps',
                 self.task_id, len(repaired_plan['steps']),

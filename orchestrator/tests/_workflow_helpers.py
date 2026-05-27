@@ -95,6 +95,12 @@ class FakeBriefing:
     async def build_architect_prompt(self, task: dict, worktree=None, context: str | None = None) -> str:
         return f'Plan task: {task.get("title", "")}'
 
+    async def build_plan_completion_prompt(
+        self, task: dict, partial_plan: dict, worktree=None,
+        context: str | None = None,
+    ) -> str:
+        return f'Complete partial plan: {task.get("title", "")}'
+
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,

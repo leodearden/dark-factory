@@ -142,3 +142,50 @@ class TestBuildPlanTighteningPrompt:
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
         prompt = await self._build(briefing)
         assert 'claude-task-2656-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestBuildPlanCompletionPrompt:
+    """Completion pass that resumes a partial plan left by an interrupted run."""
+
+    async def _build(self, briefing: BriefingAssembler) -> str:
+        task = {'id': '3822', 'title': 'Add recon closure', 'description': 'Demo'}
+        partial = {
+            'task_id': '3822',
+            'title': 'Add recon closure',
+            'files': ['recon.py'],
+            'analysis': 'partial analysis',
+            'prerequisites': [],
+            'steps': [
+                {'id': 'step-1', 'type': 'test', 'description': 'test a',
+                 'status': 'pending', 'commit': None},
+                {'id': 'step-2', 'type': 'impl', 'description': 'impl a',
+                 'status': 'pending', 'commit': None},
+            ],
+        }
+        return await briefing.build_plan_completion_prompt(
+            task, partial, worktree=None, context='',
+        )
+
+    async def test_shows_partial_and_requires_finalize(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._build(briefing)
+        # The existing steps are shown so the architect can build on them.
+        assert 'step-1' in prompt
+        assert 'step-2' in prompt
+        # Must instruct finalizing the completed plan.
+        assert 'confirm_plan' in prompt
+        # Frames the work as finishing, not starting over.
+        assert 'Completion' in prompt or 'finish' in prompt.lower()
+
+    async def test_offers_restart_and_rejection_escape_hatches(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._build(briefing)
+        assert 'create_plan' in prompt
+        assert 'report_unactionable_task' in prompt
+
+    async def test_includes_agent_identity(self, briefing: BriefingAssembler):
+        prompt = await self._build(briefing)
+        assert 'claude-task-3822-architect' in prompt

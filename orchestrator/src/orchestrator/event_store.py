@@ -124,6 +124,11 @@ class EventType(StrEnum):
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 
+    # Plan salvaged — the architect CLI run reported failure (e.g. budget/turn
+    # cap) but had already written a finalized, valid plan to disk; the
+    # workflow uses that plan instead of discarding it and re-planning.
+    plan_salvaged = 'plan_salvaged'
+
     # Phase skipped — emitted when an optimistic-path optimisation
     # short-circuits a workflow phase (B: revalidation skipped on overlap=0;
     # C: full architect+implementer skipped via SIMPLE_TASK).

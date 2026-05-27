@@ -595,6 +595,12 @@ class TaskArtifacts:
             )
         plan['_session_id'] = session_id
         plan['_created_at'] = datetime.now(UTC).isoformat()
+        # Invariant: a provenance-stamped plan is a complete plan, so it must
+        # carry the completeness marker.  The architect's confirm_plan normally
+        # sets this already (idempotent setdefault); paths that inject a
+        # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
+        # plan is not mistaken for an interrupted partial on a later requeue.
+        plan.setdefault('_finalized_at', plan['_created_at'])
         self._write_json(self.root / 'plan.json', plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:

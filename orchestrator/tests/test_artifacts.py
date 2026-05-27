@@ -200,6 +200,22 @@ class TestPlanProvenance:
         assert updated['_session_id'] == 'session-abc123'
         assert '_created_at' in updated
 
+    def test_stamp_plan_provenance_backfills_finalized_marker(self, artifacts: TaskArtifacts):
+        # Invariant: a provenance-stamped plan is complete, so it carries the
+        # completeness marker even when confirm_plan was not the writer (eval
+        # initial_plan / SIMPLE_TASK paths).
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.read_plan()['_finalized_at']
+
+    def test_stamp_plan_provenance_preserves_existing_finalized_marker(self, artifacts: TaskArtifacts):
+        # setdefault must not clobber a marker the architect already stamped.
+        plan = dict(VALID_PLAN_WITH_STEPS)
+        plan['_finalized_at'] = '2026-01-01T00:00:00+00:00'
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.read_plan()['_finalized_at'] == '2026-01-01T00:00:00+00:00'
+
     def test_stamp_plan_provenance_preserves_existing_plan_data(self, artifacts: TaskArtifacts):
         plan = {
             'task_id': 'task-1',
