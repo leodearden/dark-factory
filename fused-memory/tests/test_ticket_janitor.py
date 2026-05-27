@@ -672,6 +672,55 @@ async def test_probe_defect_escalation_is_rate_limited(store, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_probe_success_resets_consecutive_failure_counter(store, tmp_path):
+    """A probe success resets the per-project counter so intermittent blips never accumulate.
+
+    A probe that alternates raise/succeed/raise/succeed... never builds up
+    3 consecutive raises and must therefore never surface an escalation, even
+    across many ticks.  The pending ticket stays pending throughout.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='intermittent probe'),
+        )
+
+        call_count = [0]
+
+        def _alternating_probe(pid: str) -> bool:
+            call_count[0] += 1
+            if call_count[0] % 2 == 1:  # odd calls raise
+                raise RuntimeError('intermittent probe failure')
+            return True  # even calls succeed
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_alternating_probe,
+            probe_defect_threshold=3,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # 6 ticks: alternating raise/succeed — consecutive count never reaches 3
+        for _ in range(6):
+            await janitor.tick()
+
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Intermittent probe raises must never surface an escalation; '
+            f'got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending'
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):
