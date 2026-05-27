@@ -2264,6 +2264,92 @@ class TestResolveWatcherOutageL2:
 
 
 # ---------------------------------------------------------------------------
+# task 1501: _check_watcher_guard trip must also file the outage L2
+# ---------------------------------------------------------------------------
+
+class TestCheckWatcherGuardFilesL2Outage:
+    """When _check_watcher_guard trips, _file_watcher_outage_l2 is also called."""
+
+    @pytest.mark.asyncio
+    async def test_trip_files_outage_l2_crashloop(self, tmp_path: Path) -> None:
+        """Crashloop trip: L2 outage escalation is filed with reason='watcher_crashloop'."""
+        max_count = 3
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-populate exits_deque with max_count - 1 entries so the trip fires
+        # exactly on the max_count-th call (the one made by _check_watcher_guard).
+        exits_deque = deque([now] * (max_count - 1))
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_crashloop', max_count, window, now
+        )
+
+        assert tripped is True, 'Guard should have tripped'
+        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop')
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 after crashloop trip; got {len(l2s)}'
+        )
+        assert 'watcher_crashloop' in l2s[0].summary, (
+            f'L2 summary must contain "watcher_crashloop"; got {l2s[0].summary!r}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+
+    @pytest.mark.asyncio
+    async def test_trip_files_outage_l2_misconfigured(self, tmp_path: Path) -> None:
+        """Misconfigured trip: L2 outage escalation is filed with reason='watcher_misconfigured'."""
+        max_count = 3
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        exits_deque = deque([now] * (max_count - 1))
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_misconfigured', max_count, window, now
+        )
+
+        assert tripped is True, 'Guard should have tripped'
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 after misconfigured trip; got {len(l2s)}'
+        )
+        assert 'watcher_misconfigured' in l2s[0].summary, (
+            f'L2 summary must contain "watcher_misconfigured"; got {l2s[0].summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_l2_when_guard_does_not_trip(self, tmp_path: Path) -> None:
+        """When guard does NOT trip (below threshold), no L2 is filed."""
+        max_count = 5
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        exits_deque: deque[float] = deque()  # empty — first entry added by guard itself
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_crashloop', max_count, window, now
+        )
+
+        assert tripped is False, 'Guard should not have tripped'
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 0, (
+            f'Expected 0 L2s when guard does not trip; got {l2s}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
 # ---------------------------------------------------------------------------
 
