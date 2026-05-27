@@ -1313,14 +1313,17 @@ class TaskWorkflow:
 
                 break
 
-            # Architect task-rejection artifacts.  Both are terminal — handle
+            # Architect task-rejection artifacts.  All are terminal — handle
             # deterministically before the "no plan.json" failure path so
-            # neither interacts with the consecutive_no_plan_failures cycle
-            # counter.  Order matters: unactionable_task is the most decisive
-            # (jumps straight to L1, bypasses steward); already_done is a
-            # clean DONE; blocking_dependency may re-loop the architect.
+            # none interacts with the consecutive_no_plan_failures cycle
+            # counter.  Order matters: unactionable_task and false_premise are
+            # the most decisive (jump straight to L1, bypass steward);
+            # already_done is a clean DONE; blocking_dependency may re-loop
+            # the architect.
             if self.artifacts.read_unactionable_task() is not None:
                 return await self._handle_unactionable_task_report()
+            if self.artifacts.read_false_premise() is not None:
+                return await self._handle_false_premise_report()
             if self.artifacts.read_already_done() is not None:
                 return await self._handle_already_done_report()
             # Fix B: the architect may have written a blocking_dependency
@@ -1655,6 +1658,8 @@ class TaskWorkflow:
         # handlers work unchanged.
         if self.artifacts.read_unactionable_task() is not None:
             return await self._handle_unactionable_task_report()
+        if self.artifacts.read_false_premise() is not None:
+            return await self._handle_false_premise_report()
         if self.artifacts.read_already_done() is not None:
             return await self._handle_already_done_report()
         if self.artifacts.read_blocking_dependency() is not None:
