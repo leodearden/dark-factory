@@ -1767,3 +1767,108 @@ async def test_collect_scheduler_state_uses_meta_files_for_deep_path(
     assert len(modules) == 1
     assert modules[0]['path'] == 'orchestrator/src'
     assert modules[0]['holder'] == '1'
+
+
+# ---------------------------------------------------------------------------
+# step-1507: tab_scheduler.jsx filters modules by projectFilter
+# ---------------------------------------------------------------------------
+#
+# Regression guard: picking a project must narrow both task rows AND module
+# cards/heatmap columns. The bug (tab_scheduler.jsx:441,447) was passing raw
+# `modules={modules}` to SchedulerHeatmap and ModulesView even when
+# projectFilter was active, leaving all modules visible regardless of filter.
+#
+# No JS test runner exists in this repo (see file-level comment in
+# tab_scheduler.jsx). Following the precedent of
+# test_index_html_references_new_scheduler_jsx_files (line 1277), we assert
+# structural patterns in the JSX source that are exactly the wiring that makes
+# the fix work.
+
+
+def test_tab_scheduler_filters_modules_by_project_filter(client):
+    """tab_scheduler.jsx must derive visibleModules and pass it to both consumer sites.
+
+    Structural regression test (no JS runner available; mirrors the
+    test_index_html_references_new_scheduler_jsx_files pattern):
+
+    1. A `visibleModules` variable is defined (the filter exists).
+    2. SchedulerHeatmap receives `modules={visibleModules}` — not raw `modules={modules}`.
+    3. ModulesView receives `modules={visibleModules}` — not raw `modules={modules}`.
+    4. The visibleModules derivation inspects BOTH `project` AND `holder_project`,
+       enforcing the task-description contract: a module held by a task in the
+       selected project stays visible even when the module's own project differs.
+
+    Fails RED against the unfixed file (no visibleModules, raw modules={modules} at
+    tab_scheduler.jsx:441 and :447).  Passes GREEN after the fix.
+    """
+    import re
+
+    resp = client.get('/static/redux/tab_scheduler.jsx')
+    assert resp.status_code == 200
+    body = resp.text
+
+    # 1. visibleModules variable is defined
+    assert 'visibleModules' in body, (
+        'tab_scheduler.jsx is missing a visibleModules derivation. '
+        'The projectFilter must filter modules just as it filters rows '
+        '(see visibleRows at tab_scheduler.jsx:284). '
+        'Task: Dashboard Scheduler tab project filter must also filter modules/locks.'
+    )
+
+    # 2. SchedulerHeatmap receives modules={visibleModules}
+    # Match the opening tag and its attributes with DOTALL so attributes on
+    # multiple lines are included.
+    heatmap_match = re.search(
+        r'<SchedulerHeatmap\b([^>]*(?:(?!<SchedulerHeatmap)[^>])*?)/>',
+        body,
+        re.DOTALL,
+    )
+    assert heatmap_match is not None, (
+        'Could not locate <SchedulerHeatmap … /> self-closing element in tab_scheduler.jsx'
+    )
+    heatmap_attrs = heatmap_match.group(1)
+    assert 'modules={visibleModules}' in heatmap_attrs, (
+        f'SchedulerHeatmap still receives raw modules={{modules}} instead of '
+        f'modules={{visibleModules}}. Attributes found: {heatmap_attrs!r}. '
+        'Fix: pass visibleModules (the project-filtered list) to SchedulerHeatmap '
+        '(tab_scheduler.jsx:441).'
+    )
+
+    # 3. ModulesView receives modules={visibleModules}
+    modules_view_match = re.search(
+        r'<ModulesView\b([^>]*(?:(?!<ModulesView)[^>])*?)/>',
+        body,
+        re.DOTALL,
+    )
+    assert modules_view_match is not None, (
+        'Could not locate <ModulesView … /> self-closing element in tab_scheduler.jsx'
+    )
+    modules_view_attrs = modules_view_match.group(1)
+    assert 'modules={visibleModules}' in modules_view_attrs, (
+        f'ModulesView still receives raw modules={{modules}} instead of '
+        f'modules={{visibleModules}}. Attributes found: {modules_view_attrs!r}. '
+        'Fix: pass visibleModules (the project-filtered list) to ModulesView '
+        '(tab_scheduler.jsx:447).'
+    )
+
+    # 4. The visibleModules derivation references both project and holder_project.
+    # Extract the const visibleModules = … ; block.
+    defn_match = re.search(
+        r'const\s+visibleModules\s*=\s*([\s\S]+?);',
+        body,
+        re.DOTALL,
+    )
+    assert defn_match is not None, (
+        'Could not extract the visibleModules definition from tab_scheduler.jsx. '
+        'Expected a `const visibleModules = …;` statement.'
+    )
+    defn_text = defn_match.group(1)
+    assert 'project' in defn_text, (
+        f'visibleModules definition does not reference the `project` field: {defn_text!r}'
+    )
+    assert 'holder_project' in defn_text, (
+        f'visibleModules definition does not reference the `holder_project` field. '
+        f'Definition: {defn_text!r}. '
+        'The filter must keep modules held by a task in the selected project visible '
+        '(see task description: "Consider both project and holder_project").'
+    )
