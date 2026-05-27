@@ -98,7 +98,8 @@ def _iter_events(
     since: datetime,
 ) -> Iterable[tuple[str, str, str | None, dict]]:
     """Yield (timestamp, event_type, task_id, data) tuples from runs.db."""
-    conn = sqlite3.connect(str(db_path))
+    # Open read-only to avoid touching -wal/-shm sidecars; mirrors digest.py:242.
+    conn = sqlite3.connect(f'{db_path.resolve().as_uri()}?mode=ro', uri=True)
     try:
         cur = conn.execute(
             'SELECT timestamp, event_type, task_id, data '
