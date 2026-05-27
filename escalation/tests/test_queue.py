@@ -1811,3 +1811,125 @@ class TestAttachDedupeChild:
         assert result.severity == 'blocking'
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
+
+class TestFindPendingL2ByRootCause:
+    """EscalationQueue.find_pending_l2_by_root_cause() locates a pending L2 by root_cause string."""
+
+    def _make_l2(self, queue: EscalationQueue, task_id: str, root_cause: str) -> Escalation:
+        """Submit a pending L2 escalation with the given root_cause."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster test',
+            level=2,
+            root_cause=root_cause,
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_returns_id_of_matching_pending_l2(self, tmp_path: Path):
+        """(a) Returns the id of a pending L2 whose root_cause matches."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result == l2.id
+
+    def test_returns_none_when_no_l2_has_root_cause(self, tmp_path: Path):
+        """(b) Returns None when no L2 has the given root_cause."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Some other root cause')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None
+
+    def test_returns_none_when_only_l0_l1_has_root_cause(self, tmp_path: Path):
+        """(c) Returns None when only an L0 or L1 has the root_cause (level filter)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        # L0 with matching root_cause
+        l0 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='L0 test',
+            level=0,
+            root_cause='Bad merge strategy',
+        )
+        queue.submit(l0)
+        # L1 with matching root_cause
+        l1 = Escalation(
+            id=queue.make_id('task-2'),
+            task_id='task-2',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test',
+            level=1,
+            root_cause='Bad merge strategy',
+        )
+        queue.submit(l1)
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None, f'Expected None (level filter), got {result!r}'
+
+    def test_returns_none_when_matching_l2_is_already_resolved(self, tmp_path: Path):
+        """(d) Returns None when the matching L2 is already resolved (status filter)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+        queue.resolve(l2.id, 'Fixed')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None
+
+    def test_returns_oldest_when_multiple_pending_l2s_share_root_cause(self, tmp_path: Path):
+        """(e) Returns the OLDEST (by timestamp) when multiple pending L2s share root_cause."""
+        import time
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+        time.sleep(0.01)  # ensure distinct timestamps
+        newer = self._make_l2(queue, 'task-2', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result == older.id, (
+            f'Expected oldest id={older.id!r}, got {result!r} (newer={newer.id!r})'
+        )
+
+    def test_returns_none_for_empty_root_cause(self, tmp_path: Path):
+        """(f) Returns None for an empty root_cause (never match)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', '')  # L2 with empty root_cause
+
+        result = queue.find_pending_l2_by_root_cause('')
+
+        assert result is None
+
+    def test_returns_none_for_whitespace_only_root_cause(self, tmp_path: Path):
+        """(f cont.) Returns None for whitespace-only root_cause (never match)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('   ')
+
+        assert result is None
+
+    def test_match_is_whitespace_trim_tolerant(self, tmp_path: Path):
+        """(g) Trailing/leading whitespace in the query is stripped — 'Bad merge' matches 'Bad merge '."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy  ')
+
+        assert result == l2.id, (
+            f'Expected match despite trailing whitespace; got {result!r}'
+        )
+
