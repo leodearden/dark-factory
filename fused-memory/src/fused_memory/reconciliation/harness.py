@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -46,6 +47,11 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
@@ -54,6 +60,31 @@ try:
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
+
+# Recon-wide dedup config: covers all four recon escalation categories.
+# Wider than DedupeConfig.for_recon() (which only covers recon_integrity_issue)
+# because A7b also folds non-finding categories so each DISTINCT recurring message
+# files once — see design_decisions in plan.json for rationale.
+# Set to None when escalation package is not installed; _escalate checks
+# HAS_ESCALATION before using it.
+#
+# Escalation-closure contract (A7b / plans/afk-A7-recon-closure.md):
+#   - The reconciliation harness NEVER calls queue.resolve().
+#   - The watcher session (port 8103) is the sole closer of recon escalations.
+#   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+#   See ReconciliationHarness._escalate() docstring for per-call-site details.
+_RECON_DEDUP_CONFIG = (
+    dataclasses.replace(
+        DedupeConfig.for_recon(),  # type: ignore[possibly-undefined]
+        infra_dedupe_categories=(
+            'recon_integrity_issue',
+            'recon_failure',
+            'recon_stale_run',
+            'recon_backlog_overflow',
+        ),
+    )
+    if HAS_ESCALATION else None
+)
 
 logger = logging.getLogger(__name__)
 
@@ -618,12 +649,46 @@ class ReconciliationHarness:
         run_id: str,
         summary: str,
         detail: str = '',
+        *,
+        finding: dict | None = None,
     ) -> None:
-        """Submit an escalation to the queue (fire-and-forget)."""
+        """Submit an escalation to the queue (fire-and-forget).
+
+        Routing contract (A7b):
+        - The harness NEVER calls queue.resolve() — the escalation-watcher
+          session (port 8103) is the sole closer per plans/afk-A7-recon-closure.md.
+        - Dedup folds only on the way IN, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+        - When finding is not None (a finding dict with category / affected_ids /
+          description), the fingerprint is keyed on finding identity so the same
+          target across N cycles produces exactly one pending escalation.
+        - When finding is None, the fingerprint falls back to a description-only
+          hash of the summary, so identical recurring messages fold while distinct
+          ones stay individually visible.
+        """
         if not HAS_ESCALATION or self._escalation_queue is None:
             return
         try:
             queue = self._escalation_queue
+            if finding is not None:
+                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                    category,
+                    finding.get('category') or '',
+                    [str(a) for a in (finding.get('affected_ids') or [])],
+                    finding.get('description') or '',
+                )
+            else:
+                # No finding in scope: use '' for finding_category (sentinel for
+                # "summary-only, no finding identity") so the description-hash branch
+                # of compute_content_fingerprint is used.  Using '' instead of
+                # re-using escalation_category keeps the identity composition
+                # semantically accurate — the second arg is the finding's own
+                # category, which is absent here.
+                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                    category,
+                    '',
+                    [],
+                    summary,
+                )
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(f'recon-{run_id[:8]}'),
                 task_id=f'recon-{run_id[:8]}',
@@ -632,8 +697,9 @@ class ReconciliationHarness:
                 category=category,
                 summary=summary,
                 detail=detail,
+                dedupe_fingerprint=fingerprint,
             )
-            queue.submit(esc)
+            submit_or_dedupe(queue, esc, _RECON_DEDUP_CONFIG)  # type: ignore[possibly-undefined]
         except Exception as e:
             logger.warning(f'Failed to submit escalation: {e}')
 
@@ -1132,6 +1198,7 @@ class ReconciliationHarness:
                     parent_run_id,
                     f'Non-actionable integrity finding: {finding.get("description", "?")}',
                     detail=json.dumps(finding, default=str),
+                    finding=finding,
                 )
 
             if not actionable:
@@ -1275,6 +1342,7 @@ class ReconciliationHarness:
                         run_id,
                         f'Unresolved after remediation: {finding.get("description", "?")}',
                         detail=json.dumps(finding, default=str),
+                        finding=finding,
                     )
 
             logger.info(

@@ -7,11 +7,15 @@ Covers:
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
+- A7b: harness._escalate fingerprint stamping and dedup routing
+  (TestReconEscalationDedup)
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -170,4 +174,511 @@ class TestStage2PromptMandatesUniquenessToken:
         assert 'uniqueness_token' in result, (
             "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
             "(guards against the per-cycle summary uniqueness section being dropped)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# A7b: harness._escalate fingerprint stamping + dedup routing
+# ---------------------------------------------------------------------------
+
+
+def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
+    """Build a minimal ReconciliationHarness wired to a real EscalationQueue.
+
+    Uses mocked memory/journal/event_buffer so _escalate can be exercised
+    without any I/O other than the queue filesystem writes under tmp_path.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            judge_enabled=False,  # no Judge; avoids needing real journal for Judge.init
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+    harness = ReconciliationHarness(
+        memory_service=AsyncMock(),
+        taskmaster=None,
+        journal=MagicMock(),
+        event_buffer=MagicMock(),
+        config=config,
+        known_projects={},
+    )
+    queue_dir = tmp_path / queue_subdir
+    harness._escalation_queue = EscalationQueue(queue_dir)
+    return harness, queue_dir
+
+
+class TestReconEscalationDedup:
+    """A7b: harness._escalate stamps dedupe_fingerprint and routes through submit_or_dedupe."""
+
+    # ── Step 1: fingerprint stamping ────────────────────────────────────
+
+    def test_escalate_stamps_finding_fingerprint(self, tmp_path):
+        """_escalate with finding= kwarg stamps dedupe_fingerprint on the Escalation.
+
+        RED before impl: _escalate has no finding param and never sets dedupe_fingerprint.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'missing_knowledge',
+            'affected_ids': ['452'],
+            'description': 'Task 452 lacks completion summary',
+            'actionable': False,
+            'severity': 'minor',
+        }
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='abcd1234',
+            summary='Non-actionable integrity finding: missing knowledge for task 452',
+            detail='...',
+            finding=finding,
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 pending file, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue',
+            'missing_knowledge',
+            ['452'],
+            'Task 452 lacks completion summary',
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f"dedupe_fingerprint mismatch: got {data.get('dedupe_fingerprint')!r}, "
+            f"expected {expected_fp!r}"
+        )
+
+    # ── Step 3: dedup folding on recurrence ─────────────────────────────
+
+    def test_recurring_finding_folds_into_one_parent(self, tmp_path):
+        """Calling _escalate 3x with the same finding produces 1 file with dedupe_count==2.
+
+        RED before impl: queue.submit() does not fold duplicates, so 3 files are created.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'missing_knowledge',
+            'affected_ids': ['452'],
+            'description': 'Task 452 lacks completion summary',
+        }
+
+        for _ in range(3):
+            harness._escalate(
+                'recon_integrity_issue',
+                run_id='aaaa0001',
+                summary='Non-actionable integrity finding: missing knowledge for task 452',
+                finding=finding,
+            )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Expected 1 pending file (deduped), got {len(files)}'
+        )
+
+        data = json.loads(files[0].read_text())
+        assert data['dedupe_count'] == 2, (
+            f"Expected dedupe_count==2 (2 children folded), got {data['dedupe_count']}"
+        )
+
+    def test_distinct_findings_stay_distinct(self, tmp_path):
+        """Two calls with DIFFERENT affected_ids produce 2 separate files (not folded).
+
+        Remains GREEN after impl: distinct fingerprints → no dedup parent → 2 submits.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='bbbb0001',
+            summary='Non-actionable integrity finding: missing knowledge for task 452',
+            finding={
+                'category': 'missing_knowledge',
+                'affected_ids': ['452'],
+                'description': 'Task 452 lacks completion summary',
+            },
+        )
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='bbbb0002',
+            summary='Non-actionable integrity finding: missing knowledge for task 361',
+            finding={
+                'category': 'missing_knowledge',
+                'affected_ids': ['361'],
+                'description': 'Task 361 lacks completion summary',
+            },
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, (
+            f'Expected 2 distinct pending files, got {len(files)}'
+        )
+
+    # ── Step 5: non-finding categories fold on summary ──────────────────
+
+    @pytest.mark.parametrize('category', [
+        # Three non-finding-only categories plus recon_integrity_issue (which has
+        # finding-aware paths but also except-arm paths called WITHOUT a finding,
+        # e.g. "Remediation orchestration failed" and "Remediation pass failed").
+        # All four must fold on summary when finding=None.
+        'recon_failure',
+        'recon_stale_run',
+        'recon_backlog_overflow',
+        'recon_integrity_issue',
+    ])
+    def test_non_finding_categories_dedup_on_summary(self, tmp_path, category):
+        """Non-finding recon categories fold identical summaries and keep distinct ones.
+
+        Two calls with the same summary → 1 file with dedupe_count==1.
+        One more call with a different summary → 2 files total.
+
+        Verifies that _RECON_DEDUP_CONFIG covers all four recon categories and
+        the summary-fallback branch in _escalate is wired correctly.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        repeated_summary = 'Stage memory_consolidator failed: timeout'
+
+        # Two identical summary calls → should fold to 1 parent
+        harness._escalate(category, run_id='aaaa1111', summary=repeated_summary, detail='')
+        harness._escalate(category, run_id='aaaa1112', summary=repeated_summary, detail='')
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'[{category}] Expected 1 pending file after 2 identical-summary calls, '
+            f'got {len(files)}'
+        )
+        data = json.loads(files[0].read_text())
+        assert data['dedupe_count'] == 1, (
+            f'[{category}] Expected dedupe_count==1, got {data["dedupe_count"]}'
+        )
+
+        # A third call with a DIFFERENT summary → should stay distinct (2 files)
+        harness._escalate(
+            category, run_id='aaaa1113',
+            summary='Stage task_knowledge_sync failed: timeout',
+            detail='',
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, (
+            f'[{category}] Expected 2 pending files after distinct-summary call, '
+            f'got {len(files)}'
+        )
+
+    # ── Step 7: call-site threading in _maybe_remediate / _run_remediation_pass ─
+
+    @pytest.mark.asyncio
+    async def test_maybe_remediate_passes_finding_to_escalate(self, tmp_path):
+        """_maybe_remediate non-actionable loop uses finding-based fingerprint.
+
+        RED before impl: _maybe_remediate calls _escalate without finding=, so the
+        fingerprint is a summary hash instead of the per-target finding hash.
+        """
+        from datetime import UTC, datetime
+
+        from escalation.dedupe import compute_content_fingerprint
+
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'memory_stale',
+            'affected_ids': ['m1'],
+            'description': 'd1',
+            'actionable': False,
+            'severity': 'minor',
+        }
+        parent_run = ReconciliationRun(
+            id='parent-run-id',
+            project_id='test_project',
+            run_type=RunType.full,
+            trigger_reason='buffer',
+            started_at=datetime.now(UTC),
+            events_processed=0,
+            status=RunStatus.running,
+            stage_reports={'integrity_check': {'items_flagged': [finding]}},
+        )
+
+        await harness._maybe_remediate(
+            'test_project', 'parent-run-id', parent_run,
+            TierConfig(), project_root='/tmp/x',
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 pending file, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'memory_stale', ['m1'], 'd1'
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f'Expected finding-based fingerprint {expected_fp!r}, '
+            f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
+        )
+
+    # ── Step 9: regression guard — harness never resolves its own escalations ──
+
+    def test_harness_never_resolves_its_own_escalations(self, tmp_path):
+        """Harness must never call EscalationQueue.resolve() — watcher is sole closer.
+
+        Pins the watcher-is-sole-closer contract from plans/afk-A7-recon-closure.md.
+        Already-passing behaviourally; exists as a regression guard so any future
+        accidental resolve() call in _escalate is caught immediately.
+        """
+        from unittest.mock import patch
+
+        from escalation.queue import EscalationQueue
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        sentinel_called = []
+
+        def _never_resolve(*args, **kwargs):
+            sentinel_called.append(('resolve', args, kwargs))
+            raise AssertionError(
+                'ReconciliationHarness must never call EscalationQueue.resolve() — '
+                'the escalation-watcher session is the sole closer '
+                '(plans/afk-A7-recon-closure.md)'
+            )
+
+        with patch.object(EscalationQueue, 'resolve', side_effect=_never_resolve):
+            # Simulate all four _escalate categories used by the harness:
+            # (a) recon_stale_run — _recover_stale_runs path
+            harness._escalate('recon_stale_run', 'run1111', 'Run stale (>300s), recovered')
+            # (b) recon_failure — run_full_cycle except arm
+            harness._escalate('recon_failure', 'run2222', 'Stage s1 failed: timeout')
+            # (c) recon_integrity_issue with finding — _maybe_remediate non-actionable loop
+            harness._escalate(
+                'recon_integrity_issue', 'run3333',
+                'Non-actionable integrity finding: task 452 stale',
+                finding={'category': 'knowledge_stale', 'affected_ids': ['452'], 'description': 'x'},
+            )
+            # (d) recon_integrity_issue without finding — _maybe_remediate except arm
+            harness._escalate('recon_integrity_issue', 'run4444', 'Remediation orchestration failed: err')
+            # (e) recon_backlog_overflow — BacklogIterator except arm
+            harness._escalate('recon_backlog_overflow', 'run5555', 'Backlog chunk 1 failed: oom')
+
+        # resolve must never have been invoked
+        assert sentinel_called == [], (
+            f'EscalationQueue.resolve() was unexpectedly called: {sentinel_called}'
+        )
+
+        # All submitted escalations must still be pending (not resolved/archived)
+        files = list(queue_dir.glob('esc-*.json'))
+        assert files, 'Expected at least one pending escalation after all _escalate calls'
+        for f in files:
+            data = json.loads(f.read_text())
+            assert data['status'] == 'pending', (
+                f'{f.name}: expected status=pending, got {data["status"]!r}'
+            )
+
+    # ── Amendment 3: severity promotion on fold ─────────────────────────
+
+    def test_severity_promoted_to_max_on_fold(self, tmp_path):
+        """Folding a 'blocking' child into an 'info' parent promotes parent severity.
+
+        Documents the attach_dedupe_child / _max_severity contract so that any
+        future refactor that breaks severity promotion is caught immediately.
+        The watcher (port 8103) reads parent.severity for triage — a blocking
+        recurrence must remain visible even if the parent was filed at 'info'.
+
+        Note: _escalate maps recon_integrity_issue → 'info' and recon_failure →
+        'blocking' consistently, so different severities for the same fingerprint
+        cannot arise via _escalate alone (same category ⇒ same fingerprint ⇒
+        same severity slot).  This test exercises the promotion path directly via
+        submit_or_dedupe so the _max_severity contract is pinned regardless of
+        how _escalate's severity mapping may evolve.
+        """
+        from escalation.dedupe import (
+            DedupeConfig,
+            compute_content_fingerprint,
+            content_fingerprint_key,
+            submit_or_dedupe,
+        )
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue_dir = tmp_path / 'sev_test'
+        queue = EscalationQueue(queue_dir)
+        cfg = DedupeConfig(
+            infra_dedupe_enabled=True,
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('test_sev_category',),
+            key_fn=content_fingerprint_key,
+        )
+        fp = compute_content_fingerprint('test_sev_category', 'stale_k', ['t1'], '')
+
+        # First submission: 'info' severity → becomes the parent.
+        esc1 = Escalation(
+            id=queue.make_id('sev-parent'),
+            task_id='sev-parent',
+            agent_role='test',
+            severity='info',
+            category='test_sev_category',
+            summary='stale_k for t1',
+            dedupe_fingerprint=fp,
+        )
+        submit_or_dedupe(queue, esc1, cfg)
+
+        # Second submission: 'blocking' severity → folds into parent, promoting severity.
+        esc2 = Escalation(
+            id=queue.make_id('sev-child'),
+            task_id='sev-child',
+            agent_role='test',
+            severity='blocking',
+            category='test_sev_category',
+            summary='stale_k for t1',
+            dedupe_fingerprint=fp,
+        )
+        submit_or_dedupe(queue, esc2, cfg)
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 file (folded), got {len(files)}'
+        data = json.loads(files[0].read_text())
+        assert data['severity'] == 'blocking', (
+            f'Expected severity promoted to "blocking", got {data["severity"]!r}. '
+            'attach_dedupe_child must call _max_severity() so the parent always '
+            'reflects the highest-urgency signal across all folded occurrences.'
+        )
+        assert data['dedupe_count'] == 1, (
+            f'Expected dedupe_count==1 (one child folded), got {data["dedupe_count"]}'
+        )
+
+    # ── Amendment 4: producer/consumer contract for fingerprint key ──────
+
+    def test_content_fingerprint_key_matches_dedupe_fingerprint(self, tmp_path):
+        """content_fingerprint_key(esc) == esc.dedupe_fingerprint — producer/consumer contract.
+
+        Guards against future divergence where the watcher re-hashes independently
+        and starts treating the same finding as distinct (causing dedupe_count to
+        rise while separate files reopen for the same finding).
+
+        The watcher uses content_fingerprint_key to find the dedup parent.
+        The harness stamps esc.dedupe_fingerprint via compute_content_fingerprint.
+        Both must agree on identity — this test pins that invariant end-to-end
+        by reading a real escalation off disk and asserting the key function
+        returns its stored fingerprint.
+        """
+        from escalation.dedupe import (
+            compute_content_fingerprint,
+            content_fingerprint_key,
+        )
+        from escalation.models import Escalation
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='contract-run',
+            summary='Contract test finding',
+            finding={
+                'category': 'contract_cat',
+                'affected_ids': ['id1'],
+                'description': 'desc contract',
+            },
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1
+        esc = Escalation.from_json(files[0].read_text())
+
+        # The key the watcher uses must equal the producer-stamped fingerprint.
+        assert content_fingerprint_key(esc) == esc.dedupe_fingerprint, (
+            'content_fingerprint_key(esc) diverges from esc.dedupe_fingerprint — '
+            'producer (harness._escalate) and consumer (watcher find_dedupe_parent) '
+            'use different identity paths, which would cause dedup to silently break.'
+        )
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'contract_cat', ['id1'], 'desc contract',
+        )
+        assert esc.dedupe_fingerprint == expected_fp, (
+            f'Fingerprint mismatch: stored {esc.dedupe_fingerprint!r}, '
+            f'expected {expected_fp!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_residue_passes_finding_to_escalate(self, tmp_path):
+        """_run_remediation_pass residue loop uses finding-based fingerprint.
+
+        RED before impl: _run_remediation_pass calls _escalate without finding=, so
+        the fingerprint is summary-based rather than keyed on the finding identity.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+
+        from escalation.dedupe import compute_content_fingerprint
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+        # Override journal with AsyncMock so start_run/complete_run/etc. are awaitable
+        harness.journal = AM()
+        harness.journal.get_watermark = AM(return_value=None)
+        harness.journal.write_journal = AM()
+        # Make instance_id a plain string (ReconciliationRun expects str | None)
+        harness.buffer.instance_id = 'test-instance'
+
+        residue_finding = {
+            'category': 'knowledge_stale',
+            'affected_ids': ['t99'],
+            'description': 'Task 99 stale after remediation',
+        }
+        now = datetime.now(UTC)
+
+        # Use real stage instances (to pass isinstance checks in _run_remediation_pass)
+        # with their run() methods patched to return quickly.
+        stages = harness._make_stages()
+        stages[0].run = AM(return_value=StageReport(
+            stage=StageId.memory_consolidator, started_at=now, completed_at=now,
+        ))
+        stages[1].run = AM(return_value=StageReport(
+            stage=StageId.task_knowledge_sync, started_at=now, completed_at=now,
+        ))
+        stages[2].run = AM(return_value=StageReport(
+            stage=StageId.integrity_check, started_at=now, completed_at=now,
+            items_flagged=[residue_finding],
+        ))
+        harness._make_stages = lambda: stages
+
+        await harness._run_remediation_pass(
+            'test_project', 'parent-run-id',
+            findings=[{
+                'category': 'missing_knowledge', 'affected_ids': ['t1'],
+                'description': 'trigger finding', 'actionable': True,
+            }],
+            tier=TierConfig(),
+            project_root='/tmp/x',
+            filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 residue escalation, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'knowledge_stale', ['t99'],
+            'Task 99 stale after remediation',
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f'Expected finding-based fingerprint {expected_fp!r}, '
+            f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
         )
