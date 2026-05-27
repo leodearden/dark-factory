@@ -354,8 +354,18 @@ def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
     assert result == {"x": [{"k": 1}, {"k": 1}]}
 
 
-def test_merge_metadata_type_mismatch_old_wins():
-    """Type mismatch (old=list, new=dict) resolves to OLD wins under append=True."""
+def test_merge_metadata_type_mismatch_old_wins_for_non_hint_keys():
+    """Type mismatch (old=list, new=dict) resolves to OLD wins for arbitrary keys.
+
+    This audit-field-protection rule is intentional for generic keys (e.g. ``x``,
+    ``done_provenance``) where a malformed/unexpected write should not be allowed
+    to overwrite a structured value.
+
+    Note: ``memory_hints`` is the only key that receives special treatment — it is
+    normalised from legacy list-of-dicts shape to canonical dict shape before
+    _merge_values runs, so the dict-vs-dict recursive union path handles the merge
+    instead.  See test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict.
+    """
     old_raw = '{"x":[1,2]}'
     new_raw = '{"x":{"a":1}}'
     result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
