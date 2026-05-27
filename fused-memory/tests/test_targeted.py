@@ -1457,8 +1457,9 @@ class TestSweepCancelledDescendants:
             NO descendant_skipped_co_cancelled action.  Guards against
             over-suppression.
         """
-        from fused_memory.reconciliation import targeted
         from escalation.models import Escalation
+
+        from fused_memory.reconciliation import targeted
 
         project_root = str(tmp_path)
 
@@ -1545,8 +1546,9 @@ class TestSweepCancelledDescendants:
         blocking scope_violation L1 file.  No descendant_skipped_co_cancelled
         action must appear — the guard never suppresses on a re-check failure.
         """
-        from fused_memory.reconciliation import targeted
         from escalation.models import Escalation
+
+        from fused_memory.reconciliation import targeted
 
         monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: True)
 
