@@ -3111,6 +3111,71 @@ class TestMarkBlockedFalseDoneGuard:
             f'got kwargs={kwargs!r}'
         )
 
+    async def test_transient_infra_routes_to_l1_as_infra_issue(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """A merge outcome with the transient-infra (ENOSPC) reason prefix
+        must skip the steward and submit a human-facing L1 tagged
+        ``infra_issue`` — the merge worker already pruned + retried, and the
+        steward can't free disk.  The infra_issue category lets the
+        escalation-watcher auto-resolve once the disk recovers.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from orchestrator.merge_queue import (
+            TRANSIENT_INFRA_REASON_PREFIX,
+            MergeOutcome,
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        spy_mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
+
+        async def _fake_enqueue(_queue, request, _event_store):
+            request.result.set_result(MergeOutcome(
+                'blocked',
+                reason=(
+                    f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify still '
+                    f'reports no space left on device after pruning stale '
+                    f'merge worktrees and retrying. disk full'
+                ),
+            ))
+
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            outcome = await workflow._submit_to_merge_queue(
+                task_assignment.task_id, pre_rebased=False, merge_phase=True,
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED, got {outcome!r}'
+        )
+        spy_mark_blocked.assert_awaited_once()
+        assert spy_mark_blocked.await_args is not None
+        _args, kwargs = spy_mark_blocked.await_args
+        assert kwargs.get('escalate_to_human') is True, (
+            'transient_infra must call _mark_blocked(escalate_to_human=True); '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('category') == 'infra_issue', (
+            'transient_infra must tag the escalation infra_issue; '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('merge_phase') is True, (
+            f'merge_phase must be threaded through; got kwargs={kwargs!r}'
+        )
+
     async def test_l1_dedupe_when_already_open(
         self, config, git_ops, task_assignment, tmp_path
     ):

@@ -1088,6 +1088,70 @@ class GitOps:
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
 
+    async def prune_stale_merge_worktrees(
+        self, keep: Path | None = None,
+    ) -> list[str]:
+        """Force-remove leftover ``_merge-*`` worktrees; return paths removed.
+
+        Disk-pressure recovery helper.  A crashed or abandoned merge can leave
+        ``_merge-<id>`` worktrees behind under ``worktree_base``, each holding
+        a full checkout — dead weight that contributes to ENOSPC.  This
+        force-removes every such *registered* worktree EXCEPT *keep* (the merge
+        worktree currently in use), then runs ``git worktree prune`` to clear
+        stale admin entries.
+
+        NEVER touches task worktrees (``worktree_base/<task_id>``) — those hold
+        live builds.  Only paths that are direct children of ``worktree_base``
+        AND whose name starts with ``_merge-`` are eligible, so a task whose id
+        happens to start with ``_merge`` cannot be caught (task ids are not
+        prefixed that way).  Enumerates via ``git worktree list --porcelain``
+        rather than globbing the filesystem, so a half-created directory git
+        doesn't track is never removed.
+        """
+        removed: list[str] = []
+        keep_resolved = keep.resolve() if keep else None
+
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return removed
+
+        for line in out.splitlines():
+            if not line.startswith('worktree '):
+                continue
+            wt_path = Path(line[len('worktree '):].strip())
+            try:
+                wt_resolved = wt_path.resolve()
+            except OSError:
+                wt_resolved = wt_path
+            if wt_resolved.parent != self.worktree_base:
+                continue
+            if not wt_resolved.name.startswith('_merge-'):
+                continue
+            if keep_resolved is not None and wt_resolved == keep_resolved:
+                continue
+            rc_rm, _, err = await _run(
+                ['git', 'worktree', 'remove', '--force', str(wt_path)],
+                cwd=self.project_root,
+            )
+            if rc_rm == 0:
+                removed.append(str(wt_path))
+            else:
+                logger.warning(
+                    'prune_stale_merge_worktrees: failed to remove %s: %s',
+                    wt_path, err.strip(),
+                )
+
+        if removed:
+            await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+            logger.info(
+                'prune_stale_merge_worktrees: removed %d stale merge '
+                'worktree(s)', len(removed),
+            )
+        return removed
+
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #
     # Once the merge queue (task 292) is stable and we have metrics on

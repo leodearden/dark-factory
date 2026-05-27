@@ -18,6 +18,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
     MergeOutcome,
@@ -28,7 +29,9 @@ from orchestrator.merge_queue import (
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
+    _verify_hit_enospc,
 )
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -4766,3 +4769,173 @@ async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_c
     assert outcome.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
         f'unexpected reason: {outcome.reason!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# A2: transient-ENOSPC detection, pruning, and prune-and-retry
+# ---------------------------------------------------------------------------
+
+
+def _enospc_verify_result() -> VerifyResult:
+    """A failed VerifyResult whose captured output bears an ENOSPC signature."""
+    return VerifyResult(
+        passed=False,
+        test_output='E   OSError: [Errno 28] No space left on device',
+        lint_output='',
+        type_output='',
+        summary='disk full',
+    )
+
+
+class TestVerifyHitEnospc:
+    """Unit tests for the _verify_hit_enospc string-match detector."""
+
+    def test_detects_no_space_left_phrase(self):
+        assert _verify_hit_enospc(_enospc_verify_result()) is True
+
+    def test_detects_os_error_28_in_lint_output(self):
+        v = VerifyResult(
+            passed=False, test_output='', lint_output='build: os error 28',
+            type_output='', summary='',
+        )
+        assert _verify_hit_enospc(v) is True
+
+    def test_detects_bare_enospc_token_in_type_output(self):
+        v = VerifyResult(
+            passed=False, test_output='', lint_output='',
+            type_output='write failed: ENOSPC', summary='',
+        )
+        assert _verify_hit_enospc(v) is True
+
+    def test_ordinary_test_failure_is_not_enospc(self):
+        v = VerifyResult(
+            passed=False, test_output='2 failed, 3 passed',
+            lint_output='', type_output='', summary='tests failed',
+        )
+        assert _verify_hit_enospc(v) is False
+
+    def test_non_string_outputs_are_skipped_without_raising(self):
+        # A bare MagicMock (the shape several existing verify tests use) must
+        # not raise — non-string attributes are filtered out, yielding False.
+        assert _verify_hit_enospc(
+            MagicMock(passed=False, summary='tests failed'),
+        ) is False
+
+
+@pytest.mark.asyncio
+class TestPruneStaleMergeWorktrees:
+    """GitOps.prune_stale_merge_worktrees removes _merge-* worktrees only."""
+
+    async def test_prunes_stale_keeps_active_and_never_touches_tasks(
+        self, git_ops: GitOps,
+    ):
+        keep_wt, _ = await git_ops._create_merge_worktree()
+        stale_a, _ = await git_ops._create_merge_worktree()
+        stale_b, _ = await git_ops._create_merge_worktree()
+        # A live task worktree must never be touched.
+        task_wt = (await git_ops.create_worktree('live-task')).path
+
+        removed = await git_ops.prune_stale_merge_worktrees(keep=keep_wt)
+
+        assert len(removed) == 2
+        assert not stale_a.exists()
+        assert not stale_b.exists()
+        assert keep_wt.exists()  # the active merge wt survives
+        assert task_wt.exists()  # task worktrees are never pruned
+
+    async def test_prune_with_no_keep_removes_all_merge_worktrees(
+        self, git_ops: GitOps,
+    ):
+        a, _ = await git_ops._create_merge_worktree()
+        b, _ = await git_ops._create_merge_worktree()
+        task_wt = (await git_ops.create_worktree('keepme')).path
+
+        removed = await git_ops.prune_stale_merge_worktrees(keep=None)
+
+        assert len(removed) == 2
+        assert not a.exists()
+        assert not b.exists()
+        assert task_wt.exists()
+
+
+@pytest.mark.asyncio
+class TestEnospcTransientInfraRetry:
+    """SpeculativeMergeWorker prunes + retries once on ENOSPC, then escalates
+    as transient infra if it persists."""
+
+    async def test_persistent_enospc_prunes_retries_once_then_blocks(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'enospc-task', 'enospc.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Verify always reports ENOSPC → worker should retry exactly once.
+        mock_verify = AsyncMock(return_value=_enospc_verify_result())
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=['/x/_merge-stale']),
+            ) as mock_prune,
+        ):
+            req = _make_request('enospc-task', 'enospc-task', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {outcome.reason!r}'
+        )
+        # Verify ran twice (initial + one prune-and-retry); prune ran once.
+        assert mock_verify.call_count == 2
+        assert mock_prune.call_count == 1
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_enospc_then_pass_on_retry_completes_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """If the post-prune retry passes, the merge proceeds to 'done' and
+        no transient-infra escalation is raised."""
+        wt = await _make_branch_with_file(
+            git_ops, 'enospc-heals', 'heals.py', 'y = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # First verify hits ENOSPC; the retry (after prune) passes.
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        mock_verify = AsyncMock(
+            side_effect=[_enospc_verify_result(), passing],
+        )
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=[]),
+            ) as mock_prune,
+        ):
+            req = _make_request('enospc-heals', 'enospc-heals', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        assert mock_verify.call_count == 2
+        assert mock_prune.call_count == 1
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task

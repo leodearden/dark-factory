@@ -3519,6 +3519,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -3538,6 +3539,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 result.reason,
                 merge_phase=merge_phase,
                 escalate_to_human=True,
+            )
+        # Transient-infra short-circuit: the merge worker already pruned stale
+        # merge worktrees and retried the verify, and it still hit ENOSPC.  Go
+        # straight to a human-facing L1 tagged ``infra_issue`` (not the
+        # steward — it can't free disk).  The durable ref + infra_issue
+        # category let the escalation-watcher auto-resolve if the disk has
+        # recovered by read-time.
+        if result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX):
+            self._write_merge_failure_review('transient_infra', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='infra_issue',
             )
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
