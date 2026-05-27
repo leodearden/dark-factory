@@ -747,3 +747,158 @@ class TestPromoteToL2Dedup:
             f"Expected 'created' (resolved L2 should not block new one): {second}"
         )
         assert second['id'] != first['id'], 'New L2 must have a different id'
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2Cascade: end-to-end integration through MCP tools
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2Cascade:
+    """End-to-end: promote_to_l2 + resolve_issue (via MCP tools) cascades to members.
+
+    Verification strategy:
+    - Seed L1 escalations via queue.submit() directly (bypasses MCP, mirrors _seed_esc helper).
+    - Call promote_to_l2 via MCP tool to file an L2 referencing both.
+    - Verify L1s remain pending at L1 after promote_to_l2 (members stay at L1).
+    - Call resolve_issue on the L2 via MCP tool.
+    - Verify members are now resolved with the cascade attribution.
+    """
+
+    def _seed_l1(self, queue: EscalationQueue, esc_id: str, task_id: str) -> Escalation:
+        """Seed a pending L1 escalation directly via queue.submit()."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 cluster member',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_members_stay_pending_after_promote(self, tmp_path: Path):
+        """(c) After promote_to_l2, L1 members remain pending — not pulled to L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        m1 = self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        m2 = self._seed_l1(queue, 'esc-l1-2', 'task-2')
+
+        await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
+        )
+
+        # Both L1s must still be pending
+        tool = await server.get_tool('get_pending_escalations')
+        pending_l1 = [e for e in tool.fn(level=1) if e['id'] in {'esc-l1-1', 'esc-l1-2'}]
+        assert len(pending_l1) == 2, (
+            f'Expected both L1s still pending, got {[e["id"] for e in pending_l1]}'
+        )
+        for e in pending_l1:
+            assert e['status'] == 'pending', f'Expected pending, got {e["status"]!r}'
+
+    @pytest.mark.asyncio
+    async def test_resolve_l2_cascades_to_members_via_mcp(self, tmp_path: Path):
+        """(d) resolve_issue on the L2 cascades resolution to members."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        self._seed_l1(queue, 'esc-l1-2', 'task-2')
+
+        l2_result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
+        )
+        l2_id = l2_result['id']
+
+        # Resolve the L2 via MCP tool
+        resolve_tool = await server.get_tool('resolve_issue')
+        resolve_result = resolve_tool.fn(escalation_id=l2_id, resolution='Root cause fixed')
+
+        assert resolve_result.get('status') == 'resolved', (
+            f'Expected L2 resolved, got: {resolve_result}'
+        )
+
+        # Members must now be resolved
+        m1 = queue.get('esc-l1-1')
+        m2 = queue.get('esc-l1-2')
+        assert m1 is not None
+        assert m2 is not None
+        assert m1.status == 'resolved', f'Expected m1 resolved, got {m1.status!r}'
+        assert m2.status == 'resolved', f'Expected m2 resolved, got {m2.status!r}'
+
+    @pytest.mark.asyncio
+    async def test_cascade_preserves_resolution_text_in_members(self, tmp_path: Path):
+        """(d cont.) Cascaded members have the same resolution text as the L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        l2_result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+
+        resolve_tool = await server.get_tool('resolve_issue')
+        resolve_tool.fn(escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
+
+        m1 = queue.get('esc-l1-1')
+        assert m1 is not None
+        assert m1.resolution == 'Fix confirmed in prod', (
+            f"Expected resolution text propagated to member, got {m1.resolution!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cascade_sets_resolved_by_audit_attribution(self, tmp_path: Path):
+        """(e) Members carry resolved_by='l2-cascade:{l2_id}' for audit attribution."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        l2_result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        l2_id = l2_result['id']
+
+        resolve_tool = await server.get_tool('resolve_issue')
+        resolve_tool.fn(escalation_id=l2_id, resolution='Fixed')
+
+        m1 = queue.get('esc-l1-1')
+        assert m1 is not None
+        assert m1.resolved_by == f'l2-cascade:{l2_id}', (
+            f"Expected l2-cascade attribution, got {m1.resolved_by!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dismiss_l2_cascades_dismiss_to_members(self, tmp_path: Path):
+        """(f) Dismiss the L2 (terminate=True) → members are dismissed."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        self._seed_l1(queue, 'esc-l1-2', 'task-2')
+        l2_result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
+        )
+
+        resolve_tool = await server.get_tool('resolve_issue')
+        resolve_tool.fn(
+            escalation_id=l2_result['id'],
+            resolution='Not actionable',
+            terminate=True,
+        )
+
+        m1 = queue.get('esc-l1-1')
+        m2 = queue.get('esc-l1-2')
+        assert m1 is not None
+        assert m2 is not None
+        assert m1.status == 'dismissed', f'Expected m1 dismissed, got {m1.status!r}'
+        assert m2.status == 'dismissed', f'Expected m2 dismissed, got {m2.status!r}'
