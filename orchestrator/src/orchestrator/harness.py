@@ -1966,6 +1966,68 @@ Output JSON matching the schema. Every task must appear in the output.
         except Exception:
             logger.warning('Failed to file scheduler-pause escalation', exc_info=True)
 
+    # Synthetic task_id sentinel and root_cause key for watcher-outage L2
+    # escalations.  One canonical root_cause keys all watcher-outage L2s
+    # regardless of trip reason (crashloop / misconfigured / cost-ceiling /
+    # disabled) — the dedup contract from plans/escalation-l2-tiering.md.
+    _WATCHER_OUTAGE_SENTINEL: str = '__watcher_supervisor__'
+    _WATCHER_OUTAGE_ROOT_CAUSE: str = 'watcher_supervisor_down'
+
+    def _file_watcher_outage_l2(self, reason: str) -> None:
+        """File an L2 outage escalation when the watcher subsystem is not running.
+
+        Mirrors _file_scheduler_pause_escalation (L1 helper) but targets the
+        human L2 stream because a watcher outage means no-one is handling L1s.
+
+        Dedup: find_pending_l2_by_root_cause(root_cause) returns early when an
+        open L2 with the same root_cause already exists, so multiple trips
+        (e.g. crashloop + cost-ceiling simultaneously) file exactly one L2.
+
+        Best-effort: a missing queue (bare-Harness tests) or any filing failure
+        is swallowed so this never breaks the supervisor / cost-ceiling /
+        startup paths.
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.find_pending_l2_by_root_cause(
+                self._WATCHER_OUTAGE_ROOT_CAUSE
+            ) is not None:
+                return                         # dedup: one open L2 at a time
+            from escalation.models import Escalation
+            n_l1 = len([
+                e for e in self._escalation_queue.get_pending() if e.level == 1
+            ])
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._WATCHER_OUTAGE_SENTINEL),
+                task_id=self._WATCHER_OUTAGE_SENTINEL,
+                agent_role='orchestrator-watcher-supervisor',
+                severity='urgent',
+                category='infra_issue',
+                level=2,
+                root_cause=self._WATCHER_OUTAGE_ROOT_CAUSE,
+                summary=(
+                    f'escalation-watcher-auto down ({reason}); {n_l1} L1 pending'
+                )[:200],
+                detail=(
+                    'The escalation-watcher-auto supervisor is not running or has '
+                    'been paused.  No autonomous L1 triage is taking place.\n\n'
+                    f'Reason: {reason}\n'
+                    f'Pending L1 escalations: {n_l1}\n\n'
+                    'Investigate the reason, fix the underlying issue, and restart '
+                    'the orchestrator (or re-enable the watcher supervisor) to resume '
+                    'autonomous triage.'
+                ),
+                suggested_action='investigate_watcher_supervisor',
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning(
+                'Filed L2 watcher-outage escalation %s (reason=%s, n_l1=%d)',
+                esc.id, reason, n_l1,
+            )
+        except Exception:
+            logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
+
     def _file_restored_pause_escalation(self) -> None:
         """File the L1 for a pause restored from a prior run (deferred from run()).
 
