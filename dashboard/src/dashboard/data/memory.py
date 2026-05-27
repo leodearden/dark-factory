@@ -186,22 +186,38 @@ async def mcp_tool_call(
     return await session.call_tool(client, tool_name, arguments)
 
 
+async def _first_success(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    tool_name: str,
+    args: dict,
+    log_label: str,
+) -> dict:
+    """Call an MCP tool on each configured URL; return the first success.
+
+    On all-fail returns ``{'offline': True, 'error': '; '.join(errors)}``.
+    This is correct for singleton-per-instance tools (e.g. ``get_status``,
+    ``get_curator_state``); aggregating helpers (``get_queue_stats``,
+    ``get_wal_status``) handle their own per-URL loops.
+    """
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            return await mcp_tool_call(client, url, tool_name, args)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('%s failed for %s: %s', log_label, url, e)
+            errors.append(f'{url}: {e}')
+            invalidate_session(url)
+    return {'offline': True, 'error': '; '.join(errors)}
+
+
 async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
     """Fetch memory subsystem status, trying each configured URL.
 
     Returns the first successful status dict, or {offline: True, error: ...}.
     """
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            return await mcp_tool_call(client, url, 'get_status', {})
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('get_status failed for %s: %s', url, e)
-            errors.append(f'{url}: {e}')
-            # Invalidate stale session so next poll retries init
-            invalidate_session(url)
-    return {'offline': True, 'error': '; '.join(errors)}
+    return await _first_success(client, config, 'get_status', {}, 'get_status')
 
 
 async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
@@ -277,13 +293,6 @@ async def get_curator_state(client: httpx.AsyncClient, config: DashboardConfig) 
       ``{'paused': bool, 'paused_reason': str | None,
          'soonest_open_at': str | None, 'account_count': int}``
     """
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            return await mcp_tool_call(client, url, 'get_curator_state', {})
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('get_curator_state failed for %s: %s', url, e)
-            errors.append(f'{url}: {e}')
-            invalidate_session(url)
-    return {'offline': True, 'error': '; '.join(errors)}
+    return await _first_success(
+        client, config, 'get_curator_state', {}, 'get_curator_state'
+    )

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+
+from dashboard.data.memory import get_curator_state
 
 
 def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
@@ -619,10 +622,6 @@ class TestGetCuratorState:
     @pytest.mark.asyncio
     async def test_get_curator_state_returns_state_from_mcp(self):
         """Helper calls get_curator_state tool and returns the payload on success."""
-        from unittest.mock import AsyncMock, patch
-
-        from dashboard.data.memory import get_curator_state
-
         mcp_payload = {
             'paused': True,
             'paused_reason': 'all capped',
@@ -641,10 +640,6 @@ class TestGetCuratorState:
     @pytest.mark.asyncio
     async def test_get_curator_state_returns_offline_dict_when_all_urls_fail(self):
         """Helper returns offline dict and calls mcp_tool_call once per URL on failure."""
-        from unittest.mock import AsyncMock, patch
-
-        from dashboard.data.memory import get_curator_state
-
         config = _make_test_config(
             fused_memory_urls=['http://localhost:18765', 'http://localhost:18766'],
         )

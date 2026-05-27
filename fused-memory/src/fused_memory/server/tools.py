@@ -1329,6 +1329,10 @@ def create_mcp_server(
 
         The dashboard polls this to surface WHY the curator is paused alongside
         the existing ``capped_now`` indicator.
+
+        Note: the four values are read from the live gate without a lock. During
+        a state transition (e.g. ``_on_resume()`` flipping paused → unpaused) the
+        snapshot may be momentarily inconsistent; refresh on the next poll.
         """
         try:
             if curator_usage_gate is None:

@@ -870,11 +870,12 @@ async def api_curator(request: Request) -> JSONResponse:
         capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_spark = _empty_capped
 
-    paused_reason: str | None = (
-        curator_state.get('paused_reason')
-        if not curator_state.get('offline')
-        else None
-    )
+    if 'paused' in curator_state:
+        paused_reason: str | None = curator_state.get('paused_reason')
+    else:
+        if curator_state:
+            logger.debug('curator/state: unexpected response shape %r', curator_state)
+        paused_reason = None
 
     return JSONResponse(
         redux_api.shape_curator(

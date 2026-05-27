@@ -7,7 +7,6 @@ TDD steps:
 
 from __future__ import annotations
 
-import asyncio
 import os
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -64,7 +63,13 @@ class TestGetCuratorStateLiveGate:
 
     @pytest.mark.asyncio
     async def test_get_curator_state_returns_gate_state_when_paused(self, tmp_path):
-        """Tool returns the gate's live paused state after _handle_cap_detected."""
+        """Tool correctly maps gate's observable paused state to the MCP response.
+
+        Drives gate state directly via internal attributes to isolate the tool's
+        read path from the gate's transition machinery (probe tasks, background
+        scheduling), per reviewer feedback on the original _handle_cap_detected
+        approach.
+        """
         from shared.cost_store import CostStore
 
         db_path = tmp_path / 'curator_events.db'
@@ -80,15 +85,12 @@ class TestGetCuratorStateLiveGate:
             ):
                 gate = UsageGate(config, cost_store=store)
 
-            gate._run_probe = AsyncMock(return_value=True)
-
+            # Drive paused state directly: set the underlying attributes that
+            # is_paused, paused_reason, soonest_resets_at, and account_count read from.
             reset_dt = datetime(2026, 6, 1, tzinfo=UTC)
-            gate._handle_cap_detected('synthetic cap', reset_dt, gate._accounts[0].token)
-
-            # Drain background tasks so gate state is fully settled.
-            pending = list(gate._background_tasks)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            gate._accounts[0].capped = True
+            gate._accounts[0].resets_at = reset_dt
+            gate._paused_reason = 'All accounts capped (last: synthetic cap)'
 
             svc = _make_mock_service()
             server = create_mcp_server(svc, curator_usage_gate=gate)
@@ -103,8 +105,5 @@ class TestGetCuratorStateLiveGate:
             }, f'Unexpected result: {result!r}'
         finally:
             if gate is not None:
-                pending = list(gate._background_tasks)
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
                 await gate.shutdown()
             await store.close()
