@@ -2170,6 +2170,24 @@ class TestFileWatcherOutageL2:
             f'summary must mention pending-L1 count (2); got {l2.summary!r}'
         )
 
+    def test_idempotent_no_duplicate_on_second_call(self, tmp_path: Path) -> None:
+        """Multiple calls while an open L2 exists must NOT create duplicate L2s.
+
+        Calls _file_watcher_outage_l2 three times (same reason twice, then a
+        different reason) and asserts exactly ONE L2 is still pending, proving
+        the dedup guard fires on the 2nd and 3rd calls.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+        h._file_watcher_outage_l2('watcher_crashloop')          # same reason — dedup
+        h._file_watcher_outage_l2('watcher_misconfigured')      # different reason — still dedup
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected exactly 1 L2 after 3 calls; got {len(l2s)}: {l2s}'
+        )
+
     def test_noop_when_queue_is_none(self, tmp_path: Path) -> None:
         """When _escalation_queue is None, _file_watcher_outage_l2 must be a no-op.
 
