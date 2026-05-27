@@ -471,3 +471,132 @@ class TestSeverityValidation:
             assert 'error' not in result, (
                 f"Known severity {sev!r} should be accepted, got error: {result}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for promote_to_l2 tests
+# ---------------------------------------------------------------------------
+
+async def _promote_to_l2(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the promote_to_l2 MCP tool directly."""
+    tool = await server.get_tool('promote_to_l2')
+    return await tool.fn(**kwargs)
+
+
+_L2_DEFAULTS: dict[str, Any] = {
+    'task_id': 't-1',
+    'agent_role': 'escalation-watcher-auto',
+    'member_ids': [],  # override in each test
+    'root_cause': 'Bad merge strategy',
+    'evidence': 'Multiple L1s pointing to the same merge regression.',
+    'options': ['A: rollback merge', 'B: fix forward', 'C: something else'],
+    'summary': 'Merge regression cluster',
+}
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2Create: create path
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2Create:
+    """promote_to_l2 creates a new L2 record (create path)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_created_with_id_and_members(self, tmp_path: Path):
+        """(a) promote_to_l2 returns {id, status='created', members=[l1_id]}."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result['status'] == 'created', f"Expected 'created', got: {result}"
+        assert 'id' in result
+        assert result['members'] == ['esc-l1-1']
+
+    @pytest.mark.asyncio
+    async def test_on_disk_record_has_correct_fields(self, tmp_path: Path):
+        """(b) On-disk record has level=2, status='pending', members, root_cause, options, detail."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            task_id='t-1',
+            agent_role='watcher-auto',
+            member_ids=['esc-l1-1'],
+            root_cause='Bad merge strategy',
+            evidence='Evidence text here',
+            options=['A: fix', 'B: rollback'],
+            summary='Merge cluster',
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2, f'Expected level=2, got {esc.level}'
+        assert esc.status == 'pending', f'Expected pending, got {esc.status!r}'
+        assert esc.members == ['esc-l1-1']
+        assert esc.root_cause == 'Bad merge strategy'
+        assert esc.options == ['A: fix', 'B: rollback']
+        assert esc.detail == 'Evidence text here', f'Expected evidence in detail, got {esc.detail!r}'
+
+    @pytest.mark.asyncio
+    async def test_single_member_l2_works(self, tmp_path: Path):
+        """(c) 1-member L2 works exactly like multi-member (no special case)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-solo']},
+        )
+
+        assert result['status'] == 'created'
+        assert result['members'] == ['esc-l1-solo']
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2
+        assert esc.members == ['esc-l1-solo']
+
+    @pytest.mark.asyncio
+    async def test_empty_member_ids_returns_error(self, tmp_path: Path):
+        """(d) member_ids=[] returns {'error': ...} and nothing is queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': []},
+        )
+
+        assert 'error' in result, f'Expected error for empty member_ids, got: {result}'
+        assert len(queue.get_pending()) == 0, 'Nothing should be queued on error'
+
+    @pytest.mark.asyncio
+    async def test_empty_root_cause_returns_error(self, tmp_path: Path):
+        """(e) root_cause='' returns {'error': ...} and nothing is queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': ''},
+        )
+
+        assert 'error' in result, f'Expected error for empty root_cause, got: {result}'
+        assert len(queue.get_pending()) == 0, 'Nothing should be queued on error'
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_root_cause_returns_error(self, tmp_path: Path):
+        """(e cont.) root_cause='  ' (whitespace-only) returns error."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': '   '},
+        )
+
+        assert 'error' in result, f'Expected error for whitespace root_cause, got: {result}'
+        assert len(queue.get_pending()) == 0, 'Nothing should be queued on error'
