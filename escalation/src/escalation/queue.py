@@ -496,20 +496,8 @@ class EscalationQueue:
         if resolution_turns is not None:
             esc.resolution_turns = resolution_turns
 
-        # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root)
-        json_text = esc.to_json()
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation_id, dir=str(path.parent)
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(json_text)
-            os.rename(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
-
+        # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
+        self._atomic_write_path(path, esc.to_json())
         return esc
 
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
@@ -519,23 +507,36 @@ class EscalationQueue:
     def _atomic_write(self, escalation_id: str, json_text: str) -> None:
         """Write *json_text* atomically to ``queue_dir/{escalation_id}.json``.
 
-        Uses the tmp+rename pattern: write to a temp file in the same directory
-        then rename over the target path.  On failure the tmp file is cleaned up
-        and the exception propagates unchanged.
+        Thin wrapper around ``_atomic_write_path`` that constructs the target
+        path from *escalation_id* and ``queue_dir``.  Always writes to the queue
+        root — not the archive.
 
         Callers: submit(), resolve(), submit_resolved(), _rewrite().
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        fd, tmp_path = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation_id, dir=str(self.queue_dir)
+        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
+
+    def _atomic_write_path(self, path: Path, json_text: str) -> None:
+        """Write *json_text* atomically to *path*.
+
+        Uses the tmp+rename pattern: the tmp file is created in ``path.parent``
+        (not hard-coded to ``queue_dir``) so that the ``os.rename`` stays within
+        the same directory — required for archive targets where *path* lives in
+        a dated subdir.  On failure the tmp file is cleaned up and the exception
+        propagates unchanged.
+
+        Callers: _atomic_write() (root targets), patch_resolution_metadata()
+        (root or archive targets).
+        """
+        fd, tmp_path_str = tempfile.mkstemp(
+            suffix='.tmp', prefix=path.stem, dir=str(path.parent)
         )
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(json_text)
-            os.rename(tmp_path, str(path))
+            os.rename(tmp_path_str, str(path))
         except Exception:
             with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
+                os.unlink(tmp_path_str)
             raise
 
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
