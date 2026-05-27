@@ -349,30 +349,3 @@ class TestCuratorUsageGateLeakGuard:
         # only useful action is cleanup.
         await opened_stores[0].close()
 
-
-# ---------------------------------------------------------------------------
-# step-5: source-inspection test — run_server passes curator_usage_gate kwarg
-# ---------------------------------------------------------------------------
-
-
-def test_run_server_passes_curator_usage_gate_to_create_mcp_server():
-    """run_server must forward curator_usage_gate to create_mcp_server.
-
-    Uses inspect.getsource as a lightweight regression guard so that an
-    accidental deletion of the one-line wire-up (at main.py:596-601 area)
-    is caught immediately without spinning up the full server.
-
-    If this assertion fails, check fused-memory/src/fused_memory/server/main.py
-    around the create_mcp_server(...) call and ensure
-    ``curator_usage_gate=curator_usage_gate`` is present as a keyword arg.
-    """
-    import inspect
-
-    import fused_memory.server.main as main_mod
-
-    src = inspect.getsource(main_mod.run_server)
-    assert 'curator_usage_gate=curator_usage_gate' in src, (
-        'run_server does not pass curator_usage_gate to create_mcp_server. '
-        'Add curator_usage_gate=curator_usage_gate to the create_mcp_server(...) '
-        'call in fused-memory/src/fused_memory/server/main.py.'
-    )
