@@ -2527,7 +2527,17 @@ Output JSON matching the schema. Every task must appear in the output.
         if not candidates:
             return None
 
-        esc = max(candidates, key=lambda e: e.timestamp)
+        if len(candidates) > 1:
+            logger.warning(
+                '_rehydrate_merge_halt: %d qualifying L1s found; registering '
+                'only the most recent as halt owner.  The merge queue will '
+                'resume as soon as that owner L1 is resolved — even though '
+                '%d older L1(s) remain pending.  Resolve the most-recent L1 '
+                'last to avoid premature queue resumption.',
+                len(candidates),
+                len(candidates) - 1,
+            )
+        esc = max(candidates, key=lambda e: datetime.fromisoformat(e.timestamp))
         reason = (
             f'Rehydrated merge halt from preserved L1 {esc.id} '
             f'(category={esc.category}) after restart'

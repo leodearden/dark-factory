@@ -12,14 +12,17 @@ original failure shape (two wip_conflict escalations; only one owns the halt).
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
+from orchestrator.merge_queue import SpeculativeMergeWorker
 
 
 @pytest.fixture
@@ -280,6 +283,68 @@ class TestRehydrateMergeHalt:
         assert worker.halt_owner_esc_id == esc_newer.id
         assert result == esc_newer.id
         _ = esc_older  # referenced for clarity
+
+    def test_rehydrate_logs_warning_for_multiple_l1s(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ):
+        """When multiple qualifying L1s exist, a warning pinning the premature-
+        resume risk must be logged alongside the normal halt-restore warning.
+        """
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        _make_wip_esc(queue, '7001', timestamp='2026-05-27T09:00:00+00:00')
+        _make_wip_esc(queue, '7002', timestamp='2026-05-27T10:00:00+00:00')
+        _make_wip_esc(queue, '7003', timestamp='2026-05-27T11:00:00+00:00')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            harness._rehydrate_merge_halt()
+
+        # The multi-L1 advisory warning must appear in the log output
+        advisory_msgs = [
+            r for r in caplog.records
+            if 'qualifying L1s found' in r.message
+        ]
+        assert advisory_msgs, (
+            'Expected a warning about multiple qualifying L1s; got none. '
+            f'Log records: {[r.message for r in caplog.records]}'
+        )
+        # Sanity: the halt is set and owner is the most recent
+        assert worker.is_wip_halted
+        assert worker.halt_owner_esc_id is not None
+
+    def test_rehydrate_against_real_speculative_merge_worker(
+        self, harness: Harness
+    ):
+        """Integration guard: _rehydrate_merge_halt works with the real
+        SpeculativeMergeWorker, ensuring _FakeMergeWorker can't drift from
+        the real implementation's halt-owner contract.
+        """
+        real_worker = SpeculativeMergeWorker(
+            git_ops=MagicMock(),
+            queue=asyncio.Queue(),
+        )
+        harness._merge_worker = real_worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        # Initial state must match the post-restart shape: un-halted, no owner
+        assert real_worker.is_wip_halted is False
+        assert real_worker.halt_owner_esc_id is None
+
+        esc = _make_wip_esc(queue, '8888')
+
+        result = harness._rehydrate_merge_halt()
+
+        assert real_worker.is_wip_halted is True, (
+            'Real SpeculativeMergeWorker must be halted after rehydration'
+        )
+        assert real_worker.halt_owner_esc_id == esc.id, (
+            'Real SpeculativeMergeWorker owner must be the preserved L1 id'
+        )
+        assert result == esc.id
 
 
 class TestForceUnhaltMergeQueue:
