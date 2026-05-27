@@ -257,3 +257,69 @@ class TestReconEscalationDedup:
             f"dedupe_fingerprint mismatch: got {data.get('dedupe_fingerprint')!r}, "
             f"expected {expected_fp!r}"
         )
+
+    # ── Step 3: dedup folding on recurrence ─────────────────────────────
+
+    def test_recurring_finding_folds_into_one_parent(self, tmp_path):
+        """Calling _escalate 3x with the same finding produces 1 file with dedupe_count==2.
+
+        RED before impl: queue.submit() does not fold duplicates, so 3 files are created.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'missing_knowledge',
+            'affected_ids': ['452'],
+            'description': 'Task 452 lacks completion summary',
+        }
+
+        for _ in range(3):
+            harness._escalate(
+                'recon_integrity_issue',
+                run_id='aaaa0001',
+                summary='Non-actionable integrity finding: missing knowledge for task 452',
+                finding=finding,
+            )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Expected 1 pending file (deduped), got {len(files)}'
+        )
+
+        data = json.loads(files[0].read_text())
+        assert data['dedupe_count'] == 2, (
+            f"Expected dedupe_count==2 (2 children folded), got {data['dedupe_count']}"
+        )
+
+    def test_distinct_findings_stay_distinct(self, tmp_path):
+        """Two calls with DIFFERENT affected_ids produce 2 separate files (not folded).
+
+        Remains GREEN after impl: distinct fingerprints → no dedup parent → 2 submits.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='bbbb0001',
+            summary='Non-actionable integrity finding: missing knowledge for task 452',
+            finding={
+                'category': 'missing_knowledge',
+                'affected_ids': ['452'],
+                'description': 'Task 452 lacks completion summary',
+            },
+        )
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='bbbb0002',
+            summary='Non-actionable integrity finding: missing knowledge for task 361',
+            finding={
+                'category': 'missing_knowledge',
+                'affected_ids': ['361'],
+                'description': 'Task 361 lacks completion summary',
+            },
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, (
+            f'Expected 2 distinct pending files, got {len(files)}'
+        )
