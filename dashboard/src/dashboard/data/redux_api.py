@@ -772,7 +772,7 @@ def shape_curator(
                 'pending_total': pending_total,
                 # Fresh literal each call — avoids sharing the mutable capped_accounts
                 # list from a module-level constant across multiple default responses.
-                'accounts_summary': dict(accounts_summary) if accounts_summary else {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []},
+                'accounts_summary': dict(accounts_summary) if accounts_summary else {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []},
             },
         }
     }

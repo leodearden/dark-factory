@@ -796,7 +796,7 @@ def test_shape_curator_passes_accounts_summary():
         'pending': {'labels': [], 'values': []},
     }
     capped_spark = {'labels': [], 'values': []}
-    accounts_summary = {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a']}
+    accounts_summary = {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a'], 'account_names': ['a']}
 
     result = shape_curator(
         pending=[],
@@ -810,7 +810,7 @@ def test_shape_curator_passes_accounts_summary():
 
     assert 'CURATOR_STATE' in result
     state = result['CURATOR_STATE']['state']
-    assert state['accounts_summary'] == {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a']}, (
+    assert state['accounts_summary'] == {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a'], 'account_names': ['a']}, (
         f'Expected accounts_summary to flow through shape_curator, got {state.get("accounts_summary")!r}'
     )
 
@@ -838,7 +838,7 @@ def test_shape_curator_default_accounts_summary():
     )
 
     state = result['CURATOR_STATE']['state']
-    assert state['accounts_summary'] == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}, (
+    assert state['accounts_summary'] == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}, (
         f'Expected default empty accounts_summary when kwarg omitted, got {state.get("accounts_summary")!r}'
     )
 
@@ -911,6 +911,7 @@ def test_api_curator_account_count_denominator_not_capped(tmp_path: Path):
         'capped': 1,
         'available': 3,
         'capped_accounts': ['acc-a'],
+        'account_names': ['acc-a'],
     }, f'Expected accounts_summary with total=4, got {state.get("accounts_summary")!r}'
 
 
@@ -993,4 +994,5 @@ def test_api_curator_uses_days_seven_lookback(tmp_path: Path):
         'capped': 1,
         'available': 0,
         'capped_accounts': ['acc-a'],
+        'account_names': ['acc-a'],
     }, f'Expected accounts_summary with total=1, got {state.get("accounts_summary")!r}'

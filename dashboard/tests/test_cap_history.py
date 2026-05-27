@@ -896,7 +896,7 @@ class TestSummarizeAccounts:
     def test_empty_intervals_no_total(self):
         """(a) empty intervals, no total_accounts -> all zeros."""
         result = summarize_accounts([])
-        assert result == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}, (
+        assert result == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}, (
             f'Expected all-zero dict for empty intervals, got {result}'
         )
 
@@ -906,7 +906,7 @@ class TestSummarizeAccounts:
         t1 = now - timedelta(hours=2)
         intervals = [CapInterval('acc', t1, None)]
         result = summarize_accounts(intervals)
-        assert result == {'total': 1, 'capped': 1, 'available': 0, 'capped_accounts': ['acc']}, (
+        assert result == {'total': 1, 'capped': 1, 'available': 0, 'capped_accounts': ['acc'], 'account_names': ['acc']}, (
             f'Expected 1 capped account, got {result}'
         )
 
@@ -917,7 +917,7 @@ class TestSummarizeAccounts:
         t2 = now - timedelta(hours=1)
         intervals = [CapInterval('acc', t1, t2)]
         result = summarize_accounts(intervals)
-        assert result == {'total': 1, 'capped': 0, 'available': 1, 'capped_accounts': []}, (
+        assert result == {'total': 1, 'capped': 0, 'available': 1, 'capped_accounts': [], 'account_names': ['acc']}, (
             f'Expected closed interval to yield capped=0, got {result}'
         )
 
@@ -931,7 +931,7 @@ class TestSummarizeAccounts:
             CapInterval('b', t1, t2),
         ]
         result = summarize_accounts(intervals)
-        assert result == {'total': 2, 'capped': 1, 'available': 1, 'capped_accounts': ['a']}, (
+        assert result == {'total': 2, 'capped': 1, 'available': 1, 'capped_accounts': ['a'], 'account_names': ['a', 'b']}, (
             f'Expected mixed result capped=1/available=1, got {result}'
         )
 
@@ -946,7 +946,7 @@ class TestSummarizeAccounts:
         t1 = now - timedelta(minutes=10)
         intervals = [CapInterval('a', t1, None)]
         result = summarize_accounts(intervals, total_accounts=4)
-        assert result == {'total': 4, 'capped': 1, 'available': 3, 'capped_accounts': ['a']}, (
+        assert result == {'total': 4, 'capped': 1, 'available': 3, 'capped_accounts': ['a'], 'account_names': ['a']}, (
             f'Expected total=4 (from account_count denominator), got {result}. '
             f'Bug: if total=1 then available=0 and capped_now would be wrongly 1 '
             f'(the original 3-uncapped-accounts bug).'
@@ -980,7 +980,7 @@ class TestSummarizeAccounts:
             CapInterval('b', t1, None),
         ]
         result = summarize_accounts(intervals)
-        assert result == {'total': 2, 'capped': 2, 'available': 0, 'capped_accounts': ['a', 'b']}, (
+        assert result == {'total': 2, 'capped': 2, 'available': 0, 'capped_accounts': ['a', 'b'], 'account_names': ['a', 'b']}, (
             f'Expected all-capped result, got {result}'
         )
 

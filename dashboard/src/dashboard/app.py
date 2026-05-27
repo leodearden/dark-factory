@@ -889,7 +889,7 @@ async def api_curator(request: Request) -> JSONResponse:
 
     # Compute per-account availability summary in its own try/except so a failure
     # here does not affect capped_now / capped_spark (or vice versa).
-    _empty_summary: AccountsSummary = {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}
+    _empty_summary: AccountsSummary = {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}
     try:
         accounts_summary: AccountsSummary = summarize_accounts(intervals, total_accounts=account_count)
     except Exception:

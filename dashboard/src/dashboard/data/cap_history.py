@@ -390,6 +390,7 @@ class AccountsSummary(TypedDict):
     capped: int
     available: int
     capped_accounts: list[str]
+    account_names: list[str]  # all distinct accounts in intervals, sorted
 
 
 def summarize_accounts(
@@ -418,9 +419,14 @@ def summarize_accounts(
           stale relative to actual cap-history.
         - ``capped`` — ``len(capped_accounts)``.
         - ``available`` — ``total - capped``.
+        - ``account_names`` — sorted list of all distinct account names seen in *intervals*
+          (superset of ``capped_accounts``).  Returned so callers such as
+          :func:`compute_capped_now_and_windows` can pass it to
+          :func:`merge_all_accounts_capped` without a redundant third pass.
     """
     capped_accounts = sorted({iv.account_name for iv in intervals if iv.end is None})
     all_accounts = {iv.account_name for iv in intervals}
+    account_names = sorted(all_accounts)
     total = max(total_accounts or 0, len(all_accounts))
     capped = len(capped_accounts)
     available = total - capped
@@ -429,6 +435,7 @@ def summarize_accounts(
         'capped': capped,
         'available': available,
         'capped_accounts': capped_accounts,
+        'account_names': account_names,
     }
 
 
@@ -472,6 +479,6 @@ def compute_capped_now_and_windows(
     """
     summary = summarize_accounts(intervals, total_accounts=total_accounts)
     capped_now = 1 if summary['total'] > 0 and summary['available'] == 0 else 0
-    account_names = sorted({iv.account_name for iv in intervals})
-    capped_windows = merge_all_accounts_capped(intervals, account_names)
+    # Reuse account_names from summary — avoids a third pass over intervals.
+    capped_windows = merge_all_accounts_capped(intervals, summary['account_names'])
     return capped_now, capped_windows
