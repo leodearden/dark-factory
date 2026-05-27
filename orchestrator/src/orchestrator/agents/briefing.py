@@ -319,7 +319,7 @@ a. **Drop genuinely-unneeded entries**: call
    current plan files.  You may keep some flagged entries if you judge
    them genuinely needed; the gate's re-check is the source of truth.
 b. **Plan is honest as-is**: call `confirm_plan()` unchanged.  The
-   workflow will then escalate to a human — choose this only when the
+   workflow will then file a level-1 escalation (auto-watcher triages; promotes to L2 if a human is needed) — choose this only when the
    work is genuinely incomplete and the flagged files really do need
    edits.
 

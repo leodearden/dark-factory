@@ -2893,9 +2893,9 @@ Output JSON matching the schema. Every task must appear in the output.
         previous (crashed or completed) run are cleared before the new run
         begins.
 
-        L1 (steward→human) escalations are intentionally preserved across
-        restart — they represent human-attention requests that were not yet
-        acted on and must not be silently lost during long AFK periods.
+        L1 (steward→auto-watcher) escalations are intentionally preserved across
+        restart — they represent items pending auto-triage (which may then promote
+        to L2 for a human) and must not be silently lost during long AFK periods.
         """
         if self._escalation_queue is None:
             return
