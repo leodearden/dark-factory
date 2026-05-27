@@ -294,3 +294,39 @@ class TestSweepSafety:
         report = sweep.sweep(tmp_path, apply=True)
         assert path.exists()
         assert report.archived == 0
+
+
+class TestSweepIdempotency:
+    """Running sweep(apply=True) twice leaves disk state unchanged on the second call."""
+
+    def _disk_snapshot(self, queue_dir: Path) -> dict[str, bytes]:
+        """Return {relative_path_str: content_bytes} for every file under queue_dir."""
+        return {
+            str(p.relative_to(queue_dir)): p.read_bytes()
+            for p in sorted(queue_dir.rglob('*'))
+            if p.is_file()
+        }
+
+    def test_double_apply_is_noop(self, tmp_path: Path):
+        RESOLVED_AT_A = '2026-05-20T10:00:00+00:00'
+        RESOLVED_AT_B = '2026-05-21T08:00:00+00:00'
+
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=RESOLVED_AT_A)
+        _write_root_esc(tmp_path, 'esc-1-2', 'resolved', resolved_at=RESOLVED_AT_A)
+        _write_root_esc(tmp_path, 'esc-2-1', 'dismissed', resolved_at=RESOLVED_AT_B)
+        _write_root_esc(tmp_path, 'esc-3-1', 'pending')
+        # Archive-only file with no root copy (should be untouched by both calls)
+        _write_archive_esc(tmp_path, 'esc-4-1', RESOLVED_AT_A, 'resolved', resolved_by='steward')
+
+        report1 = sweep.sweep(tmp_path, apply=True)
+        assert report1.archived > 0 or report1.reconciled_root_wins > 0 or report1.reconciled_archive_wins > 0
+
+        snapshot = self._disk_snapshot(tmp_path)
+
+        report2 = sweep.sweep(tmp_path, apply=True)
+
+        assert report2.archived == 0
+        assert report2.reconciled_root_wins == 0
+        assert report2.reconciled_archive_wins == 0
+        assert report2.untouched_pending == 1
+        assert self._disk_snapshot(tmp_path) == snapshot
