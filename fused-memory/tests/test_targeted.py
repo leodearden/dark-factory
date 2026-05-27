@@ -1426,6 +1426,114 @@ class TestSweepCancelledDescendants:
         assert esc.severity == 'blocking'
         assert esc.category == 'scope_violation'
 
+    # ── Co-cancellation race suppression (task 1490) ────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('case', [
+        'orch_live_co_cancelled',
+        'orch_dead_co_cancelled',
+        'orch_live_genuinely_active',
+    ])
+    async def test_co_cancelled_dependent_suppressed(
+        self,
+        wired_reconciler,
+        mock_taskmaster,
+        mock_interceptor,
+        monkeypatch,
+        tmp_path,
+        case,
+    ):
+        """Suppress spurious scope_violation L1s for co-cancelled sibling dependents.
+
+        Parametrized cases:
+        (a) orch_live_co_cancelled  — live re-check shows D now 'cancelled':
+            no escalation file written, no descendant_escalated action, one
+            descendant_skipped_co_cancelled action (task_id=='D').
+        (b) orch_dead_co_cancelled  — orch dead, re-check shows D 'cancelled':
+            set_task_status NOT called, no descendant_blocked action, one
+            descendant_skipped_co_cancelled action.
+        (c) orch_live_genuinely_active — re-check STILL shows D 'pending'
+            (genuine orphan): escalation file present (scope_violation/L1/blocking),
+            NO descendant_skipped_co_cancelled action.  Guards against
+            over-suppression.
+        """
+        from fused_memory.reconciliation import targeted
+        from escalation.models import Escalation
+
+        project_root = str(tmp_path)
+
+        # D is a pure dependent: no spawned_from / escalation_id → takes the
+        # ambiguous escalate-or-block route, never the deterministic-cancel route.
+        d_pending = {
+            'id': 'D', 'status': 'pending', 'title': 'dependent',
+            'metadata': {}, 'dependencies': ['A'], 'subtasks': [],
+        }
+        snapshot1 = {'tasks': [d_pending]}  # stale initial sweep snapshot (L548)
+
+        orch_live = case in ('orch_live_co_cancelled', 'orch_live_genuinely_active')
+        monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: orch_live)
+
+        if case == 'orch_live_genuinely_active':
+            # Re-check: D is still pending (genuinely-active orphan)
+            snapshot2 = {'tasks': [dict(d_pending)]}
+        else:
+            # Re-check: D is now cancelled (co-cancelled sibling)
+            snapshot2 = {'tasks': [dict(d_pending, status='cancelled')]}
+
+        # side_effect: snapshot1 → initial get_tasks (L548 in sweep),
+        #              snapshot2 → live re-check in _live_status_map
+        mock_taskmaster.get_tasks = AsyncMock(side_effect=[snapshot1, snapshot2])
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+        esc_files = list(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        actions = result.get('actions', [])
+        skip_actions = [
+            a for a in actions if a.get('type') == 'descendant_skipped_co_cancelled'
+        ]
+
+        if case == 'orch_live_co_cancelled':
+            # (a) Suppressed: no escalation file, no escalated action, one skip
+            assert esc_files == [], (
+                f'expected no escalation files, got {esc_files}'
+            )
+            assert not any(a.get('type') == 'descendant_escalated' for a in actions), (
+                'unexpected descendant_escalated action present'
+            )
+            assert len(skip_actions) == 1, (
+                f'expected exactly one skip action, got {skip_actions}'
+            )
+            assert skip_actions[0].get('task_id') == 'D'
+
+        elif case == 'orch_dead_co_cancelled':
+            # (b) Suppressed: no block call, no blocked action, one skip
+            mock_interceptor.set_task_status.assert_not_called()
+            assert not any(a.get('type') == 'descendant_blocked' for a in actions), (
+                'unexpected descendant_blocked action present'
+            )
+            assert len(skip_actions) == 1, (
+                f'expected exactly one skip action, got {skip_actions}'
+            )
+            assert skip_actions[0].get('task_id') == 'D'
+
+        elif case == 'orch_live_genuinely_active':
+            # (c) NOT suppressed: escalation file present, no skip action
+            assert len(esc_files) == 1, (
+                f'expected one escalation file for genuine orphan, got {esc_files}'
+            )
+            esc = Escalation.from_json(esc_files[0].read_text())
+            assert esc.category == 'scope_violation'
+            assert esc.level == 1
+            assert esc.severity == 'blocking'
+            assert not skip_actions, (
+                f'expected no skip actions for genuine orphan, got {skip_actions}'
+            )
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
