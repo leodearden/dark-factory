@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.services.write_journal import WriteJournal
+    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +411,7 @@ def create_mcp_server(
     reconciliation_harness: ReconciliationHarness | None = None,
     backlog_policy: BacklogPolicy | None = None,
     event_queue: EventQueue | None = None,
+    curator_usage_gate: UsageGate | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -1313,6 +1315,43 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'get_queue_stats error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_curator_state() -> dict[str, Any]:
+        """Read-only snapshot of the curator UsageGate's current state.
+
+        Returns ``{'paused', 'paused_reason', 'soonest_open_at', 'account_count'}``.
+        ``paused_reason`` is None when the gate is healthy or unconfigured.
+        ``soonest_open_at`` is an ISO 8601 string or None.
+        When no gate is wired (curator disabled), returns safe zero-defaults.
+
+        The dashboard polls this to surface WHY the curator is paused alongside
+        the existing ``capped_now`` indicator.
+        """
+        try:
+            if curator_usage_gate is None:
+                return {
+                    'paused': False,
+                    'paused_reason': None,
+                    'soonest_open_at': None,
+                    'account_count': 0,
+                }
+            gate = curator_usage_gate
+            paused = gate.is_paused
+            paused_reason = gate.paused_reason or None
+            resets_at = gate.soonest_resets_at
+            soonest_open_at = resets_at.isoformat() if resets_at is not None else None
+            return {
+                'paused': paused,
+                'paused_reason': paused_reason,
+                'soonest_open_at': soonest_open_at,
+                'account_count': gate.account_count,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_curator_state error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
