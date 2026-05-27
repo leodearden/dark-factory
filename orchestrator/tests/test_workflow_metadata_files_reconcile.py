@@ -23,6 +23,7 @@ def _make_workflow(
     *,
     project_root: Path,
     task_id: str = '101',
+    backend_metadata: dict | None = None,
 ) -> tuple[TaskWorkflow, AsyncMock, AsyncMock]:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -39,6 +40,9 @@ def _make_workflow(
     update_task = AsyncMock(return_value=True)
     scheduler = MagicMock()
     scheduler.update_task = update_task
+    scheduler.get_task = AsyncMock(
+        return_value={'id': task_id, 'metadata': backend_metadata or {}}
+    )
 
     git_ops = MagicMock()
     get_merge_diff_files = AsyncMock(return_value=[])
@@ -53,6 +57,13 @@ def _make_workflow(
         mcp=MagicMock(),
     )
     return wf, update_task, get_merge_diff_files
+
+
+def _persisted_payload(update_task: AsyncMock) -> dict:
+    """Return the metadata dict passed to the most recent update_task call."""
+    assert update_task.await_args is not None
+    args, _ = update_task.await_args
+    return args[1]
 
 
 @pytest.mark.asyncio
@@ -120,3 +131,62 @@ async def test_writes_empty_list_when_diff_returns_empty(tmp_path: Path):
     await wf._reconcile_metadata_files_for_done()
 
     update_task.assert_awaited_once_with('101', {'files': []})
+
+
+@pytest.mark.asyncio
+async def test_reconcile_preserves_memory_hints_from_backend(tmp_path: Path):
+    """Sibling keys added by Stage-2 reconciliation survive the files write.
+
+    The in-memory task dict has no memory_hints; the backend (get_task)
+    has memory_hints + _causation_id attached after the workflow loaded.
+    The persisted payload must contain BOTH the recomputed files AND the
+    preserved sibling keys.
+    """
+    wf, update_task, get_merge_diff_files = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+            '_causation_id': 'C1',
+        },
+    )
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = 'b' * 40
+    get_merge_diff_files.return_value = ['src/landed.py']
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload == {
+        'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        '_causation_id': 'C1',
+        'files': ['src/landed.py'],
+    }, f'Sibling keys from backend must survive the files write; got {payload}'
+
+
+@pytest.mark.asyncio
+async def test_reconcile_explicit_files_override_backend_files(tmp_path: Path):
+    """New 'files' value always wins over any pre-existing backend 'files'.
+
+    Even when the backend already has a stale 'files' list, the freshly
+    computed merge-diff replaces it.  Sibling keys are still preserved.
+    """
+    wf, update_task, get_merge_diff_files = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={
+            'files': ['old/stale.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        },
+    )
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = 'b' * 40
+    get_merge_diff_files.return_value = ['src/new.py']
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == ['src/new.py'], (
+        f"New files must override stale backend files; got {payload.get('files')!r}"
+    )
+    assert payload.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
+        f"memory_hints must survive when files key is overridden; got {payload!r}"
+    )
