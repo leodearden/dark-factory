@@ -10,11 +10,21 @@ single canonical record (oldest survives, ``dedupe_count`` = group size,
 ``dedupe_fingerprint`` stamped), archives/dismisses the rest, and leaves every
 blocking and non-recon category escalation completely untouched.
 
-The collapse policy is byte-identical to the live A7a/A7b submit-time
-deduplication: eligible categories are sourced from
-``DedupeConfig.for_recon().infra_dedupe_categories`` (= ``('recon_integrity_issue',)``),
-and the fingerprint is computed via ``compute_content_fingerprint`` with the
-same inputs that the harness passes at submit time.
+The collapse policy is consistent with the A7a/A7b dedup approach: eligible
+categories are sourced from ``DedupeConfig.for_recon().infra_dedupe_categories``
+(= ``('recon_integrity_issue',)``), and each escalation's fingerprint is computed
+from the same inputs (``escalation_category``, ``finding_category``,
+``affected_ids``, ``description``) that A7b will stamp at submit time once the
+harness migrates from ``_escalate()`` / ``queue.submit()`` to
+``submit_or_dedupe()``.
+
+Note: the harness currently bypasses dedup entirely — ``_escalate()`` calls
+``queue.submit()`` directly and does NOT invoke ``submit_or_dedupe``, so no
+``dedupe_fingerprint`` has been stamped on any existing record.  Every
+``recon_integrity_issue`` that has accumulated to date is therefore unstamped.
+This script's fingerprint is a forward-looking commitment to the shape A7b will
+stamp once the harness is migrated — backfilled canonicals carry
+``dedupe_fingerprint`` so that future ``submit_or_dedupe`` folds route correctly.
 
 Usage
 -----
@@ -50,6 +60,7 @@ import logging
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from escalation.dedupe import DedupeConfig, compute_content_fingerprint
@@ -63,6 +74,33 @@ DEFAULT_NOTE: str = (
     'Collapsed by A7c backfill: duplicate recon_integrity_issue finding. '
     'Canonical record retains full dedupe_count and dedupe_fingerprint.'
 )
+
+# Sentinel: timestamps that cannot be parsed sort to the END of the group so
+# they are never mistakenly selected as the canonical (oldest).
+_MAX_DT: datetime = datetime.max.replace(tzinfo=UTC)
+
+
+def _parse_ts(ts: str | None) -> datetime:
+    """Parse an ISO 8601 timestamp string into an aware datetime.
+
+    Normalises the ``Z`` UTC suffix to ``+00:00`` for Python < 3.11
+    compatibility.  Naive timestamps (no timezone info) are assumed UTC.
+    Returns ``_MAX_DT`` on any parse failure so unparseable records sort to
+    the END of their fingerprint group and are never selected as canonical.
+
+    Mirrors the ``datetime.fromisoformat`` + tzinfo-fill pattern used by
+    ``find_dedupe_parent`` in escalation/dedupe.py.
+    """
+    if not ts:
+        return _MAX_DT
+    try:
+        normalised = ts.replace('Z', '+00:00') if ts.endswith('Z') else ts
+        dt = datetime.fromisoformat(normalised)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except (ValueError, TypeError):
+        return _MAX_DT
 
 
 def finding_fingerprint(esc: Escalation) -> str:
@@ -144,8 +182,10 @@ def build_plan(
     for fp, members in groups.items():
         if len(members) <= 1:
             continue  # singleton — idempotency guard, nothing to collapse
-        # Sort by (timestamp, id) so the oldest is first and ties are deterministic.
-        members.sort(key=lambda e: (e.timestamp, e.id))
+        # Sort by parsed timestamp so mixed ISO formats (Z vs +00:00 vs
+        # microsecond precision) all compare correctly.  _parse_ts falls back
+        # to _MAX_DT on failure so unparseable records sort to the end.
+        members.sort(key=lambda e: (_parse_ts(e.timestamp), e.id))
         canonical = members[0]
         children = members[1:]
         collapses.append(GroupCollapse(
@@ -196,6 +236,19 @@ def apply_plan(
             logger.warning('Canonical %s not found; skipping group', collapse.canonical_id)
             continue
 
+        # Guard: if the canonical already carries dedupe state, A7b may already
+        # be active for this fingerprint.  Skip rather than overwriting — the
+        # backfill has no business meddling with A7b's in-progress work.
+        if canonical.dedupe_count > 0 or canonical.dedupe_children:
+            logger.warning(
+                'Canonical %s already has dedupe state (count=%d, children=%d); '
+                'skipping group — A7b may already be active for this fingerprint',
+                collapse.canonical_id,
+                canonical.dedupe_count,
+                len(canonical.dedupe_children),
+            )
+            continue
+
         canonical.dedupe_count = collapse.group_size
         canonical.dedupe_children = list(collapse.child_ids)
         canonical.dedupe_fingerprint = collapse.fingerprint
@@ -203,8 +256,15 @@ def apply_plan(
         updated += 1
 
         for child_id in collapse.child_ids:
-            queue.resolve(child_id, note, dismiss=True, resolved_by=resolved_by)
-            dismissed += 1
+            result = queue.resolve(child_id, note, dismiss=True, resolved_by=resolved_by)
+            if result is None:
+                logger.warning(
+                    'Child %s not found during resolve (state drift between '
+                    'get_pending and apply); skipping',
+                    child_id,
+                )
+            else:
+                dismissed += 1
 
     return {'dismissed': dismissed, 'updated': updated}
 
