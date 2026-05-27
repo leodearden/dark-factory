@@ -125,26 +125,27 @@ class TestFindDarkFactoryPaths:
         result2 = self.find('edit orchestrator/harness.py', prefixes=('foo/',))
         assert result2 == []
 
-    def test_url_style_path_matches_by_design(self):
-        """A URL like ``https://github.com/owner/orchestrator/`` matches because
-        the slash before ``orchestrator/`` satisfies the lookbehind.
+    def test_url_style_path_no_match_when_preceded_by_slash(self):
+        """A URL like ``https://github.com/owner/orchestrator/`` must NOT match
+        because '/' is excluded from the left-boundary class (task-1494 reverses
+        the task-1095 'over-rejection' pin).
 
-        This is intentional: better to over-reject a URL that mentions a
-        dark-factory path than to miss a genuine mis-filing.
+        The path separator '/' is explicitly removed from the boundary class
+        ``[^A-Za-z0-9_\\-]`` → ``[^A-Za-z0-9_\\-/.]`` so that mid-URL or
+        mid-path occurrences of a registered prefix are not treated as leading
+        references to that project.
         """
         result = self.find('see https://github.com/owner/orchestrator/repo')
-        assert 'orchestrator/' in result
+        assert 'orchestrator/' not in result
 
-    def test_nested_path_segment_matches_by_design(self):
-        """Filesystem paths like ``tests/orchestrator/harness.py`` match because
-        the slash *before* ``orchestrator/`` satisfies the lookbehind boundary
-        class ``[^A-Za-z0-9_-]``, which admits ``/``.
+    def test_nested_path_segment_no_match_when_preceded_by_slash(self):
+        """Filesystem paths like ``tests/orchestrator/harness.py`` must NOT match
+        because '/' is not a valid left boundary (task-1494 reverses task-1095).
 
-        This over-rejection is intentional — same contract as
-        ``test_url_style_path_matches_by_design``.  If the lookbehind were
-        tightened to a whitespace-only class (``\\s``), both assertions below
-        would fail, confirming this is a meaningful contract test, not an
-        accidentally-passing assertion.
+        The lookbehind class now excludes '/' and '.', so a prefix appearing as
+        a mid-path segment (preceded by '/') is not detected.  Only a bare
+        leading reference — at start-of-string or after whitespace/punctuation
+        that is NOT a path separator — triggers the guard.
         """
         cases = [
             ('tests/orchestrator/harness.py', 'orchestrator/'),
@@ -152,8 +153,8 @@ class TestFindDarkFactoryPaths:
         ]
         for text, expected_prefix in cases:
             result = self.find(text)
-            assert expected_prefix in result, (
-                f'Expected {expected_prefix!r} to be detected in {text!r}; '
+            assert expected_prefix not in result, (
+                f'Expected {expected_prefix!r} NOT to be detected in {text!r}; '
                 f'got {result!r}'
             )
 
