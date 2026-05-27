@@ -595,3 +595,71 @@ class TestInvalidateSession:
 
         # Must not raise — idempotent by design.
         invalidate_session('http://unknown:9999')
+
+
+# ── get_curator_state ───────────────────────────────────────────
+
+
+def _make_test_config(*, fused_memory_urls: list[str], tmp_path=None):
+    """Build a minimal DashboardConfig for get_curator_state tests."""
+    from pathlib import Path
+
+    from dashboard.config import DashboardConfig
+
+    root = tmp_path or Path('/tmp/test-curator-state')
+    return DashboardConfig(
+        project_root=root,
+        fused_memory_urls=fused_memory_urls,
+    )
+
+
+class TestGetCuratorState:
+    """Tests for the get_curator_state helper in memory.py."""
+
+    @pytest.mark.asyncio
+    async def test_get_curator_state_returns_state_from_mcp(self):
+        """Helper calls get_curator_state tool and returns the payload on success."""
+        from unittest.mock import AsyncMock, patch
+
+        from dashboard.data.memory import get_curator_state
+
+        mcp_payload = {
+            'paused': True,
+            'paused_reason': 'all capped',
+            'soonest_open_at': '2026-06-01T00:00:00+00:00',
+            'account_count': 2,
+        }
+
+        config = _make_test_config(fused_memory_urls=['http://localhost:18765'])
+
+        with patch('dashboard.data.memory.mcp_tool_call', new=AsyncMock(return_value=mcp_payload)):
+            async with httpx.AsyncClient() as client:
+                result = await get_curator_state(client, config)
+
+        assert result == mcp_payload, f'Unexpected result: {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_get_curator_state_returns_offline_dict_when_all_urls_fail(self):
+        """Helper returns offline dict and calls mcp_tool_call once per URL on failure."""
+        from unittest.mock import AsyncMock, call, patch
+
+        from dashboard.data.memory import get_curator_state
+
+        config = _make_test_config(
+            fused_memory_urls=['http://localhost:18765', 'http://localhost:18766'],
+        )
+
+        with patch(
+            'dashboard.data.memory.mcp_tool_call',
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ) as mock_call:
+            async with httpx.AsyncClient() as client:
+                result = await get_curator_state(client, config)
+
+        assert result.get('offline') is True, f'Expected offline=True, got: {result!r}'
+        assert 'error' in result, f'Expected error key, got: {result!r}'
+        assert 'refused' in result['error'], f'Expected "refused" in error: {result["error"]!r}'
+        assert mock_call.call_count == 2, (
+            f'Expected mcp_tool_call called twice (once per URL), '
+            f'got {mock_call.call_count}'
+        )
