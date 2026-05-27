@@ -843,7 +843,7 @@ class TestParkStopConfig:
         assert OrchestratorConfig().park_stop_enabled is True
 
     def test_park_stop_parked_threshold_default(self):
-        assert OrchestratorConfig().park_stop_parked_threshold == 5
+        assert OrchestratorConfig().park_stop_parked_threshold == 15
 
     def test_park_stop_parked_window_hours_default(self):
         assert OrchestratorConfig().park_stop_parked_window_hours == 1.0
@@ -874,11 +874,11 @@ class TestParkStopConfig:
             "defaults.yaml is missing 'park_stop_parked_window_hours'"
         )
         assert defaults['park_stop_enabled'] is True
-        assert defaults['park_stop_parked_threshold'] == 5
+        assert defaults['park_stop_parked_threshold'] == 15
         assert defaults['park_stop_parked_window_hours'] == 1.0
 
         # Also verify the values flow through OrchestratorConfig() at runtime.
         config = OrchestratorConfig()
         assert config.park_stop_enabled is True
-        assert config.park_stop_parked_threshold == 5
+        assert config.park_stop_parked_threshold == 15
         assert config.park_stop_parked_window_hours == 1.0
