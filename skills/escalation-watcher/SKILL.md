@@ -122,10 +122,10 @@ It is better to stall development than to bake in a significant bad decision.
 
 ## Handling Escalations by Category
 
-For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. At level-1, interpret it through this lens:
+For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. At level-2, interpret it through this lens:
 
-- **`manual_intervention`** — The steward explicitly gave up. This is authoritative: the issue genuinely needs human judgment. Always respect it.
-- **`investigate_and_retry`** — Misleading at level-1. The steward already investigated and retried (up to 3 attempts, $12 budget). If it re-escalated with this value, the underlying issue persisted through retries. Treat as a persistent problem, not transient. Don't just retry.
+- **`manual_intervention`** — The auto-watcher explicitly gave up. This is authoritative: the issue genuinely needs human judgment. Always respect it.
+- **`investigate_and_retry`** — Misleading at level-2. The item has already passed through *both* the per-task steward (L0) *and* the auto-watcher (L1) and persisted through their combined triage and retry budgets. Treat as a deeply persistent problem, not transient. Don't just retry.
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
 
@@ -415,6 +415,8 @@ mcp__escalation__resolve_issue(
 The `resolution` text matters — for `terminate=false`, it's injected directly into the agent's context when the task resumes. Be specific: include file paths, function names, and concrete instructions.
 
 For `terminate=true` (dismiss), the resolution is recorded for audit but the task is abandoned. The task can be rescheduled later.
+
+**L2 cluster cascade:** when a resolved L2 represents a causal cluster (multiple member L1 escalations grouped by the auto-watcher), resolving the L2 here cascades to close its L1 members via the escalation server — this skill resolves only the L2 itself, never each member directly. For design details, see `plans/escalation-l2-tiering.md`. Note: the cascade activates once the server-side `promote_to_l2` mechanic (E2) is shipped; prior to that, only the L2 itself closes — the behaviour of this skill is unchanged either way.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
