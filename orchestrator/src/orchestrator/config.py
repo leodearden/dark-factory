@@ -597,6 +597,15 @@ class OrchestratorConfig(BaseSettings):
     # call it a loop in the merge phase (the steward resolution between
     # them is the mediation we already gave it a chance to perform).
     max_consecutive_merge_thrash: int = Field(default=2, ge=1)
+    merge_verify_min_free_disk_bytes: int = Field(
+        default=10 * 1024**3,
+        description=(
+            'Pre-verify disk guard threshold. Before post-merge verify, if free '
+            'space on the merge-worktree volume is below this, prune stale _merge-* '
+            'worktrees; if still below after pruning, skip verify and escalate as '
+            'transient infra (disk pressure) instead of running a doomed build.'
+        ),
+    )
     requeue_cooldown_secs: float = Field(default=30.0)
     # Per-task settle window applied after a dispatch when reconciliation or
     # steward signals are present (recon_reset_count > 1, steward_clear_at,

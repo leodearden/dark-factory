@@ -29,6 +29,7 @@ from orchestrator.merge_queue import (
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
+    _ensure_verify_disk_space,
     _verify_hit_enospc,
 )
 from orchestrator.verify import VerifyResult
@@ -5204,6 +5205,291 @@ class TestEnospcTransientInfraRetry:
 
         assert outcome.status == 'done', f'unexpected: {outcome}'
         assert mock_verify.call_count == 2
+        assert mock_prune.call_count == 1
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# A2 (cont.): pre-verify disk guard
+# ---------------------------------------------------------------------------
+
+_GIB = 1024**3
+
+
+def _usage(free_bytes: int):
+    """Fake ``shutil.disk_usage`` return value exposing only ``.free``."""
+    return MagicMock(free=free_bytes)
+
+
+@pytest.mark.asyncio
+class TestEnsureVerifyDiskSpace:
+    """Unit tests for the _ensure_verify_disk_space pre-verify guard helper."""
+
+    def _git_ops(self, pruned: list[str] | None = None) -> MagicMock:
+        gops = MagicMock()
+        gops.prune_stale_merge_worktrees = AsyncMock(
+            return_value=pruned if pruned is not None else [],
+        )
+        return gops
+
+    async def test_sufficient_space_returns_none_without_pruning(
+        self, tmp_path: Path,
+    ):
+        gops = self._git_ops()
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            return_value=_usage(20 * _GIB),
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, tmp_path, 10 * _GIB, 't1',
+            )
+        assert reason is None
+        gops.prune_stale_merge_worktrees.assert_not_called()
+
+    async def test_low_then_prune_frees_enough_returns_none(
+        self, tmp_path: Path,
+    ):
+        gops = self._git_ops(pruned=['/x/_merge-a'])
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, tmp_path, 10 * _GIB, 't1',
+            )
+        assert reason is None
+        gops.prune_stale_merge_worktrees.assert_awaited_once()
+
+    async def test_persistent_low_returns_transient_infra_reason(
+        self, tmp_path: Path,
+    ):
+        gops = self._git_ops()
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(1 * _GIB), _usage(1 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, tmp_path, 10 * _GIB, 't1',
+            )
+        assert reason is not None
+        assert reason.startswith(TRANSIENT_INFRA_REASON_PREFIX)
+        gops.prune_stale_merge_worktrees.assert_awaited_once()
+
+    async def test_oserror_on_first_stat_fails_open(self, tmp_path: Path):
+        gops = self._git_ops()
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=OSError('stat failed'),
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, tmp_path, 10 * _GIB, 't1',
+            )
+        assert reason is None
+        gops.prune_stale_merge_worktrees.assert_not_called()
+
+    async def test_oserror_on_post_prune_stat_fails_open(self, tmp_path: Path):
+        gops = self._git_ops()
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(1 * _GIB), OSError('stat failed')],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, tmp_path, 10 * _GIB, 't1',
+            )
+        # Pruned once (free was low), but the re-check stat failed → fail open.
+        assert reason is None
+        gops.prune_stale_merge_worktrees.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestPreVerifyDiskGuardWiring:
+    """The guard is wired before the first verify in both merge workers."""
+
+    async def test_merge_worker_proceeds_when_space_sufficient(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'disk-ok', 'ok.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = _mock_verify_pass()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                return_value=_usage(50 * _GIB),
+            ),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=[]),
+            ) as mock_prune,
+        ):
+            req = _make_request('disk-ok', 'disk-ok', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        assert mock_verify.call_count == 1
+        mock_prune.assert_not_called()
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_merge_worker_proceeds_when_prune_frees_enough(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'disk-heals', 'heals.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = _mock_verify_pass()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                side_effect=[_usage(2 * _GIB), _usage(50 * _GIB)],
+            ),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=['/x/_merge-stale']),
+            ) as mock_prune,
+        ):
+            req = _make_request('disk-heals', 'disk-heals', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        assert mock_verify.call_count == 1
+        assert mock_prune.call_count == 1
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_merge_worker_fails_open_on_disk_usage_oserror(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'disk-stat-boom', 'boom.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = _mock_verify_pass()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                side_effect=OSError('stat boom'),
+            ),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=[]),
+            ) as mock_prune,
+        ):
+            req = _make_request('disk-stat-boom', 'disk-stat-boom', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        assert mock_verify.call_count == 1
+        mock_prune.assert_not_called()
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_merge_worker_short_circuits_on_persistent_low_disk(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'disk-low', 'low.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = _mock_verify_pass()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                return_value=_usage(1 * _GIB),
+            ),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=[]),
+            ) as mock_prune,
+        ):
+            req = _make_request('disk-low', 'disk-low', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {outcome.reason!r}'
+        )
+        # Build must NOT run when the guard short-circuits.
+        mock_verify.assert_not_called()
+        assert mock_prune.call_count == 1
+        # Main must not have advanced.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'low.py' not in main_files
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_speculative_worker_short_circuits_on_persistent_low_disk(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-disk-low', 'low.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = _mock_verify_pass()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                return_value=_usage(1 * _GIB),
+            ),
+            patch.object(
+                git_ops, 'prune_stale_merge_worktrees',
+                AsyncMock(return_value=[]),
+            ) as mock_prune,
+        ):
+            req = _make_request('spec-disk-low', 'spec-disk-low', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {outcome.reason!r}'
+        )
+        mock_verify.assert_not_called()
         assert mock_prune.call_count == 1
 
         await worker.stop()
