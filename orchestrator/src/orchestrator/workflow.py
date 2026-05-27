@@ -4708,32 +4708,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if self.escalation_queue and not skip_escalation:
             # Fix C short-circuit: the caller determined this failure is not
-            # resolvable by the steward.  Submit L0 for visibility then go
-            # straight to L1 — skip the steward entirely.
+            # resolvable by the steward (e.g. false premise, unactionable spec,
+            # confirmed cycle).  Skip the L0 entirely — a stopped steward
+            # cannot consume it — and submit only the human-facing L1.
+            # This also prevents duplicate design_concern escalations in the
+            # queue (an L0 the steward can never act on + an L1 for the same
+            # report), keeping dashboards clean and preventing orphan-L0 reaper
+            # noise.  The unactionable handler follows the same pattern.
             if escalate_to_human:
-                if not self.escalation_queue.has_open_l1(self.task_id):
-                    from escalation.models import Escalation
-
-                    esc = Escalation(
-                        id=self.escalation_queue.make_id(self.task_id),
-                        task_id=self.task_id,
-                        agent_role='orchestrator',
-                        severity='blocking',
-                        category=category,
-                        summary=reason[:200],
-                        detail=detail or reason,
-                        suggested_action=suggested_action,
-                        worktree=str(self.worktree) if self.worktree else None,
-                        workflow_state=self.state.value,
-                    )
-                    self.escalation_queue.submit(esc)
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.escalation_created,
-                            task_id=self.task_id, phase=self.state.value,
-                            data={'escalation_id': esc.id, 'category': category,
-                                  'severity': 'blocking', 'summary': reason[:200]},
-                        )
                 await self._ensure_l1_escalation_for_blocked(
                     reason, detail or reason, category=category,
                 )

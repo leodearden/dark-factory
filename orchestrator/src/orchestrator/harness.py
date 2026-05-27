@@ -1850,6 +1850,26 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
 
             return report
+        except asyncio.CancelledError:
+            # Hard-cancel: hard_cancel_workflow() called task.cancel() because the
+            # workflow ignored the soft cancel_event for ≥ terminal_status_hard_cancel_polls
+            # consecutive polls.  Catch here (before `except Exception`) so the
+            # wrapper asyncio.Task completes normally (returns a result rather than
+            # entering CANCELLED state).  A synthetic TaskReport(outcome=CANCELLED)
+            # propagates through _collect_done_reports' normal append path and is
+            # persisted by _run_store.save_task_result — symmetric with the BLOCKED
+            # report from `except Exception`.  The `finally` block still runs
+            # unconditionally (lock release, registry cleanup, scheduler.release).
+            logger.warning(
+                'Workflow slot for task %s hard-cancelled — '
+                'returning synthetic CANCELLED report',
+                assignment.task_id,
+            )
+            return TaskReport(
+                task_id=assignment.task_id,
+                title=assignment.task.get('title', ''),
+                outcome=WorkflowOutcome.CANCELLED,
+            )
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
             return TaskReport(
