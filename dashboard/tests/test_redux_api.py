@@ -421,14 +421,17 @@ def test_shape_burndown_emits_completed_and_velocity():
     df = body['BURNDOWN_BY_PROJECT']['dark_factory']
     assert df['completed'] == 2       # 5 - 3
     assert df['velocity'] == 1.0      # 2 / 2 distinct days
+    assert df['window_days'] == 2     # 2026-05-20 and 2026-05-21
 
     ri = body['BURNDOWN_BY_PROJECT']['reify']
     assert ri['completed'] == 2       # 12 - 10
     assert ri['velocity'] == 1.0      # 2 / 2 distinct days
+    assert ri['window_days'] == 2     # same label range
 
     agg = body['BURNDOWN']
     assert agg['completed'] == 4      # sum(2, 2) — not delta on aggregate series
     assert agg['velocity'] == 2.0     # 4 / 2 aggregate distinct days
+    assert agg['window_days'] == 2    # union of all labels = 2 distinct days
 
 
 def test_shape_burndown_completed_ignores_snapshot_frequency():

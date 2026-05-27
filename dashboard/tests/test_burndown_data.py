@@ -2132,3 +2132,39 @@ class TestComputeWindowCompletion:
         result = compute_window_completion({'labels': labels, 'done': done, 'pending': [10] * 100})
         assert result['completed'] == 0
         assert result['velocity'] == 0.0
+
+    def test_mismatched_lengths_returns_zeros(self):
+        """len(labels) != len(done) is a guard branch — must return zeros.
+
+        Mismatched lengths can occur if a series is partially written or truncated.
+        The function must not raise; it returns the safe zero dict.
+        """
+        result = compute_window_completion({
+            'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00'],
+            'done': [1, 2],  # one entry short
+        })
+        assert result['completed'] == 0
+        assert result['velocity'] == 0.0
+        assert result['window_days'] == 0
+
+    def test_none_values_in_done_coerced(self):
+        """None entries in done[] are coerced to 0 via ``x or 0`` guard.
+
+        done[0] = None means the first snapshot had no count recorded.
+        done[-1] = 5 → completed = max(0, 5 - 0) = 5.
+        """
+        result = compute_window_completion({
+            'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00'],
+            'done': [None, 5],
+        })
+        assert result['completed'] == 5
+        assert abs(result['velocity'] - 5 / 2) < 1e-9  # 2 distinct days
+
+    def test_none_at_end_clamps_to_zero(self):
+        """None at done[-1] is coerced to 0: max(0, 0 - 3) = 0 (clamped)."""
+        result = compute_window_completion({
+            'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00'],
+            'done': [3, None],
+        })
+        assert result['completed'] == 0
+        assert result['velocity'] == 0.0

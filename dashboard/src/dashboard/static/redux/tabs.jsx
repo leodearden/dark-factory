@@ -1080,7 +1080,7 @@ function BurnTab({ projectFilter }) {
         return (
           <div className="col-span-12 grid cols-4">
             <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
-                hint="window avg"
+                hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
                 spark={b.done} sparkColor={CP.ok} />
             <ST label="Completed (window)" value={completed}
                 spark={b.done} sparkColor={CP.ok} />

@@ -417,7 +417,7 @@ def compute_forecast_confidence(series: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _distinct_days(labels: list[Any]) -> int:
+def distinct_iso_days(labels: list[Any]) -> int:
     """Count distinct ISO-date prefixes in *labels* (min 1 to avoid div-by-zero)."""
     seen: set[str] = set()
     for lbl in labels:
@@ -428,7 +428,7 @@ def _distinct_days(labels: list[Any]) -> int:
 
 
 def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
-    """Return ``{completed, velocity}`` from a burndown series.
+    """Return ``{completed, velocity, window_days}`` from a burndown series.
 
     ``completed`` is ``max(0, done[-1] - done[0])``, i.e. the net increase in
     the done-count over the window.  Negative deltas (tasks reopened) are
@@ -439,10 +439,14 @@ def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     :func:`compute_forecast_confidence`).  Returns 0.0 if the series has fewer
     than 2 snapshots.
 
-    Returns ``{completed: 0, velocity: 0.0}`` on empty / mismatched / single-
-    snapshot input.
+    ``window_days`` is the distinct-day count used as the denominator (0 when
+    the series has no usable delta, i.e. on empty / mismatched / single-
+    snapshot input).
+
+    Returns ``{completed: 0, velocity: 0.0, window_days: 0}`` on empty /
+    mismatched / single-snapshot input.
     """
-    zero: dict[str, Any] = {'completed': 0, 'velocity': 0.0}
+    zero: dict[str, Any] = {'completed': 0, 'velocity': 0.0, 'window_days': 0}
     labels = list(series.get('labels') or [])
     done = list(series.get('done') or [])
     if not labels or not done:
@@ -453,9 +457,31 @@ def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
         return zero  # single snapshot → no meaningful delta
 
     completed = max(0, (done[-1] or 0) - (done[0] or 0))
-    day_count = _distinct_days(labels)
+    day_count = distinct_iso_days(labels)
     velocity = completed / day_count
-    return {'completed': completed, 'velocity': velocity}
+    return {'completed': completed, 'velocity': velocity, 'window_days': day_count}
+
+
+def aggregate_window_completion(
+    per_project: Mapping[str, Mapping[str, Any]],
+    sorted_labels: list[Any],
+) -> dict[str, Any]:
+    """Return ``{completed, velocity, window_days}`` for the aggregate burndown.
+
+    Uses the **sum-of-per-project-deltas** approach: each project contributes
+    ``p['completed']`` (already clamped by :func:`compute_window_completion`),
+    and the results are summed.  This is robust to projects entering mid-window
+    — computing a delta on the aggregate ``done`` series would over-count tasks
+    from projects whose first snapshot appears after the window start.
+
+    ``window_days`` is the distinct-day count across all ``sorted_labels``
+    (the union of all project label sets), used as the aggregate velocity
+    denominator.
+    """
+    completed = sum(p.get('completed', 0) for p in per_project.values())
+    window_days = distinct_iso_days(sorted_labels)
+    velocity = completed / window_days
+    return {'completed': completed, 'velocity': velocity, 'window_days': window_days}
 
 
 async def get_burndown_series(
