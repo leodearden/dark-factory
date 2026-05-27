@@ -614,6 +614,17 @@ async def test_repeated_probe_raises_surface_infra_issue_escalation(store, tmp_p
         assert body['category'] == 'infra_issue'
         assert body['severity'] == 'info'
         assert body['agent_role'] == 'fused-memory/ticket-janitor'
+        # Count and project_id must round-trip through detail and summary.
+        detail = json.loads(body['detail'])
+        assert detail['consecutive_probe_failures'] == 3, (
+            f'Expected consecutive_probe_failures=3 in detail; got {detail}'
+        )
+        assert detail['project_id'] == project_id, (
+            f'Expected project_id={project_id!r} in detail; got {detail}'
+        )
+        assert str(3) in body['summary'], (
+            f'Expected "3" in summary to confirm count was serialised; got {body["summary"]!r}'
+        )
         # Fail-open preserved: ticket is still pending, never reaped, never stamped
         row = await store.get(ticket_id)
         assert row['status'] == 'pending', (
@@ -718,6 +729,70 @@ async def test_probe_success_resets_consecutive_failure_counter(store, tmp_path)
         assert row['reason'] is None
     finally:
         handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_bail_out_when_orchestrator_not_running(store, tmp_path):
+    """_surface_probe_defect bail-out when the orchestrator is not running.
+
+    Guards the branches of _surface_probe_defect that return early before
+    queue.submit — analogous to the no-orchestrator path in tick() step 4.
+
+    Invariants when the orchestrator is absent:
+    (a) No esc-*.json file is written (bail-out before submit).
+    (b) The per-project failure counter is NOT reset — it keeps accumulating
+        so the defect will be surfaced once the orchestrator starts.
+    (c) _escalation_log[(pid, _PROBE_DEFECT, _PROBE_DEFECT)] stays empty so
+        there is no cooldown recorded and the next tick retries immediately.
+    """
+    from fused_memory.middleware.ticket_janitor import _PROBE_DEFECT
+
+    # Create the lock file but do NOT hold it — _orchestrator_running returns False.
+    _make_orchestrator_layout(tmp_path, hold_lock=False)
+    project_id = _project_id_for(tmp_path)
+    ticket_id = await store.submit(
+        project_id=project_id,
+        candidate_json=_candidate_blob(title='bail-out probe test'),
+    )
+
+    def _always_raises(pid: str) -> bool:
+        raise RuntimeError('probe broken')
+
+    # threshold=1: the very first raise should try to surface — but bail-out
+    # because the orchestrator is not running.
+    janitor = TicketJanitor(
+        store,
+        primary_project_root=str(tmp_path),
+        liveness_probe=_always_raises,
+        probe_defect_threshold=1,
+    )
+
+    for _ in range(3):
+        await janitor.tick()
+
+    esc_dir = tmp_path / 'data' / 'escalations'
+    files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+
+    # (a) No escalation file submitted.
+    assert files == [], (
+        f'Expected no escalation when orchestrator is not running; '
+        f'got {[f.name for f in files]}'
+    )
+    # (b) Counter keeps accumulating — not reset by the bail-out.
+    assert janitor._probe_failures[project_id] == 3, (
+        f'Counter must accumulate (not reset) on bail-out; '
+        f'got {janitor._probe_failures[project_id]}'
+    )
+    # (c) Cooldown log stays empty — no cooldown recorded so next tick retries.
+    key = (project_id, _PROBE_DEFECT, _PROBE_DEFECT)
+    assert janitor._escalation_log[key] == [], (
+        f'Cooldown log must stay empty on bail-out; '
+        f'got {janitor._escalation_log[key]}'
+    )
+    # Ticket is still pending throughout (fail-open preserved).
+    row = await store.get(ticket_id)
+    assert row['status'] == 'pending'
+    assert row['reason'] is None
 
 
 @pytest.mark.asyncio
