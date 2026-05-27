@@ -719,6 +719,17 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Worktree identity guard (Fix C) — on crash-recovery / worktree reuse,
+    # compare the worktree's stored title against the live DB task's title and
+    # quarantine on mismatch.  Catches a recycled task id whose orphaned
+    # worktree carries unrelated WIP (reify task 3770).  Fails open when either
+    # title is missing.
+    worktree_identity_guard_enabled: bool = Field(default=True)
+    # Orphan worktree reaper (Fix B) — at startup, sweep worktrees whose numeric
+    # id no longer maps to a live task: quarantine those with commits/dirty WIP,
+    # reap the provably-empty ones, then prune stale git admin entries.
+    worktree_orphan_reaper_enabled: bool = Field(default=True)
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such

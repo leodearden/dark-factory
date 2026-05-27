@@ -29,11 +29,13 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
 from orchestrator.config import GitConfig
+from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
 
@@ -459,7 +461,9 @@ class GitOps:
         )
         return remote_ref, behind
 
-    async def create_worktree(self, branch_name: str) -> WorktreeInfo:
+    async def create_worktree(
+        self, branch_name: str, *, expected_title: str | None = None,
+    ) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
         Returns a WorktreeInfo with the worktree path and the base commit SHA
@@ -467,7 +471,12 @@ class GitOps:
         advances during task execution.
 
         If the worktree/branch already exist (e.g., from a requeued task),
-        reuses them instead of failing.
+        reuses them instead of failing — UNLESS ``expected_title`` is supplied
+        and the existing worktree's stored title fails to match it (a recycled
+        task id whose orphaned worktree holds unrelated WIP).  On mismatch the
+        stale worktree is quarantined and a fresh one is created instead.
+        ``expected_title=None`` (the default) skips this guard entirely, so all
+        existing callers/tests are unaffected.
         """
         worktree_path = self.worktree_base / branch_name
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -520,7 +529,28 @@ class GitOps:
         # directory (e.g. containing only .task/ state files from a previous
         # run) must be removed so a fresh worktree can be created.
         if worktree_path.exists():
-            if await self._is_registered_worktree(worktree_path):
+            reuse_ok = await self._is_registered_worktree(worktree_path)
+            # ── Identity guard (Fix C, defense-in-depth) ──────────────
+            # A registered worktree whose stored title does not match the
+            # live task's title is a recycled-id collision: the dir name
+            # equals the new task's numeric id but the contents belong to a
+            # deleted task.  Quarantine it (preserving its WIP) and fall
+            # through to a fresh create.  identities_match fails open, so a
+            # title-less legacy worktree is reused as before.
+            if reuse_ok and expected_title is not None:
+                stored_title = read_worktree_title(worktree_path)
+                if not identities_match(stored_title, expected_title):
+                    logger.warning(
+                        'create_worktree: reuse identity MISMATCH for %s — '
+                        'stored title %r != expected %r; quarantining and '
+                        'creating fresh',
+                        worktree_path, stored_title, expected_title,
+                    )
+                    await self.quarantine_worktree(
+                        worktree_path, branch_name, 'reuse-identity-mismatch',
+                    )
+                    reuse_ok = False
+            if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
 
                 # Save any uncommitted tracked work before rebasing
@@ -563,7 +593,12 @@ class GitOps:
                     base_commit=actual_base,
                     stale_commits=stale_commits,
                 )
-            else:
+            elif worktree_path.exists():
+                # Either a stale directory that was never a registered
+                # worktree, or — if it was just quarantined above — already
+                # moved away (worktree_path.exists() is then False and this
+                # branch is skipped).  Remove the leftover stale dir so a
+                # fresh worktree can be created.
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
                     f'git worktree — removing stale directory and creating fresh worktree'
@@ -1756,3 +1791,104 @@ class GitOps:
             logger.warning(f'Failed to delete branch {full_branch}: {err}')
 
         logger.info(f'Cleaned up worktree {worktree} and branch {full_branch}')
+
+    # ── Orphan-worktree hygiene (Fix B/C) ─────────────────────────────
+
+    @property
+    def quarantine_base(self) -> Path:
+        """Sibling base for quarantined worktrees — OUTSIDE ``worktree_base``.
+
+        A direct sibling (``<worktree_dir>-orphaned``) rather than a child, so
+        a quarantined worktree is never re-scanned by crash-recovery or the
+        orphan reaper (both iterate ``worktree_base`` only).
+        """
+        return self.worktree_base.parent / f'{self.worktree_base.name}-orphaned'
+
+    async def worktree_has_unsaved_work(self, worktree: Path, branch: str) -> bool:
+        """Whether a worktree holds work that must be preserved before removal.
+
+        ``True`` if EITHER the branch carries commits beyond main
+        (``rev-list --count main..task/<branch> > 0``) OR the working tree is
+        dirty (``git status --porcelain`` non-empty).  **Fail-safe ``True``**
+        on any git error (including a missing branch) — never report a worktree
+        as safe-to-reap when we cannot prove it is empty and clean.
+        """
+        full_branch = f'{self.config.branch_prefix}{branch}'
+        try:
+            # Commits beyond main.  A missing branch makes rev-list fail → True.
+            rc, out, _ = await _run(
+                ['git', 'rev-list', '--count',
+                 f'{self.config.main_branch}..{full_branch}'],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                return True
+            if int(out.strip()) > 0:
+                return True
+            # No commits beyond main — check for uncommitted WIP in the tree.
+            rc, status_out, _ = await _run(
+                ['git', 'status', '--porcelain'],
+                cwd=worktree,
+            )
+            if rc != 0:
+                return True
+            return bool(status_out.strip())
+        except (WorktreeMissing, ValueError, OSError) as e:
+            logger.warning(
+                'worktree_has_unsaved_work: error inspecting %s (%s) — '
+                'treating as unsaved (fail-safe)', worktree, e,
+            )
+            return True
+
+    async def quarantine_worktree(
+        self, worktree: Path, branch: str, reason: str,
+    ) -> Path | None:
+        """Relocate a worktree (and its branch) into the quarantine base.
+
+        Best-effort: commits any uncommitted WIP first (so it is preserved on
+        the renamed branch), then moves the worktree to
+        ``quarantine_base/<branch>-<UTC-ts>`` and renames the branch to
+        ``task/<branch>-<ts>``.  Logs a WARNING and returns the destination
+        path, or ``None`` if the relocation could not complete.  **Never
+        raises** — callers treat a ``None`` return as "left in place".
+        """
+        ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+        dest_name = f'{branch}-{ts}'
+        dest_path = self.quarantine_base / dest_name
+        try:
+            # Preserve uncommitted WIP on the branch before relocating.
+            try:
+                await self.commit(worktree, f'chore: quarantine WIP ({reason})')
+            except Exception as e:
+                logger.warning(
+                    'quarantine_worktree: WIP commit failed for %s (%s) — '
+                    'continuing with relocation: %s', worktree, reason, e,
+                )
+            await self.rename_worktree(worktree, dest_path, branch, dest_name)
+            logger.warning(
+                'QUARANTINED worktree %s -> %s (reason=%s)',
+                worktree, dest_path, reason,
+            )
+            return dest_path
+        except Exception as e:
+            logger.warning(
+                'quarantine_worktree: failed to relocate %s (reason=%s): %s',
+                worktree, reason, e,
+            )
+            return None
+
+    async def prune_worktrees(self) -> None:
+        """Best-effort ``git worktree prune`` — clears stale admin entries.
+
+        Clears the ``.git/worktrees`` administrative records left behind by
+        worktrees removed off-band (manual ``rm -rf``, quarantine, reap).
+        Never raises.
+        """
+        try:
+            rc, _, err = await _run(
+                ['git', 'worktree', 'prune'], cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning('prune_worktrees: git worktree prune failed: %s', err)
+        except Exception as e:
+            logger.warning('prune_worktrees: git worktree prune raised: %s', e)

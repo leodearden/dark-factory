@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -3014,3 +3015,102 @@ class TestRunWorktreeMissing:
         with pytest.raises(FileNotFoundError) as exc:
             await _run(['definitely-not-a-real-binary-xyz'])
         assert not isinstance(exc.value, WorktreeMissing)
+
+
+def _write_stored_title(worktree: Path, title: str) -> None:
+    """Write a ``.task/metadata.json`` carrying ``title`` into *worktree*."""
+    task_dir = worktree / '.task'
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / 'metadata.json').write_text(
+        json.dumps({'title': title, 'task_id': worktree.name})
+    )
+
+
+@pytest.mark.asyncio
+class TestWorktreeReuseIdentityGuard:
+    """Fix C reuse path — create_worktree(expected_title=...) quarantines a
+    recycled-id worktree instead of reusing it for the wrong task."""
+
+    async def test_reuse_when_title_matches(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('reuse-match')
+        _write_stored_title(info.path, 'Build the frobnicator')
+
+        info2 = await git_ops.create_worktree(
+            'reuse-match', expected_title='Build the frobnicator',
+        )
+        assert info2.path == info.path  # reused, not recreated
+        assert not git_ops.quarantine_base.exists()  # nothing quarantined
+
+    async def test_quarantine_and_fresh_create_on_mismatch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('recycled')
+        _write_stored_title(info.path, 'Trajectory beta: spline solver')
+        # A tracked file that belongs to the WRONG (orphaned) task.
+        (info.path / 'spline.rs').write_text('fn solve() {}\n')
+        await git_ops.commit(info.path, 'trajectory WIP')
+
+        info2 = await git_ops.create_worktree(
+            'recycled', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        # Fresh worktree at the original path, WITHOUT the orphan's file.
+        assert info2.path == info.path
+        assert info2.path.exists()
+        assert (info2.path / 'README.md').exists()
+        assert not (info2.path / 'spline.rs').exists()
+
+        # The orphan was relocated to the sibling quarantine base, file intact.
+        assert git_ops.quarantine_base.exists()
+        quarantined = list(git_ops.quarantine_base.glob('recycled-*'))
+        assert len(quarantined) == 1
+        assert (quarantined[0] / 'spline.rs').exists()
+
+    async def test_none_expected_title_skips_guard(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('reuse-noguard')
+        _write_stored_title(info.path, 'Original task')
+
+        # expected_title omitted → guard skipped → reused despite any mismatch.
+        info2 = await git_ops.create_worktree('reuse-noguard')
+        assert info2.path == info.path
+        assert not git_ops.quarantine_base.exists()
+
+
+@pytest.mark.asyncio
+class TestOrphanWorktreeHelpers:
+    """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
+
+    async def test_quarantine_moves_and_preserves_committed_work(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-task')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        dest = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
+
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert (dest / 'work.py').exists()  # committed work preserved
+        assert not info.path.exists()  # moved out of the scanned base
+        # Original branch was renamed away.
+        _, branches, _ = await _run(
+            ['git', 'branch', '--list', 'task/q-task'], cwd=git_ops.project_root,
+        )
+        assert branches.strip() == ''
+
+    async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('clean-wt')
+        assert await git_ops.worktree_has_unsaved_work(info.path, 'clean-wt') is False
+
+    async def test_unsaved_work_true_on_commit(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('commit-wt')
+        (info.path / 'f.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'a commit beyond main')
+        assert await git_ops.worktree_has_unsaved_work(info.path, 'commit-wt') is True
+
+    async def test_unsaved_work_true_on_dirty_tree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('dirty-wt')
+        (info.path / 'untracked.py').write_text('a = 1\n')  # uncommitted WIP
+        assert await git_ops.worktree_has_unsaved_work(info.path, 'dirty-wt') is True
+
+    async def test_unsaved_work_failsafe_on_missing_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('exists-wt')
+        # Query a branch with no task/ ref → rev-list fails → fail-safe True.
+        assert await git_ops.worktree_has_unsaved_work(info.path, 'no-such-branch') is True

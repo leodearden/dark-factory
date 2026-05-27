@@ -514,7 +514,17 @@ class TaskWorkflow:
         # If the caller pre-created the worktree (eval mode) skip creation
         # and rev-parse HEAD instead.
         if self.worktree is None:
-            worktree_info = await self.git_ops.create_worktree(branch_name)
+            # Pass the live task title so create_worktree can quarantine a
+            # reused worktree whose stored identity belongs to a different
+            # (recycled-id) task — defense-in-depth behind Fix C's flag.
+            worktree_info = await self.git_ops.create_worktree(
+                branch_name,
+                expected_title=(
+                    self.task.get('title')
+                    if self.config.worktree_identity_guard_enabled
+                    else None
+                ),
+            )
             self.worktree = worktree_info.path
             base_commit = worktree_info.base_commit
         else:

@@ -37,6 +37,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
     from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker
@@ -681,6 +682,12 @@ class Harness:
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
 
+            # 2e. Reap/quarantine orphan worktrees (Fix B).  Runs here — after
+            # recovery + stranded-reconcile and before the first acquire_next —
+            # so scheduler._dispatched is empty and no live workflow can race
+            # the sweep.  Self-gates on worktree_orphan_reaper_enabled.
+            await self._reap_orphan_worktrees()
+
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
             logger.info(f'Task tree populated: {self.report.total_tasks} pending tasks')
@@ -1172,6 +1179,45 @@ Output JSON matching the schema. Every task must appear in the output.
                 cleaned += 1
                 continue
 
+            # ── Semantic identity guard (Fix C) ───────────────────────
+            # The numeric guard above only proves plan.task_id == dirname.
+            # For a RECYCLED id both equal the NEW task's id, so it passes
+            # even when the worktree's content belongs to the deleted task
+            # (reify task 3770 adopted a trajectory plan onto a cycle-breaker
+            # task).  Compare the worktree's stored title to the LIVE DB
+            # task's title and quarantine on a provable mismatch — this is the
+            # exact line that would have caught 3770.
+            if self.config.worktree_identity_guard_enabled:
+                live = await self.scheduler.get_task(task_id)
+                if live is None:
+                    # get_task returns None for BOTH "deleted" and transient
+                    # error — both safely handled by deferring: do not adopt,
+                    # do not destroy.  The orphan reaper (which fail-safes on
+                    # an empty task list) handles a genuinely-deleted task.
+                    logger.warning(
+                        'Recovery: worktree %s has no live DB task — deferring '
+                        '(no adopt, no destroy)', task_id,
+                    )
+                    continue
+                stored_title = read_worktree_title(entry)
+                if not identities_match(stored_title, live.get('title')):
+                    logger.warning(
+                        'Recovery: worktree %s identity MISMATCH — stored title '
+                        '%r != live %r; quarantining',
+                        task_id, stored_title, live.get('title'),
+                    )
+                    await self.git_ops.quarantine_worktree(
+                        entry, task_id, 'recovery-identity-mismatch',
+                    )
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.worktree_quarantined,
+                            task_id=task_id,
+                            data={'reason': 'recovery-identity-mismatch'},
+                        )
+                    cleaned += 1
+                    continue
+
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)
             completed = [
@@ -1238,6 +1284,101 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.info(
                 f'Crash recovery: {recovered} plans recovered, '
                 f'{cleaned} worktrees cleaned'
+            )
+
+    async def _reap_orphan_worktrees(self) -> None:
+        """Reap/quarantine worktrees whose id no longer maps to a live task.
+
+        Worktrees are keyed purely on the numeric task id and are cleaned only
+        on merge/done or crash-recovery heuristics — never when a task is
+        deleted from the DB.  Such an orphan survives on disk and can later be
+        adopted for an unrelated (recycled-id) task (Fix B closes that gap).
+
+        Run ONCE at startup, AFTER ``_reconcile_stranded_in_progress`` and
+        BEFORE the first ``acquire_next`` — at that point
+        ``scheduler._dispatched`` is empty so no live workflow can race the
+        sweep.
+
+        Policy: **quarantine** anything with commits OR uncommitted WIP
+        (preserving it); **reap** only provably-empty/clean dirs.  Fail-safe:
+        an empty task list (likely a transient DB failure) ABORTS the sweep —
+        never mass-destroy.
+
+        Self-gates on ``worktree_orphan_reaper_enabled`` so the call site can
+        stay unconditional and the flag is honoured from a direct invocation.
+        """
+        if not self.config.worktree_orphan_reaper_enabled:
+            return
+
+        worktree_base = self.git_ops.worktree_base
+        if not worktree_base.exists():
+            return
+
+        tasks = await self.scheduler.get_tasks()
+        if not tasks:
+            logger.warning(
+                'Orphan reaper: get_tasks() returned empty — aborting sweep '
+                '(fail-safe against transient DB failure)'
+            )
+            return
+        live_ids = {str(t['id']) for t in tasks}
+
+        reaped = 0
+        quarantined = 0
+        for entry in worktree_base.iterdir():
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            # Skip reserved (merge / auto-eval skip-attempt) worktrees.
+            if name.startswith('_merge-') or name.endswith('-skip-attempt'):
+                continue
+            # Skip live, recovered, preserved, and in-flight worktrees.
+            if (
+                name in live_ids
+                or name in self._recovered_plans
+                or name in self._preserved_worktrees
+                or name in self._recovered_sessions
+                or name in self.scheduler._dispatched
+            ):
+                continue
+
+            # Orphan: numeric id no longer maps to a live task.
+            if await self.git_ops.worktree_has_unsaved_work(entry, name):
+                dest = await self.git_ops.quarantine_worktree(
+                    entry, name, 'orphan-reaper',
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.worktree_quarantined,
+                        task_id=name,
+                        data={
+                            'reason': 'orphan-reaper',
+                            'dest': str(dest) if dest else None,
+                        },
+                    )
+                quarantined += 1
+                logger.info(
+                    'Orphan reaper: quarantined %s (had unsaved work)', name,
+                )
+            else:
+                await self.git_ops.cleanup_worktree(entry, name)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.worktree_reaped,
+                        task_id=name,
+                        data={'reason': 'orphan-reaper'},
+                    )
+                reaped += 1
+                logger.info(
+                    'Orphan reaper: reaped %s (clean, no commits)', name,
+                )
+
+        # Clear stale .git/worktrees admin entries (best-effort, never raises).
+        await self.git_ops.prune_worktrees()
+
+        if reaped or quarantined:
+            logger.info(
+                'Orphan reaper: %d reaped, %d quarantined', reaped, quarantined,
             )
 
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
