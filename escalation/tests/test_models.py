@@ -22,7 +22,7 @@ class TestBornAtL2Severities:
 
     def test_constant_contains_exactly_critical_and_urgent(self):
         """BORN_AT_L2_SEVERITIES contains exactly {'critical', 'urgent'} — no extras."""
-        assert BORN_AT_L2_SEVERITIES == frozenset({'critical', 'urgent'})
+        assert frozenset({'critical', 'urgent'}) == BORN_AT_L2_SEVERITIES
 
 
 class TestEscalationLevelDefault:
