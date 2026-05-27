@@ -136,3 +136,73 @@ class TestHarnessDocstringReflectsL2Ladder:
         """_dismiss_stale_escalations docstring must name the actual L1 consumer."""
         doc = Harness._dismiss_stale_escalations.__doc__ or ""
         assert "auto-watcher" in doc
+
+
+# ===========================================================================
+# Step-5 tests: audit-notes markdown file
+# ===========================================================================
+
+_AUDIT_DOC = _REPO_ROOT / 'plans' / 'task-1503-l1-assumptions-audit.md'
+
+_REQUIRED_HEADINGS = [
+    '## Flagged behavioral L1-assumptions',
+    '## Files updated in task 1503',
+    '## Deferred / out-of-scope',
+]
+
+_REQUIRED_CALL_SITES = [
+    '_handle_wip_conflict',
+    '_handle_wip_recovery',
+    '_handle_wip_recovery_no_advance',
+    '_handle_unmerged_state',
+    '_handle_terminal_exit_on_block',
+    '_ensure_l1_escalation_for_blocked',
+    'trigger_retry_cap_exhausted',
+    'escalate_to_human=',
+]
+
+
+class TestL1AssumptionsAuditDocExists:
+    """plans/task-1503-l1-assumptions-audit.md must exist and name all flagged sites."""
+
+    def test_audit_doc_exists(self):
+        assert _AUDIT_DOC.exists(), f"Expected audit doc at {_AUDIT_DOC}"
+
+    def test_audit_doc_has_flagged_section(self):
+        text = _AUDIT_DOC.read_text()
+        assert '## Flagged behavioral L1-assumptions' in text
+
+    def test_audit_doc_has_files_updated_section(self):
+        text = _AUDIT_DOC.read_text()
+        assert '## Files updated in task 1503' in text
+
+    def test_audit_doc_has_deferred_section(self):
+        text = _AUDIT_DOC.read_text()
+        assert '## Deferred / out-of-scope' in text
+
+    def test_audit_doc_names_handle_wip_conflict(self):
+        assert '_handle_wip_conflict' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_handle_wip_recovery(self):
+        assert '_handle_wip_recovery' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_handle_wip_recovery_no_advance(self):
+        assert '_handle_wip_recovery_no_advance' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_handle_unmerged_state(self):
+        assert '_handle_unmerged_state' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_handle_terminal_exit_on_block(self):
+        assert '_handle_terminal_exit_on_block' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_ensure_l1_escalation_for_blocked(self):
+        assert '_ensure_l1_escalation_for_blocked' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_trigger_retry_cap_exhausted(self):
+        assert 'trigger_retry_cap_exhausted' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_names_escalate_to_human_param(self):
+        assert 'escalate_to_human=' in _AUDIT_DOC.read_text()
+
+    def test_audit_doc_links_to_l2_tiering_plan(self):
+        assert 'escalation-l2-tiering.md' in _AUDIT_DOC.read_text()
