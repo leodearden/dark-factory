@@ -1996,6 +1996,11 @@ Output JSON matching the schema. Every task must appear in the output.
             ) is not None:
                 return                         # dedup: one open L2 at a time
             from escalation.models import Escalation
+            # NOTE: two get_pending() traversals occur here (one inside
+            # find_pending_l2_by_root_cause above, one for n_l1 below).
+            # This is acceptable at typical escalation-queue depths; if the
+            # queue grows large, consider caching the pending list within a
+            # single call or offloading to asyncio.to_thread.
             n_l1 = len([
                 e for e in queue.get_pending() if e.level == 1
             ])
@@ -3322,9 +3327,18 @@ Output JSON matching the schema. Every task must appear in the output.
         Mirrors _start_terminal_status_watcher.
         """
         if not self.config.watcher_supervisor_enabled:
-            # Supervisor permanently disabled — file the outage L2 so the
+            # Supervisor permanently disabled — file an outage L2 so the
             # human L2 stream is notified (idempotent: dedup guard no-ops if
-            # already open).
+            # one is already open, so repeated restarts produce exactly one L2).
+            #
+            # Intentional-disable note: when the supervisor is deliberately
+            # disabled via config, this L2 will remain open indefinitely because
+            # the only auto-resolver (_resolve_watcher_outage_l2) runs from the
+            # healthy-clean branch of _watcher_supervisor_loop, which never
+            # executes while the supervisor is disabled.  This is expected
+            # behaviour — the operator should manually resolve/dismiss the L2
+            # once they have verified the disable is intentional.  The 'urgent'
+            # severity is intentional: no autonomous L1 triage is occurring.
             self._file_watcher_outage_l2('watcher_supervisor_enabled=false')
             return
         if (
@@ -3641,18 +3655,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 reason,
             )
         # File the watcher-outage L2 so the human L2 stream is notified even
-        # when the watcher subsystem is not running.  Best-effort: a filing
-        # failure must never prevent the return True that stops the supervisor.
-        try:
-            self._file_watcher_outage_l2(reason)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                '_file_watcher_outage_l2 raised on %s trip; stopping supervisor anyway',
-                reason,
-                exc_info=True,
-            )
+        # when the watcher subsystem is not running.  No outer try/except needed
+        # here: _file_watcher_outage_l2 is already best-effort (its body is
+        # entirely wrapped in `except Exception`), so any filing failure is
+        # swallowed internally.  CancelledError is not raised by the sync helper.
+        self._file_watcher_outage_l2(reason)
         return True  # always stop, even if pause_scheduler raised
 
     async def _scan_for_terminal_active_tasks(self) -> int:
