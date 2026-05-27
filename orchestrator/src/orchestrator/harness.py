@@ -1987,19 +1987,20 @@ Output JSON matching the schema. Every task must appear in the output.
         is swallowed so this never breaks the supervisor / cost-ceiling /
         startup paths.
         """
-        if not self._escalation_queue:        # bare-Harness unit tests stay green
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
             return
         try:
-            if self._escalation_queue.find_pending_l2_by_root_cause(
+            if queue.find_pending_l2_by_root_cause(
                 self._WATCHER_OUTAGE_ROOT_CAUSE
             ) is not None:
                 return                         # dedup: one open L2 at a time
             from escalation.models import Escalation
             n_l1 = len([
-                e for e in self._escalation_queue.get_pending() if e.level == 1
+                e for e in queue.get_pending() if e.level == 1
             ])
             esc = Escalation(
-                id=self._escalation_queue.make_id(self._WATCHER_OUTAGE_SENTINEL),
+                id=queue.make_id(self._WATCHER_OUTAGE_SENTINEL),
                 task_id=self._WATCHER_OUTAGE_SENTINEL,
                 agent_role='orchestrator-watcher-supervisor',
                 severity='urgent',
@@ -2020,7 +2021,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 ),
                 suggested_action='investigate_watcher_supervisor',
             )
-            self._escalation_queue.submit(esc)
+            queue.submit(esc)
             logger.warning(
                 'Filed L2 watcher-outage escalation %s (reason=%s, n_l1=%d)',
                 esc.id, reason, n_l1,
@@ -2038,15 +2039,16 @@ Output JSON matching the schema. Every task must appear in the output.
         No-op when no pending L2 with root_cause='watcher_supervisor_down' exists.
         Best-effort: failures are swallowed so the supervisor loop never breaks.
         """
-        if not self._escalation_queue:
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
             return
         try:
-            existing_id = self._escalation_queue.find_pending_l2_by_root_cause(
+            existing_id = queue.find_pending_l2_by_root_cause(
                 self._WATCHER_OUTAGE_ROOT_CAUSE
             )
             if existing_id is None:
                 return
-            self._escalation_queue.resolve(
+            queue.resolve(
                 existing_id,
                 resolution='watcher recovered',
                 resolved_by='orchestrator-watcher-supervisor',
@@ -3314,6 +3316,10 @@ Output JSON matching the schema. Every task must appear in the output.
         Mirrors _start_terminal_status_watcher.
         """
         if not self.config.watcher_supervisor_enabled:
+            # Supervisor permanently disabled — file the outage L2 so the
+            # human L2 stream is notified (idempotent: dedup guard no-ops if
+            # already open).
+            self._file_watcher_outage_l2('watcher_supervisor_enabled=false')
             return
         if (
             self._watcher_supervisor_task is not None
