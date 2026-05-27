@@ -229,14 +229,17 @@ def find_dedupe_parent(
 ) -> str | None:
     """Return the id of the oldest matching pending parent, or None.
 
+    Short-circuit: if ``candidate_key`` (the resolved key of the candidate) is
+    falsy (None, empty tuple, empty string), the function returns ``None``
+    immediately — falsy keys are never matched to prevent unrelated or
+    unstamped escalations from collapsing.
+
     A parent matches when ALL of the following hold:
     - ``parent.status == 'pending'`` (get_pending() already ensures this).
     - ``parent.category == candidate.category``.
     - ``key_fn(parent) == key_fn(candidate)`` where key_fn is resolved from
       ``config.key_fn`` (None → ``_default_summary_key`` wrapping
       ``summary_dedupe_key``).
-    - ``candidate_key`` is falsy (None, empty tuple, empty string) — falsy
-      keys are never matched to prevent unrelated escalations from collapsing.
     - Age filter: ``(now - parsed(parent.timestamp)) <= window_secs``, UNLESS
       ``config.infra_dedupe_window_secs`` is ``float('inf')`` (unbounded) in
       which case the age filter is skipped entirely.  Parent timestamps are

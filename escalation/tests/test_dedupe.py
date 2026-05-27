@@ -902,6 +902,62 @@ class TestSubmitOrDedupe:
         parent = Escalation.from_json(self._queue_files(queue)[0].read_text())
         assert parent.dedupe_count == 1
 
+    # --- Gate conditions ---
+
+    def test_gate_disabled_skips_dedup(self, tmp_path):
+        """Gate: infra_dedupe_enabled=False => always queued, no fold even with same-key parent."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        cfg = DedupeConfig(infra_dedupe_enabled=False)
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_infra_esc('esc-1-1')
+        r1 = submit_or_dedupe(queue, esc1, cfg)
+        assert r1['status'] == 'queued'
+
+        # Same-key summary — would fold under the default enabled config.
+        esc2 = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+        r2 = submit_or_dedupe(queue, esc2, cfg)
+
+        assert r2['status'] == 'queued', (
+            f'Disabled gate must never fold; got: {r2}'
+        )
+        assert len(self._queue_files(queue)) == 2
+
+    def test_gate_wrong_category_skips_dedup(self, tmp_path):
+        """Gate: category not in infra_dedupe_categories => always queued, no fold."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        # Default config gates on 'infra_issue' only; use a design_concern escalation.
+        cfg = DedupeConfig()  # infra_dedupe_categories=('infra_issue',)
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        def _make_design(esc_id: str):
+            return Escalation(
+                id=esc_id,
+                task_id='42',
+                agent_role='implementer',
+                severity='info',
+                category='design_concern',
+                summary='fused-memory connection timeout on port 8002',
+            )
+
+        esc1 = _make_design('esc-1-1')
+        r1 = submit_or_dedupe(queue, esc1, cfg)
+        assert r1['status'] == 'queued'
+
+        # Same summary tokens — would fold if category matched.
+        esc2 = _make_design('esc-1-2')
+        r2 = submit_or_dedupe(queue, esc2, cfg)
+
+        assert r2['status'] == 'queued', (
+            f'Out-of-scope category must never fold; got: {r2}'
+        )
+        assert len(self._queue_files(queue)) == 2
+
     # --- TOCTOU ---
 
     def test_toctou_falls_through_to_submit(self, tmp_path, monkeypatch):
