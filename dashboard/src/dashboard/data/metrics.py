@@ -29,7 +29,12 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
-from dashboard.data.memory import get_curator_state, get_memory_status, get_queue_stats, mcp_tool_call
+from dashboard.data.memory import (
+    get_curator_state,
+    get_memory_status,
+    get_queue_stats,
+    mcp_tool_call,
+)
 from dashboard.data.merge_queue import active_queued_merges
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
