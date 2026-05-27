@@ -2373,6 +2373,56 @@ class TaskWorkflow:
             escalate_to_human=True,
         )
 
+    async def _handle_false_premise_report(self) -> WorkflowOutcome:
+        """Process a ``.task/false_premise.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        Stops the steward early to close the small async window where a
+        stale L0 from a prior PLAN attempt could be processed concurrently
+        with our L1 submission.  The ``finally`` block in ``run()`` also
+        stops the steward, so this is defense-in-depth.
+
+        Then short-circuits to ``_mark_blocked(escalate_to_human=True,
+        category='design_concern')``, which submits a level-1 design_concern
+        escalation directly without invoking the steward — only a human/curator
+        can re-spec a test premise or relocate a signal to a different task.
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_false_premise()
+        assert report is not None  # caller must have verified
+
+        classification = str(report.get('classification') or '')
+        premise = str(report.get('premise') or '').strip()
+        evidence = str(report.get('evidence') or '')
+        proposed_resolution = str(report.get('proposed_resolution') or '')
+
+        if self._steward:
+            await self._steward.stop()
+            self._steward = None
+
+        self.artifacts.clear_false_premise()
+
+        if not premise:
+            return await self._mark_blocked(
+                'Architect wrote malformed false_premise.json '
+                '(missing premise)',
+                detail=json.dumps(report, indent=2)[:2000],
+                escalate_to_human=True,
+                category='design_concern',
+            )
+
+        return await self._mark_blocked(
+            f'Architect reported false RED-test premise: {premise}',
+            detail=(
+                f'classification: {classification}\n'
+                f'evidence: {evidence}\n'
+                f'proposed_resolution: {proposed_resolution}'
+            )[:2000],
+            escalate_to_human=True,
+            category='design_concern',
+        )
+
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
         # Clear stale merge-failure review from prior runs — prevents
