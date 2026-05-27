@@ -417,6 +417,47 @@ def compute_forecast_confidence(series: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _distinct_days(labels: list[Any]) -> int:
+    """Count distinct ISO-date prefixes in *labels* (min 1 to avoid div-by-zero)."""
+    seen: set[str] = set()
+    for lbl in labels:
+        day = (lbl[:10] if isinstance(lbl, str) and len(lbl) >= 10 else None)
+        if day:
+            seen.add(day)
+    return max(1, len(seen))
+
+
+def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``{completed, velocity}`` from a burndown series.
+
+    ``completed`` is ``max(0, done[-1] - done[0])``, i.e. the net increase in
+    the done-count over the window.  Negative deltas (tasks reopened) are
+    clamped to 0.
+
+    ``velocity`` is ``completed / distinct_day_count`` where distinct days are
+    derived from ISO date prefixes of *labels* (same convention as
+    :func:`compute_forecast_confidence`).  Returns 0.0 if the series has fewer
+    than 2 snapshots.
+
+    Returns ``{completed: 0, velocity: 0.0}`` on empty / mismatched / single-
+    snapshot input.
+    """
+    zero: dict[str, Any] = {'completed': 0, 'velocity': 0.0}
+    labels = list(series.get('labels') or [])
+    done = list(series.get('done') or [])
+    if not labels or not done:
+        return zero
+    if len(labels) != len(done):
+        return zero
+    if len(labels) < 2:
+        return zero  # single snapshot → no meaningful delta
+
+    completed = max(0, (done[-1] or 0) - (done[0] or 0))
+    day_count = _distinct_days(labels)
+    velocity = completed / day_count
+    return {'completed': completed, 'velocity': velocity}
+
+
 async def get_burndown_series(
     db: aiosqlite.Connection | None,
     project_id: str,
