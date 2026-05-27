@@ -353,6 +353,135 @@ def create_server(
             return {'error': f'Escalation {escalation_id} not found'}
         return esc.to_dict()
 
+    # --- L2 promotion tool ---
+
+    @mcp.tool()
+    async def promote_to_l2(
+        task_id: str,
+        agent_role: str,
+        member_ids: list[str],
+        root_cause: str,
+        evidence: str,
+        options: list[str],
+        summary: str,
+        category: str = 'design_concern',
+        severity: str = 'blocking',
+    ) -> dict[str, Any]:
+        """Promote one or more L1 escalations to an L2 cluster (human-facing).
+
+        This tool is for the auto-watcher to file a cluster of related L1
+        escalations as a single L2 decision point.  The L2 records the member
+        L1 ids, the root-cause dedup key, and the proposed options for human
+        resolution.  When the human resolves (or dismisses) the L2, the
+        resolution cascades automatically to all member L1s.
+
+        **Root-cause dedup**: if a pending L2 with the same *root_cause* already
+        exists, this call UPDATES that existing L2 (appends new members) rather
+        than filing a duplicate.  The response ``status`` distinguishes the two
+        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.
+
+        **Members stay at L1**: the member L1 escalations are referenced but
+        NOT promoted; they remain pending at L1 until the L2 is resolved.
+
+        **Bypasses chokepoint**: this tool calls ``queue.submit()`` directly
+        (create path) or ``queue.add_members_to_l2()`` (update path).  The
+        terminal-task auto-resolve gate and severity→level=2 gate in
+        ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
+        explicitly by this tool.
+
+        Parameters
+        ----------
+        task_id:
+            Passed to ``queue.make_id()`` for id generation.  Typically the
+            first member L1's task id.
+        agent_role:
+            Caller identity, e.g. ``'escalation-watcher-auto'``.
+        member_ids:
+            Non-empty list of L1 escalation ids forming this cluster.
+            Passing an empty list returns ``{'error': ...}``.
+        root_cause:
+            Non-empty exact-string dedup key.  Whitespace-only input returns
+            ``{'error': ...}`` (mirrors ``find_pending_l2_by_root_cause``).
+        evidence:
+            Supporting context — stored in the escalation's ``detail`` field.
+        options:
+            Proposed resolution paths, e.g. ``['A: rollback', 'B: fix forward',
+            'C: something else']``.
+        summary:
+            One-line cluster hypothesis.
+        category:
+            Escalation category; defaults to ``'design_concern'``.
+        severity:
+            Severity tag; defaults to ``'blocking'``.  Decoupled from
+            ``level=2`` — the tool sets ``level=2`` explicitly.  Must be one
+            of ``models.KNOWN_SEVERITIES``; unknown values return
+            ``{'error': ...}`` (mirrors ``escalate_blocker`` validation).
+
+        Response shapes
+        ---------------
+        Create (new L2)::
+
+            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>]}
+
+        Update (existing pending L2 with same root_cause)::
+
+            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>]}
+
+        Error::
+
+            {'error': '<reason>'}
+        """
+        # Validate required non-empty fields
+        if not member_ids:
+            return {'error': 'member_ids must be a non-empty list'}
+        if not root_cause.strip():
+            return {'error': 'root_cause must be a non-empty string'}
+        if severity not in KNOWN_SEVERITIES:
+            return {
+                'error': (
+                    f'invalid severity {severity!r}; '
+                    f'expected one of {sorted(KNOWN_SEVERITIES)}'
+                ),
+            }
+
+        # Dedup check: look for an existing pending L2 with the same root_cause.
+        existing_id = queue.find_pending_l2_by_root_cause(root_cause)
+        if existing_id is not None:
+            updated = queue.add_members_to_l2(existing_id, list(dict.fromkeys(member_ids)))
+            if updated is not None:
+                return {
+                    'id': existing_id,
+                    'status': 'updated',
+                    'members': updated.members,
+                }
+            # Race: the pending L2 was resolved/archived between find and update.
+            # Fall through to the create path so the caller gets a valid result
+            # rather than a misleading {'status': 'updated', 'members': []}.
+            logger.warning(
+                'promote_to_l2: pending L2 %s disappeared during member-update (race); '
+                'creating a new L2 for root_cause=%r',
+                existing_id, root_cause,
+            )
+
+        # Create path: build a fresh L2 and submit it.
+        # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
+        # do not create duplicate entries in the on-disk record.
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=agent_role,
+            severity=severity,
+            category=category,
+            summary=summary,
+            detail=evidence,
+            level=2,
+            members=list(dict.fromkeys(member_ids)),
+            root_cause=root_cause.strip(),
+            options=list(options),
+        )
+        queue.submit(esc)
+        return {'id': esc.id, 'status': 'created', 'members': esc.members}
+
     # --- Merge queue tools ---
 
     @mcp.tool()

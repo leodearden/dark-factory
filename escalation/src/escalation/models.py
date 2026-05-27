@@ -7,6 +7,11 @@ Consumer-per-level contract (invariant):
 
 Escalations are born at L2 when their severity is in BORN_AT_L2_SEVERITIES.
 All other escalations start at L0 (level=0) and are promoted by handlers.
+
+L2 cluster fields (default-empty; L0/L1 are unaffected):
+  members:    list of member L1 escalation ids forming this cluster
+  root_cause: exact-string dedup key for pending-L2 lookup
+  options:    proposed resolution options (e.g. ['A: rollback', 'B: fix forward'])
 """
 
 from __future__ import annotations
@@ -49,6 +54,12 @@ class Escalation:
     dedupe_count: int = 0  # number of duplicate submissions folded into this parent
     dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
     dedupe_fingerprint: str | None = None  # content fingerprint for A7a/A7b recon dedup
+    # L2 cluster fields — empty defaults keep L0/L1 escalations bit-identical on disk.
+    # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
+    # filter: absent keys map to the dataclass defaults without any migration required.
+    members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
+    root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
+    options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
 
     def to_dict(self) -> dict:
         return asdict(self)

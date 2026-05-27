@@ -1811,3 +1811,408 @@ class TestAttachDedupeChild:
         assert result.severity == 'blocking'
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
+
+class TestFindPendingL2ByRootCause:
+    """EscalationQueue.find_pending_l2_by_root_cause() locates a pending L2 by root_cause string."""
+
+    def _make_l2(self, queue: EscalationQueue, task_id: str, root_cause: str) -> Escalation:
+        """Submit a pending L2 escalation with the given root_cause."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster test',
+            level=2,
+            root_cause=root_cause,
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_returns_id_of_matching_pending_l2(self, tmp_path: Path):
+        """(a) Returns the id of a pending L2 whose root_cause matches."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result == l2.id
+
+    def test_returns_none_when_no_l2_has_root_cause(self, tmp_path: Path):
+        """(b) Returns None when no L2 has the given root_cause."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Some other root cause')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None
+
+    def test_returns_none_when_only_l0_l1_has_root_cause(self, tmp_path: Path):
+        """(c) Returns None when only an L0 or L1 has the root_cause (level filter)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        # L0 with matching root_cause
+        l0 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='L0 test',
+            level=0,
+            root_cause='Bad merge strategy',
+        )
+        queue.submit(l0)
+        # L1 with matching root_cause
+        l1 = Escalation(
+            id=queue.make_id('task-2'),
+            task_id='task-2',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test',
+            level=1,
+            root_cause='Bad merge strategy',
+        )
+        queue.submit(l1)
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None, f'Expected None (level filter), got {result!r}'
+
+    def test_returns_none_when_matching_l2_is_already_resolved(self, tmp_path: Path):
+        """(d) Returns None when the matching L2 is already resolved (status filter)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+        queue.resolve(l2.id, 'Fixed')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result is None
+
+    def test_returns_oldest_when_multiple_pending_l2s_share_root_cause(self, tmp_path: Path):
+        """(e) Returns the OLDEST (by timestamp) when multiple pending L2s share root_cause."""
+        import time
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+        time.sleep(0.01)  # ensure distinct timestamps
+        newer = self._make_l2(queue, 'task-2', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        assert result == older.id, (
+            f'Expected oldest id={older.id!r}, got {result!r} (newer={newer.id!r})'
+        )
+
+    def test_returns_none_for_empty_root_cause(self, tmp_path: Path):
+        """(f) Returns None for an empty root_cause (never match)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', '')  # L2 with empty root_cause
+
+        result = queue.find_pending_l2_by_root_cause('')
+
+        assert result is None
+
+    def test_returns_none_for_whitespace_only_root_cause(self, tmp_path: Path):
+        """(f cont.) Returns None for whitespace-only root_cause (never match)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('   ')
+
+        assert result is None
+
+    def test_match_is_whitespace_trim_tolerant(self, tmp_path: Path):
+        """(g) Trailing/leading whitespace in the query is stripped — 'Bad merge' matches 'Bad merge '."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        result = queue.find_pending_l2_by_root_cause('Bad merge strategy  ')
+
+        assert result == l2.id, (
+            f'Expected match despite trailing whitespace; got {result!r}'
+        )
+
+
+class TestAddMembersToL2:
+    """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
+
+    def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L2 escalation with an initial member."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_returns_updated_escalation(self, tmp_path: Path):
+        """(a) Returns the updated Escalation object."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None, 'Expected updated Escalation, got None'
+        assert isinstance(result, Escalation)
+
+    def test_appends_new_members(self, tmp_path: Path):
+        """(b) Appends new member ids, preserving order — no duplicates (set-union)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-2'])
+
+        assert result is not None
+        assert 'esc-l1-0' in result.members  # original preserved
+        assert 'esc-l1-1' in result.members  # new member added
+        assert 'esc-l1-2' in result.members  # new member added
+        assert len(result.members) == 3, f'Expected 3 members, got {result.members}'
+
+    def test_set_union_semantics_no_duplicates(self, tmp_path: Path):
+        """(b cont.) Adding an already-existing member id does NOT duplicate it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0', 'esc-l1-1'])
+
+        assert result is not None
+        assert result.members.count('esc-l1-0') == 1, 'Duplicate members must not be added'
+        assert 'esc-l1-1' in result.members
+        assert len(result.members) == 2
+
+    def test_leaves_other_fields_untouched(self, tmp_path: Path):
+        """(c) root_cause, options, summary, detail, timestamp are not modified."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='Original summary',
+            level=2,
+            root_cause='Bad merge strategy',
+            options=['A: fix', 'B: rollback'],
+            detail='Original evidence',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        original_ts = esc.timestamp
+
+        result = queue.add_members_to_l2(esc.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.root_cause == 'Bad merge strategy'
+        assert result.options == ['A: fix', 'B: rollback']
+        assert result.summary == 'Original summary'
+        assert result.detail == 'Original evidence'
+        assert result.timestamp == original_ts
+
+    def test_returns_none_when_l2_not_found_in_queue_root(self, tmp_path: Path):
+        """(d) Returns None when the L2 is archived or unknown (refuses archived L2s)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        queue.resolve(l2.id, 'Fixed')  # moves to archive
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is None, f'Expected None for archived L2, got {result!r}'
+
+    def test_returns_none_for_unknown_id(self, tmp_path: Path):
+        """(d cont.) Returns None for a completely unknown id."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        result = queue.add_members_to_l2('esc-does-not-exist', ['esc-l1-1'])
+
+        assert result is None, f'Expected None for unknown id, got {result!r}'
+
+    def test_empty_new_member_ids_is_noop(self, tmp_path: Path):
+        """(e) add_members_to_l2 with empty new_member_ids returns escalation unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, [])
+
+        assert result is not None
+        assert result.members == ['esc-l1-0'], f'Expected unchanged members, got {result.members}'
+
+    def test_write_is_durable_reload_shows_appended_members(self, tmp_path: Path):
+        """(f) Reload via queue.get(l2_id) shows the appended members."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-2'])
+
+        reloaded = queue.get(l2.id)
+        assert reloaded is not None
+        assert 'esc-l1-0' in reloaded.members
+        assert 'esc-l1-1' in reloaded.members
+        assert 'esc-l1-2' in reloaded.members
+        assert len(reloaded.members) == 3
+
+    def test_internal_duplicates_in_new_member_ids_are_deduplicated(self, tmp_path: Path):
+        """Suggestion-3: new_member_ids=['a','a','b'] adds 'a' exactly once.
+
+        Set-union is only against *existing* members; if new_member_ids itself
+        contains duplicates they must be collapsed before the union so each id
+        appears at most once in the resulting members list.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-1', 'esc-l1-2'])
+
+        assert result is not None
+        assert result.members.count('esc-l1-1') == 1, (
+            f"'esc-l1-1' must appear exactly once, got {result.members}"
+        )
+        assert 'esc-l1-2' in result.members
+        assert result.members.count('esc-l1-0') == 1  # original untouched
+        assert len(result.members) == 3, (
+            f'Expected 3 unique members (esc-l1-0, esc-l1-1, esc-l1-2), got {result.members}'
+        )
+
+
+class TestResolveCascade:
+    """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
+
+    def _make_l1(self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L1 escalation."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test escalation',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _make_l2_with_members(
+        self,
+        queue: EscalationQueue,
+        l2_id: str,
+        member_ids: list[str],
+    ) -> Escalation:
+        """Submit a pending L2 escalation referencing the given member ids."""
+        esc = Escalation(
+            id=l2_id,
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=list(member_ids),
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_resolve_l2_cascades_resolution_to_members(self, tmp_path: Path):
+        """(a) resolve(l2_id) with members=[m1,m2] cascades — m1 and m2 are resolved."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1', 'task-1')
+        self._make_l1(queue, 'esc-l1-2', 'task-2')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
+
+        queue.resolve(l2.id, 'Resolved the root cause')
+
+        r1 = queue.get('esc-l1-1')
+        r2 = queue.get('esc-l1-2')
+        assert r1 is not None
+        assert r2 is not None
+        assert r1.status == 'resolved', f'Expected m1 resolved, got {r1.status!r}'
+        assert r2.status == 'resolved', f'Expected m2 resolved, got {r2.status!r}'
+        assert r1.resolution == 'Resolved the root cause'
+        assert r2.resolution == 'Resolved the root cause'
+
+    def test_members_carry_cascade_resolved_by(self, tmp_path: Path):
+        """(b) members carry resolved_by='l2-cascade:{l2_id}' for audit."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
+
+        queue.resolve(l2.id, 'Fixed upstream')
+
+        m = queue.get('esc-l1-1')
+        assert m is not None
+        expected_by = f'l2-cascade:{l2.id}'
+        assert m.resolved_by == expected_by, (
+            f"Expected resolved_by={expected_by!r}, got {m.resolved_by!r}"
+        )
+
+    def test_dismiss_path_cascades_dismiss_to_members(self, tmp_path: Path):
+        """(c) resolve(l2_id, dismiss=True) cascades dismiss to members (status='dismissed')."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1')
+        self._make_l1(queue, 'esc-l1-2')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
+
+        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True)
+
+        m1 = queue.get('esc-l1-1')
+        m2 = queue.get('esc-l1-2')
+        assert m1 is not None
+        assert m2 is not None
+        assert m1.status == 'dismissed', f'Expected m1 dismissed, got {m1.status!r}'
+        assert m2.status == 'dismissed', f'Expected m2 dismissed, got {m2.status!r}'
+
+    def test_cascade_is_idempotent_member_already_resolved(self, tmp_path: Path):
+        """(d) Member already resolved keeps its prior resolved_by/resolution (idempotency)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1')
+        queue.resolve('esc-l1-1', 'Pre-resolved separately', resolved_by='steward')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
+
+        # Cascade should hit the idempotency guard in resolve() for m1
+        queue.resolve(l2.id, 'L2 resolution')
+
+        m1_reloaded = queue.get('esc-l1-1')
+        assert m1_reloaded is not None
+        assert m1_reloaded.status == 'resolved'
+        assert m1_reloaded.resolution == 'Pre-resolved separately', (
+            'Prior resolution must be preserved (idempotency)'
+        )
+        assert m1_reloaded.resolved_by == 'steward', (
+            'Prior resolved_by must be preserved (idempotency)'
+        )
+
+    def test_cascade_to_nonexistent_member_is_best_effort(self, tmp_path: Path):
+        """(e) Cascade to a non-existent member id is best-effort — no raise."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        # Only seed one of two referenced members
+        self._make_l1(queue, 'esc-l1-1')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-nonexistent'])
+
+        # Must not raise
+        result = queue.resolve(l2.id, 'Fixed')
+
+        assert result is not None
+        assert result.status == 'resolved'
+        # The existing member should still be resolved
+        m1 = queue.get('esc-l1-1')
+        assert m1 is not None
+        assert m1.status == 'resolved'
+
+    def test_l2_with_empty_members_resolves_normally_no_cascade(self, tmp_path: Path):
+        """(f) L2 with empty members resolves normally (no cascade, no error)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', [])
+
+        result = queue.resolve(l2.id, 'Fixed; no members')
+
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Fixed; no members'
+

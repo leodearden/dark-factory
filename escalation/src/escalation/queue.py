@@ -302,6 +302,27 @@ class EscalationQueue:
         Idempotent: if the escalation is already resolved or dismissed, this
         method returns the existing escalation unchanged without re-archiving
         or re-firing the _resolve_callback.
+
+        Cascade: if the escalation is an L2 with a non-empty ``members`` list,
+        after archiving the L2 each member id is resolved recursively with the
+        same *resolution* text.  The cascade uses
+        ``resolved_by='l2-cascade:{escalation_id}'`` so the audit trail
+        distinguishes direct resolves from cascades.  *dismiss* is propagated
+        so a dismissed L2 dismisses its members too.
+
+        Cascade contract:
+        - Recursion terminates because L1 members carry empty ``members`` lists.
+        - Per-member exceptions are caught and logged; a single bad member id
+          never blocks the remaining cascade.
+        - ``resolve()`` is idempotent, so cascading to an already-resolved member
+          is a safe no-op.
+
+        Ordering note (for ``_resolve_callback`` consumers):
+        ``_resolve_callback`` fires for the L2 **before** the cascade to member
+        L1s begins.  Consumers of the callback that inspect member state will see
+        members still pending at callback time; they should re-query member state
+        rather than assuming terminality.  This ordering is stable — do not rely
+        on members being resolved at the moment the L2 callback fires.
         """
         esc = self.get(escalation_id)
         if esc is None:
@@ -330,6 +351,24 @@ class EscalationQueue:
                 self._resolve_callback(esc)
             except Exception as e:
                 logger.warning(f'Resolve callback failed for {escalation_id}: {e}')
+
+        # Cascade to member L1s (L2 clusters only — L0/L1 have empty members).
+        # Recursion is bounded: L1 members carry empty members[], so no deeper nesting.
+        if esc.members:
+            cascade_resolved_by = f'l2-cascade:{escalation_id}'
+            for member_id in esc.members:
+                try:
+                    self.resolve(
+                        member_id,
+                        resolution,
+                        dismiss=dismiss,
+                        resolved_by=cascade_resolved_by,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        'cascade: failed to resolve member %s of L2 %s: %s',
+                        member_id, escalation_id, e,
+                    )
 
         return esc
 
@@ -387,6 +426,104 @@ class EscalationQueue:
                 logger.warning(f'Resolve callback failed for {escalation.id}: {e}')
 
         return escalation
+
+    def find_pending_l2_by_root_cause(self, root_cause: str) -> str | None:
+        """Return the id of the oldest pending L2 escalation whose root_cause matches.
+
+        Algorithm:
+        1. Strip *root_cause*; return None immediately for empty/whitespace-only input
+           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s convention).
+        2. Iterate ``self.get_pending()``, filtering to ``level == 2`` and
+           ``esc.root_cause.strip() == candidate``.
+        3. Among matches, return the id of the entry with the OLDEST timestamp
+           (ISO 8601 string comparison; malformed timestamps fall back to
+           ``datetime.min`` so they sort first — never silently lost).
+
+        Cost: O(N) over pending escalations, where N is the current queue depth.
+        Acceptable at current escalation rates; mirrors the existing
+        ``find_dedupe_parent`` O(N) pattern in dedupe.py.
+        """
+        candidate = root_cause.strip()
+        if not candidate:
+            return None
+
+        oldest_id: str | None = None
+        oldest_ts: datetime = datetime.max.replace(tzinfo=UTC)
+
+        for esc in self.get_pending():
+            if esc.level != 2:
+                continue
+            if esc.root_cause.strip() != candidate:
+                continue
+            # Parse timestamp; fall back to datetime.min on bad input so malformed
+            # entries are treated as oldest (never silently dropped).
+            try:
+                ts = datetime.fromisoformat(esc.timestamp)
+                # Ensure tz-aware for comparison
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+            except (ValueError, AttributeError):
+                ts = datetime.min.replace(tzinfo=UTC)
+            if ts < oldest_ts:
+                oldest_ts = ts
+                oldest_id = esc.id
+
+        return oldest_id
+
+    def add_members_to_l2(
+        self, escalation_id: str, new_member_ids: list[str],
+    ) -> Escalation | None:
+        """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
+
+        **Not concurrency-safe.**  The read-modify-write of ``members`` is not
+        atomic: two concurrent callers for the same parent each read the same
+        pre-mutation snapshot, both append and both write — the second rewrite
+        clobbers the first's additions.  Single-writer invariant matches the
+        rest of the queue; see ``attach_dedupe_child`` for a full discussion.
+
+        Loads the L2 directly from ``queue_dir/{escalation_id}.json`` (queue root
+        only).  This refuses archived L2s — they were already adjudicated by a
+        human; re-opening them via member append would resurrect a closed decision
+        (the same Defect-2 class of bug that motivated task 1498).  For the same
+        reason this method never falls back to the archive.
+
+        Set-union semantics: member ids already present in ``esc.members`` are
+        not added again.  *new_member_ids* is also deduplicated internally via
+        ``dict.fromkeys`` so passing ``['a', 'a', 'b']`` adds 'a' exactly once.
+        New ids are appended in the order they first appear in *new_member_ids*.
+
+        Only ``members`` is modified.  ``root_cause``, ``options``, ``summary``,
+        ``detail``, and ``timestamp`` are preserved so the human-facing decision
+        context remains the L2's original framing across repeated auto-watcher
+        triage passes.
+
+        Returns the updated ``Escalation`` (or the unchanged escalation when
+        *new_member_ids* is empty or all ids are already present).  Returns
+        ``None`` when *escalation_id* is not found in the queue root (unknown id
+        or archived).
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
+            return None
+
+        if not new_member_ids:
+            return esc  # no-op
+
+        existing = set(esc.members)
+        appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
+        if appended:
+            esc.members.extend(appended)
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'add_members_to_l2: added %d new member(s) to %s (total=%d)',
+                len(appended), escalation_id, len(esc.members),
+            )
+        return esc
 
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
