@@ -74,8 +74,8 @@ except ImportError:
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
-    dataclasses.replace(  # type: ignore[possibly-undefined]
-        DedupeConfig.for_recon(),
+    dataclasses.replace(
+        DedupeConfig.for_recon(),  # type: ignore[possibly-undefined]
         infra_dedupe_categories=(
             'recon_integrity_issue',
             'recon_failure',
