@@ -152,25 +152,14 @@ def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
     with patch('orchestrator.analyze_modules.sqlite3.connect', spy):
         rows = list(_iter_events(event_store.db_path, since))
 
-    # URI contract — implementation-independent assertions:
-    assert captured_uri is not None
-    assert captured_uri.startswith('file:///'), (
-        f'Expected file:/// form (Path.resolve().as_uri()), got {captured_uri!r}'
-    )
-    assert captured_uri.endswith('?mode=ro'), (
-        f'URI must end with ?mode=ro, got {captured_uri!r}'
+    # URI contract — single exact-match subsumes all substring checks.
+    # Enforces: file:/// prefix, .resolve() present, ?mode=ro suffix, uri=True kwarg.
+    expected_uri = event_store.db_path.resolve().as_uri() + '?mode=ro'
+    assert captured_uri == expected_uri, (
+        f'Expected read-only URI {expected_uri!r}, got {captured_uri!r}'
     )
     assert captured_uri_kwarg is True, (
         f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
-    )
-    path_portion = captured_uri.removesuffix('?mode=ro')
-    assert '?' not in path_portion, (
-        f'Unencoded ? in path portion of URI: {captured_uri!r}'
-    )
-    # Enforces .resolve() is present: bare .as_uri() may differ on platforms with symlinks.
-    assert path_portion == event_store.db_path.resolve().as_uri(), (
-        f'URI path portion does not match resolved-path URI; '
-        f'got {path_portion!r}, want {event_store.db_path.resolve().as_uri()!r}'
     )
 
     # Reads still work — seeded event is returned.
