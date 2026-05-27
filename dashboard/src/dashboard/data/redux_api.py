@@ -678,7 +678,11 @@ def shape_burndown(
     """
     # Local import avoids circular import: burndown.py imports stats and
     # this module imports config/no-burndown.
-    from dashboard.data.burndown import compute_forecast_confidence
+    from dashboard.data.burndown import (
+        aggregate_window_completion,
+        compute_forecast_confidence,
+        compute_window_completion,
+    )
 
     by_project: dict[str, dict] = {}
     label_set: set[str] = set()
@@ -686,14 +690,16 @@ def shape_burndown(
         labels = list(series.get('labels') or [])
         label_set.update(labels)
         forecast = compute_forecast_confidence(series)
+        completion = compute_window_completion(series)
         by_project[_project_label(pid)] = {
             'labels': labels,
             **{k: list(series.get(k) or []) for k in _BURNDOWN_KEYS},
             **forecast,
+            **completion,
         }
 
     sorted_labels = sorted(label_set)
-    aggregate: dict[str, list] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
+    aggregate: dict[str, Any] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
     for series in series_by_project.values():
         labels = list(series.get('labels') or [])
         index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
@@ -703,6 +709,7 @@ def shape_burndown(
                     aggregate[k][index_map[lbl]] += int(val or 0)
 
     aggregate.update(compute_forecast_confidence(aggregate))
+    aggregate.update(aggregate_window_completion(by_project, sorted_labels))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
 
