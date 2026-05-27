@@ -598,6 +598,7 @@ async def run_server():
         reconciliation_harness=reconciliation_harness,
         backlog_policy=backlog_policy,
         event_queue=event_queue,
+        curator_usage_gate=curator_usage_gate,
     )
 
     # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
