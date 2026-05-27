@@ -1544,6 +1544,68 @@ class TestPatchResolutionMetadata:
             'Archive dir must not be created for a non-existent id'
         )
 
+    def test_patch_multi_date_archive_picks_newest_and_root_stays_clean(
+        self, tmp_path: Path,
+    ):
+        """Multi-date archive: patch picks the newest copy and root stays clean.
+
+        This drives extraction of the newest-by-date selection into a shared helper
+        (_locate_path) used by both get() and patch_resolution_metadata().
+        A naive candidates[0] pick would non-deterministically select either copy;
+        this test asserts the newest copy is always patched.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Manually create two archive files for the same id under different dated subdirs
+        older_dir = queue.queue_dir / 'archive' / '2025-01-01'
+        newer_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        older_dir.mkdir(parents=True, exist_ok=True)
+        newer_dir.mkdir(parents=True, exist_ok=True)
+
+        older_esc = _make_escalation('esc-42-1', status='resolved')
+        older_esc.resolution = 'older_copy'
+        older_text_before = older_esc.to_json()
+        (older_dir / 'esc-42-1.json').write_text(older_text_before)
+
+        newer_esc = _make_escalation('esc-42-1', status='resolved')
+        newer_esc.resolution = 'newer_copy'
+        (newer_dir / 'esc-42-1.json').write_text(newer_esc.to_json())
+
+        # Confirm no root file
+        assert not (queue.queue_dir / 'esc-42-1.json').exists()
+
+        # --- Action ---
+        result = queue.patch_resolution_metadata('esc-42-1', resolved_by='steward', resolution_turns=3)
+
+        # (a) Root stays clean
+        assert not (queue.queue_dir / 'esc-42-1.json').exists(), (
+            'Root must stay clean after patching an archive-resident escalation'
+        )
+
+        # (b) Newer copy is patched
+        newer_data = json.loads((newer_dir / 'esc-42-1.json').read_text())
+        assert newer_data['resolved_by'] == 'steward', (
+            f"Expected newest copy to have resolved_by='steward'; got {newer_data.get('resolved_by')!r}"
+        )
+        assert newer_data['resolution_turns'] == 3, (
+            f"Expected newest copy to have resolution_turns=3; got {newer_data.get('resolution_turns')!r}"
+        )
+        assert newer_data['resolution'] == 'newer_copy', (
+            f"Payload must be preserved: expected resolution='newer_copy'; got {newer_data.get('resolution')!r}"
+        )
+
+        # (c) Older copy is byte-for-byte unchanged
+        older_text_after = (older_dir / 'esc-42-1.json').read_text()
+        assert older_text_after == older_text_before, (
+            'Older archive copy must be byte-for-byte unchanged'
+        )
+
+        # (d) Return value reflects the patch
+        assert result is not None
+        assert result.resolved_by == 'steward', (
+            f"result.resolved_by must be 'steward'; got {result.resolved_by!r}"
+        )
+
     def test_patch_resolved_in_root_rewrites_root_in_place_no_archive_orphan(
         self, tmp_path: Path,
     ):
