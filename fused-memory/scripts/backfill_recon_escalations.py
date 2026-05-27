@@ -48,6 +48,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,7 +76,18 @@ def finding_fingerprint(esc: Escalation) -> str:
     with empty affected_ids and the escalation summary) when ``esc.detail`` is
     missing or not a valid JSON object containing the expected finding fields.
     """
-    raise NotImplementedError
+    try:
+        finding = json.loads(esc.detail)
+        if not isinstance(finding, dict):
+            raise TypeError('detail is not a JSON object')
+        finding_category = finding.get('category', '')
+        affected_ids = finding.get('affected_ids', [])
+        description = finding.get('description', '')
+        return compute_content_fingerprint(
+            esc.category, finding_category, affected_ids, description,
+        )
+    except (json.JSONDecodeError, TypeError):
+        return compute_content_fingerprint(esc.category, '', [], esc.summary or '')
 
 
 @dataclass
@@ -113,7 +125,51 @@ def build_plan(
     idempotency guard: after an apply every group is a singleton, so re-runs
     are no-ops).
     """
-    raise NotImplementedError
+    if eligible_categories is None:
+        eligible_categories = set(DedupeConfig.for_recon().infra_dedupe_categories)
+
+    pending_before = len(pending)
+
+    eligible = [e for e in pending if e.category in eligible_categories]
+    eligible_total = len(eligible)
+
+    # Group by fingerprint, sorting each group oldest-first.
+    groups: dict[str, list[Escalation]] = defaultdict(list)
+    for esc in eligible:
+        fp = finding_fingerprint(esc)
+        groups[fp].append(esc)
+
+    distinct_fingerprints = len(groups)
+
+    collapses: list[GroupCollapse] = []
+    for fp, members in groups.items():
+        if len(members) <= 1:
+            continue  # singleton — idempotency guard, nothing to collapse
+        # Sort by (timestamp, id) so the oldest is first and ties are deterministic.
+        members.sort(key=lambda e: (e.timestamp, e.id))
+        canonical = members[0]
+        children = members[1:]
+        collapses.append(GroupCollapse(
+            fingerprint=fp,
+            canonical_id=canonical.id,
+            child_ids=[c.id for c in children],
+            group_size=len(members),
+            category=canonical.category,
+        ))
+
+    groups_collapsed = len(collapses)
+    to_dismiss = sum(len(c.child_ids) for c in collapses)
+    expected_survivors = pending_before - to_dismiss
+
+    return BackfillPlan(
+        collapses=collapses,
+        pending_before=pending_before,
+        eligible_total=eligible_total,
+        distinct_fingerprints=distinct_fingerprints,
+        groups_collapsed=groups_collapsed,
+        to_dismiss=to_dismiss,
+        expected_survivors=expected_survivors,
+    )
 
 
 def apply_plan(
@@ -132,7 +188,26 @@ def apply_plan(
 
     Returns a dict with ``dismissed`` and ``updated`` counts.
     """
-    raise NotImplementedError
+    dismissed = 0
+    updated = 0
+
+    for collapse in plan.collapses:
+        canonical = queue.get(collapse.canonical_id)
+        if canonical is None:
+            logger.warning('Canonical %s not found; skipping group', collapse.canonical_id)
+            continue
+
+        canonical.dedupe_count = collapse.group_size
+        canonical.dedupe_children = list(collapse.child_ids)
+        canonical.dedupe_fingerprint = collapse.fingerprint
+        queue.submit(canonical)
+        updated += 1
+
+        for child_id in collapse.child_ids:
+            queue.resolve(child_id, note, dismiss=True, resolved_by=resolved_by)
+            dismissed += 1
+
+    return {'dismissed': dismissed, 'updated': updated}
 
 
 def run(
@@ -147,12 +222,75 @@ def run(
     Returns a report dict.  When ``apply`` is False (dry-run, the default),
     no writes are performed.
     """
-    raise NotImplementedError
+    queue = EscalationQueue(Path(queue_dir))
+    pending = queue.get_pending()
+    plan = build_plan(pending)
+
+    eligible_cats = set(DedupeConfig.for_recon().infra_dedupe_categories)
+    blocking_pending = sum(
+        1 for e in pending if e.category not in eligible_cats
+    )
+
+    report: dict = {
+        'queue_dir': str(queue_dir),
+        'pending_before': plan.pending_before,
+        'eligible_total': plan.eligible_total,
+        'distinct_fingerprints': plan.distinct_fingerprints,
+        'groups_collapsed': plan.groups_collapsed,
+        'to_dismiss': plan.to_dismiss,
+        'expected_survivors': plan.expected_survivors,
+        'blocking_pending': blocking_pending,
+        'dry_run': not apply,
+    }
+
+    if apply:
+        result = apply_plan(queue, plan, resolved_by=resolved_by, note=note)
+        pending_after = len(queue.get_pending())
+        report['dismissed'] = result['dismissed']
+        report['updated'] = result['updated']
+        report['pending_after'] = pending_after
+
+    return report
 
 
 def main() -> int:
     """CLI entry point.  Returns an exit code."""
-    raise NotImplementedError
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
+
+    parser = argparse.ArgumentParser(
+        description='Backfill: collapse duplicate recon_integrity_issue escalations.',
+    )
+    parser.add_argument(
+        '--queue-dir',
+        default='./data/reconciliation/escalations',
+        help='Path to the escalation queue directory (default: ./data/reconciliation/escalations).',
+    )
+    parser.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+        help='Perform writes. Without this flag the script is a dry run.',
+    )
+    parser.add_argument(
+        '--resolved-by',
+        default=RESOLVED_BY,
+        help=f'resolved_by tag written to dismissed records (default: {RESOLVED_BY}).',
+    )
+    parser.add_argument(
+        '--note',
+        default=DEFAULT_NOTE,
+        help='Resolution note written to dismissed records.',
+    )
+    args = parser.parse_args()
+
+    report = run(
+        args.queue_dir,
+        apply=args.apply,
+        resolved_by=args.resolved_by,
+        note=args.note,
+    )
+    print(json.dumps(report, indent=2, default=str))
+    return 0
 
 
 if __name__ == '__main__':
