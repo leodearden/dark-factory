@@ -375,3 +375,127 @@ class TestReconEscalationDedup:
             f'[{category}] Expected 2 pending files after distinct-summary call, '
             f'got {len(files)}'
         )
+
+    # ── Step 7: call-site threading in _maybe_remediate / _run_remediation_pass ─
+
+    @pytest.mark.asyncio
+    async def test_maybe_remediate_passes_finding_to_escalate(self, tmp_path):
+        """_maybe_remediate non-actionable loop uses finding-based fingerprint.
+
+        RED before impl: _maybe_remediate calls _escalate without finding=, so the
+        fingerprint is a summary hash instead of the per-target finding hash.
+        """
+        from datetime import UTC, datetime
+
+        from escalation.dedupe import compute_content_fingerprint
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'memory_stale',
+            'affected_ids': ['m1'],
+            'description': 'd1',
+            'actionable': False,
+            'severity': 'minor',
+        }
+        parent_run = ReconciliationRun(
+            id='parent-run-id',
+            project_id='test_project',
+            run_type=RunType.full,
+            trigger_reason='buffer',
+            started_at=datetime.now(UTC),
+            events_processed=0,
+            status=RunStatus.running,
+            stage_reports={'integrity_check': {'items_flagged': [finding]}},
+        )
+
+        await harness._maybe_remediate(
+            'test_project', 'parent-run-id', parent_run,
+            TierConfig(), project_root='/tmp/x',
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 pending file, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'memory_stale', ['m1'], 'd1'
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f'Expected finding-based fingerprint {expected_fp!r}, '
+            f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_residue_passes_finding_to_escalate(self, tmp_path):
+        """_run_remediation_pass residue loop uses finding-based fingerprint.
+
+        RED before impl: _run_remediation_pass calls _escalate without finding=, so
+        the fingerprint is summary-based rather than keyed on the finding identity.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+
+        from escalation.dedupe import compute_content_fingerprint
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+        # Override journal with AsyncMock so start_run/complete_run/etc. are awaitable
+        harness.journal = AM()
+        harness.journal.get_watermark = AM(return_value=None)
+        harness.journal.write_journal = AM()
+        # Make instance_id a plain string (ReconciliationRun expects str | None)
+        harness.buffer.instance_id = 'test-instance'
+
+        residue_finding = {
+            'category': 'knowledge_stale',
+            'affected_ids': ['t99'],
+            'description': 'Task 99 stale after remediation',
+        }
+        now = datetime.now(UTC)
+
+        # Use real stage instances (to pass isinstance checks in _run_remediation_pass)
+        # with their run() methods patched to return quickly.
+        stages = harness._make_stages()
+        stages[0].run = AM(return_value=StageReport(
+            stage=StageId.memory_consolidator, started_at=now, completed_at=now,
+        ))
+        stages[1].run = AM(return_value=StageReport(
+            stage=StageId.task_knowledge_sync, started_at=now, completed_at=now,
+        ))
+        stages[2].run = AM(return_value=StageReport(
+            stage=StageId.integrity_check, started_at=now, completed_at=now,
+            items_flagged=[residue_finding],
+        ))
+        harness._make_stages = lambda: stages
+
+        await harness._run_remediation_pass(
+            'test_project', 'parent-run-id',
+            findings=[{
+                'category': 'missing_knowledge', 'affected_ids': ['t1'],
+                'description': 'trigger finding', 'actionable': True,
+            }],
+            tier=TierConfig(),
+            project_root='/tmp/x',
+            filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 residue escalation, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'knowledge_stale', ['t99'],
+            'Task 99 stale after remediation',
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f'Expected finding-based fingerprint {expected_fp!r}, '
+            f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
+        )
