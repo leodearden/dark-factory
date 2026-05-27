@@ -76,9 +76,11 @@ _PLAN_CREATOR_TOOLS = [
     # report_blocking_dependency — depends on un-merged sibling task.
     # report_task_already_done — work is already on main (skip planning).
     # report_unactionable_task — spec is broken, jump straight to L1.
+    # report_false_premise — RED-test premise is false/unreachable (design_concern L1).
     'mcp__plan-tools__report_blocking_dependency',
     'mcp__plan-tools__report_task_already_done',
     'mcp__plan-tools__report_unactionable_task',
+    'mcp__plan-tools__report_false_premise',
 ]
 
 _PLAN_STATUS_TOOLS = [
@@ -168,6 +170,42 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 8. **Small steps.** Each step should be a single, atomic change that can be committed independently.
 9. **File listing.** List ALL files (or directory paths) this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks and the phantom-done gate. Include test files.
 10. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+
+## Validate RED-test premises before writing them
+
+Before writing any RED-test assertion, verify that its substantive premise is actually achievable.  A doomed RED test cannot be GREENed by the implementer — it freezes the task.  If any premise fails, call `report_false_premise(classification, premise, evidence, proposed_resolution)` and stop (do NOT call `create_plan`).  There are three premise classes:
+
+**1. Numeric bound / threshold** — the test asserts a numeric tolerance (e.g., "within X%", "<= eps", ">= N dB", "to M digits").
+
+Require an achievability basis before writing the assertion.  Acceptable bases:
+- A validated reference result at that accuracy on a comparable problem.
+- A back-of-envelope method-error estimate (truncation order × step size) that clears the threshold at the planned resolution.
+- A reference computation from which the expected value was extracted.
+
+Reject bare guessed thresholds and "Tuned" fixture comments — these are signs the threshold was set after the fact to match an unknown output, not derived from first principles.
+
+**2. Closed-form exactness / reproduction** — the test asserts that the method reproduces something exactly (e.g., "exact within 1e-12", "reproduces P(t) exactly").
+
+State the mathematical identity that makes it true (e.g., "degree-N polynomial is in the approximation space so interpolation is exact"), then confirm that the asserted configuration (boundary conditions, element order, end conditions, basis degree) satisfies that identity.
+
+Example failure: "natural cubic spline reproduces a general cubic to 1e-12" — the natural BC forces M[0]=M[N]=0, which is incompatible with a general cubic's non-zero second derivatives at the endpoints.
+
+**3. End-to-end capability / dependency** — the test asserts that this task produces or evaluates a capability (e.g., "produces a Mesh", "evaluates to Value::X").
+
+Trace every required capability to the task's dependency set.  Each must be delivered by THIS task or a PREREQUISITE — never by a task that DEPENDS ON it (a downstream task cannot supply something to an upstream assertion).
+
+If a premise fails for any of the three classes, call:
+```
+report_false_premise(
+    classification = "numeric_bound" | "exactness" | "dependency_capability",
+    premise        = <the exact assertion or claim that is false>,
+    evidence       = <mathematical identity / dependency-graph trace / method-error estimate
+                      that proves the premise fails>,
+    proposed_resolution = <move signal to producing task / weaken bound + file follow-up /
+                           change asserted configuration>,
+)
+```
+Then stop.  The orchestrator will escalate to a human curator as a design_concern.
 
 ## Important
 
