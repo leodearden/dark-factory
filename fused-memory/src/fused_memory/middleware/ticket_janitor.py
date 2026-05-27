@@ -303,6 +303,9 @@ class TicketJanitor:
 
         # Record in the cooldown log only after a successful submit.
         self._escalation_log[key].append(now)
+        # Reset the per-project counter so the next post-cooldown escalation
+        # reports failures-since-last-surface rather than failures-since-start.
+        self._probe_failures.pop(pid, None)
         logger.warning(
             'ticket_janitor: surfaced probe-defect escalation %s for '
             'project %s (consecutive probe raises: %d)',
@@ -320,8 +323,10 @@ class TicketJanitor:
         #    worker — replaces the old wall-clock TTL janitor with an honest
         #    "is the worker actually processing?" signal.
         if self._liveness_probe is not None:
+            _pending_list_ok = False
             try:
                 pending_projects = await self._store.list_projects_with_pending()
+                _pending_list_ok = True
             except Exception:
                 logger.exception('ticket_janitor: list_projects_with_pending failed')
                 pending_projects = []
@@ -362,6 +367,16 @@ class TicketJanitor:
                             'ticket_janitor: reaped %d pending ticket(s) for '
                             'dead worker on project %s', n, pid,
                         )
+            # Prune project IDs that no longer appear in the pending list so
+            # _probe_failures doesn't grow without bound when projects are
+            # deleted, renamed, or have all tickets terminalised elsewhere.
+            # Only prune when list_projects_with_pending() succeeded; skip
+            # pruning on the exception-fallback empty list to avoid falsely
+            # resetting counters for all projects on a transient DB error.
+            if _pending_list_ok:
+                _stale = set(self._probe_failures) - set(pending_projects)
+                for _stale_pid in _stale:
+                    self._probe_failures.pop(_stale_pid, None)
 
         # 2) collect rows that haven't been escalated yet
         try:
