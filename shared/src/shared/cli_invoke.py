@@ -10,6 +10,7 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -92,6 +93,24 @@ CAP_HIT_RESUME_PROMPT = (
 # (orchestrator restart, not a usage-cap interrupt) and the agent message
 # should stay a plain "continue" rather than mentioning usage limits.
 CRASH_RECOVERY_RESUME_PROMPT = 'continue'
+
+# Concrete CLI/usage errors that exit instantly with no output but are NOT usage
+# caps. Matched case-insensitively against stderr/output so the zero-cost cap
+# heuristic doesn't misfire (and loop forever) on a local CLI failure.
+NON_CAP_CLI_ERROR_MARKERS = [
+    'is already in use',        # --session-id collision (reify-3604)
+    'unrecognized arguments',
+    'unknown option',
+    'invalid value',
+    'no such file or directory',
+    'permission denied',
+]
+
+
+def _is_non_cap_cli_error(stderr: str, output: str) -> bool:
+    blob = f'{stderr or ""}\n{output or ""}'.lower()
+    return any(m in blob for m in NON_CAP_CLI_ERROR_MARKERS)
+
 
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
@@ -313,6 +332,21 @@ def _to_token_count(v: int | None) -> int | None:
     return v or None
 
 
+def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:
+    """Switch the retry loop to a fresh (non-resume) invocation.
+
+    Drops the resume session, restores the real task prompt, and regenerates a
+    pre-allocated session_id *when one was set* — the prior failed attempt may have
+    already committed that UUID to disk, and reusing it on a fresh `--session-id`
+    makes the CLI exit instantly with 'Session ID … is already in use'
+    (the 2026-05-26 reify-3604 wedge). Callers that pass no session_id keep none.
+    """
+    invoke_kwargs.pop('resume_session_id', None)
+    invoke_kwargs['prompt'] = original_prompt
+    if invoke_kwargs.get('session_id'):
+        invoke_kwargs['session_id'] = str(uuid.uuid4())
+
+
 @dataclass
 class _SubprocessResult:
     stdout: str
@@ -523,8 +557,7 @@ async def invoke_with_cap_retry(
                     )
                     if auth_marked:
                         slot.settle()
-                        invoke_kwargs.pop('resume_session_id', None)
-                        invoke_kwargs['prompt'] = original_prompt
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         logger.warning(
                             f'{label}: account {account_name} auth-failed '
                             f'(HTTP {result.api_error_status}) — failing over',
@@ -561,8 +594,7 @@ async def invoke_with_cap_retry(
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
                         resume_or_fresh = 'resuming'
                     else:
-                        invoke_kwargs.pop('resume_session_id', None)
-                        invoke_kwargs['prompt'] = original_prompt
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh'
 
                     if acct_name:
@@ -595,45 +627,55 @@ async def invoke_with_cap_retry(
                     and result.turns <= 1
                     and result.duration_ms < 5000
                 ):
-                    logger.warning(
-                        f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
-                        f'duration={result.duration_ms}ms) — treating as cap hit. '
-                        f'Output: {result.output[:200]!r}',
-                    )
-                    cap_marked = usage_gate._handle_cap_detected(
-                        f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
-                        None,
-                        slot.token,
-                    )
-                    if not cap_marked:
+                    if _is_non_cap_cli_error(result.stderr, result.output):
+                        # A recognised local CLI/usage error (e.g. --session-id
+                        # collision) exits zero-cost and instantly, but it is NOT a
+                        # usage cap.  Counting it as a cap loops forever (reify-3604).
+                        # Fall through: Branch C retries fresh when resuming, else the
+                        # failed result is returned for normal verify/steward handling.
                         logger.warning(
-                            f'{label}: heuristic cap suspected but no account could be marked '
-                            f'(token unresolved) — treating as normal failure',
+                            f'{label}: zero-cost instant exit is a CLI error, not a cap '
+                            f'(stderr={result.stderr[:160]!r}) — not counting as cap hit',
                         )
-                        unattributed_cap = True
                     else:
-                        slot.settle()  # _handle_cap_detected already cleared probe_in_flight
-                        consecutive_cap_hits += 1
-                        full_cycles = (consecutive_cap_hits - 1) // num_accounts
-                        cooldown = min(
-                            _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
-                            _MAX_CAP_COOLDOWN_SECS,
-                        )
-                        # Cannot resume a session that never ran
-                        invoke_kwargs.pop('resume_session_id', None)
-                        invoke_kwargs['prompt'] = original_prompt
-                        acct_name = usage_gate.active_account_name
                         logger.warning(
-                            f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+                            f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
+                            f'duration={result.duration_ms}ms) — treating as cap hit. '
+                            f'Output: {result.output[:200]!r}',
                         )
+                        cap_marked = usage_gate._handle_cap_detected(
+                            f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
+                            None,
+                            slot.token,
+                        )
+                        if not cap_marked:
+                            logger.warning(
+                                f'{label}: heuristic cap suspected but no account could be marked '
+                                f'(token unresolved) — treating as normal failure',
+                            )
+                            unattributed_cap = True
+                        else:
+                            slot.settle()  # _handle_cap_detected already cleared probe_in_flight
+                            consecutive_cap_hits += 1
+                            full_cycles = (consecutive_cap_hits - 1) // num_accounts
+                            cooldown = min(
+                                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                                _MAX_CAP_COOLDOWN_SECS,
+                            )
+                            # Cannot resume a session that never ran
+                            _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                            acct_name = usage_gate.active_account_name
+                            logger.warning(
+                                f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+                            )
 
-                        # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
-                        now = time.monotonic()
-                        elapsed = now - retry_start
-                        _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
+                            # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
+                            now = time.monotonic()
+                            elapsed = now - retry_start
+                            _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
 
-                        await asyncio.sleep(cooldown)
-                        continue
+                            await asyncio.sleep(cooldown)
+                            continue
 
                 # Non-cap-hit failure while resuming → fall back to fresh invocation
                 if not result.success and invoke_kwargs.get('resume_session_id'):
@@ -641,8 +683,7 @@ async def invoke_with_cap_retry(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
                     )
-                    invoke_kwargs.pop('resume_session_id', None)
-                    invoke_kwargs['prompt'] = original_prompt
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
                 if not unattributed_cap:
