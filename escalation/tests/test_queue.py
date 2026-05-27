@@ -1413,6 +1413,95 @@ class TestIterAllEscalationPaths:
         )
 
 
+class TestPatchResolutionMetadata:
+    """EscalationQueue.patch_resolution_metadata() — archive-aware in-place metadata patch.
+
+    Core contract: patching an archived escalation rewrites the archive copy in place;
+    it NEVER creates a file in the queue root (no resurrection).
+    """
+
+    def test_patch_archived_no_resurrection_and_returns_updated_with_preserved_fields(
+        self, tmp_path: Path,
+    ):
+        """Regression test: patching resolved_by on an archived escalation must rewrite
+        the archive copy and MUST NOT create a file in the queue root.
+
+        Failure mode (the bug): _rewrite() delegates to _atomic_write() which always
+        writes to queue_dir/{id}.json (the ROOT), resurrecting the file out of the archive.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        # Resolve: file moves to archive/YYYY-MM-DD/esc-1-1.json
+        queue.resolve('esc-1-1', 'Original resolution')
+
+        # Confirm the escalation is in archive, root is empty
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: file must not be in queue root after resolve()'
+        )
+        archive_files_before = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_before) == 1, (
+            f'Pre-condition: expected exactly 1 archive file; got {archive_files_before}'
+        )
+
+        # Capture pre-patch fields for "unchanged" assertions
+        pre_patch = queue.get('esc-1-1')
+        assert pre_patch is not None
+        pre_resolved_at = pre_patch.resolved_at
+        pre_level = pre_patch.level
+        pre_task_id = pre_patch.task_id
+        pre_status = pre_patch.status
+
+        # --- Action ---
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward', resolution_turns=5)
+
+        # (a) NO FILE RESURRECTION — root stays clean
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'RESURRECTION BUG: patch_resolution_metadata wrote to queue root; '
+            'the archive copy should have been rewritten in place instead'
+        )
+
+        # (b) Exactly one archive file; patched fields present
+        archive_files_after = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after) == 1, (
+            f'Expected exactly 1 archive file after patch; got {archive_files_after}'
+        )
+        archived_data = json.loads(archive_files_after[0].read_text())
+        assert archived_data['resolved_by'] == 'steward', (
+            f"Expected resolved_by='steward' in archive; got {archived_data.get('resolved_by')!r}"
+        )
+        assert archived_data['resolution_turns'] == 5, (
+            f"Expected resolution_turns=5 in archive; got {archived_data.get('resolution_turns')!r}"
+        )
+
+        # (c) Preserved fields unchanged
+        assert archived_data['status'] == 'resolved', (
+            f"Status must remain 'resolved'; got {archived_data['status']!r}"
+        )
+        assert archived_data['resolution'] == 'Original resolution', (
+            f"Resolution must be preserved; got {archived_data.get('resolution')!r}"
+        )
+        assert archived_data['resolved_at'] == pre_resolved_at, (
+            f'resolved_at must be unchanged; pre={pre_resolved_at!r}, '
+            f'post={archived_data.get("resolved_at")!r}'
+        )
+        assert archived_data['level'] == pre_level
+        assert archived_data['task_id'] == pre_task_id
+        assert archived_data['status'] == pre_status
+
+        # (d) Return value is the updated Escalation
+        assert result is not None, 'patch_resolution_metadata must return the updated Escalation'
+        assert result.resolved_by == 'steward', (
+            f"result.resolved_by must be 'steward'; got {result.resolved_by!r}"
+        )
+        assert result.resolution_turns == 5, (
+            f'result.resolution_turns must be 5; got {result.resolution_turns!r}'
+        )
+        assert result.status == 'resolved', (
+            f"result.status must be 'resolved'; got {result.status!r}"
+        )
+
+
 class TestAttachDedupeChild:
     """EscalationQueue.attach_dedupe_child() — mutate a pending parent in place."""
 
