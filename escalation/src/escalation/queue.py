@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from escalation import archive
@@ -387,6 +387,49 @@ class EscalationQueue:
                 logger.warning(f'Resolve callback failed for {escalation.id}: {e}')
 
         return escalation
+
+    def find_pending_l2_by_root_cause(self, root_cause: str) -> str | None:
+        """Return the id of the oldest pending L2 escalation whose root_cause matches.
+
+        Algorithm:
+        1. Strip *root_cause*; return None immediately for empty/whitespace-only input
+           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s convention).
+        2. Iterate ``self.get_pending()``, filtering to ``level == 2`` and
+           ``esc.root_cause.strip() == candidate``.
+        3. Among matches, return the id of the entry with the OLDEST timestamp
+           (ISO 8601 string comparison; malformed timestamps fall back to
+           ``datetime.min`` so they sort first — never silently lost).
+
+        Cost: O(N) over pending escalations, where N is the current queue depth.
+        Acceptable at current escalation rates; mirrors the existing
+        ``find_dedupe_parent`` O(N) pattern in dedupe.py.
+        """
+        candidate = root_cause.strip()
+        if not candidate:
+            return None
+
+        oldest_id: str | None = None
+        oldest_ts: datetime = datetime.max.replace(tzinfo=timezone.utc)
+
+        for esc in self.get_pending():
+            if esc.level != 2:
+                continue
+            if esc.root_cause.strip() != candidate:
+                continue
+            # Parse timestamp; fall back to datetime.min on bad input so malformed
+            # entries are treated as oldest (never silently dropped).
+            try:
+                ts = datetime.fromisoformat(esc.timestamp)
+                # Ensure tz-aware for comparison
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                ts = datetime.min.replace(tzinfo=timezone.utc)
+            if ts < oldest_ts:
+                oldest_ts = ts
+                oldest_id = esc.id
+
+        return oldest_id
 
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
