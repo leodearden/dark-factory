@@ -244,7 +244,7 @@ async def test_missing_premise_still_escalates_design_concern(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_plan_routes_false_premise_to_handler(tmp_path: Path):
     """_plan() detects false_premise.json and routes to _handle_false_premise_report."""
-    from orchestrator.agent_runner import AgentResult
+    from shared.cli_invoke import AgentResult
 
     wt = tmp_path / 'wt'
     f = _make(worktree=wt, project_root=tmp_path / 'proj')
@@ -262,7 +262,7 @@ async def test_plan_routes_false_premise_to_handler(tmp_path: Path):
             evidence='e',
             proposed_resolution='r',
         )
-        return AgentResult(success=True, cost_usd=0.5, turns=3)
+        return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
 
     f.wf._invoke = AsyncMock(side_effect=_invoke_writes_false_premise)
 
@@ -281,7 +281,7 @@ async def test_plan_routes_false_premise_to_handler(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_simple_task_routes_false_premise_to_handler(tmp_path: Path):
     """_run_simple_task() detects false_premise.json and routes to handler."""
-    from orchestrator.agent_runner import AgentResult
+    from shared.cli_invoke import AgentResult
 
     wt = tmp_path / 'wt'
     f = _make(worktree=wt, project_root=tmp_path / 'proj')
@@ -298,7 +298,7 @@ async def test_simple_task_routes_false_premise_to_handler(tmp_path: Path):
             evidence='e',
             proposed_resolution='r',
         )
-        return AgentResult(success=True, cost_usd=0.5, turns=3)
+        return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
 
     f.wf._invoke = AsyncMock(side_effect=_invoke_writes_false_premise)
 
