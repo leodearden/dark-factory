@@ -31,11 +31,11 @@ Discover the terminal command for spawning interactive sessions:
 ## The Main Loop
 
 ```
-1. Drain any pending escalations
-2. Start watcher (background task)
-3. Wait for watcher to fire (it exits on first escalation)
+1. Drain any pending L2 escalations
+2. Start watcher (background task, filtered to L2)
+3. Wait for watcher to fire (it exits on first L2 escalation)
 4. Read escalation from watcher output
-5. Also drain any other pending escalations
+5. Also drain any other pending L2 escalations
 6. Handle each escalation
 7. Go to 2
 ```
@@ -50,55 +50,14 @@ mcp__escalation__get_pending_escalations()
 
 Handle each one before (re)starting the watcher. This catches anything that accumulated while no watcher was active.
 
-### Cross-escalation analysis
+### L2-only contract
 
-Before level filtering or individual handling, scan **all** pending escalations (every level) for shared patterns. Detecting clusters matters even for escalations you won't handle — the human needs to see systematic issues:
-- Multiple escalations referencing the **same files or code** (e.g., several tasks all missing variants from `value.rs`)
-- **Similar summaries** suggesting a common root cause (e.g., "code lost in merge resolution")
-- Multiple tasks blocked by the **same regression or missing prerequisite**
+This skill drains and waits only on **level-2 escalations**. Both the watcher subprocess and the `get_pending_escalations` draining call are filtered to `level == 2` (see details in the relevant sections below).
 
-If you detect a shared root cause, flag it to the human as a **systematic issue** rather than handling each escalation independently. The individual symptoms may look like separate problems, but fixing the root cause unblocks all of them at once — and handling them individually risks inconsistent partial fixes.
+- **L0** is owned by per-task stewards — do not drain or handle L0 escalations here.
+- **L1** is owned by escalation-watcher-auto — do not drain or handle L1 escalations here.
 
-Delegate the pattern analysis to a sub-agent if there are more than ~5 pending escalations:
-
-```
-Agent(
-  description="Analyze escalation patterns",
-  prompt="""
-Analyze these pending escalations for shared root causes.
-
-## Escalations
-<paste summary of each: id, task_id, category, summary, files mentioned>
-
-## What to look for
-- Multiple escalations referencing the same files, functions, or code regions
-- Similar error descriptions suggesting a single upstream cause
-- Dependency chains (task A needs B which needs C — all escalated separately)
-
-## Output
-{
-  "clusters": [
-    {
-      "root_cause": "description of shared cause",
-      "escalation_ids": ["esc-XX-1", "esc-YY-2"],
-      "evidence": "what links them"
-    }
-  ],
-  "independent": ["esc-ZZ-3"]  // escalations with no shared pattern
-}
-""",
-  subagent_type="general-purpose"
-)
-```
-
-### Level filtering
-
-After cross-escalation analysis, separate escalations by level. Escalations have a `level` field: 0 = agent-to-steward, 1 = steward-to-human.
-
-- **Level 1**: handle according to the category rules below. This is the skill's primary job.
-- **Level 0**: these are handled by the task steward automatically — this typically takes a few minutes. **Leave them alone.** They are included in cross-escalation analysis (above) so you can spot patterns, but do not flag them as problems and do not handle them yourself. If the cross-escalation analysis reveals a cluster of L0 escalations sharing a root cause, report the pattern to the human as useful context — but don't treat the individual L0 escalations as action items.
-
-**Exception:** if the human explicitly asks you to process everything (all levels), then handle L0 escalations using the same category rules as L1.
+Never process L0 or L1 from this skill, even if explicitly asked — if the user wants to handle lower-level escalations, they should invoke the appropriate skill for that level.
 
 ### Starting the watcher
 
