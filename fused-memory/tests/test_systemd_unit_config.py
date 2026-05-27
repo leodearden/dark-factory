@@ -14,11 +14,17 @@ from pathlib import Path
 def _parse_systemd_unit(path: Path) -> dict[str, list[str]]:
     """Parse a systemd unit file into a dict of section → non-comment lines.
 
-    Rules (faithful to systemd INI dialect):
+    Rules applied:
     - Lines whose stripped form starts with '[' open a new section.
     - Lines whose stripped form starts with '#' or ';' are comments — skip.
     - Blank lines are skipped.
     - All other lines belong to the current section (None before the first header).
+
+    Limitation: line continuations (trailing '\\') are NOT joined.  Each
+    physical line is recorded separately.  This is harmless for exact-string
+    membership checks like ``Environment=MEM0_TELEMETRY=false``, but callers
+    that need reassembled values for multi-line directives (e.g. ExecStart)
+    must handle joining themselves.
     """
     sections: dict[str, list[str]] = {}
     current: str | None = None
@@ -51,13 +57,6 @@ class TestSystemdUnitMem0Telemetry:
     )
     EXPECTED_DIRECTIVE = "Environment=MEM0_TELEMETRY=false"
 
-    def test_unit_file_exists(self):
-        """Sanity-check that the unit file itself is present in the repo."""
-        assert self.UNIT_FILE.is_file(), (
-            f"Systemd unit example not found at {self.UNIT_FILE}. "
-            "Was the file renamed or moved?"
-        )
-
     def test_mem0_telemetry_false_in_service_section(self):
         """[Service] must contain Environment=MEM0_TELEMETRY=false as a non-comment directive.
 
@@ -71,6 +70,12 @@ class TestSystemdUnitMem0Telemetry:
         is contingent on import ordering. Pinning the var at the systemd layer removes
         that fragile dependency (belt-and-suspenders; both mechanisms are kept active).
         The live/deployed unit must carry this identical line.
+
+        Scope note: this test pins the *checked-in example* file
+        (fused-memory.service.example-systemd-config), not the live/deployed unit.
+        It cannot detect drift between the example and a deployed unit.  That gap
+        is accepted as an inherent in-repo limitation; deployment discipline (copying
+        the example to the actual unit) remains the responsibility of the operator.
         """
         sections = _parse_systemd_unit(self.UNIT_FILE)
         assert "Service" in sections, (
