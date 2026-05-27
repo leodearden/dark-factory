@@ -34,7 +34,7 @@ import hashlib
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -256,7 +256,6 @@ def find_dedupe_parent(
     path becomes hot, maintain an in-memory (category, key) → [(ts, id)] index
     populated by submit/resolve callbacks instead.
     """
-    import math
 
     effective_now = now if now is not None else datetime.now(UTC)
     unbounded = math.isinf(config.infra_dedupe_window_secs)

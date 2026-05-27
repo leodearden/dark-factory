@@ -10,7 +10,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from escalation.dedupe import DedupeConfig, submit_or_dedupe as _dedupe_submit_or_dedupe
+from escalation.dedupe import DedupeConfig
+from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
