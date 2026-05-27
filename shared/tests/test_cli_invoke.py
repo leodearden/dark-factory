@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -639,6 +640,53 @@ class TestCapHitResume:
             # Third call: resume sess-2
             assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-2'
             assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+
+    async def test_fresh_fallback_regenerates_session_id(self):
+        """Failed resume → fresh fallback hands the CLI a NEW pre-allocated UUID.
+
+        Regression for reify-3604: the resume attempt may already have committed
+        the caller's pre-allocated UUID to disk, so reusing it on the fresh
+        ``--session-id`` retry makes the CLI exit instantly with 'Session ID …
+        is already in use'.  The fallback must drop resume_session_id and
+        regenerate session_id.
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+
+        # cost_usd defaults to 0.5 in _make_result, so the failure does not trip
+        # the zero-cost heuristic — it routes through the resume-fallback branch.
+        failed_resume = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                session_id='sess-orig',
+                resume_session_id='sess-orig',
+            )
+
+        assert mock_invoke.call_count == 2
+        # First call: resume attempt with the caller's session id.
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-orig'
+        # Second call: fresh fallback — resume dropped, session_id regenerated.
+        second_call = mock_invoke.call_args_list[1]
+        assert 'resume_session_id' not in second_call.kwargs
+        new_sid = second_call.kwargs.get('session_id')
+        assert new_sid and new_sid != 'sess-orig'
+        assert str(uuid.UUID(new_sid)) == new_sid
 
 
 # ── Caller-initiated resume (crash recovery) ───────────────────────────

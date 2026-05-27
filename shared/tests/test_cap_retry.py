@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
@@ -584,6 +585,45 @@ class TestCapRetryResume:
             "next_probe_in_s must be a numeric value (round(cooldown, 1)) in the cap_wait payload"
         )
 
+    async def test_fresh_fallback_regenerates_session_id(self):
+        """Fresh fallback after a failed resume regenerates a fresh session_id.
+
+        Regression for the reify-3604 wedge: the resume attempt may have already
+        committed the pre-allocated UUID to disk, so reusing it on the fresh
+        ``--session-id`` retry would make the CLI exit instantly with
+        'Session ID … is already in use'.  The fallback must hand a NEW UUID to
+        the fresh invocation (and drop resume_session_id).
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        # cost_usd defaults to 0.5 in make_result, so the resume failure does NOT
+        # trip the zero-cost heuristic — it routes through the resume-fallback branch.
+        resume_fail = make_result(success=False, output='resume broke')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[resume_fail, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='p', session_id='sess-orig', resume_session_id='sess-orig',
+            )
+        assert mock_inv.await_count == 2
+        # First call: the resume attempt uses the caller-supplied session id.
+        assert mock_inv.call_args_list[0].kwargs.get('resume_session_id') == 'sess-orig'
+        # Second call: fresh fallback — resume dropped, session_id regenerated.
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs
+        new_sid = second.kwargs.get('session_id')
+        assert new_sid, 'fresh fallback must keep a session_id (caller passed one)'
+        assert new_sid != 'sess-orig', 'session_id must be regenerated, not reused'
+        # Must be a valid UUID (str(uuid.uuid4()) round-trips through UUID()).
+        assert str(uuid.UUID(new_sid)) == new_sid
+
 
 # ===================================================================
 # TestCapRetryCooldown
@@ -1010,6 +1050,66 @@ class TestCapRetryEdgeCases:
         assert mock_inv.call_args_list[1].kwargs['prompt'] == CAP_HIT_RESUME_PROMPT
         assert mock_inv.call_args_list[2].kwargs['prompt'] == 'precious prompt'
         assert mock_inv.call_args_list[3].kwargs['prompt'] == 'precious prompt'
+
+    async def test_zero_cost_cli_error_not_treated_as_cap(self):
+        """A recognised CLI error (zero-cost instant exit) is NOT counted as a cap.
+
+        Regression for reify-3604: ``claude --session-id <X>`` on a reused UUID
+        exits in ~300ms with empty cost and 'Session ID … is already in use'.
+        The zero-cost heuristic must recognise that as a concrete CLI error and
+        fall through (no cap mark, no sleep, no unbounded retry) so the caller
+        gets the failed result for normal verify/steward handling.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+        )
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = make_result(
+            success=False, cost_usd=0, turns=0, duration_ms=300,
+            stderr='Error: Session ID x is already in use.',
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        # Single invocation: no cap-driven retry.
+        mock_inv.assert_awaited_once()
+        # The cap path was not taken.
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        # The failed result is returned to the caller verbatim.
+        assert got is result
+        assert got.success is False
+
+    async def test_zero_cost_unknown_message_still_cap(self):
+        """A zero-cost instant exit with an UNRECOGNISED message is still a cap.
+
+        Guards against over-narrowing the new CLI-error carve-out: when stderr is
+        empty (and output carries no known CLI-error marker), the heuristic must
+        still treat the result as a cap hit and fail over.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        capped = make_result(
+            success=False, cost_usd=0, turns=0, duration_ms=300, stderr='',
+        )
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        assert mock_inv.await_count == 2
+        gate._handle_cap_detected.assert_called_once()
+        mock_sleep.assert_awaited_once()
+        assert got.success is True
 
 
 # ===================================================================
