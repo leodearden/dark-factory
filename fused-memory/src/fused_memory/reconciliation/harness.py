@@ -1163,6 +1163,66 @@ class ReconciliationHarness:
             logger.warning(f'Failed to load prior S3 findings: {e}')
         return None
 
+    async def _finding_persistence_count(
+        self,
+        project_id: str,
+        finding: dict,
+        lookback: int = 5,
+    ) -> int:
+        """Count how many of the last `lookback` completed runs contain a matching finding.
+
+        Identity is determined by compute_content_fingerprint (same key as _escalate uses
+        for dedup), so findings that differ only in non-identity fields do not inflate the
+        count.  Counted per-run — duplicates within one run's items_flagged do not count
+        twice.
+
+        Returns 0 if HAS_ESCALATION is False, if the fingerprint call raises, or if any
+        other exception occurs (graceful degradation).
+
+        Task 1512 / plans/afk-A7-recon-closure.md.
+        """
+        if not HAS_ESCALATION:
+            return 0
+        try:
+            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                'recon_integrity_issue',
+                finding.get('category') or '',
+                [str(a) for a in (finding.get('affected_ids') or [])],
+                finding.get('description') or '',
+            )
+        except Exception:
+            return 0
+        try:
+            recent = await self.journal.get_recent_runs(project_id, limit=lookback)
+            count = 0
+            for run in recent:
+                if run.status != 'completed':
+                    continue
+                s3_report = run.stage_reports.get('integrity_check')
+                if s3_report is None:
+                    continue
+                if isinstance(s3_report, dict):
+                    items = s3_report.get('items_flagged', []) or []
+                else:
+                    items = s3_report.items_flagged or []
+                # Count this run once if any item matches the target fingerprint
+                for item in items:
+                    try:
+                        fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                            'recon_integrity_issue',
+                            item.get('category') or '',
+                            [str(a) for a in (item.get('affected_ids') or [])],
+                            item.get('description') or '',
+                        )
+                    except Exception:
+                        continue
+                    if fp == target_fp:
+                        count += 1
+                        break  # one match per run is enough
+            return count
+        except Exception:
+            return 0
+
     async def _maybe_remediate(
         self,
         project_id: str,
