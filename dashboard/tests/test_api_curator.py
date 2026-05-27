@@ -30,6 +30,14 @@ from dashboard.data.metrics import METRICS_SCHEMA
 # dashboard.data.metrics namespace, so patch there — not dashboard.data.memory.
 _PATCH_TARGET = 'dashboard.data.metrics.mcp_tool_call'
 
+# Healthy (unpaused) curator-gate dict returned by get_curator_state when the
+# MCP helper is mocked.  Most endpoint tests do not care about paused_reason and
+# just need a deterministic, server-free response.
+_HEALTHY_GATE = {'paused': False, 'paused_reason': None, 'soonest_open_at': None, 'account_count': 0}
+
+# Convenience patch target for get_curator_state (resolved in the app namespace).
+_PATCH_CURATOR_STATE = 'dashboard.app.memory_data.get_curator_state'
+
 ACCOUNT_EVENTS_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS account_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,10 +89,9 @@ def test_curator_endpoint_returns_envelope_shape(client):
     None in the response (healthy gate has no pause reason).
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
-    healthy_gate = {'paused': False, 'paused_reason': None, 'soonest_open_at': None, 'account_count': 0}
     with (
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
-        patch('dashboard.app.memory_data.get_curator_state', new=AsyncMock(return_value=healthy_gate)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = client.get('/api/v2/dashboard/curator')
 
@@ -138,6 +145,7 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -190,7 +198,11 @@ def test_curator_latency_spark_from_metrics_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -239,7 +251,11 @@ def test_curator_capped_spark_from_runs_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -275,7 +291,11 @@ def test_curator_capped_now_open_ended_interval(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -319,6 +339,7 @@ def test_api_curator_delegates_to_compute_capped_now_and_windows(tmp_path: Path)
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=empty_result),
         patch('dashboard.app.compute_capped_now_and_windows', new=mock_helper),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -435,7 +456,11 @@ def test_curator_pending_spark_from_metrics_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -477,6 +502,7 @@ def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -547,6 +573,7 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         _override_client(config) as c,
         patch('dashboard.app.get_curator_sparks', new=_mock_sparks),
         patch(_PATCH_TARGET, new=_mock_mcp),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -585,7 +612,11 @@ def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatc
         return {'project_id': 'p', 'count': 0, 'tickets': []}
 
     config = _make_config(tmp_path)
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=_mock_mcp):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=_mock_mcp),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -651,6 +682,7 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
             'dashboard.data.db.DbPool.get',
             new=AsyncMock(side_effect=OSError('simulated transient FS error')),
         ),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
