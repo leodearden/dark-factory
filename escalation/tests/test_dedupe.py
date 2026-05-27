@@ -379,3 +379,54 @@ class TestFindDedupeParent:
         # Despite enabled=False, find_dedupe_parent still finds a match
         result = find_dedupe_parent(queue, candidate, config, now=now)
         assert result == 'esc-1-1'
+
+
+class TestEscalationDedupeFingerprint:
+    """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
+
+    def _make_min_escalation(self):
+        from escalation.models import Escalation
+        return Escalation(
+            id='esc-1-1',
+            task_id='1',
+            agent_role='implementer',
+            severity='blocking',
+            category='recon_integrity_issue',
+            summary='Unresolved after remediation: entity mismatch',
+        )
+
+    def test_default_is_none(self):
+        """(a) A freshly constructed Escalation has dedupe_fingerprint is None by default."""
+        esc = self._make_min_escalation()
+        assert esc.dedupe_fingerprint is None
+
+    def test_round_trips_via_json(self):
+        """(b) When set to a string, dedupe_fingerprint survives to_json/from_json round-trip."""
+        from escalation.models import Escalation
+        esc = self._make_min_escalation()
+        esc.dedupe_fingerprint = 'abc123deadbeef'
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.dedupe_fingerprint == 'abc123deadbeef'
+
+    def test_from_dict_without_key_defaults_to_none(self):
+        """(c) from_dict on a legacy dict WITHOUT the key defaults to None."""
+        from escalation.models import Escalation
+        old_dict = {
+            'id': 'esc-1-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'recon_integrity_issue',
+            'summary': 'Unresolved after remediation: entity mismatch',
+        }
+        esc = Escalation.from_dict(old_dict)
+        assert esc.dedupe_fingerprint is None
+
+    def test_separate_instances_do_not_share_state(self):
+        """(d) Two separate instances do not share the dedupe_fingerprint field."""
+        esc_a = self._make_min_escalation()
+        esc_b = self._make_min_escalation()
+        esc_a.dedupe_fingerprint = 'fingerprint-for-a'
+        assert esc_b.dedupe_fingerprint is None, (
+            'Setting dedupe_fingerprint on one instance must not affect another'
+        )
