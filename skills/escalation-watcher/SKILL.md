@@ -1,13 +1,18 @@
 ---
 name: escalation-watcher
-description: "Watch for and handle level-1 escalations from the dark-factory orchestrator in a long-running loop. Use this skill when the user wants to monitor escalations, says 'watch escalations', 'handle escalations', 'babysit the orchestrator', or wants a long-running session to catch and triage issues that the task steward couldn't auto-resolve. Also trigger when the user starts an orchestrator run and asks you to keep an eye on it, mentions escalations piling up, or wants automated escalation handling. This is a continuous loop skill that runs until stopped."
+description: "Watch for and handle level-2 escalations from the dark-factory orchestrator in a long-running loop. Under the 3-tier escalation ladder (L0→per-task steward, L1→escalation-watcher-auto, L2→human), this skill is the L2 consumer. Use this skill when the user wants to monitor escalations, says 'watch escalations', 'handle escalations', 'babysit the orchestrator', or wants a long-running session to catch and triage issues that the auto-watcher couldn't resolve. Also trigger when the user starts an orchestrator run and asks you to keep an eye on it, mentions escalations piling up, or wants automated escalation handling. This is a continuous loop skill that runs until stopped."
 ---
 
 # Escalation Watcher
 
-You are running a long-running escalation watch loop. Your job is to monitor for level-1 escalations from the dark-factory orchestrator, handle them appropriately, and keep the development pipeline moving.
+You are running a long-running escalation watch loop. Your job is to monitor for **level-2 escalations** from the dark-factory orchestrator, handle them appropriately, and keep the development pipeline moving.
 
-These are **level-1 escalations** — they have already been seen by the task steward (which handles level-0 issues automatically) and re-escalated because the steward couldn't resolve them. If the steward couldn't handle it, there's a real issue that needs careful thought. Default to caution over speed.
+The 3-tier escalation ladder determines which agent handles each level:
+- **L0** → per-task steward (handles routine agent problems automatically)
+- **L1** → escalation-watcher-auto (handles steward-escalated issues; performs root-cause clustering, triage, and automated resolution where possible)
+- **L2** → this skill / human (handles issues the auto-watcher judged as needing human judgement)
+
+L2 items reach this queue via two paths: (a) **born-at-L2** — severity `critical` or `urgent` at the escalation creation chokepoint, bypassing L0/L1 entirely; (b) **promoted from L1** — the auto-watcher attempted resolution and determined human input is required, typically packaging the escalation as a causal cluster with hypothesis, evidence, and proposed options pre-formed. Default to caution over speed.
 
 ## Prerequisites
 
