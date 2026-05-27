@@ -79,3 +79,40 @@ class TestSweepBasic:
         assert report.root_after == 1
         assert report.reconciled_root_wins == 0
         assert report.reconciled_archive_wins == 0
+
+
+class TestSweepDryRunDefault:
+    """apply=False (default) leaves disk untouched but populates report with would-do counts."""
+
+    def test_dry_run_default_does_not_move_files(self, tmp_path: Path):
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-1-2', 'resolved', resolved_at='2026-05-20T11:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-2-1', 'dismissed', resolved_at='2026-05-21T08:00:00+00:00')
+        report = sweep.sweep(tmp_path)  # default: apply=False
+        # All 3 root files still present
+        assert (tmp_path / 'esc-1-1.json').exists()
+        assert (tmp_path / 'esc-1-2.json').exists()
+        assert (tmp_path / 'esc-2-1.json').exists()
+        # No archive dir created
+        assert not (tmp_path / 'archive').exists()
+        # But report says 3 would move
+        assert report.archived == 3
+
+    def test_dry_run_root_after_is_projected(self, tmp_path: Path):
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-1-2', 'resolved', resolved_at='2026-05-20T11:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-2-1', 'dismissed', resolved_at='2026-05-21T08:00:00+00:00')
+        report = sweep.sweep(tmp_path)
+        assert report.root_before == 3
+        assert report.root_after == 0  # projected: all 3 would move
+
+    def test_apply_false_explicit_same_as_default(self, tmp_path: Path):
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00')
+        report_default = sweep.sweep(tmp_path)
+        # reset: file still there since dry-run
+        report_explicit = sweep.sweep(tmp_path, apply=False)
+        assert report_default.archived == report_explicit.archived
+        assert report_default.root_before == report_explicit.root_before
+        assert report_default.root_after == report_explicit.root_after
+        # Both leave disk unchanged
+        assert (tmp_path / 'esc-1-1.json').exists()
