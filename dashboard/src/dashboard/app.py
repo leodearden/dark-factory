@@ -810,7 +810,7 @@ async def api_curator(request: Request) -> JSONResponse:
         cd = await _cost_dbs(config, pool)
         return await read_cap_intervals(cd, days=1)
 
-    fanout_r, sparks_r, intervals_r = await asyncio.gather(
+    fanout_r, sparks_r, intervals_r, state_r = await asyncio.gather(
         fan_out_list_tickets(
             http_client,
             config,
@@ -818,6 +818,7 @@ async def api_curator(request: Request) -> JSONResponse:
         ),
         _sparks_leg(),
         _intervals_leg(),
+        memory_data.get_curator_state(http_client, config),
         return_exceptions=True,
     )
     # fan_out_list_tickets never raises a normal Exception (per-root failures are
@@ -827,6 +828,7 @@ async def api_curator(request: Request) -> JSONResponse:
     raw_tickets, pending_total = safe_gather_result(fanout_r, ([], 0), 'curator/fan_out')
     curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
     intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
+    curator_state: dict = safe_gather_result(state_r, {'offline': True}, 'curator/state')
 
     # Map raw MCP rows to the dashboard display shape (age_seconds, title, etc.).
     # Pure CPU — runs after the gather with no latency penalty.
@@ -868,16 +870,20 @@ async def api_curator(request: Request) -> JSONResponse:
         capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_spark = _empty_capped
 
+    if 'paused' in curator_state:
+        paused_reason: str | None = curator_state.get('paused_reason')
+    else:
+        if curator_state:
+            logger.debug('curator/state: unexpected response shape %r', curator_state)
+        paused_reason = None
+
     return JSONResponse(
         redux_api.shape_curator(
             pending=pending,
             curator_sparks=curator_sparks,
             capped_spark=cast(dict, capped_spark),
             capped_now=capped_now,
-            # paused_reason: the usage_gate's pause reason lives only in-memory and
-            # is not exposed by any current MCP tool.  Returns None until a follow-up
-            # task adds a snapshot column or a new get_curator_state MCP tool.
-            paused_reason=None,
+            paused_reason=paused_reason,
             pending_total=pending_total,
         )
     )

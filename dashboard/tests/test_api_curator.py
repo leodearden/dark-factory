@@ -30,6 +30,14 @@ from dashboard.data.metrics import METRICS_SCHEMA
 # dashboard.data.metrics namespace, so patch there — not dashboard.data.memory.
 _PATCH_TARGET = 'dashboard.data.metrics.mcp_tool_call'
 
+# Healthy (unpaused) curator-gate dict returned by get_curator_state when the
+# MCP helper is mocked.  Most endpoint tests do not care about paused_reason and
+# just need a deterministic, server-free response.
+_HEALTHY_GATE = {'paused': False, 'paused_reason': None, 'soonest_open_at': None, 'account_count': 0}
+
+# Convenience patch target for get_curator_state (resolved in the app namespace).
+_PATCH_CURATOR_STATE = 'dashboard.app.memory_data.get_curator_state'
+
 ACCOUNT_EVENTS_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS account_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,11 +84,15 @@ def test_curator_endpoint_returns_envelope_shape(client):
     without a real server. latency_spark / capped_spark default to empty series
     because no DB is seeded in this test.
 
-    Also pins state.paused_reason to None (the current placeholder value until
-    the follow-up MCP tool lands — see app.py paused_reason TODO).
+    get_curator_state is mocked to a healthy (unpaused) state so the test is
+    deterministic without a real fused-memory server.  paused_reason should be
+    None in the response (healthy gate has no pause reason).
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = client.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -102,7 +114,7 @@ def test_curator_endpoint_returns_envelope_shape(client):
     state = cs.get('state', {})
     assert 'capped_now' in state
     assert 'paused_reason' in state
-    assert state['paused_reason'] is None  # pinned to None; see app.py paused_reason TODO
+    assert state['paused_reason'] is None  # healthy gate → paused_reason is None
     assert 'pending_total' in state
 
 
@@ -133,6 +145,7 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -185,7 +198,11 @@ def test_curator_latency_spark_from_metrics_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -234,7 +251,11 @@ def test_curator_capped_spark_from_runs_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -270,7 +291,11 @@ def test_curator_capped_now_open_ended_interval(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -314,6 +339,7 @@ def test_api_curator_delegates_to_compute_capped_now_and_windows(tmp_path: Path)
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=empty_result),
         patch('dashboard.app.compute_capped_now_and_windows', new=mock_helper),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -430,7 +456,11 @@ def test_curator_pending_spark_from_metrics_db(tmp_path: Path):
 
     config = _make_config(tmp_path)
     empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -472,6 +502,7 @@ def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -542,6 +573,7 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         _override_client(config) as c,
         patch('dashboard.app.get_curator_sparks', new=_mock_sparks),
         patch(_PATCH_TARGET, new=_mock_mcp),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -580,7 +612,11 @@ def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatc
         return {'project_id': 'p', 'count': 0, 'tickets': []}
 
     config = _make_config(tmp_path)
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=_mock_mcp):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=_mock_mcp),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -646,6 +682,7 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
             'dashboard.data.db.DbPool.get',
             new=AsyncMock(side_effect=OSError('simulated transient FS error')),
         ),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -675,3 +712,66 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
     capped = cs['capped_spark']
     assert 1 not in capped['values'], 'Expected no cap events (all zeros) when intervals leg failed'
     assert cs['state']['capped_now'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-11: paused_reason flows from MCP get_curator_state tool
+# ---------------------------------------------------------------------------
+
+
+def test_curator_endpoint_flows_paused_reason_from_mcp(tmp_path: Path):
+    """paused_reason from get_curator_state helper appears in curator state envelope.
+
+    Patches both the list_tickets fan-out (metrics.mcp_tool_call) and the
+    get_curator_state helper so the endpoint resolves without a real server.
+    Verifies that paused_reason from the gate reaches CURATOR_STATE.state.
+    """
+    config = _make_config(tmp_path, fused_memory_urls=['http://localhost:18765'])
+    mcp_tickets = {'project_id': 'p', 'count': 0, 'tickets': []}
+    curator_state_payload = {
+        'paused': True,
+        'paused_reason': 'All accounts capped (last: synthetic cap)',
+        'soonest_open_at': '2026-06-01T00:00:00+00:00',
+        'account_count': 1,
+    }
+
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
+        patch('dashboard.app.memory_data.get_curator_state',
+              new=AsyncMock(return_value=curator_state_payload)),
+        _override_client(config) as client,
+    ):
+        resp = client.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    state = data['CURATOR_STATE']['state']
+    assert state['paused_reason'] == 'All accounts capped (last: synthetic cap)', (
+        f'Expected paused_reason to flow through from MCP tool; got {state["paused_reason"]!r}'
+    )
+
+
+def test_curator_endpoint_paused_reason_none_when_helper_offline(tmp_path: Path):
+    """paused_reason is None when the get_curator_state helper is offline.
+
+    Ensures a failing curator-state leg degrades gracefully to paused_reason=None
+    rather than propagating an error or returning an unexpected value.
+    """
+    config = _make_config(tmp_path, fused_memory_urls=['http://localhost:18765'])
+    mcp_tickets = {'project_id': 'p', 'count': 0, 'tickets': []}
+    offline_payload = {'offline': True, 'error': 'all unreachable'}
+
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
+        patch('dashboard.app.memory_data.get_curator_state',
+              new=AsyncMock(return_value=offline_payload)),
+        _override_client(config) as client,
+    ):
+        resp = client.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    state = data['CURATOR_STATE']['state']
+    assert state['paused_reason'] is None, (
+        f'Expected paused_reason=None when gate helper offline; got {state["paused_reason"]!r}'
+    )
