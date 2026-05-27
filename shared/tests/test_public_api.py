@@ -102,7 +102,7 @@ class TestModuleLevelAll:
         from shared import locking
 
         assert hasattr(locking, '__all__'), 'locking must define __all__'
-        assert set(locking.__all__) == {'normalize_lock', 'files_to_modules'}
+        assert set(locking.__all__) == {'normalize_lock', 'files_to_modules', 'modules_conflict'}
 
 
 class TestInitAllCompleteness:
