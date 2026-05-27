@@ -19,6 +19,11 @@ from datetime import UTC, datetime
 # bypassing the auto-watcher and routing straight to a human.
 BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 
+# All valid severity values accepted by the MCP tools (escalate_blocker /
+# escalate_info).  Used to validate caller input and return a clear error
+# rather than silently misrouting escalations.
+KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
+
 
 @dataclass
 class Escalation:

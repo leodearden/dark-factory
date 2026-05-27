@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -252,3 +253,221 @@ class TestGetPendingLevelFilter:
         assert result[0]['id'] == l2_a.id
         assert result[0]['task_id'] == 'task-A'
         assert result[0]['level'] == 2
+
+
+# ---------------------------------------------------------------------------
+# TestL2DedupeBypass: born-at-L2 escalations bypass deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestL2DedupeBypass:
+    """Born-at-L2 escalations bypass deduplication and get their own on-disk record."""
+
+    @pytest.mark.asyncio
+    async def test_l2_infra_issue_bypasses_dedupe_gets_own_record(self, tmp_path: Path):
+        """escalate_info(severity='critical', category='infra_issue') is NOT folded into parent.
+
+        Even with a matching pending infra_issue parent (same summary prefix),
+        a critical-severity child must produce its own 'queued' record at level=2
+        rather than returning 'dedup_skipped' and losing its L2 routing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        # Pre-seed a pending infra_issue parent whose summary key will match
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='infra connection timeout',
+        )
+        queue.submit(parent)
+
+        # Child call: same category, overlapping summary, but born-at-L2
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='infra connection timeout on port 8002',
+            severity='critical',
+        )
+
+        # Must be queued (not dedup_skipped) — dedupe bypassed for L2
+        assert result['status'] == 'queued', (
+            f"Expected 'queued' (L2 bypasses dedupe), got: {result}"
+        )
+        # The child's on-disk record must exist independently and carry level=2
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2, f"Expected level==2 on own record, got: {esc.level}"
+
+    @pytest.mark.asyncio
+    async def test_l2_dedupe_bypass_does_not_modify_parent(self, tmp_path: Path):
+        """When L2 bypasses dedupe, the pre-seeded parent's dedupe_count stays 0."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='infra connection timeout',
+        )
+        queue.submit(parent)
+        parent_id = parent.id
+
+        await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='infra connection timeout on port 8002',
+            severity='critical',
+        )
+
+        updated_parent = queue.get(parent_id)
+        assert updated_parent is not None
+        assert updated_parent.dedupe_count == 0, (
+            f"Expected dedupe_count==0 (L2 bypasses dedupe), got: {updated_parent.dedupe_count}"
+        )
+        assert len(updated_parent.dedupe_children) == 0, (
+            f"Expected no dedupe_children (L2 bypasses dedupe), got: {updated_parent.dedupe_children}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_l2_blocker_terminal_task_resolved_record_has_level2(self, tmp_path: Path):
+        """born-at-L2 severity + terminal task: auto-resolved on-disk record has level==2.
+
+        The L2 gate stamps esc.level=2 before Gate 4 (terminal-task auto-resolve),
+        so submit_resolved writes the record with level=2 even when the task is done.
+        """
+        async def _lookup(task_id: str) -> str:
+            return 'done'
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, task_status_lookup=_lookup)
+
+        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+
+        assert result['status'] == 'resolved', (
+            f"Expected 'resolved' (terminal task auto-resolve), got: {result['status']}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2, (
+            f"Expected level==2 on auto-resolved record, got: {esc.level}"
+        )
+        assert esc.status == 'resolved'
+
+    @pytest.mark.asyncio
+    async def test_l2_urgent_blocker_bypasses_dedupe(self, tmp_path: Path):
+        """escalate_blocker(severity='urgent') with infra_issue also bypasses dedupe."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        # Pre-seed a matching pending parent
+        parent = Escalation(
+            id=queue.make_id('task-999'),
+            task_id='task-999',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='infra connection timeout',
+        )
+        queue.submit(parent)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='infra connection timeout on port 8002',
+            severity='urgent',
+        )
+
+        assert result['status'] == 'queued', (
+            f"Expected 'queued' (L2 urgent bypasses dedupe), got: {result}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2
+
+
+# ---------------------------------------------------------------------------
+# TestSeverityValidation: escalate_blocker/escalate_info validate severity
+# ---------------------------------------------------------------------------
+
+
+class TestSeverityValidation:
+    """escalate_blocker/escalate_info reject unknown severity strings."""
+
+    @pytest.mark.asyncio
+    async def test_blocker_uppercase_critical_returns_error(self, tmp_path: Path):
+        """escalate_blocker(severity='CRITICAL') returns error — gate is case-sensitive."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, severity='CRITICAL', **_COMMON_KWARGS)
+
+        assert 'error' in result, f"Expected error for 'CRITICAL' (case-sensitive), got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_info_uppercase_urgent_returns_error(self, tmp_path: Path):
+        """escalate_info(severity='Urgent') returns error — gate is case-sensitive."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(server, severity='Urgent', **_COMMON_KWARGS)
+
+        assert 'error' in result, f"Expected error for 'Urgent' (case-sensitive), got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_blocker_typo_severity_returns_error_and_nothing_queued(self, tmp_path: Path):
+        """escalate_blocker with typo severity returns error and queues nothing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, severity='criticial', **_COMMON_KWARGS)
+
+        assert 'error' in result, f"Expected error for typo severity 'criticial', got: {result}"
+        assert len(queue.get_pending()) == 0, (
+            "Expected nothing queued when severity is invalid"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['CRITICAL', 'Urgent', 'criticial', 'INFO', 'BLOCKING'])
+    async def test_case_sensitive_gate_rejects_variants(self, tmp_path: Path, severity: str):
+        """The gate is case-sensitive; mixed-case/upper-case severities are rejected."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, severity=severity, **_COMMON_KWARGS)
+
+        assert 'error' in result, (
+            f"Expected error for severity={severity!r} (case-sensitive gate), got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_known_severities_all_accepted(self, tmp_path: Path):
+        """All KNOWN_SEVERITIES values are accepted without error by escalate_blocker."""
+        from escalation.models import KNOWN_SEVERITIES
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        for sev in KNOWN_SEVERITIES:
+            result = await _blocker(
+                server,
+                task_id=f'task-{sev}',
+                agent_role='implementer',
+                category='scope_violation',
+                summary=f'severity={sev} acceptance test',
+                severity=sev,
+            )
+            assert 'error' not in result, (
+                f"Known severity {sev!r} should be accepted, got error: {result}"
+            )

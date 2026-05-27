@@ -12,7 +12,7 @@ from fastmcp import FastMCP
 
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
@@ -76,15 +76,26 @@ def create_server(
         TOCTOU logic so recon (A7b) can reuse the same orchestration without
         duplication.
 
+        Born-at-L2 escalations (``esc.severity in BORN_AT_L2_SEVERITIES``) are
+        bypassed from deduplication: they need their own on-disk record stamped
+        ``level=2``.  Folding them into an existing parent (which retains its
+        original lower level) would silently drop the L2 routing signal.
+
         Response shapes (from dedupe.submit_or_dedupe):
         - Queued:        ``{'id': esc_id, 'status': 'queued'}``
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                             'parent_id': parent_id, 'child_id': esc.id}``
+          (never returned for L2 escalations — they always produce 'queued')
 
         Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
         — the child re-runs on its next workflow invocation; no per-child wake
         signal is emitted.
         """
+        # L2 escalations bypass deduplication: their level=2 stamp must be
+        # preserved on an independent on-disk record (see docstring above).
+        if esc.severity in BORN_AT_L2_SEVERITIES:
+            queue.submit(esc)
+            return {'id': esc.id, 'status': 'queued'}
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
     # --- Terminal-task chokepoint helper ---
@@ -108,8 +119,10 @@ def create_server(
         """
         # Severity gate: critical/urgent escalations are born at L2, bypassing
         # the auto-watcher and routing straight to a human (BORN_AT_L2_SEVERITIES).
-        # This runs before all other gates so the on-disk record is always stamped
-        # level=2 for any path that reaches the queue (queued, deduped, or resolved).
+        # This runs before all other gates so the on-disk record is stamped level=2
+        # on every path: queued normally, auto-resolved via submit_resolved, or any
+        # gate bypass.  L2 escalations also skip deduplication in _submit_or_dedupe
+        # so they are never silently folded into a lower-level parent.
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc.level = 2
 
@@ -180,15 +193,29 @@ def create_server(
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
 
+        *severity* must be one of ``models.KNOWN_SEVERITIES``
+        (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
+        (including case variants such as ``'INFO'`` or ``'CRITICAL'``) are rejected
+        with an ``{'error': ...}`` response so misconfigured callers get immediate
+        feedback rather than silently-misrouted L0 escalations.
+
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
 
         Response shape:
         - Queued (task alive):    ``{id, status}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id}``
+          (L2 escalations are never deduped — they always produce 'queued')
         - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
           Callers needing the full record can call get_escalation(id).
         """
+        if severity not in KNOWN_SEVERITIES:
+            return {
+                'error': (
+                    f'invalid severity {severity!r}; '
+                    f'expected one of {sorted(KNOWN_SEVERITIES)}'
+                ),
+            }
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,
@@ -229,6 +256,12 @@ def create_server(
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
 
+        *severity* must be one of ``models.KNOWN_SEVERITIES``
+        (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
+        (including case variants such as ``'BLOCKING'`` or ``'CRITICAL'``) are
+        rejected with an ``{'error': ...}`` response so misconfigured callers get
+        immediate feedback rather than silently-misrouted escalations.
+
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
@@ -236,9 +269,17 @@ def create_server(
         Response shape always includes ``action='terminate_cleanly'`` plus:
         - Queued:        ``{id, status, action}``  where status='queued'
         - Deduped:       ``{id, status, parent_id, child_id, action}``
+          (L2 escalations are never deduped — they always produce 'queued')
         - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
           Callers needing the full record can call get_escalation(id).
         """
+        if severity not in KNOWN_SEVERITIES:
+            return {
+                'error': (
+                    f'invalid severity {severity!r}; '
+                    f'expected one of {sorted(KNOWN_SEVERITIES)}'
+                ),
+            }
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,
