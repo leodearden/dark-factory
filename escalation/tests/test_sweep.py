@@ -116,3 +116,125 @@ class TestSweepDryRunDefault:
         assert report_default.root_after == report_explicit.root_after
         # Both leave disk unchanged
         assert (tmp_path / 'esc-1-1.json').exists()
+
+
+def _write_archive_esc(
+    queue_dir: Path,
+    id: str,
+    resolved_at: str,
+    status: str,
+    resolved_by: str | None = None,
+    resolution_turns: int | None = None,
+) -> Path:
+    """Write a minimal esc-*.json directly into queue_dir/archive/YYYY-MM-DD/<id>.json."""
+    esc = Escalation(
+        id=id,
+        task_id='1',
+        agent_role='test',
+        severity='info',
+        category='cleanup_needed',
+        summary='test escalation',
+        status=status,
+        resolved_at=resolved_at,
+        resolved_by=resolved_by,
+        resolution_turns=resolution_turns,
+    )
+    from escalation import archive as _archive
+    dated_dir = _archive.archive_dir_for_date(queue_dir, resolved_at)
+    dated_dir.mkdir(parents=True, exist_ok=True)
+    path = dated_dir / f'{id}.json'
+    path.write_text(esc.to_json())
+    return path
+
+
+class TestSweepReconciliation:
+    """When an archive copy already exists, pick the richer record."""
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_root_richer_wins_overwrites_archive_content(self, tmp_path: Path):
+        """Root has resolved_by='steward', archive has resolved_by=None → root wins."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward'
+        )
+        report = sweep.sweep(tmp_path, apply=True)
+        # Archive file still at its original path, now has root content
+        assert archive_path.exists()
+        assert not root_path.exists()
+        winner = Escalation.from_json(archive_path.read_text())
+        assert winner.resolved_by == 'steward'
+        assert report.reconciled_root_wins == 1
+        assert report.archived == 0
+        assert report.reconciled_archive_wins == 0
+
+    def test_archive_richer_wins_drops_root(self, tmp_path: Path):
+        """Archive has resolved_by='steward', root has resolved_by=None → archive wins."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by='steward'
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by=None
+        )
+        report = sweep.sweep(tmp_path, apply=True)
+        assert archive_path.exists()
+        assert not root_path.exists()
+        # Archive content is unchanged
+        winner = Escalation.from_json(archive_path.read_text())
+        assert winner.resolved_by == 'steward'
+        assert report.reconciled_archive_wins == 1
+        assert report.reconciled_root_wins == 0
+
+    def test_tied_richness_archive_wins_drops_root(self, tmp_path: Path):
+        """Both resolved_by=None, resolution_turns=None → tie → archive wins."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved',
+            resolved_by=None, resolution_turns=None
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by=None, resolution_turns=None
+        )
+        report = sweep.sweep(tmp_path, apply=True)
+        assert archive_path.exists()
+        assert not root_path.exists()
+        assert report.reconciled_archive_wins == 1
+
+    def test_resolution_turns_tiebreaker_when_resolved_by_tied(self, tmp_path: Path):
+        """Both have resolved_by='steward'; root has resolution_turns=5, archive=None → root wins."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved',
+            resolved_by='steward', resolution_turns=None
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward', resolution_turns=5
+        )
+        report = sweep.sweep(tmp_path, apply=True)
+        assert archive_path.exists()
+        assert not root_path.exists()
+        winner = Escalation.from_json(archive_path.read_text())
+        assert winner.resolution_turns == 5
+        assert report.reconciled_root_wins == 1
+
+    def test_dry_run_reconciliation_leaves_both_copies_intact(self, tmp_path: Path):
+        """Dry-run for root-wins case: both files remain, report shows reconciled_root_wins=1."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward'
+        )
+        archive_orig = archive_path.read_text()
+        root_orig = root_path.read_text()
+        report = sweep.sweep(tmp_path, apply=False)
+        # Both files untouched
+        assert archive_path.read_text() == archive_orig
+        assert root_path.read_text() == root_orig
+        # But report says root would win
+        assert report.reconciled_root_wins == 1
