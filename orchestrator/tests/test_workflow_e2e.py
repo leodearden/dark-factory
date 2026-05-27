@@ -5325,6 +5325,80 @@ class TestMarkBlockedBypassDetection:
             f'{[(e.id, e.category) for e in all_escs]}'
         )
 
+    async def test_bypass_done_summary_reflects_row_status(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """The bypass_done L1 summary must derive the row state from exc.old_status
+        (e.g. "row is 'done'") rather than the hardcoded literal 'row already done'.
+
+        RED: current summary is 'row already done, provenance commit not on main'
+        which contains 'already done' but lacks "row is 'done'".
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+
+        # Off-main done: row has done_provenance with a fabricated SHA.
+        bypass_sha = 'd' * 40
+        scheduler.task_data = {  # type: ignore[attr-defined]
+            task_assignment.task_id: {
+                'id': task_assignment.task_id,
+                'status': 'done',
+                'metadata': {
+                    'done_provenance': {
+                        'kind': 'merged', 'commit': bypass_sha,
+                    },
+                },
+            },
+        }
+
+        original_set = scheduler.set_task_status
+
+        async def raising_set(task_id, status, *, done_provenance=None, reopen_reason=None):
+            if status == 'blocked' and reopen_reason is None:
+                raise TerminalExitRejection(
+                    task_id=task_id, old_status='done',
+                    target_status='blocked', raw='terminal_exit_rejected',
+                )
+            await original_set(
+                task_id, status,
+                done_provenance=done_provenance,
+                reopen_reason=reopen_reason,
+            )
+
+        scheduler.set_task_status = raising_set  # type: ignore[method-assign]
+
+        outcome = await workflow._mark_blocked('off-main done detected')
+
+        # Genuine bypass — BLOCKED outcome, not CANCELLED.
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED on genuine bypass path, got {outcome!r}'
+        )
+
+        # A bypass_done L1 must be filed.
+        l1 = queue.get_by_task(task_assignment.task_id, level=1)
+        bypass_l1 = [e for e in l1 if e.category == 'bypass_done']
+        assert bypass_l1, (
+            f'expected category=bypass_done in L1 list, got '
+            f'{[(e.id, e.category) for e in l1]}'
+        )
+
+        # The summary must be derived from exc.old_status — not the hardcoded
+        # literal 'row already done'.
+        summary = bypass_l1[0].summary
+        assert "row is 'done'" in summary, (
+            f"Expected \"row is 'done'\" in bypass_done summary, got: {summary!r}"
+        )
+        assert 'already done' not in summary, (
+            f"Expected hardcoded 'already done' to be absent from summary, got: {summary!r}"
+        )
+
     async def test_run_aborts_gracefully_when_task_cancelled_at_setup(
         self, config, git_ops, task_assignment, tmp_path,
     ):
