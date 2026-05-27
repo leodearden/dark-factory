@@ -14,6 +14,7 @@ from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centraliz
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.usage_gate import InvokeSlot
 
 from orchestrator.config import OrchestratorConfig
@@ -2492,3 +2493,82 @@ class TestMakePreTriageGate:
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         assert gate.detect_cap_hit() is True
         assert gate.detect_cap_hit() is False
+
+
+# ---------------------------------------------------------------------------
+# Defect-2 regression: _patch_resolution_metadata must not resurrect archived
+# escalations into the queue root.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def steward_with_real_queue(tmp_path, worktree, mock_config, mock_mcp, mock_briefing):
+    """TaskSteward using a REAL EscalationQueue backed by tmp_path.
+
+    Replaces mock_queue with a real filesystem-backed queue so that the
+    on-disk write location (queue root vs archive) can be directly asserted.
+    """
+    real_queue = EscalationQueue(tmp_path / 'escalations')
+    return TaskSteward(
+        task_id='42',
+        task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+        worktree=worktree,
+        config=mock_config,
+        mcp=mock_mcp,
+        escalation_queue=real_queue,
+        briefing=mock_briefing,
+    )
+
+
+class TestPatchResolutionMetadataDefect2:
+    """Regression tests for Defect-2: _patch_resolution_metadata must not resurrect
+    archived escalations into the queue root."""
+
+    def test_patches_archived_escalation_in_place_and_root_stays_empty(
+        self, steward_with_real_queue
+    ):
+        """After patching, the queue root must be empty and the archive copy must
+        carry resolved_by='steward' with the correct resolution_turns.
+
+        This test FAILS on the current _rewrite-based implementation because
+        _rewrite always writes to queue_dir/{id}.json (the root), resurrecting
+        an escalation that resolve() already moved to the archive.
+        """
+        steward = steward_with_real_queue
+        queue = steward.escalation_queue
+
+        # Setup: submit then resolve without attribution (simulates the
+        # agent-resolved-without-attribution edge case).
+        esc = _make_escalation(id='esc-42-7')
+        queue.submit(esc)
+        queue.resolve('esc-42-7', 'agent fixed it')
+
+        # Pre-conditions: file should now be in the archive, not the root.
+        assert not (queue.queue_dir / 'esc-42-7.json').exists(), (
+            'queue root must be empty after resolve() archives the file'
+        )
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-7.json'))
+        assert len(archive_files) == 1, 'exactly one archive copy must exist after resolve()'
+        archived_data = json.loads(archive_files[0].read_text())
+        assert archived_data['resolved_by'] is None, (
+            'archive copy must have resolved_by=None before patching'
+        )
+
+        # Action: call the method under test.
+        steward._patch_resolution_metadata('esc-42-7', _make_result(turns=5))
+
+        # Post-condition (a): NO RESURRECTION to queue root — this is the headline
+        # assertion that fails on the _rewrite-based implementation.
+        assert not (queue.queue_dir / 'esc-42-7.json').exists(), (
+            'DEFECT-2 REGRESSION: _patch_resolution_metadata resurrected the file '
+            'into the queue root (should have updated the archive copy in place)'
+        )
+        # Post-condition (b): archive still has exactly one copy (no duplication).
+        post_archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-7.json'))
+        assert len(post_archive_files) == 1, 'archive must still have exactly one copy'
+        # Post-condition (c): archive copy carries the patched fields.
+        patched = json.loads(post_archive_files[0].read_text())
+        assert patched['resolved_by'] == 'steward'
+        assert patched['resolution_turns'] == 5
+        assert patched['status'] == 'resolved'
+        assert patched['resolution'] == 'agent fixed it'
