@@ -1534,6 +1534,63 @@ class TestSweepCancelledDescendants:
                 f'expected no skip actions for genuine orphan, got {skip_actions}'
             )
 
+    @pytest.mark.asyncio
+    async def test_recheck_failure_falls_back_to_escalation(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, monkeypatch, tmp_path,
+    ):
+        """Live re-check I/O failure must NOT drop a genuine orphan (fail-open).
+
+        The initial sweep snapshot succeeds; the live re-check raises RuntimeError.
+        The sweep must fall through to the existing escalate path and write one
+        blocking scope_violation L1 file.  No descendant_skipped_co_cancelled
+        action must appear — the guard never suppresses on a re-check failure.
+        """
+        from fused_memory.reconciliation import targeted
+        from escalation.models import Escalation
+
+        monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: True)
+
+        project_root = str(tmp_path)
+
+        # D is a pure dependent (no spawned_from / escalation_id) → ambiguous route.
+        d_pending = {
+            'id': 'D', 'status': 'pending', 'title': 'dependent',
+            'metadata': {}, 'dependencies': ['A'], 'subtasks': [],
+        }
+        snapshot1 = {'tasks': [d_pending]}  # initial sweep snapshot succeeds
+
+        # side_effect: snapshot1 → initial get_tasks (L548),
+        #              RuntimeError → live re-check in _live_status_map
+        mock_taskmaster.get_tasks = AsyncMock(
+            side_effect=[snapshot1, RuntimeError('db down')],
+        )
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        # Re-check failure must fall-open: escalation file is still written
+        esc_dir = tmp_path / 'data' / 'escalations'
+        esc_files = list(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert len(esc_files) == 1, (
+            f'expected one escalation file on re-check failure, got {esc_files}'
+        )
+        esc = Escalation.from_json(esc_files[0].read_text())
+        assert esc.task_id == 'D'
+        assert esc.category == 'scope_violation'
+        assert esc.level == 1
+
+        # No skip action — the guard must not suppress on a transient re-check error
+        actions = result.get('actions', [])
+        skip_actions = [
+            a for a in actions if a.get('type') == 'descendant_skipped_co_cancelled'
+        ]
+        assert not skip_actions, (
+            f'expected no skip actions on re-check failure, got {skip_actions}'
+        )
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
