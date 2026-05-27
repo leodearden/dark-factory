@@ -67,6 +67,12 @@ except ImportError:
 # files once — see design_decisions in plan.json for rationale.
 # Set to None when escalation package is not installed; _escalate checks
 # HAS_ESCALATION before using it.
+#
+# Escalation-closure contract (A7b / plans/afk-A7-recon-closure.md):
+#   - The reconciliation harness NEVER calls queue.resolve().
+#   - The watcher session (port 8103) is the sole closer of recon escalations.
+#   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+#   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
     DedupeConfig(  # type: ignore[possibly-undefined]
         infra_dedupe_enabled=True,
