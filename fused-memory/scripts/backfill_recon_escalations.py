@@ -49,8 +49,7 @@ import json
 import logging
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 from escalation.dedupe import DedupeConfig, compute_content_fingerprint

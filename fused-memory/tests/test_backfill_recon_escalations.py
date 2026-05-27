@@ -6,6 +6,7 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import types
@@ -13,9 +14,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
-from escalation.dedupe import compute_content_fingerprint, DedupeConfig
+from escalation.dedupe import compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -348,7 +347,6 @@ class TestApplyPlan:
         plan = build_plan(queue.get_pending())
         apply_plan(queue, plan)
 
-        canonical_id = plan.collapses[0].canonical_id
         child_ids = plan.collapses[0].child_ids
 
         # Children are no longer pending.
@@ -518,7 +516,7 @@ class TestApplyAndIdempotency:
     def test_apply_collapses_to_expected_survivor_count(self, tmp_path: Path) -> None:
         """After apply, pending count = distinct fingerprints + non-eligible."""
         queue = EscalationQueue(tmp_path)
-        state = self._seed_queue(queue)
+        self._seed_queue(queue)
 
         report = run(tmp_path, apply=True)
         assert report['dry_run'] is False
@@ -641,10 +639,8 @@ class TestSafetyAndCli:
         old_argv = _sys.argv
         try:
             _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(tmp_path)]
-            try:
+            with contextlib.suppress(SystemExit):
                 _mod.main()
-            except SystemExit:
-                pass
         finally:
             _sys.argv = old_argv
 
@@ -665,10 +661,8 @@ class TestSafetyAndCli:
         old_argv = _sys.argv
         try:
             _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(tmp_path), '--apply']
-            try:
+            with contextlib.suppress(SystemExit):
                 _mod.main()
-            except SystemExit:
-                pass
         finally:
             _sys.argv = old_argv
 
