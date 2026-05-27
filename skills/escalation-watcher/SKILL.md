@@ -1,13 +1,18 @@
 ---
 name: escalation-watcher
-description: "Watch for and handle level-1 escalations from the dark-factory orchestrator in a long-running loop. Use this skill when the user wants to monitor escalations, says 'watch escalations', 'handle escalations', 'babysit the orchestrator', or wants a long-running session to catch and triage issues that the task steward couldn't auto-resolve. Also trigger when the user starts an orchestrator run and asks you to keep an eye on it, mentions escalations piling up, or wants automated escalation handling. This is a continuous loop skill that runs until stopped."
+description: "Watch for and handle level-2 escalations from the dark-factory orchestrator in a long-running loop. Under the 3-tier escalation ladder (L0→per-task steward, L1→escalation-watcher-auto, L2→human), this skill is the L2 consumer. Use this skill when the user wants to monitor escalations, says 'watch escalations', 'handle escalations', 'babysit the orchestrator', or wants a long-running session to catch and triage issues that the auto-watcher couldn't resolve. Also trigger when the user starts an orchestrator run and asks you to keep an eye on it, mentions escalations piling up, or wants automated escalation handling. This is a continuous loop skill that runs until stopped."
 ---
 
 # Escalation Watcher
 
-You are running a long-running escalation watch loop. Your job is to monitor for level-1 escalations from the dark-factory orchestrator, handle them appropriately, and keep the development pipeline moving.
+You are running a long-running escalation watch loop. Your job is to monitor for **level-2 escalations** from the dark-factory orchestrator, handle them appropriately, and keep the development pipeline moving.
 
-These are **level-1 escalations** — they have already been seen by the task steward (which handles level-0 issues automatically) and re-escalated because the steward couldn't resolve them. If the steward couldn't handle it, there's a real issue that needs careful thought. Default to caution over speed.
+The 3-tier escalation ladder determines which agent handles each level:
+- **L0** → per-task steward (handles routine agent problems automatically)
+- **L1** → escalation-watcher-auto (handles steward-escalated issues; performs root-cause clustering, triage, and automated resolution where possible)
+- **L2** → this skill / human (handles issues the auto-watcher judged as needing human judgement)
+
+L2 items reach this queue via two paths: (a) **born-at-L2** — severity `critical` or `urgent` at the escalation creation chokepoint, bypassing L0/L1 entirely; (b) **promoted from L1** — the auto-watcher attempted resolution and determined human input is required, typically packaging the escalation as a causal cluster with hypothesis, evidence, and proposed options pre-formed. Default to caution over speed.
 
 ## Prerequisites
 
@@ -26,83 +31,42 @@ Discover the terminal command for spawning interactive sessions:
 ## The Main Loop
 
 ```
-1. Drain any pending escalations
-2. Start watcher (background task)
-3. Wait for watcher to fire (it exits on first escalation)
+1. Drain any pending L2 escalations
+2. Start watcher (background task, filtered to L2)
+3. Wait for watcher to fire (it exits on first L2 escalation)
 4. Read escalation from watcher output
-5. Also drain any other pending escalations
+5. Also drain any other pending L2 escalations
 6. Handle each escalation
 7. Go to 2
 ```
 
 ### Draining pending escalations
 
-On startup and after each watcher fire, check for all pending escalations:
+On startup and after each watcher fire, check for all pending L2 escalations:
 
 ```
-mcp__escalation__get_pending_escalations()
+mcp__escalation__get_pending_escalations(level=2)
 ```
 
-Handle each one before (re)starting the watcher. This catches anything that accumulated while no watcher was active.
+Handle each one before (re)starting the watcher. This catches any L2 escalations that accumulated while no watcher was active.
 
-### Cross-escalation analysis
+### L2-only contract
 
-Before level filtering or individual handling, scan **all** pending escalations (every level) for shared patterns. Detecting clusters matters even for escalations you won't handle — the human needs to see systematic issues:
-- Multiple escalations referencing the **same files or code** (e.g., several tasks all missing variants from `value.rs`)
-- **Similar summaries** suggesting a common root cause (e.g., "code lost in merge resolution")
-- Multiple tasks blocked by the **same regression or missing prerequisite**
+This skill drains and waits only on **level-2 escalations**. Both the watcher subprocess and the `get_pending_escalations` draining call are filtered to `level == 2` (see details in the relevant sections below).
 
-If you detect a shared root cause, flag it to the human as a **systematic issue** rather than handling each escalation independently. The individual symptoms may look like separate problems, but fixing the root cause unblocks all of them at once — and handling them individually risks inconsistent partial fixes.
+- **L0** is owned by per-task stewards — do not drain or handle L0 escalations here.
+- **L1** is owned by escalation-watcher-auto — do not drain or handle L1 escalations here.
 
-Delegate the pattern analysis to a sub-agent if there are more than ~5 pending escalations:
-
-```
-Agent(
-  description="Analyze escalation patterns",
-  prompt="""
-Analyze these pending escalations for shared root causes.
-
-## Escalations
-<paste summary of each: id, task_id, category, summary, files mentioned>
-
-## What to look for
-- Multiple escalations referencing the same files, functions, or code regions
-- Similar error descriptions suggesting a single upstream cause
-- Dependency chains (task A needs B which needs C — all escalated separately)
-
-## Output
-{
-  "clusters": [
-    {
-      "root_cause": "description of shared cause",
-      "escalation_ids": ["esc-XX-1", "esc-YY-2"],
-      "evidence": "what links them"
-    }
-  ],
-  "independent": ["esc-ZZ-3"]  // escalations with no shared pattern
-}
-""",
-  subagent_type="general-purpose"
-)
-```
-
-### Level filtering
-
-After cross-escalation analysis, separate escalations by level. Escalations have a `level` field: 0 = agent-to-steward, 1 = steward-to-human.
-
-- **Level 1**: handle according to the category rules below. This is the skill's primary job.
-- **Level 0**: these are handled by the task steward automatically — this typically takes a few minutes. **Leave them alone.** They are included in cross-escalation analysis (above) so you can spot patterns, but do not flag them as problems and do not handle them yourself. If the cross-escalation analysis reveals a cluster of L0 escalations sharing a root cause, report the pattern to the human as useful context — but don't treat the individual L0 escalations as action items.
-
-**Exception:** if the human explicitly asks you to process everything (all levels), then handle L0 escalations using the same category rules as L1.
+Never process L0 or L1 from this skill, even if explicitly asked — doing so would race with the per-task steward and escalation-watcher-auto, which own those queues and rely on their own resolution callbacks. If the user wants to handle lower-level escalations, they should invoke the appropriate skill for that level.
 
 ### Starting the watcher
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir <project_root>/data/escalations 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 2>&1
 ```
 
-Run as a **background task** (Bash with `run_in_background`). The watcher uses inotify and exits after the first matching escalation, printing its JSON to stdout.
+Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout.
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
@@ -114,7 +78,7 @@ Parse the escalation JSON from the output, then fetch full details via MCP:
 mcp__escalation__get_escalation(escalation_id="esc-XX-N")
 ```
 
-Then drain any additional pending escalations before restarting the watcher.
+Then drain any additional pending L2 escalations before restarting the watcher.
 
 ## Priority Hierarchy
 
@@ -158,10 +122,14 @@ It is better to stall development than to bake in a significant bad decision.
 
 ## Handling Escalations by Category
 
-For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. At level-1, interpret it through this lens:
+For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. First determine the escalation's **L2 origin**, then interpret the hint accordingly:
 
-- **`manual_intervention`** — The steward explicitly gave up. This is authoritative: the issue genuinely needs human judgment. Always respect it.
-- **`investigate_and_retry`** — Misleading at level-1. The steward already investigated and retried (up to 3 attempts, $12 budget). If it re-escalated with this value, the underlying issue persisted through retries. Treat as a persistent problem, not transient. Don't just retry.
+**Born-at-L2** (severity `critical` or `urgent` at creation — bypassed L0 and L1 entirely):
+Neither the per-task steward nor the auto-watcher has seen this record. Read `suggested_action` as the originating agent's own annotation — a starting point, not evidence of prior triage. `investigate_and_retry` here means what it says: a retry may well succeed since no automated attempt has been made yet.
+
+**Promoted-from-L1** (the auto-watcher attempted resolution and escalated to human):
+- **`manual_intervention`** — The auto-watcher explicitly gave up. This is authoritative: the issue genuinely needs human judgment. Always respect it.
+- **`investigate_and_retry`** — Misleading for promoted items. The item has already passed through *both* the per-task steward (L0) *and* the auto-watcher (L1) and persisted through their combined triage and retry budgets. Treat as a deeply persistent problem, not transient. Don't just retry.
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
 
@@ -451,6 +419,10 @@ mcp__escalation__resolve_issue(
 The `resolution` text matters — for `terminate=false`, it's injected directly into the agent's context when the task resumes. Be specific: include file paths, function names, and concrete instructions.
 
 For `terminate=true` (dismiss), the resolution is recorded for audit but the task is abandoned. The task can be rescheduled later.
+
+**L2 cluster cascade:** when a resolved L2 represents a causal cluster (multiple member L1 escalations grouped by the auto-watcher), resolving the L2 here cascades to close its L1 members via the escalation server — this skill resolves only the L2 itself, never each member directly. For design details, see `plans/escalation-l2-tiering.md`. Note: the cascade activates once the server-side `promote_to_l2` mechanic (E2) is shipped; prior to that, only the L2 itself closes — the behaviour of this skill is unchanged either way.
+
+**Transition period (until E2 ships):** L1 clustering by the auto-watcher is not yet active. Multiple simultaneous L2 escalations may share a common root cause without being packaged as a named cluster. When you see more than one L2 pending, scan them for shared files, summaries, or task IDs — if they share a root cause, handle them together and note the relationship in your resolution text.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
