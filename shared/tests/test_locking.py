@@ -3,7 +3,7 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
-from shared.locking import files_to_modules, normalize_lock
+from shared.locking import files_to_modules, modules_conflict, normalize_lock
 
 
 class TestNormalizeLock:
@@ -78,3 +78,26 @@ class TestFilesToModules:
         # generator
         gen = (p for p in ['foo/bar.py', 'foo/baz.py'])
         assert files_to_modules(gen, depth=2) == ['foo/bar.py', 'foo/baz.py']
+
+
+class TestModulesConflict:
+    def test_exact_match_conflicts(self):
+        assert modules_conflict('crates/reify-types', 'crates/reify-types')
+
+    def test_parent_prefix_of_child_conflicts(self):
+        # A sub-lock_depth parent ('foo') conflicts with a deeper child.
+        assert modules_conflict('foo', 'foo/bar')
+        assert modules_conflict('foo/bar', 'foo')
+
+    def test_symmetric(self):
+        assert modules_conflict('a/b', 'a/b/c') == modules_conflict('a/b/c', 'a/b')
+
+    def test_sibling_paths_do_not_conflict(self):
+        assert not modules_conflict('crates/reify-types', 'crates/reify-eval')
+
+    def test_shared_string_prefix_without_slash_does_not_conflict(self):
+        # 'foo' must not be treated as a prefix of 'foobar' (no path boundary).
+        assert not modules_conflict('foo', 'foobar')
+
+    def test_disjoint_paths_do_not_conflict(self):
+        assert not modules_conflict('a/b', 'c/d')

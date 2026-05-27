@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from shared.locking import files_to_modules, normalize_lock
+from shared.locking import files_to_modules, modules_conflict, normalize_lock
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -395,8 +395,12 @@ class ModuleLockTable:
 
     @staticmethod
     def _conflicts(a: str, b: str) -> bool:
-        """Two modules conflict if one is a prefix of the other (or exact match)."""
-        return a == b or a.startswith(b + '/') or b.startswith(a + '/')
+        """Two modules conflict if one is a prefix of the other (or exact match).
+
+        Thin delegate to ``shared.locking.modules_conflict`` so the prefix rule
+        has a single definition shared with the dashboard's holder lookup.
+        """
+        return modules_conflict(a, b)
 
     def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
         """Count how many *other* tasks hold a lock that conflicts with ``module``."""
@@ -2349,13 +2353,16 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains nine top-level keys:
+        Contains ten top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
         - current_holders: {module: task_id}
+        - lock_depth: int — top-level normalization depth for lock keys, so
+          consumers (e.g. the dashboard) can normalize file footprints the
+          same way before matching against current_holders.
         - is_paused: bool — True when the scheduler is park-stop paused
         - pause_reason: str | None — human-readable reason, or None when not paused
         - snapshot_at: ISO8601 timestamp
@@ -2415,6 +2422,7 @@ class Scheduler:
             'pin_queue': pin_queue,
             'overrides': overrides,
             'current_holders': current_holders,
+            'lock_depth': self.config.lock_depth,
             'is_paused': self.is_paused,
             'pause_reason': self.pause_reason,
             'snapshot_at': datetime.now(UTC).isoformat(),

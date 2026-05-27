@@ -1600,3 +1600,170 @@ async def test_collect_scheduler_state_normalises_non_dict_snapshot(
     assert pin_queue == []
     # No project should be misclassified as offline either
     assert project not in offline
+
+
+# ---------------------------------------------------------------------------
+# task-dashboard-lock-alignment: lock_set is normalized to the scheduler's
+# lock_depth from meta_files, and holders resolve via the shared prefix rule.
+# These deep-path cases would FAIL on main, where lock_set was the raw
+# plan.json file paths and the holder lookup was a dict-equality miss.
+# ---------------------------------------------------------------------------
+
+
+def test_compose_rows_normalizes_meta_files_to_module_locks():
+    """_compose_rows derives lock_set from meta_files normalized to lock_depth.
+
+    A deep file path (orchestrator/src/orchestrator/scheduler.py) must collapse
+    to the depth-2 module key 'orchestrator/src' — matching the snapshot's
+    current_holders keying.  On main, lock_set kept the raw file path and never
+    matched a normalized holder key.
+    """
+    from dashboard.data.scheduler import _compose_rows
+
+    active_tasks = [
+        {
+            'task_id': '1',
+            'title': 'Deep task',
+            'priority': 'high',
+            'started': 1,
+            # Raw plan.json paths (file granularity) — must be ignored in favour
+            # of meta_files, the scheduler's footprint source.
+            'locks': ['orchestrator/src/orchestrator/scheduler.py'],
+            'meta_files': [
+                'orchestrator/src/orchestrator/scheduler.py',
+                'orchestrator/src/orchestrator/workflow.py',
+            ],
+        }
+    ]
+
+    rows = _compose_rows(active_tasks, _scheduler_snapshot(), depth=2)
+
+    assert rows[0]['lock_set'] == ['orchestrator/src'], (
+        f"Expected normalized module lock, got {rows[0]['lock_set']!r}"
+    )
+
+
+def test_compose_rows_falls_back_to_locks_when_no_meta_files():
+    """When meta_files is absent/empty, lock_set falls back to `locks` (normalized).
+
+    Keeps behavior for tasks whose taskmaster metadata is untagged but which
+    still have a worktree plan.json footprint.
+    """
+    from dashboard.data.scheduler import _compose_rows
+
+    active_tasks = [
+        {
+            'task_id': '1',
+            'title': 'No metadata',
+            'priority': 'high',
+            'started': 1,
+            'locks': ['crates/reify-types/src/persistent.rs'],
+            'meta_files': [],
+        }
+    ]
+
+    rows = _compose_rows(active_tasks, _scheduler_snapshot(), depth=2)
+    assert rows[0]['lock_set'] == ['crates/reify-types']
+
+
+def test_compose_rows_deep_path_holder_resolves_in_module_contention():
+    """Deep-path footprint + holder keyed at lock_depth → module shows the holder.
+
+    End-to-end of the alignment fix: a task touching
+    orchestrator/src/orchestrator/scheduler.py normalizes to 'orchestrator/src',
+    and a snapshot holding 'orchestrator/src' resolves as that module's holder.
+    On main this returned None (raw path vs normalized key mismatch).
+    """
+    from dashboard.data.scheduler import _compose_rows, _module_contention_counts
+
+    active_tasks = [
+        {
+            'task_id': '7',
+            'title': 'Deep holder',
+            'priority': 'high',
+            'started': 1,
+            'meta_files': ['orchestrator/src/orchestrator/scheduler.py'],
+        }
+    ]
+    snapshot = _scheduler_snapshot(current_holders={'orchestrator/src': '7'})
+
+    rows = _compose_rows(active_tasks, snapshot, depth=2)
+    modules = _module_contention_counts(rows, snapshot['current_holders'], project='orch')
+
+    assert len(modules) == 1
+    assert modules[0]['path'] == 'orchestrator/src'
+    assert modules[0]['holder'] == '7', (
+        f"Expected holder '7' via normalized key match, got {modules[0]['holder']!r}"
+    )
+
+
+def test_module_contention_counts_resolves_sub_lock_depth_parent_holder():
+    """A holder keyed at a sub-lock_depth parent matches a deeper child module.
+
+    The scheduler's hierarchical lock means a holder on 'foo' (one component)
+    conflicts with a child module 'foo/bar'.  The dashboard must surface that
+    holder on the child module's row via the shared prefix rule, not equality.
+    """
+    from dashboard.data.scheduler import _module_contention_counts
+
+    rows = [{'task_id': '1', 'lock_set': ['foo/bar']}]
+    # Holder is keyed at the parent 'foo' (fewer than lock_depth components).
+    result = _module_contention_counts(rows, {'foo': 'T-9'}, project='p')
+
+    assert len(result) == 1
+    assert result[0]['path'] == 'foo/bar'
+    assert result[0]['holder'] == 'T-9', (
+        'sub-lock_depth parent holder must match child module via prefix rule'
+    )
+
+
+async def test_collect_scheduler_state_uses_meta_files_for_deep_path(
+    dummy_client, dummy_config,
+):
+    """End-to-end: collect_scheduler_state normalizes meta_files using snapshot lock_depth.
+
+    A snapshot carrying lock_depth=2 + a holder at 'orchestrator/src', joined
+    with an active task whose meta_files is a deep path, must produce a row
+    lock_set of ['orchestrator/src'] and a module whose holder resolves.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+
+    snapshot = _scheduler_snapshot(
+        current_holders={'orchestrator/src': '1'},
+        lock_depth=2,
+        snapshot_at='2026-01-01T00:00:00+00:00',
+    )
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Deep task',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 5,
+            'locks': ['orchestrator/src/orchestrator/scheduler.py'],
+            'meta_files': ['orchestrator/src/orchestrator/scheduler.py'],
+        }
+    ]
+
+    mock_mcp = AsyncMock(side_effect=[snapshot, []])
+    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, _pins, _events, offline, _paused = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert offline == []
+    assert len(rows) == 1
+    assert rows[0]['lock_set'] == ['orchestrator/src']
+    assert len(modules) == 1
+    assert modules[0]['path'] == 'orchestrator/src'
+    assert modules[0]['holder'] == '1'

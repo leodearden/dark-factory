@@ -225,7 +225,7 @@ function ModulesView({ modules, rows, eventsMap }) {
                     <span style={{ color: 'var(--fg-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.title}>
                       {r.title || '—'}
                     </span>
-                    {r.park_state && r.park_state.module_path === m.path && (
+                    {r.park_state && (r.park_state.modules || []).includes(m.path) && (
                       <span style={{ color: 'var(--warn)', fontSize: 10, flexShrink: 0 }}>parked</span>
                     )}
                   </div>

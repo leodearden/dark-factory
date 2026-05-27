@@ -26,9 +26,10 @@ function cellStateFor(row, module) {
   const lockSet = row.lock_set || [];
   if (!lockSet.includes(module.path)) return 'not-in-set';
 
-  // This task is parked waiting on this specific module
+  // This task is parked waiting on this specific module.  park_state.modules
+  // is a list of parked module keys (server snapshot shape), not a scalar.
   const ps = row.park_state;
-  if (ps && ps.module_path === module.path) return 'parked-by-me';
+  if (ps && (ps.modules || []).includes(module.path)) return 'parked-by-me';
 
   // Another task is currently running with this module held
   if (module.holder && module.holder !== row.task_id) return 'held-by-other';
@@ -66,14 +67,15 @@ function HeatmapCell({ state, holder }) {
 function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
   const { useState } = React;
 
-  // Pre-compute parked rows keyed by `(project, module_path)` so cellStateFor
+  // Pre-compute parked rows keyed by `(project, module)` so cellStateFor
   // can classify 'parked-by-other' without leaking parks across projects
   // (two projects sharing a file path must not appear to park each other).
+  // park_state.modules is a list — register one entry per parked module.
   const parkedByModule = {};
   for (const row of (rows || [])) {
     const ps = row.park_state;
-    if (ps && ps.module_path) {
-      parkedByModule[`${row.project || ''}/${ps.module_path}`] = row.task_id;
+    for (const m of (ps && ps.modules) || []) {
+      parkedByModule[`${row.project || ''}/${m}`] = row.task_id;
     }
   }
 

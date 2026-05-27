@@ -13,7 +13,18 @@ from collections.abc import Iterable
 __all__ = [
     'normalize_lock',
     'files_to_modules',
+    'modules_conflict',
 ]
+
+
+def modules_conflict(a: str, b: str) -> bool:
+    """Two module locks conflict if one is a prefix of the other (or exact match).
+
+    This is the canonical hierarchical-conflict rule used by the orchestrator's
+    ``ModuleLockTable`` (which delegates to it) and by the dashboard's holder
+    lookup. Keeping it here means the prefix semantics live in exactly one place.
+    """
+    return a == b or a.startswith(b + '/') or b.startswith(a + '/')
 
 
 def normalize_lock(module: str, depth: int = 2) -> str:

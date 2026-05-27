@@ -362,15 +362,15 @@ class TestEffectivePrioritiesCache:
 
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'effective_priorities',
-    'pin_queue', 'overrides', 'current_holders', 'snapshot_at',
+    'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct nine-key dict."""
+    """get_state_snapshot() returns the correct ten-key dict."""
 
-    def test_snapshot_returns_nine_top_level_keys(self):
+    def test_snapshot_returns_ten_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         snap = scheduler.get_state_snapshot()
         assert set(snap.keys()) == _SNAPSHOT_KEYS
@@ -389,6 +389,13 @@ class TestGetStateSnapshotShape:
         # Pause state defaults — scheduler is not paused at construction.
         assert snap['is_paused'] is False
         assert snap['pause_reason'] is None
+
+    def test_snapshot_exposes_lock_depth(self):
+        # lock_depth lets the dashboard normalize footprints the same way the
+        # scheduler does before matching against current_holders.
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=3))
+        snap = scheduler.get_state_snapshot()
+        assert snap['lock_depth'] == 3
 
     def test_snapshot_is_deep_copy_of_internal_state(self):
         """Mutating the returned snapshot must not affect the scheduler's internal state."""

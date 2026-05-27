@@ -138,6 +138,14 @@ async def _shape_one_project(
 
         task_locks: list[str] = list(wt.get('files') or [])
 
+        # Footprint the scheduler actually locks on: taskmaster metadata.files.
+        # Unlike `locks` (worktree plan.json file paths, absent for pending
+        # tasks with no worktree yet), this is present for every task and is
+        # the same source the scheduler derives its module locks from.  Kept as
+        # an additive field so the Tasks tab can stay on `locks` (file
+        # granularity) while the scheduler tab normalizes `meta_files`.
+        meta_files = list((task.get('metadata') or {}).get('files') or [])
+
         uid = _task_uid(project, task_id)
         agent = f'claude-task-{task_id}' if wt else None
         active.append({
@@ -153,6 +161,7 @@ async def _shape_one_project(
             'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
             'deps': deps,
             'locks': task_locks,
+            'meta_files': meta_files,
         })
 
         # File locks: only in-flight statuses are considered holders.  Pending

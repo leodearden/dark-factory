@@ -13,7 +13,7 @@ Shape contract (returned by collect_scheduler_state):
         skip_count         int         from snapshot.skip_counts
         park_state         dict | None from snapshot.parks[task_id]
         age_seconds        int         seconds since park install or started*60
-        lock_set           list[str]   declared file locks from plan.json
+        lock_set           list[str]   normalized module locks (depth from snapshot)
         pinned             bool        from snapshot.overrides
         reserve_now        bool        from snapshot.overrides
         boost_tier         str | None  from snapshot.overrides
@@ -47,6 +47,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
+from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
@@ -71,9 +72,16 @@ def _module_contention_counts(
     For each module path that appears in any task's ``lock_set``, count how many
     tasks include it.  Attach the current holder (from *current_holders*) if any.
 
+    The holder for a module is resolved via the shared hierarchical prefix rule
+    (``modules_conflict``), not dict-equality, so a holder key that is a
+    sub-``lock_depth`` parent of the module still matches.  Both *rows*'
+    ``lock_set`` and *current_holders* keys are normalized module locks.
+
     Args:
-        rows:            Task row dicts, each with ``task_id`` and ``lock_set``.
-        current_holders: ``{module_path: task_id}`` from the scheduler snapshot.
+        rows:            Task row dicts, each with ``task_id`` and ``lock_set``
+                         (normalized module locks).
+        current_holders: ``{module_path: task_id}`` from the scheduler snapshot
+                         (module keys normalized to lock_depth).
         project:         Optional project label to tag each module entry with.
                          Module paths are NOT globally unique (two projects can
                          each have ``src/utils.py``), so we propagate the
@@ -97,7 +105,16 @@ def _module_contention_counts(
 
     result: list[dict] = []
     for path, count in counts.items():
-        holder = current_holders.get(path)
+        # Resolve the holder via the shared hierarchical prefix rule rather than
+        # dict-equality.  Both *path* (a normalized module key) and the
+        # current_holders keys are normalized to lock_depth, so the common case
+        # is an exact match — but a holder key with fewer than lock_depth
+        # components (a sub-depth parent) still conflicts with this child
+        # module, and modules_conflict catches it where `.get(path)` would miss.
+        holder = next(
+            (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
+            None,
+        )
         result.append({
             'path': path,
             'holder': holder,
@@ -113,12 +130,20 @@ def _module_contention_counts(
 def _compose_rows(
     active_tasks: list[dict],
     snapshot: dict,
+    depth: int = 2,
 ) -> list[dict]:
     """Join active-task metadata with a scheduler snapshot into displayable rows.
 
     Each active task in *active_tasks* must carry a ``task_id`` field (the raw
     numeric string used as key in the snapshot dicts).  The ``started`` field is
     the task age in minutes (from ``collect_active_tasks``).
+
+    The row's ``lock_set`` is the task's footprint **normalized to module locks**
+    at *depth* (the scheduler's ``lock_depth``) via ``files_to_modules`` — so the
+    values match the snapshot's ``current_holders`` keys.  The footprint is
+    sourced from ``meta_files`` (taskmaster ``metadata.files``, what the scheduler
+    locks on), falling back to ``locks`` (worktree plan.json file paths) when a
+    task carries no metadata footprint.
 
     Snapshot keys consumed: ``skip_counts``, ``parks``, ``effective_priorities``,
     ``overrides``.
@@ -170,7 +195,9 @@ def _compose_rows(
             'skip_count': skip_counts.get(tid, 0),
             'park_state': park_state,
             'age_seconds': age_seconds,
-            'lock_set': list(task.get('locks') or []),
+            'lock_set': files_to_modules(
+                task.get('meta_files') or task.get('locks') or [], depth
+            ),
             'pinned': bool(ov.get('pinned')),
             'reserve_now': bool(ov.get('reserve_now')),
             'boost_tier': ov.get('boost_tier'),
@@ -422,8 +449,11 @@ async def collect_scheduler_state(
                 'project_root': str(root),
             })
 
-        # Compose rows
-        rows = _compose_rows(enriched, snapshot)
+        # Compose rows — normalize footprints to the scheduler's lock_depth so
+        # row lock_set values match the snapshot's current_holders keys.  Older
+        # snapshots without lock_depth degrade to the default depth of 2.
+        depth = snapshot.get('lock_depth', 2)
+        rows = _compose_rows(enriched, snapshot, depth)
         all_rows.extend(rows)
 
         # Module contention from composed rows + snapshot holders.
