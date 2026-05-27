@@ -291,14 +291,13 @@ function SchedulerTab({ projectFilter = [] }) {
   //   • the module belongs to a selected project (m.project)
   //   • the module is currently held by a task in a selected project (m.holder_project)
   //     — needed so a cross-project lock holder doesn't disappear from the heatmap.
-  const visibleModules = stUseMemo(() => projectFilter.length === 0
+  const visibleModules = projectFilter.length === 0
     ? modules
     : modules.filter(m =>
         !m.project ||
         projectFilter.includes(m.project) ||
         (m.holder_project && projectFilter.includes(m.holder_project))
-      ),
-  [modules, projectFilter]);
+      );
 
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {
