@@ -5314,11 +5314,11 @@ async def test_unresolved_after_remediation_does_not_escalate_when_persistence_b
 ):
     """Unresolved-after-remediation findings are suppressed when persistence < threshold.
 
-    The default threshold (_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 3) is used.
+    The default threshold (_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4) is used.
     No prior runs are seeded, but the parent run and remediation run each persist
     their stage_reports BEFORE _finding_persistence_count is called
     (harness.py:1065 and harness.py:1405), so the actual persistence count is 2
-    (= 1 parent + 1 remediation).  2 < 3, so the finding must NOT produce an
+    (= 1 parent + 1 remediation).  2 < 4, so the finding must NOT produce an
     escalation.  Instead a structured logger.info with event name
     'reconciliation.unresolved_after_remediation_suppressed' must be emitted.
     The test PINS persistence == 2 explicitly so a future threshold change to 2
@@ -5427,14 +5427,15 @@ async def test_unresolved_after_remediation_escalates_when_persistence_meets_thr
 ):
     """Unresolved-after-remediation finding escalates with persistence count in summary.
 
-    Pre-seeds N-1 = 2 completed runs containing the target finding F.
-    Current cycle also contains F (both parent S3 and remediation S3).
-    Persistence count becomes 3 when parent run is persisted before remediation.
+    Pre-seeds N-2 = 2 completed runs containing the target finding F (for default
+    threshold 4).  Current cycle also contains F (both parent S3 and remediation S3).
+    Persistence count becomes 4 (= 2 seeded + 1 parent + 1 remediation) when the
+    parent run is persisted before _finding_persistence_count is called.
 
     Asserts:
     (a) queue contains exactly one escalation with category 'recon_integrity_issue'
         whose summary starts with 'Persistently unresolved after remediation' and
-        contains '(3 cycles)'.
+        contains '(4 cycles)' (or the threshold N-cycles phrasing for any threshold).
     (b) escalation's dedupe_fingerprint matches compute_content_fingerprint so that
         future re-filings fold into the same queue record.
 
@@ -5461,8 +5462,8 @@ async def test_unresolved_after_remediation_escalates_when_persistence_meets_thr
     # run + current remediation run) because both are completed and their stage
     # reports are persisted before _finding_persistence_count is called.
     # Total = (N-2 seeded) + 1 parent + 1 remediation = N = threshold.
-    # So seed N-2 = 1 run for the default threshold of 3.
-    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)  # 1 by default
+    # So seed N-2 = 2 runs for the default threshold of 4.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)  # 2 by default
     base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
 
     for i in range(n_seed):

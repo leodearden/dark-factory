@@ -88,14 +88,20 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
-# Task 1512: minimum number of consecutive completed runs that must contain a
-# finding before it is escalated from _run_remediation_pass.  Below this count
-# the finding is suppressed (emitting a structured log instead) on the grounds
+# Task 1512: minimum number of completed runs that must contain a finding
+# before it is escalated from _run_remediation_pass.  Below this count the
+# finding is suppressed (emitting a structured log instead) on the grounds
 # that remediation is likely to fix it on the next attempt.
-# Three cycles ≈ 15–90 minutes given the per-project 5-second cooldown and
-# typical cycle durations — short enough that a genuinely-broken finding still
-# escalates within a watchable window, long enough to filter transient findings.
-_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 3
+#
+# Counting note: each reconciliation cycle produces TWO completed runs — the
+# parent full run (persisted at run_full_cycle ~line 1065) and the remediation
+# run (persisted at _run_remediation_pass ~line 1405).  Both are counted by
+# _finding_persistence_count because both are 'completed' journal rows.  A
+# threshold of 4 therefore fires after 2 complete reconciliation cycles that
+# both flagged the same finding — short enough that a genuinely broken finding
+# escalates within a watchable window (≈ 10–180 minutes depending on cycle
+# duration), long enough to filter transient findings.
+_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
@@ -1176,7 +1182,7 @@ class ReconciliationHarness:
         self,
         project_id: str,
         finding: dict,
-        lookback: int = 5,
+        lookback: int = max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD),
     ) -> int:
         """Count how many of the last `lookback` completed runs contain a matching finding.
 
@@ -1185,8 +1191,13 @@ class ReconciliationHarness:
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
 
+        The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
+        that raising the threshold never silently caps the count below the gate value.
+
         Returns 0 if HAS_ESCALATION is False, if the fingerprint call raises, or if any
-        other exception occurs (graceful degradation).
+        other exception occurs (graceful degradation).  When the journal call itself
+        fails, a warning is logged so debugging a 'why didn't this escalate?' incident
+        is possible — the caller proceeds as if persistence is 0 (fail-closed).
 
         Task 1512 / plans/afk-A7-recon-closure.md.
         """
@@ -1229,8 +1240,44 @@ class ReconciliationHarness:
                         count += 1
                         break  # one match per run is enough
             return count
-        except Exception:
+        except Exception as _e:
+            logger.warning(
+                'reconciliation.persistence_count_failed',
+                extra={
+                    'project_id': project_id,
+                    'finding_category': finding.get('category', ''),
+                    'error': str(_e),
+                },
+            )
             return 0
+
+    def _log_non_actionable_finding(
+        self,
+        project_id: str,
+        run_id: str,
+        finding: dict,
+    ) -> None:
+        """Emit a structured INFO log for a non-actionable Stage-3 integrity finding.
+
+        Non-actionable findings are suppressed from the escalation queue (task 1512 /
+        plans/afk-A7-recon-closure.md): the only possible human action — "accept as
+        known" — is achieved by *not* filing.  This helper keeps the finding observable
+        in the recon log/journal without touching the queue.
+
+        Called from both _maybe_remediate (parent pass) and _run_remediation_pass (after
+        the second-pass actionable partition) so both sites stay in sync as fields evolve.
+        """
+        logger.info(
+            'reconciliation.non_actionable_integrity_finding',
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'finding_category': finding.get('category', ''),
+                'affected_ids': list(finding.get('affected_ids') or []),
+                'description': finding.get('description', ''),
+                'severity': finding.get('severity', ''),
+            },
+        )
 
     async def _maybe_remediate(
         self,
@@ -1268,17 +1315,7 @@ class ReconciliationHarness:
             # filing, so escalating them is a category error.  Instead, emit a structured
             # log record so the finding stays observable in the recon log/journal.
             for finding in non_actionable:
-                logger.info(
-                    'reconciliation.non_actionable_integrity_finding',
-                    extra={
-                        'project_id': project_id,
-                        'run_id': parent_run_id,
-                        'finding_category': finding.get('category', ''),
-                        'affected_ids': list(finding.get('affected_ids') or []),
-                        'description': finding.get('description', ''),
-                        'severity': finding.get('severity', ''),
-                    },
-                )
+                self._log_non_actionable_finding(project_id, parent_run_id, finding)
 
             if not actionable:
                 return
@@ -1433,19 +1470,9 @@ class ReconciliationHarness:
                 actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
                 non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
                 # Non-actionable findings are logged but never escalated — same
-                # contract as the parent pass in _maybe_remediate (lines 1270-1281).
+                # contract as the parent pass in _maybe_remediate.
                 for finding in non_actionable_remaining:
-                    logger.info(
-                        'reconciliation.non_actionable_integrity_finding',
-                        extra={
-                            'project_id': project_id,
-                            'run_id': run_id,
-                            'finding_category': finding.get('category', ''),
-                            'affected_ids': list(finding.get('affected_ids') or []),
-                            'description': finding.get('description', ''),
-                            'severity': finding.get('severity', ''),
-                        },
-                    )
+                    self._log_non_actionable_finding(project_id, run_id, finding)
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
