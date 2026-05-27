@@ -25,7 +25,12 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import _WATCHER_MAX_BACKOFF_SECS, _WATCHER_TIMEOUT_GRACE_SECS, Harness
+from orchestrator.harness import (
+    _WATCHER_ALLOWED_TOOLS,
+    _WATCHER_MAX_BACKOFF_SECS,
+    _WATCHER_TIMEOUT_GRACE_SECS,
+    Harness,
+)
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -2077,3 +2082,25 @@ class TestMaybeWriteDigestSurfacesMissingState:
             pytest.raises(AttributeError, match='scheduler'),
         ):
             await h._watcher_supervisor_loop()
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
+# ---------------------------------------------------------------------------
+
+class TestWatcherAllowedTools:
+    """_WATCHER_ALLOWED_TOOLS includes the L2-promotion tool (task 1501)."""
+
+    def test_promote_to_l2_in_allowed_tools(self) -> None:
+        """mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS.
+
+        The autonomous L1-watcher agent can promote escalations to L2 when they
+        exceed its scope — this requires the promote_to_l2 MCP tool in its
+        allowed-tools allowlist (consumer-per-level contract from
+        plans/escalation-l2-tiering.md).
+        """
+        assert 'mcp__escalation__promote_to_l2' in _WATCHER_ALLOWED_TOOLS, (
+            'mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS '
+            'so the autonomous watcher can promote L1→L2 escalations; '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
