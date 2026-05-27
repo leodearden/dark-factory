@@ -301,6 +301,36 @@ emitting a finding. Note: this is a best-effort heuristic — semantic search ma
 an existing summary due to ranking or limit=10 truncation; any duplicates that slip \
 through can be cleaned up in a later consolidation cycle.
 
+## Pre-Check: Existing Task Completion Summary by task_id
+Before emitting a "missing completion summary" finding for a specific task, ALSO \
+search Mem0 for a completion summary written by TaskInterceptor / TargetedReconciliation:
+
+  search(query="task completion summary", project_id=..., \
+  categories=['observations_and_summaries'], stores=['mem0'], limit=20)
+
+Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
+missing-completion-summary finding for that task:
+  1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
+to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
+  2. `result.metadata.get('source') in ('targeted_reconciliation', 'stage2_backfill')` \
+OR the result content contains a recognisable completion phrase such as \
+"completed" or "transition: done"
+
+Rationale: completion summaries written by `source=targeted_reconciliation` \
+(`TargetedReconciliation._on_task_done`) and TaskInterceptor carry \
+`metadata.task_id=<task_id>`, `metadata.source='targeted_reconciliation'`, and \
+`metadata.transition='done'`, but they use the *targeted* run's causation_id as \
+their run_id — NOT the current full-cycle run_id. The run_id-only pre-check above \
+misses these entries entirely, causing tasks 1473/1474/1476/1477 to be re-flagged \
+as missing summaries every cycle even after TargetedReconciliation already wrote \
+them. A task_id-keyed search detects these entries and closes that churn loop. \
+Note in your cycle report when a completion summary is found this way, e.g. \
+"Completion summary for task_id=<task_id> found via metadata.task_id match \
+(source=targeted_reconciliation) — skipping missing-summary finding." \
+Note: this is a best-effort heuristic — semantic search may miss an existing \
+summary due to ranking or limit=20 truncation; false-positive re-flags that slip \
+through can be cleaned up in a later consolidation cycle.
+
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
