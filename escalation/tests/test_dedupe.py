@@ -659,6 +659,92 @@ class TestUnboundedWindow:
         )
 
 
+class TestDedupeConfigForRecon:
+    """DedupeConfig.for_recon() — classmethod for recon integrity dedup config."""
+
+    def _make_recon_esc(self, esc_id: str, fingerprint: str | None = 'shared-fp', ts: str | None = None):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='42',
+            agent_role='reconciler',
+            severity='info',
+            category='recon_integrity_issue',
+            summary='Unresolved after remediation: entity mismatch',
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def test_default_config_unchanged(self):
+        """Regression: DedupeConfig() defaults are unchanged by for_recon classmethod."""
+        from escalation.dedupe import DedupeConfig
+        cfg = DedupeConfig()
+        assert cfg.key_fn is None
+        assert cfg.infra_dedupe_window_secs == 600.0
+        assert cfg.infra_dedupe_categories == ('infra_issue',)
+        assert cfg.infra_dedupe_enabled is True
+
+    def test_for_recon_folds_matching_fingerprints_regardless_of_age(self, tmp_path):
+        """(1) for_recon(): two recon_integrity_issue escalations with same fingerprint
+        fold even when the parent is days old (content key + inf window + recon category)."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Parent 3 days old
+        three_days_ago = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        parent = self._make_recon_esc('esc-1-1', ts=three_days_ago)
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2')  # same fingerprint 'shared-fp'
+        cfg = DedupeConfig.for_recon()
+        result = find_dedupe_parent(queue, candidate, cfg)
+        assert result == 'esc-1-1', (
+            f'for_recon() must fold matching fingerprints regardless of age; got: {result}'
+        )
+
+    def test_for_recon_does_not_fold_different_fingerprints(self, tmp_path):
+        """(2) Different fingerprints do NOT fold under for_recon()."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_recon_esc('esc-1-1', fingerprint='fp-different')
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2', fingerprint='fp-another')
+        cfg = DedupeConfig.for_recon()
+        result = find_dedupe_parent(queue, candidate, cfg)
+        assert result is None, (
+            f'Different fingerprints must not fold under for_recon(); got: {result}'
+        )
+
+    def test_for_recon_handles_recon_category(self, tmp_path):
+        """(3) for_recon() config handles recon_integrity_issue category via find_dedupe_parent."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_recon_esc('esc-1-1')
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2')
+        cfg = DedupeConfig.for_recon()
+        # find_dedupe_parent should match since category is recon_integrity_issue
+        # and fingerprints match
+        result = find_dedupe_parent(queue, candidate, cfg)
+        assert result == 'esc-1-1'
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
