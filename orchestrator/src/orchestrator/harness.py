@@ -2594,6 +2594,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 watcher, self.config.watcher_daily_cost_ceiling_usd,
             )
             await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            # File an L2 outage escalation so the operator learns via their L2
+            # stream that the watcher has been paused (dedup-safe: no-op if one
+            # is already open).  Intentionally NOT done for the orch-wide ceiling
+            # below — that's a different failure mode (the whole orchestrator is
+            # over budget, not specifically the watcher).
+            self._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
             return
 
         if total >= self.config.orch_daily_cost_ceiling_usd:
@@ -3527,6 +3533,10 @@ Output JSON matching the schema. Every task must appear in the output.
                     # counter so the next degenerate burst starts fresh from base.
                     consecutive_degenerate_clean = 0
                     logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
+                    # Resolve any open watcher-outage L2 — the watcher is running
+                    # healthily again.  Degenerate-clean (fast exits) are NOT recovery
+                    # signals; only healthy-clean (duration >= min) clears the outage.
+                    self._resolve_watcher_outage_l2()
                     await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
