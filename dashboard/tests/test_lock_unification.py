@@ -77,3 +77,32 @@ def test_tab_tasks_jsx_uses_scheduler_for_lock_display(client):
     assert 'lock-free' in body
     assert 'lock-mine' in body
     assert 'lock-taken' in body
+
+
+# ---------------------------------------------------------------------------
+# step-9: tab_overview.jsx gains Modules lock column from D.SCHEDULER.modules
+# ---------------------------------------------------------------------------
+
+
+def test_tab_overview_jsx_shows_module_locks_from_scheduler(client):
+    resp = client.get('/static/redux/tab_overview.jsx')
+    assert resp.status_code == 200
+    body = resp.text
+
+    # (a) The Orchestrators table must have a Modules column header.
+    assert 'Modules' in body, (
+        "tab_overview.jsx Orchestrators table must have a 'Modules' column header"
+    )
+
+    # (b) The column must derive held/contended counts from D.SCHEDULER.modules.
+    assert 'D.SCHEDULER' in body, (
+        "tab_overview.jsx must reference D.SCHEDULER for module lock counts"
+    )
+    assert '.modules' in body, (
+        "tab_overview.jsx must reference .modules from SCHEDULER"
+    )
+
+    # (c) FILE_LOCKS must not be referenced.
+    assert 'FILE_LOCKS' not in body, (
+        "tab_overview.jsx must not reference FILE_LOCKS"
+    )
