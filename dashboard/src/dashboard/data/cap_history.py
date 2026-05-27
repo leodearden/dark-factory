@@ -36,6 +36,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TypedDict
 
 import aiosqlite
 
@@ -382,11 +383,20 @@ def bucketise_cap_sparkline(
 # ---------------------------------------------------------------------------
 
 
+class AccountsSummary(TypedDict):
+    """Return type for :func:`summarize_accounts`."""
+
+    total: int
+    capped: int
+    available: int
+    capped_accounts: list[str]
+
+
 def summarize_accounts(
     intervals: list[CapInterval],
     *,
     total_accounts: int | None = None,
-) -> dict[str, int | list[str]]:
+) -> AccountsSummary:
     """Derive per-account availability counts from a list of cap intervals.
 
     Args:
