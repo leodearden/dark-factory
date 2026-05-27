@@ -1606,6 +1606,51 @@ class TestPatchResolutionMetadata:
             f"result.resolved_by must be 'steward'; got {result.resolved_by!r}"
         )
 
+    def test_patch_archive_atomicity_tmp_cleanup_on_rename_failure(
+        self, tmp_path: Path,
+    ):
+        """When os.rename raises (e.g. disk full), the tmp file is cleaned up
+        and the exception propagates.
+
+        Key assertion: NO .tmp files remain in archive_dir OR queue root after failure.
+        This catches the failure mode where the tmp file gets created in the queue root
+        (wrong dir) and then orphaned when rename fails.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'archived')
+
+        # Locate the archive dated subdir
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 1, 'Pre-condition: escalation must be archived'
+        archive_dir = archive_files[0].parent
+        original_content = archive_files[0].read_text()
+
+        # Patch os.rename to fail
+        with patch('os.rename', side_effect=OSError('disk full')):
+            with pytest.raises(OSError, match='disk full'):
+                queue.patch_resolution_metadata('esc-1-1', resolved_by='steward')
+
+        # (a) No .tmp files orphaned in archive_dir
+        tmp_files_in_archive = list(archive_dir.glob('esc-1-1*.tmp'))
+        assert tmp_files_in_archive == [], (
+            f'Orphaned .tmp files in archive_dir: {tmp_files_in_archive}; '
+            'tmp file must be created in path.parent and cleaned up on failure'
+        )
+
+        # (b) No .tmp files orphaned in queue root — key regression check
+        # (if tmp was created in queue root instead of archive_dir, it would be orphaned here)
+        tmp_files_in_root = list(queue.queue_dir.glob('esc-1-1*.tmp'))
+        assert tmp_files_in_root == [], (
+            f'Orphaned .tmp files in queue root: {tmp_files_in_root}; '
+            'tmp file must NOT be created in queue root for archive-resident targets'
+        )
+
+        # (c) Original archive file content is unchanged (rename never happened)
+        assert archive_files[0].read_text() == original_content, (
+            'Original archive file must be unchanged after rename failure'
+        )
+
     def test_patch_resolved_in_root_rewrites_root_in_place_no_archive_orphan(
         self, tmp_path: Path,
     ):
