@@ -16,6 +16,7 @@ from orchestrator.mcp.plan_tools import (
     _remove_plan_step,
     _replace_plan_step,
     _report_blocking_dependency,
+    _report_false_premise,
     _report_task_already_done,
     _report_unactionable_task,
     _update_plan_metadata,
@@ -488,6 +489,66 @@ class TestReportUnactionableTask:
         _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
         _report_unactionable_task(artifacts, 'r', 'e')
+
+        plan = artifacts.read_plan()
+        assert plan['task_id'] == 'test-1'
+        assert len(plan['steps']) == 1
+
+
+class TestReportFalsePremise:
+    """Architect's escape hatch when a RED-test premise is false/unreachable."""
+
+    def test_writes_artifact(self, artifacts):
+        result = _report_false_premise(
+            artifacts,
+            classification='exactness',
+            premise='natural cubic spline reproduces a general cubic to 1e-12',
+            evidence='natural BC forces M[0]=M[N]=0; impossible for a general cubic',
+            proposed_resolution='change asserted end-condition or weaken bound + file follow-up',
+        )
+        assert result['status'] == 'ok'
+        assert result['classification'] == 'exactness'
+
+        data = artifacts.read_false_premise()
+        assert data is not None
+        assert data['classification'] == 'exactness'
+        assert 'natural cubic spline' in data['premise']
+        assert 'M[0]=M[N]=0' in data['evidence']
+        assert 'change asserted end-condition' in data['proposed_resolution']
+        assert 'reported_at' in data
+
+    def test_overwrites_prior_report(self, artifacts):
+        _report_false_premise(
+            artifacts,
+            classification='numeric_bound',
+            premise='first premise',
+            evidence='e1',
+            proposed_resolution='r1',
+        )
+        _report_false_premise(
+            artifacts,
+            classification='dependency_capability',
+            premise='second premise',
+            evidence='e2',
+            proposed_resolution='r2',
+        )
+        data = artifacts.read_false_premise()
+        assert data is not None
+        assert data['classification'] == 'dependency_capability'
+        assert data['premise'] == 'second premise'
+        assert data['evidence'] == 'e2'
+        assert data['proposed_resolution'] == 'r2'
+
+    def test_does_not_mutate_plan_json(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
+        _report_false_premise(
+            artifacts,
+            classification='exactness',
+            premise='p',
+            evidence='e',
+            proposed_resolution='r',
+        )
 
         plan = artifacts.read_plan()
         assert plan['task_id'] == 'test-1'
