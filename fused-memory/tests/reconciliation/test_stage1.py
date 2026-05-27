@@ -432,6 +432,62 @@ class TestReconEscalationDedup:
             f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
         )
 
+    # ── Step 9: regression guard — harness never resolves its own escalations ──
+
+    def test_harness_never_resolves_its_own_escalations(self, tmp_path):
+        """Harness must never call EscalationQueue.resolve() — watcher is sole closer.
+
+        Pins the watcher-is-sole-closer contract from plans/afk-A7-recon-closure.md.
+        Already-passing behaviourally; exists as a regression guard so any future
+        accidental resolve() call in _escalate is caught immediately.
+        """
+        from unittest.mock import patch
+
+        from escalation.queue import EscalationQueue
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        sentinel_called = []
+
+        def _never_resolve(*args, **kwargs):
+            sentinel_called.append(('resolve', args, kwargs))
+            raise AssertionError(
+                'ReconciliationHarness must never call EscalationQueue.resolve() — '
+                'the escalation-watcher session is the sole closer '
+                '(plans/afk-A7-recon-closure.md)'
+            )
+
+        with patch.object(EscalationQueue, 'resolve', side_effect=_never_resolve):
+            # Simulate all four _escalate categories used by the harness:
+            # (a) recon_stale_run — _recover_stale_runs path
+            harness._escalate('recon_stale_run', 'run1111', 'Run stale (>300s), recovered')
+            # (b) recon_failure — run_full_cycle except arm
+            harness._escalate('recon_failure', 'run2222', 'Stage s1 failed: timeout')
+            # (c) recon_integrity_issue with finding — _maybe_remediate non-actionable loop
+            harness._escalate(
+                'recon_integrity_issue', 'run3333',
+                'Non-actionable integrity finding: task 452 stale',
+                finding={'category': 'knowledge_stale', 'affected_ids': ['452'], 'description': 'x'},
+            )
+            # (d) recon_integrity_issue without finding — _maybe_remediate except arm
+            harness._escalate('recon_integrity_issue', 'run4444', 'Remediation orchestration failed: err')
+            # (e) recon_backlog_overflow — BacklogIterator except arm
+            harness._escalate('recon_backlog_overflow', 'run5555', 'Backlog chunk 1 failed: oom')
+
+        # resolve must never have been invoked
+        assert sentinel_called == [], (
+            f'EscalationQueue.resolve() was unexpectedly called: {sentinel_called}'
+        )
+
+        # All submitted escalations must still be pending (not resolved/archived)
+        files = list(queue_dir.glob('esc-*.json'))
+        assert files, 'Expected at least one pending escalation after all _escalate calls'
+        for f in files:
+            data = json.loads(f.read_text())
+            assert data['status'] == 'pending', (
+                f'{f.name}: expected status=pending, got {data["status"]!r}'
+            )
+
     @pytest.mark.asyncio
     async def test_remediation_residue_passes_finding_to_escalate(self, tmp_path):
         """_run_remediation_pass residue loop uses finding-based fingerprint.
