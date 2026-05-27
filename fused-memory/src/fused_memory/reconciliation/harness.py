@@ -46,6 +46,12 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
@@ -618,12 +624,40 @@ class ReconciliationHarness:
         run_id: str,
         summary: str,
         detail: str = '',
+        *,
+        finding: dict | None = None,
     ) -> None:
-        """Submit an escalation to the queue (fire-and-forget)."""
+        """Submit an escalation to the queue (fire-and-forget).
+
+        Routing contract (A7b):
+        - The harness NEVER calls queue.resolve() — the escalation-watcher
+          session (port 8103) is the sole closer per plans/afk-A7-recon-closure.md.
+        - Dedup folds only on the way IN, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+        - When finding is not None (a finding dict with category / affected_ids /
+          description), the fingerprint is keyed on finding identity so the same
+          target across N cycles produces exactly one pending escalation.
+        - When finding is None, the fingerprint falls back to a description-only
+          hash of the summary, so identical recurring messages fold while distinct
+          ones stay individually visible.
+        """
         if not HAS_ESCALATION or self._escalation_queue is None:
             return
         try:
             queue = self._escalation_queue
+            if finding is not None:
+                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                    category,
+                    finding.get('category') or '',
+                    [str(a) for a in (finding.get('affected_ids') or [])],
+                    finding.get('description') or '',
+                )
+            else:
+                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                    category,
+                    category,
+                    [],
+                    summary,
+                )
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(f'recon-{run_id[:8]}'),
                 task_id=f'recon-{run_id[:8]}',
@@ -632,6 +666,7 @@ class ReconciliationHarness:
                 category=category,
                 summary=summary,
                 detail=detail,
+                dedupe_fingerprint=fingerprint,
             )
             queue.submit(esc)
         except Exception as e:
