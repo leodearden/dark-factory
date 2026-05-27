@@ -24,6 +24,7 @@ class TestTopLevelImports:
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            modules_conflict,
             normalize_lock,
         )
 
@@ -38,6 +39,7 @@ class TestTopLevelImports:
         assert CostStore is not None
         assert normalize_lock is not None
         assert files_to_modules is not None
+        assert modules_conflict is not None
         assert AllAccountsCappedException is not None
         assert AgentFailureClass is not None
         assert AgentFailureKind is not None
