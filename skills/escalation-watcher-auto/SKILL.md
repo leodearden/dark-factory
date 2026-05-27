@@ -175,7 +175,7 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
 
-Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent.
+Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
 
 ## Main Loop
 
@@ -184,11 +184,18 @@ Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found 
 2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
    If YES → use L2 promotion paths throughout (steps 4 and 5)
    If NO  → fall back to LEGACY mode (see Graceful Degradation)
-3. Drain all pending L1 escalations (get_pending_escalations, filter level==1, status==pending)
-4. Apply shallow RCA across the full drain batch — detect causal clusters (see Shallow-by-default RCA)
-5. For each escalation: autonomous dispatch (scope_violation / dependency / cleanup)
+3. Drain and deduplicate pending L1 escalations:
+   a. Fetch candidates: get_pending_escalations(), filter level==1, status==pending → candidate_l1s
+   b. Fetch pending L2s: get_pending_escalations(), filter level==2, status==pending → pending_l2s
+   c. Build already_promoted = {id for L2 in pending_l2s for id in L2.members}
+   d. work_batch = [e for e in candidate_l1s if e.id not in already_promoted]
+   (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
+    and re-promotes the same items, inflating the counter and re-spending RCA budget)
+4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
+5. For each escalation in work_batch: autonomous dispatch (scope_violation / dependency / cleanup)
    OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
-6. Increment escalations_handled counter
+6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
+   do NOT count toward the rotation limit
 7. Check rotation limits — if reached, emit digest and exit
 8. Wait for next L1: foreground-blocking call to escalation.watcher (see below)
 9. On watcher return: go to 3
@@ -198,13 +205,16 @@ The digest is emitted on rotation-limit exit regardless of mode (promotion or le
 
 ### Draining pending escalations
 
-On startup and after each watcher fire, call:
+On startup and after each watcher fire:
 
-```
-mcp__escalation__get_pending_escalations()
-```
+1. Fetch L1 candidates: `mcp__escalation__get_pending_escalations()` → filter `level == 1`, `status == "pending"`
+2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
+3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
+4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
 
-Filter to `level == 1` and `status == "pending"`. Handle each before (re)starting the wait.
+Handle only `work_batch` before (re)starting the wait.
+
+**Why this filter matters:** Promoted member L1s remain `status == "pending"` at level 1 — the escalation model has no per-L1 "promoted" marker. Without the filter, every drain cycle re-encounters the same already-promoted L1s, re-runs shallow RCA on them, and re-calls `promote_to_l2` (which the server deduplicates, so no duplicate L2s are created). The real costs are: (1) `escalations_handled` is inflated, triggering premature rotation-limit exits; (2) RCA reads (git log/diff, get_tasks) are re-spent on already-triaged items, burning context budget unnecessarily.
 
 ### Waiting for the next L1
 
