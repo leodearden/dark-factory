@@ -80,6 +80,13 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 _PAUSED_IDLE_POLL_SECS: float = 15.0
 _PAUSED_IDLE_LOG_SECS: float = 180.0
 
+# Run-forever idle (default; --until-idle opts out): when the queue drains and
+# the scheduler is NOT paused, the loop polls for newly-scheduled tasks rather
+# than exiting.  The poll cadence is configurable (config.idle_poll_secs);
+# _IDLE_POLL_LOG_SECS throttles the "Idle — polling" INFO so a long dead-idle
+# stretch doesn't flood journald (mirrors _PAUSED_IDLE_LOG_SECS).
+_IDLE_POLL_LOG_SECS: float = 180.0
+
 # Allowed and disallowed tools for the escalation-watcher-auto rotation.
 # Scoped to what escalation triage actually needs: file reads, foreground
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
@@ -325,6 +332,10 @@ class Harness:
         # Idle-while-paused state (task 1322 follow-up).  Throttle timestamp for
         # the "alive but paused" WARNING emitted by the main run loop.
         self._last_paused_idle_log: float = 0.0
+        # Run-forever idle state.  Set by run(); throttle timestamp for the
+        # "Idle — polling" INFO emitted when a drained queue produced no work.
+        self._until_idle: bool = False
+        self._last_idle_poll_log: float = 0.0
         # Reason captured by _load_persisted_scheduler_pause() at run() startup,
         # filed as a (deduped) L1 escalation once the escalation queue exists.
         self._restored_pause_reason: str | None = None
@@ -458,13 +469,18 @@ class Harness:
         delay_secs: int = 0,
         force_dirty_start: bool = False,
         retag_modules: bool = False,
+        until_idle: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
         If *prd_path* is ``None``, skip PRD parsing and run existing tasks.
         If *delay_secs* > 0, sleep that many seconds after startup (escalation
         server runs immediately) before executing tasks.
+        If *until_idle* is True, exit when the task queue drains (legacy
+        one-shot behavior); otherwise run forever, idling and polling for
+        newly-scheduled tasks (the default, for long-lived systemd service use).
         """
+        self._until_idle = until_idle
         self.report.started_at = datetime.now(UTC).isoformat()
 
         # Install the usage-gate SIGHUP handler now that we're inside
@@ -757,7 +773,55 @@ class Harness:
                                 '— continuing main loop', changed,
                             )
                             continue
-                        break  # all done or all blocked
+
+                        # Genuine empty queue (not paused, nothing freed).
+                        if self._until_idle:
+                            break  # --until-idle: exit on drain (one-shot run)
+
+                        # Run forever (default): a drained queue is NOT "done".
+                        # Under systemd this service is long-lived; stop is via
+                        # SIGTERM (→ CancelledError → exit 130), not queue drain.
+                        # Idle and re-poll the tree so tasks scheduled after
+                        # startup get picked up.
+                        #
+                        # Invariant: this branch is only reachable with `active`
+                        # empty and no focused review in flight — _review_running
+                        # / _pending_review_task serialize at the loop top, so a
+                        # full-review-on-idle here can't race a focused review.
+                        now = time.monotonic()
+                        self._compute_tallies(task_reports)
+                        if self.report.completed > 0 or task_reports:
+                            # The cycle did work: emit a per-cycle summary, run a
+                            # rate-limited full review, then reset for next cycle.
+                            # (Dead-idle polls skip this so an empty tree doesn't
+                            # spam journald with 0/0 summaries + reconcile sweeps.)
+                            logger.info(self.report.summary())
+                            if (self.review_checkpoint
+                                    and self.config.review.full_review_on_complete
+                                    and self.report.completed > 0
+                                    and self.review_checkpoint.should_run_full(now)):
+                                await self._run_full_review_and_tag()
+                            # Reset per-cycle aggregates.  Safe to drop the old
+                            # task_reports list here (see invariant above: no
+                            # report is still being collected).  Recompute
+                            # total_tasks cheaply so completed/total stays honest.
+                            task_reports = []
+                            self.report = HarnessReport(
+                                started_at=datetime.now(UTC).isoformat()
+                            )
+                            statuses, _ = await self.scheduler.get_statuses()
+                            self.report.total_tasks = sum(
+                                1 for s in statuses.values() if s == 'pending'
+                            )
+                        elif now - self._last_idle_poll_log >= _IDLE_POLL_LOG_SECS:
+                            logger.info(
+                                'Idle — polling for new tasks every %.0fs '
+                                '(run forever; pass --until-idle to exit on drain)',
+                                self.config.idle_poll_secs,
+                            )
+                            self._last_idle_poll_log = now
+                        await asyncio.sleep(self.config.idle_poll_secs)
+                        continue
                     # Wait for any active task to complete, then retry.
                     # Timeout ensures newly-added tasks are discovered
                     # within 15s even when no running task completes.
@@ -782,41 +846,16 @@ class Harness:
                 done, _ = await asyncio.wait(active)
                 self._collect_done_reports(done, task_reports)
 
-            self.report.task_reports = task_reports
-            self.report.completed = sum(
-                1 for r in task_reports if r.outcome == WorkflowOutcome.DONE
-            )
-            self.report.blocked = sum(
-                1 for r in task_reports if r.outcome == WorkflowOutcome.BLOCKED
-            )
-            self.report.escalated = sum(
-                1 for r in task_reports if r.outcome == WorkflowOutcome.ESCALATED
-            )
-            self.report.total_cost_usd = sum(r.cost_usd for r in task_reports)
+            self._compute_tallies(task_reports)
 
-            # 3b. Optional full review after all tasks complete
+            # 3b. Optional full review after all tasks complete.  This is the
+            # exit / --until-idle path: the gate is unconditional (no
+            # should_run_full rate-limit — that ceiling applies only to the
+            # run-forever idle path, which can fire repeatedly).
             if (self.review_checkpoint
                     and self.config.review.full_review_on_complete
                     and self.report.completed > 0):
-                logger.info('Running full post-completion review...')
-                try:
-                    review_report = await self.review_checkpoint.run_full()
-                    self.report.review_checkpoints += 1
-                    self.report.review_findings += review_report.findings_count
-                    self.report.review_tasks_created += len(review_report.tasks_created)
-                    self.report.review_cost_usd += review_report.cost_usd
-                    logger.info(
-                        'Full review complete: %d findings, %d tasks created',
-                        review_report.findings_count,
-                        len(review_report.tasks_created),
-                    )
-                    if review_report.tasks_created:
-                        try:
-                            await self._tag_task_modules()
-                        except Exception as tag_err:
-                            logger.warning(f'Post-review module tagging failed: {tag_err}')
-                except Exception as e:
-                    logger.error(f'Full review failed: {e}')
+                await self._run_full_review_and_tag()
 
         finally:
             # 4. Shutdown
@@ -2415,6 +2454,55 @@ Output JSON matching the schema. Every task must appear in the output.
                             self._trigger_review_checkpoint()
             except Exception as e:
                 logger.error(f'Workflow slot error: {e}')
+
+    def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
+        """Fill ``self.report`` aggregates from the collected task reports.
+
+        Shared by the post-loop (exit / --until-idle) block and the
+        run-forever idle branch, which recomputes per-cycle before logging the
+        cycle summary.
+        """
+        self.report.task_reports = task_reports
+        self.report.completed = sum(
+            1 for r in task_reports if r.outcome == WorkflowOutcome.DONE
+        )
+        self.report.blocked = sum(
+            1 for r in task_reports if r.outcome == WorkflowOutcome.BLOCKED
+        )
+        self.report.escalated = sum(
+            1 for r in task_reports if r.outcome == WorkflowOutcome.ESCALATED
+        )
+        self.report.total_cost_usd = sum(r.cost_usd for r in task_reports)
+
+    async def _run_full_review_and_tag(self) -> None:
+        """Run a full review and tag any tasks it creates with code modules.
+
+        The body of the post-completion review minus its gating ``if`` — the
+        caller owns the gate (unconditional on the exit path; rate-limited via
+        ``should_run_full`` on the run-forever idle path).  Mirrors
+        ``_run_review_checkpoint`` but calls ``run_full`` instead of
+        ``run_focused``.
+        """
+        assert self.review_checkpoint is not None
+        logger.info('Running full post-completion review...')
+        try:
+            review_report = await self.review_checkpoint.run_full()
+            self.report.review_checkpoints += 1
+            self.report.review_findings += review_report.findings_count
+            self.report.review_tasks_created += len(review_report.tasks_created)
+            self.report.review_cost_usd += review_report.cost_usd
+            logger.info(
+                'Full review complete: %d findings, %d tasks created',
+                review_report.findings_count,
+                len(review_report.tasks_created),
+            )
+            if review_report.tasks_created:
+                try:
+                    await self._tag_task_modules()
+                except Exception as tag_err:
+                    logger.warning(f'Post-review module tagging failed: {tag_err}')
+        except Exception as e:
+            logger.error(f'Full review failed: {e}')
 
     def _trigger_review_checkpoint(self) -> None:
         """Spawn a review checkpoint as a concurrent task.
