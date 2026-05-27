@@ -4371,7 +4371,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 category='bypass_done',
                 summary=(
                     f'Mark-done bypass detected for task {self.task_id}: '
-                    f'row already done, provenance commit not on main'
+                    f'row is {exc.old_status!r}, provenance commit not on main'
                 ),
                 detail=(
                     f'reason: {reason}\n'
