@@ -59,6 +59,9 @@ def _make(
     # Fix 1: workflow refreshes metadata.files via update_task before
     # set_task_status('done').  Stub as AsyncMock so the await succeeds.
     scheduler.update_task = AsyncMock(return_value=True)
+    # _setup_worktree_and_artifacts now reads live status at dispatch before
+    # claiming 'in-progress' (commit 57e25f1260); None → non-terminal → proceed.
+    scheduler.get_status = AsyncMock(return_value=None)
 
     # Stage 1: workflow now calls scheduler.mark_done — wire the helper
     # to forward into set_task_status so existing assertions still observe

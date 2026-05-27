@@ -46,6 +46,9 @@ def _make_workflow(
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock(return_value=None)
     scheduler.update_task = AsyncMock(return_value=True)
+    # _setup_worktree_and_artifacts now reads live status at dispatch before
+    # claiming 'in-progress' (commit 57e25f1260); None → non-terminal → proceed.
+    scheduler.get_status = AsyncMock(return_value=None)
 
     git_ops = MagicMock()
     git_ops.worktree_base = project_root / '.worktrees'
