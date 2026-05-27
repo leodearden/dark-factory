@@ -367,6 +367,17 @@ class TestConfirmPlan:
         plan = artifacts.read_plan()
         assert '_revalidated_at' in plan
 
+    def test_stamps_finalized_marker(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _confirm_plan(artifacts)
+        assert result['status'] == 'ok'
+        assert result['finalized'] is True
+
+        plan = artifacts.read_plan()
+        # _finalized_at is the durable completeness marker the workflow gates on.
+        assert '_finalized_at' in plan
+        assert plan['_finalized_at']
+
     def test_no_plan_returns_error(self, artifacts):
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'
@@ -376,6 +387,16 @@ class TestConfirmPlan:
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'
         assert 'no steps' in result['message'].lower()
+        # A plan that cannot be confirmed must NOT receive the marker.
+        assert '_finalized_at' not in artifacts.read_plan()
+
+    def test_empty_files_returns_error(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        result = _confirm_plan(artifacts)
+        assert result['status'] == 'error'
+        assert 'files' in result['message'].lower()
+        assert '_finalized_at' not in artifacts.read_plan()
 
 
 class TestReportBlockingDependency:

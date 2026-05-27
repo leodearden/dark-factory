@@ -88,6 +88,7 @@ class BriefingAssembler:
    c. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order. Alternate test/impl.
    d. Call `add_design_decision(decision, rationale)` for non-obvious choices.
    e. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
+   f. Call `confirm_plan()` as your FINAL action, once every step is added, to mark the plan complete. Without it the plan is treated as incomplete and will not advance.
 3. List ALL files (or directory paths) you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks and the phantom-done gate, so be exhaustive and precise.
 """
 
@@ -180,6 +181,79 @@ and either confirm it, update it, or recreate it from scratch.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
 4. Ensure the `files` list is exhaustive — it drives concurrency locks.
 5. Do NOT remove or replace steps with status "done".
+"""
+
+    async def build_plan_completion_prompt(
+        self,
+        task: dict,
+        partial_plan: dict,
+        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        context: str | None = None,
+    ) -> str:
+        """Build prompt to finish a partial plan left by an interrupted session.
+
+        A prior planning session wrote some steps but never called
+        ``confirm_plan`` (it ran out of budget/turns, or crashed). Rather than
+        discard that work and re-plan from scratch, hand the partial plan back
+        to the architect: verify the existing steps against current main, add
+        whatever is missing, then finalize. The architect may also discard the
+        partial entirely (``create_plan`` overwrites it) if it reflects a
+        flawed approach.
+        """
+        if context is None:
+            context = await self._get_memory_context(task.get('id'))
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
+
+        existing_steps = [
+            s for s in partial_plan.get('steps', []) if isinstance(s, dict)
+        ]
+        plan_json = json.dumps(partial_plan, indent=2)
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Plan Completion — Finish an Interrupted Plan
+
+A previous planning session for this task was cut short (it ran out of budget
+or turns) before it finalized the plan. It left a PARTIAL plan on disk with
+{len(existing_steps)} step(s) already recorded. Your job is to finish it — not
+to start over from nothing.
+
+## Partial Plan (already on disk)
+
+```json
+{plan_json}
+```
+
+## Action
+
+1. Read the relevant files to re-ground yourself in the task and verify the
+   existing steps are still correct against the CURRENT state of the codebase
+   (main may have advanced since the partial was written).
+2. Then take ONE of these paths:
+   a. **Partial is sound, just unfinished** — keep the existing steps and add
+      the remaining ones with `add_plan_step(...)` (continue the existing TDD
+      ordering and step-id sequence), adjusting `files` via
+      `update_plan_metadata(files=...)` if the scope grew. Fix individual steps
+      with `replace_plan_step` / `remove_plan_step` as needed.
+   b. **Partial reflects a flawed approach** — call `create_plan(...)` to
+      replace it wholesale, then add steps as usual.
+   c. **The task should not be planned at all** — use the rejection exits
+      (`report_blocking_dependency` / `report_task_already_done` /
+      `report_unactionable_task`) exactly as in fresh planning.
+3. If you produced a plan (paths a or b), call `confirm_plan()` as your FINAL
+   action to mark it complete. Without it the plan stays incomplete and will
+   not advance.
+4. Keep the `files` list exhaustive — it drives concurrency locks. Do NOT
+   remove or replace steps with status "done".
 """
 
     async def build_plan_tightening_prompt(

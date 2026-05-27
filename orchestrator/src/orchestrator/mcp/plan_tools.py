@@ -255,11 +255,30 @@ def _confirm_plan(
         return {'status': 'error', 'message': 'No plan exists.'}
     if not plan.get('steps'):
         return {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
+    if not plan.get('files'):
+        return {
+            'status': 'error',
+            'message': (
+                'Plan has no files — cannot confirm. Call create_plan (or '
+                'update_plan_metadata) with a non-empty files list first.'
+            ),
+        }
 
-    plan['_revalidated_at'] = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC).isoformat()
+    # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
+    # the architect declared the plan complete; the workflow requires it before
+    # a plan may advance to execution (workflow._plan), and salvages a plan that
+    # carries it even when the CLI run failed on a budget/turn cap.  Its ABSENCE
+    # on a plan that already has steps means a prior session was interrupted
+    # mid-build — the workflow routes that partial to a completion pass instead
+    # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
+    # checks (see workflow._can_skip_revalidation).
+    plan['_finalized_at'] = now
+    plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
     return {
         'status': 'ok',
+        'finalized': True,
         'steps': len(plan['steps']),
         'files': len(plan.get('files', [])),
     }
@@ -533,11 +552,19 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     @mcp.tool()
     def confirm_plan() -> dict[str, Any]:
-        """Confirm the existing plan is still valid after revalidation.
+        """Mark the plan COMPLETE. Call this as your final plan-tools action.
 
-        Call this when you have reviewed the changes on main and
-        determined the plan requires no modifications. Stamps a
-        revalidation timestamp on the plan.
+        This is the terminal "I am done building (or revising) this plan"
+        signal, required in BOTH flows:
+          - Initial planning: call it once every step and prerequisite has
+            been added, immediately after the last ``add_plan_step``.
+          - Revalidation: call it when you have reviewed the changes on main
+            and the plan needs no further modification.
+
+        Stamps a durable completeness marker on the plan. A plan WITHOUT this
+        marker is treated as incomplete: it will not advance to execution, and
+        a later session may resume and finish it. Requires a non-empty steps
+        and files list.
         """
         return _confirm_plan(artifacts)
 

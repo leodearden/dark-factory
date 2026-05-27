@@ -26,6 +26,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -213,6 +214,9 @@ PLAN = {
         {'decision': 'Mirror greet() signature', 'rationale': 'Consistency'},
     ],
     'reuse': [],
+    # Models a successful architect run: the agent called confirm_plan, so the
+    # plan carries the completeness marker the workflow now gates on.
+    '_finalized_at': '2026-01-01T00:00:00+00:00',
 }
 
 
@@ -2537,6 +2541,10 @@ class StringPrereqsArchitectStub(AgentStub):
                 },
             ],
             '_schema_version': 1,
+            # Finalized: confirm_plan validates steps+files but not prerequisite
+            # dict shape, so the prereq-format gate (not the finalize gate) is
+            # what must fire here.
+            '_finalized_at': '2026-01-01T00:00:00+00:00',
         }
         (task_dir / 'plan.json').write_text(json.dumps(bad_plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -2582,6 +2590,211 @@ class TestPrerequisitesValidation:
         esc = l0[0]
         # summary or detail must mention 'prerequisites' to confirm the validation ran
         assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
+
+
+class _EventRecorder:
+    """Minimal event_store stand-in: records emit() calls, exposes run_id."""
+
+    run_id = 'test-run'
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def emit(self, event_type, **kwargs) -> None:
+        self.calls.append((event_type, kwargs))
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestPlanFinalizeMarker:
+    """The architect must finalize a plan (confirm_plan → ``_finalized_at``)
+    before it advances.  A finalized plan survives a budget/turn cap (salvage);
+    an unfinalized one blocks, and any partial left behind is resumed by the
+    completion pass rather than discarded.
+    """
+
+    async def test_salvage_finalized_plan_on_cap(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """A finalized plan on disk is used even when the architect run reports a
+        budget cap (success=False), instead of being discarded."""
+
+        class CappedAfterFinalizeStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                task_dir = cwd / '.task'
+                task_dir.mkdir(parents=True, exist_ok=True)
+                plan = dict(PLAN)  # PLAN carries _finalized_at
+                plan['_schema_version'] = 1
+                (task_dir / 'plan.json').write_text(
+                    json.dumps(plan, indent=2) + '\n'
+                )
+                # Finalized, then the run is cut off by the budget cap.
+                return AgentResult(
+                    success=False, output='', subtype='error_max_budget_usd',
+                    cost_usd=12.0, turns=100,
+                )
+
+        stub = CappedAfterFinalizeStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        events = _EventRecorder()
+        workflow.event_store = events  # type: ignore[assignment]
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # Salvaged: the finalized plan carried the workflow past PLAN to DONE.
+        assert outcome == WorkflowOutcome.DONE
+        assert stub.calls.count('architect') == 1
+        salvaged = [c for c in events.calls if c[0] == EventType.plan_salvaged]
+        assert len(salvaged) == 1
+        assert salvaged[0][1]['data']['failure_kind']
+
+    async def test_block_unfinalized_plan_on_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """A non-finalized plan is NOT salvaged on a failed run — the task blocks
+        and the partial is preserved on disk for the completion pass."""
+
+        class CappedBeforeFinalizeStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                task_dir = cwd / '.task'
+                task_dir.mkdir(parents=True, exist_ok=True)
+                plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
+                plan['_schema_version'] = 1
+                (task_dir / 'plan.json').write_text(
+                    json.dumps(plan, indent=2) + '\n'
+                )
+                return AgentResult(
+                    success=False, output='', subtype='error_max_budget_usd',
+                    cost_usd=12.0,
+                )
+
+        stub = CappedBeforeFinalizeStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='ok',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        l0 = queue.get_by_task('42', level=0)
+        assert l0 and 'Planning failed' in l0[0].summary
+        # The partial is left on disk so the next session can finish it.
+        assert workflow.worktree is not None
+        assert TaskArtifacts(workflow.worktree).read_plan().get('steps')
+
+    async def test_unfinalized_plan_on_success_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """An architect that exits success but never called confirm_plan leaves a
+        plan with no _finalized_at — the workflow treats it as incomplete."""
+
+        class SuccessNoFinalizeStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                task_dir = cwd / '.task'
+                task_dir.mkdir(parents=True, exist_ok=True)
+                plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
+                plan['_schema_version'] = 1
+                (task_dir / 'plan.json').write_text(
+                    json.dumps(plan, indent=2) + '\n'
+                )
+                return AgentResult(success=True, output='Plan created', cost_usd=0.5)
+
+        stub = SuccessNoFinalizeStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='ok',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        l0 = queue.get_by_task('42', level=0)
+        assert l0
+        assert 'not finalized' in (l0[0].summary + (l0[0].detail or '')).lower()
+
+    async def test_partial_plan_routes_to_completion(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """A partial plan (steps, no _finalized_at) left by a prior session is
+        resumed via the completion pass, not deleted or re-planned from scratch."""
+
+        class RecordingBriefing(FakeBriefing):
+            def __init__(self) -> None:
+                self.completion_called = False
+
+            async def build_plan_completion_prompt(
+                self, task, partial_plan, worktree=None, context=None,
+            ) -> str:
+                self.completion_called = True
+                return 'Complete the partial plan'
+
+        class CompletingArchitectStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                # Finish the partial: stamp the completeness marker, as a real
+                # architect would by calling confirm_plan.
+                arts = TaskArtifacts(cwd)
+                plan = arts.read_plan()
+                plan['_finalized_at'] = '2026-01-01T00:00:00+00:00'
+                arts.write_plan(plan)
+                return AgentResult(success=True, output='Plan completed', cost_usd=0.4)
+
+        stub = CompletingArchitectStub()
+        briefing = RecordingBriefing()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        workflow.briefing = briefing  # type: ignore[assignment]
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Pre-seed the worktree with a partial plan: steps present, but not
+        # finalized and not provenance-stamped (an interrupted prior session).
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(
+            task_assignment.task_id, 'Add farewell function', 'desc',
+            base_commit=worktree_info.base_commit,
+        )
+        partial = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
+        arts.write_plan(partial)
+
+        outcome = await workflow.run()
+
+        assert briefing.completion_called is True
+        assert 'architect' in stub.calls
+        assert outcome == WorkflowOutcome.DONE
 
 
 # ---------------------------------------------------------------------------
