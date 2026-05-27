@@ -161,8 +161,11 @@ def main(verbose: bool):
               help='Start even if project_root has uncommitted changes (risky)')
 @click.option('--retag-modules', is_flag=True,
               help='Force re-tag all non-done/cancelled tasks with code modules')
+@click.option('--until-idle', is_flag=True,
+              help='Exit when the task queue drains (default: run forever, '
+                   'idling for newly-scheduled tasks)')
 def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
-        force_dirty_start: bool, retag_modules: bool):
+        force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.harness import Harness
 
@@ -198,6 +201,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             prd, dry_run=dry_run, delay_secs=delay_secs,
             force_dirty_start=force_dirty_start,
             retag_modules=retag_modules,
+            until_idle=until_idle,
         )
 
     try:
