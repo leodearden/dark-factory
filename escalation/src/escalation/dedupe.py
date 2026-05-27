@@ -8,6 +8,8 @@ Provides:
 - find_dedupe_parent() — scans the live queue and returns the oldest
                          pending parent id whose key matches the candidate,
                          or None.
+- compute_content_fingerprint() — deterministic sha256-based fingerprint
+                                   keyed on finding identity for recon dedup.
 
 Design contracts (see plan.json design_decisions for rationale):
 - find_dedupe_parent() does NOT check DedupeConfig.infra_dedupe_enabled.
@@ -19,8 +21,9 @@ Design contracts (see plan.json design_decisions for rationale):
 
 from __future__ import annotations
 
-__all__ = ['DedupeConfig', 'find_dedupe_parent', 'summary_dedupe_key']
+__all__ = ['DedupeConfig', 'compute_content_fingerprint', 'find_dedupe_parent', 'summary_dedupe_key']
 
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -31,6 +34,65 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
 _NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
+_WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
+
+# Unit separator: never appears in category names or entity IDs, so the join is
+# collision-free without hashing the readable prefix components.
+_FIELD_SEP = '\x1f'
+
+
+def _normalize_description(text: str) -> str:
+    """Normalise a description string for the empty-affected_ids tiebreak.
+
+    Steps:
+    1. Casefold (Unicode-aware lower-case).
+    2. Strip all non-word, non-whitespace characters (reuses _NON_WORD_PATTERN).
+    3. Collapse multiple whitespace runs to a single space and strip edges.
+
+    Reuses _NON_WORD_PATTERN so the normalisation is consistent with
+    summary_dedupe_key's stripping stage.
+    """
+    casefolded = text.casefold()
+    stripped = _NON_WORD_PATTERN.sub('', casefolded)
+    return _WHITESPACE_PATTERN.sub(' ', stripped).strip()
+
+
+def compute_content_fingerprint(
+    escalation_category: str,
+    finding_category: str,
+    affected_ids: list[str],
+    description: str = '',
+) -> str:
+    """Return a deterministic sha256 fingerprint keyed on finding identity.
+
+    Identity composition:
+    - ``escalation_category``, ``finding_category``, and a *body* joined by
+      the unit separator ``\\x1f`` (collision-free since the separator never
+      appears in category names or entity IDs).
+    - When ``affected_ids`` is NON-EMPTY: body = sorted(affected_ids) joined
+      by ``\\x1f``.  The ``description`` is intentionally ignored so that
+      recurring findings on the same targets fold even as their prose drifts
+      cycle to cycle.
+    - When ``affected_ids`` is EMPTY: body = ``'desc:'`` + first 16 hex chars
+      of ``sha256(normalised_description)`` so that description-only findings
+      with identical normalised text still fold, while genuinely distinct
+      descriptions do not.
+
+    Uses ``hashlib.sha256`` (NOT Python's builtin ``hash()``) so the result is
+    deterministic across processes regardless of ``PYTHONHASHSEED``.
+
+    Returns the full 64-character hex digest of the sha256 of the composed
+    identity string encoded as UTF-8.
+    """
+    if affected_ids:
+        body = _FIELD_SEP.join(sorted(affected_ids))
+    else:
+        norm = _normalize_description(description)
+        desc_hash = hashlib.sha256(norm.encode()).hexdigest()[:16]
+        body = 'desc:' + desc_hash
+
+    identity = _FIELD_SEP.join([escalation_category, finding_category, body])
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 @dataclass
