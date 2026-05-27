@@ -420,9 +420,12 @@ class TestDedupeTOCTOURace:
 
         Setup:
         (1) Submit a first infra_issue blocker → parent_id.
-        (2) Monkeypatch escalation.server.find_dedupe_parent to a wrapper that resolves
-            the parent (archiving the file) and then returns parent_id as if it were still
-            pending — mimicking the TOCTOU window.
+        (2) Monkeypatch escalation.dedupe.find_dedupe_parent (NOT escalation.server) to
+            a wrapper that resolves the parent (archiving the file) and then returns
+            parent_id as if it were still pending — mimicking the TOCTOU window.
+            After step-14 the server delegates to dedupe.submit_or_dedupe, which calls
+            find_dedupe_parent from escalation.dedupe; patching the dedupe module is
+            therefore the correct target post-delegation.
         (3) Call escalate_blocker a second time with a similar infra_issue summary.
 
         Assertions:
@@ -432,12 +435,8 @@ class TestDedupeTOCTOURace:
             so the root holds only the newly submitted child).
         (c) The second result['id'] matches the filename id of that new file — confirming
             queue.submit(esc) was actually invoked with the candidate escalation.
-
-        This test FAILS on the current implementation because attach_dedupe_child returns
-        None silently when the parent is already archived, but the helper still returns
-        {'status': 'dedup_skipped'} unconditionally, dropping the escalation.
         """
-        import escalation.server as server_module
+        import escalation.dedupe as dedupe_module
 
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
@@ -452,11 +451,12 @@ class TestDedupeTOCTOURace:
         )
         assert first['status'] == 'queued'
 
-        # (2) Monkeypatch find_dedupe_parent so that after finding the parent it
-        #     concurrently resolves it (archiving the file) before returning.
+        # (2) Monkeypatch escalation.dedupe.find_dedupe_parent (the call site after
+        #     step-14 delegation) so that after finding the parent it concurrently
+        #     resolves it (archiving the file) before returning.
         #     This replicates the race where the parent is resolved between the
         #     queue scan and the attach call.
-        _original_find = server_module.find_dedupe_parent
+        _original_find = dedupe_module.find_dedupe_parent
 
         def _racing_find(q, esc, cfg, now=None):
             result = _original_find(q, esc, cfg, now=now)
@@ -465,7 +465,7 @@ class TestDedupeTOCTOURace:
                 q.resolve(result, resolution='raced')
             return result  # still returns the id — simulating the stale read
 
-        monkeypatch.setattr(server_module, 'find_dedupe_parent', _racing_find)
+        monkeypatch.setattr(dedupe_module, 'find_dedupe_parent', _racing_find)
 
         # (3) Second blocker with a similar summary — hits the race window.
         second = await _blocker(
