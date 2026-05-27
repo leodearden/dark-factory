@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,11 +20,21 @@ from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
 
+class _FakeScheduler:
+    """Minimal stand-in for ``Harness.scheduler`` (the park-to-blocked path)."""
+
+    def __init__(self, status: str | None = None) -> None:
+        # Default None → no park unless a test sets a status.
+        self.get_status = AsyncMock(return_value=status)
+        self.set_task_status = AsyncMock()
+
+
 class _FakeHarness:
     """Minimal stand-in for ``orchestrator.harness.Harness``."""
 
-    def __init__(self) -> None:
+    def __init__(self, status: str | None = None) -> None:
         self.events: dict[str, asyncio.Event] = {}
+        self.scheduler = _FakeScheduler(status)
 
     def is_workflow_active(self, task_id: str) -> bool:
         return task_id in self.events
@@ -101,3 +112,57 @@ async def test_active_task_times_out_when_slot_does_not_clear(queue):
     assert result['was_active'] is True
     assert result['released'] is True
     assert result['slot_cleared'] is False
+    # Slot never cleared → must NOT park (parking would race a live workflow).
+    harness.scheduler.set_task_status.assert_not_awaited()
+    assert result['parked'] is None
+
+
+@pytest.mark.asyncio
+async def test_in_progress_task_parked_as_blocked(queue):
+    """Slot clears while the task is still 'in-progress' → parked as 'blocked'.
+
+    This is the /unblock shape: an escalated task whose agent was paused.
+    Parking to the reaper-immune 'blocked' state protects the worktree from
+    the stranded-in-progress sweep while the human finishes the merge.
+    """
+    harness = _FakeHarness(status='in-progress')
+    ev = asyncio.Event()
+    harness.events['42'] = ev
+
+    async def _watcher():
+        await ev.wait()
+        await asyncio.sleep(0.05)
+        harness.events.pop('42', None)
+
+    server = create_server(queue, harness=harness)
+    asyncio.create_task(_watcher())
+    result = await _call_release(server, task_id='42', timeout_secs=2)
+
+    assert result['slot_cleared'] is True
+    assert result['parked'] == 'blocked'
+    harness.scheduler.set_task_status.assert_awaited_once_with('42', 'blocked')
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_not_parked(queue):
+    """Slot clears but the task already went terminal ('done') → no park.
+
+    The normal out-of-band-done path: nothing to protect, and we must not
+    drag a done task back to 'blocked'.
+    """
+    harness = _FakeHarness(status='done')
+    ev = asyncio.Event()
+    harness.events['42'] = ev
+
+    async def _watcher():
+        await ev.wait()
+        await asyncio.sleep(0.05)
+        harness.events.pop('42', None)
+
+    server = create_server(queue, harness=harness)
+    asyncio.create_task(_watcher())
+    result = await _call_release(server, task_id='42', timeout_secs=2)
+
+    assert result['slot_cleared'] is True
+    assert result['parked'] is None
+    harness.scheduler.set_task_status.assert_not_awaited()

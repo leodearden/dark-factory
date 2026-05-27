@@ -1510,11 +1510,13 @@ Output JSON matching the schema. Every task must appear in the output.
             # is still finishing.
             if mid_run:
                 cancelled_at = self._workflow_cancel_at.get(tid)
-                if (
-                    cancelled_at is not None
-                    and now - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
-                ):
-                    continue
+                if cancelled_at is not None:
+                    if now - cancelled_at < self._RECONCILE_CANCEL_GRACE_S:
+                        continue
+                    # Grace window elapsed — lazily prune so the dict stays
+                    # bounded for tasks that exit terminal and are never
+                    # re-dispatched (re-dispatch otherwise clears the stamp).
+                    self._workflow_cancel_at.pop(tid, None)
 
             try:
                 outcome = await self._reconcile_one_stranded(
@@ -1718,6 +1720,21 @@ Output JSON matching the schema. Every task must appear in the output.
         # blocked is a deliberate state and we only flip it to done on
         # observed evidence.
         if status == 'blocked':
+            return None
+
+        # An open L1 escalation is the deliberate human-handoff signal (e.g. an
+        # active /unblock session owns this worktree). Don't reap it — leave the
+        # worktree, branch, and status intact. Mirrors the is_ancestor Guard 1,
+        # extended to the unmerged in-progress path. No revert: reverting to
+        # pending would let the scheduler dispatch a competing agent.
+        if (
+            self._escalation_queue is not None
+            and self._escalation_queue.has_open_l1(tid)
+        ):
+            logger.info(
+                'Reconcile: task %s in-progress with open L1 escalation; '
+                'leaving worktree intact (human-managed)', tid,
+            )
             return None
 
         # 'in-progress' and not on main: classify by lock state.
@@ -2035,6 +2052,11 @@ Output JSON matching the schema. Every task must appear in the output.
             cancel_event = asyncio.Event()
             self._workflow_cancel_events[assignment.task_id] = cancel_event
 
+            # Clear any stale soft-cancel grace stamp from a prior incarnation
+            # of this task so a freshly re-dispatched run starts clean (the
+            # stamp is no longer popped in the finally — see note there).
+            self._workflow_cancel_at.pop(assignment.task_id, None)
+
             # Register the asyncio.Task handle for this slot so hard_cancel_workflow
             # can request a hard cancel if the workflow ignores the soft event.
             # current_task() must be non-None here because _run_slot is always
@@ -2171,7 +2193,12 @@ Output JSON matching the schema. Every task must appear in the output.
         finally:
             self._escalation_events.pop(assignment.task_id, None)
             self._workflow_cancel_events.pop(assignment.task_id, None)
-            self._workflow_cancel_at.pop(assignment.task_id, None)
+            # NB: deliberately do NOT pop _workflow_cancel_at here.  Popping it
+            # in the finally defeated the R3 reconcile grace window — it only
+            # ever overlapped the period the live slot already protected (via
+            # dispatch-table membership), leaving the brief post-exit window
+            # uncovered.  The stamp is instead cleared at (re)dispatch (top of
+            # _run_slot) and lazily pruned by the sweep's grace-check reader.
             self._workflow_slot_tasks.pop(assignment.task_id, None)
             self._terminal_cancel_counts.pop(assignment.task_id, None)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED

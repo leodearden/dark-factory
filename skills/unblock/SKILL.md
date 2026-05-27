@@ -199,7 +199,7 @@ Enter plan mode. The plan covers two parts:
 
 The merge procedure is iterative — don't assume one pass will be enough:
 
-1. **Release the orchestrator's grip** on the task before merging — call `release_workflow(task_id="<TASK_ID>", timeout_secs=30)` on the escalation MCP. This soft-cancels any active workflow so the orchestrator stops processing the task while you finish it manually. If `was_active` is False the orchestrator wasn't running it; you can skip this step in that case.
+1. **Release the orchestrator's grip** on the task before merging — call `release_workflow(task_id="<TASK_ID>", timeout_secs=30)` on the escalation MCP. This soft-cancels any active workflow so the orchestrator stops processing the task while you finish it manually. Once the slot clears, if the task is still `in-progress` the tool parks it as `blocked` (returned as `parked: "blocked"`) — this both stops the orchestrator from re-dispatching it AND protects the worktree from the stranded-in-progress reconciliation sweep (the reaper) while you work. If `was_active` is False the orchestrator wasn't running it; you can skip this step in that case.
 2. Rebase on main. Resolve any conflicts.
 3. Run the project's full verification suite (tests, lint, type-check).
 4. Fix any failures.
@@ -232,7 +232,7 @@ Choose one of these based on the analysis:
 
 ### 4.4: Execute the plan
 
-Exit plan mode and execute. **Keep the task in its current status during the work** — don't change it until you've successfully merged or resolved. This prevents the orchestrator from trying to start new agents on it.
+Exit plan mode and execute. **Keep the task in its current status during the work** — don't manually change it until you've successfully merged or resolved. This prevents the orchestrator from trying to start new agents on it. One deliberate exception: in the blocked-task merge procedure, `release_workflow` intentionally moves an escalated/in-progress task to `blocked` (the reaper-immune holding state) when it releases the slot — that's the safe status to work from, and the final `set_task_status(done)` after merge is then the normal blocked→done transition.
 
 ### 4.5: Final reflect
 

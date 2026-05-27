@@ -216,6 +216,14 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
     assert tid not in h._workflow_cancel_events, 'cancel event not cleaned up in finally'
     assert sem._value == 1, f'semaphore not released by finally (value={sem._value})'
 
+    # (c2) The soft-cancel grace stamp set by hard_cancel_workflow must PERSIST
+    # past the finally — it is no longer popped there (popping it defeated the
+    # R3 reconcile grace window, leaving the post-exit window uncovered).  It
+    # is cleared only at (re)dispatch or lazily by the sweep once it expires.
+    assert tid in h._workflow_cancel_at, (
+        'grace stamp must persist past the finally (popped only at re-dispatch)'
+    )
+
     # (d) Regression: _collect_done_reports must handle the wrapper_task cleanly.
     task_reports: list = []
     h._collect_done_reports({wrapper_task}, task_reports)
@@ -223,3 +231,52 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
         f'Expected _collect_done_reports to append 1 report, got {len(task_reports)}'
     )
     assert task_reports[0].outcome == WorkflowOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
+    harness_for_run_slot: Harness,
+) -> None:
+    """A stale ``_workflow_cancel_at`` stamp from a prior incarnation is
+    cleared when the task is (re)dispatched.
+
+    The finally no longer pops the stamp, so a freshly re-dispatched run must
+    clear it at the top of ``_run_slot`` (right after registering the new
+    cancel_event) — otherwise a leftover stamp would grace-skip the sweep for
+    a task that is genuinely running again.
+    """
+    h = harness_for_run_slot
+    tid = '42'
+    # Stale stamp left over from a prior incarnation's soft-cancel.
+    h._workflow_cancel_at[tid] = 123.0
+    assignment = TaskAssignment(task_id=tid, task={'title': 't'}, modules=[])
+    sem = asyncio.Semaphore(0)
+
+    with patch('orchestrator.harness.TaskWorkflow') as mock_wf_cls:
+        async def _wedge() -> None:
+            await asyncio.sleep(3600)
+
+        mock_wf = MagicMock()
+        mock_wf.run = _wedge
+        mock_wf_cls.return_value = mock_wf
+
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+
+        # Poll until the slot registers.  The stamp pop happens at dispatch,
+        # just before the slot-task registration, so once the slot is present
+        # the stale stamp must already be gone.
+        for _ in range(50):
+            if tid in h._workflow_slot_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert tid in h._workflow_slot_tasks, (
+            '_run_slot did not register itself in _workflow_slot_tasks'
+        )
+
+        assert tid not in h._workflow_cancel_at, (
+            'stale grace stamp not cleared at (re)dispatch'
+        )
+
+        # Cleanup: hard-cancel the wedged slot and drain.
+        h.hard_cancel_workflow(tid)
+        await asyncio.wait({wrapper_task}, timeout=5.0)
