@@ -560,6 +560,24 @@ class TargetedReconciler:
         orchestrator_live = is_orchestrator_live_for(project_root)
         parent_id_str = str(parent_id)
 
+        # Lazy memo for the co-cancellation live re-check (task 1490).
+        # Populated at most once per sweep, only when an ambiguous descendant
+        # is encountered.  The initial get_tasks snapshot above (L548) may
+        # predate sibling-cancel DB commits because targeted reconciliation is
+        # fire-and-forget (task_interceptor.py:810-826) while user cancels are
+        # awaited sequentially — so sibling DB writes land before this
+        # background task re-reads.  A fresh re-read at decision time catches
+        # co-cancelled siblings that the stale snapshot missed.
+        #
+        # Tradeoff: if _live_status_map raises and returns {}, the memo is set
+        # to an empty dict, so all *subsequent* ambiguous descendants in this
+        # sweep also skip the re-read and fall through to escalate/block.  This
+        # is intentional: one transient failure short-circuits further attempts
+        # to avoid a per-descendant retry storm.  The fail-open behaviour
+        # (escalating/blocking rather than silently suppressing) preserves the
+        # genuine-orphan detection contract on infrastructure glitches.
+        live_status: dict[str, str] | None = None
+
         for t in all_tasks:
             if not isinstance(t, dict):
                 continue
@@ -606,30 +624,74 @@ class TargetedReconciler:
             )
 
             if deterministic_orphan:
+                # No co-cancellation guard needed here: _sweep_cancel_orphan
+                # emits a status transition to 'cancelled'.  If the dependent
+                # was co-cancelled by the user between the initial snapshot and
+                # now, the TaskInterceptor same-status guard
+                # (task_interceptor.py:620) returns {'no_op': True}, making
+                # this branch safely idempotent under the same race.
                 action = await self._sweep_cancel_orphan(
                     task_id=tid, parent_id=parent_id_str, project_root=project_root,
                 )
-            elif orchestrator_live:
-                action = self._sweep_escalate_l1(
-                    task_id=tid,
-                    parent_id=parent_id_str,
-                    escalation_id=escalation_id,
-                    is_dependent=is_dependent,
-                    project_root=project_root,
-                )
             else:
-                action = await self._sweep_block_orphan(
-                    task_id=tid,
-                    parent_id=parent_id_str,
-                    escalation_id=escalation_id,
-                    is_dependent=is_dependent,
-                    project_root=project_root,
-                )
+                # Ambiguous route (escalate when orch live; block when orch dead).
+                # Before acting, do a lazy live re-read to detect co-cancelled
+                # siblings whose cancel DB write landed after the initial snapshot.
+                if live_status is None:
+                    live_status = await self._live_status_map(project_root)
+                if live_status.get(tid) == 'cancelled':
+                    action = {
+                        'type': 'descendant_skipped_co_cancelled',
+                        'task_id': tid,
+                        'parent_id': parent_id_str,
+                    }
+                elif orchestrator_live:
+                    action = self._sweep_escalate_l1(
+                        task_id=tid,
+                        parent_id=parent_id_str,
+                        escalation_id=escalation_id,
+                        is_dependent=is_dependent,
+                        project_root=project_root,
+                    )
+                else:
+                    action = await self._sweep_block_orphan(
+                        task_id=tid,
+                        parent_id=parent_id_str,
+                        escalation_id=escalation_id,
+                        is_dependent=is_dependent,
+                        project_root=project_root,
+                    )
 
             if action is not None:
                 actions.append(action)
 
         return actions
+
+    async def _live_status_map(self, project_root: str) -> dict[str, str]:
+        """Return a fresh {str(task_id): str(status)} map for the project.
+
+        Called at most once per sweep (lazy-memoized by the caller) to detect
+        co-cancelled siblings whose status DB write landed after the initial
+        snapshot was taken.  Fails open: any exception logs a warning and
+        returns {}, so the ambiguous branch falls through to the existing
+        escalate/block path rather than silently dropping a genuine orphan.
+        """
+        try:
+            tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+        except Exception as e:
+            logger.warning(
+                'sweep: live status re-check failed for parent sweep at %s: %s',
+                project_root, e,
+            )
+            return {}
+        all_tasks = tasks_data.get('tasks', []) if isinstance(tasks_data, dict) else []
+        if not isinstance(all_tasks, list):
+            return {}
+        return {
+            str(t.get('id', '') or ''): str(t.get('status', '') or '')
+            for t in all_tasks
+            if isinstance(t, dict)
+        }
 
     async def _sweep_cancel_orphan(
         self, *, task_id: str, parent_id: str, project_root: str,
