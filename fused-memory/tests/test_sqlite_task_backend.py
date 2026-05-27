@@ -422,6 +422,31 @@ def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
     assert _normalize_legacy_memory_hints_value(None) is None
 
 
+@pytest.mark.asyncio
+async def test_update_task_legacy_list_hints_coerce_under_append_true(backend, project_root):
+    """End-to-end: legacy list-shape memory_hints row + append=True dict write → union.
+
+    Locks the Stage-2 LLM call path: update_task(append=True) with a canonical-dict
+    memory_hints payload now correctly merges with a row that was seeded in legacy
+    list-of-dicts shape, rather than silently discarding the incoming dict.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='legacy-row',
+        metadata=json.dumps({'memory_hints': [{'entity': 'E1', 'query': 'q1'}]}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['memory_hints'] == {
+        'entities': ['E1', 'E2'],
+        'queries': ['q1', 'q2'],
+    }
+
+
 # ── add_subtask / nested IDs ───────────────────────────────────────
 
 
