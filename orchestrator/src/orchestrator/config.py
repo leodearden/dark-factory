@@ -249,6 +249,14 @@ class ReviewConfig(BaseModel):
     full_review_on_complete: bool = Field(default=True)
     briefing_path: str = Field(default='review/briefing.yaml')
     reports_dir: str = Field(default='data/review-checkpoints')
+    # Run-forever rate-limit on the per-idle-cycle full review.  Both gates
+    # must be open (a true ceiling) before a drain-to-idle triggers another
+    # full review: at least ``full_review_min_interval_secs`` wall-clock since
+    # the last full review AND at least ``full_review_min_tasks`` merges since
+    # then.  Only consulted on the run-forever idle path; the exit /
+    # --until-idle post-loop review stays unconditional.
+    full_review_min_interval_secs: float = Field(default=86400.0)
+    full_review_min_tasks: int = Field(default=20)
 
 
 _DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
@@ -541,6 +549,13 @@ class OrchestratorConfig(BaseSettings):
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
+
+    # Run-forever idle poll cadence (seconds).  When the queue drains and the
+    # orchestrator is running forever (no --until-idle), it idles and re-polls
+    # the task tree every this many seconds for newly-scheduled work.  Kept
+    # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
+    # poll cadence can be tuned independently of the pause-recovery cadence.
+    idle_poll_secs: float = Field(default=15.0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
