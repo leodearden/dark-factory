@@ -5741,6 +5741,133 @@ class TestMarkBlockedBypassDetection:
             f'{scheduler.reopen_reasons.get(task_assignment.task_id)!r}'
         )
 
+    async def test_run_preempts_legitimate_done_at_dispatch(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Pre-empt check: live status is 'done' at dispatch AND provenance commit
+        is reachable from main → abort with WorkflowOutcome.DONE, no escalations.
+
+        RED: run()'s SetTaskStatusRejected handler calls _handle_cancelled_terminal_exit
+        which returns None for old_status='done'; falls through to the
+        'unhandled rejection' path → _mark_blocked(escalate_to_human=True) →
+        outcome=BLOCKED with a task_failure L1.  Wrong outcome, wrong category.
+
+        GREEN (step-12): extend the handler to call _handle_terminal_exit_on_block;
+        legitimate-done (provenance commit on main) calls _enter_phase(DONE) and
+        returns DONE with zero escalations.
+        """
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        tid = task_assignment.task_id
+
+        # Pre-seed live status as 'done' so get_status returns terminal at dispatch.
+        scheduler.statuses[tid] = ['done']
+
+        # Populate done_provenance with the actual main-branch HEAD so
+        # git_ops.is_ancestor(main_sha, main_sha) → True (every commit is its
+        # own ancestor in git).
+        main_sha = await git_ops.get_main_sha()
+        scheduler.task_data[tid] = {
+            'id': tid,
+            'status': 'done',
+            'metadata': {
+                'done_provenance': {'kind': 'merged', 'commit': main_sha},
+            },
+        }
+
+        outcome = await workflow.run()
+
+        # (a) RED: fails — unhandled-rejection path returns BLOCKED, not DONE.
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for legitimate-done at dispatch, got {outcome!r}'
+        )
+
+        # (b) 'in-progress' must never have been written.
+        written = scheduler.statuses.get(tid, [])
+        assert 'in-progress' not in written, (
+            f"Pre-empt failed: 'in-progress' was written; statuses: {written!r}"
+        )
+
+        # (c) Zero escalations at L0 and L1 — no task_failure, no bypass_done.
+        all_escs = (
+            queue.get_by_task(tid, level=0)
+            + queue.get_by_task(tid, level=1)
+        )
+        assert not all_escs, (
+            f'Expected no escalations for legitimate-done at dispatch, got '
+            f'{[(e.id, e.category) for e in all_escs]}'
+        )
+
+        # (d) Row must NOT be reopened.
+        assert tid not in scheduler.reopen_reasons, (
+            f'Expected no reopen for legitimate-done row, got '
+            f'{scheduler.reopen_reasons.get(tid)!r}'
+        )
+
+    async def test_run_preempts_bypass_done_at_dispatch(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Pre-empt check: live status is 'done' at dispatch but NO valid provenance
+        → bypass detected → reopen + L1 bypass_done + WorkflowOutcome.BLOCKED.
+
+        RED: same unhandled-rejection path as test_run_preempts_legitimate_done —
+        outcome is BLOCKED but L1 category is 'task_failure' (not 'bypass_done')
+        and no reopen_reason is written.
+
+        GREEN (step-12): _handle_terminal_exit_on_block detects bypass (no provenance)
+        → reopens row with reopen_reason='bypass detected: …', files exactly one L1
+        with category='bypass_done', returns BLOCKED.
+        """
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        tid = task_assignment.task_id
+
+        # Pre-seed live status as 'done' with NO done_provenance metadata.
+        # get_task returns None → provenance commit is missing → bypass path.
+        scheduler.statuses[tid] = ['done']
+
+        outcome = await workflow.run()
+
+        # (a) outcome must be BLOCKED (bypass-done path).
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED for bypass-done at dispatch, got {outcome!r}'
+        )
+
+        # (b) 'in-progress' must never have been written — pre-empt still fires.
+        written = scheduler.statuses.get(tid, [])
+        assert 'in-progress' not in written, (
+            f"Pre-empt failed: 'in-progress' was written; statuses: {written!r}"
+        )
+
+        # (c) Exactly one L1 with category='bypass_done' — NOT 'task_failure'.
+        # RED: fails because the unhandled-rejection path submits task_failure.
+        l1 = queue.get_by_task(tid, level=1)
+        bypass_l1 = [e for e in l1 if e.category == 'bypass_done']
+        assert len(bypass_l1) == 1, (
+            f'Expected exactly one bypass_done L1, got '
+            f'{[(e.id, e.category) for e in l1]!r}'
+        )
+
+        # (d) Row must be reopened with a 'bypass detected:' reason.
+        # RED: fails — unhandled-rejection path does NOT write a reopen_reason.
+        assert tid in scheduler.reopen_reasons, (
+            'Expected reopen_reason to be persisted after bypass detection'
+        )
+        assert scheduler.reopen_reasons[tid].startswith('bypass detected:'), (
+            f'Expected reopen_reason to start with "bypass detected:", got '
+            f'{scheduler.reopen_reasons[tid]!r}'
+        )
+
+        # (e) Row's last status must be 'blocked' (reopened).
+        assert scheduler.statuses[tid][-1] == 'blocked', (
+            f'Expected final status "blocked" after reopen, got '
+            f'{scheduler.statuses[tid]!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestCleanupVerificationGate:
