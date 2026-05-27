@@ -2572,3 +2572,54 @@ class TestPatchResolutionMetadataDefect2:
         assert patched['resolution_turns'] == 5
         assert patched['status'] == 'resolved'
         assert patched['resolution'] == 'agent fixed it'
+
+    # ------------------------------------------------------------------
+    # Mock-level contract tests (use the existing mock_queue fixture)
+    # ------------------------------------------------------------------
+
+    def test_calls_patch_resolution_metadata_not_rewrite(self, steward):
+        """patch_resolution_metadata is called with the expected kwargs and _rewrite
+        is NOT called — guards against regressing back to the resurrecting _rewrite."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by=None
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=7))
+        steward.escalation_queue.patch_resolution_metadata.assert_called_once_with(
+            'esc-42-1', resolved_by='steward', resolution_turns=7
+        )
+        steward.escalation_queue._rewrite.assert_not_called()
+
+    def test_skips_when_status_pending(self, steward):
+        """When the escalation is still pending, patch_resolution_metadata is NOT called."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending', resolved_by=None
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_skips_when_already_attributed(self, steward):
+        """When resolved_by is already set, patch_resolution_metadata is NOT called
+        — preserves any existing agent attribution (e.g. resolved_by='interactive')."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by='interactive'
+        )
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_skips_when_get_returns_none(self, steward):
+        """When get() returns None (escalation missing), patch_resolution_metadata
+        is NOT called — avoids errors on unknown IDs."""
+        steward.escalation_queue.get.return_value = None
+        steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        steward.escalation_queue.patch_resolution_metadata.assert_not_called()
+
+    def test_exception_in_patch_is_logged_not_raised(self, steward, caplog):
+        """An exception from patch_resolution_metadata is caught and logged as a
+        warning — it must not propagate to the caller."""
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolved_by=None
+        )
+        steward.escalation_queue.patch_resolution_metadata.side_effect = OSError('disk full')
+        with caplog.at_level(logging.WARNING):
+            steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
+        assert 'Failed to patch steward metadata on esc-42-1' in caplog.text
