@@ -435,6 +435,81 @@ class EscalationQueue:
         )
         return parent
 
+    def patch_resolution_metadata(
+        self,
+        escalation_id: str,
+        *,
+        resolved_by: str | None = None,
+        resolution_turns: int | None = None,
+    ) -> Escalation | None:
+        """Patch resolved_by and/or resolution_turns on an already-resolved escalation.
+
+        Updates the existing file in place wherever it lives (root or archive); never
+        resurrects an archived file into the queue root.  The tmp file used for the
+        atomic write is created in the target file's parent directory, so the rename
+        stays within the same filesystem subtree.
+
+        Returns None when:
+        - The escalation id is not found (no file in root or archive).
+        - The escalation is still pending — caller must have already resolved/dismissed it.
+
+        Returns the updated Escalation on success.
+        """
+        # Locate the file: root first, then archive fallback (mirrors get()).
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+            if not candidates:
+                return None
+            if len(candidates) > 1:
+                logger.warning(
+                    f'Multiple archive files for {escalation_id}: '
+                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
+                )
+                path = max(
+                    candidates,
+                    key=lambda p: (
+                        p.parent.name
+                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
+                        else ''
+                    ),
+                )
+            else:
+                path = candidates[0]
+
+        # Parse
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+
+        # Guard: only patch resolved/dismissed escalations
+        if esc.status not in ('resolved', 'dismissed'):
+            return None
+
+        # Apply patches
+        if resolved_by is not None:
+            esc.resolved_by = resolved_by
+        if resolution_turns is not None:
+            esc.resolution_turns = resolution_turns
+
+        # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root)
+        json_text = esc.to_json()
+        fd, tmp_path_str = tempfile.mkstemp(
+            suffix='.tmp', prefix=escalation_id, dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(json_text)
+            os.rename(tmp_path_str, str(path))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path_str)
+            raise
+
+        return esc
+
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
         """Atomically rewrite an escalation's JSON file."""
         self._atomic_write(escalation_id, escalation.to_json())
