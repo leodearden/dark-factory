@@ -219,6 +219,100 @@ class TestReconcileStrandedInProgress:
         # Stale lock must be deleted
         assert not lock_path.exists()
 
+    async def test_in_progress_with_open_l1_left_intact(
+        self, harness: Harness, monkeypatch
+    ):
+        """In-progress task with an open L1 escalation → worktree NOT reaped.
+
+        Reproduces the /unblock-session reap: an escalated task sits at
+        'in-progress' with an open L1 while a human edits its worktree.  The
+        worktree's plan.lock is stale (the agent exited), so WITHOUT the L1
+        guard the stranded sweep would clear the lock, force-delete the
+        worktree, and revert to pending.  The open L1 must veto all of that —
+        return None, no cleanup_worktree, no status change, lock preserved.
+        """
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        harness.scheduler.get_statuses.return_value = ({'60': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        # Stale lock (dead PID) — the would-be-reaped shape absent the guard.
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+        lock_dir = harness.git_ops.worktree_base / '60' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '60-human',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': 99999,
+        }))
+
+        # Real EscalationQueue with an open L1 for task 60 (the human handoff).
+        queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
+        harness._escalation_queue = EscalationQueue(queue_dir)
+        harness._escalation_queue.submit(Escalation(
+            id=harness._escalation_queue.make_id('60'),
+            task_id='60',
+            agent_role='task-steward',
+            severity='blocking',
+            category='task_failure',
+            summary='Escalated — human is unblocking in the worktree',
+            level=1,
+            status='pending',
+        ))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # The worktree must be left intact: no cleanup, no revert, lock present.
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert lock_path.exists()
+
+    async def test_in_progress_without_l1_still_reaped(
+        self, harness: Harness, monkeypatch
+    ):
+        """Inverse of the L1 guard: a stale-lock in-progress task with NO open
+        L1 for *that* task is still reaped — pins the guard to the specific tid.
+
+        An L1 exists for a *different* task (999); the target (61) has none, so
+        has_open_l1('61') is False and the stale-lock recovery proceeds.
+        """
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        harness.scheduler.get_statuses.return_value = ({'61': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+        lock_dir = harness.git_ops.worktree_base / '61' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '61-dead',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': 99999,
+        }))
+
+        queue_dir = harness.git_ops.worktree_base.parent / 'escalations'
+        harness._escalation_queue = EscalationQueue(queue_dir)
+        # L1 belongs to an unrelated task — must NOT shield task 61.
+        harness._escalation_queue.submit(Escalation(
+            id=harness._escalation_queue.make_id('999'),
+            task_id='999',
+            agent_role='task-steward',
+            severity='blocking',
+            category='task_failure',
+            summary='Unrelated escalation',
+            level=1,
+            status='pending',
+        ))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # No L1 for 61 → normal stale-lock recovery: reaped + reverted.
+        harness.git_ops.cleanup_worktree.assert_awaited_once()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_called_once_with('61', 'pending')  # type: ignore[attr-defined]
+        assert not lock_path.exists()
+
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
         [

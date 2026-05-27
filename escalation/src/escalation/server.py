@@ -352,13 +352,25 @@ def create_server(
         ``DONE`` if terminal, ``REQUEUED`` otherwise — never creates new
         escalations as a result of this call.
 
+        Once the workflow slot has cleared, if the task is still
+        ``in-progress`` (the typical /unblock shape: an escalated task whose
+        agent was paused) it is parked as ``blocked``.  ``blocked`` is the
+        reaper-immune holding state — it stops the orchestrator from
+        re-dispatching the task AND protects the worktree from the stranded-
+        in-progress reconciliation sweep while the human finishes the work.
+        From ``blocked`` the final ``set_task_status('done')`` after merge is
+        the normal blocked→done transition.
+
         Returns:
-            ``{released, was_active, slot_cleared}``
+            ``{released, was_active, slot_cleared, parked}``
             - ``was_active``: True if a workflow slot was registered when
               the call started.
             - ``released``: True if ``cancel_workflow`` accepted the request.
             - ``slot_cleared``: True if the workflow finished within
               ``timeout_secs``.
+            - ``parked``: the status the task was parked into (``'blocked'``)
+              once the slot cleared, or ``None`` if no park occurred (slot
+              still active, or task already terminal/non-in-progress).
         """
         if harness is None:
             return {
@@ -370,6 +382,7 @@ def create_server(
         if not was_active:
             return {
                 'released': False, 'was_active': False, 'slot_cleared': True,
+                'parked': None,
             }
         # Wait up to timeout_secs for the slot to clear
         loop = asyncio.get_event_loop()
@@ -379,10 +392,29 @@ def create_server(
                 break
             await asyncio.sleep(0.5)
         slot_cleared = not harness.is_workflow_active(task_id)
+
+        # Park the task in a reaper-immune status once the slot has cleared.
+        # Only when the slot is gone (a still-live slot is already reaper-safe
+        # via dispatch-table membership; parking it would race the workflow).
+        # An escalated /unblock task sits at 'in-progress' with an open L1
+        # while the human works; without this, release_workflow clears the
+        # only sweep protection (dispatch-table membership via scheduler.release)
+        # without changing the persisted status, leaving the worktree exposed
+        # to the stranded-in-progress reaper.  'blocked' is the existing
+        # sweep-immune state (symmetric with the already-safe blocked-task path)
+        # and won't trip park-stop (threshold is 15 blocked-transitions/hour).
+        parked = None
+        if not harness.is_workflow_active(task_id):
+            cur = await harness.scheduler.get_status(task_id)
+            if cur == 'in-progress':
+                await harness.scheduler.set_task_status(task_id, 'blocked')
+                parked = 'blocked'
+
         return {
             'released': released,
             'was_active': was_active,
             'slot_cleared': slot_cleared,
+            'parked': parked,
         }
 
     @mcp.tool()
