@@ -468,10 +468,16 @@ class EscalationQueue:
         atomic write is created in the target file's parent directory, so the rename
         stays within the same filesystem subtree.
 
+        Multi-date duplicates: when multiple archive copies exist for the same id, only
+        the newest copy (newest parent directory name in YYYY-MM-DD lexicographic order)
+        is patched; staler copies remain untouched.  Callers should clean up duplicate
+        archive copies independently.
+
         Returns None when the escalation is missing OR still pending — caller must have
         already resolved/dismissed it.
 
-        Returns the updated Escalation on success.
+        Returns the updated Escalation on success, or the unmodified Escalation when
+        called with no patch arguments (both resolved_by and resolution_turns are None).
         """
         # Locate the file (shared helper — same root-first, archive-fallback,
         # newest-by-date logic as get()).
@@ -489,6 +495,10 @@ class EscalationQueue:
         # Guard: only patch resolved/dismissed escalations
         if esc.status not in ('resolved', 'dismissed'):
             return None
+
+        # No-op early return: nothing to patch — avoid disk I/O when both args are None.
+        if resolved_by is None and resolution_turns is None:
+            return esc
 
         # Apply patches
         if resolved_by is not None:

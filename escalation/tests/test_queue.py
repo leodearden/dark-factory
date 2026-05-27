@@ -1627,7 +1627,7 @@ class TestPatchResolutionMetadata:
         original_content = archive_files[0].read_text()
 
         # Patch os.rename to fail
-        with patch('os.rename', side_effect=OSError('disk full')), pytest.raises(OSError, match='disk full'):
+        with patch('escalation.queue.os.rename', side_effect=OSError('disk full')), pytest.raises(OSError, match='disk full'):
             queue.patch_resolution_metadata('esc-1-1', resolved_by='steward')
 
         # (a) No .tmp files orphaned in archive_dir
