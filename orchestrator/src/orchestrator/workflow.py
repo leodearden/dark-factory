@@ -452,6 +452,12 @@ class TaskWorkflow:
         (already-on-main shortcuts, eval mode without a merge), write an
         empty list — the fused-memory gate-skip-when-verified-provenance
         branch handles the missing-files case from there.
+
+        Sibling keys such as ``memory_hints`` and ``_causation_id`` (added by
+        Stage-2 reconciliation after the workflow loaded ``self.task``) are
+        preserved via the ``_merge_fresh_metadata`` read-modify-write; a
+        pre-fix bare ``{'files': files}`` write clobbered them under the
+        default ``append=False``.
         """
         if self._merge_sha and self._base_commit:
             files = await self.git_ops.get_merge_diff_files(
@@ -459,7 +465,13 @@ class TaskWorkflow:
             )
         else:
             files = []
-        await self.scheduler.update_task(self.task_id, {'files': files})
+        merged = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {},
+            log_context='done metadata files reconcile',
+        )
+        merged['files'] = files
+        self.task['metadata'] = merged
+        await self.scheduler.update_task(self.task_id, merged)
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
         """Transition to a new workflow phase, emitting events."""
