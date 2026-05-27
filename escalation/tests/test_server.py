@@ -600,3 +600,150 @@ class TestPromoteToL2Create:
 
         assert 'error' in result, f'Expected error for whitespace root_cause, got: {result}'
         assert len(queue.get_pending()) == 0, 'Nothing should be queued on error'
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2Dedup: dedup / update path
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2Dedup:
+    """promote_to_l2 dedup: second call with same root_cause updates the existing L2."""
+
+    @pytest.mark.asyncio
+    async def test_second_call_same_root_cause_returns_same_id_and_updated_status(
+        self, tmp_path: Path,
+    ):
+        """(a) Two calls with the same root_cause return the SAME id; second has status='updated'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
+        )
+
+        assert first['status'] == 'created'
+        assert second['status'] == 'updated', f"Expected 'updated', got: {second}"
+        assert second['id'] == first['id'], (
+            f"Expected same id on dedup; first={first['id']!r}, second={second['id']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_call_appends_members_set_union(self, tmp_path: Path):
+        """(b) Second call appends new members (set-union: existing preserved, new added once)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        # Pass both the existing member (should not duplicate) and a new one
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
+        )
+
+        assert second['status'] == 'updated'
+        members = second['members']
+        assert 'esc-l1-1' in members, f"Original member must be preserved: {members}"
+        assert 'esc-l1-2' in members, f"New member must be added: {members}"
+        assert members.count('esc-l1-1') == 1, f"No duplicate for existing member: {members}"
+
+    @pytest.mark.asyncio
+    async def test_only_one_l2_file_on_disk(self, tmp_path: Path):
+        """(c) Only ONE L2 file exists after two calls with the same root_cause."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']})
+        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']})
+
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 1, (
+            f'Expected exactly 1 pending L2, got {len(pending_l2)}: '
+            f'{[e.id for e in pending_l2]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_call_does_not_modify_root_cause_options_summary_detail(
+        self, tmp_path: Path,
+    ):
+        """(d) Existing L2's root_cause, options, summary, detail are NOT modified by the second call."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(
+            server,
+            task_id='t-1',
+            agent_role='watcher',
+            member_ids=['esc-l1-1'],
+            root_cause='Bad merge strategy',
+            evidence='First evidence',
+            options=['A: fix'],
+            summary='First summary',
+        )
+        # Second call with different evidence, options, summary — should NOT overwrite
+        await _promote_to_l2(
+            server,
+            task_id='t-2',
+            agent_role='watcher',
+            member_ids=['esc-l1-2'],
+            root_cause='Bad merge strategy',
+            evidence='Second evidence (should not overwrite)',
+            options=['X: different option'],
+            summary='Different summary',
+        )
+
+        esc = queue.get(first['id'])
+        assert esc is not None
+        assert esc.root_cause == 'Bad merge strategy'
+        assert esc.options == ['A: fix'], f'Options must be preserved: {esc.options}'
+        assert esc.summary == 'First summary', f'Summary must be preserved: {esc.summary}'
+        assert esc.detail == 'First evidence', f'Detail must be preserved: {esc.detail}'
+
+    @pytest.mark.asyncio
+    async def test_different_root_cause_creates_new_l2(self, tmp_path: Path):
+        """(e) Different root_cause produces a new L2 (status='created' again)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'root cause A'},
+        )
+        second = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'root cause B'},
+        )
+
+        assert first['status'] == 'created'
+        assert second['status'] == 'created', f"Expected 'created' for different root_cause: {second}"
+        assert first['id'] != second['id'], 'Different root causes must produce different L2s'
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 2, f'Expected 2 pending L2s: {[e.id for e in pending_l2]}'
+
+    @pytest.mark.asyncio
+    async def test_resolved_l2_does_not_block_new_l2_same_root_cause(
+        self, tmp_path: Path,
+    ):
+        """(f) A resolved L2 with the same root_cause does NOT block creating a fresh L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        # Create and resolve the first L2
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        queue.resolve(first['id'], 'Previous resolution')
+
+        # Second call: same root_cause, but first is resolved → new L2 (status='created')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
+        )
+
+        assert second['status'] == 'created', (
+            f"Expected 'created' (resolved L2 should not block new one): {second}"
+        )
+        assert second['id'] != first['id'], 'New L2 must have a different id'
