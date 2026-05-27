@@ -1933,3 +1933,128 @@ class TestFindPendingL2ByRootCause:
             f'Expected match despite trailing whitespace; got {result!r}'
         )
 
+
+class TestAddMembersToL2:
+    """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
+
+    def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L2 escalation with an initial member."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_returns_updated_escalation(self, tmp_path: Path):
+        """(a) Returns the updated Escalation object."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None, 'Expected updated Escalation, got None'
+        assert isinstance(result, Escalation)
+
+    def test_appends_new_members(self, tmp_path: Path):
+        """(b) Appends new member ids, preserving order — no duplicates (set-union)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-2'])
+
+        assert result is not None
+        assert 'esc-l1-0' in result.members  # original preserved
+        assert 'esc-l1-1' in result.members  # new member added
+        assert 'esc-l1-2' in result.members  # new member added
+        assert len(result.members) == 3, f'Expected 3 members, got {result.members}'
+
+    def test_set_union_semantics_no_duplicates(self, tmp_path: Path):
+        """(b cont.) Adding an already-existing member id does NOT duplicate it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0', 'esc-l1-1'])
+
+        assert result is not None
+        assert result.members.count('esc-l1-0') == 1, 'Duplicate members must not be added'
+        assert 'esc-l1-1' in result.members
+        assert len(result.members) == 2
+
+    def test_leaves_other_fields_untouched(self, tmp_path: Path):
+        """(c) root_cause, options, summary, detail, timestamp are not modified."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='Original summary',
+            level=2,
+            root_cause='Bad merge strategy',
+            options=['A: fix', 'B: rollback'],
+            detail='Original evidence',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        original_ts = esc.timestamp
+
+        result = queue.add_members_to_l2(esc.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.root_cause == 'Bad merge strategy'
+        assert result.options == ['A: fix', 'B: rollback']
+        assert result.summary == 'Original summary'
+        assert result.detail == 'Original evidence'
+        assert result.timestamp == original_ts
+
+    def test_returns_none_when_l2_not_found_in_queue_root(self, tmp_path: Path):
+        """(d) Returns None when the L2 is archived or unknown (refuses archived L2s)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        queue.resolve(l2.id, 'Fixed')  # moves to archive
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is None, f'Expected None for archived L2, got {result!r}'
+
+    def test_returns_none_for_unknown_id(self, tmp_path: Path):
+        """(d cont.) Returns None for a completely unknown id."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        result = queue.add_members_to_l2('esc-does-not-exist', ['esc-l1-1'])
+
+        assert result is None, f'Expected None for unknown id, got {result!r}'
+
+    def test_empty_new_member_ids_is_noop(self, tmp_path: Path):
+        """(e) add_members_to_l2 with empty new_member_ids returns escalation unchanged."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, [])
+
+        assert result is not None
+        assert result.members == ['esc-l1-0'], f'Expected unchanged members, got {result.members}'
+
+    def test_write_is_durable_reload_shows_appended_members(self, tmp_path: Path):
+        """(f) Reload via queue.get(l2_id) shows the appended members."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-2'])
+
+        reloaded = queue.get(l2.id)
+        assert reloaded is not None
+        assert 'esc-l1-0' in reloaded.members
+        assert 'esc-l1-1' in reloaded.members
+        assert 'esc-l1-2' in reloaded.members
+        assert len(reloaded.members) == 3
+
