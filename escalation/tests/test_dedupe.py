@@ -589,6 +589,76 @@ class TestContentFingerprintKey:
         assert result is None, 'None fingerprint must never fold into any parent'
 
 
+class TestUnboundedWindow:
+    """find_dedupe_parent with float('inf') window folds regardless of parent age."""
+
+    def _make_recon_esc(self, esc_id: str, fingerprint: str = 'shared-fp', ts: str | None = None):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='42',
+            agent_role='reconciler',
+            severity='info',
+            category='recon_integrity_issue',
+            summary='Unresolved after remediation: entity mismatch',
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def test_inf_window_folds_regardless_of_age(self, tmp_path):
+        """(1) With inf window, parent 10 days old still returns parent id."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Parent with timestamp 10 days in the past
+        ten_days_ago = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+        parent = self._make_recon_esc('esc-1-1', ts=ten_days_ago)
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2')
+        cfg = DedupeConfig(
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('recon_integrity_issue',),
+            key_fn=content_fingerprint_key,
+        )
+        result = find_dedupe_parent(queue, candidate, cfg)
+        assert result == 'esc-1-1', (
+            f'Inf window must fold regardless of age; got: {result}'
+        )
+
+    def test_finite_window_out_of_window_returns_none(self, tmp_path):
+        """(2) Regression: default 600s window still returns None for out-of-window parent."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = Escalation(
+            id='esc-1-1', task_id='42', agent_role='impl', severity='blocking',
+            category='infra_issue', summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(parent)
+
+        # Move 'now' 700s into the future (outside the 600s window)
+        now = datetime.now(UTC) + timedelta(seconds=700)
+        candidate = Escalation(
+            id='esc-1-2', task_id='42', agent_role='impl', severity='blocking',
+            category='infra_issue', summary='fused-memory connection timeout on port 9999',
+        )
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result is None, (
+            f'Finite 600s window must return None for out-of-window parent; got: {result}'
+        )
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
