@@ -15,6 +15,7 @@ from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _format_task_id,
     _merge_metadata,
+    _normalize_legacy_memory_hints_value,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -353,12 +354,185 @@ def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
     assert result == {"x": [{"k": 1}, {"k": 1}]}
 
 
-def test_merge_metadata_type_mismatch_old_wins():
-    """Type mismatch (old=list, new=dict) resolves to OLD wins under append=True."""
+def test_merge_metadata_type_mismatch_old_wins_for_non_hint_keys():
+    """Type mismatch (old=list, new=dict) resolves to OLD wins for arbitrary keys.
+
+    This audit-field-protection rule is intentional for generic keys (e.g. ``x``,
+    ``done_provenance``) where a malformed/unexpected write should not be allowed
+    to overwrite a structured value.
+
+    Note: ``memory_hints`` is the only key that receives special treatment — it is
+    normalised from legacy list-of-dicts shape to canonical dict shape before
+    _merge_values runs, so the dict-vs-dict recursive union path handles the merge
+    instead.  See test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict.
+    """
     old_raw = '{"x":[1,2]}'
     new_raw = '{"x":{"a":1}}'
     result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
     assert result["x"] == [1, 2]
+
+
+# ── _merge_metadata: legacy memory_hints migration ───────────────────
+
+
+def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
+    """Legacy list-of-dicts memory_hints is coerced to dict shape and union-merged.
+
+    When an existing row carries the legacy memory_hints shape
+    ``[{"entity": ..., "query": ...}, ...]`` and the incoming payload carries the
+    canonical shape ``{"entities": [...], "queries": [...]}`` with append=True, the
+    legacy list must be coerced to dict shape BEFORE _merge_values runs — so the
+    merge falls into the dict-vs-dict recursive path (which unions the inner lists)
+    rather than the type-mismatch OLD-wins path (which silently discards the new dict).
+
+    Old-then-new stable order is preserved (same policy as the dict-vs-dict union).
+
+    Also covers symmetric cases to ensure normalization is applied to both sides:
+    * old=canonical dict, new=legacy list → union (new side is also normalised)
+    * old=legacy list,     new=legacy list → both coerced then unioned
+    """
+    # Primary case: old=legacy list, new=canonical dict
+    old_raw = '{"memory_hints":[{"entity":"E1","query":"q1"},{"entity":"E2","query":"q2"}]}'
+    new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
+
+    # Symmetric case 1: old=canonical dict, new=legacy list → union
+    old_raw_sym = '{"memory_hints":{"entities":["E1"],"queries":["q1"]}}'
+    new_raw_sym = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
+    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, append=True))
+    assert result_sym == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
+
+    # Symmetric case 2: old=legacy list, new=legacy list → both coerced, then unioned
+    old_raw_ll = '{"memory_hints":[{"entity":"E1","query":"q1"}]}'
+    new_raw_ll = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
+    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, append=True))
+    assert result_ll == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
+
+
+def test_merge_metadata_legacy_hints_not_normalized_on_one_sided_write():
+    """Normalization is scoped to the collision path: one-sided writes do not migrate.
+
+    When only the *old* side carries ``memory_hints`` (and the incoming write
+    does not touch that key), the stored legacy list shape is left unchanged.
+    Normalization only fires when BOTH sides carry ``memory_hints``, keeping
+    the special case strictly scoped to the merge-collision path and avoiding
+    any implicit side-effect on unrelated writes.
+    """
+    old_raw = '{"tag":"old","memory_hints":[{"entity":"E1","query":"q1"}]}'
+    new_raw = '{"tag":"new"}'  # does not carry memory_hints
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    # scalar collision on "tag" → OLD wins
+    assert result["tag"] == "old"
+    # memory_hints was NOT in the incoming write, so normalization does not fire;
+    # the legacy list shape is preserved verbatim in the merged result.
+    assert result["memory_hints"] == [{"entity": "E1", "query": "q1"}]
+
+
+def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
+    """_normalize_legacy_memory_hints_value correctly handles edge cases in the list.
+
+    Proves:
+    * dict entries with only entity → entity extracted, no query
+    * dict entries with only query → query extracted, no entity
+    * dict entries with both → both extracted
+    * empty dicts → skipped
+    * non-dict items (str, None) → skipped
+    * empty-string entity/query → skipped
+    * None-valued entity/query → skipped
+    * duplicate entity/query values → deduplicated in stable (first-seen) order
+    * already-canonical dict input → returned unchanged (pass-through)
+    * None input → returned unchanged (pass-through)
+
+    Cross-reference: test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict
+    covers the full _merge_metadata path; this test locks the helper's semantics.
+    """
+    # Mixed/malformed list
+    malformed = [
+        {"entity": "E1"},           # only entity — ok
+        {"query": "q1"},            # only query — ok
+        {"entity": "E2", "query": "q2"},  # both — ok
+        {},                         # empty dict — skip
+        "not-a-dict",               # non-dict — skip
+        None,                       # non-dict — skip
+        {"entity": ""},             # empty string — skip
+        {"query": None},            # None value — skip
+    ]
+    result = _normalize_legacy_memory_hints_value(malformed)
+    assert result == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
+
+    # Duplicates — deduplicated in stable first-seen order
+    duped = [
+        {"entity": "E1", "query": "q1"},
+        {"entity": "E1", "query": "q2"},  # duplicate entity — skip entity, keep query
+        {"entity": "E2", "query": "q1"},  # duplicate query — keep entity, skip query
+    ]
+    result_dedup = _normalize_legacy_memory_hints_value(duped)
+    assert result_dedup == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
+
+    # Already-canonical dict — pass-through
+    canonical = {"entities": ["X"], "queries": ["q"]}
+    assert _normalize_legacy_memory_hints_value(canonical) is canonical
+
+    # None — pass-through
+    assert _normalize_legacy_memory_hints_value(None) is None
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_list_hints_coerce_under_append_true(backend, project_root):
+    """End-to-end: legacy list-shape memory_hints row + append=True dict write → union.
+
+    Locks the Stage-2 LLM call path: update_task(append=True) with a canonical-dict
+    memory_hints payload now correctly merges with a row that was seeded in legacy
+    list-of-dicts shape, rather than silently discarding the incoming dict.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='legacy-row',
+        metadata=json.dumps({'memory_hints': [{'entity': 'E1', 'query': 'q1'}]}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['memory_hints'] == {
+        'entities': ['E1', 'E2'],
+        'queries': ['q1', 'q2'],
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(backend, project_root):
+    """Sibling metadata keys are untouched when a legacy-list hints row is migrated.
+
+    Mirrors test_update_task_preserves_sibling_keys_during_memory_hints_append but
+    proves the no-collateral-damage promise still holds when the row starts in
+    legacy list-of-dicts shape rather than canonical dict shape.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='sibling-row',
+        metadata=json.dumps({
+            'files': ['src/a.py'],
+            'spawned_from': 'task-100',
+            'audit': {'created_by': 'x'},
+            'memory_hints': [{'entity': 'E1', 'query': 'q1'}],
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {
+        'files': ['src/a.py'],
+        'spawned_from': 'task-100',
+        'audit': {'created_by': 'x'},
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+    }
 
 
 # ── add_subtask / nested IDs ───────────────────────────────────────
@@ -490,6 +664,42 @@ async def test_update_task_memory_hints_union_on_subtask(backend, project_root):
     sub = await backend.get_task('1.1', project_root=project_root)
     hints = sub['metadata']['memory_hints']
     assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_hints_coerce_on_subtask_dotted_id(backend, project_root):
+    """Legacy list-shape memory_hints is coerced on the dotted-id subtask path.
+
+    Stage-2 attaches hints to subtasks via the dotted-id path; this locks parity
+    with the top-level test_update_task_legacy_list_hints_coerce_under_append_true.
+    Both the direct get_task('1.1') and the parent['subtasks'][0] paths must
+    return the unioned dict-shape after the migration write.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='hinted')
+
+    # Seed the subtask with the legacy list-of-dicts shape.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': [{'entity': 'E1', 'query': 'q1'}]}),
+        append=False,
+    )
+    # Stage-2 writes canonical dict shape with append=True.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+
+    expected = {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']}
+
+    # (a) Direct get_task on the subtask.
+    sub = await backend.get_task('1.1', project_root=project_root)
+    assert sub['metadata']['memory_hints'] == expected
+
+    # (b) Parent's subtasks[0] also reflects the migration.
+    parent = await backend.get_task('1', project_root=project_root)
+    assert parent['subtasks'][0]['metadata']['memory_hints'] == expected
 
 
 @pytest.mark.asyncio
