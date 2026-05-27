@@ -1502,6 +1502,81 @@ class TestPatchResolutionMetadata:
         )
 
 
+    def test_patch_pending_returns_none_no_mutation(self, tmp_path: Path):
+        """(a) Patching a pending escalation returns None and leaves the file unchanged."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        before = (queue.queue_dir / 'esc-1-1.json').read_text()
+
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward', resolution_turns=5)
+
+        # Must return None for pending escalations
+        assert result is None, (
+            f'Expected None for pending escalation; got {result!r}'
+        )
+
+        # File must be byte-for-byte unchanged
+        after = (queue.queue_dir / 'esc-1-1.json').read_text()
+        assert after == before, (
+            'File must be unchanged when patching a pending escalation'
+        )
+
+        # In-file resolved_by must still be None
+        data = json.loads(after)
+        assert data['resolved_by'] is None, (
+            f"resolved_by should still be None; got {data['resolved_by']!r}"
+        )
+
+    def test_patch_nonexistent_returns_none_no_files_created(self, tmp_path: Path):
+        """(b) Patching a non-existent id returns None and creates no files."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        result = queue.patch_resolution_metadata('esc-does-not-exist', resolved_by='steward')
+
+        assert result is None, (
+            f'Expected None for non-existent escalation; got {result!r}'
+        )
+        assert list(queue.queue_dir.glob('*.json')) == [], (
+            'No JSON files should be created for a non-existent id'
+        )
+        assert not (queue.queue_dir / 'archive').exists(), (
+            'Archive dir must not be created for a non-existent id'
+        )
+
+    def test_patch_resolved_in_root_rewrites_root_in_place_no_archive_orphan(
+        self, tmp_path: Path,
+    ):
+        """(c) When a resolved escalation is in queue root (archive move failed),
+        patch rewrites the root file in place and creates NO archive file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Write a resolved escalation directly to root (simulating crash-mid-archive)
+        resolved_esc = _make_escalation('esc-1-1', status='resolved')
+        resolved_esc.resolution = 'stuck in root'
+        (queue.queue_dir / 'esc-1-1.json').write_text(resolved_esc.to_json())
+
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward')
+
+        # (i) File stays in root with updated field
+        assert (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Root file must still exist after patching'
+        )
+        data = json.loads((queue.queue_dir / 'esc-1-1.json').read_text())
+        assert data['resolved_by'] == 'steward', (
+            f"resolved_by must be 'steward' in root file; got {data.get('resolved_by')!r}"
+        )
+
+        # (ii) No archive file created (no orphan move)
+        assert not (queue.queue_dir / 'archive').exists(), (
+            'No archive dir should be created when root file is patched in place'
+        )
+
+        assert result is not None
+        assert result.resolved_by == 'steward'
+
+
 class TestAttachDedupeChild:
     """EscalationQueue.attach_dedupe_child() — mutate a pending parent in place."""
 
