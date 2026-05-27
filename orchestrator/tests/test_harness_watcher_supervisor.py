@@ -2350,6 +2350,37 @@ class TestCheckWatcherGuardFilesL2Outage:
 
 
 # ---------------------------------------------------------------------------
+# task 1501: _start_watcher_supervisor disabled branch must file outage L2
+# ---------------------------------------------------------------------------
+
+class TestStartWatcherSupervisorDisabledFilesL2:
+    """When watcher_supervisor_enabled=False, _start_watcher_supervisor must file an L2."""
+
+    def test_disabled_branch_files_outage_l2(self, tmp_path: Path) -> None:
+        """With watcher_supervisor_enabled=False, calling _start_watcher_supervisor
+        must: (a) not create an asyncio.Task, (b) file an L2 outage escalation
+        with summary containing 'watcher_supervisor_enabled=false'.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.config = h.config.model_copy(update={'watcher_supervisor_enabled': False})
+
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
+            h._start_watcher_supervisor()
+            mock_ct.assert_not_called()
+
+        assert h._watcher_supervisor_task is None
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 outage escalation when supervisor disabled; got {len(l2s)}'
+        )
+        assert 'watcher_supervisor_enabled=false' in l2s[0].summary.lower(), (
+            f'L2 summary must mention watcher_supervisor_enabled=false; got {l2s[0].summary!r}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+
+
+# ---------------------------------------------------------------------------
 # task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
 # ---------------------------------------------------------------------------
 
