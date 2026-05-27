@@ -777,7 +777,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     park_stop_parked_threshold: int = Field(
-        default=5,
+        default=15,
         ge=1,
         description=(
             'Number of tasks transitioned to blocked within '

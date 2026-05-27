@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
 
 from orchestrator.config import OrchestratorConfig
@@ -392,6 +394,226 @@ class TestParkStopE2E:
         assert harness2.scheduler.pause_reason == persisted_reason, (
             f'Expected persisted reason {persisted_reason!r}; '
             f'got {harness2.scheduler.pause_reason!r}'
+        )
+
+
+class TestSchedulerPauseEscalation:
+    """A scheduler pause must file an L1 escalation so an AFK operator is notified.
+
+    Park-stop follow-up: a paused scheduler used to surface only a WARNING log +
+    a timeline event (invisible AFK).  pause_scheduler() now files a deduped L1
+    against the synthetic ``__scheduler__`` task_id; a restored pause re-files
+    (deduped) so exactly one persistent L1 spans the restart loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pause_files_l1_escalation(self, tmp_path: Path) -> None:
+        """pause_scheduler() files one blocking L1 and still emits scheduler_paused."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+
+        await harness.pause_scheduler(
+            'park-stop: 15 tasks transitioned to blocked within 1.0h (threshold=15)'
+        )
+
+        sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
+        assert len(sentinel) == 1, (
+            f'Expected exactly one __scheduler__ escalation; got {sentinel!r}'
+        )
+        esc = sentinel[0]
+        assert esc.category == 'scheduler_paused', f'got {esc.category!r}'
+        assert esc.level == 1, f'expected L1; got level={esc.level}'
+        assert esc.severity == 'blocking', f'got {esc.severity!r}'
+
+        # The pre-existing scheduler_paused timeline event must still fire.
+        rows = _query_events(event_store, 'scheduler_paused')
+        assert len(rows) == 1, f'Expected 1 scheduler_paused event; got {len(rows)}'
+
+    @pytest.mark.asyncio
+    async def test_pause_escalation_deduped(self, tmp_path: Path) -> None:
+        """Two pauses while one L1 is open file exactly one sentinel escalation."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+
+        await harness.pause_scheduler('first reason')
+        await harness.pause_scheduler('second reason')
+
+        sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
+        assert len(sentinel) == 1, (
+            f'has_open_l1 must dedup repeat pauses to one L1; got {sentinel!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_queue_pause_is_noop(self, tmp_path: Path) -> None:
+        """With no escalation queue (bare-Harness unit tests), pausing is a clean no-op."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        assert harness._escalation_queue is None
+        # Must not raise despite the missing queue.
+        await harness.pause_scheduler('no-queue reason')
+        assert harness.scheduler.is_paused is True
+
+    @pytest.mark.asyncio
+    async def test_restored_pause_files_l1(self, tmp_path: Path) -> None:
+        """A pause restored from a prior run files an L1 tagged 'restored from prior run'."""
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True)
+        seeder = RunStore(db_dir / 'runs.db')
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason='park-stop: 15 tasks transitioned to blocked within 1.0h (threshold=15)',
+            pause_at_iso='2026-05-27T09:00:00+00:00',
+            set_by_run_id='prior-run-xyz',
+        )
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._run_store = seeder
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+
+        # Restore runs before the queue exists in run(); the deferred helper files it.
+        await harness._load_persisted_scheduler_pause()
+        assert harness._restored_pause_reason is not None
+        harness._file_restored_pause_escalation()
+
+        sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
+        assert len(sentinel) == 1, f'Expected one restored L1; got {sentinel!r}'
+        assert 'restored from prior run' in sentinel[0].detail, (
+            f'Restored L1 detail must flag cross-run continuity; got {sentinel[0].detail!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_restored_pause_deduped_against_surviving_l1(self, tmp_path: Path) -> None:
+        """When the prior run's L1 survived the restart, the restore filing is a no-op."""
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True)
+        seeder = RunStore(db_dir / 'runs.db')
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason='park-stop: prior',
+            pause_at_iso='2026-05-27T09:00:00+00:00',
+            set_by_run_id='prior-run-xyz',
+        )
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._run_store = seeder
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+
+        # Pre-seed an open sentinel L1 (the prior run's escalation survived restart).
+        pre = Escalation(
+            id=queue.make_id('__scheduler__'),
+            task_id='__scheduler__',
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category='scheduler_paused',
+            summary='pre-existing scheduler pause',
+            level=1,
+        )
+        queue.submit(pre)
+
+        await harness._load_persisted_scheduler_pause()
+        harness._file_restored_pause_escalation()
+
+        sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
+        assert len(sentinel) == 1, (
+            f'Restore must not double-file when a prior L1 survives; got {sentinel!r}'
+        )
+        assert sentinel[0].id == pre.id, (
+            'The surviving pre-seeded L1 must remain the single open escalation'
+        )
+
+
+class TestHarnessIdleWhilePaused:
+    """The main run loop must idle (not exit 0) while the scheduler is paused.
+
+    Park-stop follow-up: acquire_next() returns None while paused; treating that
+    as completion exits 0, defeats Restart=on-failure, and wedges the factory.
+    The loop now idles in-process so an in-process resume resumes dispatch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_idles_while_paused_then_exits_after_resume(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Paused → idle (real loop), resume from inside the idle sleep → clean exit.
+
+        Drives the real ``Harness.run()`` loop with heavyweight startup/shutdown
+        neutralised.  The scheduler is paused before the loop; acquire_next()
+        always returns None and the task tree is empty.  A fake asyncio.sleep
+        asserts the loop is paused on the first idle tick (proving the idle
+        branch — not the completion-break — was taken) then resumes the
+        scheduler so the next iteration falls through to the genuine-completion
+        break.  A sentinel after 3 idle ticks fast-fails well under the 60s
+        thread-mode timeout if resume never takes effect.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+
+        # Neutralise heavyweight startup so no real servers / background tasks spawn.
+        harness.mcp = MagicMock()
+        harness.mcp.start = AsyncMock()
+        harness.mcp.stop = AsyncMock()
+        harness.mcp.url = 'http://localhost:0'
+        harness.usage_gate = None
+        harness.review_checkpoint = None
+
+        harness._start_escalation_server = AsyncMock()
+        harness._start_merge_worker = AsyncMock()
+        harness._dismiss_stale_escalations = AsyncMock()
+        harness._rehydrate_merge_halt = MagicMock()
+        harness._file_restored_pause_escalation = MagicMock()
+        harness._start_orphan_l0_reaper = MagicMock()
+        harness._start_terminal_status_watcher = MagicMock()
+        harness._start_watcher_supervisor = MagicMock()
+        harness._start_stranded_reconcile = MagicMock()
+        harness._tag_task_modules = AsyncMock()
+        harness._recover_crashed_tasks = AsyncMock()
+        harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+        harness._enforce_cost_ceilings = AsyncMock()
+
+        # Real scheduler: empty tree, never dispatches, starts paused.
+        harness.scheduler.acquire_next = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'1': 'pending'}, None),
+        )
+        harness.scheduler.pause('test idle pause')
+
+        class _IdleLoopStuck(Exception):
+            pass
+
+        sleep_calls = {'n': 0}
+
+        async def fake_sleep(_secs, *args, **kwargs):
+            sleep_calls['n'] += 1
+            if sleep_calls['n'] == 1:
+                # Proves the idle branch ran (paused, not completing).
+                assert harness.scheduler.is_paused is True, (
+                    'loop must still be paused on the first idle tick'
+                )
+                harness.scheduler.resume()
+                return
+            if sleep_calls['n'] > 3:
+                raise _IdleLoopStuck(
+                    'idle loop did not exit after resume — would have hung'
+                )
+            return
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        report = await harness.run(
+            prd_path=None, dry_run=False, force_dirty_start=True,
+        )
+
+        # The idle branch must have executed at least once (old code would
+        # break immediately and never reach the idle sleep).
+        assert sleep_calls['n'] >= 1, (
+            'Paused loop must idle via asyncio.sleep, not break as "complete"'
+        )
+        # And the run must exit cleanly once resumed (empty tree → completion break).
+        assert harness.scheduler.is_paused is False, 'scheduler must be resumed at exit'
+        assert report.completed == 0, (
+            f'No tasks ran, so completed must be 0; got {report.completed}'
         )
 
 

@@ -71,6 +71,15 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Idle-while-paused tuning (task 1322 follow-up).  When the scheduler is paused
+# and no tasks are active, the main run loop idles in-process instead of exiting
+# 0 (which defeats Restart=on-failure and wedges the factory).
+# _PAUSED_IDLE_POLL_SECS matches the existing 15s acquire_next wait so a resume
+# is picked up within one poll; _PAUSED_IDLE_LOG_SECS throttles the
+# "alive but paused" WARNING so a multi-hour pause doesn't flood the log.
+_PAUSED_IDLE_POLL_SECS: float = 15.0
+_PAUSED_IDLE_LOG_SECS: float = 180.0
+
 # Allowed and disallowed tools for the escalation-watcher-auto rotation.
 # Scoped to what escalation triage actually needs: file reads, foreground
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
@@ -313,6 +322,13 @@ class Harness:
         self._escalation_task: asyncio.Task | None = None
         self._orphan_reaper_task: asyncio.Task | None = None
 
+        # Idle-while-paused state (task 1322 follow-up).  Throttle timestamp for
+        # the "alive but paused" WARNING emitted by the main run loop.
+        self._last_paused_idle_log: float = 0.0
+        # Reason captured by _load_persisted_scheduler_pause() at run() startup,
+        # filed as a (deduped) L1 escalation once the escalation queue exists.
+        self._restored_pause_reason: str | None = None
+
         # Digest + EWA trip counters (task 1327 AFK hardening).
         # Delegated to _init_digest_state() so test helpers can call the same
         # canonical code without duplicating the counter names by value (task 1449).
@@ -553,6 +569,14 @@ class Harness:
             except Exception as e:
                 logger.warning(f'Failed to rehydrate merge halt: {e}')
 
+            # 1c0b. File the L1 escalation for a pause restored from a prior
+            # run (deferred from _load_persisted_scheduler_pause, which ran
+            # before the escalation queue existed).  Placed after the stale-L0
+            # dismissal + merge-halt rehydration so the queue is settled;
+            # has_open_l1 dedups against a prior run's surviving L1, so the
+            # operator sees one persistent L1 across the restart loop.
+            self._file_restored_pause_escalation()
+
             # 1c1. Start orphan L0 reaper (non-fatal) — catches escalations
             # whose task_id has no active workflow/steward (e.g. reviewer
             # emits against a synthetic task_id, or a workflow crashed
@@ -695,6 +719,30 @@ class Harness:
 
                 if assignment is None:
                     if not active:
+                        if self.scheduler.is_paused:
+                            # Paused ≠ done.  acquire_next() returns None while
+                            # paused (task-1322); treating that as completion
+                            # exits 0 and defeats Restart=on-failure, stranding
+                            # an AFK operator behind a wedged-but-"successful"
+                            # service.  Idle in-process instead so an in-process
+                            # resume_scheduler() (via the still-running
+                            # escalation MCP) resumes dispatch without a restart.
+                            # The six background loops keep running while we idle.
+                            now = time.monotonic()
+                            if (
+                                now - self._last_paused_idle_log
+                                >= _PAUSED_IDLE_LOG_SECS
+                            ):
+                                logger.warning(
+                                    'Scheduler paused — idling (no active '
+                                    'tasks). reason=%r  Resolve the L1 '
+                                    'escalation / resume_scheduler() to '
+                                    'continue.',
+                                    self.scheduler.pause_reason,
+                                )
+                                self._last_paused_idle_log = now
+                            await asyncio.sleep(_PAUSED_IDLE_POLL_SECS)
+                            continue
                         # Before treating as "all done", sweep stranded
                         # in-progress.  Tasks stranded by transient backend
                         # failures may unblock pending dependents; a clean
@@ -1669,6 +1717,69 @@ Output JSON matching the schema. Every task must appear in the output.
         # action will resolve and the next true rejection (if any) starts
         # a fresh strike count.
         self._reconcile_failure_counts.pop(tid, None)
+
+    # Synthetic task_id for scheduler-pause escalations.  Filename-safe for
+    # EscalationQueue.make_id (yields esc-__scheduler__-N); never a real task,
+    # so the orphan-L0 reaper (L0-only), _on_escalation (no registered event),
+    # and reconcile (no such task) all leave it alone.
+    _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
+
+    def _file_scheduler_pause_escalation(self, reason: str) -> None:
+        """File an L1 escalation when scheduler dispatch is paused.
+
+        Covers every pause path — park-stop, cost-ceiling (1323), EWA digest
+        (1327), watcher-crashloop — because all route through
+        ``pause_scheduler``.  Deduped by ``has_open_l1`` so a restored pause
+        re-filing (or a second sibling trip) does not stack duplicate L1s: the
+        operator sees exactly one open scheduler-pause escalation at a time.
+
+        Best-effort: a missing queue (bare-Harness unit tests) or any submit
+        failure is swallowed so escalation filing never breaks the pause path.
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._SCHEDULER_PAUSE_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._SCHEDULER_PAUSE_SENTINEL),
+                task_id=self._SCHEDULER_PAUSE_SENTINEL,
+                agent_role='orchestrator-scheduler',
+                severity='blocking',
+                category='scheduler_paused',
+                summary=(f'Scheduler paused — dispatch halted: {reason}')[:200],
+                detail=(
+                    'The orchestrator scheduler is paused and will dispatch no '
+                    'new tasks until a human resolves this.\n\n'
+                    f'Reason: {reason}\n\n'
+                    'The process stays alive and idles; the escalation MCP server '
+                    'remains reachable. Investigate why work was parked, then '
+                    'resolve this escalation / call resume_scheduler() to resume '
+                    'dispatch in-process (no restart needed).'
+                ),
+                suggested_action='investigate_and_resume_scheduler',
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 scheduler-pause escalation %s', esc.id)
+        except Exception:
+            logger.warning('Failed to file scheduler-pause escalation', exc_info=True)
+
+    def _file_restored_pause_escalation(self) -> None:
+        """File the L1 for a pause restored from a prior run (deferred from run()).
+
+        ``_load_persisted_scheduler_pause`` runs before the escalation queue
+        exists, so it only captures ``_restored_pause_reason``; this helper is
+        called once the queue is up.  ``has_open_l1`` makes it a no-op when the
+        prior run's L1 survived the restart, so the operator sees a single
+        persistent L1 across the Restart=on-failure loop.
+        """
+        if self._restored_pause_reason is None:
+            return
+        self._file_scheduler_pause_escalation(
+            f'(restored from prior run) {self._restored_pause_reason}'
+        )
 
     def _escalate_reconcile_skip(
         self,
@@ -3418,6 +3529,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 data={'reason': reason},
             )
 
+        # File an L1 so an AFK operator is actually notified (a WARNING log +
+        # timeline event are invisible otherwise).  Covers park-stop and the
+        # sibling cost-ceiling / EWA / watcher halts — all route through here.
+        # Deduped via has_open_l1.  Note: the park-stop latch (scheduler.py)
+        # sets is_paused=True *before* this callback runs, so a was-paused
+        # transition check would never fire — dedup must be queue-state based.
+        self._file_scheduler_pause_escalation(reason)
+
     async def resume_scheduler(self) -> None:
         """Clear the scheduler pause so acquire_next() resumes dispatching.
 
@@ -3485,6 +3604,11 @@ Output JSON matching the schema. Every task must appear in the output.
                     restored_from_run_id,
                 )
                 self.scheduler.pause(reason)
+                # Stash the reason so run() can file the L1 escalation once the
+                # escalation queue exists (this runs at line ~492, before
+                # _start_escalation_server creates _escalation_queue).  See
+                # _file_restored_pause_escalation.
+                self._restored_pause_reason = reason
                 # Emit a distinct event so the timeline self-documents
                 # cross-run continuity.  Operators querying the event log
                 # for a run that starts with dispatch halted can see WHY
