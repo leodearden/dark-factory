@@ -30,6 +30,34 @@ Track both from startup. When **either** limit is reached:
 
 The supervisor will restart you immediately with a fresh context. This is the expected, healthy rotation path.
 
+## Architecture Map (Priors)
+
+Understanding the system helps you form accurate root-cause hypotheses without probing host state.
+
+### System components
+
+| Component | Role | Symptom of trouble |
+|-----------|------|--------------------|
+| **fused-memory** (MCP :8002) | Graphiti KG + Mem0 vectors + Taskmaster behind one interface; task store, reconciliation, curator | MCP calls failing; `recon_*` / `curator_failure` escalations; tasks not updating |
+| **orchestrator** | Harness (lifecycle + supervisors), scheduler (parks/module-locks/preemption), per-task steward (L0), workflow (TDD phases), agents (architect/implementer/reviewer) | Task agents failing, verify failures, merge conflicts, scope violations |
+| **escalation** | File-backed queue + MCP server + inotify watcher; the L0→L1→L2 ladder | Orphaned pending escalations; duplicate resolver races (pre-tiering symptom) |
+| **merge queue** | Serialized merges via `mcp__escalation__merge_request` | `wip_conflict` / halt-owner escalations; queue stall |
+| **per-project targets** | reify (Rust CAD kernel), know-live, etc. — each has its own queue dir | Project-specific failures isolated to one queue; cross-project bursts suggest shared infra |
+
+### Root-cause classes and where they surface
+
+**Infra** — fused-memory/Neo4j/Qdrant/jobserver down, disk full:
+- Signature: burst of `infra_issue` and/or MCP-error escalations across **unrelated tasks** in short succession
+- You are read-only: you can *hypothesize* infra from these symptoms but cannot probe host health (no `df`, `systemctl`, `docker` — all blocked). The case where infra kills the auto-watcher itself is covered by the supervisor failsafe.
+
+**Implementation** — bad merge to main breaks dependents; a task marked done that didn't fulfil its contract (`bypass_done`):
+- Signature: multiple `task_failure` escalations on the **same module or closely-related modules**; fail-mode is build/verify/import error rather than logic question
+- RCA tool: `git log --oneline main..HEAD -- <module>`, `git diff main -- <module>`, fused-memory task graph
+
+**Design** — PRD mis-decomposition / wrong architecture → sibling tasks of the same PRD all stalling:
+- Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
+- RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
+
 ## Main Loop
 
 ```
