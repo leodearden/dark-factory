@@ -436,7 +436,6 @@ def create_server(
             return {'error': 'root_cause must be a non-empty string'}
 
         # Dedup check: look for an existing pending L2 with the same root_cause.
-        # (Dedup branch will be wired in step-12; here we only implement create.)
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
             updated = queue.add_members_to_l2(existing_id, list(member_ids))

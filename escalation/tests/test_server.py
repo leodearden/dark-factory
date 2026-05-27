@@ -483,6 +483,13 @@ async def _promote_to_l2(server, **kwargs: Any) -> dict[str, Any]:
     return await tool.fn(**kwargs)
 
 
+async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the resolve_issue MCP tool directly (sync tool)."""
+    tool = await server.get_tool('resolve_issue')
+    # resolve_issue is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
 _L2_DEFAULTS: dict[str, Any] = {
     'task_id': 't-1',
     'agent_role': 'escalation-watcher-auto',
@@ -637,7 +644,7 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         # Pass both the existing member (should not duplicate) and a new one
@@ -785,8 +792,8 @@ class TestPromoteToL2Cascade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        m1 = self._seed_l1(queue, 'esc-l1-1', 'task-1')
-        m2 = self._seed_l1(queue, 'esc-l1-2', 'task-2')
+        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        self._seed_l1(queue, 'esc-l1-2', 'task-2')
 
         await _promote_to_l2(
             server,
@@ -794,8 +801,8 @@ class TestPromoteToL2Cascade:
         )
 
         # Both L1s must still be pending
-        tool = await server.get_tool('get_pending_escalations')
-        pending_l1 = [e for e in tool.fn(level=1) if e['id'] in {'esc-l1-1', 'esc-l1-2'}]
+        all_pending_l1 = await _get_pending(server, level=1)
+        pending_l1 = [e for e in all_pending_l1 if e['id'] in {'esc-l1-1', 'esc-l1-2'}]
         assert len(pending_l1) == 2, (
             f'Expected both L1s still pending, got {[e["id"] for e in pending_l1]}'
         )
@@ -818,8 +825,7 @@ class TestPromoteToL2Cascade:
         l2_id = l2_result['id']
 
         # Resolve the L2 via MCP tool
-        resolve_tool = await server.get_tool('resolve_issue')
-        resolve_result = resolve_tool.fn(escalation_id=l2_id, resolution='Root cause fixed')
+        resolve_result = await _resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
 
         assert resolve_result.get('status') == 'resolved', (
             f'Expected L2 resolved, got: {resolve_result}'
@@ -845,8 +851,7 @@ class TestPromoteToL2Cascade:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
-        resolve_tool = await server.get_tool('resolve_issue')
-        resolve_tool.fn(escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
+        await _resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -867,8 +872,7 @@ class TestPromoteToL2Cascade:
         )
         l2_id = l2_result['id']
 
-        resolve_tool = await server.get_tool('resolve_issue')
-        resolve_tool.fn(escalation_id=l2_id, resolution='Fixed')
+        await _resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -889,8 +893,8 @@ class TestPromoteToL2Cascade:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
 
-        resolve_tool = await server.get_tool('resolve_issue')
-        resolve_tool.fn(
+        await _resolve_issue(
+            server,
             escalation_id=l2_result['id'],
             resolution='Not actionable',
             terminate=True,

@@ -2100,8 +2100,8 @@ class TestResolveCascade:
     def test_resolve_l2_cascades_resolution_to_members(self, tmp_path: Path):
         """(a) resolve(l2_id) with members=[m1,m2] cascades — m1 and m2 are resolved."""
         queue = EscalationQueue(tmp_path / 'esc')
-        m1 = self._make_l1(queue, 'esc-l1-1', 'task-1')
-        m2 = self._make_l1(queue, 'esc-l1-2', 'task-2')
+        self._make_l1(queue, 'esc-l1-1', 'task-1')
+        self._make_l1(queue, 'esc-l1-2', 'task-2')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
 
         queue.resolve(l2.id, 'Resolved the root cause')
@@ -2149,7 +2149,7 @@ class TestResolveCascade:
     def test_cascade_is_idempotent_member_already_resolved(self, tmp_path: Path):
         """(d) Member already resolved keeps its prior resolved_by/resolution (idempotency)."""
         queue = EscalationQueue(tmp_path / 'esc')
-        m1 = self._make_l1(queue, 'esc-l1-1')
+        self._make_l1(queue, 'esc-l1-1')
         queue.resolve('esc-l1-1', 'Pre-resolved separately', resolved_by='steward')
         l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
 

@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from escalation import archive
@@ -441,7 +441,7 @@ class EscalationQueue:
             return None
 
         oldest_id: str | None = None
-        oldest_ts: datetime = datetime.max.replace(tzinfo=timezone.utc)
+        oldest_ts: datetime = datetime.max.replace(tzinfo=UTC)
 
         for esc in self.get_pending():
             if esc.level != 2:
@@ -454,9 +454,9 @@ class EscalationQueue:
                 ts = datetime.fromisoformat(esc.timestamp)
                 # Ensure tz-aware for comparison
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    ts = ts.replace(tzinfo=UTC)
             except (ValueError, AttributeError):
-                ts = datetime.min.replace(tzinfo=timezone.utc)
+                ts = datetime.min.replace(tzinfo=UTC)
             if ts < oldest_ts:
                 oldest_ts = ts
                 oldest_id = esc.id
