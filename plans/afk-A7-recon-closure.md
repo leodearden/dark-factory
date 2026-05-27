@@ -1,5 +1,44 @@
 # AFK A7: Bound and consume the recon escalation queue (RE-SCOPED 2026-05-26)
 
+## DIRECTION 3 UPDATE (2026-05-27): dedup abandoned for recon_integrity_issue; pile dismissed; watcher built
+
+A7a/A7b/A7c all landed (tasks 1483/1484/1485 done) and the service restarted onto
+them — but a live dry-run proved the **content-fingerprint dedup is ineffective on
+real data**. The records have no stable identity: the LLM emits a different
+`finding.category` (task_memory_mismatch / other / systemic_pattern / …) and a
+polluted `affected_ids` (volatile memory UUIDs, co-flagged tasks, inconsistent
+`452` / `task-452` / `task_452` encodings) every cycle.
+
+- A7c backfill dry-run: 6,048 → **5,703** survivors (only 345 folded).
+- Even a normalized task-id + summary-class key: **~3,670** survivors; **1,460**
+  findings carry no extractable task-id at all.
+
+Root cause is upstream of dedup: escalating **non-actionable** info findings to a
+human-facing queue is a category error (the only human action is accept-as-known,
+which = not filing). Operator chose **Direction 3**:
+
+1. **Bulk-dismiss the pile** — `fused-memory/scripts/dismiss_recon_integrity_noise.py`
+   (dry-run default, idempotent, archives not deletes). Applied 2026-05-27:
+   **6,048 → 90 pending** (5,958 recon_integrity_issue archived under
+   `data/reconciliation/escalations/archive/2026-05-27/`; 90 kept = 21 blocking +
+   recon_stale_run 53, infra_issue 14, risk_identified 9, recon_failure 5,
+   dependency_discovered 4, cleanup_needed 4, recon_backlog_overflow 1).
+2. **Watcher built now** — `skills/recon-escalation-watcher/` (sibling of
+   escalation-watcher; sole closer; action set verify-fixed / accept-as-known /
+   file-a-real-task / fix-directly-via-fused-memory). Launcher: `recon-watch/`
+   (`mcp.json` → escalation 8103 + fused-memory 8002; `run.sh`). Registered via
+   `~/.claude/commands/recon-escalation-watcher.md` symlink. Invoke with
+   `./recon-watch/run.sh` (or `/recon-escalation-watcher` in a session whose
+   `escalation` MCP points at 8103).
+3. **Go-forward fix = follow-up task** — stop the harness escalating non-actionable
+   info findings into 8103 (route to a log; escalate only the genuinely-needs-human
+   subset, e.g. past a recurrence threshold). Filed 2026-05-27 as **task 1512**.
+   Until it lands the watcher holds the line against a steady trickle.
+
+The dedup machinery (A7a/A7b) and A7c backfill script remain in the tree but are
+**not the chosen cleanup path** for recon_integrity_issue. Everything below is the
+2026-05-26 re-scope, preserved for context.
+
 ## Status
 
 **Re-scoped, awaiting implementation approval.** The original premise ("~2,347 actionable
