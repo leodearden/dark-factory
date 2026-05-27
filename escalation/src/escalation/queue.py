@@ -403,6 +403,19 @@ class EscalationQueue:
         Returns ``None`` when:
         - The parent file does not exist in the queue root (unknown id or
           already archived / resolved — refusing to touch archived parents).
+
+        **Recon reuse contract (A7a/A7b):**  ``dedupe.submit_or_dedupe`` calls
+        this function for *both* infra and recon dedup.  Two invariants hold:
+
+        1. ``dedupe_count`` doubles as the recon *recurrence count* — each
+           successful fold into a recon parent increments it by 1, so the
+           steward can read ``dedupe_count`` as "this finding recurred N times".
+
+        2. ``parent.dedupe_fingerprint`` is **preserved** across each
+           ``_rewrite()`` call — this function does not touch it.  The
+           invariant is that ``submit_or_dedupe`` can match successive folds
+           to the same canonical parent by fingerprint without the parent ever
+           losing its fingerprint identity after the first write.
         """
         path = self.queue_dir / f'{parent_id}.json'
         if not path.exists():

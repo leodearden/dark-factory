@@ -10,7 +10,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from escalation.dedupe import DedupeConfig, find_dedupe_parent
+from escalation.dedupe import DedupeConfig
+from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -71,43 +72,20 @@ def create_server(
     def _submit_or_dedupe(esc: Escalation) -> dict[str, Any]:
         """Submit *esc* to the queue, or fold it into an existing pending parent.
 
-        Deduplication is applied only when:
-        - ``cfg.infra_dedupe_enabled`` is True, AND
-        - ``esc.category`` is in ``cfg.infra_dedupe_categories``.
+        Delegates to ``dedupe.submit_or_dedupe`` which centralises the gate +
+        TOCTOU logic so recon (A7b) can reuse the same orchestration without
+        duplication.
 
-        On a dedupe match: the parent's dedupe_count / dedupe_children are
-        updated atomically (no new file is written for the child) and a
-        ``{'id': parent_id, 'status': 'dedup_skipped', 'parent_id': parent_id}``
-        dict is returned.
+        Response shapes (from dedupe.submit_or_dedupe):
+        - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+        - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
+                            'parent_id': parent_id, 'child_id': esc.id}``
 
-        On no match (or when dedupe is disabled / category not in scope):
-        the escalation is submitted normally and
-        ``{'id': esc_id, 'status': 'queued'}`` is returned.
+        Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
+        — the child re-runs on its next workflow invocation; no per-child wake
+        signal is emitted.
         """
-        # Gate 1 (infra_dedupe_enabled) and gate 2 (category membership) both
-        # short-circuit in pure memory before any disk I/O via find_dedupe_parent.
-        # This is the ONLY call site for find_dedupe_parent in server.py.
-        if cfg.infra_dedupe_enabled and esc.category in cfg.infra_dedupe_categories:
-            parent_id = find_dedupe_parent(queue, esc, cfg)
-            # TOCTOU guard: attach_dedupe_child returns None when the parent
-            # was resolved/archived between the find scan and this call.
-            # On None, fall through to submit() so the escalation is not
-            # silently dropped.
-            if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
-                # child_id is included for audit: callers can map their assigned
-                # id back to the parent's dedupe_children list.
-                #
-                # Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
-                # — the child re-runs on its next workflow invocation; no per-child wake
-                # signal is emitted.
-                return {
-                    'id': parent_id,
-                    'status': 'dedup_skipped',
-                    'parent_id': parent_id,
-                    'child_id': esc.id,
-                }
-        esc_id = queue.submit(esc)
-        return {'id': esc_id, 'status': 'queued'}
+        return _dedupe_submit_or_dedupe(queue, esc, cfg)
 
     # --- Terminal-task chokepoint helper ---
 
