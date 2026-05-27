@@ -447,6 +447,38 @@ async def test_update_task_legacy_list_hints_coerce_under_append_true(backend, p
     }
 
 
+@pytest.mark.asyncio
+async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(backend, project_root):
+    """Sibling metadata keys are untouched when a legacy-list hints row is migrated.
+
+    Mirrors test_update_task_preserves_sibling_keys_during_memory_hints_append but
+    proves the no-collateral-damage promise still holds when the row starts in
+    legacy list-of-dicts shape rather than canonical dict shape.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='sibling-row',
+        metadata=json.dumps({
+            'files': ['src/a.py'],
+            'spawned_from': 'task-100',
+            'audit': {'created_by': 'x'},
+            'memory_hints': [{'entity': 'E1', 'query': 'q1'}],
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {
+        'files': ['src/a.py'],
+        'spawned_from': 'task-100',
+        'audit': {'created_by': 'x'},
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+    }
+
+
 # ── add_subtask / nested IDs ───────────────────────────────────────
 
 
