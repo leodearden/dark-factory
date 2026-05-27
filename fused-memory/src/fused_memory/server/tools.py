@@ -1815,16 +1815,29 @@ def create_mcp_server(
             tag: Tag context (optional)
             done_provenance: Verified evidence for a done transition; Stage-2
                 reconciliation uses this instead of fabricating 'shipped via X'
-                edges from metadata.modules. Shape:
-                  {"commit": "<sha-or-ref>"} — preferred; resolved via
-                  git rev-parse and pinned to a full SHA.
-                  {"note": "<explanation>"} — escape hatch for fast-forward
-                  merges, work covered by a sibling task, or interactive
-                  sessions where no single commit applies.
-                Both keys may be provided. At least one non-empty value is
-                required when reconciliation.require_done_provenance is True
-                (default False during rollout — missing provenance logs a
-                warning but does not block the transition).
+                edges from metadata.modules. Schema::
+
+                  {
+                    "kind":   "merged" | "found_on_main",  # required
+                    "commit": "<sha-or-ref>",              # required for both kinds
+                    "note":   "<free text>",               # required if kind="found_on_main"
+                  }
+
+                ``kind="merged"``: the work landed on main via a merge commit.
+                ``commit`` is resolved via ``git rev-parse`` to a full 40-char
+                SHA and ancestor-checked against main via
+                ``git merge-base --is-ancestor <sha> main``.
+                ``kind="found_on_main"``: the implementation is already on main
+                from a sibling task / prior orchestrator run. Both ``commit``
+                and ``note`` are required; ``commit`` is resolved + ancestor-
+                checked identically. ``note`` must cite the providing
+                task/commit.
+                A bare ``{"note": ...}`` (no ``kind``) is always rejected.
+                When reconciliation.require_done_provenance is False (default
+                during rollout), missing/empty provenance logs a warning and
+                the transition proceeds; malformed provenance (wrong type,
+                unknown kind, unresolvable commit, branch-only SHA) always
+                errors regardless.
             reopen_reason: Required to exit a terminal status (done, cancelled).
                 Short free-text explanation — e.g. 'un-defer script',
                 'manual re-scope', 'reconciliation: re-implementation required'.
@@ -2003,6 +2016,13 @@ def create_mcp_server(
 
         Returns each ticket with extracted candidate_title for at-a-glance
         triage. ``result_json`` is omitted (verbose; not useful here).
+
+        Note on ``expires_at``: this field is a non-load-bearing advisory
+        far-future placeholder (now + 365 days at submit time). The retired
+        wall-clock TTL janitor no longer runs. Stuck or abandoned pending
+        tickets are reaped by the worker-liveness reaper (TicketJanitor.tick),
+        which marks pending tickets failed with reason='worker_dead' when the
+        project's curator worker has died — NOT by a wall-clock TTL sweep.
 
         Args:
             project_root: Absolute path to project root.
