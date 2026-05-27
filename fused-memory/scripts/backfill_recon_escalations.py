@@ -6,8 +6,10 @@ Motivation: Task A7a introduced content-fingerprint deduplication for
 ~5,858 ``recon_integrity_issue`` records that accumulated before A7a/A7b went
 live each represent a recurring finding that was filed independently every
 reconciliation cycle.  This script collapses each fingerprint group into a
-single canonical record (oldest survives, ``dedupe_count`` = group size,
-``dedupe_fingerprint`` stamped), archives/dismisses the rest, and leaves every
+single canonical record (oldest survives, ``dedupe_count`` = number of folded
+children (= group_size − 1), matching the ``attach_dedupe_child`` semantics and
+the ``dedupe_count == len(dedupe_children)`` invariant; ``dedupe_fingerprint``
+stamped), archives/dismisses the rest, and leaves every
 blocking and non-recon category escalation completely untouched.
 
 The collapse policy is consistent with the A7a/A7b dedup approach: eligible
@@ -249,7 +251,7 @@ def apply_plan(
             )
             continue
 
-        canonical.dedupe_count = collapse.group_size
+        canonical.dedupe_count = len(collapse.child_ids)
         canonical.dedupe_children = list(collapse.child_ids)
         canonical.dedupe_fingerprint = collapse.fingerprint
         queue.submit(canonical)
