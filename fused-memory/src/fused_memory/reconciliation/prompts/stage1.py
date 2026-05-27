@@ -114,6 +114,24 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 {_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
+**Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
+`add_memory`, the content string MUST include all four of: (1) the reconciliation \
+`run_id` (provided in the payload context under "## Reconciliation Context"), \
+(2) the full list of flag UUIDs/markers emitted this cycle (or "none" if zero), \
+(3) Stage 1's substantive mutation IDs this cycle — memory IDs added/deleted, \
+edge UUIDs updated/invalidated, entity UUIDs refreshed — plus the task_ids on \
+emitted flags (Stage 1 has no task-write tools; these are the analog to Stage 2's \
+"task IDs created/modified"), and (4) a `uniqueness_token` set to the cycle-start \
+time in ISO 8601 format (e.g. `"2026-05-26T11:59:24+00:00"`). Example output line: \
+`uniqueness_token: 2026-05-26T11:59:24+00:00`. The cycle-start time is available in \
+the "### Cycle Fence" payload section ("This cycle started at <iso>") when provided; \
+otherwise use the current time. \
+Rationale: Mem0 deduplicates near-duplicate writes by cosine similarity — a confirmed \
+cycle had its summary silently dropped (`memory_ids=[]`) because the content was too \
+uniform across cycles (run 59db9a95, summary 19f19857). Embedding the ISO timestamp \
+guarantees a semantically-distinct content string even for zero-flag/zero-mutation \
+cycles, defeating cosine-similarity dedup.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \

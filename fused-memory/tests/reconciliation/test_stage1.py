@@ -171,6 +171,3 @@ class TestStage2PromptMandatesUniquenessToken:
             "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
             "(guards against the per-cycle summary uniqueness section being dropped)."
         )
-
-
-
