@@ -76,11 +76,16 @@ def test_curator_endpoint_returns_envelope_shape(client):
     without a real server. latency_spark / capped_spark default to empty series
     because no DB is seeded in this test.
 
-    Also pins state.paused_reason to None (the current placeholder value until
-    the follow-up MCP tool lands — see app.py paused_reason TODO).
+    get_curator_state is mocked to a healthy (unpaused) state so the test is
+    deterministic without a real fused-memory server.  paused_reason should be
+    None in the response (healthy gate has no pause reason).
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+    healthy_gate = {'paused': False, 'paused_reason': None, 'soonest_open_at': None, 'account_count': 0}
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch('dashboard.app.memory_data.get_curator_state', new=AsyncMock(return_value=healthy_gate)),
+    ):
         resp = client.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -102,7 +107,7 @@ def test_curator_endpoint_returns_envelope_shape(client):
     state = cs.get('state', {})
     assert 'capped_now' in state
     assert 'paused_reason' in state
-    assert state['paused_reason'] is None  # pinned to None; see app.py paused_reason TODO
+    assert state['paused_reason'] is None  # healthy gate → paused_reason is None
     assert 'pending_total' in state
 
 
