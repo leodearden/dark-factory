@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -69,13 +70,24 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     archive_index = _build_archive_index(archive_root)
 
     for path in root_files:
-        esc = Escalation.from_json(path.read_text())
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning('skipping unparsable %s: %s', path.name, e)
+            report.skipped_unparsable += 1
+            continue
 
         if esc.status == 'pending':
             report.untouched_pending += 1
             continue
 
         if esc.status in ('resolved', 'dismissed'):
+            if not esc.resolved_at:
+                logger.warning(
+                    'skipping %s: status %s but resolved_at is missing', path.name, esc.status
+                )
+                report.skipped_unparsable += 1
+                continue
             existing_archive = archive_index.get(path.stem)
 
             if existing_archive is None:
@@ -99,6 +111,10 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                         os.unlink(path)
                     report.reconciled_archive_wins += 1
             continue
+
+        # Defensive: unknown status (should not occur given models.py constraints)
+        logger.warning('skipping %s: unknown status %r', path.name, esc.status)
+        report.skipped_unparsable += 1
 
     report.root_after = (
         report.root_before
