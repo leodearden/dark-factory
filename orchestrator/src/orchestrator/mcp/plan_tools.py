@@ -326,6 +326,29 @@ def _report_unactionable_task(
     return {'status': 'ok', 'reason': reason}
 
 
+def _report_false_premise(
+    artifacts: TaskArtifacts,
+    classification: str,
+    premise: str,
+    evidence: str,
+    proposed_resolution: str,
+) -> dict[str, Any]:
+    """Write the false-premise artifact for the workflow to act on.
+
+    The architect calls this when it has determined that a RED-test premise
+    is false, unreachable, or misattributed — before writing the doomed
+    assertion.  The workflow short-circuits to a level-1 design_concern
+    escalation, bypassing the steward.
+    """
+    artifacts.write_false_premise(
+        classification=classification,
+        premise=premise,
+        evidence=evidence,
+        proposed_resolution=proposed_resolution,
+    )
+    return {'status': 'ok', 'classification': classification}
+
+
 def _resolve_main_sha(worktree: Path) -> str:
     """Return the current ``main`` HEAD SHA visible from *worktree*.
 
@@ -601,6 +624,49 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
                 or impossibility, with file:line references where possible.
         """
         return _report_unactionable_task(artifacts, reason, evidence)
+
+    @mcp.tool()
+    def report_false_premise(
+        classification: str,
+        premise: str,
+        evidence: str,
+        proposed_resolution: str,
+    ) -> dict[str, Any]:
+        """Report that a RED-test premise is false before writing the assertion.
+
+        Use this INSTEAD of writing the test when you have determined that
+        a RED test's substantive premise is false, unreachable, or
+        misattributed.  The three premise classes are:
+
+        - ``numeric_bound``: The test asserts a numeric threshold or tolerance
+          (e.g. "within X%", "<= eps", ">= N dB", "to M digits") with no
+          achievability basis.
+        - ``exactness``: The test asserts closed-form exactness or reproduction
+          (e.g. "exact within 1e-12", "reproduces P(t) exactly") but the
+          stated configuration does not satisfy the identity that would make
+          it true.
+        - ``dependency_capability``: The test asserts that this task produces
+          or evaluates a capability that is actually delivered by a task that
+          DEPENDS ON this one, not a prerequisite.
+
+        After calling this tool, stop. Do NOT call ``create_plan`` or
+        ``escalate_blocker``. The orchestrator will mark this task BLOCKED
+        and submit a level-1 design_concern escalation directly — the steward
+        is bypassed because re-speccing a test premise requires human/curator
+        judgment.
+
+        Args:
+            classification: One of ``numeric_bound``, ``exactness``, or
+                ``dependency_capability``.
+            premise: The exact assertion or claim that is false.
+            evidence: The mathematical identity, method-error estimate,
+                dependency-graph trace, or other proof that the premise fails.
+            proposed_resolution: Suggested fix — move signal to producing task /
+                weaken bound + file follow-up / change asserted configuration.
+        """
+        return _report_false_premise(
+            artifacts, classification, premise, evidence, proposed_resolution
+        )
 
     return mcp
 

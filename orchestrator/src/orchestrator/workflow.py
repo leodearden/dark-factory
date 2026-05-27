@@ -1313,14 +1313,17 @@ class TaskWorkflow:
 
                 break
 
-            # Architect task-rejection artifacts.  Both are terminal — handle
+            # Architect task-rejection artifacts.  All are terminal — handle
             # deterministically before the "no plan.json" failure path so
-            # neither interacts with the consecutive_no_plan_failures cycle
-            # counter.  Order matters: unactionable_task is the most decisive
-            # (jumps straight to L1, bypasses steward); already_done is a
-            # clean DONE; blocking_dependency may re-loop the architect.
+            # none interacts with the consecutive_no_plan_failures cycle
+            # counter.  Order matters: unactionable_task and false_premise are
+            # the most decisive (jump straight to L1, bypass steward);
+            # already_done is a clean DONE; blocking_dependency may re-loop
+            # the architect.
             if self.artifacts.read_unactionable_task() is not None:
                 return await self._handle_unactionable_task_report()
+            if self.artifacts.read_false_premise() is not None:
+                return await self._handle_false_premise_report()
             if self.artifacts.read_already_done() is not None:
                 return await self._handle_already_done_report()
             # Fix B: the architect may have written a blocking_dependency
@@ -1655,6 +1658,8 @@ class TaskWorkflow:
         # handlers work unchanged.
         if self.artifacts.read_unactionable_task() is not None:
             return await self._handle_unactionable_task_report()
+        if self.artifacts.read_false_premise() is not None:
+            return await self._handle_false_premise_report()
         if self.artifacts.read_already_done() is not None:
             return await self._handle_already_done_report()
         if self.artifacts.read_blocking_dependency() is not None:
@@ -2372,6 +2377,58 @@ class TaskWorkflow:
             detail=f'reason: {reason}\nevidence: {evidence}'[:2000],
             escalate_to_human=True,
         )
+
+    async def _handle_false_premise_report(self) -> WorkflowOutcome:
+        """Process a ``.task/false_premise.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        Stops the steward early to close the small async window where a
+        stale L0 from a prior PLAN attempt could be processed concurrently
+        with our L1 submission.  The ``finally`` block in ``run()`` also
+        stops the steward, so this is defense-in-depth.
+
+        Then short-circuits to ``_mark_blocked(escalate_to_human=True,
+        category='design_concern')``, which submits a level-1 design_concern
+        escalation directly without invoking the steward — only a human/curator
+        can re-spec a test premise or relocate a signal to a different task.
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_false_premise()
+        assert report is not None  # caller must have verified
+
+        classification = str(report.get('classification') or '')
+        premise = str(report.get('premise') or '').strip()
+        evidence = str(report.get('evidence') or '')
+        proposed_resolution = str(report.get('proposed_resolution') or '')
+
+        if self._steward:
+            await self._steward.stop()
+            self._steward = None
+
+        if not premise:
+            result = await self._mark_blocked(
+                'Architect wrote malformed false_premise.json '
+                '(missing premise)',
+                detail=json.dumps(report, indent=2)[:2000],
+                escalate_to_human=True,
+                category='design_concern',
+            )
+        else:
+            result = await self._mark_blocked(
+                f'Architect reported false RED-test premise: {premise}',
+                detail=(
+                    f'classification: {classification}\n'
+                    f'evidence: {evidence}\n'
+                    f'proposed_resolution: {proposed_resolution}'
+                )[:2000],
+                escalate_to_human=True,
+                category='design_concern',
+            )
+        # Clear only after the L1 escalation has been successfully submitted —
+        # if _mark_blocked raises, the artifact survives for the next retry.
+        self.artifacts.clear_false_premise()
+        return result
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
@@ -4468,6 +4525,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         merge_phase: bool = False,
         escalate_to_human: bool = False,
         suggested_action: str = 'investigate_and_retry',
+        category: str = 'task_failure',
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -4537,6 +4595,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
 
         if self.escalation_queue and not skip_escalation:
+            # Fix C short-circuit: the caller determined this failure is not
+            # resolvable by the steward (e.g. false premise, unactionable spec,
+            # confirmed cycle).  Skip the L0 entirely — a stopped steward
+            # cannot consume it — and submit only the human-facing L1.
+            # This also prevents duplicate design_concern escalations in the
+            # queue (an L0 the steward can never act on + an L1 for the same
+            # report), keeping dashboards clean and preventing orphan-L0 reaper
+            # noise.  The unactionable handler follows the same pattern.
+            if escalate_to_human:
+                await self._ensure_l1_escalation_for_blocked(
+                    reason, detail or reason, category=category,
+                )
+                return WorkflowOutcome.BLOCKED
+
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
                 from escalation.models import Escalation
@@ -4546,7 +4618,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     task_id=self.task_id,
                     agent_role='orchestrator',
                     severity='blocking',
-                    category='task_failure',
+                    category=category,
                     summary=reason[:200],
                     detail=detail or reason,
                     suggested_action=suggested_action,
@@ -4559,18 +4631,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.event_store.emit(
                         EventType.escalation_created,
                         task_id=self.task_id, phase=self.state.value,
-                        data={'escalation_id': esc.id, 'category': 'task_failure',
+                        data={'escalation_id': esc.id, 'category': category,
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
-
-            # Fix C short-circuit: the caller already determined this is
-            # a confirmed loop / unresolvable failure that the steward
-            # cannot un-stick.  Skip steward, submit L1, return BLOCKED.
-            if escalate_to_human:
-                await self._ensure_l1_escalation_for_blocked(
-                    reason, detail or reason,
-                )
-                return WorkflowOutcome.BLOCKED
 
             # Capture window-start for the broadened dismiss-with-terminate
             # guard below.  Any L0 whose resolved_at falls inside this window
@@ -4687,11 +4750,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Fall-through BLOCKED: either no escalation queue, or the steward
         # never resolved the L0.  Either way a human should know — submit
         # an L1 (deduped) so the task isn't silently parked.
-        await self._ensure_l1_escalation_for_blocked(reason, detail or reason)
+        await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
         return WorkflowOutcome.BLOCKED
 
     async def _ensure_l1_escalation_for_blocked(
-        self, reason: str, detail: str,
+        self, reason: str, detail: str, *, category: str = 'task_failure',
     ) -> None:
         """Submit a level-1 escalation if none is open for this task.
 
@@ -4710,7 +4773,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             task_id=self.task_id,
             agent_role='orchestrator',
             severity='blocking',
-            category='task_failure',
+            category=category,
             summary=f'Workflow blocked, no automated resolution path: {reason[:160]}',
             detail=detail or reason,
             suggested_action='manual_intervention',
@@ -4724,7 +4787,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 EventType.escalation_created,
                 task_id=self.task_id, phase=self.state.value,
                 data={
-                    'escalation_id': esc.id, 'category': 'task_failure',
+                    'escalation_id': esc.id, 'category': category,
                     'severity': 'blocking', 'level': 1,
                     'summary': reason[:200],
                 },

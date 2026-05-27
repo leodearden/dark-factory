@@ -331,6 +331,39 @@ class TaskArtifacts:
         """Remove ``.task/unactionable_task.json`` if present."""
         (self.root / 'unactionable_task.json').unlink(missing_ok=True)
 
+    def write_false_premise(
+        self,
+        classification: str,
+        premise: str,
+        evidence: str,
+        proposed_resolution: str,
+    ) -> None:
+        """Write ``.task/false_premise.json`` — architect's report that a
+        RED-test premise is false, unreachable, or misattributed.
+
+        The workflow short-circuits to a level-1 design_concern escalation,
+        bypassing the steward — only a human/curator can re-spec the premise.
+        """
+        data = {
+            'classification': classification,
+            'premise': premise,
+            'evidence': evidence,
+            'proposed_resolution': proposed_resolution,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'false_premise.json', data)
+
+    def read_false_premise(self) -> dict | None:
+        """Return the parsed ``.task/false_premise.json`` artifact if present."""
+        path = self.root / 'false_premise.json'
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_false_premise(self) -> None:
+        """Remove ``.task/false_premise.json`` if present."""
+        (self.root / 'false_premise.json').unlink(missing_ok=True)
+
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
         plan_path = self.root / 'plan.json'
