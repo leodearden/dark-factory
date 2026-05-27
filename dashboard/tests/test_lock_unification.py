@@ -36,3 +36,44 @@ def test_data_js_drops_file_locks_default_and_endpoint_mapping(client):
 
     # Sanity: SCHEDULER (unified source) must still be initialised.
     assert 'SCHEDULER' in body, "data.js must keep SCHEDULER as the unified lock source"
+
+
+# ---------------------------------------------------------------------------
+# step-7: tab_tasks.jsx rewired to read locks from D.SCHEDULER
+# ---------------------------------------------------------------------------
+
+
+def test_tab_tasks_jsx_uses_scheduler_for_lock_display(client):
+    resp = client.get('/static/redux/tab_tasks.jsx')
+    assert resp.status_code == 200
+    body = resp.text
+
+    # (a) Old FILE_LOCKS lookups must be gone.
+    assert 'FILE_LOCKS' not in body, (
+        "tab_tasks.jsx still references FILE_LOCKS"
+    )
+    assert 'fileLocks' not in body, (
+        "tab_tasks.jsx still references fileLocks"
+    )
+
+    # (b) Unified source must be used.
+    assert 'D.SCHEDULER' in body or 'DF_T.SCHEDULER' in body, (
+        "tab_tasks.jsx must read locks from D.SCHEDULER or DF_T.SCHEDULER"
+    )
+    assert '.rows' in body, "tab_tasks.jsx must access .rows from SCHEDULER"
+    assert '.modules' in body, "tab_tasks.jsx must access .modules from SCHEDULER"
+
+    # (c) Section label updated.
+    assert 'Module locks' in body, (
+        "tab_tasks.jsx must label the lock section 'Module locks'"
+    )
+
+    # (d) holder_project qualifier present (project-qualified join).
+    assert 'holder_project' in body, (
+        "tab_tasks.jsx must reference holder_project for the scheduler join"
+    )
+
+    # (e) Lock chip CSS palette classes preserved.
+    assert 'lock-free' in body
+    assert 'lock-mine' in body
+    assert 'lock-taken' in body
