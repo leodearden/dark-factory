@@ -129,6 +129,46 @@ class EscalationQueue:
 
         return escalation.id
 
+    def _locate_path(self, escalation_id: str) -> Path | None:
+        """Return the on-disk path for *escalation_id*, or None if not found.
+
+        Lookup order:
+        1. ``queue_dir/{escalation_id}.json`` (queue root).
+        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``):
+           - If exactly one candidate: return it.
+           - If multiple candidates (multi-date duplicates): emit a WARNING naming the id
+             and return the newest by ``parent.name`` lexicographic order
+             (YYYY-MM-DD sorts lexicographically == chronologically; non-date names fall back
+             to ``''`` and are treated as oldest).
+
+        Shared by ``get()`` and ``patch_resolution_metadata()`` so that the archive
+        fallback and newest-by-date selection logic live in exactly one place.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if path.exists():
+            return path
+        # Fall back to archive: search all dated subdirs.
+        candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                f'Multiple archive files for {escalation_id}: '
+                f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
+            )
+            # YYYY-MM-DD sorts lexicographically == chronologically.
+            # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
+            # matching the comment and ensuring valid date dirs always win.
+            return max(
+                candidates,
+                key=lambda p: (
+                    p.parent.name
+                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
+                    else ''
+                ),
+            )
+        return candidates[0]
+
     def get(self, escalation_id: str) -> Escalation | None:
         """Read a single escalation by ID.
 
@@ -140,30 +180,9 @@ class EscalationQueue:
         should avoid repeated get() calls for ids known to be archived.
         TODO: memoise the archive listing per dated subdir to reduce repeated scans.
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        if not path.exists():
-            # Fall back to archive: search all dated subdirs.
-            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
-            if not candidates:
-                return None
-            if len(candidates) > 1:
-                logger.warning(
-                    f'Multiple archive files for {escalation_id}: '
-                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
-                )
-                # YYYY-MM-DD sorts lexicographically == chronologically.
-                # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
-                # matching the comment and ensuring valid date dirs always win.
-                path = max(
-                    candidates,
-                    key=lambda p: (
-                        p.parent.name
-                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
-                        else ''
-                    ),
-                )
-            else:
-                path = candidates[0]
+        path = self._locate_path(escalation_id)
+        if path is None:
+            return None
         try:
             return Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -454,27 +473,11 @@ class EscalationQueue:
 
         Returns the updated Escalation on success.
         """
-        # Locate the file: root first, then archive fallback (mirrors get()).
-        path = self.queue_dir / f'{escalation_id}.json'
-        if not path.exists():
-            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
-            if not candidates:
-                return None
-            if len(candidates) > 1:
-                logger.warning(
-                    f'Multiple archive files for {escalation_id}: '
-                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
-                )
-                path = max(
-                    candidates,
-                    key=lambda p: (
-                        p.parent.name
-                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
-                        else ''
-                    ),
-                )
-            else:
-                path = candidates[0]
+        # Locate the file (shared helper — same root-first, archive-fallback,
+        # newest-by-date logic as get()).
+        path = self._locate_path(escalation_id)
+        if path is None:
+            return None
 
         # Parse
         try:
