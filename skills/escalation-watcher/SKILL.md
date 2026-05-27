@@ -42,13 +42,13 @@ Discover the terminal command for spawning interactive sessions:
 
 ### Draining pending escalations
 
-On startup and after each watcher fire, check for all pending escalations:
+On startup and after each watcher fire, check for all pending L2 escalations:
 
 ```
-mcp__escalation__get_pending_escalations()
+mcp__escalation__get_pending_escalations(level=2)
 ```
 
-Handle each one before (re)starting the watcher. This catches anything that accumulated while no watcher was active.
+Handle each one before (re)starting the watcher. This catches any L2 escalations that accumulated while no watcher was active.
 
 ### L2-only contract
 
@@ -63,10 +63,10 @@ Never process L0 or L1 from this skill, even if explicitly asked — if the user
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir <project_root>/data/escalations 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 2>&1
 ```
 
-Run as a **background task** (Bash with `run_in_background`). The watcher uses inotify and exits after the first matching escalation, printing its JSON to stdout.
+Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout.
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
@@ -78,7 +78,7 @@ Parse the escalation JSON from the output, then fetch full details via MCP:
 mcp__escalation__get_escalation(escalation_id="esc-XX-N")
 ```
 
-Then drain any additional pending escalations before restarting the watcher.
+Then drain any additional pending L2 escalations before restarting the watcher.
 
 ## Priority Hierarchy
 
