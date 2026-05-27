@@ -26,6 +26,7 @@ __all__ = [
     'compute_content_fingerprint',
     'content_fingerprint_key',
     'find_dedupe_parent',
+    'submit_or_dedupe',
     'summary_dedupe_key',
 ]
 
@@ -301,3 +302,48 @@ def find_dedupe_parent(
 
     # Return the oldest by timestamp (first match we should fold into)
     return min(matches, key=lambda pair: pair[0])[1]
+
+
+def submit_or_dedupe(
+    queue: EscalationQueue,
+    esc: Escalation,
+    config: DedupeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Submit *esc* to *queue* or fold it into an existing pending parent.
+
+    This is the central gated orchestration wrapper that centralises:
+    - Gate 1: ``config.infra_dedupe_enabled``
+    - Gate 2: ``esc.category in config.infra_dedupe_categories``
+    - Parent lookup via ``find_dedupe_parent``
+    - TOCTOU guard: ``attach_dedupe_child`` returns ``None`` when the parent
+      was resolved between the find scan and the attach call; in that case
+      fall through to ``queue.submit()`` so the escalation is never dropped.
+
+    Response shapes (identical to server._submit_or_dedupe):
+    - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+    - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
+                        'parent_id': parent_id, 'child_id': esc.id}``
+
+    Recon (A7b) calls this directly with ``DedupeConfig.for_recon()`` instead
+    of ``queue.submit()``, routing through the same gate + TOCTOU logic used
+    by the infra path.
+
+    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
+    """
+    # Gate 1 (enabled) and Gate 2 (category membership) both short-circuit
+    # in pure memory before any disk I/O via find_dedupe_parent.
+    if config.infra_dedupe_enabled and esc.category in config.infra_dedupe_categories:
+        parent_id = find_dedupe_parent(queue, esc, config, now=now)
+        # TOCTOU guard: attach_dedupe_child returns None when the parent was
+        # resolved/archived between the find scan and this call.  Fall through
+        # to submit() so the escalation is not silently dropped.
+        if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
+            return {
+                'id': parent_id,
+                'status': 'dedup_skipped',
+                'parent_id': parent_id,
+                'child_id': esc.id,
+            }
+    esc_id = queue.submit(esc)
+    return {'id': esc_id, 'status': 'queued'}
