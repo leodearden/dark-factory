@@ -361,6 +361,27 @@ def test_merge_metadata_type_mismatch_old_wins():
     assert result["x"] == [1, 2]
 
 
+# ── _merge_metadata: legacy memory_hints migration ───────────────────
+
+
+def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
+    """Legacy list-of-dicts memory_hints is coerced to dict shape and union-merged.
+
+    When an existing row carries the legacy memory_hints shape
+    ``[{"entity": ..., "query": ...}, ...]`` and the incoming payload carries the
+    canonical shape ``{"entities": [...], "queries": [...]}`` with append=True, the
+    legacy list must be coerced to dict shape BEFORE _merge_values runs — so the
+    merge falls into the dict-vs-dict recursive path (which unions the inner lists)
+    rather than the type-mismatch OLD-wins path (which silently discards the new dict).
+
+    Old-then-new stable order is preserved (same policy as the dict-vs-dict union).
+    """
+    old_raw = '{"memory_hints":[{"entity":"E1","query":"q1"},{"entity":"E2","query":"q2"}]}'
+    new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
+
+
 # ── add_subtask / nested IDs ───────────────────────────────────────
 
 
