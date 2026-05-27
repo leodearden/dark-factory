@@ -127,12 +127,12 @@ def harness_for_run_slot() -> Harness:
     # TaskWorkflow constructor kwarg sources — all None since TaskWorkflow is
     # patched in the test body; kwargs are evaluated before passing to the mock
     # so the attribute accesses must not raise AttributeError.
-    h.config = None
-    h.git_ops = None
-    h.briefing = None
-    h.mcp = None
+    h.config = None  # type: ignore[assignment]
+    h.git_ops = None  # type: ignore[assignment]
+    h.briefing = None  # type: ignore[assignment]
+    h.mcp = None  # type: ignore[assignment]
     h.usage_gate = None
-    h._merge_queue = None
+    h._merge_queue = None  # type: ignore[assignment]
     h._merge_worker = None
     h.cost_store = None
     # _collect_done_reports uses these
@@ -206,6 +206,7 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
 
     # (b) wrapper_task.result() must return TaskReport(outcome=CANCELLED).
     report = wrapper_task.result()
+    assert report is not None, 'Expected _run_slot to return a TaskReport, got None'
     assert report.outcome == WorkflowOutcome.CANCELLED, (
         f'Expected outcome=CANCELLED, got {report.outcome!r}'
     )
