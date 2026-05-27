@@ -5392,3 +5392,113 @@ async def test_unresolved_after_remediation_does_not_escalate_when_persistence_b
     assert actionable_finding['description'] in rec.__dict__.get('description', ''), (
         f'Expected description in log record, got: {rec.__dict__.get("description")}'
     )
+
+
+@pytest.mark.asyncio
+async def test_unresolved_after_remediation_escalates_when_persistence_meets_threshold_with_recurrence_summary(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """Unresolved-after-remediation finding escalates with persistence count in summary.
+
+    Pre-seeds N-1 = 2 completed runs containing the target finding F.
+    Current cycle also contains F (both parent S3 and remediation S3).
+    Persistence count becomes 3 when parent run is persisted before remediation.
+
+    Asserts:
+    (a) queue contains exactly one escalation with category 'recon_integrity_issue'
+        whose summary starts with 'Persistently unresolved after remediation' and
+        contains '(3 cycles)'.
+    (b) escalation's dedupe_fingerprint matches compute_content_fingerprint so that
+        future re-filings fold into the same queue record.
+
+    Task 1512 / plans/afk-A7-recon-closure.md.
+    """
+    import uuid as _uuid
+    from datetime import timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Use the first actionable finding from _make_s3_findings()
+    actionable_finding = _make_s3_findings()[0]
+    assert actionable_finding['actionable'] is True
+
+    # Seed N-1 prior completed runs containing the target finding
+    n_seed = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 1  # 2 by default
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+
+    for i in range(n_seed):
+        run_id = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(run_id, {
+            'integrity_check': {'items_flagged': [actionable_finding]},
+        })
+        await journal.complete_run(run_id, 'completed')
+
+    # Push an event for the current cycle
+    await event_buffer.push(_make_event())
+
+    # Mock S3 to always return [actionable_finding] (both parent and remediation)
+    async def s3_always_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_always_returns_finding
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) Exactly one escalation with 'Persistently unresolved' summary and recurrence count
+    pending = esc_queue.get_pending()
+    persistent_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+    ]
+    assert len(persistent_escalations) == 1, (
+        f'Expected exactly 1 persistent-unresolved escalation, '
+        f'got {len(persistent_escalations)}: {[e.summary for e in pending]}'
+    )
+    esc = persistent_escalations[0]
+    assert f'({_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles)' in esc.summary, (
+        f'Expected summary to contain "({_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles)", '
+        f'got: {esc.summary!r}'
+    )
+
+    # (b) dedupe_fingerprint matches compute_content_fingerprint for the finding
+    expected_fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        actionable_finding.get('category') or '',
+        [str(a) for a in (actionable_finding.get('affected_ids') or [])],
+        actionable_finding.get('description') or '',
+    )
+    assert esc.dedupe_fingerprint == expected_fp, (
+        f'Expected dedupe_fingerprint == {expected_fp!r}, '
+        f'got: {esc.dedupe_fingerprint!r}'
+    )
