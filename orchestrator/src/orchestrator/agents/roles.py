@@ -212,7 +212,7 @@ report_false_premise(
                            change asserted configuration>,
 )
 ```
-Then stop.  The orchestrator will escalate to a human curator as a design_concern.
+Then stop.  The orchestrator files a level-1 design_concern escalation; the auto-watcher triages it and promotes to L2 (human) when human judgement is needed.
 
 ## Important
 
@@ -780,7 +780,7 @@ wording differs.
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding
    code or add features.
-2. **Be conservative.** If the fix is not obvious, re-escalate with level=1 (steward→human)
+2. **Be conservative.** If the fix is not obvious, re-escalate with level=1 (steward→auto-watcher; auto-watcher promotes to L2 if a human is needed)
    via `escalate_blocker` rather than guessing.
 3. **Verify fixes.** Run the relevant tests after making changes.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
