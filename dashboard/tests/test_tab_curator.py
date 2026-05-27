@@ -336,3 +336,56 @@ def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
             f"the brace-depth walk may have stopped at a nested '}}' before "
             f'reaching this key.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 (task-1510): data.js seed and tab_curator.jsx accounts_summary
+# ---------------------------------------------------------------------------
+
+
+def test_data_js_seed_carries_accounts_summary(data_js_body: str) -> None:
+    """CURATOR_STATE seed in data.js must include accounts_summary.
+
+    Uses the brace-aware _extract_curator_state_block helper to scope the
+    check to the CURATOR_STATE block only.
+
+    RED baseline: accounts_summary not yet added to the seed block.
+    Msg: CURATOR_STATE.state seed missing accounts_summary — React seed falls
+    back to undefined and the curator pill throws at render.
+    """
+    seed_block = _extract_curator_state_block(data_js_body)
+    assert seed_block, (
+        'data.js does not contain a CURATOR_STATE: { ... } seed block — '
+        'prerequisite for this test (see test_data_js_registers_curator_endpoint).'
+    )
+    assert re.search(r'\baccounts_summary\s*:', seed_block), (
+        'CURATOR_STATE.state seed missing accounts_summary: — '
+        'React seed falls back to undefined and the curator pill throws at render. '
+        "Add `accounts_summary: { total: 0, capped: 0, available: 0, capped_accounts: [] }` "
+        'to the state object inside the CURATOR_STATE seed in data.js.'
+    )
+
+
+def test_tab_curator_jsx_renders_accounts_summary(tab_curator_jsx_body: str) -> None:
+    """tab_curator.jsx must reference accounts_summary.available in the state pill.
+
+    Two independent contracts:
+    (1) accounts_summary appears in the state destructure (followed by comma or brace).
+    (2) The word 'available' appears within ~400 chars after 'accounts_summary'
+        (scoped proximity check guards against a stale reference in a different part
+        of the file).
+
+    RED baseline: data.js and tab_curator.jsx not yet updated.
+    Msg: tab_curator.jsx state pill does not reference accounts_summary.available —
+    UI still shows only Capped/Open without a count.
+    """
+    assert re.search(r'\baccounts_summary\b\s*[,}=]', tab_curator_jsx_body), (
+        'tab_curator.jsx state pill does not destructure or reference accounts_summary — '
+        'add accounts_summary to the const { ... } = state destructure in CuratorTab.'
+    )
+    assert re.search(r'accounts_summary\.available', tab_curator_jsx_body), (
+        'tab_curator.jsx does not use the property access accounts_summary.available — '
+        'UI still shows only Capped/Open without a count. '
+        'Add the `${accounts_summary.available}/${accounts_summary.total} available` '
+        'label to the badge ternary in the state pill.'
+    )

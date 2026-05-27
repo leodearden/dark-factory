@@ -29,7 +29,12 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
-from dashboard.data.memory import get_memory_status, get_queue_stats, mcp_tool_call
+from dashboard.data.memory import (
+    get_curator_state,
+    get_memory_status,
+    get_queue_stats,
+    mcp_tool_call,
+)
 from dashboard.data.merge_queue import active_queued_merges
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
@@ -317,6 +322,19 @@ async def _sample_curator(
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
+    # Curator gate dict — supplies account_count (denominator for capped_now under
+    # all-accounts-capped semantics, mirroring app.py:864-866). Inline try/except
+    # absorbs any HTTP/transport failure so the sampler degrades to the cap-history
+    # universe rather than failing outright.
+    try:
+        curator_state = await get_curator_state(http_client, config)
+    except Exception:
+        logger.debug('get_curator_state failed in _sample_curator', exc_info=True)
+        curator_state = {}
+    account_count: int = (
+        curator_state.get('account_count', 0) if isinstance(curator_state, dict) else 0
+    )
+
     # 2. Cap intervals (last 7 days — long enough to catch any plausible open-ended
     # cap; account_events scan is cheap and indexed by created_at).
     try:
@@ -325,15 +343,24 @@ async def _sample_curator(
         logger.debug('read_cap_intervals failed', exc_info=True)
         intervals = []
 
-    # 3. capped_now (any-account semantics) + capped_windows (all-accounts merge)
+    # 3. capped_now (all-accounts-capped semantics) + capped_windows (all-accounts merge)
     # derived together by compute_capped_now_and_windows — single source of truth
-    # shared with api_curator. See cap_history.py for the asymmetric semantics
-    # rationale and the sorted-account_names determinism guard.
+    # shared with api_curator. account_count is threaded in from the curator gate;
+    # on gate-offline it degrades to the cap-history universe (max(0, #distinct intervals)).
+    # See cap_history.py for the all-accounts-capped semantics rationale.
     try:
-        capped_now, capped_windows = compute_capped_now_and_windows(intervals)
+        capped_now, capped_windows = compute_capped_now_and_windows(intervals, account_count)
     except Exception:
-        logger.debug('compute_capped_now_and_windows failed', exc_info=True)
-        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+        # Raise to WARNING so the silent capped_now=0 degrade is visible in metrics logs.
+        # The prior code returned `1 if any(iv.end is None ...) else 0`; that any-account
+        # fallback would now produce a false positive in the wedged-interval scenario the
+        # helper deliberately treats as not-capped, so it is dropped in favour of
+        # degrade-safe 0.
+        logger.warning(
+            'compute_capped_now_and_windows failed in _sample_curator — degrading capped_now to 0',
+            exc_info=True,
+        )
+        capped_now = 0
         capped_windows = []
 
     # 4. Terminal tickets resolved in the last hour.

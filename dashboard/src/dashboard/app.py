@@ -38,10 +38,12 @@ from dashboard.data.burndown import (
     downsample,
 )
 from dashboard.data.cap_history import (
+    AccountsSummary,
     CapInterval,
     bucketise_cap_sparkline,
     compute_capped_now_and_windows,
     read_cap_intervals,
+    summarize_accounts,
 )
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.costs import (
@@ -808,7 +810,9 @@ async def api_curator(request: Request) -> JSONResponse:
 
     async def _intervals_leg() -> list[CapInterval]:
         cd = await _cost_dbs(config, pool)
-        return await read_cap_intervals(cd, days=1)
+        # days=7 matches _sample_curator look-back so caps older than 1 day are
+        # not misreported as uncapped (consistent with metrics.py:323).
+        return await read_cap_intervals(cd, days=7)
 
     fanout_r, sparks_r, intervals_r, state_r = await asyncio.gather(
         fan_out_list_tickets(
@@ -855,20 +859,42 @@ async def api_curator(request: Request) -> JSONResponse:
             }
         )
 
-    # capped_now (any-account semantics) + capped_windows (all-accounts merge)
-    # come from one helper — single source of truth shared with _sample_curator.
-    # See dashboard.data.cap_history for the asymmetric semantics rationale.
+    # Extract account_count from the already-fetched gate dict so healthy accounts
+    # with no recent cap events are counted as available (the denominator fix).
+    account_count: int = (
+        curator_state.get('account_count', 0) if isinstance(curator_state, dict) else 0
+    )
+
+    # capped_now (all-accounts-capped semantics via summarize_accounts) + capped_windows
+    # (all-accounts simultaneously capped merge) come from one helper — single source
+    # of truth shared with _sample_curator.  Pass account_count so healthy accounts
+    # without recent cap events are NOT counted as capped (fixes the reported bug where
+    # 1 wedged interval among N accounts showed "Capped").
+    # See dashboard.data.cap_history for the semantics rationale.
     # The sparkline downstream (bucketise_cap_sparkline) renders the strict
     # all-accounts-capped window — a 1 in the sparkline means EVERY account was
-    # blocked at that bucket. capped_now flags any-account live state.
+    # blocked at that bucket.
     _empty_capped: ChartData = {'labels': [], 'values': []}
     try:
-        capped_now, capped_windows = compute_capped_now_and_windows(intervals)
+        capped_now, capped_windows = compute_capped_now_and_windows(intervals, account_count)
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
     except Exception:
-        logger.debug('curator/capped_now_and_spark computation failed', exc_info=True)
-        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+        # Raise to WARNING so the silent capped_now=0 degrade is always visible in logs.
+        # The prior code returned capped_now=1 when any interval was open-ended; that
+        # conservative fallback would now give a false positive because the helper
+        # no longer uses any-account semantics.  WARNING is the right visibility level.
+        logger.warning('curator/capped_now_and_spark computation failed — degrading capped_now to 0', exc_info=True)
+        capped_now = 0
         capped_spark = _empty_capped
+
+    # Compute per-account availability summary in its own try/except so a failure
+    # here does not affect capped_now / capped_spark (or vice versa).
+    _empty_summary: AccountsSummary = {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}
+    try:
+        accounts_summary: AccountsSummary = summarize_accounts(intervals, total_accounts=account_count)
+    except Exception:
+        logger.debug('curator/accounts_summary computation failed', exc_info=True)
+        accounts_summary = _empty_summary
 
     if 'paused' in curator_state:
         paused_reason: str | None = curator_state.get('paused_reason')
@@ -885,6 +911,7 @@ async def api_curator(request: Request) -> JSONResponse:
             capped_now=capped_now,
             paused_reason=paused_reason,
             pending_total=pending_total,
+            accounts_summary=accounts_summary,
         )
     )
 

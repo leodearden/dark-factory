@@ -1436,6 +1436,90 @@ async def test_fan_out_list_tickets_first_url_succeeds_skips_second(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# task-1510 step-3(B): mixed availability → capped_now=0 in _sample_curator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_mixed_availability_returns_capped_now_zero(
+    tmp_path: Path, config
+):
+    """capped_now=0 when one account is capped and another is uncapped.
+
+    Setup: two accounts in runs.db:
+    - acc-a: open-ended cap_hit (still capped)
+    - acc-b: cap_hit + resumed closed pair (currently uncapped)
+
+    With all-accounts-capped semantics: total=2, capped=1, available=1 → capped_now=0.
+    Under old any-account semantics acc-a is open → capped_now=1 (the bug).
+
+    RED baseline: old any-account semantics; GREEN after all-accounts-capped fix.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+
+    # acc-a: open-ended cap (still capped)
+    cap_time_a = now - timedelta(minutes=30)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc-a', 'cap_hit', cap_time_a.isoformat()),
+    )
+    # acc-b: closed cap (currently uncapped)
+    cap_time_b = now - timedelta(minutes=60)
+    resumed_time_b = now - timedelta(minutes=20)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc-b', 'cap_hit', cap_time_b.isoformat()),
+    )
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc-b', 'resumed', resumed_time_b.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert result is not None
+    assert result['capped_now'] == 0, (
+        f'Expected capped_now=0 (acc-b is uncapped so not all accounts are capped), '
+        f'got {result["capped_now"]}. '
+        f'Bug: old any-account semantics returns 1 because acc-a is still open.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # task-1329 step-3: CancelledError from a CHILD coroutine propagates out of
 # fan_out_list_tickets (buggy reducer swallows it silently)
 # ---------------------------------------------------------------------------
@@ -1482,3 +1566,157 @@ async def test_fan_out_list_tickets_propagates_child_cancelled_error(tmp_path: P
         async with httpx.AsyncClient(transport=transport) as http_client:
             with pytest.raises(asyncio.CancelledError):
                 await fan_out_list_tickets(http_client, cfg, limit=2000, timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# task-1510 step-11: _sample_curator account_count denominator + warning-degrade fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_account_count_denominator_not_capped(tmp_path: Path, config):
+    """1 open cap of 4 configured accounts (account_count=4) must NOT read Capped.
+
+    Setup: ONE open-ended cap_hit for 'acc-a' at now-30min (no resumed pair).
+    Gate: account_count=4 → total=max(4,1)=4, capped=1, available=3 → capped_now=0.
+
+    RED baseline: current _sample_curator does NOT call get_curator_state →
+    account_count=0 → total=max(0,1)=1 → capped_now=1.
+    Also: patching dashboard.data.metrics.get_curator_state raises AttributeError
+    before step-12 because the name is not yet imported into the metrics module.
+
+    capped_now=1 means _sample_curator ignored the gate denominator —
+    the exact wedged-interval bug the api_curator fix closes (reviewer correctness_partial_fix).
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    cap_time = now - timedelta(minutes=30)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc-a', 'cap_hit', cap_time.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    GATE = {
+        'paused': False,
+        'paused_reason': None,
+        'soonest_open_at': None,
+        'account_count': 4,
+    }
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    with patch('dashboard.data.metrics.get_curator_state', new=AsyncMock(return_value=GATE)):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets_conn = await aiosqlite.connect(str(tickets_path))
+            tickets_conn.row_factory = aiosqlite.Row
+            runs_conn = await aiosqlite.connect(str(runs_path))
+            runs_conn.row_factory = aiosqlite.Row
+            try:
+                result = await _sample_curator(
+                    http_client,
+                    config,
+                    tickets_conn,
+                    [runs_conn],
+                    now=now,
+                )
+            finally:
+                await tickets_conn.close()
+                await runs_conn.close()
+
+    assert result['capped_now'] == 0, (
+        f'Expected capped_now=0 (1 open cap of 4 configured accounts), '
+        f'got {result["capped_now"]}. '
+        'capped_now=1 means _sample_curator ignored the gate denominator — '
+        'the original 3-uncapped-accounts bug (reviewer correctness_partial_fix).'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_fallback_degrades_to_zero_when_helper_raises(
+    tmp_path: Path, config
+):
+    """compute_capped_now_and_windows raised → except-branch must degrade to capped_now=0.
+
+    Setup: ONE open-ended cap_hit for 'acc-a' at now-30min.
+    Patches compute_capped_now_and_windows with side_effect=ValueError('boom')
+    so the try-block raises and the except-branch fallback runs.
+
+    RED baseline: current code computes
+        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+    in the except → with 1 open interval → capped_now=1 → assertion FAILS.
+
+    The legacy any-account fallback would silently flip back to 1 in exactly
+    the 1-open-of-N scenario the new helper would have returned 0 for —
+    reviewer stale_fallback_logic.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    cap_time = now - timedelta(minutes=30)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc-a', 'cap_hit', cap_time.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    with patch(
+        'dashboard.data.metrics.compute_capped_now_and_windows',
+        new=MagicMock(side_effect=ValueError('boom')),
+    ):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets_conn = await aiosqlite.connect(str(tickets_path))
+            tickets_conn.row_factory = aiosqlite.Row
+            runs_conn = await aiosqlite.connect(str(runs_path))
+            runs_conn.row_factory = aiosqlite.Row
+            try:
+                result = await _sample_curator(
+                    http_client,
+                    config,
+                    tickets_conn,
+                    [runs_conn],
+                    now=now,
+                )
+            finally:
+                await tickets_conn.close()
+                await runs_conn.close()
+
+    assert result['capped_now'] == 0, (
+        f'Expected capped_now=0 (degrade-safe fallback), got {result["capped_now"]}. '
+        'compute_capped_now_and_windows raised → except-branch fallback must degrade to '
+        'capped_now=0 (matches app.py post-1510 contract). '
+        'The legacy `1 if any(open-ended) else 0` fallback would silently flip back to 1 '
+        'in exactly the 1-open-of-N scenario the new helper would have returned 0 for — '
+        'reviewer stale_fallback_logic.'
+    )

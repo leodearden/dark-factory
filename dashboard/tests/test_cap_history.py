@@ -825,6 +825,165 @@ class TestComputeCappedNowAndWindows:
             f'Got {windows1} vs {windows2}'
         )
 
+    def test_mixed_availability_returns_capped_now_zero(self):
+        """(a) mixed: 'a' open-ended, 'b' closed → capped_now=0.
+
+        With all-accounts-capped semantics: total=2, capped=1, available=1 → 0.
+        Under old any-account semantics this would return 1 (a is open).
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('a', t1, None),  # open-ended
+            CapInterval('b', t1, t2),    # closed
+        ]
+        capped_now, _ = compute_capped_now_and_windows(intervals)
+        assert capped_now == 0, (
+            f"mixed availability: 'b' is uncapped so capped_now must be 0; "
+            f"==1 means old any-account semantics still active (got {capped_now})"
+        )
+
+    def test_account_count_denominator_returns_capped_now_zero(self):
+        """(b) 1 open cap of 3 configured accounts → capped_now=0.
+
+        This is THE reported-bug case at helper level: one account has a stale
+        open-ended cap_hit while 2 healthy accounts have no cap events at all.
+        Without total_accounts the universe would be 1 (all capped) → capped_now=1.
+        With total_accounts=3: total=3, capped=1, available=2 → capped_now=0.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(minutes=10)
+        intervals = [CapInterval('a', t1, None)]
+        capped_now, _ = compute_capped_now_and_windows(intervals, total_accounts=3)
+        assert capped_now == 0, (
+            f'account_count denominator case: 1 capped of 3 total must return '
+            f'capped_now=0 (2 available). Got {capped_now}. '
+            f'Bug: if account_count ignored then total=1, available=0 → capped_now=1 '
+            f'(the original 3-uncapped-accounts bug).'
+        )
+
+    def test_all_accounts_open_ended_returns_capped_now_one(self):
+        """(c) both accounts open-ended → capped_now=1.
+
+        Sanity check: all-accounts-capped semantics still returns 1 when ALL are capped.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('a', t1, None),
+            CapInterval('b', t1, None),
+        ]
+        capped_now, _ = compute_capped_now_and_windows(intervals)
+        assert capped_now == 1, (
+            f'Both accounts open-ended: expected capped_now=1, got {capped_now}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSummarizeAccounts — pure helper summarize_accounts
+# ---------------------------------------------------------------------------
+
+from dashboard.data.cap_history import summarize_accounts  # noqa: E402
+
+
+class TestSummarizeAccounts:
+    """Tests for summarize_accounts(intervals, *, total_accounts=None).
+
+    RED baseline: ImportError (summarize_accounts does not exist yet).
+    """
+
+    def test_empty_intervals_no_total(self):
+        """(a) empty intervals, no total_accounts -> all zeros."""
+        result = summarize_accounts([])
+        assert result == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}, (
+            f'Expected all-zero dict for empty intervals, got {result}'
+        )
+
+    def test_single_open_ended_no_total(self):
+        """(b) single open-ended interval, no total_accounts -> total=1, capped=1, available=0."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        intervals = [CapInterval('acc', t1, None)]
+        result = summarize_accounts(intervals)
+        assert result == {'total': 1, 'capped': 1, 'available': 0, 'capped_accounts': ['acc'], 'account_names': ['acc']}, (
+            f'Expected 1 capped account, got {result}'
+        )
+
+    def test_single_closed_interval_no_total(self):
+        """(c) single closed pair -> total=1, capped=0, available=1."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=1)
+        intervals = [CapInterval('acc', t1, t2)]
+        result = summarize_accounts(intervals)
+        assert result == {'total': 1, 'capped': 0, 'available': 1, 'capped_accounts': [], 'account_names': ['acc']}, (
+            f'Expected closed interval to yield capped=0, got {result}'
+        )
+
+    def test_mixed_open_and_closed(self):
+        """(d) mixed: 'a' open-ended, 'b' closed -> total=2, capped=1, available=1."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('a', t1, None),
+            CapInterval('b', t1, t2),
+        ]
+        result = summarize_accounts(intervals)
+        assert result == {'total': 2, 'capped': 1, 'available': 1, 'capped_accounts': ['a'], 'account_names': ['a', 'b']}, (
+            f'Expected mixed result capped=1/available=1, got {result}'
+        )
+
+    def test_account_count_denominator(self):
+        """(e) total_accounts=4 with 1 open-ended interval -> total=4, available=3.
+
+        THE key denominator case behind the bug fix:
+        One account has a stale open cap while 3 healthy accounts have no recent events.
+        With total_accounts=4, available=3 and capped_now should NOT be 1.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(minutes=10)
+        intervals = [CapInterval('a', t1, None)]
+        result = summarize_accounts(intervals, total_accounts=4)
+        assert result == {'total': 4, 'capped': 1, 'available': 3, 'capped_accounts': ['a'], 'account_names': ['a']}, (
+            f'Expected total=4 (from account_count denominator), got {result}. '
+            f'Bug: if total=1 then available=0 and capped_now would be wrongly 1 '
+            f'(the original 3-uncapped-accounts bug).'
+        )
+
+    def test_clamp_intervals_exceed_total_accounts(self):
+        """(f) 2 distinct open accounts with total_accounts=1 -> total=max(1,2)=2.
+
+        max() guards against under-report when account_count is stale or wrong.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        intervals = [
+            CapInterval('a', t1, None),
+            CapInterval('b', t1, None),
+        ]
+        result = summarize_accounts(intervals, total_accounts=1)
+        assert result['total'] == 2, (
+            f'Expected total=max(1,2)=2 when intervals exceed total_accounts, got {result["total"]}'
+        )
+        assert result['capped'] == 2
+        assert result['available'] == 0
+        assert sorted(result['capped_accounts']) == ['a', 'b']
+
+    def test_two_open_accounts_no_total(self):
+        """(g) two open-ended accounts, no total_accounts -> total=2, capped=2, available=0."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        intervals = [
+            CapInterval('a', t1, None),
+            CapInterval('b', t1, None),
+        ]
+        result = summarize_accounts(intervals)
+        assert result == {'total': 2, 'capped': 2, 'available': 0, 'capped_accounts': ['a', 'b'], 'account_names': ['a', 'b']}, (
+            f'Expected all-capped result, got {result}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-7 tests: bucketise_cap_sparkline

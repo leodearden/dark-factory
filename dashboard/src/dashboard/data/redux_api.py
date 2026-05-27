@@ -712,6 +712,8 @@ def shape_burndown(
 # ---------------------------------------------------------------------------
 
 
+
+
 def shape_curator(
     *,
     pending: list[dict],
@@ -720,6 +722,7 @@ def shape_curator(
     capped_now: int,
     paused_reason: str | None,
     pending_total: int,
+    accounts_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return ``{CURATOR_STATE: {pending, latency_spark, pending_spark, capped_spark, state}}``.
 
@@ -733,6 +736,11 @@ def shape_curator(
       using p50 labels as the shared time axis since all series share the same rows)
 
     *capped_spark* is passed through unchanged (``{labels, values}`` ChartData).
+
+    *accounts_summary* is the ``{total, capped, available, capped_accounts}`` dict
+    produced by :func:`~dashboard.data.cap_history.summarize_accounts`.  Defaults to
+    an all-zero empty summary when omitted.  Passed through into ``state.accounts_summary``
+    so the React UI can render "{available}/{total} available" when not all-capped.
     """
     sparks = curator_sparks or {}
     p50_series = sparks.get('p50') or {}
@@ -762,6 +770,9 @@ def shape_curator(
                 'capped_now': capped_now,
                 'paused_reason': paused_reason,
                 'pending_total': pending_total,
+                # Fresh literal each call — avoids sharing the mutable capped_accounts
+                # list from a module-level constant across multiple default responses.
+                'accounts_summary': dict(accounts_summary) if accounts_summary else {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []},
             },
         }
     }

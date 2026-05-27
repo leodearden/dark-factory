@@ -775,3 +775,224 @@ def test_curator_endpoint_paused_reason_none_when_helper_offline(tmp_path: Path)
     assert state['paused_reason'] is None, (
         f'Expected paused_reason=None when gate helper offline; got {state["paused_reason"]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task-1510): shape_curator accounts_summary kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_shape_curator_passes_accounts_summary():
+    """shape_curator propagates accounts_summary kwarg into the state dict.
+
+    RED baseline: shape_curator does not accept accounts_summary -> TypeError.
+    """
+    from dashboard.data.redux_api import shape_curator
+
+    curator_sparks = {
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+        'pending': {'labels': [], 'values': []},
+    }
+    capped_spark = {'labels': [], 'values': []}
+    accounts_summary = {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a'], 'account_names': ['a']}
+
+    result = shape_curator(
+        pending=[],
+        curator_sparks=curator_sparks,
+        capped_spark=capped_spark,
+        capped_now=0,
+        paused_reason=None,
+        pending_total=0,
+        accounts_summary=accounts_summary,
+    )
+
+    assert 'CURATOR_STATE' in result
+    state = result['CURATOR_STATE']['state']
+    assert state['accounts_summary'] == {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a'], 'account_names': ['a']}, (
+        f'Expected accounts_summary to flow through shape_curator, got {state.get("accounts_summary")!r}'
+    )
+
+
+def test_shape_curator_default_accounts_summary():
+    """Omitting accounts_summary kwarg yields the empty default dict."""
+    from dashboard.data.redux_api import shape_curator
+
+    curator_sparks = {
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+        'pending': {'labels': [], 'values': []},
+    }
+    capped_spark = {'labels': [], 'values': []}
+
+    result = shape_curator(
+        pending=[],
+        curator_sparks=curator_sparks,
+        capped_spark=capped_spark,
+        capped_now=0,
+        paused_reason=None,
+        pending_total=0,
+        # accounts_summary deliberately omitted
+    )
+
+    state = result['CURATOR_STATE']['state']
+    assert state['accounts_summary'] == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': [], 'account_names': []}, (
+        f'Expected default empty accounts_summary when kwarg omitted, got {state.get("accounts_summary")!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-7 (task-1510): end-to-end account_count denominator + days=7 tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_runs_db(tmp_path: Path, events: list[tuple[str, str, datetime]]) -> Path:
+    """Create runs.db at the canonical path and insert account_events; return path."""
+    runs_dir = tmp_path / 'data' / 'orchestrator'
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    runs_db_path = runs_dir / 'runs.db'
+    conn = sqlite3.connect(str(runs_db_path))
+    conn.executescript(ACCOUNT_EVENTS_SCHEMA)
+    for account, event_type, ts in events:
+        conn.execute(
+            'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+            (account, event_type, ts.isoformat()),
+        )
+    conn.commit()
+    conn.close()
+    return runs_db_path
+
+
+def test_api_curator_account_count_denominator_not_capped(tmp_path: Path):
+    """THE bug-fix test: 1 open cap of 4 configured accounts → capped_now=0.
+
+    Scenario: ONE account has a stale open-ended cap_hit while 3 healthy accounts
+    have NO recent cap events (so they never appear in intervals).
+
+    Under the OLD any-account semantics: capped_now=1 (acc-a is open → bug).
+    Under the NEW all-accounts-capped semantics with account_count=4:
+    total=4, capped=1, available=3 → capped_now=0.
+
+    RED baseline: app.py calls compute_capped_now_and_windows(intervals) without
+    total_accounts, so total=1, available=0 → capped_now=1 (bug not fixed yet).
+    """
+    now = datetime.now(UTC)
+    cap_hit_time = now - timedelta(minutes=10)
+
+    _seed_runs_db(tmp_path, [('acc-a', 'cap_hit', cap_hit_time)])
+
+    gate = {
+        'paused': False,
+        'paused_reason': None,
+        'soonest_open_at': None,
+        'account_count': 4,
+    }
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=gate)),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    state = resp.json()['CURATOR_STATE']['state']
+    assert state['capped_now'] == 0, (
+        f'1 open cap of 4 configured accounts must NOT read Capped; '
+        f'account_count is the denominator. capped_now={state["capped_now"]} means '
+        f'the fix ignored account_count — the original 3-uncapped-accounts bug.'
+    )
+    assert state['accounts_summary'] == {
+        'total': 4,
+        'capped': 1,
+        'available': 3,
+        'capped_accounts': ['acc-a'],
+        'account_names': ['acc-a'],
+    }, f'Expected accounts_summary with total=4, got {state.get("accounts_summary")!r}'
+
+
+def test_api_curator_all_accounts_capped_pins_one(tmp_path: Path):
+    """Both accounts capped → capped_now=1 and accounts_summary shows zero available."""
+    now = datetime.now(UTC)
+    cap_time_a = now - timedelta(minutes=15)
+    cap_time_b = now - timedelta(minutes=10)
+
+    _seed_runs_db(tmp_path, [
+        ('acc-a', 'cap_hit', cap_time_a),
+        ('acc-b', 'cap_hit', cap_time_b),
+    ])
+
+    gate = {
+        'paused': False,
+        'paused_reason': None,
+        'soonest_open_at': None,
+        'account_count': 2,
+    }
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=gate)),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    state = resp.json()['CURATOR_STATE']['state']
+    assert state['capped_now'] == 1, (
+        f'Both accounts capped → expected capped_now=1, got {state["capped_now"]}'
+    )
+    summary = state['accounts_summary']
+    assert summary['available'] == 0, f'Expected available=0, got {summary}'
+    assert summary['capped'] == 2, f'Expected capped=2, got {summary}'
+    assert summary['total'] == 2, f'Expected total=2, got {summary}'
+
+
+def test_api_curator_uses_days_seven_lookback(tmp_path: Path):
+    """Cap from 2 days ago must be visible (requires days=7 lookback).
+
+    RED baseline: with days=1 the 2-day-old cap_hit is filtered out
+    (intervals=[]) so capped=0/available=1/capped_now=0.
+
+    The days=7 bump in step-8 includes the 2-day-old event so capped_now=1.
+    """
+    now = datetime.now(UTC)
+    old_cap_time = now - timedelta(days=2)  # outside 1-day window, inside 7-day window
+
+    _seed_runs_db(tmp_path, [('acc-a', 'cap_hit', old_cap_time)])
+
+    gate = {
+        'paused': False,
+        'paused_reason': None,
+        'soonest_open_at': None,
+        'account_count': 1,
+    }
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=gate)),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    state = resp.json()['CURATOR_STATE']['state']
+    assert state['capped_now'] == 1, (
+        f'2-day-old open-ended cap must be visible with days=7 lookback. '
+        f'capped_now={state["capped_now"]} means the cap was excluded — '
+        f'days=1 cutoff is still in place (the 1-day lookback bug).'
+    )
+    assert state['accounts_summary'] == {
+        'total': 1,
+        'capped': 1,
+        'available': 0,
+        'capped_accounts': ['acc-a'],
+        'account_names': ['acc-a'],
+    }, f'Expected accounts_summary with total=1, got {state.get("accounts_summary")!r}'

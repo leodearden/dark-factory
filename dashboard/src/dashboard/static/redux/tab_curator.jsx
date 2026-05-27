@@ -150,7 +150,7 @@ function QueueRow({ ticket, onCancel }) {
 function CuratorTab({ projectFilter = [] }) {
   const cs = D.CURATOR_STATE || {};
   const { pending = [], latency_spark, pending_spark, capped_spark, state = {} } = cs;
-  const { capped_now = 0, paused_reason = null, pending_total = 0 } = state;
+  const { capped_now = 0, paused_reason = null, pending_total = 0, accounts_summary = { total: 0, capped: 0, available: 0, capped_accounts: [] } } = state;
 
   // Optimistic cancellation: set of ticket_ids removed from local view
   const [cancelled, setCancelled] = useState(() => new Set());
@@ -221,9 +221,16 @@ function CuratorTab({ projectFilter = [] }) {
   const grouped = groupBy(visible, t => t.project_id || '(unknown)');
 
   const stateBadgeClass = capped_now === 0 ? 'ok' : 'bad';
-  const stateLabel = capped_now === 0
-    ? 'Open'
-    : paused_reason ? `Capped: ${paused_reason}` : 'Capped';
+  let stateLabel;
+  if (capped_now === 1) {
+    stateLabel = paused_reason ? `Capped: ${paused_reason}` : 'Capped';
+  } else if (accounts_summary.total > 0) {
+    // Intentional: show N/M even when capped===0 (all healthy). "4/4 available" is
+    // more informative than a plain "Open" badge and makes the denominator visible.
+    stateLabel = `${accounts_summary.available}/${accounts_summary.total} available`;
+  } else {
+    stateLabel = 'Open';
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>

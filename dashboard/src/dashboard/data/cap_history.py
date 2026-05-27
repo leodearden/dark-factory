@@ -14,6 +14,8 @@ Public API
 - :func:`merge_all_accounts_capped` — intersect intervals across all accounts.
 - :func:`compute_overlap_ms` — sum capped-overlap milliseconds for a window.
 - :func:`bucketise_cap_sparkline` — produce a 0/1 :class:`ChartData` sparkline.
+- :func:`summarize_accounts` — derive per-account capped/available counts from
+  a list of :class:`CapInterval` with an optional ``total_accounts`` denominator.
 - :func:`compute_capped_now_and_windows` — derive ``(capped_now, capped_windows)``
   from a list of :class:`CapInterval`; shared by ``api_curator`` and ``_sample_curator``.
 
@@ -34,6 +36,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TypedDict
 
 import aiosqlite
 
@@ -376,21 +379,87 @@ def bucketise_cap_sparkline(
 
 
 # ---------------------------------------------------------------------------
+# summarize_accounts
+# ---------------------------------------------------------------------------
+
+
+class AccountsSummary(TypedDict):
+    """Return type for :func:`summarize_accounts`."""
+
+    total: int
+    capped: int
+    available: int
+    capped_accounts: list[str]
+    account_names: list[str]  # all distinct accounts in intervals, sorted
+
+
+def summarize_accounts(
+    intervals: list[CapInterval],
+    *,
+    total_accounts: int | None = None,
+) -> AccountsSummary:
+    """Derive per-account availability counts from a list of cap intervals.
+
+    Args:
+        intervals: List of :class:`CapInterval` objects.
+        total_accounts: True total of configured accounts (e.g.
+            ``UsageGate.account_count``).  When provided it is used as the
+            denominator so accounts with no recent cap events are counted as
+            available.  Defaults to ``None`` which falls back to the number
+            of distinct accounts observed in *intervals*.
+
+    Returns:
+        Dict with keys ``total``, ``capped``, ``available``, ``capped_accounts``
+        where:
+
+        - ``capped_accounts`` — sorted list of distinct account names that have
+          at least one open-ended interval (currently capped).
+        - ``total`` — ``max(total_accounts or 0, #distinct accounts in intervals)``.
+          The ``max()`` guards against under-reporting when ``total_accounts`` is
+          stale relative to actual cap-history.
+        - ``capped`` — ``len(capped_accounts)``.
+        - ``available`` — ``total - capped``.
+        - ``account_names`` — sorted list of all distinct account names seen in *intervals*
+          (superset of ``capped_accounts``).  Returned so callers such as
+          :func:`compute_capped_now_and_windows` can pass it to
+          :func:`merge_all_accounts_capped` without a redundant third pass.
+    """
+    capped_accounts = sorted({iv.account_name for iv in intervals if iv.end is None})
+    all_accounts = {iv.account_name for iv in intervals}
+    account_names = sorted(all_accounts)
+    total = max(total_accounts or 0, len(all_accounts))
+    capped = len(capped_accounts)
+    available = total - capped
+    return {
+        'total': total,
+        'capped': capped,
+        'available': available,
+        'capped_accounts': capped_accounts,
+        'account_names': account_names,
+    }
+
+
+# ---------------------------------------------------------------------------
 # compute_capped_now_and_windows
 # ---------------------------------------------------------------------------
 
 
 def compute_capped_now_and_windows(
     intervals: list[CapInterval],
+    total_accounts: int | None = None,
 ) -> tuple[int, list[tuple[datetime, datetime | None]]]:
     """Derive (capped_now, capped_windows) from a single intervals list.
 
     Consolidates logic that was previously duplicated in api_curator and
-    _sample_curator.  Uses asymmetric semantics intentionally:
+    _sample_curator.  Uses asymmetric semantics:
 
-    - *capped_now* uses "any account currently capped" semantics — 1 if any
-      interval has ``end=None`` at query time.  This avoids false-negatives
-      when some accounts had no events in the look-back window.
+    - *capped_now* is 1 iff the account universe is non-empty AND no account
+      is currently usable (``available == 0``), where universe size =
+      ``max(total_accounts, #accounts seen in intervals)``.  Pass
+      ``total_accounts`` (the gate's ``account_count``) so healthy accounts
+      with no recent cap events are counted as available; omit it (``None``)
+      to fall back to the cap-history universe (preserves existing behaviour
+      when the gate is not reachable).
     - *capped_windows* uses "all accounts simultaneously capped" semantics via
       :func:`merge_all_accounts_capped` on a **sorted** ``account_names`` list
       for deterministic merge-event ordering across reruns.
@@ -401,12 +470,15 @@ def compute_capped_now_and_windows(
             ``list[CapInterval]`` from :func:`read_cap_intervals`; the
             ``list`` annotation matches reality and avoids the overhead of
             a redundant materialisation pass.
+        total_accounts: True total of configured accounts; see
+            :func:`summarize_accounts`.  Defaults to ``None``.
 
     Returns:
         ``(capped_now, capped_windows)`` where ``capped_now`` is 0 or 1 and
         ``capped_windows`` is the output of :func:`merge_all_accounts_capped`.
     """
-    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
-    account_names = sorted({iv.account_name for iv in intervals})
-    capped_windows = merge_all_accounts_capped(intervals, account_names)
+    summary = summarize_accounts(intervals, total_accounts=total_accounts)
+    capped_now = 1 if summary['total'] > 0 and summary['available'] == 0 else 0
+    # Reuse account_names from summary — avoids a third pass over intervals.
+    capped_windows = merge_all_accounts_capped(intervals, summary['account_names'])
     return capped_now, capped_windows
