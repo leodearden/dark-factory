@@ -3624,6 +3624,19 @@ Output JSON matching the schema. Every task must appear in the output.
                 'pause_scheduler raised on %s trip; stopping supervisor anyway',
                 reason,
             )
+        # File the watcher-outage L2 so the human L2 stream is notified even
+        # when the watcher subsystem is not running.  Best-effort: a filing
+        # failure must never prevent the return True that stops the supervisor.
+        try:
+            self._file_watcher_outage_l2(reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                '_file_watcher_outage_l2 raised on %s trip; stopping supervisor anyway',
+                reason,
+                exc_info=True,
+            )
         return True  # always stop, even if pause_scheduler raised
 
     async def _scan_for_terminal_active_tasks(self) -> int:
