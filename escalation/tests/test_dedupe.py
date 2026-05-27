@@ -455,8 +455,9 @@ class TestComputeContentFingerprint:
         The key identity tuple: ('recon_integrity_issue', 'entity_mismatch', 'id-sentinel')
         joined by \\x1f (unit separator).
         """
-        from escalation.dedupe import compute_content_fingerprint
         import hashlib
+
+        from escalation.dedupe import compute_content_fingerprint
         # Compute what the expected fingerprint should be:
         # identity = escalation_category \x1f finding_category \x1f body
         # body = sorted(['id-sentinel']) joined by \x1f = 'id-sentinel'
@@ -710,8 +711,6 @@ class TestDedupeConfigForRecon:
 
     def test_for_recon_does_not_fold_different_fingerprints(self, tmp_path):
         """(2) Different fingerprints do NOT fold under for_recon()."""
-        from datetime import UTC, datetime, timedelta
-
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -728,8 +727,6 @@ class TestDedupeConfigForRecon:
 
     def test_for_recon_handles_recon_category(self, tmp_path):
         """(3) for_recon() config handles recon_integrity_issue category via find_dedupe_parent."""
-        from datetime import UTC, datetime, timedelta
-
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -910,7 +907,6 @@ class TestSubmitOrDedupe:
     def test_toctou_falls_through_to_submit(self, tmp_path, monkeypatch):
         """TOCTOU: find_dedupe_parent resolves parent before returning => escalation queued."""
         import escalation.dedupe as dedupe_module
-
         from escalation.dedupe import DedupeConfig, submit_or_dedupe
         from escalation.queue import EscalationQueue
 
