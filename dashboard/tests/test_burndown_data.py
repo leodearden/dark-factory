@@ -21,6 +21,7 @@ from dashboard.data.burndown import (
     aggregate_burndown_projects,
     aggregate_burndown_series,
     collect_snapshot,
+    compute_window_completion,
     downsample,
     get_burndown_projects,
     get_burndown_series,
@@ -2082,3 +2083,52 @@ class TestAggregateBurndownSeries:
         assert result['done'][idx1] == 10
         idx3 = result['labels'].index(ts3)
         assert result['done'][idx3] == 30
+
+
+# ---------------------------------------------------------------------------
+# compute_window_completion
+# ---------------------------------------------------------------------------
+
+
+class TestComputeWindowCompletion:
+    """Tests for the compute_window_completion pure helper."""
+
+    def test_monotonic_done_over_7_distinct_days(self):
+        """Delta of [0, 0, 1, 1, 1, 2, 3] across 7 distinct days → completed=3, velocity=3/7."""
+        labels = [f'2026-05-{19 + i:02d}T00:00:00' for i in range(7)]
+        done = [0, 0, 1, 1, 1, 2, 3]
+        result = compute_window_completion({'labels': labels, 'done': done, 'pending': [10] * 7})
+        assert result['completed'] == 3
+        assert abs(result['velocity'] - 3 / 7) < 1e-9
+
+    def test_reopened_task_clamps_at_zero(self):
+        """When done dips at the end [5, 6, 7, 6], completed = max(0, 6-5) = 1."""
+        labels = [f'2026-05-{20 + i:02d}T00:00:00' for i in range(4)]
+        done = [5, 6, 7, 6]
+        result = compute_window_completion({'labels': labels, 'done': done, 'pending': [10] * 4})
+        assert result['completed'] == 1
+        assert abs(result['velocity'] - 1 / 4) < 1e-9
+
+    def test_empty_labels_returns_zeros(self):
+        """Empty series → completed=0, velocity=0.0."""
+        result = compute_window_completion({'labels': [], 'done': [], 'pending': []})
+        assert result['completed'] == 0
+        assert result['velocity'] == 0.0
+
+    def test_single_snapshot_returns_zeros(self):
+        """Single snapshot has no delta → completed=0, velocity=0.0."""
+        result = compute_window_completion({'labels': ['2026-05-20T00:00:00'], 'done': [42], 'pending': [5]})
+        assert result['completed'] == 0
+        assert result['velocity'] == 0.0
+
+    def test_flat_series_regression(self):
+        """100 snapshots all done=5 in one day → completed=0, velocity=0.0.
+
+        Regression: the buggy frontend code would yield sum(5*100)/100 = 5/day.
+        The correct delta-based answer is max(0, 5-5) = 0.
+        """
+        labels = [f'2026-05-20T{h:02d}:{m:02d}:00' for h in range(0, 10) for m in range(0, 10)][:100]
+        done = [5] * 100
+        result = compute_window_completion({'labels': labels, 'done': done, 'pending': [10] * 100})
+        assert result['completed'] == 0
+        assert result['velocity'] == 0.0
