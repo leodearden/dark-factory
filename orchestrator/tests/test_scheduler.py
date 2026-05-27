@@ -3568,6 +3568,45 @@ class TestBlastRadiusRefinement:
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
 
+    @pytest.mark.asyncio
+    async def test_acquire_failure_preserves_memory_hints(self, scheduler: Scheduler):
+        """Sibling keys set by Stage-2 reconciliation survive the blast-radius files write.
+
+        When lock acquisition fails and the scheduler rewrites metadata.files,
+        it must read the current backend metadata first so that memory_hints and
+        _causation_id attached after the task went in-progress are not clobbered.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        assert lt.try_acquire('other', ['crates/reify-compiler/src/conformance.rs'])
+
+        backend_md = {
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+            '_causation_id': 'C1',
+        }
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': backend_md}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is False
+        assert update_task.await_args is not None
+        _, _args = update_task.await_args.args, update_task.await_args
+        persisted = update_task.await_args.args[1]
+        assert persisted == {
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+            '_causation_id': 'C1',
+            'files': ['crates/reify-compiler/src/conformance.rs'],
+        }, f'Sibling keys from backend must survive blast-radius files write; got {persisted}'
+
 
 class TestSchedulerMcpSessionDI:
     """Tests for the optional mcp_session dependency-injection kwarg on Scheduler.
