@@ -327,9 +327,14 @@ class TestReconEscalationDedup:
     # ── Step 5: non-finding categories fold on summary ──────────────────
 
     @pytest.mark.parametrize('category', [
+        # Three non-finding-only categories plus recon_integrity_issue (which has
+        # finding-aware paths but also except-arm paths called WITHOUT a finding,
+        # e.g. "Remediation orchestration failed" and "Remediation pass failed").
+        # All four must fold on summary when finding=None.
         'recon_failure',
         'recon_stale_run',
         'recon_backlog_overflow',
+        'recon_integrity_issue',
     ])
     def test_non_finding_categories_dedup_on_summary(self, tmp_path, category):
         """Non-finding recon categories fold identical summaries and keep distinct ones.
