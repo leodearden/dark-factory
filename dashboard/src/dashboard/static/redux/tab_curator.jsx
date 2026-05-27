@@ -225,6 +225,8 @@ function CuratorTab({ projectFilter = [] }) {
   if (capped_now === 1) {
     stateLabel = paused_reason ? `Capped: ${paused_reason}` : 'Capped';
   } else if (accounts_summary.total > 0) {
+    // Intentional: show N/M even when capped===0 (all healthy). "4/4 available" is
+    // more informative than a plain "Open" badge and makes the denominator visible.
     stateLabel = `${accounts_summary.available}/${accounts_summary.total} available`;
   } else {
     stateLabel = 'Open';

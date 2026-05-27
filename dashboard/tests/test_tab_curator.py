@@ -383,8 +383,8 @@ def test_tab_curator_jsx_renders_accounts_summary(tab_curator_jsx_body: str) -> 
         'tab_curator.jsx state pill does not destructure or reference accounts_summary — '
         'add accounts_summary to the const { ... } = state destructure in CuratorTab.'
     )
-    assert re.search(r'accounts_summary[\s\S]{0,400}available', tab_curator_jsx_body), (
-        'tab_curator.jsx does not reference available within 400 chars of accounts_summary — '
+    assert re.search(r'accounts_summary\.available', tab_curator_jsx_body), (
+        'tab_curator.jsx does not use the property access accounts_summary.available — '
         'UI still shows only Capped/Open without a count. '
         'Add the `${accounts_summary.available}/${accounts_summary.total} available` '
         'label to the badge ternary in the state pill.'
