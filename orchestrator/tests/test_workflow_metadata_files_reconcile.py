@@ -87,6 +87,9 @@ async def test_writes_merge_diff_files_when_merge_sha_and_base_commit_set(
     update_task.assert_awaited_once_with(
         '101', {'files': ['src/landed_a.py', 'src/landed_b.py']},
     )
+    # Anchor the read half of the RMW — prevents silent regression where
+    # get_task is skipped and only the bare {'files': ...} payload is sent.
+    wf.scheduler.get_task.assert_awaited_once_with('101')
 
 
 @pytest.mark.asyncio

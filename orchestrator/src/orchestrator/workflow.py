@@ -470,6 +470,10 @@ class TaskWorkflow:
             log_context='done metadata files reconcile',
         )
         merged['files'] = files
+        # Optimistically update in-memory so downstream reads in this session
+        # see the expected state.  In-memory is intentionally optimistic; the
+        # backend is the authority and will be re-read on the next reconcile
+        # cycle if this write fails (consistent with _handle_no_plan_failure).
         self.task['metadata'] = merged
         await self.scheduler.update_task(self.task_id, merged)
 

@@ -2675,6 +2675,10 @@ class Scheduler:
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
         # degrades gracefully to the prior {'files': needed} write.
+        # Note: this is intentionally backend-only — the scheduler holds no per-task
+        # in-memory metadata to merge with (unlike workflow._reconcile_metadata_files_for_done,
+        # which overlays backend onto in-memory via _merge_fresh_metadata). The merge policy
+        # is {**fresh_md, 'files': needed}: Stage-2 sibling keys survive, 'files' wins.
         fresh = await self.get_task(task_id)
         fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
         merged = {**fresh_md, 'files': needed}

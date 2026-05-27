@@ -3599,7 +3599,6 @@ class TestBlastRadiusRefinement:
 
         assert ok is False
         assert update_task.await_args is not None
-        _, _args = update_task.await_args.args, update_task.await_args
         persisted = update_task.await_args.args[1]
         assert persisted == {
             'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
