@@ -15,6 +15,7 @@ from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _format_task_id,
     _merge_metadata,
+    _normalize_legacy_memory_hints_value,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -380,6 +381,45 @@ def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
     new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
     result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
     assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
+
+
+def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
+    """_normalize_legacy_memory_hints_value correctly handles edge cases in the list.
+
+    Proves:
+    * dict entries with only entity → entity extracted, no query
+    * dict entries with only query → query extracted, no entity
+    * dict entries with both → both extracted
+    * empty dicts → skipped
+    * non-dict items (str, None) → skipped
+    * empty-string entity/query → skipped
+    * None-valued entity/query → skipped
+    * already-canonical dict input → returned unchanged (pass-through)
+    * None input → returned unchanged (pass-through)
+
+    Cross-reference: test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict
+    covers the full _merge_metadata path; this test locks the helper's semantics.
+    """
+    # Mixed/malformed list
+    malformed = [
+        {"entity": "E1"},           # only entity — ok
+        {"query": "q1"},            # only query — ok
+        {"entity": "E2", "query": "q2"},  # both — ok
+        {},                         # empty dict — skip
+        "not-a-dict",               # non-dict — skip
+        None,                       # non-dict — skip
+        {"entity": ""},             # empty string — skip
+        {"query": None},            # None value — skip
+    ]
+    result = _normalize_legacy_memory_hints_value(malformed)
+    assert result == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
+
+    # Already-canonical dict — pass-through
+    canonical = {"entities": ["X"], "queries": ["q"]}
+    assert _normalize_legacy_memory_hints_value(canonical) is canonical
+
+    # None — pass-through
+    assert _normalize_legacy_memory_hints_value(None) is None
 
 
 # ── add_subtask / nested IDs ───────────────────────────────────────
