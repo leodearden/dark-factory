@@ -42,7 +42,8 @@ async def _info(server, **kwargs: Any) -> dict[str, Any]:
 
 async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
     tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
+    # get_pending_escalations is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------

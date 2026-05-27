@@ -282,12 +282,24 @@ def create_server(
     @mcp.tool()
     def get_pending_escalations(
         task_id: str | None = None,
+        level: int | None = None,
     ) -> list[dict[str, Any]]:
-        """List all pending escalations, optionally filtered by task ID."""
+        """List all pending escalations, optionally filtered by task ID and/or level.
+
+        *level* — when set, returns only escalations at the given escalation level:
+          0 = L0 (agent→steward), 1 = L1 (steward/workflow→auto-watcher),
+          2 = L2 (auto-watcher→human).
+        When omitted, all pending escalations are returned regardless of level.
+
+        *task_id* — when set, restricts the search to escalations for that task.
+        Both filters can be combined.
+        """
         if task_id:
-            escalations = queue.get_by_task(task_id, status='pending')
+            escalations = queue.get_by_task(task_id, status='pending', level=level)
         else:
             escalations = queue.get_pending()
+            if level is not None:
+                escalations = [e for e in escalations if e.level == level]
         return [e.to_dict() for e in escalations]
 
     @mcp.tool()
