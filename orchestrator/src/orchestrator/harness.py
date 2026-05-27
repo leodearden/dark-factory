@@ -107,9 +107,12 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
-    # Escalation MCP: read + autonomous resolve
+    # Escalation MCP: read + autonomous resolve + L1→L2 promotion
+    # (promote_to_l2 is needed by the consumer-per-level contract so the
+    # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__resolve_issue',
+    'mcp__escalation__promote_to_l2',
     # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
