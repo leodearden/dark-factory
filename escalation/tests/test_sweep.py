@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+_WORKTREE_SRC = str(Path(__file__).parent.parent / 'src')
 
 from escalation import sweep
 from escalation.models import Escalation
@@ -330,3 +333,57 @@ class TestSweepIdempotency:
         assert report2.reconciled_archive_wins == 0
         assert report2.untouched_pending == 1
         assert self._disk_snapshot(tmp_path) == snapshot
+
+
+class TestSweepCli:
+    """CLI entry point: main() and __main__ guard."""
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_cli_dry_run_default_returns_0_and_does_not_move(self, tmp_path: Path, caplog):
+        """main(['--queue-dir', ...]) returns 0, leaves files in root, logs DRY-RUN."""
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            result = sweep.main(['--queue-dir', str(tmp_path)])
+        assert result == 0
+        assert (tmp_path / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'archive').exists()
+        assert any(
+            'DRY-RUN' in r.getMessage() and 'archived=1' in r.getMessage()
+            for r in caplog.records
+        ), f'Expected DRY-RUN summary; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_cli_apply_returns_0_and_moves(self, tmp_path: Path, caplog):
+        """main(['--queue-dir', ..., '--apply']) returns 0 and archives the file."""
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            result = sweep.main(['--queue-dir', str(tmp_path), '--apply'])
+        assert result == 0
+        assert not (tmp_path / 'esc-1-1.json').exists()
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert any(
+            'APPLIED' in r.getMessage() for r in caplog.records
+        ), f'Expected APPLIED summary; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_cli_missing_queue_dir_returns_2_and_logs_error(self, tmp_path: Path, caplog):
+        """main(['--queue-dir', '/no-such-dir']) returns 2 and logs error."""
+        missing = tmp_path / 'no-such-dir'
+        with caplog.at_level(logging.ERROR, logger='escalation.sweep'):
+            result = sweep.main(['--queue-dir', str(missing)])
+        assert result == 2
+        assert any(
+            'queue-dir does not exist' in r.getMessage() for r in caplog.records
+        ), f'Expected missing-dir error; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_main_block_shell_exit_code_is_2_for_missing_queue_dir(self):
+        """The __main__ guard propagates main()'s return value via sys.exit().
+
+        Uses PYTHONPATH so the subprocess can find sweep.py when running from
+        a worktree where it is not yet installed in the editable venv.
+        """
+        proc = subprocess.run(
+            [sys.executable, '-m', 'escalation.sweep', '--queue-dir', '/no/such/path'],
+            capture_output=True,
+            env={**os.environ, 'PYTHONPATH': _WORKTREE_SRC},
+        )
+        assert proc.returncode == 2
