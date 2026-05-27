@@ -326,6 +326,18 @@ class Harness:
         # task status transitions.  See zombie-escalation fix Step 4.
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
 
+        # Per-task asyncio.Task handle for the _run_slot coroutine — registered
+        # at _run_slot start, popped in its finally.  Enables hard-cancel
+        # fallback when a workflow ignores the soft cancel_event.
+        # See task 1491, ITEM 2 (hard-cancel fallback).
+        self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
+
+        # Consecutive terminal-status poll counts per task.  Incremented each
+        # poll a workflow is terminal but still active; reset when it is no
+        # longer terminal or drops out of the active set.  Controls the
+        # soft→hard cancel threshold (config.terminal_status_hard_cancel_polls).
+        self._terminal_cancel_counts: dict[str, int] = {}
+
         # Background poll: periodically check fused-memory for active tasks
         # whose status has flipped to terminal out-of-band (typically a human
         # marking a task done via /unblock).  When detected, set the cancel
@@ -1732,6 +1744,12 @@ Output JSON matching the schema. Every task must appear in the output.
             cancel_event = asyncio.Event()
             self._workflow_cancel_events[assignment.task_id] = cancel_event
 
+            # Register the asyncio.Task handle for this slot so hard_cancel_workflow
+            # can request a hard cancel if the workflow ignores the soft event.
+            # current_task() is safe here because _run_slot is always scheduled
+            # as an asyncio.Task (via create_task in _acquire_and_run_slot).
+            self._workflow_slot_tasks[assignment.task_id] = asyncio.current_task()  # type: ignore[assignment]
+
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
             recovered_session = self._recovered_sessions.pop(assignment.task_id, None)
             # Drop any preserved-worktree marker once the slot picks the task up.
@@ -1841,6 +1859,8 @@ Output JSON matching the schema. Every task must appear in the output.
             self._escalation_events.pop(assignment.task_id, None)
             self._workflow_cancel_events.pop(assignment.task_id, None)
             self._workflow_cancel_at.pop(assignment.task_id, None)
+            self._workflow_slot_tasks.pop(assignment.task_id, None)
+            self._terminal_cancel_counts.pop(assignment.task_id, None)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
             if report is not None:
                 requeued = await self._apply_retry_cap(
@@ -2691,6 +2711,33 @@ Output JSON matching the schema. Every task must appear in the output.
     def is_workflow_active(self, task_id: str) -> bool:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
+
+    def hard_cancel_workflow(self, task_id: str) -> bool:
+        """Hard-cancel the asyncio.Task running the workflow slot for ``task_id``.
+
+        This is the escalation path when a workflow ignores the soft
+        ``cancel_event`` (set by ``cancel_workflow``) for too long.
+        Requesting asyncio.Task.cancel() forces a ``CancelledError`` into the
+        coroutine's next await point; the ``_run_slot`` finally block still
+        runs (CancelledError is BaseException, so it bypasses the
+        ``except Exception`` guard at harness.py:1833) ensuring lock release
+        and registry cleanup.
+
+        Re-stamps ``_workflow_cancel_at`` for the R3 reconcile grace window,
+        mirroring ``cancel_workflow``.
+
+        Returns ``True`` iff a live (non-done) slot task was found and
+        ``cancel()`` was requested.  Returns ``False`` when there is no
+        registered slot task or it is already done — the call is a no-op and
+        the caller should treat this as a no-op.
+        """
+        task = self._workflow_slot_tasks.get(task_id)
+        if task is None or task.done():
+            return False
+        # Stamp wall-clock so the reconcile sweep respects the R3 grace window.
+        self._workflow_cancel_at[task_id] = time.monotonic()
+        task.cancel()
+        return True
 
     # ------------------------------------------------------------------
     # Terminal-status watcher (zombie-escalation fix Step 5)

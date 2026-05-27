@@ -29,6 +29,8 @@ def harness() -> Harness:
     # window (R3 race guard).  Initialise here so the bypass-__init__
     # fixture matches the real Harness attribute set.
     h._workflow_cancel_at = {}
+    # hard_cancel_workflow reads _workflow_slot_tasks (task 1491, step-6).
+    h._workflow_slot_tasks = {}
     return h
 
 
@@ -56,3 +58,42 @@ def test_cancel_workflow_idempotent(harness: Harness):
     # Already-set event is fine; cancel still reports active=True.
     assert harness.cancel_workflow('42') is True
     assert event.is_set() is True
+
+
+# ---------------------------------------------------------------------------
+# hard_cancel_workflow — task 1491, ITEM 2
+# ---------------------------------------------------------------------------
+
+
+def test_hard_cancel_workflow_returns_false_when_no_slot(harness: Harness):
+    """Returns False when no slot task is registered for the task_id."""
+    assert harness.hard_cancel_workflow('does-not-exist') is False
+
+
+@pytest.mark.asyncio
+async def test_hard_cancel_workflow_cancels_registered_task(harness: Harness):
+    """When a live asyncio.Task is registered, hard_cancel_workflow cancels it
+    and returns True."""
+    slot_task = asyncio.ensure_future(asyncio.sleep(3600))
+    harness._workflow_slot_tasks['42'] = slot_task
+
+    result = harness.hard_cancel_workflow('42')
+    assert result is True
+
+    # Allow the event loop to propagate the cancellation.
+    with pytest.raises(asyncio.CancelledError):
+        await slot_task
+    assert slot_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_hard_cancel_workflow_returns_false_for_done_task(harness: Harness):
+    """Returns False when the registered task is already done."""
+    slot_task = asyncio.ensure_future(asyncio.sleep(0))
+    await slot_task  # let it complete
+
+    harness._workflow_slot_tasks['42'] = slot_task
+    assert slot_task.done()
+
+    result = harness.hard_cancel_workflow('42')
+    assert result is False
