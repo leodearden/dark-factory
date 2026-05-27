@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from orchestrator.analyze_modules import (
     ModuleStats,
     _first_component,
+    _iter_events,
     _parse_since,
     aggregate,
     render_json,
@@ -117,3 +121,48 @@ def test_render_json_is_machine_readable():
     # conflict = 7/4 = 1.75 (>= 0.5 but < 2.0) → suggest 2.
     assert payload['crates']['conflict_rate'] == 1.75
     assert payload['crates']['suggested_max_per_module'] == 2
+
+
+def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
+    """_iter_events must open runs.db via a read-only file:/// URI (uri=True, ?mode=ro).
+
+    Modelled on dashboard/tests/test_db.py::test_get_builds_sqlite_uri_via_path_as_uri
+    and fused-memory/tests/test_scheduler_state_tools.py.
+
+    The spy delegates to the real sqlite3.connect so the SELECT still executes
+    and the generator's finally-block closes the connection normally.
+    """
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='1',
+        data={'modules': ['crates/foo/src']},
+    )
+
+    real_connect = sqlite3.connect
+    captured_uri: str | None = None
+    captured_uri_kwarg: bool | None = None
+
+    def spy(*args, **kwargs):
+        nonlocal captured_uri, captured_uri_kwarg
+        captured_uri = args[0] if args else None
+        captured_uri_kwarg = kwargs.get('uri')
+        return real_connect(*args, **kwargs)
+
+    since = datetime.now(UTC) - timedelta(days=1)
+    with patch('orchestrator.analyze_modules.sqlite3.connect', spy):
+        rows = list(_iter_events(event_store.db_path, since))
+
+    # URI contract — single exact-match subsumes all substring checks.
+    # Enforces: file:/// prefix, .resolve() present, ?mode=ro suffix, uri=True kwarg.
+    expected_uri = event_store.db_path.resolve().as_uri() + '?mode=ro'
+    assert captured_uri == expected_uri, (
+        f'Expected read-only URI {expected_uri!r}, got {captured_uri!r}'
+    )
+    assert captured_uri_kwarg is True, (
+        f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
+    )
+
+    # Reads still work — seeded event is returned.
+    assert len(rows) == 1
+    _ts, event_type, _task_id, _data = rows[0]
+    assert event_type == 'lock_acquired'
