@@ -305,16 +305,20 @@ through can be cleaned up in a later consolidation cycle.
 Before emitting a "missing completion summary" finding for a specific task, ALSO \
 search Mem0 for a completion summary written by TaskInterceptor / TargetedReconciliation:
 
-  search(query="task completion summary", project_id=..., \
-  categories=['observations_and_summaries'], stores=['mem0'], limit=20)
+  search(query="task completion summary task_id=<task_id> source=targeted_reconciliation", \
+  project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=20)
+
+Including `task_id=<task_id>` in the query biases the vector ranking toward the specific \
+task's entry (mirroring the Flag Suppression Check which uses \
+`query="stage1_flag_suppression task_id=<N>"`); without it a generic query risks ranking \
+the relevant entry out of the top-20 when many tasks have completion summaries.
 
 Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
 missing-completion-summary finding for that task:
   1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
 to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
-  2. `result.metadata.get('source') in ('targeted_reconciliation', 'stage2_backfill')` \
-OR the result content contains a recognisable completion phrase such as \
-"completed" or "transition: done"
+  2. `result.metadata.get('source') == 'targeted_reconciliation'` \
+OR the result content contains "completed"
 
 Rationale: completion summaries written by `source=targeted_reconciliation` \
 (`TargetedReconciliation._on_task_done`) and TaskInterceptor carry \
