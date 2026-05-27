@@ -311,7 +311,7 @@ class TaskArtifacts:
         incompatible with main).
 
         The workflow short-circuits to a level-1 escalation, bypassing the
-        steward — only a human can rewrite or cancel the task.
+        steward — the auto-watcher triages; a human (L2) rewrites or cancels the task.
         """
         data = {
             'reason': reason,
@@ -342,7 +342,7 @@ class TaskArtifacts:
         RED-test premise is false, unreachable, or misattributed.
 
         The workflow short-circuits to a level-1 design_concern escalation,
-        bypassing the steward — only a human/curator can re-spec the premise.
+        bypassing the steward — the auto-watcher triages; a human/curator (L2) re-specs the premise.
         """
         data = {
             'classification': classification,

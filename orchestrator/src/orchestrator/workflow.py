@@ -69,7 +69,7 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
 
 
 class _StewardReescalated(Exception):
-    """Raised when the steward re-escalates to level-1 (human intervention)."""
+    """Raised when the steward re-escalates to level-1 (consumed by the auto-watcher, which may promote to L2 for a human)."""
 
     def __init__(self, escalations):
         self.escalations = escalations
@@ -4122,7 +4122,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Wait for all level-0 pending escalations to be resolved.
 
         Raises ``_StewardReescalated`` if the steward re-escalated to
-        level-1 (human), indicating the task should be blocked.
+        level-1 (consumed by the auto-watcher), indicating the task should be blocked.
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -4840,7 +4840,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, status='pending', level=0,
                 )
                 if not remaining:
-                    # Guard: if the steward escalated to L1 (human-only),
+                    # Guard: if the steward escalated to L1 (auto-watcher consumer),
                     # leave the task's status untouched and exit.  L0-empty
                     # alone does not mean "all clear" — an open L1 signals
                     # that the steward handed off.
@@ -5491,7 +5491,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Wait for the steward to finish pending work, with grace period.
 
         On timeout, auto-re-escalate remaining level-0 escalations to
-        level 1 (steward→human) and dismiss the originals.
+        level 1 (steward→auto-watcher) and dismiss the originals.
 
         Only waits if the steward is actually running — otherwise there's
         nothing to wait for.
