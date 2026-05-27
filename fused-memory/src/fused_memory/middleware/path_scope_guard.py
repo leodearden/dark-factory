@@ -40,13 +40,27 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     """Build (and cache) a compiled regex for the given prefix tuple.
 
     Each prefix is anchored by a leading word boundary: start-of-string OR
-    a character that is NOT ``[A-Za-z0-9_-]``.  Stops e.g.
-    ``foo-orchestrator/`` from matching ``orchestrator/`` while still
-    matching bare ``orchestrator/`` after whitespace or punctuation.
+    a character that is NOT ``[A-Za-z0-9_\\-/.]``.  This means a prefix
+    matches ONLY as a *leading* path component — at start-of-string or after
+    whitespace, punctuation, quotes, colons, etc. — but NOT when preceded by a
+    path separator (``/``) or a dot (``.``).
+
+    Excluding ``/`` and ``.`` from the boundary class ensures that mid-path
+    occurrences like ``vendor/corpus/expr.txt`` or ``x.corpus/foo`` do NOT
+    match the bare prefix ``corpus/``, eliminating the false-positive routing
+    of tasks whose text merely passes *through* a known-project directory.
+
+    Note: ``\\-`` is kept escaped (literal hyphen, no range); ``/`` and ``.``
+    are plain literals inside the class.
+
+    Cache note: ``_PATTERN_CACHE`` is keyed by the prefix tuple; the boundary
+    class is a compile-time constant (not a runtime variable), so no cache
+    invalidation or versioning is needed when the pattern template changes —
+    only new prefixes cause a new compile.
     """
     if prefixes not in _PATTERN_CACHE:
         alts = '|'.join(re.escape(p) for p in prefixes)
-        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-]))({alts})')
+        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-/.]))({alts})')
         _PATTERN_CACHE[prefixes] = pattern
     return _PATTERN_CACHE[prefixes]
 
