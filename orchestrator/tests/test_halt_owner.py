@@ -174,6 +174,31 @@ class TestHaltOwnerUnhaltPredicate:
         assert not worker.is_wip_halted
 
 
+class TestRehydrateMergeHalt:
+    """Harness._rehydrate_merge_halt restores halt+owner from preserved L1s on restart."""
+
+    def test_rehydrate_restores_halt_and_owner_from_preserved_wip_conflict(
+        self, harness: Harness
+    ):
+        """Core regression: after restart with a preserved wip_conflict L1,
+        the halt and owner must be restored.  Simulates restart by assigning
+        a fresh (un-halted, owner=None) _FakeMergeWorker and calling
+        _rehydrate_merge_halt() directly.
+        """
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '1111')  # level-1, wip_conflict (preserved L1)
+
+        result = harness._rehydrate_merge_halt()
+
+        assert worker.is_wip_halted is True
+        assert worker.halt_owner_esc_id == esc.id
+        assert result == esc.id
+
+
 class TestForceUnhaltMergeQueue:
     """Operator escape hatch for orphan halts (no escalation owns the halt).
 
