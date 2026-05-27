@@ -70,9 +70,33 @@ def repo_root() -> Path | None:
 
 
 @pytest.fixture(autouse=True)
-def _clear_orch_config_path(monkeypatch):
-    """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
+def _isolate_orch_config(monkeypatch, tmp_path):
+    """Isolate OrchestratorConfig from the real project tree for every test.
+
+    ORCH_CONFIG_PATH is removed so tests don't inadvertently load the real
+    config via that env var.
+
+    project_root isolation (the load-bearing part): with ORCH_CONFIG_PATH unset,
+    the settings source (``settings_customise_sources``) falls back to the
+    *relative* ``Path('config.yaml')``.  Running ``cd orchestrator && pytest``
+    (exactly how the per-subproject test command invokes us) therefore loads the
+    tracked ``orchestrator/config.yaml``, whose ``project_root`` resolves to the
+    real repo root.  Any test that builds a bare ``OrchestratorConfig()`` and
+    drives ``acquire_next`` then writes
+    ``<repo>/data/orchestrator/scheduler_state.json`` (and the overrides SQLite
+    DB) into the live tree — which the dashboard reads back as real scheduler
+    state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
+    ``tmp_path`` so those writes land in tmp instead.
+
+    Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
+    kwargs) still win over the env, and ``env_settings`` only overrides
+    ``project_root`` — every other field still loads from config.yaml/defaults,
+    so tests that depend on config.yaml values (e.g. lock_depth) are unaffected.
+    Config-loading tests already use ``tmp_path`` as their project_root, so the
+    env value agrees with the YAML they write.
+    """
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)

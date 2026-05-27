@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -396,6 +397,30 @@ class TestGetStateSnapshotShape:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=3))
         snap = scheduler.get_state_snapshot()
         assert snap['lock_depth'] == 3
+
+    def test_bare_config_project_root_isolated_to_tmp(self, tmp_path):
+        """Bare OrchestratorConfig() must NOT resolve project_root to the real repo.
+
+        Regression guard for the snapshot-pollution bug: with ORCH_CONFIG_PATH
+        unset, the settings source falls back to the relative ``config.yaml``,
+        so ``cd orchestrator && pytest`` would load the tracked
+        ``orchestrator/config.yaml`` (project_root → real repo) and let
+        ``acquire_next`` write ``<repo>/data/orchestrator/scheduler_state.json``
+        — which the dashboard then displays as live state.  The autouse
+        ``_isolate_orch_config`` fixture pins project_root to this test's
+        tmp_path via ORCH_PROJECT_ROOT; assert that isolation holds and that the
+        derived snapshot path stays under tmp, never the real tree.
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        assert config.project_root == tmp_path.resolve(), (
+            f'project_root leaked outside tmp: {config.project_root!r} — the '
+            'autouse config-isolation fixture is not active or was overridden.'
+        )
+        scheduler = Scheduler(config)
+        snapshot_path = (
+            Path(scheduler._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+        )
+        assert snapshot_path.is_relative_to(tmp_path.resolve())
 
     def test_snapshot_is_deep_copy_of_internal_state(self):
         """Mutating the returned snapshot must not affect the scheduler's internal state."""
