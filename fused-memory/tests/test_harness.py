@@ -5432,8 +5432,13 @@ async def test_unresolved_after_remediation_escalates_when_persistence_meets_thr
     actionable_finding = _make_s3_findings()[0]
     assert actionable_finding['actionable'] is True
 
-    # Seed N-1 prior completed runs containing the target finding
-    n_seed = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 1  # 2 by default
+    # Seed N-2 prior completed runs.
+    # Persistence is counted across ALL completed runs (prior seeded + parent full
+    # run + current remediation run) because both are completed and their stage
+    # reports are persisted before _finding_persistence_count is called.
+    # Total = (N-2 seeded) + 1 parent + 1 remediation = N = threshold.
+    # So seed N-2 = 1 run for the default threshold of 3.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)  # 1 by default
     base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
 
     for i in range(n_seed):

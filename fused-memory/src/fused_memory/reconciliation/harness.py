@@ -1430,8 +1430,12 @@ class ReconciliationHarness:
                         self._escalate(
                             'recon_integrity_issue',
                             run_id,
-                            f'Unresolved after remediation: {finding.get("description", "?")}',
-                            detail=json.dumps(finding, default=str),
+                            f'Persistently unresolved after remediation '
+                            f'({persistence} cycles): {finding.get("description", "?")}',
+                            detail=json.dumps(
+                                {**finding, 'persistence': persistence},
+                                default=str,
+                            ),
                             finding=finding,
                         )
                     else:
