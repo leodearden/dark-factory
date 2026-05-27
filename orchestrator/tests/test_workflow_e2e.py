@@ -5389,14 +5389,12 @@ class TestMarkBlockedBypassDetection:
             f'{[(e.id, e.category) for e in l1]}'
         )
 
-        # The summary must be derived from exc.old_status — not the hardcoded
-        # literal 'row already done'.
-        summary = bypass_l1[0].summary
-        assert "row is 'done'" in summary, (
-            f"Expected \"row is 'done'\" in bypass_done summary, got: {summary!r}"
-        )
-        assert 'already done' not in summary, (
-            f"Expected hardcoded 'already done' to be absent from summary, got: {summary!r}"
+        # Assert old_status is surfaced in the structured detail field — a
+        # durable behavioral check that doesn't pin prose wording in the summary.
+        detail = bypass_l1[0].detail
+        assert 'old_status: done' in detail, (
+            f"Expected 'old_status: done' in bypass_done detail (structured field), "
+            f"got: {detail!r}"
         )
 
     async def test_run_aborts_gracefully_when_task_cancelled_at_setup(

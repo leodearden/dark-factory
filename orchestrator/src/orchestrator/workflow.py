@@ -1062,13 +1062,10 @@ class TaskWorkflow:
             # out-of-band before setup completed.  Release locks (via the
             # finally block) and exit gracefully — no reopen, no escalation,
             # no phase transition to BLOCKED.
-            if isinstance(exc, TerminalExitRejection) and exc.old_status == 'cancelled':
-                logger.info(
-                    'Task %s cancelled out-of-band before setup completed — '
-                    'aborting gracefully (no reopen, no escalation)',
-                    self.task_id,
-                )
-                return WorkflowOutcome.CANCELLED
+            if isinstance(exc, TerminalExitRejection):
+                outcome = self._handle_cancelled_terminal_exit(exc)
+                if outcome is not None:
+                    return outcome
 
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
@@ -4284,6 +4281,25 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         self.escalation_queue.submit(esc)
 
+    def _handle_cancelled_terminal_exit(
+        self, exc: TerminalExitRejection,
+    ) -> 'WorkflowOutcome | None':
+        """Return ``WorkflowOutcome.CANCELLED`` when *exc* signals an authoritative
+        user/manual cancellation (``exc.old_status == 'cancelled'``), else ``None``.
+
+        Centralises the predicate and log message used at two sites — run()'s
+        ``SetTaskStatusRejected`` guard and ``_handle_terminal_exit_on_block``'s
+        sub-case 0 — so they cannot drift.
+        """
+        if exc.old_status == 'cancelled':
+            logger.info(
+                'Task %s: cancelled out-of-band; aborting gracefully '
+                '(no reopen, no escalation)',
+                self.task_id,
+            )
+            return WorkflowOutcome.CANCELLED
+        return None
+
     async def _handle_terminal_exit_on_block(
         self,
         exc: TerminalExitRejection,
@@ -4310,13 +4326,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
            ``WorkflowOutcome.BLOCKED``.
         """
         # Sub-case 0: authoritative user/manual cancellation — abort gracefully.
-        if exc.old_status == 'cancelled':
-            logger.info(
-                'Task %s: cancelled out-of-band; aborting gracefully '
-                '(no reopen, no escalation)',
-                self.task_id,
-            )
-            return WorkflowOutcome.CANCELLED
+        outcome = self._handle_cancelled_terminal_exit(exc)
+        if outcome is not None:
+            return outcome
 
         task = await self.scheduler.get_task(self.task_id)
         # Scheduler.get_task normalises task['metadata'] to a dict at the
