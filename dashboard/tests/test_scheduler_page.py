@@ -1338,6 +1338,34 @@ def test_module_contention_counts_tags_project_and_holder_project():
     assert result2[0]['holder_project'] is None
 
 
+def test_holder_project_set_iff_holder_set_jsx_contract():
+    """holder_project is non-None iff holder is non-None — JSX filter contract.
+
+    SchedulerTab.visibleModules (tab_scheduler.jsx) filters on:
+        m.holder_project && projectFilter.includes(m.holder_project)
+    If holder_project is None when a holder IS set, the module would be
+    silently hidden when the selected project owns the holder task.  Pin
+    the bi-conditional here so the data layer cannot silently break the
+    front-end assumption.
+    """
+    from dashboard.data.scheduler import _module_contention_counts
+
+    rows = [{'task_id': '1', 'lock_set': ['src/a.py']}]
+    with_holder = _module_contention_counts(rows, {'src/a.py': '1'}, project='proj-a')
+    without_holder = _module_contention_counts(rows, {}, project='proj-a')
+
+    # Bi-conditional: set together or not at all
+    assert (with_holder[0]['holder'] is not None) == (with_holder[0]['holder_project'] is not None), (
+        "holder_project must be non-None when holder is set"
+    )
+    assert (without_holder[0]['holder'] is not None) == (without_holder[0]['holder_project'] is not None), (
+        "holder_project must be None when no holder is set"
+    )
+    # Exact values
+    assert with_holder[0]['holder_project'] == 'proj-a'
+    assert without_holder[0]['holder_project'] is None
+
+
 def test_merge_module_lists_keys_by_project_and_path():
     """_merge_module_lists must NOT conflate two projects' identically-named modules.
 
