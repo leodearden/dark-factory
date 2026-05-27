@@ -23,10 +23,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
-
-from orchestrator.config import OrchestratorConfig
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
     _WATCHER_MAX_BACKOFF_SECS,
@@ -2090,7 +2089,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
 # task 1501: supervisor-failsafe — file/dedup/resolve L2 outage escalation
 # ---------------------------------------------------------------------------
 
-def _make_harness_with_queue(tmp_path: Path) -> tuple['Harness', 'EscalationQueue']:
+def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Build a Harness with a real EscalationQueue for outage-L2 tests.
 
     Uses the same __new__ + _init_harness_state_for_test pattern as
@@ -2111,7 +2110,7 @@ def _make_harness_with_queue(tmp_path: Path) -> tuple['Harness', 'EscalationQueu
     return h, queue
 
 
-def _submit_sample_l1(queue: 'EscalationQueue', task_id: str = 'task-sample-1') -> str:
+def _submit_sample_l1(queue: EscalationQueue, task_id: str = 'task-sample-1') -> str:
     """Submit a minimal L1 escalation and return its id."""
     from escalation.models import Escalation
     esc = Escalation(
@@ -2432,7 +2431,7 @@ class TestEnforceCostCeilingsFilesL2:
 # task 1501: _watcher_supervisor_loop healthy-clean branch resolves outage L2
 # ---------------------------------------------------------------------------
 
-def _make_loop_harness_with_queue(tmp_path: Path) -> tuple['Harness', 'EscalationQueue']:
+def _make_loop_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
     h = _make_loop_harness(tmp_path)
     queue = EscalationQueue(tmp_path / 'esc')
