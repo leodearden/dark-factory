@@ -1006,6 +1006,119 @@ async def test_concurrent_add_task_yields_unique_ids(backend, project_root):
     assert ids == list(range(1, 21))
 
 
+# ── Monotonic id allocation (id-recycling regression) ───────────────
+#
+# Fix A: ``add_task`` / ``add_subtask`` allocate
+# ``max(MAX(tasks.id), id_counters.max_id) + 1`` so a deleted id is NEVER
+# reissued.  Without this, deleting the top task frees its id, the next
+# ``add_task`` re-mints it, and an orphaned worktree keyed on that numeric id
+# gets misadopted for unrelated work (reify task 3770).
+
+
+@pytest.mark.asyncio
+async def test_top_level_id_not_reused_after_delete(backend, project_root):
+    """Core regression: deleting the top task must NOT free its id for reuse."""
+    one = await backend.add_task(project_root=project_root, title='first')
+    assert one['id'] == '1'
+    await backend.remove_tasks(['1'], project_root=project_root)
+    two = await backend.add_task(project_root=project_root, title='second')
+    assert two['id'] == '2'  # NOT '1'
+
+
+@pytest.mark.asyncio
+async def test_subtask_id_not_reused_after_delete(backend, project_root):
+    """A deleted subtask id is not reissued within the same parent."""
+    await backend.add_task(project_root=project_root, title='parent')
+    a = await backend.add_subtask('1', project_root=project_root, title='A')
+    assert a['id'] == '1.1'
+    await backend.remove_tasks(['1.1'], project_root=project_root)
+    b = await backend.add_subtask('1', project_root=project_root, title='B')
+    assert b['id'] == '1.2'  # NOT '1.1'
+
+
+@pytest.mark.asyncio
+async def test_id_monotonic_across_delete_add_cycles(backend, project_root):
+    """Repeated create+delete of the trailing task keeps bumping the id."""
+    ids = []
+    for _ in range(5):
+        dto = await backend.add_task(project_root=project_root, title='cycle')
+        ids.append(int(dto['id']))
+        await backend.remove_tasks([dto['id']], project_root=project_root)
+    assert ids == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_delete_current_max_still_bumps(backend, project_root):
+    """Deleting the current MAX row still advances past it (counter holds)."""
+    await backend.add_task(project_root=project_root, title='a')  # 1
+    await backend.add_task(project_root=project_root, title='b')  # 2
+    await backend.remove_tasks(['2'], project_root=project_root)  # max row gone
+    three = await backend.add_task(project_root=project_root, title='c')
+    assert three['id'] == '3'  # NOT '2'
+
+
+@pytest.mark.asyncio
+async def test_id_counter_per_tag_isolation(backend, project_root):
+    """Counters are scoped per tag — a delete in one tag never affects another."""
+    await backend.add_task(project_root=project_root, title='m1', tag='master')
+    await backend.add_task(project_root=project_root, title='f1', tag='feature')
+    await backend.remove_tasks(['1'], project_root=project_root, tag='master')
+    m2 = await backend.add_task(project_root=project_root, title='m2', tag='master')
+    f2 = await backend.add_task(project_root=project_root, title='f2', tag='feature')
+    assert m2['id'] == '2'  # master counter held past the delete
+    assert f2['id'] == '2'  # feature sequence independent, unaffected
+
+
+@pytest.mark.asyncio
+async def test_id_counter_survives_close_reopen(tmp_path):
+    """The counter persists across a connection close/reopen.
+
+    Mirrors a ``systemctl restart fused-memory`` cycle: the high-water mark
+    must outlive the process so a delete-then-restart-then-add can't recycle.
+    """
+    proot = str(tmp_path / 'proj')
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+
+    b1 = SqliteTaskBackend(cfg)
+    await b1.start()
+    await b1.add_task(project_root=proot, title='one')   # id 1
+    await b1.remove_tasks(['1'], project_root=proot)
+    await b1.close()
+
+    b2 = SqliteTaskBackend(cfg)
+    await b2.start()
+    try:
+        two = await b2.add_task(project_root=proot, title='two')
+        assert two['id'] == '2'  # counter survived the reopen — NOT '1'
+    finally:
+        await b2.close()
+
+
+@pytest.mark.asyncio
+async def test_id_counter_self_heals_when_empty_but_tasks_present(backend, project_root):
+    """A legacy DB (tasks present, id_counters empty) honours the row high-water.
+
+    Simulates an upgrade onto a DB that predates the counter: the first
+    post-upgrade alloc must be ``MAX(tasks.id) + 1``, then the counter is
+    seeded so it holds the line on subsequent deletes.
+    """
+    await backend.add_task(project_root=project_root, title='a')  # 1
+    await backend.add_task(project_root=project_root, title='b')  # 2
+
+    # Wipe the counter to mimic a pre-Fix-A DB.
+    conn = await backend._get_connection(project_root)
+    await conn.execute('DELETE FROM id_counters')
+    await conn.commit()
+
+    three = await backend.add_task(project_root=project_root, title='c')
+    assert three['id'] == '3'  # self-healed from MAX(tasks.id)
+
+    # And the counter now holds across a delete of the current max.
+    await backend.remove_tasks(['3'], project_root=project_root)
+    four = await backend.add_task(project_root=project_root, title='d')
+    assert four['id'] == '4'
+
+
 # ── Cancellation hardening ─────────────────────────────────────────
 
 
