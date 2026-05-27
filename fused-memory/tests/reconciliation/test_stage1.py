@@ -7,6 +7,9 @@ Covers:
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
+- STAGE1_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1488): minimal existence
+  check via STAGE1_SYSTEM_PROMPT to guard against the Per-Cycle Summary Uniqueness section
+  being dropped (TestStage1PromptMandatesUniquenessToken)
 """
 
 from __future__ import annotations
@@ -172,5 +175,22 @@ class TestStage2PromptMandatesUniquenessToken:
             "(guards against the per-cycle summary uniqueness section being dropped)."
         )
 
+
+# ---------------------------------------------------------------------------
+# Step 1 (task-1488): STAGE1 prompt mandates uniqueness_token in cycle summaries
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PromptMandatesUniquenessToken:
+    """Minimal existence check: STAGE1_SYSTEM_PROMPT exposes the uniqueness_token mechanism."""
+
+    def test_stage1_system_prompt_exposes_uniqueness_token(self):
+        """STAGE1_SYSTEM_PROMPT must expose uniqueness_token."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'uniqueness_token' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must expose uniqueness_token "
+            "(guards against the Per-Cycle Summary Uniqueness section being dropped)."
+        )
 
 
