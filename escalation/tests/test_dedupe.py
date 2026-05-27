@@ -745,6 +745,201 @@ class TestDedupeConfigForRecon:
         assert result == 'esc-1-1'
 
 
+class TestSubmitOrDedupe:
+    """submit_or_dedupe(queue, esc, config, now=None) — gated orchestration wrapper."""
+
+    def _make_recon_esc(self, esc_id: str, fingerprint: str | None = None, task_id: str = '42'):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='reconciler',
+            severity='info',
+            category='recon_integrity_issue',
+            summary='Unresolved after remediation: entity mismatch',
+        )
+        esc.dedupe_fingerprint = fingerprint
+        return esc
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '42', summary: str = 'fused-memory connection timeout on port 8002'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    # --- RECON config ---
+
+    def test_recon_first_submit_queued(self, tmp_path):
+        """(a) First recon_integrity_issue with stamped fingerprint => {'status':'queued'}."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_recon_esc('esc-1-1', fingerprint='fp-abc')
+        result = submit_or_dedupe(queue, esc, DedupeConfig.for_recon())
+
+        assert result['status'] == 'queued'
+        assert 'id' in result
+        files = self._queue_files(queue)
+        assert len(files) == 1
+
+    def test_recon_same_fingerprint_dedupes_regardless_of_age(self, tmp_path):
+        """(b) Second escalation with SAME fingerprint + old parent timestamp => dedup_skipped."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # First: submit parent with old timestamp
+        esc1 = self._make_recon_esc('esc-1-1', fingerprint='fp-abc')
+        # Give parent an old timestamp (2 days ago)
+        esc1.timestamp = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        result1 = submit_or_dedupe(queue, esc1, DedupeConfig.for_recon())
+        parent_id = result1['id']
+        assert result1['status'] == 'queued'
+
+        # Second: different summary but SAME fingerprint -> should fold
+        esc2 = self._make_recon_esc('esc-1-2', fingerprint='fp-abc')
+        esc2.summary = 'Non-actionable integrity finding: entity mismatch (different run)'
+        result2 = submit_or_dedupe(queue, esc2, DedupeConfig.for_recon())
+
+        assert result2['status'] == 'dedup_skipped'
+        assert result2['parent_id'] == parent_id
+        assert 'child_id' in result2
+
+        # Still one file
+        assert len(self._queue_files(queue)) == 1
+
+        # Parent dedupe_count == 1
+        parent = Escalation.from_json(self._queue_files(queue)[0].read_text())
+        assert parent.dedupe_count == 1
+
+    def test_recon_triple_fold_preserves_fingerprint(self, tmp_path):
+        """(c) Third fold: dedupe_count==2 AND parent.dedupe_fingerprint unchanged."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_recon_esc('esc-1-1', fingerprint='fp-abc')
+        submit_or_dedupe(queue, esc1, DedupeConfig.for_recon())
+
+        esc2 = self._make_recon_esc('esc-1-2', fingerprint='fp-abc')
+        submit_or_dedupe(queue, esc2, DedupeConfig.for_recon())
+
+        esc3 = self._make_recon_esc('esc-1-3', fingerprint='fp-abc')
+        result3 = submit_or_dedupe(queue, esc3, DedupeConfig.for_recon())
+
+        assert result3['status'] == 'dedup_skipped'
+        parent = Escalation.from_json(self._queue_files(queue)[0].read_text())
+        assert parent.dedupe_count == 2
+        # Fingerprint preserved across folds (invariant)
+        assert parent.dedupe_fingerprint == 'fp-abc'
+
+    def test_recon_different_fingerprint_queued_separately(self, tmp_path):
+        """(d) Candidate with DIFFERENT fingerprint => queued (two files)."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_recon_esc('esc-1-1', fingerprint='fp-abc')
+        submit_or_dedupe(queue, esc1, DedupeConfig.for_recon())
+
+        esc2 = self._make_recon_esc('esc-1-2', fingerprint='fp-xyz')
+        result2 = submit_or_dedupe(queue, esc2, DedupeConfig.for_recon())
+
+        assert result2['status'] == 'queued'
+        assert len(self._queue_files(queue)) == 2
+
+    def test_recon_none_fingerprint_queued(self, tmp_path):
+        """(e) Candidate with dedupe_fingerprint=None => queued (never folds)."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_recon_esc('esc-1-1', fingerprint='fp-abc')
+        submit_or_dedupe(queue, esc1, DedupeConfig.for_recon())
+
+        esc2 = self._make_recon_esc('esc-1-2', fingerprint=None)
+        result2 = submit_or_dedupe(queue, esc2, DedupeConfig.for_recon())
+
+        assert result2['status'] == 'queued', (
+            f'None fingerprint must never fold; got: {result2}'
+        )
+        assert len(self._queue_files(queue)) == 2
+
+    # --- INFRA regression ---
+
+    def test_infra_default_config_dedupes_by_summary(self, tmp_path):
+        """INFRA regression: two infra_issue with same first-3-token summary fold."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_infra_esc('esc-1-1')
+        result1 = submit_or_dedupe(queue, esc1, DedupeConfig())
+        assert result1['status'] == 'queued'
+
+        esc2 = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+        result2 = submit_or_dedupe(queue, esc2, DedupeConfig())
+
+        assert result2['status'] == 'dedup_skipped'
+        assert result2['parent_id'] == result1['id']
+        assert len(self._queue_files(queue)) == 1
+        parent = Escalation.from_json(self._queue_files(queue)[0].read_text())
+        assert parent.dedupe_count == 1
+
+    # --- TOCTOU ---
+
+    def test_toctou_falls_through_to_submit(self, tmp_path, monkeypatch):
+        """TOCTOU: find_dedupe_parent resolves parent before returning => escalation queued."""
+        import escalation.dedupe as dedupe_module
+
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc1 = self._make_infra_esc('esc-1-1')
+        submit_or_dedupe(queue, esc1, DedupeConfig())
+
+        _original_find = dedupe_module.find_dedupe_parent
+
+        def _racing_find(q, esc, cfg, now=None):
+            result = _original_find(q, esc, cfg, now=now)
+            if result is not None:
+                q.resolve(result, resolution='raced')
+            return result  # still returns the id — simulating stale read
+
+        monkeypatch.setattr(dedupe_module, 'find_dedupe_parent', _racing_find)
+
+        esc2 = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+        result2 = submit_or_dedupe(queue, esc2, DedupeConfig())
+
+        assert result2['status'] == 'queued', (
+            f'TOCTOU: must fall through to submit; got: {result2}'
+        )
+        files = self._queue_files(queue)
+        assert len(files) == 1  # only the new esc (parent was archived)
+        assert result2['id'] == files[0].stem
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
