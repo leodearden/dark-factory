@@ -181,13 +181,20 @@ Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found 
 
 ```
 1. Record start time
-2. Drain all pending L1 escalations (get_pending_escalations)
-3. Handle each L1 escalation by category (see routing table below)
-4. Increment escalations_handled counter
-5. Check rotation limits — if reached, emit digest and exit
-6. Wait for next L1: foreground-blocking call to escalation.watcher (see below)
-7. On watcher return: go to 2
+2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
+   If YES → use L2 promotion paths throughout (steps 4 and 5)
+   If NO  → fall back to LEGACY mode (see Graceful Degradation)
+3. Drain all pending L1 escalations (get_pending_escalations, filter level==1, status==pending)
+4. Apply shallow RCA across the full drain batch — detect causal clusters (see Shallow-by-default RCA)
+5. For each escalation: autonomous dispatch (scope_violation / dependency / cleanup)
+   OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
+6. Increment escalations_handled counter
+7. Check rotation limits — if reached, emit digest and exit
+8. Wait for next L1: foreground-blocking call to escalation.watcher (see below)
+9. On watcher return: go to 3
 ```
+
+The digest is emitted on rotation-limit exit regardless of mode (promotion or legacy).
 
 ### Draining pending escalations
 
@@ -403,6 +410,28 @@ Skip entirely and move to the next escalation.
 
 ---
 
+## Graceful Degradation
+
+Feature-detect `mcp__escalation__promote_to_l2` **once at startup** (step 2 in the Main Loop) by checking whether it appears in your available toolset. Do NOT make a trial call — a trial call would mutate the queue.
+
+| Condition | Behaviour |
+|-----------|-----------|
+| Tool **present** | Use L2 promotion paths for all judgement-class items (steps 4 and 5 of the routing table). Emit PROMOTED lines in the digest. |
+| Tool **absent** | Fall back to **legacy mode**: leave judgement-class items pending at L1 and emit PENDING lines in the digest (the pre-tiering behaviour). Autonomous dispatch is unchanged in both modes. |
+
+This makes the skill safe to land **before** the orchestrators are restarted onto the new escalation server — the skill degrades gracefully until `promote_to_l2` becomes available at runtime.
+
+Log one line at startup so the rotation digest reflects which mode was active:
+```
+Mode: L2-promotion (promote_to_l2 available)
+```
+or
+```
+Mode: LEGACY (promote_to_l2 not available — will leave pending + digest)
+```
+
+---
+
 ## Digest Format
 
 Emit this as your **final message** when the rotation limit is reached:
@@ -411,19 +440,25 @@ Emit this as your **final message** when the rotation limit is reached:
 ## Escalation Watcher Digest
 Rotation: <escalations_handled> escalations in <elapsed_hours:.1f>h
 Exit reason: <"escalation limit reached" | "time limit reached">
+Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)
 - DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py]
 - DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55
 
-### Pending (human review required)
+### Promoted to L2 (L2-promotion mode only)
+- PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
+    Proposal: fix import in tests/test_foo.py line 42 [risk: low]
+- PROMOTED cluster (L2 esc-42-8): bad-merge-to-main-breaks-scheduler — 3 members: [esc-42-1, esc-42-3, esc-42-5]
+- PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
+- PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
+
+### Pending (human review required — LEGACY mode only)
 - PENDING (human): task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: Blocked because import error in test. To unblock: fix import in tests/test_foo.py line 42. Confidence: high. [risk: low]
 - PENDING (human): design_concern — task-88 — architectural question about X
 - PENDING (human/urgent): infra_issue — N/A — Neo4j connection refused
-
-### dependency_discovered (no matching task — human needed)
 - PENDING (human): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 
 ### Skipped
