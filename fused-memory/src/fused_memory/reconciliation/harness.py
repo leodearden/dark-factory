@@ -61,6 +61,27 @@ try:
 except ImportError:
     HAS_ESCALATION = False
 
+# Recon-wide dedup config: covers all four recon escalation categories.
+# Wider than DedupeConfig.for_recon() (which only covers recon_integrity_issue)
+# because A7b also folds non-finding categories so each DISTINCT recurring message
+# files once — see design_decisions in plan.json for rationale.
+# Set to None when escalation package is not installed; _escalate checks
+# HAS_ESCALATION before using it.
+_RECON_DEDUP_CONFIG = (
+    DedupeConfig(  # type: ignore[possibly-undefined]
+        infra_dedupe_enabled=True,
+        infra_dedupe_window_secs=float('inf'),
+        infra_dedupe_categories=(
+            'recon_integrity_issue',
+            'recon_failure',
+            'recon_stale_run',
+            'recon_backlog_overflow',
+        ),
+        key_fn=content_fingerprint_key,  # type: ignore[possibly-undefined]
+    )
+    if HAS_ESCALATION else None
+)
+
 logger = logging.getLogger(__name__)
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -668,7 +689,7 @@ class ReconciliationHarness:
                 detail=detail,
                 dedupe_fingerprint=fingerprint,
             )
-            queue.submit(esc)
+            submit_or_dedupe(queue, esc, _RECON_DEDUP_CONFIG)  # type: ignore[possibly-undefined]
         except Exception as e:
             logger.warning(f'Failed to submit escalation: {e}')
 
