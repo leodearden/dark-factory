@@ -431,6 +431,60 @@ class EscalationQueue:
 
         return oldest_id
 
+    def add_members_to_l2(
+        self, escalation_id: str, new_member_ids: list[str],
+    ) -> Escalation | None:
+        """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
+
+        **Not concurrency-safe.**  The read-modify-write of ``members`` is not
+        atomic: two concurrent callers for the same parent each read the same
+        pre-mutation snapshot, both append and both write — the second rewrite
+        clobbers the first's additions.  Single-writer invariant matches the
+        rest of the queue; see ``attach_dedupe_child`` for a full discussion.
+
+        Loads the L2 directly from ``queue_dir/{escalation_id}.json`` (queue root
+        only).  This refuses archived L2s — they were already adjudicated by a
+        human; re-opening them via member append would resurrect a closed decision
+        (the same Defect-2 class of bug that motivated task 1498).  For the same
+        reason this method never falls back to the archive.
+
+        Set-union semantics: member ids already present in ``esc.members`` are
+        not added again.  New ids are appended in the order they appear in
+        *new_member_ids*.
+
+        Only ``members`` is modified.  ``root_cause``, ``options``, ``summary``,
+        ``detail``, and ``timestamp`` are preserved so the human-facing decision
+        context remains the L2's original framing across repeated auto-watcher
+        triage passes.
+
+        Returns the updated ``Escalation`` (or the unchanged escalation when
+        *new_member_ids* is empty or all ids are already present).  Returns
+        ``None`` when *escalation_id* is not found in the queue root (unknown id
+        or archived).
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
+            return None
+
+        if not new_member_ids:
+            return esc  # no-op
+
+        existing = set(esc.members)
+        appended = [m for m in new_member_ids if m not in existing]
+        if appended:
+            esc.members.extend(appended)
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'add_members_to_l2: added %d new member(s) to %s (total=%d)',
+                len(appended), escalation_id, len(esc.members),
+            )
+        return esc
+
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
