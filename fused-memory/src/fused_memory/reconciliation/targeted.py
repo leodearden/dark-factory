@@ -658,9 +658,18 @@ class TargetedReconciler:
 
         Called at most once per sweep (lazy-memoized by the caller) to detect
         co-cancelled siblings whose status DB write landed after the initial
-        snapshot was taken.  Exception handling is added in a later step.
+        snapshot was taken.  Fails open: any exception logs a warning and
+        returns {}, so the ambiguous branch falls through to the existing
+        escalate/block path rather than silently dropping a genuine orphan.
         """
-        tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+        try:
+            tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+        except Exception as e:
+            logger.warning(
+                'sweep: live status re-check failed for parent sweep at %s: %s',
+                project_root, e,
+            )
+            return {}
         all_tasks = tasks_data.get('tasks', []) if isinstance(tasks_data, dict) else []
         if not isinstance(all_tasks, list):
             return {}
