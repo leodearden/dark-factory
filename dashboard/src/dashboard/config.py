@@ -109,6 +109,10 @@ class DashboardConfig:
         return self.project_root / 'data' / 'escalations'
 
     @property
+    def reconciliation_escalations_dir(self) -> Path:
+        return self.project_root / 'data' / 'reconciliation' / 'escalations'
+
+    @property
     def burndown_db(self) -> Path:
         return self.project_root / 'data' / 'burndown' / 'burndown.db'
 
