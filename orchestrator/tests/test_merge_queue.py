@@ -215,6 +215,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == []
@@ -251,6 +252,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == []
@@ -293,6 +295,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == []
@@ -335,8 +338,10 @@ class TestCheckPlanTargetsInTree:
 
         # pre_drop_sha has retained.py but not dropped.py, and task HEAD
         # has both — so only dropped.py should be flagged as a merge drop.
+        # Pass the worktree's real main base: dropped.py is in branch_changed
+        # (base..task_head AM), so it survives the main-side subtraction.
         result = await _check_plan_targets_in_tree(
-            pre_drop_sha, worktree, git_ops,
+            pre_drop_sha, worktree, git_ops, await git_ops.get_main_sha(),
         )
         missing = result.dropped
         assert missing == ['dropped.py']
@@ -409,9 +414,11 @@ class TestCheckPlanTargetsInTree:
             merge_sha = merge_sha.strip()
 
             # Detector must flag contested.py (on task HEAD, absent from merge)
-            # but leave other.py (present on both) alone.
+            # but leave other.py (present on both) alone.  Pass the real main
+            # tip: contested.py is in branch_changed (the branch added it), so
+            # it survives the main-side subtraction and stays flagged.
             result = await _check_plan_targets_in_tree(
-                merge_sha, worktree, git_ops,
+                merge_sha, worktree, git_ops, await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == ['contested.py']
@@ -436,6 +443,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == []
@@ -471,7 +479,7 @@ class TestCheckPlanTargetsInTree:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = await _check_plan_targets_in_tree(
-                pre_drop_sha, worktree, git_ops,
+                pre_drop_sha, worktree, git_ops, await git_ops.get_main_sha(),
                 task_id='warn-test',
             )
         assert result.dropped == ['dropped.py'], (
@@ -504,6 +512,7 @@ class TestCheckPlanTargetsInTree:
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
                 result2 = await _check_plan_targets_in_tree(
                     merge_result2.merge_commit, worktree2, git_ops,
+                    await git_ops.get_main_sha(),
                     task_id='warn-test-empty',
                 )
             assert result2.dropped == [], (
@@ -562,6 +571,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
                 task_id='drop-gitignore',
             )
             assert result.dropped == [], (
@@ -626,6 +636,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
                 task_id='drop-branch-del',
             )
             assert result.dropped == [], (
@@ -690,6 +701,7 @@ class TestCheckPlanTargetsInTree:
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
+                await git_ops.get_main_sha(),
                 task_id='drop-amend-del',
             )
             assert result.dropped == [], (
@@ -699,6 +711,121 @@ class TestCheckPlanTargetsInTree:
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_sibling_moved_file_not_flagged(self, git_ops: GitOps):
+        """A sibling git-mv on main must not flag the old path (esc-3861).
+
+        A sibling task renamed the file on main after the victim forked.
+        The victim carried the old path verbatim and never touched it, so a
+        clean merge correctly drops it.  With ``--no-renames`` + the
+        branch-changed intersection, the old path is absent from the branch's
+        add/modify set and must NOT be flagged as a drop.
+        """
+        # Base state on main: the file at its old path (the fork point).
+        (git_ops.project_root / 'old').mkdir()
+        (git_ops.project_root / 'old' / 'ast.rs').write_text('// ast\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add old/ast.rs'],
+            cwd=git_ops.project_root,
+        )
+
+        # Victim forks here carrying old/ast.rs, and only adds unrelated.py.
+        worktree = (await git_ops.create_worktree('sibling-move')).path
+        (worktree / 'unrelated.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Victim: add unrelated.py')
+        rc, task_head_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        assert rc == 0
+        task_head = task_head_out.strip()
+
+        # Sibling moves the file on main AFTER the victim forked (modelled as
+        # a delete + identical-content add, which git records as a rename).
+        (git_ops.project_root / 'new').mkdir()
+        (git_ops.project_root / 'new' / 'ast.rs').write_text('// ast\n')
+        (git_ops.project_root / 'old' / 'ast.rs').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Sibling: move old/ast.rs -> new/ast.rs'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(worktree, 'sibling-move')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            # Sanity: the clean merge really did drop the old path — the raw
+            # (unsubtracted) drop set contains it, so the intersection is what
+            # prevents the false positive.
+            rc, raw_out, _ = await _run(
+                ['git', 'diff', '--name-only', '--no-renames',
+                 '--diff-filter=D', task_head, merge_result.merge_commit],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0
+            assert 'old/ast.rs' in raw_out, (
+                f'expected merge to drop old/ast.rs; raw drop set: {raw_out!r}'
+            )
+
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops, main_sha,
+                task_id='sibling-move',
+            )
+            assert result.dropped == [], (
+                f'sibling-moved file must not be flagged; got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_genuine_drop_of_branch_added_file_still_flagged(
+        self, git_ops: GitOps,
+    ):
+        """A real drop of branch-only work is STILL flagged after subtraction.
+
+        The branch adds feature.py; main never touches it; the merge drops it
+        (resolution "accepted main").  Main is non-trivially ahead so the
+        merge-base is a genuine ancestor — distinct from main's tip — which
+        exercises the new merge-base step.  feature.py is in the branch's
+        add/modify set and absent from main, so the subtraction leaves it
+        flagged.
+        """
+        worktree = (await git_ops.create_worktree('genuine-drop')).path
+        (worktree / 'feature.py').write_text('feature = 1\n')
+        await git_ops.commit(worktree, 'Branch: add feature.py')
+
+        # Main moves ahead AFTER the fork (unrelated file) so merge-base is a
+        # real ancestor rather than main's tip.
+        (git_ops.project_root / 'ahead.py').write_text('ahead = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add ahead.py'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        # Synthetic merge commit = main's tip: the branch's only file never
+        # landed (a resolution that dropped feature.py entirely).
+        result = await _check_plan_targets_in_tree(
+            main_sha, worktree, git_ops, main_sha, task_id='genuine-drop',
+        )
+        assert result.dropped == ['feature.py']
+
+    async def test_drop_guard_fails_open_on_bad_main_sha(
+        self, git_ops: GitOps,
+    ):
+        """A merge-base failure (bogus main_sha) fails open → no drops flagged."""
+        worktree = (await git_ops.create_worktree('failopen-drop')).path
+        (worktree / 'f.py').write_text('f = 1\n')
+        await git_ops.commit(worktree, 'Add f.py')
+
+        result = await _check_plan_targets_in_tree(
+            await git_ops.get_main_sha(), worktree, git_ops,
+            'definitely-not-a-ref', task_id='failopen-drop',
+        )
+        assert result.dropped == []
 
 
 @pytest.mark.asyncio
@@ -4649,6 +4776,9 @@ class TestCheckPostMergeEquivalence:
         (wt / 'a.py').write_text('a = 1\n')
         await git_ops.commit(wt, 'Add a.py')
 
+        # Capture the pre-merge main tip — the gate anchors its merge-base on
+        # main_sha, not the post-advance SHA.
+        pre_merge_main = await git_ops.get_main_sha()
         merge_result = await git_ops.merge_to_main(wt, 'equiv-ff')
         assert merge_result.success
         assert merge_result.merge_commit is not None
@@ -4664,7 +4794,7 @@ class TestCheckPostMergeEquivalence:
             )
             assert advanced is not None
             failed = await _check_post_merge_equivalence(
-                wt, advanced, git_ops, task_id='equiv-ff-test',
+                wt, advanced, git_ops, pre_merge_main, task_id='equiv-ff-test',
             )
             assert failed == []
         finally:
@@ -4694,8 +4824,12 @@ class TestCheckPostMergeEquivalence:
         assert rc == 0
         synthetic_main = base_out.strip()
 
+        # Pass synthetic_main as main_sha too: it's the shared baseline, so
+        # main_touched is empty and the gate degrades to strict equivalence —
+        # this guards that branch-only divergence is STILL flagged.
         failed = await _check_post_merge_equivalence(
-            wt, synthetic_main, git_ops, task_id='equiv-diverge-test',
+            wt, synthetic_main, git_ops, synthetic_main,
+            task_id='equiv-diverge-test',
         )
         assert failed == ['branch_only.py']
         assert branch_head != synthetic_main  # sanity
@@ -4707,6 +4841,7 @@ class TestCheckPostMergeEquivalence:
         (wt / 'real.py').write_text('r = 1\n')
         await git_ops.commit(wt, 'Add real.py')
 
+        pre_merge_main = await git_ops.get_main_sha()
         merge_result = await git_ops.merge_to_main(wt, 'equiv-task-only')
         assert merge_result.success
         assert merge_result.merge_commit is not None
@@ -4730,11 +4865,147 @@ class TestCheckPostMergeEquivalence:
             # exclusion pathspec doesn't fire spurious flags.
 
             failed = await _check_post_merge_equivalence(
-                wt, advanced, git_ops, task_id='equiv-task-test',
+                wt, advanced, git_ops, pre_merge_main, task_id='equiv-task-test',
             )
             assert failed == []
         finally:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_sibling_also_touched_lockfile_not_flagged(
+        self, git_ops: GitOps,
+    ):
+        """A shared lockfile both sides edited must not be flagged (esc-3843).
+
+        The branch and a sibling each append a different dependency to
+        Cargo.lock in non-adjacent regions; a clean 3-way merge combines
+        both, so advanced main's Cargo.lock differs from the branch tip.  The
+        path is in both branch_touched and main_touched, so it's subtracted
+        and the gate reports no divergence.
+        """
+        # Base Cargo.lock with enough spacing that the two edits don't collide.
+        base_lock = ''.join(f'line{i}\n' for i in range(20))
+        (git_ops.project_root / 'Cargo.lock').write_text(base_lock)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add Cargo.lock'],
+            cwd=git_ops.project_root,
+        )
+
+        # Victim forks here and adds its dep near the TOP of the file.
+        wt = (await git_ops.create_worktree('lockfile-victim')).path
+        (wt / 'Cargo.lock').write_text(
+            base_lock.replace('line1\n', 'line1\nvictim-dep\n')
+        )
+        await git_ops.commit(wt, 'Victim: add victim-dep to Cargo.lock')
+        rc, branch_head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        branch_head = branch_head_out.strip()
+
+        # Sibling adds its dep near the BOTTOM of main's Cargo.lock.
+        (git_ops.project_root / 'Cargo.lock').write_text(
+            base_lock.replace('line18\n', 'line18\nsibling-dep\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Sibling: add sibling-dep to Cargo.lock'],
+            cwd=git_ops.project_root,
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(wt, 'lockfile-victim')
+        assert merge_result.success, (
+            f'expected clean 3-way merge; details={merge_result.details!r}'
+        )
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='lockfile-victim', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Sanity: advanced main's Cargo.lock really does differ from the
+            # branch tip (it carries the sibling's dep too).
+            rc, diff_out, _ = await _run(
+                ['git', 'diff', '--name-only', branch_head, advanced,
+                 '--', 'Cargo.lock'],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0
+            assert 'Cargo.lock' in diff_out, (
+                'expected advanced main Cargo.lock to differ from branch tip'
+            )
+
+            failed = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, main_sha, task_id='lockfile-victim',
+            )
+            assert failed == [], (
+                f'shared lockfile must not be flagged; got {failed!r}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_speculative_base_equals_main_sha_strict_equivalence(
+        self, git_ops: GitOps,
+    ):
+        """base == main_sha (speculative) → main_touched empty → strict
+        equivalence: a clean merge passes, a drop is still flagged."""
+        wt = (await git_ops.create_worktree('spec-equiv')).path
+        # The fork point is the speculative base; it doubles as main_sha.
+        base_sha = await git_ops.get_main_sha()
+        (wt / 'spec.py').write_text('s = 1\n')
+        await git_ops.commit(wt, 'Add spec.py')
+        rc, branch_head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        branch_head = branch_head_out.strip()
+
+        # Clean: a real merge+advance preserves spec.py → [].
+        merge_result = await git_ops.merge_to_main(wt, 'spec-equiv')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='spec-equiv', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            clean = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, base_sha, task_id='spec-equiv-clean',
+            )
+            assert clean == []
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Drop: point advanced at base_sha (spec.py absent).  main_touched is
+        # empty (base == main_sha), so strict equivalence flags spec.py.
+        dropped = await _check_post_merge_equivalence(
+            wt, base_sha, git_ops, base_sha, task_id='spec-equiv-drop',
+        )
+        assert dropped == ['spec.py']
+        assert branch_head != base_sha  # sanity
+
+    async def test_equivalence_fails_open_on_bad_main_sha(
+        self, git_ops: GitOps,
+    ):
+        """A merge-base failure (bogus main_sha) fails open → no divergence."""
+        wt = (await git_ops.create_worktree('failopen-equiv')).path
+        (wt / 'g.py').write_text('g = 1\n')
+        await git_ops.commit(wt, 'Add g.py')
+
+        failed = await _check_post_merge_equivalence(
+            wt, await git_ops.get_main_sha(), git_ops,
+            'definitely-not-a-ref', task_id='failopen-equiv',
+        )
+        assert failed == []
 
 
 @pytest.mark.asyncio
