@@ -5616,12 +5616,8 @@ async def test_non_actionable_finding_from_remediation_pass_is_never_escalated_e
 
     async def s3_returns_by_call(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
         call_count['s3'] += 1
-        if call_count['s3'] == 1:
-            # Parent pass: return both actionable A and non-actionable F to trigger remediation
-            items = [actionable_a, non_actionable_f]
-        else:
-            # Remediation pass: return only non-actionable F (still 'unresolved')
-            items = [non_actionable_f]
+        # Parent pass: both actionable A and non-actionable F; remediation pass: only non-actionable F
+        items = [actionable_a, non_actionable_f] if call_count['s3'] == 1 else [non_actionable_f]
         return StageReport(
             stage=_s.stage_id,
             started_at=datetime.now(UTC),
