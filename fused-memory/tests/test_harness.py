@@ -5315,13 +5315,20 @@ async def test_unresolved_after_remediation_does_not_escalate_when_persistence_b
     """Unresolved-after-remediation findings are suppressed when persistence < threshold.
 
     The default threshold (_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 3) is used.
-    No prior runs are seeded, so persistence == 0 < 3, and the finding must NOT
-    produce an escalation.  Instead a structured logger.info with event name
+    No prior runs are seeded, but the parent run and remediation run each persist
+    their stage_reports BEFORE _finding_persistence_count is called
+    (harness.py:1065 and harness.py:1405), so the actual persistence count is 2
+    (= 1 parent + 1 remediation).  2 < 3, so the finding must NOT produce an
+    escalation.  Instead a structured logger.info with event name
     'reconciliation.unresolved_after_remediation_suppressed' must be emitted.
+    The test PINS persistence == 2 explicitly so a future threshold change to 2
+    will fail loudly instead of silently passing.
 
-    Task 1512 / plans/afk-A7-recon-closure.md.
+    Task 1512 / plans/afk-A7-recon-closure.md / incorrect_test_assertion review finding.
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -5391,6 +5398,23 @@ async def test_unresolved_after_remediation_does_not_escalate_when_persistence_b
     )
     assert actionable_finding['description'] in rec.__dict__.get('description', ''), (
         f'Expected description in log record, got: {rec.__dict__.get("description")}'
+    )
+    # Pin the exact persistence count so future accounting changes fail loudly.
+    # With no prior runs seeded, persistence == 2 because both the parent run
+    # (harness.py:1065) and the remediation run (harness.py:1405) persist their
+    # stage_reports before _finding_persistence_count is called (harness.py:1428).
+    # If this value changes, the threshold-vs-actual-count relationship must be
+    # re-verified to ensure the test still exercises the below-threshold branch.
+    assert rec.__dict__.get('persistence') == 2, (
+        f"Expected persistence == 2 (1 parent + 1 remediation each persisted before "
+        f"_finding_persistence_count), got: {rec.__dict__.get('persistence')!r}. "
+        f"If this asserts a different value, the parent/remediation persistence "
+        f"accounting has changed and the threshold-vs-actual-count relationship "
+        f"must be re-verified."
+    )
+    assert rec.__dict__.get('threshold') == _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'Expected threshold == {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD!r}, '
+        f'got: {rec.__dict__.get("threshold")!r}'
     )
 
 
