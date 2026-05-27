@@ -325,6 +325,31 @@ class TestBuildPlan:
         assert c.canonical_id not in c.child_ids
         assert set(c.child_ids) | {c.canonical_id} == {e.id for e in group}
 
+    def test_mixed_timestamp_formats_sort_correctly(self) -> None:
+        """Oldest member is selected even with mixed ISO 8601 formats in one group.
+
+        Covers the three common variants produced by different Python versions
+        and serialisers: ``+00:00`` suffix, ``Z`` suffix, and microsecond
+        precision.  Lexicographic string comparison would mis-rank these; the
+        _parse_ts() sort key must handle them all correctly.
+        """
+        # Three escalations with the same fingerprint (same affected_ids) but
+        # timestamps in deliberately mixed formats. The '+00:00' record is
+        # oldest; it must become canonical regardless of list order.
+        oldest = _esc(timestamp='2026-01-01T00:00:00+00:00', task_id='oldest')
+        mid = _esc(timestamp='2026-01-01T00:01:00Z', task_id='mid')
+        newest = _esc(timestamp='2026-01-01T00:02:00.000123+00:00', task_id='newest')
+
+        # Shuffle the input order to ensure we're not relying on list position.
+        plan = build_plan([newest, mid, oldest])
+
+        assert len(plan.collapses) == 1
+        collapse = plan.collapses[0]
+        assert collapse.canonical_id == oldest.id, (
+            f"Expected oldest ({oldest.id}) as canonical, got {collapse.canonical_id}"
+        )
+        assert set(collapse.child_ids) == {mid.id, newest.id}
+
 
 # ---------------------------------------------------------------------------
 # TestApplyPlan
@@ -415,6 +440,87 @@ class TestApplyPlan:
         reloaded = queue.get(blocking.id)
         assert reloaded is not None
         assert reloaded.status == 'pending'
+
+    def test_canonical_with_prior_dedupe_state(self, tmp_path: Path) -> None:
+        """apply_plan skips a group whose canonical already has dedupe state.
+
+        Scenario: A7b has already folded one child into the canonical before
+        the backfill runs.  The canonical carries dedupe_count > 0.  The
+        backfill must not overwrite that state — it skips the group and logs
+        a WARNING, leaving every member unchanged.
+        """
+        queue = EscalationQueue(tmp_path)
+        base_ts = datetime(2026, 1, 1, tzinfo=UTC)
+        escs = []
+        n = 3
+        for i in range(n):
+            ts = (base_ts + timedelta(minutes=i)).isoformat()
+            e = _esc(timestamp=ts, task_id=str(i), affected_ids=['5', '6'])
+            queue.submit(e)
+            escs.append(e)
+
+        # Pre-stamp the oldest (canonical) with dedupe state to simulate A7b
+        # having already processed one child before the backfill runs.
+        canonical_esc = min(escs, key=lambda e: e.timestamp)
+        canonical_esc.dedupe_count = 1
+        canonical_esc.dedupe_children = ['some-prior-child-id']
+        queue.submit(canonical_esc)
+
+        plan = build_plan(queue.get_pending())
+        result = apply_plan(queue, plan)
+
+        # apply_plan should have skipped the group entirely.
+        assert result['updated'] == 0
+        assert result['dismissed'] == 0
+
+        # The canonical's pre-existing dedupe state must be preserved.
+        reloaded = queue.get(canonical_esc.id)
+        assert reloaded is not None
+        assert reloaded.dedupe_count == 1
+        assert reloaded.dedupe_children == ['some-prior-child-id']
+
+        # All original escalations should still be pending (nothing was dismissed).
+        pending_ids = {e.id for e in queue.get_pending()}
+        for e in escs:
+            assert e.id in pending_ids, f'{e.id} should still be pending but is not'
+
+    def test_apply_skips_when_canonical_disappeared(self, tmp_path: Path) -> None:
+        """apply_plan skips a group gracefully when the canonical file is gone.
+
+        Covers the ``queue.get(canonical_id) is None`` branch in apply_plan —
+        the canonical was in get_pending() when the plan was built but has since
+        been removed (e.g. a concurrent resolve or manual deletion between
+        build_plan and apply_plan).  Children must remain pending.
+        """
+        queue = EscalationQueue(tmp_path)
+        base_ts = datetime(2026, 1, 1, tzinfo=UTC)
+        escs = []
+        for i in range(3):
+            ts = (base_ts + timedelta(minutes=i)).isoformat()
+            e = _esc(timestamp=ts, task_id=str(i))
+            queue.submit(e)
+            escs.append(e)
+
+        # Build a plan while all escalations are present.
+        plan = build_plan(queue.get_pending())
+        assert len(plan.collapses) == 1
+        canonical_id = plan.collapses[0].canonical_id
+        child_ids = set(plan.collapses[0].child_ids)
+
+        # Simulate state drift: remove the canonical's file from the queue root
+        # (not via resolve — just delete, so get() returns None).
+        (tmp_path / f'{canonical_id}.json').unlink()
+
+        result = apply_plan(queue, plan)
+
+        # Group was skipped; no updates or dismissals should have occurred.
+        assert result['updated'] == 0
+        assert result['dismissed'] == 0
+
+        # Children should still be pending (the skip must not touch them).
+        pending_ids = {e.id for e in queue.get_pending()}
+        for cid in child_ids:
+            assert cid in pending_ids, f'Child {cid} should still be pending'
 
 
 # ---------------------------------------------------------------------------
