@@ -5302,3 +5302,93 @@ async def test_finding_persistence_count_matches_recent_runs_by_fingerprint(
     assert count_f2_narrow == 0, (
         f'Expected F2 count with lookback=1 to be 0 (run C does not have F2), got {count_f2_narrow}'
     )
+
+
+@pytest.mark.asyncio
+async def test_unresolved_after_remediation_does_not_escalate_when_persistence_below_threshold(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """Unresolved-after-remediation findings are suppressed when persistence < threshold.
+
+    The default threshold (_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 3) is used.
+    No prior runs are seeded, so persistence == 0 < 3, and the finding must NOT
+    produce an escalation.  Instead a structured logger.info with event name
+    'reconciliation.unresolved_after_remediation_suppressed' must be emitted.
+
+    Task 1512 / plans/afk-A7-recon-closure.md.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    await event_buffer.push(_make_event())
+
+    # Use the first actionable finding from _make_s3_findings()
+    actionable_finding = _make_s3_findings()[0]
+    assert actionable_finding['actionable'] is True
+
+    # Track calls to distinguish parent pass (call 1) from remediation pass (call 2)
+    call_count = {'s3': 0}
+
+    async def s3_always_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        call_count['s3'] += 1
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])   # S1: always empty
+    _mock_stage_run(harness.stages[1])   # S2: always empty
+    harness.stages[2].run = s3_always_returns_finding  # S3: always returns [F]
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # S3 must have been called twice: once for parent, once for remediation
+    assert call_count['s3'] == 2, (
+        f'Expected S3 called twice (parent + remediation), got {call_count["s3"]}'
+    )
+
+    # (a) No escalation for the unresolved finding (persistence 0 < threshold 3)
+    pending = esc_queue.get_pending()
+    unresolved_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and (
+            e.summary.startswith('Unresolved after remediation')
+            or e.summary.startswith('Persistently unresolved')
+        )
+    ]
+    assert unresolved_escalations == [], (
+        f'Expected no escalation for unresolved finding below threshold, '
+        f'got: {[e.summary for e in unresolved_escalations]}'
+    )
+
+    # (b) Suppression log record emitted
+    suppressed_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.unresolved_after_remediation_suppressed'
+    ]
+    assert len(suppressed_records) >= 1, (
+        f'Expected a "reconciliation.unresolved_after_remediation_suppressed" log record, '
+        f'got: {[r.getMessage() for r in caplog.records]}'
+    )
+    rec = suppressed_records[0]
+    assert rec.__dict__.get('finding_category') == actionable_finding['category'], (
+        f'Expected finding_category == {actionable_finding["category"]!r}, '
+        f'got: {rec.__dict__.get("finding_category")}'
+    )
+    assert actionable_finding['description'] in rec.__dict__.get('description', ''), (
+        f'Expected description in log record, got: {rec.__dict__.get("description")}'
+    )
