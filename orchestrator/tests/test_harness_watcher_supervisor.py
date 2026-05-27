@@ -23,9 +23,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import _WATCHER_MAX_BACKOFF_SECS, _WATCHER_TIMEOUT_GRACE_SECS, Harness
+from orchestrator.harness import (
+    _WATCHER_ALLOWED_TOOLS,
+    _WATCHER_MAX_BACKOFF_SECS,
+    _WATCHER_TIMEOUT_GRACE_SECS,
+    Harness,
+)
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -2077,3 +2083,449 @@ class TestMaybeWriteDigestSurfacesMissingState:
             pytest.raises(AttributeError, match='scheduler'),
         ):
             await h._watcher_supervisor_loop()
+
+
+# ---------------------------------------------------------------------------
+# task 1501: supervisor-failsafe — file/dedup/resolve L2 outage escalation
+# ---------------------------------------------------------------------------
+
+def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
+    """Build a Harness with a real EscalationQueue for outage-L2 tests.
+
+    Uses the same __new__ + _init_harness_state_for_test pattern as
+    _make_loop_harness / _make_lifecycle_harness, but also attaches a real
+    EscalationQueue rooted at tmp_path / 'esc' so submit / find_pending_l2_by_root_cause
+    / resolve execute the real disk path without mocking queue internals.
+    """
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    config = OrchestratorConfig(project_root=tmp_path)
+    h.config = config
+    h._watcher_supervisor_task = None
+    h._watcher_unclean_exits = deque()
+    h._watcher_degenerate_clean_exits = deque()
+
+    queue = EscalationQueue(tmp_path / 'esc')
+    h._escalation_queue = queue
+    return h, queue
+
+
+def _submit_sample_l1(queue: EscalationQueue, task_id: str = 'task-sample-1') -> str:
+    """Submit a minimal L1 escalation and return its id."""
+    from escalation.models import Escalation
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='test-agent',
+        severity='blocking',
+        category='infra_issue',
+        summary='sample L1 for outage test',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc.id
+
+
+class TestFileWatcherOutageL2:
+    """_file_watcher_outage_l2: creates an L2 outage escalation."""
+
+    def test_creates_new_l2_when_none_exists(self, tmp_path: Path) -> None:
+        """First call files exactly one L2 with the expected attributes.
+
+        Pre-submit 2 sample L1 escalations so the pending-L1 count is non-zero,
+        then verify the filed L2 includes the reason string and the L1 count.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # Pre-populate queue with 2 L1 escalations so count is non-zero
+        _submit_sample_l1(queue, 'task-a')
+        _submit_sample_l1(queue, 'task-b')
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+        pending = queue.get_pending()
+        l2s = [e for e in pending if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected exactly 1 L2 escalation after first call; got {len(l2s)}: {l2s}'
+        )
+        l2 = l2s[0]
+        assert l2.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE, (
+            f'root_cause must be {h._WATCHER_OUTAGE_ROOT_CAUSE!r}; got {l2.root_cause!r}'
+        )
+        assert l2.task_id == h._WATCHER_OUTAGE_SENTINEL, (
+            f'task_id must be {h._WATCHER_OUTAGE_SENTINEL!r}; got {l2.task_id!r}'
+        )
+        assert l2.severity == 'urgent', (
+            f'severity must be "urgent"; got {l2.severity!r}'
+        )
+        assert l2.agent_role == 'orchestrator-watcher-supervisor', (
+            f'agent_role must be "orchestrator-watcher-supervisor"; got {l2.agent_role!r}'
+        )
+        assert 'watcher_crashloop' in l2.summary, (
+            f'summary must contain the reason "watcher_crashloop"; got {l2.summary!r}'
+        )
+        # L1 count: 2 pre-submitted L1s
+        assert '2' in l2.summary, (
+            f'summary must mention pending-L1 count (2); got {l2.summary!r}'
+        )
+
+    def test_idempotent_no_duplicate_on_second_call(self, tmp_path: Path) -> None:
+        """Multiple calls while an open L2 exists must NOT create duplicate L2s.
+
+        Calls _file_watcher_outage_l2 three times (same reason twice, then a
+        different reason) and asserts exactly ONE L2 is still pending, proving
+        the dedup guard fires on the 2nd and 3rd calls.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+        h._file_watcher_outage_l2('watcher_crashloop')          # same reason — dedup
+        h._file_watcher_outage_l2('watcher_misconfigured')      # different reason — still dedup
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected exactly 1 L2 after 3 calls; got {len(l2s)}: {l2s}'
+        )
+
+    def test_noop_when_queue_is_none(self, tmp_path: Path) -> None:
+        """When _escalation_queue is None, _file_watcher_outage_l2 must be a no-op.
+
+        Bare-Harness unit tests (no queue attached) must stay green.
+        """
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._watcher_supervisor_task = None
+        h._watcher_unclean_exits = deque()
+        h._escalation_queue = None  # bare-Harness
+
+        # Must not raise
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _resolve_watcher_outage_l2 resolves the open outage L2
+# ---------------------------------------------------------------------------
+
+class TestResolveWatcherOutageL2:
+    """_resolve_watcher_outage_l2: resolves an open outage L2 or is a no-op."""
+
+    def test_resolves_open_l2_when_present(self, tmp_path: Path) -> None:
+        """File an outage L2, then resolve it — must no longer be pending."""
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # File the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        l2s_before = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s_before) == 1, 'precondition: one pending L2'
+        l2_id = l2s_before[0].id
+
+        # Resolve
+        h._resolve_watcher_outage_l2()
+
+        # Must no longer be in pending
+        l2s_after = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s_after) == 0, (
+            f'Expected 0 pending L2s after resolve; got {l2s_after}'
+        )
+        # Must be resolved in the full queue
+        resolved = queue.get(l2_id)
+        assert resolved is not None, f'escalation {l2_id} not found in queue'
+        assert resolved.status == 'resolved', (
+            f'Expected status="resolved"; got {resolved.status!r}'
+        )
+
+    def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
+        """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # No L2 in queue
+        pending_before = list(queue.get_pending())
+
+        # Must not raise
+        h._resolve_watcher_outage_l2()
+
+        # Queue unchanged
+        pending_after = list(queue.get_pending())
+        assert pending_after == pending_before, (
+            f'Queue should be unchanged; before={pending_before} after={pending_after}'
+        )
+
+    def test_noop_when_queue_is_none(self, tmp_path: Path) -> None:
+        """When _escalation_queue is None, _resolve_watcher_outage_l2 must be a no-op."""
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._escalation_queue = None
+
+        # Must not raise
+        h._resolve_watcher_outage_l2()
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _check_watcher_guard trip must also file the outage L2
+# ---------------------------------------------------------------------------
+
+class TestCheckWatcherGuardFilesL2Outage:
+    """When _check_watcher_guard trips, _file_watcher_outage_l2 is also called."""
+
+    @pytest.mark.asyncio
+    async def test_trip_files_outage_l2_crashloop(self, tmp_path: Path) -> None:
+        """Crashloop trip: L2 outage escalation is filed with reason='watcher_crashloop'."""
+        max_count = 3
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-populate exits_deque with max_count - 1 entries so the trip fires
+        # exactly on the max_count-th call (the one made by _check_watcher_guard).
+        exits_deque = deque([now] * (max_count - 1))
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_crashloop', max_count, window, now
+        )
+
+        assert tripped is True, 'Guard should have tripped'
+        h.pause_scheduler.assert_awaited_once_with('watcher_crashloop')
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 after crashloop trip; got {len(l2s)}'
+        )
+        assert 'watcher_crashloop' in l2s[0].summary, (
+            f'L2 summary must contain "watcher_crashloop"; got {l2s[0].summary!r}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+
+    @pytest.mark.asyncio
+    async def test_trip_files_outage_l2_misconfigured(self, tmp_path: Path) -> None:
+        """Misconfigured trip: L2 outage escalation is filed with reason='watcher_misconfigured'."""
+        max_count = 3
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        exits_deque = deque([now] * (max_count - 1))
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_misconfigured', max_count, window, now
+        )
+
+        assert tripped is True, 'Guard should have tripped'
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 after misconfigured trip; got {len(l2s)}'
+        )
+        assert 'watcher_misconfigured' in l2s[0].summary, (
+            f'L2 summary must contain "watcher_misconfigured"; got {l2s[0].summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_l2_when_guard_does_not_trip(self, tmp_path: Path) -> None:
+        """When guard does NOT trip (below threshold), no L2 is filed."""
+        max_count = 5
+        window = 600.0
+        now = time.monotonic()
+
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        exits_deque: deque[float] = deque()  # empty — first entry added by guard itself
+
+        tripped = await h._check_watcher_guard(
+            exits_deque, 'watcher_crashloop', max_count, window, now
+        )
+
+        assert tripped is False, 'Guard should not have tripped'
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 0, (
+            f'Expected 0 L2s when guard does not trip; got {l2s}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _start_watcher_supervisor disabled branch must file outage L2
+# ---------------------------------------------------------------------------
+
+class TestStartWatcherSupervisorDisabledFilesL2:
+    """When watcher_supervisor_enabled=False, _start_watcher_supervisor must file an L2."""
+
+    def test_disabled_branch_files_outage_l2(self, tmp_path: Path) -> None:
+        """With watcher_supervisor_enabled=False, calling _start_watcher_supervisor
+        must: (a) not create an asyncio.Task, (b) file an L2 outage escalation
+        with summary containing 'watcher_supervisor_enabled=false'.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.config = h.config.model_copy(update={'watcher_supervisor_enabled': False})
+
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
+            h._start_watcher_supervisor()
+            mock_ct.assert_not_called()
+
+        assert h._watcher_supervisor_task is None
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 outage escalation when supervisor disabled; got {len(l2s)}'
+        )
+        assert 'watcher_supervisor_enabled=false' in l2s[0].summary.lower(), (
+            f'L2 summary must mention watcher_supervisor_enabled=false; got {l2s[0].summary!r}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _enforce_cost_ceilings watcher ceiling trip must file outage L2
+# ---------------------------------------------------------------------------
+
+class TestEnforceCostCeilingsFilesL2:
+    """_enforce_cost_ceilings watcher ceiling trip must file an L2 outage escalation."""
+
+    @pytest.mark.asyncio
+    async def test_watcher_ceiling_trip_files_outage_l2(self, tmp_path: Path) -> None:
+        """When the watcher 24h cost ceiling trips, an L2 outage escalation is filed.
+
+        Build a Harness with a real EscalationQueue, stub cost_store whose
+        cost_totals_in_window returns (0.0, watcher_ceiling + 1.0) so the
+        watcher branch trips.  Stub pause_scheduler as AsyncMock and scheduler
+        with is_paused=False.  Assert:
+        - pause_scheduler was awaited once with 'cost_ceiling_watcher_exceeded'
+        - queue.get_pending() contains an L2 with root_cause='watcher_supervisor_down'
+          and summary containing 'cost_ceiling_watcher_exceeded'
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        watcher_ceiling = h.config.watcher_daily_cost_ceiling_usd
+        # Stub scheduler with is_paused=False so the early return is not triggered
+        h.scheduler = MagicMock()
+        h.scheduler.is_paused = False
+        # Stub cost_store so the watcher branch trips
+        h.cost_store = MagicMock()
+        h.cost_store.cost_totals_in_window = AsyncMock(
+            return_value=(0.0, watcher_ceiling + 1.0)
+        )
+        h.pause_scheduler = AsyncMock()
+
+        await h._enforce_cost_ceilings()
+
+        h.pause_scheduler.assert_awaited_once_with('cost_ceiling_watcher_exceeded')
+
+        l2s = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s) == 1, (
+            f'Expected 1 L2 outage escalation after watcher ceiling trip; got {len(l2s)}'
+        )
+        assert l2s[0].root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE, (
+            f'Expected root_cause={h._WATCHER_OUTAGE_ROOT_CAUSE!r}; got {l2s[0].root_cause!r}'
+        )
+        assert 'cost_ceiling_watcher_exceeded' in l2s[0].summary, (
+            f'L2 summary must contain "cost_ceiling_watcher_exceeded"; got {l2s[0].summary!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _watcher_supervisor_loop healthy-clean branch resolves outage L2
+# ---------------------------------------------------------------------------
+
+def _make_loop_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
+    """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
+    h = _make_loop_harness(tmp_path)
+    queue = EscalationQueue(tmp_path / 'esc')
+    h._escalation_queue = queue
+    return h, queue
+
+
+class TestWatcherSupervisorLoopRecoveryResolvesL2:
+    """_watcher_supervisor_loop healthy-clean branch resolves the open outage L2."""
+
+    @pytest.mark.asyncio
+    async def test_healthy_clean_rotation_resolves_outage_l2(self, tmp_path: Path) -> None:
+        """A healthy-clean rotation (duration >= min) resolves the open outage L2.
+
+        Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
+        lasting >= watcher_misconfigured_min_rotation_secs (healthy-clean path),
+        then assert the L2 is no longer pending (it was resolved).
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-file the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        # Drive with one healthy-clean rotation (duration > min_secs)
+        await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 0, (
+            f'Expected outage L2 to be resolved after healthy-clean rotation; '
+            f'still pending: {pending_after}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_does_NOT_resolve_outage_l2(self, tmp_path: Path) -> None:
+        """A degenerate-clean rotation (duration < min) does NOT resolve the open outage L2.
+
+        Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
+        lasting < watcher_misconfigured_min_rotation_secs (degenerate-clean path),
+        and assert the outage L2 remains pending.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
+
+        # Pre-file the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        pending_before = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+
+        # Drive with one degenerate-clean rotation (duration < min_secs)
+        await _run_supervisor_with_rotation_durations(h, [min_secs - 1.0])
+
+        pending_after = [
+            e for e in queue.get_pending()
+            if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
+        ]
+        assert len(pending_after) == 1, (
+            f'Expected outage L2 to remain pending after degenerate-clean rotation; '
+            f'got {len(pending_after)} pending'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
+# ---------------------------------------------------------------------------
+
+class TestWatcherAllowedTools:
+    """_WATCHER_ALLOWED_TOOLS includes the L2-promotion tool (task 1501)."""
+
+    def test_promote_to_l2_in_allowed_tools(self) -> None:
+        """mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS.
+
+        The autonomous L1-watcher agent can promote escalations to L2 when they
+        exceed its scope — this requires the promote_to_l2 MCP tool in its
+        allowed-tools allowlist (consumer-per-level contract from
+        plans/escalation-l2-tiering.md).
+        """
+        assert 'mcp__escalation__promote_to_l2' in _WATCHER_ALLOWED_TOOLS, (
+            'mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS '
+            'so the autonomous watcher can promote L1→L2 escalations; '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
+        )

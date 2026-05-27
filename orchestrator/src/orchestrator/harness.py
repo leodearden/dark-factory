@@ -107,9 +107,12 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
-    # Escalation MCP: read + autonomous resolve
+    # Escalation MCP: read + autonomous resolve + L1→L2 promotion
+    # (promote_to_l2 is needed by the consumer-per-level contract so the
+    # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__resolve_issue',
+    'mcp__escalation__promote_to_l2',
     # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -1963,6 +1966,102 @@ Output JSON matching the schema. Every task must appear in the output.
         except Exception:
             logger.warning('Failed to file scheduler-pause escalation', exc_info=True)
 
+    # Synthetic task_id sentinel and root_cause key for watcher-outage L2
+    # escalations.  One canonical root_cause keys all watcher-outage L2s
+    # regardless of trip reason (crashloop / misconfigured / cost-ceiling /
+    # disabled) — the dedup contract from plans/escalation-l2-tiering.md.
+    _WATCHER_OUTAGE_SENTINEL: str = '__watcher_supervisor__'
+    _WATCHER_OUTAGE_ROOT_CAUSE: str = 'watcher_supervisor_down'
+
+    def _file_watcher_outage_l2(self, reason: str) -> None:
+        """File an L2 outage escalation when the watcher subsystem is not running.
+
+        Mirrors _file_scheduler_pause_escalation (L1 helper) but targets the
+        human L2 stream because a watcher outage means no-one is handling L1s.
+
+        Dedup: find_pending_l2_by_root_cause(root_cause) returns early when an
+        open L2 with the same root_cause already exists, so multiple trips
+        (e.g. crashloop + cost-ceiling simultaneously) file exactly one L2.
+
+        Best-effort: a missing queue (bare-Harness tests) or any filing failure
+        is swallowed so this never breaks the supervisor / cost-ceiling /
+        startup paths.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+            return
+        try:
+            if queue.find_pending_l2_by_root_cause(
+                self._WATCHER_OUTAGE_ROOT_CAUSE
+            ) is not None:
+                return                         # dedup: one open L2 at a time
+            from escalation.models import Escalation
+            # NOTE: two get_pending() traversals occur here (one inside
+            # find_pending_l2_by_root_cause above, one for n_l1 below).
+            # This is acceptable at typical escalation-queue depths; if the
+            # queue grows large, consider caching the pending list within a
+            # single call or offloading to asyncio.to_thread.
+            n_l1 = len([
+                e for e in queue.get_pending() if e.level == 1
+            ])
+            esc = Escalation(
+                id=queue.make_id(self._WATCHER_OUTAGE_SENTINEL),
+                task_id=self._WATCHER_OUTAGE_SENTINEL,
+                agent_role='orchestrator-watcher-supervisor',
+                severity='urgent',
+                category='infra_issue',
+                level=2,
+                root_cause=self._WATCHER_OUTAGE_ROOT_CAUSE,
+                summary=(
+                    f'escalation-watcher-auto down ({reason}); {n_l1} L1 pending'
+                )[:200],
+                detail=(
+                    'The escalation-watcher-auto supervisor is not running or has '
+                    'been paused.  No autonomous L1 triage is taking place.\n\n'
+                    f'Reason: {reason}\n'
+                    f'Pending L1 escalations: {n_l1}\n\n'
+                    'Investigate the reason, fix the underlying issue, and restart '
+                    'the orchestrator (or re-enable the watcher supervisor) to resume '
+                    'autonomous triage.'
+                ),
+                suggested_action='investigate_watcher_supervisor',
+            )
+            queue.submit(esc)
+            logger.warning(
+                'Filed L2 watcher-outage escalation %s (reason=%s, n_l1=%d)',
+                esc.id, reason, n_l1,
+            )
+        except Exception:
+            logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
+
+    def _resolve_watcher_outage_l2(self) -> None:
+        """Resolve the open watcher-outage L2 escalation on healthy recovery.
+
+        Called from _watcher_supervisor_loop when a healthy-clean rotation
+        completes (duration >= watcher_misconfigured_min_rotation_secs) to
+        signal to the human that the watcher is running again.
+
+        No-op when no pending L2 with root_cause='watcher_supervisor_down' exists.
+        Best-effort: failures are swallowed so the supervisor loop never breaks.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
+            return
+        try:
+            existing_id = queue.find_pending_l2_by_root_cause(
+                self._WATCHER_OUTAGE_ROOT_CAUSE
+            )
+            if existing_id is None:
+                return
+            queue.resolve(
+                existing_id,
+                resolution='watcher recovered',
+                resolved_by='orchestrator-watcher-supervisor',
+            )
+            logger.info('Resolved watcher-outage L2 escalation %s (watcher recovered)', existing_id)
+        except Exception:
+            logger.warning('Failed to resolve watcher-outage L2 escalation', exc_info=True)
+
     def _file_restored_pause_escalation(self) -> None:
         """File the L1 for a pause restored from a prior run (deferred from run()).
 
@@ -2500,6 +2599,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 watcher, self.config.watcher_daily_cost_ceiling_usd,
             )
             await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            # File an L2 outage escalation so the operator learns via their L2
+            # stream that the watcher has been paused (dedup-safe: no-op if one
+            # is already open).  Intentionally NOT done for the orch-wide ceiling
+            # below — that's a different failure mode (the whole orchestrator is
+            # over budget, not specifically the watcher).
+            self._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
             return
 
         if total >= self.config.orch_daily_cost_ceiling_usd:
@@ -3222,6 +3327,19 @@ Output JSON matching the schema. Every task must appear in the output.
         Mirrors _start_terminal_status_watcher.
         """
         if not self.config.watcher_supervisor_enabled:
+            # Supervisor permanently disabled — file an outage L2 so the
+            # human L2 stream is notified (idempotent: dedup guard no-ops if
+            # one is already open, so repeated restarts produce exactly one L2).
+            #
+            # Intentional-disable note: when the supervisor is deliberately
+            # disabled via config, this L2 will remain open indefinitely because
+            # the only auto-resolver (_resolve_watcher_outage_l2) runs from the
+            # healthy-clean branch of _watcher_supervisor_loop, which never
+            # executes while the supervisor is disabled.  This is expected
+            # behaviour — the operator should manually resolve/dismiss the L2
+            # once they have verified the disable is intentional.  The 'urgent'
+            # severity is intentional: no autonomous L1 triage is occurring.
+            self._file_watcher_outage_l2('watcher_supervisor_enabled=false')
             return
         if (
             self._watcher_supervisor_task is not None
@@ -3429,6 +3547,10 @@ Output JSON matching the schema. Every task must appear in the output.
                     # counter so the next degenerate burst starts fresh from base.
                     consecutive_degenerate_clean = 0
                     logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
+                    # Resolve any open watcher-outage L2 — the watcher is running
+                    # healthily again.  Degenerate-clean (fast exits) are NOT recovery
+                    # signals; only healthy-clean (duration >= min) clears the outage.
+                    self._resolve_watcher_outage_l2()
                     await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
@@ -3532,6 +3654,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 'pause_scheduler raised on %s trip; stopping supervisor anyway',
                 reason,
             )
+        # File the watcher-outage L2 so the human L2 stream is notified even
+        # when the watcher subsystem is not running.  No outer try/except needed
+        # here: _file_watcher_outage_l2 is already best-effort (its body is
+        # entirely wrapped in `except Exception`), so any filing failure is
+        # swallowed internally.  CancelledError is not raised by the sync helper.
+        self._file_watcher_outage_l2(reason)
         return True  # always stop, even if pause_scheduler raised
 
     async def _scan_for_terminal_active_tasks(self) -> int:
