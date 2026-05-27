@@ -21,17 +21,29 @@ Design contracts (see plan.json design_decisions for rationale):
 
 from __future__ import annotations
 
-__all__ = ['DedupeConfig', 'compute_content_fingerprint', 'find_dedupe_parent', 'summary_dedupe_key']
+__all__ = [
+    'DedupeConfig',
+    'compute_content_fingerprint',
+    'content_fingerprint_key',
+    'find_dedupe_parent',
+    'summary_dedupe_key',
+]
 
 import hashlib
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
+
+# Type alias for injectable key functions.  A key function maps an Escalation
+# to a hashable value used for matching.  None return (e.g. unset fingerprint)
+# is treated as "never fold" by the empty-key guard in find_dedupe_parent.
+KeyFn = Callable[['Escalation'], Any]
 
 _NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
 _WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
@@ -95,19 +107,76 @@ def compute_content_fingerprint(
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def content_fingerprint_key(esc: Escalation) -> str | None:
+    """Key adapter for content-fingerprint dedup.
+
+    Returns ``esc.dedupe_fingerprint`` directly.  When the fingerprint is
+    ``None`` (unstamped escalation), the falsy-key guard in
+    ``find_dedupe_parent`` treats it as "never fold", so this function is safe
+    to use even for escalations that were not pre-stamped by A7b.
+    """
+    return esc.dedupe_fingerprint
+
+
+def _default_summary_key(esc: Escalation) -> tuple[str, ...]:
+    """Default key fn: wraps summary_dedupe_key for the key_fn=None path.
+
+    This wrapper is resolved at the find_dedupe_parent use-site (not stored as
+    a dataclass default) to avoid the descriptor-binding gotcha with bare
+    function defaults on dataclass fields.  The result is identical to calling
+    summary_dedupe_key(esc.summary) directly.
+    """
+    return summary_dedupe_key(esc.summary)
+
+
 @dataclass
 class DedupeConfig:
-    """Configuration knobs for infra_issue deduplication.
+    """Configuration knobs for escalation deduplication.
 
     Defaults represent the recommended AFK-hardening settings:
     - enabled         : True  — dedupe is on by default.
     - window_secs     : 600.0 — 10-minute look-back window.
     - categories      : ('infra_issue',) — only fold infra noise.
+    - key_fn          : None  — use summary_dedupe_key (default, infra path).
+
+    The ``infra_dedupe_*`` field names are historical; the config is
+    general-purpose.  Use ``DedupeConfig.for_recon()`` for the recon path.
+
+    ``key_fn`` is resolved at the ``find_dedupe_parent`` use-site: None maps
+    to ``_default_summary_key`` (wrapping ``summary_dedupe_key``).  Storing
+    None rather than the function directly avoids the dataclass
+    descriptor-binding gotcha and keeps the default path byte-identical to
+    the pre-A7a implementation.
     """
 
     infra_dedupe_enabled: bool = True
     infra_dedupe_window_secs: float = 600.0
     infra_dedupe_categories: tuple[str, ...] = ('infra_issue',)
+    key_fn: KeyFn | None = None  # None => _default_summary_key (summary prefix key)
+
+    @classmethod
+    def for_recon(cls) -> DedupeConfig:
+        """Return a DedupeConfig configured for recon integrity dedup.
+
+        Properties:
+        - ``infra_dedupe_enabled``     : True
+        - ``infra_dedupe_window_secs`` : float('inf') — unbounded window so
+          recurring findings over hours/days always fold into the same parent.
+        - ``infra_dedupe_categories``  : ('recon_integrity_issue',) — only fold
+          recon integrity findings; recon_failure / recon_backlog_overflow /
+          recon_stale_run are intentionally excluded to preserve distinct
+          blocking signals.
+        - ``key_fn``                   : content_fingerprint_key — folds on
+          esc.dedupe_fingerprint rather than the summary prefix.
+
+        The ``infra_dedupe_*`` prefix is historical / general-purpose.
+        """
+        return cls(
+            infra_dedupe_enabled=True,
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('recon_integrity_issue',),
+            key_fn=content_fingerprint_key,
+        )
 
 
 def summary_dedupe_key(summary: str) -> tuple[str, ...]:
@@ -161,10 +230,15 @@ def find_dedupe_parent(
     A parent matches when ALL of the following hold:
     - ``parent.status == 'pending'`` (get_pending() already ensures this).
     - ``parent.category == candidate.category``.
-    - ``summary_dedupe_key(parent.summary) == summary_dedupe_key(candidate.summary)``.
-    - ``(now - parsed(parent.timestamp)) <= window_secs``.
-    - ``candidate_key != ()`` — empty keys are never matched to prevent
-      unrelated empty-summary escalations from collapsing into one parent.
+    - ``key_fn(parent) == key_fn(candidate)`` where key_fn is resolved from
+      ``config.key_fn`` (None → ``_default_summary_key`` wrapping
+      ``summary_dedupe_key``).
+    - ``candidate_key`` is falsy (None, empty tuple, empty string) — falsy
+      keys are never matched to prevent unrelated escalations from collapsing.
+    - Age filter: ``(now - parsed(parent.timestamp)) <= window_secs``, UNLESS
+      ``config.infra_dedupe_window_secs`` is ``float('inf')`` (unbounded) in
+      which case the age filter is skipped entirely.  Parent timestamps are
+      still parsed for the oldest-selection sort in both modes.
 
     The ``config.infra_dedupe_enabled`` flag and category membership are
     intentionally NOT checked here — the server callers gate on those before
@@ -180,11 +254,20 @@ def find_dedupe_parent(
     path becomes hot, maintain an in-memory (category, key) → [(ts, id)] index
     populated by submit/resolve callbacks instead.
     """
+    import math
+
     effective_now = now if now is not None else datetime.now(UTC)
-    window = timedelta(seconds=config.infra_dedupe_window_secs)
-    candidate_key = summary_dedupe_key(candidate.summary)
-    # Empty key means the summary was blank/whitespace — never match to avoid
-    # collapsing unrelated escalations that happen to have no useful summary.
+    unbounded = math.isinf(config.infra_dedupe_window_secs)
+    # Only build the timedelta when the window is finite; timedelta(seconds=inf)
+    # raises OverflowError.
+    window = None if unbounded else timedelta(seconds=config.infra_dedupe_window_secs)
+
+    # Resolve the key function: None sentinel -> default summary-prefix key.
+    _key_fn: KeyFn = config.key_fn if config.key_fn is not None else _default_summary_key
+
+    candidate_key = _key_fn(candidate)
+    # Falsy key (None fingerprint, empty tuple, empty string) — never match to
+    # avoid collapsing unrelated or unstamped escalations.
     if not candidate_key:
         return None
     candidate_category = candidate.category
@@ -196,18 +279,19 @@ def find_dedupe_parent(
         # infra_dedupe_categories, so checking equality is sufficient.
         if parent.category != candidate_category:
             continue
-        # Key filter
-        if summary_dedupe_key(parent.summary) != candidate_key:
+        # Key filter using the resolved key function.
+        if _key_fn(parent) != candidate_key:
             continue
-        # Time-window filter
+        # Parse timestamp for age filter and oldest-match selection.
         try:
             parent_ts = datetime.fromisoformat(parent.timestamp)
         except (ValueError, AttributeError):
             continue
-        # Ensure timezone-aware for comparison
+        # Ensure timezone-aware for comparison.
         if parent_ts.tzinfo is None:
             parent_ts = parent_ts.replace(tzinfo=UTC)
-        if effective_now - parent_ts > window:
+        # Time-window filter — skipped entirely when window is unbounded (inf).
+        if window is not None and effective_now - parent_ts > window:
             continue
         matches.append((parent_ts, parent.id))
 
