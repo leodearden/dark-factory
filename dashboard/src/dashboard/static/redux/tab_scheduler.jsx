@@ -285,6 +285,21 @@ function SchedulerTab({ projectFilter = [] }) {
     ? rows
     : rows.filter(r => !r.project || projectFilter.includes(r.project));
 
+  // Filter modules by projectFilter — mirrors visibleRows above.
+  // Keeps a module visible when:
+  //   • no project tag (legacy/single-project path, !m.project guard mirrors !r.project)
+  //   • the module belongs to a selected project (m.project)
+  //   • the module is currently held by a task in a selected project (m.holder_project)
+  //     — needed so a cross-project lock holder doesn't disappear from the heatmap.
+  const visibleModules = stUseMemo(() => projectFilter.length === 0
+    ? modules
+    : modules.filter(m =>
+        !m.project ||
+        projectFilter.includes(m.project) ||
+        (m.holder_project && projectFilter.includes(m.holder_project))
+      ),
+  [modules, projectFilter]);
+
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {
     try {
@@ -427,7 +442,7 @@ function SchedulerTab({ projectFilter = [] }) {
           onChange={setSubTab}
         />
         <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>
-          {visibleRows.length} task{visibleRows.length !== 1 ? 's' : ''} · {modules.length} module{modules.length !== 1 ? 's' : ''}
+          {visibleRows.length} task{visibleRows.length !== 1 ? 's' : ''} · {visibleModules.length} module{visibleModules.length !== 1 ? 's' : ''}
         </span>
       </div>
 
@@ -438,13 +453,13 @@ function SchedulerTab({ projectFilter = [] }) {
           {subTab === 'tasks' ? (
             <SchedulerHeatmap
               rows={visibleRows}
-              modules={modules}
+              modules={visibleModules}
               onRowClick={handleRowClick}
               selectedTaskId={selectedTask ? selectedTask.task_id : null}
             />
           ) : (
             <ModulesView
-              modules={modules}
+              modules={visibleModules}
               rows={visibleRows}
               eventsMap={events_by_task}
             />
@@ -455,7 +470,7 @@ function SchedulerTab({ projectFilter = [] }) {
         {selectedTask && (
           <SchedulerDrawer
             task={selectedTask}
-            modules={modules}
+            modules={visibleModules}
             eventsForTask={events_by_task[`${selectedTask.project}/${selectedTask.task_id}`] || null}
             allRows={visibleRows}
             onClose={() => setSelectedTask(null)}
