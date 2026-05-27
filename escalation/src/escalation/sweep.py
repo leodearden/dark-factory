@@ -34,6 +34,20 @@ class SweepReport:
     root_after: int = 0
 
 
+def _pick_richer(root_esc: Escalation, archive_esc: Escalation) -> bool:
+    """Return True iff root is strictly richer than archive; ties go to archive."""
+    root_key = (root_esc.resolved_by is not None, root_esc.resolution_turns is not None)
+    archive_key = (archive_esc.resolved_by is not None, archive_esc.resolution_turns is not None)
+    return root_key > archive_key
+
+
+def _build_archive_index(archive_root: Path) -> dict[str, Path]:
+    """Return {stem: path} index of all esc-*.json files under archive_root."""
+    if not archive_root.exists():
+        return {}
+    return {p.stem: p for p in archive_root.rglob('esc-*.json')}
+
+
 def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     """Sweep resolved/dismissed escalations from queue root to archive.
 
@@ -51,6 +65,9 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     root_files = list(queue_dir.glob('esc-*.json'))
     report.root_before = len(root_files)
 
+    archive_root = queue_dir / archive.ARCHIVE_SUBDIR
+    archive_index = _build_archive_index(archive_root)
+
     for path in root_files:
         esc = Escalation.from_json(path.read_text())
 
@@ -59,11 +76,28 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
             continue
 
         if esc.status in ('resolved', 'dismissed'):
-            target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
-            if apply:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(path, target_dir / path.name)
-            report.archived += 1
+            existing_archive = archive_index.get(path.stem)
+
+            if existing_archive is None:
+                # No archive copy: move to dated subdir
+                target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
+                if apply:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    os.replace(path, target_dir / path.name)
+                report.archived += 1
+            else:
+                # Archive copy exists: compare richness
+                archive_esc = Escalation.from_json(existing_archive.read_text())
+                if _pick_richer(esc, archive_esc):
+                    # Root wins: atomically overwrite the archive slot
+                    if apply:
+                        os.replace(path, existing_archive)
+                    report.reconciled_root_wins += 1
+                else:
+                    # Archive wins: drop the duplicate root copy
+                    if apply:
+                        os.unlink(path)
+                    report.reconciled_archive_wins += 1
             continue
 
     report.root_after = (
