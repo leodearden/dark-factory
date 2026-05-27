@@ -601,8 +601,13 @@ class TestHarnessIdleWhilePaused:
 
         monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
 
+        # until_idle=True so the post-resume empty tree exits cleanly: this test
+        # pins the paused-idle-then-clean-exit contract, which is exactly what
+        # --until-idle restores.  Under the default run-forever the empty tree
+        # would idle indefinitely and trip the _IdleLoopStuck sentinel below.
         report = await harness.run(
             prd_path=None, dry_run=False, force_dirty_start=True,
+            until_idle=True,
         )
 
         # The idle branch must have executed at least once (old code would
@@ -615,6 +620,163 @@ class TestHarnessIdleWhilePaused:
         assert report.completed == 0, (
             f'No tasks ran, so completed must be 0; got {report.completed}'
         )
+
+
+class TestHarnessRunForever:
+    """The main run loop defaults to running forever (idle + poll on drain).
+
+    Run-forever orchestrator: a drained queue is NOT "done" under systemd.  The
+    loop idles and re-polls so tasks scheduled after startup get picked up;
+    ``--until-idle`` (until_idle=True) restores the legacy exit-on-drain.
+    """
+
+    def _neutralise(self, harness) -> None:
+        """Stub heavyweight startup/shutdown so the real run() loop is drivable."""
+        harness.mcp = MagicMock()
+        harness.mcp.start = AsyncMock()
+        harness.mcp.stop = AsyncMock()
+        harness.mcp.url = 'http://localhost:0'
+        harness.usage_gate = None
+        harness.review_checkpoint = None
+
+        harness._start_escalation_server = AsyncMock()
+        harness._start_merge_worker = AsyncMock()
+        harness._dismiss_stale_escalations = AsyncMock()
+        harness._rehydrate_merge_halt = MagicMock()
+        harness._file_restored_pause_escalation = MagicMock()
+        harness._start_orphan_l0_reaper = MagicMock()
+        harness._start_terminal_status_watcher = MagicMock()
+        harness._start_watcher_supervisor = MagicMock()
+        harness._start_stranded_reconcile = MagicMock()
+        harness._tag_task_modules = AsyncMock()
+        harness._recover_crashed_tasks = AsyncMock()
+        harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+        harness._enforce_cost_ceilings = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_run_forever_idles_on_empty_tree(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Default (until_idle=False): empty/drained tree idles via sleep, no exit.
+
+        The old code broke immediately on an empty queue.  Under run-forever the
+        loop must reach the idle branch and call ``asyncio.sleep`` with the
+        configured ``idle_poll_secs`` instead of completing.  A sentinel raised
+        from the fake sleep terminates the otherwise-infinite loop.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        self._neutralise(harness)
+
+        # Empty tree, never dispatches, NOT paused.
+        harness.scheduler.acquire_next = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+
+        class _StopIdle(Exception):
+            pass
+
+        seen = {'n': 0, 'secs': None}
+
+        async def fake_sleep(secs, *args, **kwargs):
+            seen['n'] += 1
+            seen['secs'] = secs
+            # Proves we took the run-forever idle branch (not paused, not broken).
+            assert harness.scheduler.is_paused is False, (
+                'run-forever idle branch must run with an unpaused scheduler'
+            )
+            raise _StopIdle()
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        with pytest.raises(_StopIdle):
+            await harness.run(
+                prd_path=None, dry_run=False, force_dirty_start=True,
+            )
+
+        assert seen['n'] == 1, 'run-forever must idle-sleep on a drained empty tree'
+        assert seen['secs'] == harness.config.idle_poll_secs == 15.0, (
+            f'idle sleep must use config.idle_poll_secs (15.0); got {seen["secs"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_until_idle_empty_tree_exits_cleanly(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """until_idle=True: empty tree breaks out and returns a report (no idle-sleep)."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        self._neutralise(harness)
+
+        harness.scheduler.acquire_next = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+
+        sleep_calls = {'n': 0}
+
+        async def fake_sleep(secs, *args, **kwargs):
+            sleep_calls['n'] += 1
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        report = await harness.run(
+            prd_path=None, dry_run=False, force_dirty_start=True,
+            until_idle=True,
+        )
+
+        assert report.completed == 0
+        assert sleep_calls['n'] == 0, (
+            '--until-idle must break on a drained queue, not enter the idle sleep'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_forever_resets_report_after_a_work_cycle(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A cycle that did work logs a per-cycle summary then resets for the next.
+
+        One task completes (DONE), the queue drains, and the run-forever idle
+        branch must (1) log the cycle summary, then (2) reset ``self.report`` and
+        ``task_reports`` so the next cycle's completed/total start clean.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        self._neutralise(harness)
+
+        from orchestrator.harness import TaskReport, WorkflowOutcome
+
+        assignment = MagicMock()
+        assignment.task_id = 'T1'
+        assignment.modules = ['mod/a']
+        # One assignment, then drained forever.
+        harness.scheduler.acquire_next = AsyncMock(side_effect=[assignment, None, None])
+        harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+
+        async def fake_slot(_assignment, _sem):
+            return TaskReport(task_id='T1', title='t', outcome=WorkflowOutcome.DONE)
+
+        harness._run_slot = fake_slot  # type: ignore[method-assign]
+
+        class _StopIdle(Exception):
+            pass
+
+        captured = {'report_at_sleep': None}
+
+        async def fake_sleep(_secs, *args, **kwargs):
+            # By the time we idle-sleep, the work cycle has reset the report.
+            captured['report_at_sleep'] = harness.report
+            raise _StopIdle()
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        with pytest.raises(_StopIdle):
+            await harness.run(
+                prd_path=None, dry_run=False, force_dirty_start=True,
+            )
+
+        # The report seen at idle-sleep is the FRESH per-cycle report (reset
+        # after the work cycle), so completed is back to 0 with no task_reports.
+        fresh = captured['report_at_sleep']
+        assert fresh is not None
+        assert fresh.completed == 0, (
+            'run-forever must reset self.report after a work cycle'
+        )
+        assert fresh.task_reports == [], 'per-cycle task_reports must reset to empty'
 
 
 class TestHarnessCostCeiling:
