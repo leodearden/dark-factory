@@ -323,3 +323,50 @@ class TestReconEscalationDedup:
         assert len(files) == 2, (
             f'Expected 2 distinct pending files, got {len(files)}'
         )
+
+    # ── Step 5: non-finding categories fold on summary ──────────────────
+
+    @pytest.mark.parametrize('category', [
+        'recon_failure',
+        'recon_stale_run',
+        'recon_backlog_overflow',
+    ])
+    def test_non_finding_categories_dedup_on_summary(self, tmp_path, category):
+        """Non-finding recon categories fold identical summaries and keep distinct ones.
+
+        Two calls with the same summary → 1 file with dedupe_count==1.
+        One more call with a different summary → 2 files total.
+
+        Verifies that _RECON_DEDUP_CONFIG covers all four recon categories and
+        the summary-fallback branch in _escalate is wired correctly.
+        """
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        repeated_summary = 'Stage memory_consolidator failed: timeout'
+
+        # Two identical summary calls → should fold to 1 parent
+        harness._escalate(category, run_id='aaaa1111', summary=repeated_summary, detail='')
+        harness._escalate(category, run_id='aaaa1112', summary=repeated_summary, detail='')
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'[{category}] Expected 1 pending file after 2 identical-summary calls, '
+            f'got {len(files)}'
+        )
+        data = json.loads(files[0].read_text())
+        assert data['dedupe_count'] == 1, (
+            f'[{category}] Expected dedupe_count==1, got {data["dedupe_count"]}'
+        )
+
+        # A third call with a DIFFERENT summary → should stay distinct (2 files)
+        harness._escalate(
+            category, run_id='aaaa1113',
+            summary='Stage task_knowledge_sync failed: timeout',
+            detail='',
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, (
+            f'[{category}] Expected 2 pending files after distinct-summary call, '
+            f'got {len(files)}'
+        )
