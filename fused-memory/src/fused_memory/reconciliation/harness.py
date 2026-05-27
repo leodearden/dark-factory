@@ -88,6 +88,21 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
+# Task 1512: minimum number of completed runs that must contain a finding
+# before it is escalated from _run_remediation_pass.  Below this count the
+# finding is suppressed (emitting a structured log instead) on the grounds
+# that remediation is likely to fix it on the next attempt.
+#
+# Counting note: each reconciliation cycle produces TWO completed runs — the
+# parent full run (persisted at run_full_cycle ~line 1065) and the remediation
+# run (persisted at _run_remediation_pass ~line 1405).  Both are counted by
+# _finding_persistence_count because both are 'completed' journal rows.  A
+# threshold of 4 therefore fires after 2 complete reconciliation cycles that
+# both flagged the same finding — short enough that a genuinely broken finding
+# escalates within a watchable window (≈ 10–180 minutes depending on cycle
+# duration), long enough to filter transient findings.
+_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
@@ -1163,6 +1178,107 @@ class ReconciliationHarness:
             logger.warning(f'Failed to load prior S3 findings: {e}')
         return None
 
+    async def _finding_persistence_count(
+        self,
+        project_id: str,
+        finding: dict,
+        lookback: int = max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD),
+    ) -> int:
+        """Count how many of the last `lookback` completed runs contain a matching finding.
+
+        Identity is determined by compute_content_fingerprint (same key as _escalate uses
+        for dedup), so findings that differ only in non-identity fields do not inflate the
+        count.  Counted per-run — duplicates within one run's items_flagged do not count
+        twice.
+
+        The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
+        that raising the threshold never silently caps the count below the gate value.
+
+        Returns 0 if HAS_ESCALATION is False, if the fingerprint call raises, or if any
+        other exception occurs (graceful degradation).  When the journal call itself
+        fails, a warning is logged so debugging a 'why didn't this escalate?' incident
+        is possible — the caller proceeds as if persistence is 0 (fail-closed).
+
+        Task 1512 / plans/afk-A7-recon-closure.md.
+        """
+        if not HAS_ESCALATION:
+            return 0
+        try:
+            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                'recon_integrity_issue',
+                finding.get('category') or '',
+                [str(a) for a in (finding.get('affected_ids') or [])],
+                finding.get('description') or '',
+            )
+        except Exception:
+            return 0
+        try:
+            recent = await self.journal.get_recent_runs(project_id, limit=lookback)
+            count = 0
+            for run in recent:
+                if run.status != 'completed':
+                    continue
+                s3_report = run.stage_reports.get('integrity_check')
+                if s3_report is None:
+                    continue
+                if isinstance(s3_report, dict):
+                    items = s3_report.get('items_flagged', []) or []
+                else:
+                    items = s3_report.items_flagged or []
+                # Count this run once if any item matches the target fingerprint
+                for item in items:
+                    try:
+                        fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                            'recon_integrity_issue',
+                            item.get('category') or '',
+                            [str(a) for a in (item.get('affected_ids') or [])],
+                            item.get('description') or '',
+                        )
+                    except Exception:
+                        continue
+                    if fp == target_fp:
+                        count += 1
+                        break  # one match per run is enough
+            return count
+        except Exception as _e:
+            logger.warning(
+                'reconciliation.persistence_count_failed',
+                extra={
+                    'project_id': project_id,
+                    'finding_category': finding.get('category', ''),
+                    'error': str(_e),
+                },
+            )
+            return 0
+
+    def _log_non_actionable_finding(
+        self,
+        project_id: str,
+        run_id: str,
+        finding: dict,
+    ) -> None:
+        """Emit a structured INFO log for a non-actionable Stage-3 integrity finding.
+
+        Non-actionable findings are suppressed from the escalation queue (task 1512 /
+        plans/afk-A7-recon-closure.md): the only possible human action — "accept as
+        known" — is achieved by *not* filing.  This helper keeps the finding observable
+        in the recon log/journal without touching the queue.
+
+        Called from both _maybe_remediate (parent pass) and _run_remediation_pass (after
+        the second-pass actionable partition) so both sites stay in sync as fields evolve.
+        """
+        logger.info(
+            'reconciliation.non_actionable_integrity_finding',
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'finding_category': finding.get('category', ''),
+                'affected_ids': list(finding.get('affected_ids') or []),
+                'description': finding.get('description', ''),
+                'severity': finding.get('severity', ''),
+            },
+        )
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -1191,15 +1307,15 @@ class ReconciliationHarness:
             actionable = [f for f in all_findings if f.get('actionable', False)]
             non_actionable = [f for f in all_findings if not f.get('actionable', False)]
 
-            # Escalate non-actionable findings immediately
+            # Task 1512 / plans/afk-A7-recon-closure.md:
+            # Non-actionable findings are NOT escalated.  Per the Stage-3 contract
+            # they are already (a) persisted in stage_reports.integrity_check.items_flagged
+            # and (b) forward-fed into the next cycle's S1/S2 via _get_prior_s3_findings.
+            # The only possible human action — "accept as known" — is achieved by *not*
+            # filing, so escalating them is a category error.  Instead, emit a structured
+            # log record so the finding stays observable in the recon log/journal.
             for finding in non_actionable:
-                self._escalate(
-                    'recon_integrity_issue',
-                    parent_run_id,
-                    f'Non-actionable integrity finding: {finding.get("description", "?")}',
-                    detail=json.dumps(finding, default=str),
-                    finding=finding,
-                )
+                self._log_non_actionable_finding(project_id, parent_run_id, finding)
 
             if not actionable:
                 return
@@ -1329,21 +1445,62 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # After second-pass S3: escalate ALL remaining findings (never a third pass)
+            # After second-pass S3: gate escalation on persistence (task 1512 /
+            # plans/afk-A7-recon-closure.md).  Never a third pass.
+            # A finding is only escalated when it has appeared in at least
+            # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD completed runs, which signals
+            # that remediation cannot fix it on its own.  Below the threshold we
+            # suppress the escalation and emit a structured log so the finding
+            # stays observable without polluting the queue.
+            # The except handlers further below (AllAccountsCappedException and
+            # bare Exception) are untouched — they fire on stage *exceptions*, not
+            # on Stage-3 findings, and are the genuine "needs human" signals.
+            #
+            # task 1512 review_feedback (design_inconsistency):
+            # Partition remaining findings by actionability — identical to
+            # _maybe_remediate's partition at lines 1260-1261.  Non-actionable
+            # findings are logged exactly as in the parent pass and must NEVER reach
+            # the persistence-gated escalation branch regardless of recurrence count.
             s3_report = run.stage_reports.get('integrity_check')
             if s3_report is not None:
                 if isinstance(s3_report, dict):
-                    remaining = s3_report.get('items_flagged', [])
+                    all_remaining = s3_report.get('items_flagged', [])
                 else:
-                    remaining = s3_report.items_flagged
-                for finding in remaining:
-                    self._escalate(
-                        'recon_integrity_issue',
-                        run_id,
-                        f'Unresolved after remediation: {finding.get("description", "?")}',
-                        detail=json.dumps(finding, default=str),
-                        finding=finding,
-                    )
+                    all_remaining = s3_report.items_flagged
+                actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
+                non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
+                # Non-actionable findings are logged but never escalated — same
+                # contract as the parent pass in _maybe_remediate.
+                for finding in non_actionable_remaining:
+                    self._log_non_actionable_finding(project_id, run_id, finding)
+                for finding in actionable_remaining:
+                    persistence = await self._finding_persistence_count(project_id, finding)
+                    if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
+                        self._escalate(
+                            'recon_integrity_issue',
+                            run_id,
+                            f'Persistently unresolved after remediation '
+                            f'({persistence} cycles): {finding.get("description", "?")}',
+                            detail=json.dumps(
+                                {**finding, 'persistence': persistence},
+                                default=str,
+                            ),
+                            finding=finding,
+                        )
+                    else:
+                        logger.info(
+                            'reconciliation.unresolved_after_remediation_suppressed',
+                            extra={
+                                'project_id': project_id,
+                                'run_id': run_id,
+                                'parent_run_id': parent_run_id,
+                                'finding_category': finding.get('category', ''),
+                                'affected_ids': list(finding.get('affected_ids') or []),
+                                'description': finding.get('description', ''),
+                                'persistence': persistence,
+                                'threshold': _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+                            },
+                        )
 
             logger.info(
                 'reconciliation.remediation_completed',
