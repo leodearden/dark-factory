@@ -493,6 +493,21 @@ class TaskWorkflow:
         - syncs per-worktree venvs unless the worktree is external
         - removes any ``.task/`` paths inherited as tracked from main
         """
+        # Pre-empt race: read live status BEFORE claiming 'in-progress'.
+        # If the task was cancelled (or otherwise terminal) out-of-band in the
+        # ~3 s window between acquire and dispatch, raise TerminalExitRejection
+        # so run()'s existing 1489 handler converts it to WorkflowOutcome.CANCELLED
+        # without an 'in-progress' write, no escalation, and no reopen.
+        # A None / get_status failure is not in TERMINAL_STATUSES → fall through.
+        live_status = await self.scheduler.get_status(self.task_id)
+        if live_status in TERMINAL_STATUSES:
+            raise TerminalExitRejection(
+                task_id=self.task_id,
+                old_status=live_status,
+                target_status='in-progress',
+                raw='preempt: task terminal at dispatch',
+            )
+
         await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
         # Create worktree (captures base commit for stable diffs).

@@ -5678,6 +5678,69 @@ class TestMarkBlockedBypassDetection:
             f'{scheduler.reopen_reasons.get(task_assignment.task_id)!r}'
         )
 
+    async def test_run_preempts_when_task_already_cancelled_at_dispatch(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Pre-empt check: live status already terminal BEFORE dispatch → abort
+        before claiming 'in-progress'.
+
+        ITEM 1: _setup_worktree_and_artifacts reads live status via
+        ``scheduler.get_status()`` BEFORE calling
+        ``set_task_status('in-progress')``.  When terminal, raises
+        ``TerminalExitRejection(old_status=<live>)`` so run()'s existing
+        1489 handler returns ``WorkflowOutcome.CANCELLED`` with zero
+        escalations and no 'in-progress' write.
+
+        RED: without the pre-empt read, ``set_task_status('in-progress')``
+        is called first, writing 'in-progress' to scheduler.statuses, so
+        assertion (b) — the key pre-empt assertion — fails.
+        """
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        # Pre-seed the live status as 'cancelled' so get_status returns terminal
+        # BEFORE dispatch.  set_task_status is NOT patched — the pre-empt must
+        # prevent it from being called entirely.
+        scheduler.statuses[task_assignment.task_id] = ['cancelled']
+
+        outcome = await workflow.run()
+
+        # (a) Outcome must be CANCELLED.
+        assert outcome == WorkflowOutcome.CANCELLED, (
+            f'Expected CANCELLED when task pre-cancelled at dispatch, got {outcome!r}'
+        )
+
+        # (b) PRE-EMPT KEY ASSERTION: 'in-progress' must never have been
+        # written — the race window is closed, not merely handled after the fact.
+        written = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'in-progress' not in written, (
+            f"Pre-empt failed: 'in-progress' was written before abort; "
+            f'statuses seen: {written!r}'
+        )
+
+        # (c) Workflow must NEVER have entered the BLOCKED phase.
+        assert workflow.state == WorkflowState.PLAN, (
+            f'Expected state=PLAN (never entered BLOCKED), got {workflow.state!r}'
+        )
+
+        # (d) Zero escalations — no task_failure, no bypass_done.
+        all_escs = (
+            queue.get_by_task(task_assignment.task_id, level=0)
+            + queue.get_by_task(task_assignment.task_id, level=1)
+        )
+        assert not all_escs, (
+            f'Expected no escalations for pre-cancelled task, got '
+            f'{[(e.id, e.category) for e in all_escs]}'
+        )
+
+        # (e) The row must NEVER be reopened.
+        assert task_assignment.task_id not in scheduler.reopen_reasons, (
+            f'Expected no reopen for pre-cancelled row, got '
+            f'{scheduler.reopen_reasons.get(task_assignment.task_id)!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestCleanupVerificationGate:
