@@ -381,6 +381,96 @@ class TestFindDedupeParent:
         assert result == 'esc-1-1'
 
 
+class TestComputeContentFingerprint:
+    """compute_content_fingerprint() — pure deterministic fingerprint for recon dedup."""
+
+    def test_identical_inputs_produce_identical_fingerprint(self):
+        """(a) Identical inputs => identical fingerprint."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a', 'id-b'])
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a', 'id-b'])
+        assert fp1 == fp2
+
+    def test_affected_ids_order_independent(self):
+        """(b) affected_ids order-independent: [a,b] == [b,a]."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a', 'id-b'])
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-b', 'id-a'])
+        assert fp1 == fp2
+
+    def test_different_affected_ids_differ(self):
+        """(c) Different affected_ids => different fingerprint."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a'])
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-b'])
+        assert fp1 != fp2
+
+    def test_different_finding_category_differs(self):
+        """(d) Different finding_category => different fingerprint."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a'])
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'missing_entity', ['id-a'])
+        assert fp1 != fp2
+
+    def test_different_escalation_category_differs(self):
+        """(e) Different escalation_category => different fingerprint."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a'])
+        fp2 = compute_content_fingerprint('infra_issue', 'entity_mismatch', ['id-a'])
+        assert fp1 != fp2
+
+    def test_empty_ids_uses_description_hash(self):
+        """(f) Empty affected_ids falls back to normalised description hash."""
+        from escalation.dedupe import compute_content_fingerprint
+        # Same normalised description => same
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity X is missing')
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity X is missing')
+        assert fp1 == fp2
+        # Different description => different
+        fp3 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity Y is missing')
+        assert fp1 != fp3
+
+    def test_empty_ids_normalises_description(self):
+        """(f cont.) Whitespace/case/punctuation-only differences normalise to same."""
+        from escalation.dedupe import compute_content_fingerprint
+        # These should all normalise to the same description
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'Entity X is missing')
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity x is missing')
+        fp3 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity x  is  missing')
+        fp4 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', [], 'entity x is missing!!!')
+        assert fp1 == fp2 == fp3 == fp4
+
+    def test_non_empty_ids_ignores_description(self):
+        """(g) With NON-empty affected_ids, description is ignored."""
+        from escalation.dedupe import compute_content_fingerprint
+        fp1 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a'], 'description one')
+        fp2 = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-a'], 'COMPLETELY DIFFERENT description')
+        assert fp1 == fp2
+
+    def test_determinism_not_builtin_hash(self):
+        """(h) Fingerprint is process-stable (sha256-based), not builtin hash().
+
+        This proves cross-process determinism by checking against a hard-coded
+        expected value derived from the known sha256 digest.
+        The key identity tuple: ('recon_integrity_issue', 'entity_mismatch', 'id-sentinel')
+        joined by \\x1f (unit separator).
+        """
+        from escalation.dedupe import compute_content_fingerprint
+        import hashlib
+        # Compute what the expected fingerprint should be:
+        # identity = escalation_category \x1f finding_category \x1f body
+        # body = sorted(['id-sentinel']) joined by \x1f = 'id-sentinel'
+        raw = '\x1f'.join(['recon_integrity_issue', 'entity_mismatch', 'id-sentinel'])
+        expected = hashlib.sha256(raw.encode()).hexdigest()
+
+        fp = compute_content_fingerprint('recon_integrity_issue', 'entity_mismatch', ['id-sentinel'])
+        assert fp == expected, (
+            f'Expected sha256-based fingerprint {expected!r}, got {fp!r}. '
+            'If you see a different value, the implementation may be using '
+            'builtin hash() which is PYTHONHASHSEED-salted and non-deterministic.'
+        )
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
