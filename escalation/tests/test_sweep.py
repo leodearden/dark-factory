@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-_WORKTREE_SRC = str(Path(__file__).parent.parent / 'src')
-
 from escalation import sweep
 from escalation.models import Escalation
+
+_WORKTREE_SRC = str(Path(__file__).parent.parent / 'src')
 
 
 def _write_root_esc(
