@@ -386,11 +386,47 @@ def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
     rather than the type-mismatch OLD-wins path (which silently discards the new dict).
 
     Old-then-new stable order is preserved (same policy as the dict-vs-dict union).
+
+    Also covers symmetric cases to ensure normalization is applied to both sides:
+    * old=canonical dict, new=legacy list → union (new side is also normalised)
+    * old=legacy list,     new=legacy list → both coerced then unioned
     """
+    # Primary case: old=legacy list, new=canonical dict
     old_raw = '{"memory_hints":[{"entity":"E1","query":"q1"},{"entity":"E2","query":"q2"}]}'
     new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
     result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
     assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
+
+    # Symmetric case 1: old=canonical dict, new=legacy list → union
+    old_raw_sym = '{"memory_hints":{"entities":["E1"],"queries":["q1"]}}'
+    new_raw_sym = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
+    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, append=True))
+    assert result_sym == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
+
+    # Symmetric case 2: old=legacy list, new=legacy list → both coerced, then unioned
+    old_raw_ll = '{"memory_hints":[{"entity":"E1","query":"q1"}]}'
+    new_raw_ll = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
+    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, append=True))
+    assert result_ll == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
+
+
+def test_merge_metadata_legacy_hints_not_normalized_on_one_sided_write():
+    """Normalization is scoped to the collision path: one-sided writes do not migrate.
+
+    When only the *old* side carries ``memory_hints`` (and the incoming write
+    does not touch that key), the stored legacy list shape is left unchanged.
+    Normalization only fires when BOTH sides carry ``memory_hints``, keeping
+    the special case strictly scoped to the merge-collision path and avoiding
+    any implicit side-effect on unrelated writes.
+    """
+    old_raw = '{"tag":"old","memory_hints":[{"entity":"E1","query":"q1"}]}'
+    new_raw = '{"tag":"new"}'  # does not carry memory_hints
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    # scalar collision on "tag" → OLD wins
+    assert result["tag"] == "old"
+    # memory_hints was NOT in the incoming write, so normalization does not fire;
+    # the legacy list shape is preserved verbatim in the merged result.
+    assert result["memory_hints"] == [{"entity": "E1", "query": "q1"}]
 
 
 def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
@@ -404,6 +440,7 @@ def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
     * non-dict items (str, None) → skipped
     * empty-string entity/query → skipped
     * None-valued entity/query → skipped
+    * duplicate entity/query values → deduplicated in stable (first-seen) order
     * already-canonical dict input → returned unchanged (pass-through)
     * None input → returned unchanged (pass-through)
 
@@ -423,6 +460,15 @@ def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
     ]
     result = _normalize_legacy_memory_hints_value(malformed)
     assert result == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
+
+    # Duplicates — deduplicated in stable first-seen order
+    duped = [
+        {"entity": "E1", "query": "q1"},
+        {"entity": "E1", "query": "q2"},  # duplicate entity — skip entity, keep query
+        {"entity": "E2", "query": "q1"},  # duplicate query — keep entity, skip query
+    ]
+    result_dedup = _normalize_legacy_memory_hints_value(duped)
+    assert result_dedup == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
 
     # Already-canonical dict — pass-through
     canonical = {"entities": ["X"], "queries": ["q"]}

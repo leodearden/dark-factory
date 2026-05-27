@@ -1189,15 +1189,19 @@ def _normalize_legacy_memory_hints_value(value: object) -> object:
         return value
     entities: list[str] = []
     queries: list[str] = []
+    seen_entities: set[str] = set()
+    seen_queries: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
             continue
         entity = item.get("entity")
-        if isinstance(entity, str) and entity:
+        if isinstance(entity, str) and entity and entity not in seen_entities:
             entities.append(entity)
+            seen_entities.add(entity)
         query = item.get("query")
-        if isinstance(query, str) and query:
+        if isinstance(query, str) and query and query not in seen_queries:
             queries.append(query)
+            seen_queries.add(query)
     return {"entities": entities, "queries": queries}
 
 
@@ -1217,11 +1221,14 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
     If either side fails to JSON-decode, the new value replaces the old
     verbatim — matches Taskmaster's "last write wins" fallback.
 
-    Special case — ``memory_hints``:  when either side carries the legacy
-    list-of-dicts shape (``[{"entity": ..., "query": ...}, ...]``) it is
-    normalised to the canonical dict shape before ``_merge_values`` runs, so
-    the merge falls into the dict-vs-dict recursive union path rather than the
-    type-mismatch OLD-wins path.  All other keys are unaffected.
+    Special case — ``memory_hints``:  when **both** sides carry a
+    ``memory_hints`` key and either side's value is the legacy list-of-dicts
+    shape (``[{"entity": ..., "query": ...}, ...]``), that side is normalised to
+    the canonical dict shape before ``_merge_values`` runs, so the merge falls
+    into the dict-vs-dict recursive union path rather than the type-mismatch
+    OLD-wins path.  Normalization is scoped to the merge-collision path: a write
+    that does not include ``memory_hints`` leaves a stored legacy-shape value
+    unchanged.  All other keys are unaffected.
     """
     if existing_raw is None or not append:
         return incoming
@@ -1233,9 +1240,11 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
     # Normalize legacy memory_hints list shape on both sides before merging.
-    if "memory_hints" in old:
+    # Only fires when BOTH sides carry memory_hints — i.e. on the merge collision
+    # path — so a write that omits memory_hints does not silently migrate the
+    # stored legacy shape.
+    if "memory_hints" in old and "memory_hints" in new:
         old = {**old, "memory_hints": _normalize_legacy_memory_hints_value(old["memory_hints"])}
-    if "memory_hints" in new:
         new = {**new, "memory_hints": _normalize_legacy_memory_hints_value(new["memory_hints"])}
     try:
         merged = _merge_values(old, new)
