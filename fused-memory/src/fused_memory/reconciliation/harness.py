@@ -1418,13 +1418,35 @@ class ReconciliationHarness:
             # The except handlers further below (AllAccountsCappedException and
             # bare Exception) are untouched — they fire on stage *exceptions*, not
             # on Stage-3 findings, and are the genuine "needs human" signals.
+            #
+            # task 1512 review_feedback (design_inconsistency):
+            # Partition remaining findings by actionability — identical to
+            # _maybe_remediate's partition at lines 1260-1261.  Non-actionable
+            # findings are logged exactly as in the parent pass and must NEVER reach
+            # the persistence-gated escalation branch regardless of recurrence count.
             s3_report = run.stage_reports.get('integrity_check')
             if s3_report is not None:
                 if isinstance(s3_report, dict):
-                    remaining = s3_report.get('items_flagged', [])
+                    all_remaining = s3_report.get('items_flagged', [])
                 else:
-                    remaining = s3_report.items_flagged
-                for finding in remaining:
+                    all_remaining = s3_report.items_flagged
+                actionable_remaining = [f for f in all_remaining if f.get('actionable', False)]
+                non_actionable_remaining = [f for f in all_remaining if not f.get('actionable', False)]
+                # Non-actionable findings are logged but never escalated — same
+                # contract as the parent pass in _maybe_remediate (lines 1270-1281).
+                for finding in non_actionable_remaining:
+                    logger.info(
+                        'reconciliation.non_actionable_integrity_finding',
+                        extra={
+                            'project_id': project_id,
+                            'run_id': run_id,
+                            'finding_category': finding.get('category', ''),
+                            'affected_ids': list(finding.get('affected_ids') or []),
+                            'description': finding.get('description', ''),
+                            'severity': finding.get('severity', ''),
+                        },
+                    )
+                for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
                         self._escalate(
