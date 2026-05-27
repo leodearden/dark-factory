@@ -1191,14 +1191,24 @@ class ReconciliationHarness:
             actionable = [f for f in all_findings if f.get('actionable', False)]
             non_actionable = [f for f in all_findings if not f.get('actionable', False)]
 
-            # Escalate non-actionable findings immediately
+            # Task 1512 / plans/afk-A7-recon-closure.md:
+            # Non-actionable findings are NOT escalated.  Per the Stage-3 contract
+            # they are already (a) persisted in stage_reports.integrity_check.items_flagged
+            # and (b) forward-fed into the next cycle's S1/S2 via _get_prior_s3_findings.
+            # The only possible human action — "accept as known" — is achieved by *not*
+            # filing, so escalating them is a category error.  Instead, emit a structured
+            # log record so the finding stays observable in the recon log/journal.
             for finding in non_actionable:
-                self._escalate(
-                    'recon_integrity_issue',
-                    parent_run_id,
-                    f'Non-actionable integrity finding: {finding.get("description", "?")}',
-                    detail=json.dumps(finding, default=str),
-                    finding=finding,
+                logger.info(
+                    'reconciliation.non_actionable_integrity_finding',
+                    extra={
+                        'project_id': project_id,
+                        'run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'affected_ids': list(finding.get('affected_ids') or []),
+                        'description': finding.get('description', ''),
+                        'severity': finding.get('severity', ''),
+                    },
                 )
 
             if not actionable:
