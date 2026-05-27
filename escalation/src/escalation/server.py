@@ -12,7 +12,7 @@ from fastmcp import FastMCP
 
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
-from escalation.models import Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,13 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # Severity gate: critical/urgent escalations are born at L2, bypassing
+        # the auto-watcher and routing straight to a human (BORN_AT_L2_SEVERITIES).
+        # This runs before all other gates so the on-disk record is always stamped
+        # level=2 for any path that reaches the queue (queued, deduped, or resolved).
+        if esc.severity in BORN_AT_L2_SEVERITIES:
+            esc.level = 2
+
         # Gate 1: semantic bypass — this escalation is expected even for terminal tasks
         if terminal_state_is_the_bug:
             return _submit_or_dedupe(esc)
@@ -157,6 +164,7 @@ def create_server(
         agent_role: str,
         category: str,
         summary: str,
+        severity: str = 'info',
         detail: str = '',
         suggested_action: str = '',
         worktree: str | None = None,
@@ -167,6 +175,10 @@ def create_server(
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
+
+        *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
+        create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
+        bypasses the auto-watcher and routes directly to a human.
 
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
@@ -181,7 +193,7 @@ def create_server(
             id=queue.make_id(task_id),
             task_id=task_id,
             agent_role=agent_role,
-            severity='info',
+            severity=severity,
             category=category,
             summary=summary,
             detail=detail,
@@ -199,6 +211,7 @@ def create_server(
         agent_role: str,
         category: str,
         summary: str,
+        severity: str = 'blocking',
         detail: str = '',
         suggested_action: str = '',
         worktree: str | None = None,
@@ -211,6 +224,10 @@ def create_server(
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
+
+        *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
+        create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
+        bypasses the auto-watcher and routes directly to a human.
 
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
@@ -226,7 +243,7 @@ def create_server(
             id=queue.make_id(task_id),
             task_id=task_id,
             agent_role=agent_role,
-            severity='blocking',
+            severity=severity,
             category=category,
             summary=summary,
             detail=detail,
