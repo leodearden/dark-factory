@@ -72,6 +72,13 @@ _UNPARSEABLE_PROJECT = '_unparseable_project_'
 # earn a separate per-project group rather than collapsing across reviews.
 _NO_ESCALATION = '_no_escalation_'
 
+# Sentinel used to form the cooldown key for probe-defect escalations so the
+# existing _escalation_log/_cooldown_blocks mechanism rate-limits them without
+# a second structure.  Underscore-wrapped style matches _NO_ESCALATION and
+# _UNPARSEABLE_PROJECT; cannot collide with real (project_id, task_id,
+# escalation_id) triples derived from candidate metadata.
+_PROBE_DEFECT = '_probe_defect_'
+
 
 
 def _orchestrator_running(project_root: str) -> bool:
@@ -142,6 +149,7 @@ class TicketJanitor:
         primary_project_root: str = '',
         liveness_probe: Callable[[str], bool] | None = None,
         known_projects: dict[str, str] | None = None,
+        probe_defect_threshold: int = 3,
     ) -> None:
         self._store = store
         self._cooldown_secs = cooldown_secs
@@ -152,6 +160,13 @@ class TicketJanitor:
         # for projects whose worker is dead are terminalised as
         # ``failed/worker_dead``. None disables the reaper (legacy behaviour).
         self._liveness_probe = liveness_probe
+        # Consecutive probe raises before a probe-defect escalation is surfaced.
+        # Default 3 keeps a single transient blip silent.  Reset per-project
+        # whenever the probe returns cleanly.
+        self._probe_defect_threshold = probe_defect_threshold
+        # project_id → count of consecutive liveness-probe raises.  Incremented
+        # on each raise; cleared via pop() when the probe returns without raising.
+        self._probe_failures: dict[str, int] = defaultdict(int)
         # Registry snapshotted at init — no per-tick rebuild (task 1164).
         # When known_projects is injected (server startup), store a defensive
         # copy so external mutation doesn't affect routing after init.
@@ -216,6 +231,69 @@ class TicketJanitor:
         self._escalation_log[key] = log
         return bool(log)
 
+    def _surface_probe_defect(self, pid: str, count: int) -> None:
+        """Surface an infra_issue escalation when the liveness probe has raised consecutively.
+
+        Mirrors the routing guard ladder used by tick() step 4:
+        HAS_ESCALATION → _known_projects → _orchestrator_running → submit.
+        Bail-out branches do NOT record the cooldown so the next tick retries.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'ticket_janitor: probe defect for %s (count=%d) but escalation '
+                'package unavailable; defect not surfaced', pid, count,
+            )
+            return
+
+        project_root = self._known_projects.get(pid)
+        if project_root is None:
+            logger.warning(
+                'ticket_janitor: probe defect for %s (count=%d) but cannot '
+                'resolve project_root; unable to surface escalation', pid, count,
+            )
+            return
+
+        if not _orchestrator_running(project_root):
+            logger.info(
+                'ticket_janitor: probe defect for %s (count=%d) but orchestrator '
+                'not running; will retry on next tick', pid, count,
+            )
+            return
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('ticket-janitor'),
+            task_id='task-curator',
+            agent_role='fused-memory/ticket-janitor',
+            severity='info',
+            category='infra_issue',
+            level=1,
+            summary=(
+                f'liveness probe raised {count} consecutive time(s) for '
+                f'project {pid}; pending tickets may be silently stranded'
+            ),
+            detail=json.dumps({
+                'project_id': pid,
+                'consecutive_probe_failures': count,
+                'stranded_ticket_risk': (
+                    'pending tickets for this project are neither reaped nor '
+                    'escalated while the probe raises'
+                ),
+            }),
+        )
+        try:
+            queue.submit(escalation)
+            logger.warning(
+                'ticket_janitor: surfaced probe-defect escalation %s for '
+                'project %s (consecutive probe raises: %d)',
+                escalation.id, pid, count,
+            )
+        except Exception:
+            logger.warning(
+                'ticket_janitor: failed to submit probe-defect escalation for '
+                'project %s (count=%d); will retry next tick', pid, count,
+            )
+
     async def tick(self) -> None:
         """One janitor pass.
 
@@ -241,6 +319,14 @@ class TicketJanitor:
                         'treating as alive (fail-open)', pid,
                     )
                     alive = True
+                    self._probe_failures[pid] += 1
+                    if self._probe_failures[pid] >= self._probe_defect_threshold:
+                        try:
+                            self._surface_probe_defect(pid, self._probe_failures[pid])
+                        except Exception:
+                            logger.exception(
+                                'ticket_janitor: _surface_probe_defect raised for %s', pid,
+                            )
                 if not alive:
                     try:
                         n = await self._store.mark_pending_failed_for_project(
