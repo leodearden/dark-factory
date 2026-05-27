@@ -2058,3 +2058,139 @@ class TestAddMembersToL2:
         assert 'esc-l1-2' in reloaded.members
         assert len(reloaded.members) == 3
 
+
+class TestResolveCascade:
+    """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
+
+    def _make_l1(self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-1') -> Escalation:
+        """Submit a pending L1 escalation."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 test escalation',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _make_l2_with_members(
+        self,
+        queue: EscalationQueue,
+        l2_id: str,
+        member_ids: list[str],
+    ) -> Escalation:
+        """Submit a pending L2 escalation referencing the given member ids."""
+        esc = Escalation(
+            id=l2_id,
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=list(member_ids),
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_resolve_l2_cascades_resolution_to_members(self, tmp_path: Path):
+        """(a) resolve(l2_id) with members=[m1,m2] cascades — m1 and m2 are resolved."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        m1 = self._make_l1(queue, 'esc-l1-1', 'task-1')
+        m2 = self._make_l1(queue, 'esc-l1-2', 'task-2')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
+
+        queue.resolve(l2.id, 'Resolved the root cause')
+
+        r1 = queue.get('esc-l1-1')
+        r2 = queue.get('esc-l1-2')
+        assert r1 is not None
+        assert r2 is not None
+        assert r1.status == 'resolved', f'Expected m1 resolved, got {r1.status!r}'
+        assert r2.status == 'resolved', f'Expected m2 resolved, got {r2.status!r}'
+        assert r1.resolution == 'Resolved the root cause'
+        assert r2.resolution == 'Resolved the root cause'
+
+    def test_members_carry_cascade_resolved_by(self, tmp_path: Path):
+        """(b) members carry resolved_by='l2-cascade:{l2_id}' for audit."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
+
+        queue.resolve(l2.id, 'Fixed upstream')
+
+        m = queue.get('esc-l1-1')
+        assert m is not None
+        expected_by = f'l2-cascade:{l2.id}'
+        assert m.resolved_by == expected_by, (
+            f"Expected resolved_by={expected_by!r}, got {m.resolved_by!r}"
+        )
+
+    def test_dismiss_path_cascades_dismiss_to_members(self, tmp_path: Path):
+        """(c) resolve(l2_id, dismiss=True) cascades dismiss to members (status='dismissed')."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l1(queue, 'esc-l1-1')
+        self._make_l1(queue, 'esc-l1-2')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-l1-2'])
+
+        queue.resolve(l2.id, 'Dismissed: not actionable', dismiss=True)
+
+        m1 = queue.get('esc-l1-1')
+        m2 = queue.get('esc-l1-2')
+        assert m1 is not None
+        assert m2 is not None
+        assert m1.status == 'dismissed', f'Expected m1 dismissed, got {m1.status!r}'
+        assert m2.status == 'dismissed', f'Expected m2 dismissed, got {m2.status!r}'
+
+    def test_cascade_is_idempotent_member_already_resolved(self, tmp_path: Path):
+        """(d) Member already resolved keeps its prior resolved_by/resolution (idempotency)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        m1 = self._make_l1(queue, 'esc-l1-1')
+        queue.resolve('esc-l1-1', 'Pre-resolved separately', resolved_by='steward')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1'])
+
+        # Cascade should hit the idempotency guard in resolve() for m1
+        queue.resolve(l2.id, 'L2 resolution')
+
+        m1_reloaded = queue.get('esc-l1-1')
+        assert m1_reloaded is not None
+        assert m1_reloaded.status == 'resolved'
+        assert m1_reloaded.resolution == 'Pre-resolved separately', (
+            'Prior resolution must be preserved (idempotency)'
+        )
+        assert m1_reloaded.resolved_by == 'steward', (
+            'Prior resolved_by must be preserved (idempotency)'
+        )
+
+    def test_cascade_to_nonexistent_member_is_best_effort(self, tmp_path: Path):
+        """(e) Cascade to a non-existent member id is best-effort — no raise."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        # Only seed one of two referenced members
+        self._make_l1(queue, 'esc-l1-1')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', ['esc-l1-1', 'esc-nonexistent'])
+
+        # Must not raise
+        result = queue.resolve(l2.id, 'Fixed')
+
+        assert result is not None
+        assert result.status == 'resolved'
+        # The existing member should still be resolved
+        m1 = queue.get('esc-l1-1')
+        assert m1 is not None
+        assert m1.status == 'resolved'
+
+    def test_l2_with_empty_members_resolves_normally_no_cascade(self, tmp_path: Path):
+        """(f) L2 with empty members resolves normally (no cascade, no error)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2_with_members(queue, 'esc-l2-1', [])
+
+        result = queue.resolve(l2.id, 'Fixed; no members')
+
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Fixed; no members'
+
