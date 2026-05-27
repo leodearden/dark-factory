@@ -2058,6 +2058,28 @@ class TestAddMembersToL2:
         assert 'esc-l1-2' in reloaded.members
         assert len(reloaded.members) == 3
 
+    def test_internal_duplicates_in_new_member_ids_are_deduplicated(self, tmp_path: Path):
+        """Suggestion-3: new_member_ids=['a','a','b'] adds 'a' exactly once.
+
+        Set-union is only against *existing* members; if new_member_ids itself
+        contains duplicates they must be collapsed before the union so each id
+        appears at most once in the resulting members list.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)  # already has 'esc-l1-0'
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1', 'esc-l1-1', 'esc-l1-2'])
+
+        assert result is not None
+        assert result.members.count('esc-l1-1') == 1, (
+            f"'esc-l1-1' must appear exactly once, got {result.members}"
+        )
+        assert 'esc-l1-2' in result.members
+        assert result.members.count('esc-l1-0') == 1  # original untouched
+        assert len(result.members) == 3, (
+            f'Expected 3 unique members (esc-l1-0, esc-l1-1, esc-l1-2), got {result.members}'
+        )
+
 
 class TestResolveCascade:
     """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""

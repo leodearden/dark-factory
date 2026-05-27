@@ -316,6 +316,13 @@ class EscalationQueue:
           never blocks the remaining cascade.
         - ``resolve()`` is idempotent, so cascading to an already-resolved member
           is a safe no-op.
+
+        Ordering note (for ``_resolve_callback`` consumers):
+        ``_resolve_callback`` fires for the L2 **before** the cascade to member
+        L1s begins.  Consumers of the callback that inspect member state will see
+        members still pending at callback time; they should re-query member state
+        rather than assuming terminality.  This ordering is stable — do not rely
+        on members being resolved at the moment the L2 callback fires.
         """
         esc = self.get(escalation_id)
         if esc is None:
@@ -481,8 +488,9 @@ class EscalationQueue:
         reason this method never falls back to the archive.
 
         Set-union semantics: member ids already present in ``esc.members`` are
-        not added again.  New ids are appended in the order they appear in
-        *new_member_ids*.
+        not added again.  *new_member_ids* is also deduplicated internally via
+        ``dict.fromkeys`` so passing ``['a', 'a', 'b']`` adds 'a' exactly once.
+        New ids are appended in the order they first appear in *new_member_ids*.
 
         Only ``members`` is modified.  ``root_cause``, ``options``, ``summary``,
         ``detail``, and ``timestamp`` are preserved so the human-facing decision
@@ -507,7 +515,7 @@ class EscalationQueue:
             return esc  # no-op
 
         existing = set(esc.members)
-        appended = [m for m in new_member_ids if m not in existing]
+        appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
         if appended:
             esc.members.extend(appended)
             self._rewrite(escalation_id, esc)
