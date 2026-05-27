@@ -584,3 +584,86 @@ class TestBuildEscalationQueuesSummary:
         assert sum(primary_sub['summary']['by_level'].values()) == 1
         assert primary_sub['summary']['by_status']['pending'] == 1
         assert sum(primary_sub['summary']['by_status'].values()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for resolve_owning_project — worktree false-positive
+# prefix matching (step 11)
+# ---------------------------------------------------------------------------
+
+class TestResolveOwningProjectPrefixRegression:
+    """Regression tests locking the fix for str.startswith false-positive matches.
+
+    The original implementation used raw ``str.startswith`` for path prefix
+    matching.  This causes two classes of false positives:
+
+    1. A root named ``workspace`` incorrectly matches a worktree under a
+       *sibling* root ``workspace-2`` because the string ``".../workspace-2/..."``
+       starts with ``".../workspace"``.
+    2. A root's ``.worktrees`` prefix incorrectly matches paths under a
+       ``.worktrees-archive`` sibling directory.
+
+    All three tests below FAIL against the pre-fix ``str.startswith``
+    implementation and PASS after the fix (``Path.is_relative_to``).
+    """
+
+    def test_sibling_root_prefix_does_not_false_match(self, tmp_path):
+        """workspace-2 worktree must resolve to workspace-2, not workspace.
+
+        Pre-fix bug: ``str(tmp_path/'workspace-2'/'.worktrees'/'42').startswith(
+        str(tmp_path/'workspace'))`` is True because the string
+        ".../workspace-2/..." starts with ".../workspace".
+        """
+        from dashboard.data.escalations import resolve_owning_project
+
+        ws = tmp_path / 'workspace'
+        ws2 = tmp_path / 'workspace-2'
+        # workspace FIRST so the first-hit-wins rule amplifies the bug
+        roots = [(ws, []), (ws2, [])]
+
+        wt = str(ws2 / '.worktrees' / '42')
+        esc = _esc('esc-reg-1', task_id='42', worktree=wt)
+        result = resolve_owning_project(esc, roots)
+        assert result == 'workspace-2', (
+            f"Expected 'workspace-2' but got {result!r} — "
+            "sibling-prefix false positive not fixed"
+        )
+
+    def test_unrelated_sibling_worktree_returns_none(self, tmp_path):
+        """Worktree under workspace-extra must NOT match root workspace.
+
+        Pre-fix bug: ``".../workspace-extra/...".startswith(".../workspace")``
+        is True.
+        """
+        from dashboard.data.escalations import resolve_owning_project
+
+        ws = tmp_path / 'workspace'
+        ws_extra = tmp_path / 'workspace-extra'
+        roots = [(ws, [])]
+
+        wt = str(ws_extra / '.worktrees' / '42')
+        esc = _esc('esc-reg-2', task_id='42', worktree=wt)
+        result = resolve_owning_project(esc, roots)
+        assert result is None, (
+            f"Expected None but got {result!r} — "
+            "sibling-prefix false positive not fixed"
+        )
+
+    def test_dot_worktrees_archive_suffix_does_not_false_match(self, tmp_path):
+        """Worktree under .worktrees-archive must NOT match the .worktrees form.
+
+        Pre-fix bug: ``str(root/'.worktrees-archive'/'42').startswith(
+        str(root/'.worktrees'))`` is True because the raw strings share a prefix.
+        """
+        from dashboard.data.escalations import resolve_owning_project
+
+        proj_a = tmp_path / 'projA'
+        roots = [(proj_a, [])]
+
+        wt = str(proj_a / '.worktrees-archive' / '42')
+        esc = _esc('esc-reg-3', task_id='42', worktree=wt)
+        result = resolve_owning_project(esc, roots)
+        assert result is None, (
+            f"Expected None but got {result!r} — "
+            ".worktrees-archive false-matched .worktrees prefix"
+        )
