@@ -411,7 +411,8 @@ class TestApplyPlan:
         canonical = queue.get(canonical_id)
         assert canonical is not None
         assert canonical.status == 'pending'
-        assert canonical.dedupe_count == n
+        assert canonical.dedupe_count == n - 1
+        assert canonical.dedupe_count == len(canonical.dedupe_children)
         assert set(canonical.dedupe_children) == set(plan.collapses[0].child_ids)
         assert canonical.dedupe_fingerprint == fp
 
@@ -651,8 +652,8 @@ class TestApplyAndIdempotency:
         # Canonicals' dedupe_count not clobbered.
         ca = queue.get(canonical_a.id)
         cb = queue.get(canonical_b.id)
-        assert ca is not None and ca.dedupe_count == 3
-        assert cb is not None and cb.dedupe_count == 2
+        assert ca is not None and ca.dedupe_count == 2
+        assert cb is not None and cb.dedupe_count == 1
 
     def test_blocking_records_survive_apply(self, tmp_path: Path) -> None:
         """Blocking records remain pending after apply."""
