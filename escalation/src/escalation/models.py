@@ -30,6 +30,7 @@ class Escalation:
     resolution_turns: int | None = None  # conversation turns to resolve
     dedupe_count: int = 0  # number of duplicate submissions folded into this parent
     dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
+    dedupe_fingerprint: str | None = None  # content fingerprint for A7a/A7b recon dedup
 
     def to_dict(self) -> dict:
         return asdict(self)
