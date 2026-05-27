@@ -5149,3 +5149,75 @@ async def test_project_loop_replays_before_releasing_lock_on_halt(
         f'Expected lock held during replay on halt path, got {lock_held_during_replay!r}. '
         'Bug: halt path calls mark_run_complete before _replay_deferred_writes.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1512 — stop escalating non-actionable info integrity findings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_actionable_finding_does_not_escalate_and_is_logged(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """Non-actionable S3 findings must NOT produce a recon_integrity_issue escalation.
+
+    Instead they must emit a structured logger.info('reconciliation.non_actionable_
+    integrity_finding', extra={...}) so the finding stays observable in logs without
+    polluting the escalation queue.
+
+    Task 1512: gate non-actionable escalations on recurrence via structured logging.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # Wire a real EscalationQueue so we can assert on queue contents
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    # Third entry from _make_s3_findings() is the non-actionable one
+    non_actionable_finding = _make_s3_findings()[2]
+    assert non_actionable_finding['actionable'] is False
+    assert non_actionable_finding['category'] == 'systemic_pattern'
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[non_actionable_finding])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    # (a) No recon_integrity_issue escalation for non-actionable findings
+    pending = esc_queue.get_pending()
+    non_actionable_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Non-actionable integrity finding:')
+    ]
+    assert non_actionable_escalations == [], (
+        f'Expected no escalation for non-actionable finding, got: {non_actionable_escalations}'
+    )
+
+    # (b) Structured log record emitted for the suppressed finding
+    matching_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.non_actionable_integrity_finding'
+    ]
+    assert len(matching_records) >= 1, (
+        f'Expected a log record with message "reconciliation.non_actionable_integrity_finding", '
+        f'got records: {[r.getMessage() for r in caplog.records]}'
+    )
+    record = matching_records[0]
+    assert record.__dict__.get('finding_category') == 'systemic_pattern', (
+        f'Expected finding_category == "systemic_pattern", got: {record.__dict__.get("finding_category")}'
+    )
+    assert non_actionable_finding['description'] in record.__dict__.get('description', ''), (
+        f'Expected description in log record, got: {record.__dict__.get("description")}'
+    )
