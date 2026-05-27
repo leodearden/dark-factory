@@ -129,6 +129,46 @@ class EscalationQueue:
 
         return escalation.id
 
+    def _locate_path(self, escalation_id: str) -> Path | None:
+        """Return the on-disk path for *escalation_id*, or None if not found.
+
+        Lookup order:
+        1. ``queue_dir/{escalation_id}.json`` (queue root).
+        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``):
+           - If exactly one candidate: return it.
+           - If multiple candidates (multi-date duplicates): emit a WARNING naming the id
+             and return the newest by ``parent.name`` lexicographic order
+             (YYYY-MM-DD sorts lexicographically == chronologically; non-date names fall back
+             to ``''`` and are treated as oldest).
+
+        Shared by ``get()`` and ``patch_resolution_metadata()`` so that the archive
+        fallback and newest-by-date selection logic live in exactly one place.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if path.exists():
+            return path
+        # Fall back to archive: search all dated subdirs.
+        candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                f'Multiple archive files for {escalation_id}: '
+                f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
+            )
+            # YYYY-MM-DD sorts lexicographically == chronologically.
+            # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
+            # matching the comment and ensuring valid date dirs always win.
+            return max(
+                candidates,
+                key=lambda p: (
+                    p.parent.name
+                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
+                    else ''
+                ),
+            )
+        return candidates[0]
+
     def get(self, escalation_id: str) -> Escalation | None:
         """Read a single escalation by ID.
 
@@ -140,30 +180,9 @@ class EscalationQueue:
         should avoid repeated get() calls for ids known to be archived.
         TODO: memoise the archive listing per dated subdir to reduce repeated scans.
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        if not path.exists():
-            # Fall back to archive: search all dated subdirs.
-            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
-            if not candidates:
-                return None
-            if len(candidates) > 1:
-                logger.warning(
-                    f'Multiple archive files for {escalation_id}: '
-                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
-                )
-                # YYYY-MM-DD sorts lexicographically == chronologically.
-                # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
-                # matching the comment and ensuring valid date dirs always win.
-                path = max(
-                    candidates,
-                    key=lambda p: (
-                        p.parent.name
-                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
-                        else ''
-                    ),
-                )
-            else:
-                path = candidates[0]
+        path = self._locate_path(escalation_id)
+        if path is None:
+            return None
         try:
             return Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -435,6 +454,62 @@ class EscalationQueue:
         )
         return parent
 
+    def patch_resolution_metadata(
+        self,
+        escalation_id: str,
+        *,
+        resolved_by: str | None = None,
+        resolution_turns: int | None = None,
+    ) -> Escalation | None:
+        """Patch resolved_by and/or resolution_turns on an already-resolved escalation.
+
+        Updates the existing file in place wherever it lives (root or archive); never
+        resurrects an archived file into the queue root.  The tmp file used for the
+        atomic write is created in the target file's parent directory, so the rename
+        stays within the same filesystem subtree.
+
+        Multi-date duplicates: when multiple archive copies exist for the same id, only
+        the newest copy (newest parent directory name in YYYY-MM-DD lexicographic order)
+        is patched; staler copies remain untouched.  Callers should clean up duplicate
+        archive copies independently.
+
+        Returns None when the escalation is missing OR still pending — caller must have
+        already resolved/dismissed it.
+
+        Returns the updated Escalation on success, or the unmodified Escalation when
+        called with no patch arguments (both resolved_by and resolution_turns are None).
+        """
+        # Locate the file (shared helper — same root-first, archive-fallback,
+        # newest-by-date logic as get()).
+        path = self._locate_path(escalation_id)
+        if path is None:
+            return None
+
+        # Parse
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+
+        # Guard: only patch resolved/dismissed escalations
+        if esc.status not in ('resolved', 'dismissed'):
+            return None
+
+        # No-op early return: nothing to patch — avoid disk I/O when both args are None.
+        if resolved_by is None and resolution_turns is None:
+            return esc
+
+        # Apply patches
+        if resolved_by is not None:
+            esc.resolved_by = resolved_by
+        if resolution_turns is not None:
+            esc.resolution_turns = resolution_turns
+
+        # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
+        self._atomic_write_path(path, esc.to_json())
+        return esc
+
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
         """Atomically rewrite an escalation's JSON file."""
         self._atomic_write(escalation_id, escalation.to_json())
@@ -442,23 +517,36 @@ class EscalationQueue:
     def _atomic_write(self, escalation_id: str, json_text: str) -> None:
         """Write *json_text* atomically to ``queue_dir/{escalation_id}.json``.
 
-        Uses the tmp+rename pattern: write to a temp file in the same directory
-        then rename over the target path.  On failure the tmp file is cleaned up
-        and the exception propagates unchanged.
+        Thin wrapper around ``_atomic_write_path`` that constructs the target
+        path from *escalation_id* and ``queue_dir``.  Always writes to the queue
+        root — not the archive.
 
         Callers: submit(), resolve(), submit_resolved(), _rewrite().
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        fd, tmp_path = tempfile.mkstemp(
-            suffix='.tmp', prefix=escalation_id, dir=str(self.queue_dir)
+        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
+
+    def _atomic_write_path(self, path: Path, json_text: str) -> None:
+        """Write *json_text* atomically to *path*.
+
+        Uses the tmp+rename pattern: the tmp file is created in ``path.parent``
+        (not hard-coded to ``queue_dir``) so that the ``os.rename`` stays within
+        the same directory — required for archive targets where *path* lives in
+        a dated subdir.  On failure the tmp file is cleaned up and the exception
+        propagates unchanged.
+
+        Callers: _atomic_write() (root targets), patch_resolution_metadata()
+        (root or archive targets).
+        """
+        fd, tmp_path_str = tempfile.mkstemp(
+            suffix='.tmp', prefix=path.stem, dir=str(path.parent)
         )
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(json_text)
-            os.rename(tmp_path, str(path))
+            os.rename(tmp_path_str, str(path))
         except Exception:
             with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
+                os.unlink(tmp_path_str)
             raise
 
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:

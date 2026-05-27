@@ -1413,6 +1413,276 @@ class TestIterAllEscalationPaths:
         )
 
 
+class TestPatchResolutionMetadata:
+    """EscalationQueue.patch_resolution_metadata() — archive-aware in-place metadata patch.
+
+    Core contract: patching an archived escalation rewrites the archive copy in place;
+    it NEVER creates a file in the queue root (no resurrection).
+    """
+
+    def test_patch_archived_no_resurrection_and_returns_updated_with_preserved_fields(
+        self, tmp_path: Path,
+    ):
+        """Regression test: patching resolved_by on an archived escalation must rewrite
+        the archive copy and MUST NOT create a file in the queue root.
+
+        Failure mode (the bug): _rewrite() delegates to _atomic_write() which always
+        writes to queue_dir/{id}.json (the ROOT), resurrecting the file out of the archive.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        # Resolve: file moves to archive/YYYY-MM-DD/esc-1-1.json
+        queue.resolve('esc-1-1', 'Original resolution')
+
+        # Confirm the escalation is in archive, root is empty
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: file must not be in queue root after resolve()'
+        )
+        archive_files_before = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_before) == 1, (
+            f'Pre-condition: expected exactly 1 archive file; got {archive_files_before}'
+        )
+
+        # Capture pre-patch fields for "unchanged" assertions
+        pre_patch = queue.get('esc-1-1')
+        assert pre_patch is not None
+        pre_resolved_at = pre_patch.resolved_at
+        pre_level = pre_patch.level
+        pre_task_id = pre_patch.task_id
+        pre_status = pre_patch.status
+
+        # --- Action ---
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward', resolution_turns=5)
+
+        # (a) NO FILE RESURRECTION — root stays clean
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'RESURRECTION BUG: patch_resolution_metadata wrote to queue root; '
+            'the archive copy should have been rewritten in place instead'
+        )
+
+        # (b) Exactly one archive file; patched fields present
+        archive_files_after = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after) == 1, (
+            f'Expected exactly 1 archive file after patch; got {archive_files_after}'
+        )
+        archived_data = json.loads(archive_files_after[0].read_text())
+        assert archived_data['resolved_by'] == 'steward', (
+            f"Expected resolved_by='steward' in archive; got {archived_data.get('resolved_by')!r}"
+        )
+        assert archived_data['resolution_turns'] == 5, (
+            f"Expected resolution_turns=5 in archive; got {archived_data.get('resolution_turns')!r}"
+        )
+
+        # (c) Preserved fields unchanged
+        assert archived_data['status'] == 'resolved', (
+            f"Status must remain 'resolved'; got {archived_data['status']!r}"
+        )
+        assert archived_data['resolution'] == 'Original resolution', (
+            f"Resolution must be preserved; got {archived_data.get('resolution')!r}"
+        )
+        assert archived_data['resolved_at'] == pre_resolved_at, (
+            f'resolved_at must be unchanged; pre={pre_resolved_at!r}, '
+            f'post={archived_data.get("resolved_at")!r}'
+        )
+        assert archived_data['level'] == pre_level
+        assert archived_data['task_id'] == pre_task_id
+        assert archived_data['status'] == pre_status
+
+        # (d) Return value is the updated Escalation
+        assert result is not None, 'patch_resolution_metadata must return the updated Escalation'
+        assert result.resolved_by == 'steward', (
+            f"result.resolved_by must be 'steward'; got {result.resolved_by!r}"
+        )
+        assert result.resolution_turns == 5, (
+            f'result.resolution_turns must be 5; got {result.resolution_turns!r}'
+        )
+        assert result.status == 'resolved', (
+            f"result.status must be 'resolved'; got {result.status!r}"
+        )
+
+
+    def test_patch_pending_returns_none_no_mutation(self, tmp_path: Path):
+        """(a) Patching a pending escalation returns None and leaves the file unchanged."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        before = (queue.queue_dir / 'esc-1-1.json').read_text()
+
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward', resolution_turns=5)
+
+        # Must return None for pending escalations
+        assert result is None, (
+            f'Expected None for pending escalation; got {result!r}'
+        )
+
+        # File must be byte-for-byte unchanged
+        after = (queue.queue_dir / 'esc-1-1.json').read_text()
+        assert after == before, (
+            'File must be unchanged when patching a pending escalation'
+        )
+
+        # In-file resolved_by must still be None
+        data = json.loads(after)
+        assert data['resolved_by'] is None, (
+            f"resolved_by should still be None; got {data['resolved_by']!r}"
+        )
+
+    def test_patch_nonexistent_returns_none_no_files_created(self, tmp_path: Path):
+        """(b) Patching a non-existent id returns None and creates no files."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        result = queue.patch_resolution_metadata('esc-does-not-exist', resolved_by='steward')
+
+        assert result is None, (
+            f'Expected None for non-existent escalation; got {result!r}'
+        )
+        assert list(queue.queue_dir.glob('*.json')) == [], (
+            'No JSON files should be created for a non-existent id'
+        )
+        assert not (queue.queue_dir / 'archive').exists(), (
+            'Archive dir must not be created for a non-existent id'
+        )
+
+    def test_patch_multi_date_archive_picks_newest_and_root_stays_clean(
+        self, tmp_path: Path,
+    ):
+        """Multi-date archive: patch picks the newest copy and root stays clean.
+
+        This drives extraction of the newest-by-date selection into a shared helper
+        (_locate_path) used by both get() and patch_resolution_metadata().
+        A naive candidates[0] pick would non-deterministically select either copy;
+        this test asserts the newest copy is always patched.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Manually create two archive files for the same id under different dated subdirs
+        older_dir = queue.queue_dir / 'archive' / '2025-01-01'
+        newer_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        older_dir.mkdir(parents=True, exist_ok=True)
+        newer_dir.mkdir(parents=True, exist_ok=True)
+
+        older_esc = _make_escalation('esc-42-1', status='resolved')
+        older_esc.resolution = 'older_copy'
+        older_text_before = older_esc.to_json()
+        (older_dir / 'esc-42-1.json').write_text(older_text_before)
+
+        newer_esc = _make_escalation('esc-42-1', status='resolved')
+        newer_esc.resolution = 'newer_copy'
+        (newer_dir / 'esc-42-1.json').write_text(newer_esc.to_json())
+
+        # Confirm no root file
+        assert not (queue.queue_dir / 'esc-42-1.json').exists()
+
+        # --- Action ---
+        result = queue.patch_resolution_metadata('esc-42-1', resolved_by='steward', resolution_turns=3)
+
+        # (a) Root stays clean
+        assert not (queue.queue_dir / 'esc-42-1.json').exists(), (
+            'Root must stay clean after patching an archive-resident escalation'
+        )
+
+        # (b) Newer copy is patched
+        newer_data = json.loads((newer_dir / 'esc-42-1.json').read_text())
+        assert newer_data['resolved_by'] == 'steward', (
+            f"Expected newest copy to have resolved_by='steward'; got {newer_data.get('resolved_by')!r}"
+        )
+        assert newer_data['resolution_turns'] == 3, (
+            f"Expected newest copy to have resolution_turns=3; got {newer_data.get('resolution_turns')!r}"
+        )
+        assert newer_data['resolution'] == 'newer_copy', (
+            f"Payload must be preserved: expected resolution='newer_copy'; got {newer_data.get('resolution')!r}"
+        )
+
+        # (c) Older copy is byte-for-byte unchanged
+        older_text_after = (older_dir / 'esc-42-1.json').read_text()
+        assert older_text_after == older_text_before, (
+            'Older archive copy must be byte-for-byte unchanged'
+        )
+
+        # (d) Return value reflects the patch
+        assert result is not None
+        assert result.resolved_by == 'steward', (
+            f"result.resolved_by must be 'steward'; got {result.resolved_by!r}"
+        )
+
+    def test_patch_archive_atomicity_tmp_cleanup_on_rename_failure(
+        self, tmp_path: Path,
+    ):
+        """When os.rename raises (e.g. disk full), the tmp file is cleaned up
+        and the exception propagates.
+
+        Key assertion: NO .tmp files remain in archive_dir OR queue root after failure.
+        This catches the failure mode where the tmp file gets created in the queue root
+        (wrong dir) and then orphaned when rename fails.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'archived')
+
+        # Locate the archive dated subdir
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 1, 'Pre-condition: escalation must be archived'
+        archive_dir = archive_files[0].parent
+        original_content = archive_files[0].read_text()
+
+        # Patch os.rename to fail
+        with patch('escalation.queue.os.rename', side_effect=OSError('disk full')), pytest.raises(OSError, match='disk full'):
+            queue.patch_resolution_metadata('esc-1-1', resolved_by='steward')
+
+        # (a) No .tmp files orphaned in archive_dir
+        tmp_files_in_archive = list(archive_dir.glob('esc-1-1*.tmp'))
+        assert tmp_files_in_archive == [], (
+            f'Orphaned .tmp files in archive_dir: {tmp_files_in_archive}; '
+            'tmp file must be created in path.parent and cleaned up on failure'
+        )
+
+        # (b) No .tmp files orphaned in queue root — key regression check
+        # (if tmp was created in queue root instead of archive_dir, it would be orphaned here)
+        tmp_files_in_root = list(queue.queue_dir.glob('esc-1-1*.tmp'))
+        assert tmp_files_in_root == [], (
+            f'Orphaned .tmp files in queue root: {tmp_files_in_root}; '
+            'tmp file must NOT be created in queue root for archive-resident targets'
+        )
+
+        # (c) Original archive file content is unchanged (rename never happened)
+        assert archive_files[0].read_text() == original_content, (
+            'Original archive file must be unchanged after rename failure'
+        )
+
+    def test_patch_resolved_in_root_rewrites_root_in_place_no_archive_orphan(
+        self, tmp_path: Path,
+    ):
+        """(c) When a resolved escalation is in queue root (archive move failed),
+        patch rewrites the root file in place and creates NO archive file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Write a resolved escalation directly to root (simulating crash-mid-archive)
+        resolved_esc = _make_escalation('esc-1-1', status='resolved')
+        resolved_esc.resolution = 'stuck in root'
+        (queue.queue_dir / 'esc-1-1.json').write_text(resolved_esc.to_json())
+
+        result = queue.patch_resolution_metadata('esc-1-1', resolved_by='steward')
+
+        # (i) File stays in root with updated field
+        assert (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Root file must still exist after patching'
+        )
+        data = json.loads((queue.queue_dir / 'esc-1-1.json').read_text())
+        assert data['resolved_by'] == 'steward', (
+            f"resolved_by must be 'steward' in root file; got {data.get('resolved_by')!r}"
+        )
+
+        # (ii) No archive file created (no orphan move)
+        assert not (queue.queue_dir / 'archive').exists(), (
+            'No archive dir should be created when root file is patched in place'
+        )
+
+        assert result is not None
+        assert result.resolved_by == 'steward'
+
+
 class TestAttachDedupeChild:
     """EscalationQueue.attach_dedupe_child() — mutate a pending parent in place."""
 
