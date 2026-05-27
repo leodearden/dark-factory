@@ -3023,9 +3023,10 @@ class TestMarkBlockedFalseDoneGuard:
             f'escalate_to_human=True must NOT spawn the steward, '
             f'but factory was called: {invocations}'
         )
-        # L0 (visibility) and L1 (human) both submitted.
+        # escalate_to_human=True skips the L0 entirely (a stopped steward can
+        # never act on one) and submits only the L1 — see commit 1a1eca9a67.
         l0 = queue.get_by_task(task_assignment.task_id, level=0)
-        assert len(l0) == 1
+        assert len(l0) == 0
         assert queue.has_open_l1(task_assignment.task_id)
 
     async def test_dropped_plan_targets_routes_to_l1_directly(
