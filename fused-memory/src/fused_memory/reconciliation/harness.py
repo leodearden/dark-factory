@@ -1188,6 +1188,7 @@ class ReconciliationHarness:
                     parent_run_id,
                     f'Non-actionable integrity finding: {finding.get("description", "?")}',
                     detail=json.dumps(finding, default=str),
+                    finding=finding,
                 )
 
             if not actionable:
@@ -1331,6 +1332,7 @@ class ReconciliationHarness:
                         run_id,
                         f'Unresolved after remediation: {finding.get("description", "?")}',
                         detail=json.dumps(finding, default=str),
+                        finding=finding,
                     )
 
             logger.info(
