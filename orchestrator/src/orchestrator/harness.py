@@ -533,6 +533,14 @@ class Harness:
             except Exception as e:
                 logger.warning(f'Failed to dismiss stale escalations: {e}')
 
+            # 1c0. Rehydrate merge-halt state from preserved L1s (non-fatal).
+            # Must run after _dismiss_stale_escalations so we scan the
+            # settled post-dismissal queue (only real L1s remain).
+            try:
+                self._rehydrate_merge_halt()
+            except Exception as e:
+                logger.warning(f'Failed to rehydrate merge halt: {e}')
+
             # 1c1. Start orphan L0 reaper (non-fatal) — catches escalations
             # whose task_id has no active workflow/steward (e.g. reviewer
             # emits against a synthetic task_id, or a workflow crashed
@@ -2492,6 +2500,42 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Dismissed {count} stale L0 escalation(s) from prior run; '
                 f'L1 escalations preserved across restart'
             )
+
+    def _rehydrate_merge_halt(self) -> str | None:
+        """Restore merge-halt state from preserved L1 escalations after restart.
+
+        On restart, SpeculativeMergeWorker is constructed fresh (un-halted,
+        no owner).  _dismiss_stale_escalations intentionally preserves pending
+        level-1 wip_conflict/unmerged_state escalations — but NOTHING
+        re-asserts the corresponding halt or re-registers the halt owner.
+
+        This method scans the settled post-dismissal queue for preserved L1s
+        of the relevant categories and restores the (halted, owner-registered)
+        state, so the existing _on_escalation_resolved -> unhalt_wip path
+        cleanly releases the halt when the operator resolves the L1.
+
+        Returns the escalation id that now owns the halt, or None if no action
+        was taken.
+        """
+        if self._merge_worker is None or self._escalation_queue is None:
+            return None
+
+        candidates = [
+            esc for esc in self._escalation_queue.get_pending()
+            if esc.level == 1 and esc.category in {'wip_conflict', 'unmerged_state'}
+        ]
+        if not candidates:
+            return None
+
+        esc = candidates[0]  # ordering refined in impl-2
+        reason = (
+            f'Rehydrated merge halt from preserved L1 {esc.id} '
+            f'(category={esc.category}) after restart'
+        )
+        self._merge_worker.halt_for_wip(reason)
+        self._merge_worker.set_halt_owner(esc.id)
+        logger.warning(reason)
+        return esc.id
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
