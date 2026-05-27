@@ -568,6 +568,14 @@ class TargetedReconciler:
         # awaited sequentially — so sibling DB writes land before this
         # background task re-reads.  A fresh re-read at decision time catches
         # co-cancelled siblings that the stale snapshot missed.
+        #
+        # Tradeoff: if _live_status_map raises and returns {}, the memo is set
+        # to an empty dict, so all *subsequent* ambiguous descendants in this
+        # sweep also skip the re-read and fall through to escalate/block.  This
+        # is intentional: one transient failure short-circuits further attempts
+        # to avoid a per-descendant retry storm.  The fail-open behaviour
+        # (escalating/blocking rather than silently suppressing) preserves the
+        # genuine-orphan detection contract on infrastructure glitches.
         live_status: dict[str, str] | None = None
 
         for t in all_tasks:
@@ -616,6 +624,12 @@ class TargetedReconciler:
             )
 
             if deterministic_orphan:
+                # No co-cancellation guard needed here: _sweep_cancel_orphan
+                # emits a status transition to 'cancelled'.  If the dependent
+                # was co-cancelled by the user between the initial snapshot and
+                # now, the TaskInterceptor same-status guard
+                # (task_interceptor.py:620) returns {'no_op': True}, making
+                # this branch safely idempotent under the same race.
                 action = await self._sweep_cancel_orphan(
                     task_id=tid, parent_id=parent_id_str, project_root=project_root,
                 )
