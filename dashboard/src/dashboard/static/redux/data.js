@@ -82,7 +82,7 @@ window.DF_DATA = {
     latency_spark: { labels: [], p50: [], p90: [], p99: [] },
     pending_spark: { labels: [], values: [] },
     capped_spark: { labels: [], values: [] },
-    state: { capped_now: 0, paused_reason: null, pending_total: 0 },
+    state: { capped_now: 0, paused_reason: null, pending_total: 0, accounts_summary: { total: 0, capped: 0, available: 0, capped_accounts: [] } },
   },
   // SCHEDULER is read through DF_DATA.SCHEDULER per render (not captured at
   // module-load), so reference replacement on each poll is safe.
