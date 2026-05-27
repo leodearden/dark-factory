@@ -374,11 +374,14 @@ class TestBuildEscalationQueuesSubsections:
         result = build_escalation_queues(config)
         subsections = result['subsections']
 
-        assert subsections[0]['id'] == str(primary)
+        # Use .resolve() to match what DashboardConfig.__post_init__ stores;
+        # on macOS /tmp is a symlink to /private/tmp so str(primary) may differ
+        # from the stored resolved path.
+        assert subsections[0]['id'] == str(primary.resolve())
         assert subsections[0]['label'] == 'primary'
         assert subsections[0]['kind'] == 'orchestrator'
 
-        assert subsections[1]['id'] == str(reify)
+        assert subsections[1]['id'] == str(reify.resolve())
         assert subsections[1]['label'] == 'reify'
         assert subsections[1]['kind'] == 'orchestrator'
 
@@ -427,7 +430,8 @@ class TestBuildEscalationQueuesSubsections:
 
         orchestrator_subsections = [s for s in result['subsections'] if s['kind'] == 'orchestrator']
         ids = [s['id'] for s in orchestrator_subsections]
-        assert ids.count(str(primary)) == 1, 'Primary root should appear exactly once'
+        # Use .resolve() to match the stored resolved path (DashboardConfig resolves roots).
+        assert ids.count(str(primary.resolve())) == 1, 'Primary root should appear exactly once'
 
     def test_each_subsection_has_escalations_list(self, tmp_path):
         """Each subsection carries an 'escalations' list."""
@@ -509,8 +513,9 @@ class TestBuildEscalationQueuesSummary:
         config = self._make_config(tmp_path, primary, [reify])
         result = build_escalation_queues(config)
 
-        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary))
-        reify_sub = next(s for s in result['subsections'] if s['id'] == str(reify))
+        # Use .resolve() to match the stored resolved path (DashboardConfig resolves roots).
+        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+        reify_sub = next(s for s in result['subsections'] if s['id'] == str(reify.resolve()))
 
         # primary: 1 at level 0, 1 at level 1, 1 at level 2
         assert primary_sub['summary']['by_level'][0] == 1

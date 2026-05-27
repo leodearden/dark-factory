@@ -28,6 +28,13 @@ def load_queue_escalations(esc_dir: Path) -> list[dict]:
     intentional divergence from :func:`escalation.queue.iter_all_escalation_paths`,
     which also walks the archive subtree.
 
+    The glob pattern ``*.json`` (not ``esc-*.json``) is used deliberately: the
+    task PRD specifies ``*.json``, and the escalation queue directory is
+    single-writer (only the EscalationQueue producer writes there), so stray
+    non-escalation JSON files are not expected.  Bad JSON is already skipped
+    and logged, so a non-escalation file with valid JSON would pass through
+    unchanged — an acceptable trade-off given the controlled write environment.
+
     A missing or non-directory *esc_dir* returns ``[]`` without raising.
     A file that cannot be parsed as JSON is skipped with a ``WARNING`` log.
 
@@ -58,8 +65,10 @@ def resolve_owning_project(
 
     Two-pass probe (first match wins in each pass):
 
-    1. **Worktree prefix** — if ``esc['worktree']`` starts with ``str(root)``
-       or ``str(root / '.worktrees')``, return ``root.name``.
+    1. **Worktree prefix** — if ``esc['worktree']`` is a path under ``root``
+       (i.e. ``Path(worktree).is_relative_to(root)``), return ``root.name``.
+       This matches the conventional ``.worktrees/<task_id>`` layout (where
+       ``.worktrees/`` lives inside ``root``) as well as any other subdirectory.
     2. **Task-map probe** — if ``str(esc['task_id'])`` matches ``str(t['id'])``
        for any task *t* in a root's task map, return ``root.name``.
 
@@ -80,10 +89,19 @@ def resolve_owning_project(
     # another (e.g. "workspace" matching ".../workspace-2/...") or where a
     # sibling directory suffix causes a false ".worktrees-archive" → ".worktrees"
     # match.  is_relative_to compares path *components*, not raw characters.
+    #
+    # .resolve(strict=False) canonicalises the worktree string (e.g. resolves
+    # symlink segments) so it matches the resolved roots from DashboardConfig.
+    # strict=False avoids FileNotFoundError for worktrees that have been deleted.
+    #
+    # is_relative_to(root) alone is sufficient: the conventional `.worktrees/`
+    # directory lives *inside* root, so any path under root/.worktrees/ is
+    # also relative to root.  A separate `or is_relative_to(root / '.worktrees')`
+    # arm would be logically redundant (it matches a strict subset of the first arm).
     if worktree:
-        wt = Path(worktree)
+        wt = Path(worktree).resolve(strict=False)
         for root, _task_map in roots:
-            if wt.is_relative_to(root) or wt.is_relative_to(root / '.worktrees'):
+            if wt.is_relative_to(root):
                 return root.name
 
     # Pass 2: task-map probe
