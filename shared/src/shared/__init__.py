@@ -20,7 +20,7 @@ from shared.cli_invoke import (
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
-from shared.locking import files_to_modules, normalize_lock
+from shared.locking import files_to_modules, modules_conflict, normalize_lock
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import AccountState, InvokeSlot, SessionBudgetExhausted, UsageGate
 
@@ -51,4 +51,5 @@ __all__ = [
     'SessionBudgetExhausted',
     'normalize_lock',
     'files_to_modules',
+    'modules_conflict',
 ]
