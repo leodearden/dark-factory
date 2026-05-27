@@ -7,11 +7,15 @@ Covers:
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
+- A7b: harness._escalate fingerprint stamping and dedup routing
+  (TestReconEscalationDedup)
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -170,4 +174,86 @@ class TestStage2PromptMandatesUniquenessToken:
         assert 'uniqueness_token' in result, (
             "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
             "(guards against the per-cycle summary uniqueness section being dropped)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# A7b: harness._escalate fingerprint stamping + dedup routing
+# ---------------------------------------------------------------------------
+
+
+def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
+    """Build a minimal ReconciliationHarness wired to a real EscalationQueue.
+
+    Uses mocked memory/journal/event_buffer so _escalate can be exercised
+    without any I/O other than the queue filesystem writes under tmp_path.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+    from escalation.queue import EscalationQueue
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            judge_enabled=False,  # no Judge; avoids needing real journal for Judge.init
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+    harness = ReconciliationHarness(
+        memory_service=AsyncMock(),
+        taskmaster=None,
+        journal=MagicMock(),
+        event_buffer=MagicMock(),
+        config=config,
+        known_projects={},
+    )
+    queue_dir = tmp_path / queue_subdir
+    harness._escalation_queue = EscalationQueue(queue_dir)
+    return harness, queue_dir
+
+
+class TestReconEscalationDedup:
+    """A7b: harness._escalate stamps dedupe_fingerprint and routes through submit_or_dedupe."""
+
+    # ── Step 1: fingerprint stamping ────────────────────────────────────
+
+    def test_escalate_stamps_finding_fingerprint(self, tmp_path):
+        """_escalate with finding= kwarg stamps dedupe_fingerprint on the Escalation.
+
+        RED before impl: _escalate has no finding param and never sets dedupe_fingerprint.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        finding = {
+            'category': 'missing_knowledge',
+            'affected_ids': ['452'],
+            'description': 'Task 452 lacks completion summary',
+            'actionable': False,
+            'severity': 'minor',
+        }
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='abcd1234',
+            summary='Non-actionable integrity finding: missing knowledge for task 452',
+            detail='...',
+            finding=finding,
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 pending file, got {len(files)}'
+
+        data = json.loads(files[0].read_text())
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue',
+            'missing_knowledge',
+            ['452'],
+            'Task 452 lacks completion summary',
+        )
+        assert data['dedupe_fingerprint'] == expected_fp, (
+            f"dedupe_fingerprint mismatch: got {data.get('dedupe_fingerprint')!r}, "
+            f"expected {expected_fp!r}"
         )
