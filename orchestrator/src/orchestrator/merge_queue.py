@@ -86,6 +86,7 @@ async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
     git_ops: GitOps,
+    main_sha: str,
     *,
     task_id: str | None = None,
 ) -> DropGuardResult:
@@ -97,6 +98,18 @@ async def _check_plan_targets_in_tree(
     actually produced.  Plan-vs-tip mismatches (gitignored files listed in
     ``plan['files']``, prereq-deleted files, amend-deleted files) are out
     of scope for this gate; catching those belongs to verify/review.
+
+    The raw ``task_HEAD``-minus-``merge_commit`` diff over-flags: a clean
+    merge legitimately drops a path that a *sibling* moved or deleted on
+    main, even though this branch carried the old copy and never touched
+    it.  To subtract main-side change, we intersect the drop set with the
+    files the branch itself ADDED or MODIFIED since the shared merge-base
+    (``merge-base(task_HEAD, main_sha)``).  ``main_sha`` is the pre-merge
+    main tip the merge was computed against (actual or speculative), not
+    the post-merge advanced SHA — using it keeps the subtraction robust to
+    ``advance_main``'s CAS-retry rebase.  ``--no-renames`` is deliberate:
+    a sibling rename appears as a delete of the old path on main, which is
+    absent from the branch's add/modify set and therefore dropped here.
 
     Fail-open on rc != 0: post-merge verify is the next safety net, and
     flagging a phantom drop on a transient git error is worse than missing
@@ -115,6 +128,42 @@ async def _check_plan_targets_in_tree(
         return DropGuardResult()
     task_head = head_out.strip()
 
+    # Shared baseline: what the branch and main diverged from.  Subtracting
+    # main-side change below is anchored here.
+    rc, base_out, base_err = await _run(
+        ['git', 'merge-base', task_head, main_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: merge-base %s %s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            task_head, main_sha, rc, base_err.strip(),
+            task_id or '<unknown>',
+        )
+        return DropGuardResult()
+    base = base_out.strip()
+
+    # Files the branch itself ADDED or MODIFIED since the merge-base.  A
+    # legitimately-dropped path the branch never touched (e.g. sibling-moved
+    # on main) is absent here, so the intersection below excludes it.
+    rc, changed_out, changed_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            '--diff-filter=AM', base, task_head,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: branch-changed diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            base, task_head, rc, changed_err.strip(),
+            task_id or '<unknown>',
+        )
+        return DropGuardResult()
+    branch_changed = {ln.strip() for ln in changed_out.splitlines() if ln.strip()}
+
     rc, out, err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
@@ -131,14 +180,17 @@ async def _check_plan_targets_in_tree(
         )
         return DropGuardResult()
 
-    dropped = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if dropped:
+    dropped_in_merge = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    # Subtract main-side change: only a path the branch actually produced
+    # AND the merge discarded is a real drop.  Preserve merge-diff order.
+    real_drops = [p for p in dropped_in_merge if p in branch_changed]
+    if real_drops:
         logger.warning(
             'drop-guard: dropped_plan_targets '
             'task_id=%s merge_commit_sha=%s task_head=%s dropped=%r',
-            task_id or '<unknown>', merge_commit_sha, task_head, dropped,
+            task_id or '<unknown>', merge_commit_sha, task_head, real_drops,
         )
-    return DropGuardResult(dropped=dropped)
+    return DropGuardResult(dropped=real_drops)
 
 
 async def _check_plan_files_touched_in_branch(
@@ -206,6 +258,7 @@ async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
     git_ops: GitOps,
+    main_sha: str,
     *,
     task_id: str | None = None,
 ) -> list[str]:
@@ -216,11 +269,20 @@ async def _check_post_merge_equivalence(
     did NOT touch are excluded — main legitimately includes work from
     siblings or earlier merges that the branch never saw.
 
-    Scope (touched set): the merge-base of branch and advanced_sha is the
-    pre-branch baseline; ``git diff --name-only base..branch_head`` lists
-    every path the branch produced.  We then ask git whether any of those
-    paths differ between ``branch_HEAD`` and ``advanced_sha`` — non-empty
-    = the merge dropped or rewrote work.
+    Scope (compare set): the merge-base of branch and ``main_sha`` (the
+    pre-merge main tip, NOT ``advanced_sha``) is the pre-branch baseline;
+    ``git diff --name-only base..branch_head`` lists every path the branch
+    produced.  We then subtract the paths main *also* changed since that
+    baseline (``base..main_sha``): a clean 3-way merge legitimately combines
+    the branch's and a sibling's edits to a shared path (e.g. ``Cargo.lock``),
+    so merged main differs from the branch tip there without anything being
+    dropped.  Anchoring the base on ``main_sha`` rather than ``advanced_sha``
+    keeps the gate robust to ``advance_main``'s CAS-retry rebase.
+
+    The surviving compare set is the branch's own work that main did not
+    touch; we ask git whether any of those paths differ between
+    ``branch_HEAD`` and ``advanced_sha`` — non-empty = the merge dropped or
+    rewrote that work.
 
     Empty list = clean preservation (ff-merge, --no-ff with no conflicts,
     clean rebase).  Non-empty = caller treats as a hard failure.
@@ -242,18 +304,18 @@ async def _check_post_merge_equivalence(
         return []
     branch_head = head_out.strip()
 
-    # Determine the branch's touched set against the merge-base with main.
-    # Using merge-base (rather than the workflow's _base_commit, which the
-    # caller doesn't provide here) keeps the helper self-contained.
+    # Determine the branch's touched set against the merge-base with the
+    # PRE-merge main tip (main_sha).  Using main_sha rather than advanced_sha
+    # lets us subtract main-side change below and stays rebase-robust.
     rc, mb_out, mb_err = await _run(
-        ['git', 'merge-base', branch_head, advanced_sha],
+        ['git', 'merge-base', branch_head, main_sha],
         cwd=git_ops.project_root,
     )
     if rc != 0:
         logger.warning(
             'post-merge-equiv: merge-base failed for %s..%s '
             '(rc=%d, stderr=%s); failing open. task_id=%s',
-            branch_head, advanced_sha, rc, mb_err.strip(),
+            branch_head, main_sha, rc, mb_err.strip(),
             task_id or '<unknown>',
         )
         return []
@@ -274,15 +336,49 @@ async def _check_post_merge_equivalence(
             task_id or '<unknown>',
         )
         return []
-    touched = [ln.strip() for ln in touched_out.splitlines() if ln.strip()]
-    if not touched:
+    branch_touched = [ln.strip() for ln in touched_out.splitlines() if ln.strip()]
+    if not branch_touched:
         return []
 
-    # Compare branch_head vs advanced_sha restricted to those touched paths.
+    # Paths main independently changed since the shared baseline.  A clean
+    # merge combining the branch's and a sibling's edits to such a path makes
+    # merged main differ from the branch tip there with nothing dropped, so
+    # subtract them from the compare set.
+    #
+    # Edge: when base == main_sha (speculative merge against a base that is
+    # itself the pre-merge tip), this diff is empty and we degrade to strict
+    # equivalence — the correct conservative fallback.  When a CAS re-merge
+    # advanced main past main_sha, main_touched may be a subset of what main
+    # really changed, making the gate slightly more conservative (a rare
+    # re-introduced FP) but never masking a drop — the safe direction.
+    rc, main_touched_out, main_touched_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, main_sha, '--', ':!.task/',
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: main-touched diff failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            base_sha, main_sha, rc, main_touched_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    main_touched = {ln.strip() for ln in main_touched_out.splitlines() if ln.strip()}
+
+    compare_set = [p for p in branch_touched if p not in main_touched]
+    if not compare_set:
+        # Empty pathspec on ``git diff -- `` means *all files*, not none, so
+        # short-circuit rather than running an unscoped diff.
+        return []
+
+    # Compare branch_head vs advanced_sha restricted to the surviving paths.
     rc, out, err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
-            branch_head, advanced_sha, '--', *touched,
+            branch_head, advanced_sha, '--', *compare_set,
         ],
         cwd=git_ops.project_root,
     )
@@ -721,7 +817,7 @@ class MergeWorker:
         # planned work from the task branch.
         assert merge_result.merge_commit is not None
         drop_result = await _check_plan_targets_in_tree(
-            merge_result.merge_commit, req.worktree, self._git_ops,
+            merge_result.merge_commit, req.worktree, self._git_ops, main_sha,
             task_id=req.task_id,
         )
         dropped = drop_result.dropped
@@ -819,7 +915,7 @@ class MergeWorker:
             # log line.  Loud failure here is preferable to a stuck-done
             # task discovered hours later.
             equiv_failed = await _check_post_merge_equivalence(
-                req.worktree, advanced_sha, self._git_ops,
+                req.worktree, advanced_sha, self._git_ops, main_sha,
                 task_id=req.task_id,
             )
             if equiv_failed:
@@ -1380,8 +1476,11 @@ class SpeculativeMergeWorker:
                     merge_commit = merge_commit.strip()
 
                     # Drop-guard: every file the task planned must survive.
+                    # Pass base_for_merge (the pre-merge main tip the merge
+                    # was computed against — actual or speculative) so the
+                    # subtraction is rebase-robust.
                     drop_result = await _check_plan_targets_in_tree(
-                        merge_commit, req.worktree, self._git_ops,
+                        merge_commit, req.worktree, self._git_ops, base_for_merge,
                         task_id=req.task_id,
                     )
                     dropped = drop_result.dropped
@@ -1771,8 +1870,11 @@ class SpeculativeMergeWorker:
                 # Decision-2 post-merge content-equivalence check (see
                 # MergeWorker for full rationale).  Speculative path runs
                 # the same gate so an over-eager rebase doesn't drop work.
+                # item.base_sha is the pre-merge main tip the merge was
+                # computed against (== base_for_merge); using it keeps the
+                # subtraction rebase-robust through the CAS-retry loop above.
                 equiv_failed = await _check_post_merge_equivalence(
-                    req.worktree, advanced_sha, self._git_ops,
+                    req.worktree, advanced_sha, self._git_ops, item.base_sha,
                     task_id=req.task_id,
                 )
                 if equiv_failed:
