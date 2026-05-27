@@ -1058,6 +1058,18 @@ class TaskWorkflow:
             return await self._mark_blocked(reason, detail=detail)
 
         except SetTaskStatusRejected as exc:
+            # Fast-path: an authoritative user/manual cancellation arrived
+            # out-of-band before setup completed.  Release locks (via the
+            # finally block) and exit gracefully — no reopen, no escalation,
+            # no phase transition to BLOCKED.
+            if isinstance(exc, TerminalExitRejection) and exc.old_status == 'cancelled':
+                logger.info(
+                    'Task %s cancelled out-of-band before setup completed — '
+                    'aborting gracefully (no reopen, no escalation)',
+                    self.task_id,
+                )
+                return WorkflowOutcome.CANCELLED
+
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
             # handler.  Route to L1: the row state contradicts what the
