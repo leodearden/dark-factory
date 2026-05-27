@@ -675,3 +675,66 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
     capped = cs['capped_spark']
     assert 1 not in capped['values'], 'Expected no cap events (all zeros) when intervals leg failed'
     assert cs['state']['capped_now'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-11: paused_reason flows from MCP get_curator_state tool
+# ---------------------------------------------------------------------------
+
+
+def test_curator_endpoint_flows_paused_reason_from_mcp(tmp_path: Path):
+    """paused_reason from get_curator_state helper appears in curator state envelope.
+
+    Patches both the list_tickets fan-out (metrics.mcp_tool_call) and the
+    get_curator_state helper so the endpoint resolves without a real server.
+    Verifies that paused_reason from the gate reaches CURATOR_STATE.state.
+    """
+    config = _make_config(tmp_path, fused_memory_urls=['http://localhost:18765'])
+    mcp_tickets = {'project_id': 'p', 'count': 0, 'tickets': []}
+    curator_state_payload = {
+        'paused': True,
+        'paused_reason': 'All accounts capped (last: synthetic cap)',
+        'soonest_open_at': '2026-06-01T00:00:00+00:00',
+        'account_count': 1,
+    }
+
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
+        patch('dashboard.app.memory_data.get_curator_state',
+              new=AsyncMock(return_value=curator_state_payload)),
+    ):
+        with _override_client(config) as client:
+            resp = client.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    state = data['CURATOR_STATE']['state']
+    assert state['paused_reason'] == 'All accounts capped (last: synthetic cap)', (
+        f'Expected paused_reason to flow through from MCP tool; got {state["paused_reason"]!r}'
+    )
+
+
+def test_curator_endpoint_paused_reason_none_when_helper_offline(tmp_path: Path):
+    """paused_reason is None when the get_curator_state helper is offline.
+
+    Ensures a failing curator-state leg degrades gracefully to paused_reason=None
+    rather than propagating an error or returning an unexpected value.
+    """
+    config = _make_config(tmp_path, fused_memory_urls=['http://localhost:18765'])
+    mcp_tickets = {'project_id': 'p', 'count': 0, 'tickets': []}
+    offline_payload = {'offline': True, 'error': 'all unreachable'}
+
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
+        patch('dashboard.app.memory_data.get_curator_state',
+              new=AsyncMock(return_value=offline_payload)),
+    ):
+        with _override_client(config) as client:
+            resp = client.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    state = data['CURATOR_STATE']['state']
+    assert state['paused_reason'] is None, (
+        f'Expected paused_reason=None when gate helper offline; got {state["paused_reason"]!r}'
+    )
