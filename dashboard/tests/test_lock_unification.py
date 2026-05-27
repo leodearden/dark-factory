@@ -12,7 +12,6 @@ Tests use the TestClient static-asset fetch pattern from test_index_html.py.
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # step-5: data.js drops FILE_LOCKS default + endpoint mapping
 # ---------------------------------------------------------------------------
