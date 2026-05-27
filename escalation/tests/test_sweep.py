@@ -238,3 +238,59 @@ class TestSweepReconciliation:
         assert root_path.read_text() == root_orig
         # But report says root would win
         assert report.reconciled_root_wins == 1
+
+
+class TestSweepSafety:
+    """Non-esc files, unparsable JSON, and missing resolved_at are handled safely."""
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_wal_and_shm_files_never_touched(self, tmp_path: Path):
+        """Non-esc-*.json files in queue root are ignored; esc file is archived."""
+        wal = tmp_path / 'escalations.db-wal'
+        shm = tmp_path / 'escalations.db-shm'
+        notes = tmp_path / 'notes.txt'
+        wal.write_text('wal data')
+        shm.write_text('shm data')
+        notes.write_text('notes')
+        mtime_wal = wal.stat().st_mtime
+        mtime_shm = shm.stat().st_mtime
+        mtime_notes = notes.stat().st_mtime
+
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        sweep.sweep(tmp_path, apply=True)
+
+        assert wal.exists() and wal.stat().st_mtime == mtime_wal
+        assert shm.exists() and shm.stat().st_mtime == mtime_shm
+        assert notes.exists() and notes.stat().st_mtime == mtime_notes
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+
+    def test_unparsable_json_in_root_left_alone(self, tmp_path: Path):
+        """Unparsable JSON file stays in root and increments skipped_unparsable."""
+        bad = tmp_path / 'esc-99-1.json'
+        bad.write_text('{not valid json')
+        report = sweep.sweep(tmp_path, apply=True)
+        assert bad.exists()
+        assert report.skipped_unparsable == 1
+        assert report.archived == 0
+
+    def test_missing_resolved_at_on_resolved_file_skipped(self, tmp_path: Path):
+        """resolved file with resolved_at=None stays in root, counted as skipped."""
+        path = _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=None)
+        report = sweep.sweep(tmp_path, apply=True)
+        assert path.exists()
+        assert report.skipped_unparsable == 1
+        assert report.archived == 0
+
+    def test_unknown_status_value_skipped(self, tmp_path: Path):
+        """File with unknown status does not get archived."""
+        esc = Escalation(
+            id='esc-1-1', task_id='1', agent_role='test',
+            severity='info', category='cleanup_needed', summary='test',
+            status='weird',
+        )
+        path = tmp_path / 'esc-1-1.json'
+        path.write_text(esc.to_json())
+        report = sweep.sweep(tmp_path, apply=True)
+        assert path.exists()
+        assert report.archived == 0
