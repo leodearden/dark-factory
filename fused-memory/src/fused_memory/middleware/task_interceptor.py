@@ -1505,24 +1505,21 @@ class TaskInterceptor:
     ) -> dict:
         """Synchronous, curator-bypassing path for batched human decomposition.
 
-        Creates the task directly via ``tm.add_task`` and immediately flips its
-        status to ``deferred`` so the orchestrator scheduler cannot claim it
-        before the planner finishes wiring up siblings and dependencies.  The
-        planner releases the batch by calling ``commit_planning`` (deferred →
-        pending) once all sibling tasks and dependencies are in place.
+        Creates the task directly via ``tm.add_task(status='deferred')`` — a
+        single committed INSERT that lands the row already in ``deferred`` so
+        the orchestrator scheduler cannot claim it before the planner finishes
+        wiring up siblings and dependencies.  There is no transient ``pending``
+        state for a concurrent reader (the polling orchestrator) to observe and
+        dispatch.  The planner releases the batch by calling ``commit_planning``
+        (deferred → pending) once all sibling tasks and dependencies are in
+        place.
 
         Skips the ticket store, the per-project curator queue, and the curator
         LLM round-trip entirely.  Persists ``human_decomposed=True`` in task
         metadata as a forensic marker so future curator hooks on status
         transitions can defensively skip these tasks.
 
-        Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.  Both
-        ``tm.add_task`` and the deferred-flip run under the same per-project
-        ``_write_lock`` so a concurrent caller cannot observe the task in its
-        transient ``pending`` state.  If the deferred-flip fails after the
-        task is already created, the response includes the task_id and a
-        ``warning`` so the planner can retry the flip rather than losing track
-        of a stranded task.
+        Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.
         """
         normalized_metadata: dict[str, Any]
         if metadata is None:
@@ -1558,13 +1555,13 @@ class TaskInterceptor:
             }
 
         tm = await self._ensure_taskmaster()
-        tag = kwargs.get('tag')
         task_id_str: str | None = None
         async with self._write_lock(project_id):
             try:
                 add_result = await tm.add_task(
                     project_root=project_root,
                     metadata=metadata_json,
+                    status='deferred',
                     **kwargs,
                 )
             except Exception as exc:
@@ -1575,32 +1572,6 @@ class TaskInterceptor:
                 return {'error': str(exc), 'error_type': type(exc).__name__}
 
             task_id_str = str(add_result['id'])
-
-            # Flip to deferred via raw tm.set_task_status — bypasses the gates
-            # in _apply_status_transition, which all check invariants that
-            # cannot apply to a task that was just created in this lock scope.
-            try:
-                await tm.set_task_status(task_id_str, 'deferred', project_root, tag)
-            except Exception as exc:
-                logger.warning(
-                    'submit_task[planning_mode]: deferred-flip failed for task %s: %s',
-                    task_id_str,
-                    exc,
-                )
-                # Task exists in pending — emit task_created so observers see it,
-                # then return with a warning so the planner can retry the flip.
-                event = self._make_event(
-                    EventType.task_created,
-                    project_root,
-                    {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
-                )
-                await self._journal(event)
-                return {
-                    'task_id': task_id_str,
-                    'status': 'pending',
-                    'planning_mode': True,
-                    'warning': f'deferred-flip failed: {exc}',
-                }
 
         event = self._make_event(
             EventType.task_created,

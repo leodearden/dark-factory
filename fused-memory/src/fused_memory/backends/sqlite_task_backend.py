@@ -550,6 +550,7 @@ class SqliteTaskBackend:
         priority: str | None = None,
         metadata: str | None = None,
         tag: str | None = None,
+        status: str = 'pending',
     ) -> AddTaskResult:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -585,12 +586,12 @@ class SqliteTaskBackend:
                     INSERT INTO tasks (tag, id, parent_id, title, description,
                                        details, test_strategy, status, priority,
                                        metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, '', 'pending', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
                     """,
                 (
                     tag, next_id, _TOP_LEVEL_SENTINEL, title,
                     description or '', details or '',
-                    priority or 'medium', metadata, _now(),
+                    status, priority or 'medium', metadata, _now(),
                 ),
             )
             for dep in deps_list:
