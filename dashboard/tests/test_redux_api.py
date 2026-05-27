@@ -397,3 +397,56 @@ def test_shape_burndown_aggregates_and_keeps_per_project():
     # D-0 done: 4 + 2; D-1 done: 3 + 1
     assert aggregate['done'] == [6, 4]
     assert set(body['BURNDOWN_BY_PROJECT']) == {'dark_factory', 'reify'}
+
+
+def test_shape_burndown_emits_completed_and_velocity():
+    """shape_burndown emits completed/velocity per-project and aggregated correctly.
+
+    Per-project completed = delta(done[-1] - done[0]).
+    Aggregate completed = sum of per-project completeds (NOT delta on aggregate series).
+    Aggregate velocity = aggregate_completed / distinct_days(sorted_labels).
+    """
+    series = {
+        'dark_factory': {
+            'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00'],
+            'done': [3, 5], 'in_progress': [1, 1], 'blocked': [0, 0], 'pending': [10, 8],
+        },
+        'reify': {
+            'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00'],
+            'done': [10, 12], 'in_progress': [0, 1], 'blocked': [0, 0], 'pending': [4, 3],
+        },
+    }
+    body = redux_api.shape_burndown(series)
+
+    df = body['BURNDOWN_BY_PROJECT']['dark_factory']
+    assert df['completed'] == 2       # 5 - 3
+    assert df['velocity'] == 1.0      # 2 / 2 distinct days
+
+    ri = body['BURNDOWN_BY_PROJECT']['reify']
+    assert ri['completed'] == 2       # 12 - 10
+    assert ri['velocity'] == 1.0      # 2 / 2 distinct days
+
+    agg = body['BURNDOWN']
+    assert agg['completed'] == 4      # sum(2, 2) — not delta on aggregate series
+    assert agg['velocity'] == 2.0     # 4 / 2 aggregate distinct days
+
+
+def test_shape_burndown_completed_ignores_snapshot_frequency():
+    """100 flat snapshots in one day must not inflate completed/velocity.
+
+    Regression: the buggy frontend summed all snapshot done-counts.
+    The correct delta-based answer is max(0, 7-7) = 0.
+    """
+    labels = [f'2026-05-20T{h:02d}:{m:02d}:00' for h in range(10) for m in range(10)]
+    series = {
+        'proj_x': {
+            'labels': labels,
+            'done': [7] * 100,
+            'in_progress': [0] * 100,
+            'blocked': [0] * 100,
+            'pending': [5] * 100,
+        },
+    }
+    body = redux_api.shape_burndown(series)
+    assert body['BURNDOWN']['completed'] == 0
+    assert body['BURNDOWN']['velocity'] == 0.0
