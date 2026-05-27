@@ -1072,18 +1072,17 @@ function BurnTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
-        const totalDone = b.done.reduce((s,x)=>s+x,0);
-        const days = b.labels.length || 1;
-        const velocity = totalDone / days;  // tasks/day average over the window
+        const completed = b.completed ?? 0;
+        const velocity = b.velocity ?? 0;  // tasks/day — server-computed delta / distinct-day count
         const lastPending = b.pending.length ? b.pending[b.pending.length-1] : 0;
         const firstPending = b.pending.length ? b.pending[0] : 0;
         const forecastDays = velocity > 0 ? Math.round(lastPending / velocity) : null;
         return (
           <div className="col-span-12 grid cols-4">
             <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
-                hint={`window avg · ${days}d`}
+                hint="window avg"
                 spark={b.done} sparkColor={CP.ok} />
-            <ST label="Completed (window)" value={totalDone}
+            <ST label="Completed (window)" value={completed}
                 spark={b.done} sparkColor={CP.ok} />
             <ST label="Backlog" value={lastPending}
                 delta={`${lastPending - firstPending}`}
@@ -1151,14 +1150,14 @@ function BurnTab({ projectFilter }) {
                 {projects.map(p => {
                   const pb = DF.BURNDOWN_BY_PROJECT[p.id];
                   if (!pb) return null;
-                  const done = pb.done.reduce((s,x)=>s+x,0);
+                  const completed = pb.completed ?? 0;
                   const active = pb.in_progress[pb.in_progress.length-1];
                   const blocked = pb.blocked[pb.blocked.length-1];
                   const pending = pb.pending[pb.pending.length-1];
                   return (
                     <tr key={p.id}>
                       <td className="mono">{p.id}</td>
-                      <td className="num" style={{ color: CP.ok }}>{done}</td>
+                      <td className="num" style={{ color: CP.ok }}>{completed}</td>
                       <td className="num" style={{ color: CP.accent }}>{active}</td>
                       <td className="num" style={{ color: CP.bad }}>{blocked}</td>
                       <td className="num" style={{ color: CP.warn }}>{pending}</td>
@@ -1175,15 +1174,16 @@ function BurnTab({ projectFilter }) {
       {view === 'per-project' && projects.map(p => {
         const pb = DF.BURNDOWN_BY_PROJECT[p.id];
         if (!pb) return null;
-        const done = pb.done.reduce((s,x)=>s+x,0);
+        const completed = pb.completed ?? 0;
+        const pbVelocity = pb.velocity ?? 0;
         const last = i => pb[i][pb[i].length-1];
         const summary = (
           <>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{done} done</span>
+            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{completed} done</span>
             <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{last('in_progress')} active</span>
             {last('blocked') > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{last('blocked')} blocked</span>}
             <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{last('pending')} pending</span>
-            <span style={{ color: 'var(--fg-3)' }}>· {(done/30).toFixed(1)}/day</span>
+            <span style={{ color: 'var(--fg-3)' }}>· {pbVelocity.toFixed(1)}/day</span>
           </>
         );
         return (
@@ -1213,7 +1213,7 @@ function BurnTab({ projectFilter }) {
                   <div className="panel-head"><span className="title">Velocity</span></div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}>{(done/30).toFixed(1)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}>{pbVelocity.toFixed(1)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
                       <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}>{last('pending')}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>backlog now</div></div>
                     </div>
                     <div>
