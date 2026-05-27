@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 
 
@@ -40,7 +40,7 @@ def harness() -> Harness:
     h._workflow_slot_tasks = {}
     h._terminal_cancel_counts = {}
     # High threshold so existing tests never trigger hard-cancel path.
-    h.config = SimpleNamespace(terminal_status_hard_cancel_polls=100)
+    h.config = OrchestratorConfig(terminal_status_hard_cancel_polls=100)
     h.scheduler = type('S', (), {})()  # type: ignore[assignment]
     return h
 
@@ -48,7 +48,7 @@ def harness() -> Harness:
 @pytest.fixture
 def harness_low_threshold(harness: Harness) -> Harness:
     """Fixture with threshold=2 for hard-cancel escalation tests."""
-    harness.config = SimpleNamespace(terminal_status_hard_cancel_polls=2)
+    harness.config = OrchestratorConfig(terminal_status_hard_cancel_polls=2)
     return harness
 
 
@@ -207,13 +207,13 @@ async def test_scan_stops_reprocessing_after_task_drops_out(
     harness_low_threshold: Harness,
     caplog,
 ):
-    """After the slot task's finally block removes it from
-    ``_workflow_cancel_events``, subsequent scans return 0 and do not
-    re-log the hard-cancel WARNING.
+    """Once a task's entry is absent from ``_workflow_cancel_events``,
+    subsequent scans return 0 and do not re-log the hard-cancel WARNING.
 
-    This documents the mechanism that stops the every-30s re-logging: once
-    hard-cancelled the workflow's finally block clears the registry entry,
-    so the scan naturally skips the task.
+    This exercises the scan's skip-when-absent behaviour: it does *not*
+    exercise the ``_run_slot`` finally-block cleanup that would remove the
+    entry in production (that cleanup is a separate contract tested via
+    ``_run_slot`` directly).
     """
     ev = asyncio.Event()
     harness_low_threshold._workflow_cancel_events['7'] = ev

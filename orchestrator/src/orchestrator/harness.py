@@ -1746,9 +1746,11 @@ Output JSON matching the schema. Every task must appear in the output.
 
             # Register the asyncio.Task handle for this slot so hard_cancel_workflow
             # can request a hard cancel if the workflow ignores the soft event.
-            # current_task() is safe here because _run_slot is always scheduled
-            # as an asyncio.Task (via create_task in _acquire_and_run_slot).
-            self._workflow_slot_tasks[assignment.task_id] = asyncio.current_task()  # type: ignore[assignment]
+            # current_task() must be non-None here because _run_slot is always
+            # scheduled as an asyncio.Task (via create_task in _acquire_and_run_slot).
+            current = asyncio.current_task()
+            assert current is not None, '_run_slot must be scheduled as a Task'
+            self._workflow_slot_tasks[assignment.task_id] = current
 
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
             recovered_session = self._recovered_sessions.pop(assignment.task_id, None)
@@ -2712,7 +2714,7 @@ Output JSON matching the schema. Every task must appear in the output.
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
 
-    def hard_cancel_workflow(self, task_id: str) -> bool:
+    def hard_cancel_workflow(self, task_id: str, *, restamp: bool = True) -> bool:
         """Hard-cancel the asyncio.Task running the workflow slot for ``task_id``.
 
         This is the escalation path when a workflow ignores the soft
@@ -2723,8 +2725,11 @@ Output JSON matching the schema. Every task must appear in the output.
         ``except Exception`` guard at harness.py:1833) ensuring lock release
         and registry cleanup.
 
-        Re-stamps ``_workflow_cancel_at`` for the R3 reconcile grace window,
-        mirroring ``cancel_workflow``.
+        ``restamp`` controls whether ``_workflow_cancel_at`` is updated.  Pass
+        ``restamp=True`` (the default) on the threshold-crossing call so the R3
+        reconcile grace window is anchored to the hard-cancel moment; pass
+        ``restamp=False`` on subsequent polls to avoid indefinitely extending
+        the grace window past the original hard-cancel timestamp.
 
         Returns ``True`` iff a live (non-done) slot task was found and
         ``cancel()`` was requested.  Returns ``False`` when there is no
@@ -2734,8 +2739,11 @@ Output JSON matching the schema. Every task must appear in the output.
         task = self._workflow_slot_tasks.get(task_id)
         if task is None or task.done():
             return False
-        # Stamp wall-clock so the reconcile sweep respects the R3 grace window.
-        self._workflow_cancel_at[task_id] = time.monotonic()
+        if restamp:
+            # Stamp wall-clock so the reconcile sweep respects the R3 grace
+            # window.  Only stamp at the threshold-crossing call; subsequent
+            # polls pass restamp=False to keep the window anchored.
+            self._workflow_cancel_at[task_id] = time.monotonic()
         task.cancel()
         return True
 
@@ -3160,15 +3168,28 @@ Output JSON matching the schema. Every task must appear in the output.
                     cancelled += 1
             else:
                 # At or above threshold: escalate to hard asyncio.Task.cancel().
-                # Log the WARNING exactly once at the threshold crossing so a
-                # still-draining task is not re-warned every 30 s.
-                if count == threshold:
-                    logger.warning(
-                        'Terminal-status watcher: hard-cancelling workflow for '
-                        'task %s — ignored soft cancel for %d polls (status=%s)',
-                        task_id, count, status,
-                    )
-                if self.hard_cancel_workflow(task_id):
+                # Only restamp _workflow_cancel_at at the threshold crossing so
+                # the R3 grace window has a defined endpoint; subsequent polls
+                # pass restamp=False to avoid extending it indefinitely.
+                at_crossing = count == threshold
+                result = self.hard_cancel_workflow(task_id, restamp=at_crossing)
+                if at_crossing:
+                    # Log the WARNING exactly once at the threshold crossing so
+                    # a still-draining task is not re-warned every 30 s.
+                    if result:
+                        logger.warning(
+                            'Terminal-status watcher: hard-cancelling workflow '
+                            'for task %s — ignored soft cancel for %d polls '
+                            '(status=%s)',
+                            task_id, count, status,
+                        )
+                    else:
+                        logger.warning(
+                            'Terminal-status watcher: threshold reached but no '
+                            'live slot task registered for task %s (status=%s)',
+                            task_id, status,
+                        )
+                if result:
                     cancelled += 1
 
         return cancelled
