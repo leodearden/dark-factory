@@ -2671,7 +2671,14 @@ class Scheduler:
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
         self._module_cache[task_id] = sorted(needed_set)
-        updated = await self.update_task(task_id, {'files': needed})
+        # Read-modify-write so memory_hints / _causation_id attached by Stage-2
+        # reconciliation survive the blast-radius-failure files write (task 1511).
+        # get_task already swallows MCP errors → None, so the isinstance guard
+        # degrades gracefully to the prior {'files': needed} write.
+        fresh = await self.get_task(task_id)
+        fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
+        merged = {**fresh_md, 'files': needed}
+        updated = await self.update_task(task_id, merged)
         if not updated:
             logger.warning(
                 f'Task {task_id}: metadata update failed (non-critical — '
