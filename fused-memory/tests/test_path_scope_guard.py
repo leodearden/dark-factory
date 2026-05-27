@@ -75,6 +75,30 @@ class TestFindPaths:
         # "supercrates/" must not match "crates/"
         assert find_paths('supercrates/x.rs', ('crates/',)) == []
 
+    # ------------------------------------------------------------------
+    # New boundary contract: '/' and '.' are NOT valid left boundaries
+    # ------------------------------------------------------------------
+
+    def test_slash_preceded_no_match(self):
+        """A prefix immediately preceded by '/' must NOT match (task-1494)."""
+        assert find_paths('a/corpus/x', ('corpus/',)) == []
+
+    def test_deep_nested_slash_no_match(self):
+        """A multi-segment path that passes *through* the prefix must not match."""
+        assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
+
+    def test_leading_prefix_still_matches(self):
+        """A bare leading reference still matches (regression guard)."""
+        assert find_paths('corpus/x', ('corpus/',)) == ['corpus/']
+
+    def test_space_preceded_still_matches(self):
+        """A prefix after a space still matches (regression guard)."""
+        assert find_paths('see corpus/x', ('corpus/',)) == ['corpus/']
+
+    def test_dot_preceded_no_match(self):
+        """A prefix immediately preceded by '.' must NOT match (task-1494)."""
+        assert find_paths('a.corpus/x', ('corpus/',)) == []
+
 
 # ---------------------------------------------------------------------------
 # check_candidate_for_scope
@@ -147,6 +171,52 @@ class TestCheckCandidateForScope:
         c = _candidate(title='Look at random/path/here.py')
         v = check_candidate_for_scope(c, 'reify', registry)
         assert v.outcome == 'ok'
+
+    # ------------------------------------------------------------------
+    # Nested-path boundary fix (task-1494)
+    # ------------------------------------------------------------------
+
+    def _know_live_reify_registry(self, tmp_path: Path) -> ProjectPrefixRegistry:
+        """Know-live (corpus/, tools/) + reify (crates/) registry."""
+        kl = _mkproj(tmp_path, 'know-live', ['corpus', 'tools'])
+        reify = _mkproj(tmp_path, 'reify', ['crates'])
+        return ProjectPrefixRegistry.from_roots([str(kl), str(reify)])
+
+    def test_nested_corpus_path_under_reify_is_ok(self, tmp_path):
+        """A candidate under 'reify' citing a path that passes THROUGH '/corpus/'
+        must NOT be rejected — nested segment is not a leading prefix (task-1494)."""
+        registry = self._know_live_reify_registry(tmp_path)
+        c = _candidate(details='vendor/tree-sitter-x/test/corpus/expr.txt')
+        v = check_candidate_for_scope(c, 'reify', registry)
+        assert v.outcome == 'ok'
+        assert v.matched_paths == ()
+        assert v.suggested_project is None
+
+    def test_nested_tools_path_under_reify_is_ok(self, tmp_path):
+        """A path passing through '/tools/' must not trigger know_live (task-1494)."""
+        registry = self._know_live_reify_registry(tmp_path)
+        c = _candidate(details='repo/scripts/tools/gen.sh')
+        v = check_candidate_for_scope(c, 'reify', registry)
+        assert v.outcome == 'ok'
+        assert v.matched_paths == ()
+
+    def test_bare_leading_corpus_under_reify_is_rejection(self, tmp_path):
+        """A BARE leading 'corpus/' reference (not preceded by '/') filed under reify
+        must still be rejected and suggest know_live (regression guard)."""
+        registry = self._know_live_reify_registry(tmp_path)
+        c = _candidate(title='Edit corpus/wordlist.txt')
+        v = check_candidate_for_scope(c, 'reify', registry)
+        assert v.outcome == 'rejection'
+        assert v.suggested_project == 'know_live'
+
+    def test_bare_leading_tools_under_reify_is_rejection(self, tmp_path):
+        """A BARE leading 'tools/' reference filed under reify must still be rejected
+        and suggest know_live (regression guard)."""
+        registry = self._know_live_reify_registry(tmp_path)
+        c = _candidate(title='Update tools/gen.sh')
+        v = check_candidate_for_scope(c, 'reify', registry)
+        assert v.outcome == 'rejection'
+        assert v.suggested_project == 'know_live'
 
 
 # ---------------------------------------------------------------------------
