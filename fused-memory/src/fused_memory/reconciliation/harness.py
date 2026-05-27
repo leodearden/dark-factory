@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -49,7 +50,6 @@ try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
         DedupeConfig,
         compute_content_fingerprint,
-        content_fingerprint_key,
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -74,16 +74,14 @@ except ImportError:
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
-    DedupeConfig(  # type: ignore[possibly-undefined]
-        infra_dedupe_enabled=True,
-        infra_dedupe_window_secs=float('inf'),
+    dataclasses.replace(  # type: ignore[possibly-undefined]
+        DedupeConfig.for_recon(),
         infra_dedupe_categories=(
             'recon_integrity_issue',
             'recon_failure',
             'recon_stale_run',
             'recon_backlog_overflow',
         ),
-        key_fn=content_fingerprint_key,  # type: ignore[possibly-undefined]
     )
     if HAS_ESCALATION else None
 )
@@ -679,9 +677,15 @@ class ReconciliationHarness:
                     finding.get('description') or '',
                 )
             else:
+                # No finding in scope: use '' for finding_category (sentinel for
+                # "summary-only, no finding identity") so the description-hash branch
+                # of compute_content_fingerprint is used.  Using '' instead of
+                # re-using escalation_category keeps the identity composition
+                # semantically accurate — the second arg is the finding's own
+                # category, which is absent here.
                 fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
                     category,
-                    category,
+                    '',
                     [],
                     summary,
                 )

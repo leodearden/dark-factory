@@ -490,6 +490,130 @@ class TestReconEscalationDedup:
                 f'{f.name}: expected status=pending, got {data["status"]!r}'
             )
 
+    # ── Amendment 3: severity promotion on fold ─────────────────────────
+
+    def test_severity_promoted_to_max_on_fold(self, tmp_path):
+        """Folding a 'blocking' child into an 'info' parent promotes parent severity.
+
+        Documents the attach_dedupe_child / _max_severity contract so that any
+        future refactor that breaks severity promotion is caught immediately.
+        The watcher (port 8103) reads parent.severity for triage — a blocking
+        recurrence must remain visible even if the parent was filed at 'info'.
+
+        Note: _escalate maps recon_integrity_issue → 'info' and recon_failure →
+        'blocking' consistently, so different severities for the same fingerprint
+        cannot arise via _escalate alone (same category ⇒ same fingerprint ⇒
+        same severity slot).  This test exercises the promotion path directly via
+        submit_or_dedupe so the _max_severity contract is pinned regardless of
+        how _escalate's severity mapping may evolve.
+        """
+        from escalation.dedupe import (
+            DedupeConfig,
+            compute_content_fingerprint,
+            content_fingerprint_key,
+            submit_or_dedupe,
+        )
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue_dir = tmp_path / 'sev_test'
+        queue = EscalationQueue(queue_dir)
+        cfg = DedupeConfig(
+            infra_dedupe_enabled=True,
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('test_sev_category',),
+            key_fn=content_fingerprint_key,
+        )
+        fp = compute_content_fingerprint('test_sev_category', 'stale_k', ['t1'], '')
+
+        # First submission: 'info' severity → becomes the parent.
+        esc1 = Escalation(
+            id=queue.make_id('sev-parent'),
+            task_id='sev-parent',
+            agent_role='test',
+            severity='info',
+            category='test_sev_category',
+            summary='stale_k for t1',
+            dedupe_fingerprint=fp,
+        )
+        submit_or_dedupe(queue, esc1, cfg)
+
+        # Second submission: 'blocking' severity → folds into parent, promoting severity.
+        esc2 = Escalation(
+            id=queue.make_id('sev-child'),
+            task_id='sev-child',
+            agent_role='test',
+            severity='blocking',
+            category='test_sev_category',
+            summary='stale_k for t1',
+            dedupe_fingerprint=fp,
+        )
+        submit_or_dedupe(queue, esc2, cfg)
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected 1 file (folded), got {len(files)}'
+        data = json.loads(files[0].read_text())
+        assert data['severity'] == 'blocking', (
+            f'Expected severity promoted to "blocking", got {data["severity"]!r}. '
+            'attach_dedupe_child must call _max_severity() so the parent always '
+            'reflects the highest-urgency signal across all folded occurrences.'
+        )
+        assert data['dedupe_count'] == 1, (
+            f'Expected dedupe_count==1 (one child folded), got {data["dedupe_count"]}'
+        )
+
+    # ── Amendment 4: producer/consumer contract for fingerprint key ──────
+
+    def test_content_fingerprint_key_matches_dedupe_fingerprint(self, tmp_path):
+        """content_fingerprint_key(esc) == esc.dedupe_fingerprint — producer/consumer contract.
+
+        Guards against future divergence where the watcher re-hashes independently
+        and starts treating the same finding as distinct (causing dedupe_count to
+        rise while separate files reopen for the same finding).
+
+        The watcher uses content_fingerprint_key to find the dedup parent.
+        The harness stamps esc.dedupe_fingerprint via compute_content_fingerprint.
+        Both must agree on identity — this test pins that invariant end-to-end
+        by reading a real escalation off disk and asserting the key function
+        returns its stored fingerprint.
+        """
+        from escalation.dedupe import (
+            compute_content_fingerprint,
+            content_fingerprint_key,
+        )
+        from escalation.models import Escalation
+
+        harness, queue_dir = _make_dedup_harness(tmp_path)
+
+        harness._escalate(
+            'recon_integrity_issue',
+            run_id='contract-run',
+            summary='Contract test finding',
+            finding={
+                'category': 'contract_cat',
+                'affected_ids': ['id1'],
+                'description': 'desc contract',
+            },
+        )
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1
+        esc = Escalation.from_json(files[0].read_text())
+
+        # The key the watcher uses must equal the producer-stamped fingerprint.
+        assert content_fingerprint_key(esc) == esc.dedupe_fingerprint, (
+            'content_fingerprint_key(esc) diverges from esc.dedupe_fingerprint — '
+            'producer (harness._escalate) and consumer (watcher find_dedupe_parent) '
+            'use different identity paths, which would cause dedup to silently break.'
+        )
+        expected_fp = compute_content_fingerprint(
+            'recon_integrity_issue', 'contract_cat', ['id1'], 'desc contract',
+        )
+        assert esc.dedupe_fingerprint == expected_fp, (
+            f'Fingerprint mismatch: stored {esc.dedupe_fingerprint!r}, '
+            f'expected {expected_fp!r}'
+        )
+
     @pytest.mark.asyncio
     async def test_remediation_residue_passes_finding_to_escalate(self, tmp_path):
         """_run_remediation_pass residue loop uses finding-based fingerprint.
