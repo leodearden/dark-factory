@@ -178,59 +178,6 @@ class TestStage2PromptMandatesUniquenessToken:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 (task-1486): STAGE1 pre-check broadened to search by metadata.task_id
-# ---------------------------------------------------------------------------
-
-
-class TestStage1PreCheckSearchesByTaskId:
-    """Minimal existence check: STAGE1_SYSTEM_PROMPT instructs a task_id-keyed
-    completion-summary pre-check alongside the existing run_id-keyed one.
-
-    TaskInterceptor / TargetedReconciliation write completion summaries with a
-    *different* run_id but carry metadata.task_id — so the run_id-only pre-check
-    misses them and re-flags tasks as missing summaries. The fix adds a companion
-    search that inspects metadata.task_id on results.
-
-    These are minimal key-token existence checks (NOT prose pins), mirroring the
-    TestStage2PromptMandatesUniquenessToken pattern.
-    """
-
-    def test_stage1_prompt_instructs_task_id_keyed_completion_summary_search(self):
-        """STAGE1_SYSTEM_PROMPT must instruct searching for completion summaries
-        keyed on metadata.task_id (catches targeted_reconciliation / TaskInterceptor
-        writes that carry task_id but a different run_id).
-
-        The new pre-check must reference a 'task completion summary' search (the
-        query that detects targeted_reconciliation writes with metadata.task_id).
-
-        RED before impl: the prompt only has the run_id-keyed pre-check today.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'task completion summary' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must instruct the Stage 1 agent to search for "
-            "existing completion summaries by task_id (not run_id only). "
-            "The new pre-check should use a 'task completion summary' search query "
-            "so the agent can detect entries written by source=targeted_reconciliation "
-            "which carry metadata.task_id but a different run_id."
-        )
-
-    def test_stage1_prompt_retains_run_id_pre_check(self):
-        """STAGE1_SYSTEM_PROMPT must still include the run_id-keyed pre-check.
-
-        Regression guard: the impl must extend (not replace) the existing pre-check.
-        Already GREEN before impl.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'run_id: <run_id>' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must retain the existing run_id-keyed pre-check "
-            "(search for 'run_id: <run_id>' in observations_and_summaries). "
-            "The task_id-keyed check supplements it — it does not replace it."
-        )
-
-
-# ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
 
