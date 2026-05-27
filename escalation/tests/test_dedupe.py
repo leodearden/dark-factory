@@ -471,6 +471,124 @@ class TestComputeContentFingerprint:
         )
 
 
+class TestContentFingerprintKey:
+    """content_fingerprint_key() adapter and DedupeConfig.key_fn field."""
+
+    def _make_recon_esc(self, esc_id: str, fingerprint: str | None = None):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='42',
+            agent_role='reconciler',
+            severity='info',
+            category='recon_integrity_issue',
+            summary='Unresolved after remediation: entity mismatch',
+        )
+        esc.dedupe_fingerprint = fingerprint
+        return esc
+
+    def test_content_fingerprint_key_returns_fingerprint(self):
+        """(1) content_fingerprint_key(esc) returns esc.dedupe_fingerprint."""
+        from escalation.dedupe import content_fingerprint_key
+        esc = self._make_recon_esc('esc-1-1', fingerprint='fp-abc123')
+        assert content_fingerprint_key(esc) == 'fp-abc123'
+
+    def test_content_fingerprint_key_returns_none_when_unset(self):
+        """(1) content_fingerprint_key(esc) returns None when fingerprint is None."""
+        from escalation.dedupe import content_fingerprint_key
+        esc = self._make_recon_esc('esc-1-1', fingerprint=None)
+        assert content_fingerprint_key(esc) is None
+
+    def test_default_config_key_fn_is_none(self):
+        """(2) DedupeConfig().key_fn is None (default)."""
+        from escalation.dedupe import DedupeConfig
+        cfg = DedupeConfig()
+        assert cfg.key_fn is None
+
+    def test_default_config_still_folds_infra_by_summary(self, tmp_path):
+        """(3) Regression: default config (key_fn=None) folds two infra summaries sharing first 3 tokens."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = Escalation(
+            id='esc-1-1', task_id='42', agent_role='impl', severity='blocking',
+            category='infra_issue', summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(parent)
+
+        candidate = Escalation(
+            id='esc-1-2', task_id='42', agent_role='impl', severity='blocking',
+            category='infra_issue', summary='fused-memory connection timeout on port 9999',
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result == 'esc-1-1', 'Default config must still fold by first-3-token summary key'
+
+    def test_content_key_folds_matching_fingerprints(self, tmp_path):
+        """(4) find_dedupe_parent with content key folds when fingerprints match."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_recon_esc('esc-1-1', fingerprint='shared-fp')
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2', fingerprint='shared-fp')
+        cfg = DedupeConfig(
+            key_fn=content_fingerprint_key,
+            infra_dedupe_categories=('recon_integrity_issue',),
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, cfg, now=now)
+        assert result == 'esc-1-1'
+
+    def test_content_key_does_not_fold_different_fingerprints(self, tmp_path):
+        """(4) Different fingerprints do NOT fold."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_recon_esc('esc-1-1', fingerprint='fp-a')
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2', fingerprint='fp-b')
+        cfg = DedupeConfig(
+            key_fn=content_fingerprint_key,
+            infra_dedupe_categories=('recon_integrity_issue',),
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, cfg, now=now)
+        assert result is None
+
+    def test_content_key_none_fingerprint_never_folds(self, tmp_path):
+        """(4) Candidate with None dedupe_fingerprint never folds (empty-key guard)."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_recon_esc('esc-1-1', fingerprint='some-fp')
+        queue.submit(parent)
+
+        candidate = self._make_recon_esc('esc-1-2', fingerprint=None)
+        cfg = DedupeConfig(
+            key_fn=content_fingerprint_key,
+            infra_dedupe_categories=('recon_integrity_issue',),
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, cfg, now=now)
+        assert result is None, 'None fingerprint must never fold into any parent'
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
