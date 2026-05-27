@@ -611,6 +611,42 @@ async def test_update_task_memory_hints_union_on_subtask(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_update_task_legacy_hints_coerce_on_subtask_dotted_id(backend, project_root):
+    """Legacy list-shape memory_hints is coerced on the dotted-id subtask path.
+
+    Stage-2 attaches hints to subtasks via the dotted-id path; this locks parity
+    with the top-level test_update_task_legacy_list_hints_coerce_under_append_true.
+    Both the direct get_task('1.1') and the parent['subtasks'][0] paths must
+    return the unioned dict-shape after the migration write.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='hinted')
+
+    # Seed the subtask with the legacy list-of-dicts shape.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': [{'entity': 'E1', 'query': 'q1'}]}),
+        append=False,
+    )
+    # Stage-2 writes canonical dict shape with append=True.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+
+    expected = {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']}
+
+    # (a) Direct get_task on the subtask.
+    sub = await backend.get_task('1.1', project_root=project_root)
+    assert sub['metadata']['memory_hints'] == expected
+
+    # (b) Parent's subtasks[0] also reflects the migration.
+    parent = await backend.get_task('1', project_root=project_root)
+    assert parent['subtasks'][0]['metadata']['memory_hints'] == expected
+
+
+@pytest.mark.asyncio
 async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, project_root):
     """_row_to_task coerces malformed metadata JSON to {} for both top-level and subtask rows.
 
