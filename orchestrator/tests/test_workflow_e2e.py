@@ -5258,6 +5258,73 @@ class TestMarkBlockedBypassDetection:
             task_assignment.task_id, ''
         )
 
+    async def test_mark_blocked_cancelled_midflight_aborts_gracefully(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """When set_task_status('blocked') raises TerminalExitRejection with
+        old_status='cancelled', _mark_blocked must return WorkflowOutcome.CANCELLED
+        immediately — without reopening the row or filing any escalations.
+
+        RED: WorkflowOutcome.CANCELLED does not exist yet AND current
+        _handle_terminal_exit_on_block reopens + files bypass_done L1 for the
+        provenance-less cancelled row.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+
+        # The first set_task_status('blocked', reopen_reason=None) raises
+        # TerminalExitRejection with old_status='cancelled'.
+        # A subsequent call WITH reopen_reason must NOT be reached — if it is,
+        # the reopen_reasons map will contain the task_id, triggering an
+        # assertion failure.
+        original_set = scheduler.set_task_status
+
+        async def raising_set(task_id, status, *, done_provenance=None, reopen_reason=None):
+            if status == 'blocked' and reopen_reason is None:
+                raise TerminalExitRejection(
+                    task_id=task_id, old_status='cancelled',
+                    target_status='blocked', raw='terminal_exit_rejected',
+                )
+            # Any call with reopen_reason means the workflow tried to reopen a
+            # user-cancelled row — that must NOT happen.
+            await original_set(
+                task_id, status,
+                done_provenance=done_provenance,
+                reopen_reason=reopen_reason,
+            )
+
+        scheduler.set_task_status = raising_set  # type: ignore[method-assign]
+
+        outcome = await workflow._mark_blocked('synthetic block reason', detail='x')
+
+        # Cancelled mid-flight → CANCELLED outcome, not BLOCKED/DONE.
+        assert outcome == WorkflowOutcome.CANCELLED, (
+            f'Expected CANCELLED on cancelled-mid-flight, got {outcome!r}'
+        )
+
+        # The row must NEVER be reopened.
+        assert task_assignment.task_id not in scheduler.reopen_reasons, (
+            f'Expected no reopen for cancelled row, got '
+            f'{scheduler.reopen_reasons.get(task_assignment.task_id)!r}'
+        )
+
+        # Zero escalations — no task_failure, no bypass_done.
+        all_escs = (
+            queue.get_by_task(task_assignment.task_id, level=0)
+            + queue.get_by_task(task_assignment.task_id, level=1)
+        )
+        assert not all_escs, (
+            f'Expected no escalations for cancelled row, got '
+            f'{[(e.id, e.category) for e in all_escs]}'
+        )
+
 
 @pytest.mark.asyncio
 class TestCleanupVerificationGate:
