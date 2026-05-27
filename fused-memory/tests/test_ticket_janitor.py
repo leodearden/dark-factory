@@ -556,6 +556,246 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
 
 
 @pytest.mark.asyncio
+async def test_repeated_probe_raises_surface_infra_issue_escalation(store, tmp_path):
+    """Consecutive probe raises accumulate and surface an infra_issue at the threshold.
+
+    Below the threshold (3) no escalation is emitted.  At the threshold,
+    exactly one infra_issue escalation is submitted.  The pending ticket must
+    remain status='pending' throughout — fail-open is preserved; the reaper
+    never fires and the ticket is never stamped.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+
+        def _always_raises(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_always_raises,
+            probe_defect_threshold=3,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # Tick 1 — below threshold, no escalation
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Expected no escalation after 1st tick; got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', f'ticket must stay pending after 1st tick; got {row}'
+        assert row['reason'] is None
+
+        # Tick 2 — below threshold, still no escalation
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Expected no escalation after 2nd tick; got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', f'ticket must stay pending after 2nd tick; got {row}'
+        assert row['reason'] is None
+
+        # Tick 3 — at threshold, exactly one infra_issue escalation surfaced
+        await janitor.tick()
+        files = sorted(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Expected exactly 1 escalation after 3rd tick; got {[f.name for f in files]}'
+        )
+        body = json.loads(files[0].read_text())
+        assert body['category'] == 'infra_issue'
+        assert body['severity'] == 'info'
+        assert body['agent_role'] == 'fused-memory/ticket-janitor'
+        # Count and project_id must round-trip through detail and summary.
+        detail = json.loads(body['detail'])
+        assert detail['consecutive_probe_failures'] == 3, (
+            f'Expected consecutive_probe_failures=3 in detail; got {detail}'
+        )
+        assert detail['project_id'] == project_id, (
+            f'Expected project_id={project_id!r} in detail; got {detail}'
+        )
+        assert str(3) in body['summary'], (
+            f'Expected "3" in summary to confirm count was serialised; got {body["summary"]!r}'
+        )
+        # Fail-open preserved: ticket is still pending, never reaped, never stamped
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending', (
+            f'Ticket must stay pending (fail-open); got {row}'
+        )
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_escalation_is_rate_limited(store, tmp_path):
+    """Post-threshold probe raises must not flood the escalation queue.
+
+    With probe_defect_threshold=1 the first raise surfaces immediately.
+    Subsequent raises within the cooldown window must be suppressed so that
+    only a single esc-*.json file exists across multiple ticks.  The pending
+    ticket remains status='pending' throughout.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='still stranded'),
+        )
+
+        def _always_raises(pid: str) -> bool:
+            raise RuntimeError('probe still broken')
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_always_raises,
+            probe_defect_threshold=1,
+            cooldown_secs=3600.0,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # 4 ticks — first one surfaces at threshold=1, rest must be suppressed
+        for _ in range(4):
+            await janitor.tick()
+
+        files = sorted(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Cooldown must suppress duplicate probe-defect escalations; '
+            f'got {[f.name for f in files]}'
+        )
+        # Ticket is still pending the entire time
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending'
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_success_resets_consecutive_failure_counter(store, tmp_path):
+    """A probe success resets the per-project counter so intermittent blips never accumulate.
+
+    A probe that alternates raise/succeed/raise/succeed... never builds up
+    3 consecutive raises and must therefore never surface an escalation, even
+    across many ticks.  The pending ticket stays pending throughout.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='intermittent probe'),
+        )
+
+        call_count = [0]
+
+        def _alternating_probe(pid: str) -> bool:
+            call_count[0] += 1
+            if call_count[0] % 2 == 1:  # odd calls raise
+                raise RuntimeError('intermittent probe failure')
+            return True  # even calls succeed
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_alternating_probe,
+            probe_defect_threshold=3,
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+
+        # 6 ticks: alternating raise/succeed — consecutive count never reaches 3
+        for _ in range(6):
+            await janitor.tick()
+
+        files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == [], (
+            f'Intermittent probe raises must never surface an escalation; '
+            f'got {[f.name for f in files]}'
+        )
+        row = await store.get(ticket_id)
+        assert row['status'] == 'pending'
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_bail_out_when_orchestrator_not_running(store, tmp_path):
+    """_surface_probe_defect bail-out when the orchestrator is not running.
+
+    Guards the branches of _surface_probe_defect that return early before
+    queue.submit — analogous to the no-orchestrator path in tick() step 4.
+
+    Invariants when the orchestrator is absent:
+    (a) No esc-*.json file is written (bail-out before submit).
+    (b) The per-project failure counter is NOT reset — it keeps accumulating
+        so the defect will be surfaced once the orchestrator starts.
+    (c) _escalation_log[(pid, _PROBE_DEFECT, _PROBE_DEFECT)] stays empty so
+        there is no cooldown recorded and the next tick retries immediately.
+    """
+    from fused_memory.middleware.ticket_janitor import _PROBE_DEFECT
+
+    # Create the lock file but do NOT hold it — _orchestrator_running returns False.
+    _make_orchestrator_layout(tmp_path, hold_lock=False)
+    project_id = _project_id_for(tmp_path)
+    ticket_id = await store.submit(
+        project_id=project_id,
+        candidate_json=_candidate_blob(title='bail-out probe test'),
+    )
+
+    def _always_raises(pid: str) -> bool:
+        raise RuntimeError('probe broken')
+
+    # threshold=1: the very first raise should try to surface — but bail-out
+    # because the orchestrator is not running.
+    janitor = TicketJanitor(
+        store,
+        primary_project_root=str(tmp_path),
+        liveness_probe=_always_raises,
+        probe_defect_threshold=1,
+    )
+
+    for _ in range(3):
+        await janitor.tick()
+
+    esc_dir = tmp_path / 'data' / 'escalations'
+    files = sorted(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+
+    # (a) No escalation file submitted.
+    assert files == [], (
+        f'Expected no escalation when orchestrator is not running; '
+        f'got {[f.name for f in files]}'
+    )
+    # (b) Counter keeps accumulating — not reset by the bail-out.
+    assert janitor._probe_failures[project_id] == 3, (
+        f'Counter must accumulate (not reset) on bail-out; '
+        f'got {janitor._probe_failures[project_id]}'
+    )
+    # (c) Cooldown log stays empty — no cooldown recorded so next tick retries.
+    key = (project_id, _PROBE_DEFECT, _PROBE_DEFECT)
+    assert janitor._escalation_log[key] == [], (
+        f'Cooldown log must stay empty on bail-out; '
+        f'got {janitor._escalation_log[key]}'
+    )
+    # Ticket is still pending throughout (fail-open preserved).
+    row = await store.get(ticket_id)
+    assert row['status'] == 'pending'
+    assert row['reason'] is None
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):
