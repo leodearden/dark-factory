@@ -678,7 +678,11 @@ def shape_burndown(
     """
     # Local import avoids circular import: burndown.py imports stats and
     # this module imports config/no-burndown.
-    from dashboard.data.burndown import compute_forecast_confidence
+    from dashboard.data.burndown import (
+        _distinct_days,
+        compute_forecast_confidence,
+        compute_window_completion,
+    )
 
     by_project: dict[str, dict] = {}
     label_set: set[str] = set()
@@ -686,10 +690,12 @@ def shape_burndown(
         labels = list(series.get('labels') or [])
         label_set.update(labels)
         forecast = compute_forecast_confidence(series)
+        completion = compute_window_completion(series)
         by_project[_project_label(pid)] = {
             'labels': labels,
             **{k: list(series.get(k) or []) for k in _BURNDOWN_KEYS},
             **forecast,
+            **completion,
         }
 
     sorted_labels = sorted(label_set)
@@ -703,6 +709,13 @@ def shape_burndown(
                     aggregate[k][index_map[lbl]] += int(val or 0)
 
     aggregate.update(compute_forecast_confidence(aggregate))
+
+    # Aggregate completed = sum of per-project deltas (robust to projects
+    # entering mid-window; see design decision in plan).
+    agg_completed = sum(p.get('completed', 0) for p in by_project.values())
+    agg_days = _distinct_days(sorted_labels)
+    aggregate['completed'] = agg_completed
+    aggregate['velocity'] = agg_completed / agg_days
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
 
