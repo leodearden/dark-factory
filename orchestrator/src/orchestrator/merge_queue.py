@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
-from orchestrator.verify import run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -80,6 +80,41 @@ Decision-2 check.  After ``advance_main`` succeeds, we verify that
 ``branch_HEAD`` and the advanced main SHA have the same tree (modulo
 ``.task/``).  Any divergence indicates conflict resolution dropped or
 rewrote work and needs human judgement, not a steward retry."""
+
+
+TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
+"""Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
+fails with a no-space-left/ENOSPC signature that PERSISTS after one
+prune-and-retry.  Disk pressure is frequently a self-healing host condition
+(a concurrent build finishes, a worktree is reaped), so the merge worker
+prunes stale ``_merge-*`` worktrees and retries the verify once before
+surfacing this.  The workflow routes this prefix to
+``_mark_blocked(escalate_to_human=True, category='infra_issue')`` — the
+infra_issue category plus the durable ref lets the escalation-watcher
+auto-resolve if the disk has recovered by read-time."""
+
+
+_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
+"""Substrings (matched case-insensitively) that mark a disk-full failure.
+There is no structured ENOSPC field on ``VerifyResult`` — the signal only
+appears in captured tool output — so detection is a string match."""
+
+
+def _verify_hit_enospc(verify: VerifyResult) -> bool:
+    """True when a failed ``VerifyResult`` bears a disk-full signature.
+
+    Scans the human-readable failure report and each captured output stream
+    (test/lint/type) for any ``_ENOSPC_MARKERS`` entry.
+    """
+    haystack = ' '.join(
+        s for s in (
+            verify.failure_report(),
+            verify.test_output,
+            verify.lint_output,
+            verify.type_output,
+        ) if isinstance(s, str)
+    ).lower()
+    return any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
 async def _check_plan_targets_in_tree(
@@ -461,6 +496,12 @@ class MergeWorker:
     # alternating on the merge queue for hours, each dying at the 30-min
     # warm timeout).  Counter resets on any successful merge for that task.
     MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    # After a post-merge verify fails with an ENOSPC signature, prune stale
+    # _merge-* worktrees and retry the verify at most this many times before
+    # escalating as transient infra.  Disk pressure is often self-healing, so
+    # one retry-after-prune is the conservative middle ground between blindly
+    # blocking and looping.  Resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
 
     def __init__(
         self,
@@ -481,6 +522,10 @@ class MergeWorker:
         # task_id; lives across submissions (re-submits of the same task
         # after an orchestrator re-queue also feed this counter).
         self._post_merge_verify_timeouts: dict[str, int] = {}
+        # Per-task ENOSPC prune-and-retry counter (see
+        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
+        # the timeout counter: persists across submissions, reset on success.
+        self._post_merge_verify_enospc_retries: dict[str, int] = {}
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -768,8 +813,45 @@ class MergeWorker:
                 max_retries=0,
                 is_merge_verify=True,
             )
+            # Transient-infra (disk pressure) retry: an ENOSPC failure is
+            # often a self-healing host condition.  Prune stale _merge-*
+            # worktrees (never task worktrees) and retry the verify once in
+            # the same merge_wt before escalating.
+            if not verify.passed and _verify_hit_enospc(verify):
+                prior_enospc = self._post_merge_verify_enospc_retries.get(
+                    req.task_id, 0,
+                )
+                if prior_enospc < self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES:
+                    self._post_merge_verify_enospc_retries[req.task_id] = (
+                        prior_enospc + 1
+                    )
+                    pruned = await self._git_ops.prune_stale_merge_worktrees(
+                        keep=merge_wt,
+                    )
+                    logger.warning(
+                        'Task %s: post-merge verify hit ENOSPC; pruned %d '
+                        'stale merge worktree(s), retrying verify once',
+                        req.task_id, len(pruned),
+                    )
+                    verify = await run_scoped_verification(
+                        merge_wt, req.config, req.module_configs,
+                        task_files=req.task_files,
+                        max_retries=0,
+                        is_merge_verify=True,
+                    )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
+                # Persistent ENOSPC after the prune-and-retry → transient infra.
+                if _verify_hit_enospc(verify):
+                    detail = verify.failure_report()
+                    reason = (
+                        f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+                        f'still reports no space left on device after pruning '
+                        f'stale merge worktrees and retrying. {verify.summary}'
+                    )
+                    if detail:
+                        reason = f'{reason}\n\n{detail}'
+                    return MergeOutcome('blocked', reason=reason)
                 detail = verify.failure_report()
                 reason = f'Post-merge verification failed: {verify.summary}'
                 if detail:
@@ -806,6 +888,8 @@ class MergeWorker:
             # the earlier timeouts has cleared (e.g. test was flaky, host
             # contention eased).  Reset so future timeouts start from 0.
             self._post_merge_verify_timeouts.pop(req.task_id, None)
+            # Same for the ENOSPC retry budget — disk pressure has cleared.
+            self._post_merge_verify_enospc_retries.pop(req.task_id, None)
             # Use the post-rebase SHA actually placed on main (advance_main
             # rebases on CAS retry; merge_result.merge_commit is the stale
             # pre-rebase SHA and would fail done_provenance ancestor check).
@@ -976,6 +1060,8 @@ class SpeculativeMergeWorker:
     # for rationale.  Kept as a class attribute so tests can monkeypatch
     # per-class if the two workers ever diverge.
     MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
 
     def __init__(
         self,
@@ -996,6 +1082,10 @@ class SpeculativeMergeWorker:
         # across submissions so an orchestrator re-queue of the same task
         # continues to feed the same counter.
         self._post_merge_verify_timeouts: dict[str, int] = {}
+        # Per-task ENOSPC prune-and-retry counter (mirror of MergeWorker's;
+        # see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Persists across
+        # submissions, reset on a successful CAS advance.
+        self._post_merge_verify_enospc_retries: dict[str, int] = {}
         # Depth-1 cap: cleared when a speculative merge is in flight,
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
@@ -1716,8 +1806,58 @@ class SpeculativeMergeWorker:
                 f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                 f'passed={verify.passed})'
             )
+            # Transient-infra (disk pressure) retry: an ENOSPC failure is
+            # often a self-healing host condition.  Prune stale _merge-*
+            # worktrees (never task worktrees) and retry the verify once in
+            # the same merge_wt before escalating.
+            if not verify.passed and _verify_hit_enospc(verify):
+                prior_enospc = self._post_merge_verify_enospc_retries.get(
+                    req.task_id, 0,
+                )
+                if prior_enospc < self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES:
+                    self._post_merge_verify_enospc_retries[req.task_id] = (
+                        prior_enospc + 1
+                    )
+                    pruned = await self._git_ops.prune_stale_merge_worktrees(
+                        keep=merge_wt,
+                    )
+                    logger.warning(
+                        'Task %s: post-merge verify hit ENOSPC; pruned %d '
+                        'stale merge worktree(s), retrying verify once',
+                        req.task_id, len(pruned),
+                    )
+                    try:
+                        verify = await run_scoped_verification(
+                            merge_wt, req.config, req.module_configs,
+                            task_files=req.task_files,
+                            max_retries=0,
+                            is_merge_verify=True,
+                        )
+                    except Exception as exc:
+                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        if not req.result.done():
+                            req.result.set_result(MergeOutcome(
+                                'blocked', reason=f'Verification error: {exc}',
+                            ))
+                        return False
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
+                # Persistent ENOSPC after the prune-and-retry → transient infra.
+                if _verify_hit_enospc(verify):
+                    if not req.result.done():
+                        detail = verify.failure_report()
+                        reason = (
+                            f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge '
+                            f'verify still reports no space left on device '
+                            f'after pruning stale merge worktrees and '
+                            f'retrying. {verify.summary}'
+                        )
+                        if detail:
+                            reason = f'{reason}\n\n{detail}'
+                        req.result.set_result(MergeOutcome(
+                            'blocked', reason=reason,
+                        ))
+                    return False
                 # Loop-breaker bookkeeping: bump only when the failure was a
                 # pure timeout.  Real test/lint/type failures already bubble
                 # up to the steward via the ``blocked`` outcome and do not
@@ -1761,6 +1901,8 @@ class SpeculativeMergeWorker:
                 self._cas_retries.pop(req.task_id, None)
                 # Loop-breaker counter reset on success — see MergeWorker.
                 self._post_merge_verify_timeouts.pop(req.task_id, None)
+                # ENOSPC retry budget reset on success — see MergeWorker.
+                self._post_merge_verify_enospc_retries.pop(req.task_id, None)
                 # Use the post-rebase SHA actually placed on main (see
                 # advance_main docstring — local merge_commit is stale
                 # after a CAS-retry rebase and fails done_provenance

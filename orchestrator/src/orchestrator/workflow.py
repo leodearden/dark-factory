@@ -3519,6 +3519,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -3538,6 +3539,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 result.reason,
                 merge_phase=merge_phase,
                 escalate_to_human=True,
+            )
+        # Transient-infra short-circuit: the merge worker already pruned stale
+        # merge worktrees and retried the verify, and it still hit ENOSPC.  Go
+        # straight to a human-facing L1 tagged ``infra_issue`` (not the
+        # steward — it can't free disk).  The durable ref + infra_issue
+        # category let the escalation-watcher auto-resolve if the disk has
+        # recovered by read-time.
+        if result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX):
+            self._write_merge_failure_review('transient_infra', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='infra_issue',
             )
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
@@ -4898,6 +4913,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
         return WorkflowOutcome.BLOCKED
 
+    def _durable_ref_suffix(self) -> str:
+        """Durable git identifiers to append to an L1 escalation's detail.
+
+        The originating worktree is ephemeral — task and merge worktrees are
+        reaped (e.g. by the merge queue or a disk-pressure prune) well before
+        a human reads a human-facing L1.  So cite refs that survive: the task
+        branch and the SHAs bracketing its work.  ``tip`` is the merge commit
+        SHA when the merge already landed, else a label pointing at the
+        branch's current HEAD.
+        """
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        base = (self._base_commit or '')[:12] or 'unknown'
+        tip = (self._merge_sha or '')[:12] or f'{branch}@HEAD'
+        return f'\n\n[durable refs] branch={branch} base={base} tip={tip}'
+
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
     ) -> None:
@@ -4906,6 +4936,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Called from BLOCKED-return paths so a human is signaled when
         automated handlers cannot make progress.  Idempotent — deduped
         via ``has_open_l1``.
+
+        Cites durable refs (branch + base/tip SHAs) in ``detail`` and leaves
+        ``worktree=None``: the human reads this after the worktree may be
+        gone, so the ephemeral path is worse than useless.  (The L0 builder
+        keeps ``worktree=`` — the steward is live and acts *in* that tree.)
         """
         if not self.escalation_queue:
             return
@@ -4920,9 +4955,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             severity='blocking',
             category=category,
             summary=f'Workflow blocked, no automated resolution path: {reason[:160]}',
-            detail=detail or reason,
+            detail=(detail or reason) + self._durable_ref_suffix(),
             suggested_action='manual_intervention',
-            worktree=str(self.worktree) if self.worktree else None,
+            worktree=None,
             workflow_state=self.state.value,
             level=1,
         )

@@ -2982,9 +2982,9 @@ class TestMarkBlockedFalseDoneGuard:
         self, config, git_ops, task_assignment, tmp_path
     ):
         """Fix C: ``escalate_to_human=True`` must NOT invoke the steward —
-        it goes straight to L0 + L1 + BLOCKED.  Pin this contract so
-        future refactors don't accidentally re-enable steward involvement
-        on confirmed-loop failures.
+        it goes straight to L1 + BLOCKED (no L0, per commit 1a1eca9a67).
+        Pin this contract so future refactors don't accidentally re-enable
+        steward involvement on confirmed-loop failures.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3028,6 +3028,13 @@ class TestMarkBlockedFalseDoneGuard:
         l0 = queue.get_by_task(task_assignment.task_id, level=0)
         assert len(l0) == 0
         assert queue.has_open_l1(task_assignment.task_id)
+        # A1: the human-facing L1 cites durable refs (branch + base SHA) in
+        # its detail and does NOT store the ephemeral worktree path — the
+        # worktree is reaped before a human reads the escalation.
+        l1 = queue.get_by_task(task_assignment.task_id, status='pending', level=1)[0]
+        assert l1.worktree is None
+        assert 'branch=task/' in (l1.detail or '')
+        assert 'base=' in (l1.detail or '')
 
     async def test_dropped_plan_targets_routes_to_l1_directly(
         self, config, git_ops, task_assignment, tmp_path
@@ -3102,6 +3109,71 @@ class TestMarkBlockedFalseDoneGuard:
         assert kwargs.get('merge_phase') is True, (
             'merge_phase flag must be threaded through to _mark_blocked; '
             f'got kwargs={kwargs!r}'
+        )
+
+    async def test_transient_infra_routes_to_l1_as_infra_issue(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """A merge outcome with the transient-infra (ENOSPC) reason prefix
+        must skip the steward and submit a human-facing L1 tagged
+        ``infra_issue`` — the merge worker already pruned + retried, and the
+        steward can't free disk.  The infra_issue category lets the
+        escalation-watcher auto-resolve once the disk recovers.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from orchestrator.merge_queue import (
+            TRANSIENT_INFRA_REASON_PREFIX,
+            MergeOutcome,
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        spy_mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
+
+        async def _fake_enqueue(_queue, request, _event_store):
+            request.result.set_result(MergeOutcome(
+                'blocked',
+                reason=(
+                    f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify still '
+                    f'reports no space left on device after pruning stale '
+                    f'merge worktrees and retrying. disk full'
+                ),
+            ))
+
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            outcome = await workflow._submit_to_merge_queue(
+                task_assignment.task_id, pre_rebased=False, merge_phase=True,
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED, got {outcome!r}'
+        )
+        spy_mark_blocked.assert_awaited_once()
+        assert spy_mark_blocked.await_args is not None
+        _args, kwargs = spy_mark_blocked.await_args
+        assert kwargs.get('escalate_to_human') is True, (
+            'transient_infra must call _mark_blocked(escalate_to_human=True); '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('category') == 'infra_issue', (
+            'transient_infra must tag the escalation infra_issue; '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('merge_phase') is True, (
+            f'merge_phase must be threaded through; got kwargs={kwargs!r}'
         )
 
     async def test_l1_dedupe_when_already_open(
