@@ -2406,27 +2406,29 @@ class TaskWorkflow:
             await self._steward.stop()
             self._steward = None
 
-        self.artifacts.clear_false_premise()
-
         if not premise:
-            return await self._mark_blocked(
+            result = await self._mark_blocked(
                 'Architect wrote malformed false_premise.json '
                 '(missing premise)',
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
                 category='design_concern',
             )
-
-        return await self._mark_blocked(
-            f'Architect reported false RED-test premise: {premise}',
-            detail=(
-                f'classification: {classification}\n'
-                f'evidence: {evidence}\n'
-                f'proposed_resolution: {proposed_resolution}'
-            )[:2000],
-            escalate_to_human=True,
-            category='design_concern',
-        )
+        else:
+            result = await self._mark_blocked(
+                f'Architect reported false RED-test premise: {premise}',
+                detail=(
+                    f'classification: {classification}\n'
+                    f'evidence: {evidence}\n'
+                    f'proposed_resolution: {proposed_resolution}'
+                )[:2000],
+                escalate_to_human=True,
+                category='design_concern',
+            )
+        # Clear only after the L1 escalation has been successfully submitted —
+        # if _mark_blocked raises, the artifact survives for the next retry.
+        self.artifacts.clear_false_premise()
+        return result
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
@@ -4593,6 +4595,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
 
         if self.escalation_queue and not skip_escalation:
+            # Fix C short-circuit: the caller determined this failure is not
+            # resolvable by the steward (e.g. false premise, unactionable spec,
+            # confirmed cycle).  Skip the L0 entirely — a stopped steward
+            # cannot consume it — and submit only the human-facing L1.
+            # This also prevents duplicate design_concern escalations in the
+            # queue (an L0 the steward can never act on + an L1 for the same
+            # report), keeping dashboards clean and preventing orphan-L0 reaper
+            # noise.  The unactionable handler follows the same pattern.
+            if escalate_to_human:
+                await self._ensure_l1_escalation_for_blocked(
+                    reason, detail or reason, category=category,
+                )
+                return WorkflowOutcome.BLOCKED
+
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
                 from escalation.models import Escalation
@@ -4618,15 +4634,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         data={'escalation_id': esc.id, 'category': category,
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
-
-            # Fix C short-circuit: the caller already determined this is
-            # a confirmed loop / unresolvable failure that the steward
-            # cannot un-stick.  Skip steward, submit L1, return BLOCKED.
-            if escalate_to_human:
-                await self._ensure_l1_escalation_for_blocked(
-                    reason, detail or reason, category=category,
-                )
-                return WorkflowOutcome.BLOCKED
 
             # Capture window-start for the broadened dismiss-with-terminate
             # guard below.  Any L0 whose resolved_at falls inside this window
