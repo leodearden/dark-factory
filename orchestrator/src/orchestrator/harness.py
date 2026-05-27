@@ -2527,7 +2527,7 @@ Output JSON matching the schema. Every task must appear in the output.
         if not candidates:
             return None
 
-        esc = candidates[0]  # ordering refined in impl-2
+        esc = max(candidates, key=lambda e: e.timestamp)
         reason = (
             f'Rehydrated merge halt from preserved L1 {esc.id} '
             f'(category={esc.category}) after restart'
