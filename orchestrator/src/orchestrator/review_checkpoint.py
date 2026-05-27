@@ -64,6 +64,13 @@ class ReviewCheckpoint:
         self._merged_modules: list[str] = []
         self._reports: list[ReviewReport] = []
 
+        # Full-review rate-limit state (run-forever idle path).  Kept SEPARATE
+        # from the focused counters above because run_focused() resets
+        # _last_review_at_merge on every focused checkpoint; the full-review
+        # ceiling must not be perturbed by focused cadence.
+        self._last_full_review_time: float | None = None
+        self._last_full_review_at_merge: int = 0
+
     def record_merge(self, modules: list[str]) -> None:
         """Record a successful task merge. Called by the harness after a DONE result."""
         self._merge_count += 1
@@ -93,10 +100,37 @@ class ReviewCheckpoint:
         self._reports.append(report)
         return report
 
+    def should_run_full(self, now: float) -> bool:
+        """Return True when the run-forever full-review ceiling is open.
+
+        Both gates must be open (a true AND ceiling): at least
+        ``full_review_min_interval_secs`` since the last full review (the very
+        first review is unconstrained on time — ``_last_full_review_time`` is
+        None) AND at least ``full_review_min_tasks`` merges since the last full
+        review.  ``now`` is a ``time.monotonic()`` reading supplied by the
+        caller so it shares a clock with the timestamp ``run_full()`` records.
+
+        Only consulted on the run-forever idle path; the exit / --until-idle
+        post-loop review stays unconditional.
+        """
+        time_gate = (
+            self._last_full_review_time is None
+            or now - self._last_full_review_time
+            >= self.config.review.full_review_min_interval_secs
+        )
+        task_gate = (
+            self._merge_count - self._last_full_review_at_merge
+            >= self.config.review.full_review_min_tasks
+        )
+        return time_gate and task_gate
+
     async def run_full(self) -> ReviewReport:
         """Run a full review of the entire project."""
         report = await self._run_review('full', [])
         self._last_review_at_merge = self._merge_count
+        # Record full-review trackers so should_run_full() re-closes the gate.
+        self._last_full_review_time = time.monotonic()
+        self._last_full_review_at_merge = self._merge_count
         self._merged_modules.clear()
         self._reports.append(report)
         return report

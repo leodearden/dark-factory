@@ -194,6 +194,22 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             OrchestratorConfig(terminal_status_hard_cancel_polls=0)
 
+    def test_run_forever_idle_defaults(self, monkeypatch, tmp_path):
+        """Run-forever idle + full-review rate-limit fields carry their defaults.
+
+        These three fields are absent from defaults.yaml, so OrchestratorConfig()
+        yields the Pydantic field defaults: the full-review ceiling is a true AND
+        of a 24h interval (86400s) and a 20-completed-task gate, and the idle poll
+        cadence is 15s (separate from _PAUSED_IDLE_POLL_SECS so operators can tune
+        the run-forever poll independently).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.review.full_review_min_interval_secs == 86400.0
+        assert config.review.full_review_min_tasks == 20
+        assert config.idle_poll_secs == 15.0
+
 
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
