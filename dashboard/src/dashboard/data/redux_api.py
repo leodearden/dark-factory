@@ -699,7 +699,7 @@ def shape_burndown(
         }
 
     sorted_labels = sorted(label_set)
-    aggregate: dict[str, list] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
+    aggregate: dict[str, Any] = {'labels': sorted_labels, **{k: [0] * len(sorted_labels) for k in _BURNDOWN_KEYS}}
     for series in series_by_project.values():
         labels = list(series.get('labels') or [])
         index_map = {lbl: i for i, lbl in enumerate(sorted_labels)}
