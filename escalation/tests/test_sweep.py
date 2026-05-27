@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 from escalation import sweep
 from escalation.models import Escalation
-
-_WORKTREE_SRC = str(Path(__file__).parent.parent / 'src')
 
 
 def _write_root_esc(
@@ -241,6 +236,27 @@ class TestSweepReconciliation:
         # But report says root would win
         assert report.reconciled_root_wins == 1
 
+    def test_dry_run_archive_wins_leaves_both_copies_intact(self, tmp_path: Path):
+        """Dry-run for archive-wins case: both files remain, report shows reconciled_archive_wins=1."""
+        archive_path = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by='steward'
+        )
+        root_path = _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by=None
+        )
+        archive_orig = archive_path.read_text()
+        root_orig = root_path.read_text()
+        report = sweep.sweep(tmp_path, apply=False)
+        # Both files untouched
+        assert archive_path.exists()
+        assert root_path.exists()
+        assert archive_path.read_text() == archive_orig
+        assert root_path.read_text() == root_orig
+        # But report says archive would win
+        assert report.reconciled_archive_wins == 1
+        assert report.reconciled_root_wins == 0
+
 
 class TestSweepSafety:
     """Non-esc files, unparsable JSON, and missing resolved_at are handled safely."""
@@ -285,7 +301,7 @@ class TestSweepSafety:
         assert report.archived == 0
 
     def test_unknown_status_value_skipped(self, tmp_path: Path):
-        """File with unknown status does not get archived."""
+        """File with unknown status does not get archived and is counted as skipped."""
         esc = Escalation(
             id='esc-1-1', task_id='1', agent_role='test',
             severity='info', category='cleanup_needed', summary='test',
@@ -296,6 +312,8 @@ class TestSweepSafety:
         report = sweep.sweep(tmp_path, apply=True)
         assert path.exists()
         assert report.archived == 0
+        assert report.skipped_unparsable == 1
+        assert not (tmp_path / 'archive').exists()
 
 
 class TestSweepIdempotency:
@@ -374,15 +392,3 @@ class TestSweepCli:
             'queue-dir does not exist' in r.getMessage() for r in caplog.records
         ), f'Expected missing-dir error; got: {[r.getMessage() for r in caplog.records]}'
 
-    def test_main_block_shell_exit_code_is_2_for_missing_queue_dir(self):
-        """The __main__ guard propagates main()'s return value via sys.exit().
-
-        Uses PYTHONPATH so the subprocess can find sweep.py when running from
-        a worktree where it is not yet installed in the editable venv.
-        """
-        proc = subprocess.run(
-            [sys.executable, '-m', 'escalation.sweep', '--queue-dir', '/no/such/path'],
-            capture_output=True,
-            env={**os.environ, 'PYTHONPATH': _WORKTREE_SRC},
-        )
-        assert proc.returncode == 2

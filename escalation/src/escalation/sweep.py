@@ -11,9 +11,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,23 +32,71 @@ class SweepReport:
     reconciled_root_wins: int = 0
     reconciled_archive_wins: int = 0
     untouched_pending: int = 0
+    # Counts files left in root for any skip reason: unparsable JSON, missing
+    # resolved_at on a resolved/dismissed file, or unknown status value.
+    # Individual cases are logged at WARNING level for operator review.
     skipped_unparsable: int = 0
     root_before: int = 0
     root_after: int = 0
 
 
 def _pick_richer(root_esc: Escalation, archive_esc: Escalation) -> bool:
-    """Return True iff root is strictly richer than archive; ties go to archive."""
-    root_key = (root_esc.resolved_by is not None, root_esc.resolution_turns is not None)
-    archive_key = (archive_esc.resolved_by is not None, archive_esc.resolution_turns is not None)
-    return root_key > archive_key
+    """Return True iff root is strictly richer than archive; ties go to archive.
+
+    Richness is compared lexicographically by:
+      1. resolved_by present
+      2. resolution_turns present
+      3. len(resolution text)  — guards against silent loss of free-form text
+      4. dedupe_count          — guards against losing folded-duplicate metadata
+    """
+    def _key(e: Escalation) -> tuple:
+        return (
+            e.resolved_by is not None,
+            e.resolution_turns is not None,
+            len(e.resolution or ''),
+            e.dedupe_count,
+        )
+    return _key(root_esc) > _key(archive_esc)
 
 
 def _build_archive_index(archive_root: Path) -> dict[str, Path]:
-    """Return {stem: path} index of all esc-*.json files under archive_root."""
+    """Return {stem: path} index of all esc-*.json files under archive_root.
+
+    If the same escalation id appears in multiple dated subdirs (e.g. from a
+    prior partial run or a bad import), the last path discovered wins and a
+    WARNING is logged.  The operator should investigate and deduplicate manually
+    before running --apply; the sweep will still proceed with the indexed copy.
+    """
     if not archive_root.exists():
         return {}
-    return {p.stem: p for p in archive_root.rglob('esc-*.json')}
+    index: dict[str, Path] = {}
+    for p in archive_root.rglob('esc-*.json'):
+        if p.stem in index:
+            logger.warning(
+                'archive duplicate: %s exists at %s AND %s; using latter for reconciliation',
+                p.stem, index[p.stem], p,
+            )
+        index[p.stem] = p
+    return index
+
+
+def _atomic_move(src: Path, dst: Path) -> None:
+    """Move src to dst atomically where possible, with a cross-device fallback.
+
+    os.replace is atomic on the same filesystem but raises OSError(EXDEV) when
+    src and dst are on different devices (e.g. archive is a bind mount).  In
+    that case we fall back to shutil.move (copy + unlink) and log a warning.
+    """
+    try:
+        os.replace(src, dst)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            logger.warning(
+                'cross-device move detected; falling back to shutil.move for %s → %s', src, dst
+            )
+            shutil.move(str(src), str(dst))
+        else:
+            raise
 
 
 def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
@@ -95,7 +145,7 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                 target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
                 if apply:
                     target_dir.mkdir(parents=True, exist_ok=True)
-                    os.replace(path, target_dir / path.name)
+                    _atomic_move(path, target_dir / path.name)
                 report.archived += 1
             else:
                 # Archive copy exists: compare richness
@@ -103,7 +153,7 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                 if _pick_richer(esc, archive_esc):
                     # Root wins: atomically overwrite the archive slot
                     if apply:
-                        os.replace(path, existing_archive)
+                        _atomic_move(path, existing_archive)
                     report.reconciled_root_wins += 1
                 else:
                     # Archive wins: drop the duplicate root copy
