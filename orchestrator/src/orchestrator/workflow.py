@@ -4468,6 +4468,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         merge_phase: bool = False,
         escalate_to_human: bool = False,
         suggested_action: str = 'investigate_and_retry',
+        category: str = 'task_failure',
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -4546,7 +4547,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     task_id=self.task_id,
                     agent_role='orchestrator',
                     severity='blocking',
-                    category='task_failure',
+                    category=category,
                     summary=reason[:200],
                     detail=detail or reason,
                     suggested_action=suggested_action,
@@ -4559,7 +4560,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.event_store.emit(
                         EventType.escalation_created,
                         task_id=self.task_id, phase=self.state.value,
-                        data={'escalation_id': esc.id, 'category': 'task_failure',
+                        data={'escalation_id': esc.id, 'category': category,
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
 
@@ -4568,7 +4569,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # cannot un-stick.  Skip steward, submit L1, return BLOCKED.
             if escalate_to_human:
                 await self._ensure_l1_escalation_for_blocked(
-                    reason, detail or reason,
+                    reason, detail or reason, category=category,
                 )
                 return WorkflowOutcome.BLOCKED
 
@@ -4687,11 +4688,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Fall-through BLOCKED: either no escalation queue, or the steward
         # never resolved the L0.  Either way a human should know — submit
         # an L1 (deduped) so the task isn't silently parked.
-        await self._ensure_l1_escalation_for_blocked(reason, detail or reason)
+        await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
         return WorkflowOutcome.BLOCKED
 
     async def _ensure_l1_escalation_for_blocked(
-        self, reason: str, detail: str,
+        self, reason: str, detail: str, *, category: str = 'task_failure',
     ) -> None:
         """Submit a level-1 escalation if none is open for this task.
 
@@ -4710,7 +4711,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             task_id=self.task_id,
             agent_role='orchestrator',
             severity='blocking',
-            category='task_failure',
+            category=category,
             summary=f'Workflow blocked, no automated resolution path: {reason[:160]}',
             detail=detail or reason,
             suggested_action='manual_intervention',
@@ -4724,7 +4725,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 EventType.escalation_created,
                 task_id=self.task_id, phase=self.state.value,
                 data={
-                    'escalation_id': esc.id, 'category': 'task_failure',
+                    'escalation_id': esc.id, 'category': category,
                     'severity': 'blocking', 'level': 1,
                     'summary': reason[:200],
                 },
