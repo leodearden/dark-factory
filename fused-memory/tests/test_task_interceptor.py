@@ -4956,12 +4956,10 @@ async def test_planning_mode_returns_task_id_synchronously(
         'planning_mode': True,
     }
     taskmaster.add_task.assert_called_once()
-    taskmaster.set_task_status.assert_called_once_with(
-        '2',
-        'deferred',
-        '/project',
-        None,
-    )
+    # The row is created directly in deferred via add_task(status=...);
+    # there is no separate set_task_status flip to observe (and race against).
+    assert taskmaster.add_task.call_args.kwargs.get('status') == 'deferred'
+    taskmaster.set_task_status.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -5097,30 +5095,6 @@ async def test_planning_mode_default_false_preserves_two_phase(
 
 
 @pytest.mark.asyncio
-async def test_planning_mode_deferred_flip_failure_returns_warning(
-    interceptor_facade,
-    taskmaster,
-):
-    """If tm.set_task_status fails after tm.add_task succeeded, return task_id + warning.
-
-    The task exists in pending — losing the response would strand it. The
-    planner can retry the deferred-flip via set_task_status using the
-    returned task_id.
-    """
-    taskmaster.set_task_status.side_effect = RuntimeError('Taskmaster process died')
-    result = await interceptor_facade.submit_task(
-        '/project',
-        title='X',
-        planning_mode=True,
-    )
-    assert result['task_id'] == '2'
-    assert result['status'] == 'pending'
-    assert result['planning_mode'] is True
-    assert 'warning' in result
-    assert 'Taskmaster process died' in result['warning']
-
-
-@pytest.mark.asyncio
 async def test_planning_mode_add_task_failure_returns_error(
     interceptor_facade,
     taskmaster,
@@ -5200,7 +5174,7 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
     async def fake_add_task(**kwargs):
         tid = str(next_id[0])
         next_id[0] += 1
-        statuses[tid] = 'pending'
+        statuses[tid] = kwargs.get('status', 'pending')
         return {'id': tid, 'title': kwargs.get('title') or 'untitled'}
 
     async def fake_set_status(task_id, status, project_root, tag=None):

@@ -1883,11 +1883,11 @@ def create_mcp_server(
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
-        tasks).  In planning mode the task is created directly and immediately
-        flipped to ``deferred`` status so the orchestrator scheduler cannot
-        claim it before the planner has wired up sibling dependencies.  The
-        planner commits the batch by calling ``commit_planning`` once all
-        siblings and dependencies are in place.
+        tasks).  In planning mode the task is created directly in ``deferred``
+        status (a single committed write — no transient ``pending`` state) so
+        the orchestrator scheduler cannot claim it before the planner has wired
+        up sibling dependencies.  The planner commits the batch by calling
+        ``commit_planning`` once all siblings and dependencies are in place.
 
         Planning mode returns ``{"task_id": "<id>", "status": "deferred",
         "planning_mode": True}`` synchronously — no ticket, no

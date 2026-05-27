@@ -128,6 +128,24 @@ async def test_add_task_then_get_returns_dto(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_add_task_status_param_creates_row_in_given_status(backend, project_root):
+    """add_task(status='deferred') lands the row directly in deferred — one INSERT."""
+    dto = await backend.add_task(
+        project_root=project_root, title='Deferred task', status='deferred',
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == 'deferred'
+
+
+@pytest.mark.asyncio
+async def test_add_task_status_defaults_to_pending(backend, project_root):
+    """Omitting status preserves the historical default of 'pending'."""
+    dto = await backend.add_task(project_root=project_root, title='Default task')
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == 'pending'
+
+
+@pytest.mark.asyncio
 async def test_add_task_increments_id(backend, project_root):
     await backend.add_task(project_root=project_root, title='one')
     await backend.add_task(project_root=project_root, title='two')

@@ -88,6 +88,7 @@ class TaskBackendProtocol(Protocol):
         priority: str | None = None,
         metadata: str | None = None,
         tag: str | None = None,
+        status: str = 'pending',
     ) -> AddTaskResult: ...
 
     async def update_task(
