@@ -712,12 +712,6 @@ def shape_burndown(
 # ---------------------------------------------------------------------------
 
 
-_EMPTY_ACCOUNTS_SUMMARY: dict[str, Any] = {
-    'total': 0,
-    'capped': 0,
-    'available': 0,
-    'capped_accounts': [],
-}
 
 
 def shape_curator(
@@ -776,7 +770,9 @@ def shape_curator(
                 'capped_now': capped_now,
                 'paused_reason': paused_reason,
                 'pending_total': pending_total,
-                'accounts_summary': dict(accounts_summary) if accounts_summary else dict(_EMPTY_ACCOUNTS_SUMMARY),
+                # Fresh literal each call — avoids sharing the mutable capped_accounts
+                # list from a module-level constant across multiple default responses.
+                'accounts_summary': dict(accounts_summary) if accounts_summary else {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []},
             },
         }
     }

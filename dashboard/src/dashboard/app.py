@@ -879,7 +879,11 @@ async def api_curator(request: Request) -> JSONResponse:
         capped_now, capped_windows = compute_capped_now_and_windows(intervals, account_count)
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
     except Exception:
-        logger.debug('curator/capped_now_and_spark computation failed', exc_info=True)
+        # Raise to WARNING so the silent capped_now=0 degrade is always visible in logs.
+        # The prior code returned capped_now=1 when any interval was open-ended; that
+        # conservative fallback would now give a false positive because the helper
+        # no longer uses any-account semantics.  WARNING is the right visibility level.
+        logger.warning('curator/capped_now_and_spark computation failed — degrading capped_now to 0', exc_info=True)
         capped_now = 0
         capped_spark = _empty_capped
 
