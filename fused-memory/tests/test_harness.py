@@ -5221,3 +5221,84 @@ async def test_non_actionable_finding_does_not_escalate_and_is_logged(
     assert non_actionable_finding['description'] in record.__dict__.get('description', ''), (
         f'Expected description in log record, got: {record.__dict__.get("description")}'
     )
+
+
+@pytest.mark.asyncio
+async def test_finding_persistence_count_matches_recent_runs_by_fingerprint(
+    journal,
+    event_buffer,
+    mock_memory_service,
+):
+    """_finding_persistence_count counts how many recent completed runs contain a finding.
+
+    Identity is determined by compute_content_fingerprint (same key as _escalate uses),
+    so two finding dicts that are identical by fingerprint but different Python objects
+    are counted as the same finding.
+
+    Seeding: three completed runs for 'test-project':
+      Run A (oldest):  items_flagged = [F1]
+      Run B (middle):  items_flagged = [F2]
+      Run C (newest):  items_flagged = [F1]
+
+    Expected with lookback=5: F1→2, F2→1
+    Expected with lookback=1: F1→1 (run C is most recent), F2→0
+    """
+    import uuid as _uuid
+    from datetime import timedelta
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    s3_findings = _make_s3_findings()
+    f1 = s3_findings[0]  # memory_stale, actionable
+    f2 = s3_findings[1]  # memory_contradiction, actionable
+
+    base_time = datetime.now(UTC)
+
+    async def _seed_run(findings, offset_seconds):
+        """Insert a completed run with an integrity_check report containing findings."""
+        run_id = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(seconds=offset_seconds),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        # Use plain dict form for stage reports so the test doesn't depend on
+        # StageReport model serialisation details
+        stage_reports = {
+            'integrity_check': {'items_flagged': findings},
+        }
+        await journal.update_run_stage_reports(run_id, stage_reports)
+        await journal.complete_run(run_id, 'completed')
+        return run_id
+
+    # Insert in ascending time order; SQL ORDER BY started_at DESC → C comes first
+    await _seed_run([f1], offset_seconds=0)    # Run A — oldest
+    await _seed_run([f2], offset_seconds=1)    # Run B — middle
+    await _seed_run([f1], offset_seconds=2)    # Run C — newest
+
+    # --- lookback=5: see all three runs
+    count_f1 = await harness._finding_persistence_count('test-project', f1, lookback=5)
+    assert count_f1 == 2, (
+        f'Expected F1 to appear in 2 of 3 recent runs, got {count_f1}'
+    )
+
+    count_f2 = await harness._finding_persistence_count('test-project', f2, lookback=5)
+    assert count_f2 == 1, (
+        f'Expected F2 to appear in 1 of 3 recent runs, got {count_f2}'
+    )
+
+    # --- lookback=1: only the most recent run (Run C, which has F1)
+    count_f1_narrow = await harness._finding_persistence_count('test-project', f1, lookback=1)
+    assert count_f1_narrow == 1, (
+        f'Expected F1 count with lookback=1 to be 1 (run C is most recent), got {count_f1_narrow}'
+    )
+
+    count_f2_narrow = await harness._finding_persistence_count('test-project', f2, lookback=1)
+    assert count_f2_narrow == 0, (
+        f'Expected F2 count with lookback=1 to be 0 (run C does not have F2), got {count_f2_narrow}'
+    )
