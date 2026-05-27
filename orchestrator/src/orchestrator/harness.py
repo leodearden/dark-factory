@@ -2028,6 +2028,33 @@ Output JSON matching the schema. Every task must appear in the output.
         except Exception:
             logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
 
+    def _resolve_watcher_outage_l2(self) -> None:
+        """Resolve the open watcher-outage L2 escalation on healthy recovery.
+
+        Called from _watcher_supervisor_loop when a healthy-clean rotation
+        completes (duration >= watcher_misconfigured_min_rotation_secs) to
+        signal to the human that the watcher is running again.
+
+        No-op when no pending L2 with root_cause='watcher_supervisor_down' exists.
+        Best-effort: failures are swallowed so the supervisor loop never breaks.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            existing_id = self._escalation_queue.find_pending_l2_by_root_cause(
+                self._WATCHER_OUTAGE_ROOT_CAUSE
+            )
+            if existing_id is None:
+                return
+            self._escalation_queue.resolve(
+                existing_id,
+                resolution='watcher recovered',
+                resolved_by='orchestrator-watcher-supervisor',
+            )
+            logger.info('Resolved watcher-outage L2 escalation %s (watcher recovered)', existing_id)
+        except Exception:
+            logger.warning('Failed to resolve watcher-outage L2 escalation', exc_info=True)
+
     def _file_restored_pause_escalation(self) -> None:
         """File the L1 for a pause restored from a prior run (deferred from run()).
 
