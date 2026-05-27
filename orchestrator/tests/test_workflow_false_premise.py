@@ -117,7 +117,11 @@ def _make_with_escalation_queue(
 
 @pytest.mark.asyncio
 async def test_escalate_to_human_uses_category(tmp_path: Path):
-    """_mark_blocked threads category='design_concern' into the L1 escalation."""
+    """_mark_blocked threads category='design_concern' into the L1 escalation.
+
+    With escalate_to_human=True the L0 is skipped (steward cannot act on it),
+    so *all* submitted escalations are L1 — verified by the broad assertion.
+    """
     f, submitted = _make_with_escalation_queue(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj'
     )
@@ -128,7 +132,12 @@ async def test_escalate_to_human_uses_category(tmp_path: Path):
 
     l1_escs = [e for e in submitted if getattr(e, 'level', None) == 1]
     assert l1_escs, 'Expected at least one L1 escalation to be submitted'
-    assert all(e.category == 'design_concern' for e in l1_escs)
+    # Every escalation (not just L1) must carry the threaded category so a
+    # future refactor cannot silently regress either site.
+    assert all(e.category == 'design_concern' for e in submitted), (
+        f'All submitted escalations must carry category=design_concern; got: '
+        f'{[(e.level, e.category) for e in submitted]}'
+    )
 
 
 @pytest.mark.asyncio
@@ -142,7 +151,37 @@ async def test_default_category_is_task_failure(tmp_path: Path):
 
     l1_escs = [e for e in submitted if getattr(e, 'level', None) == 1]
     assert l1_escs, 'Expected at least one L1 escalation to be submitted'
-    assert all(e.category == 'task_failure' for e in l1_escs)
+    assert all(e.category == 'task_failure' for e in submitted), (
+        f'All submitted escalations must carry the default category; got: '
+        f'{[(e.level, e.category) for e in submitted]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_l0_category_threading_escalate_to_human_false(tmp_path: Path):
+    """L0 creation path also carries the threaded category (steward path).
+
+    escalate_to_human=False routes through L0 creation before handing off to
+    the steward (or falling through to a final L1 when no steward is running).
+    This pins that both L0 and L1 carry the correct category so neither site
+    can silently regress in a future refactor.
+    """
+    f, submitted = _make_with_escalation_queue(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj'
+    )
+
+    await f.wf._mark_blocked(
+        'r', detail='d', escalate_to_human=False, category='design_concern'
+    )
+
+    l0_escs = [e for e in submitted if getattr(e, 'level', 0) == 0]
+    assert l0_escs, 'Expected at least one L0 escalation to be submitted'
+    # All escalations (L0 from steward path + any fall-through L1) must carry
+    # the threaded category — catches regressions at both construction sites.
+    assert all(e.category == 'design_concern' for e in submitted), (
+        f'All submitted escalations must carry category=design_concern; got: '
+        f'{[(e.level, e.category) for e in submitted]}'
+    )
 
 
 # ---------------------------------------------------------------------------

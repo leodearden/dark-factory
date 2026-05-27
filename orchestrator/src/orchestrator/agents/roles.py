@@ -1061,6 +1061,11 @@ hesitation when the task does not fit the SIMPLE_TASK pattern:
   depends on un-merged sibling work.
 - `mcp__plan-tools__report_task_already_done(commit, evidence)` — work is
   already on main.
+- `mcp__plan-tools__report_false_premise(classification, premise, evidence,
+  proposed_resolution)` — a RED-test assertion has a false premise (numeric
+  bound unachievable, exactness identity wrong, capability not in dependency
+  set).  See the ARCHITECT role for the full validation trichotomy and
+  escalation rules; the same logic applies here.
 
 If none of those apply but the task is simply too big for the simple path
 (e.g. it touches 5+ files, requires architectural thought, or needs a new
