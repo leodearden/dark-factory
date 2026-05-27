@@ -2205,6 +2205,65 @@ class TestFileWatcherOutageL2:
 
 
 # ---------------------------------------------------------------------------
+# task 1501: _resolve_watcher_outage_l2 resolves the open outage L2
+# ---------------------------------------------------------------------------
+
+class TestResolveWatcherOutageL2:
+    """_resolve_watcher_outage_l2: resolves an open outage L2 or is a no-op."""
+
+    def test_resolves_open_l2_when_present(self, tmp_path: Path) -> None:
+        """File an outage L2, then resolve it — must no longer be pending."""
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # File the outage L2
+        h._file_watcher_outage_l2('watcher_crashloop')
+        l2s_before = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s_before) == 1, 'precondition: one pending L2'
+        l2_id = l2s_before[0].id
+
+        # Resolve
+        h._resolve_watcher_outage_l2()
+
+        # Must no longer be in pending
+        l2s_after = [e for e in queue.get_pending() if e.level == 2]
+        assert len(l2s_after) == 0, (
+            f'Expected 0 pending L2s after resolve; got {l2s_after}'
+        )
+        # Must be resolved in the full queue
+        resolved = queue.get(l2_id)
+        assert resolved is not None, f'escalation {l2_id} not found in queue'
+        assert resolved.status == 'resolved', (
+            f'Expected status="resolved"; got {resolved.status!r}'
+        )
+
+    def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
+        """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        # No L2 in queue
+        pending_before = list(queue.get_pending())
+
+        # Must not raise
+        h._resolve_watcher_outage_l2()
+
+        # Queue unchanged
+        pending_after = list(queue.get_pending())
+        assert pending_after == pending_before, (
+            f'Queue should be unchanged; before={pending_before} after={pending_after}'
+        )
+
+    def test_noop_when_queue_is_none(self, tmp_path: Path) -> None:
+        """When _escalation_queue is None, _resolve_watcher_outage_l2 must be a no-op."""
+        h = Harness.__new__(Harness)
+        _init_harness_state_for_test(h)
+        h.config = OrchestratorConfig(project_root=tmp_path)
+        h._escalation_queue = None
+
+        # Must not raise
+        h._resolve_watcher_outage_l2()
+
+
+# ---------------------------------------------------------------------------
 # task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
 # ---------------------------------------------------------------------------
 
