@@ -736,6 +736,20 @@ class OrchestratorConfig(BaseSettings):
     # cascading into escalations.  See zombie-escalation fix Step 5.
     terminal_status_watcher_enabled: bool = Field(default=True)
     terminal_status_poll_interval_secs: float = Field(default=30.0)
+    # Number of consecutive terminal-status watcher polls a workflow may ignore
+    # the soft cancel_event before the watcher escalates to a hard
+    # asyncio.Task.cancel().  At the 30 s default poll interval this is ~90 s
+    # of grace before the hard-cancel fires.  Must be >= 1 so at least one
+    # soft-cancel attempt is always made before escalation.
+    terminal_status_hard_cancel_polls: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Number of consecutive terminal-status watcher polls a workflow may '
+            'ignore the soft cancel event before the watcher escalates to a hard '
+            'asyncio.Task.cancel(); at the 30s default poll this is ~90s.'
+        ),
+    )
 
     # Stranded-in-progress reconcile sweep — periodic re-run of the
     # startup ``_reconcile_stranded_in_progress`` pass during a long run.

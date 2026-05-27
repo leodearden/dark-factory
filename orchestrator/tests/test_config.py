@@ -174,6 +174,26 @@ class TestDefaults:
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
         assert field_info.default is None
 
+    def test_terminal_status_hard_cancel_polls_default(self, monkeypatch, tmp_path):
+        """terminal_status_hard_cancel_polls defaults to 3 (ITEM 2 config, step-3 RED).
+
+        At the 30 s default poll interval, threshold=3 means ~90 s of soft-cancel
+        grace before the watcher escalates to a hard asyncio.Task.cancel().
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.terminal_status_hard_cancel_polls == 3
+
+    def test_terminal_status_hard_cancel_polls_ge_1_rejects_zero(self):
+        """terminal_status_hard_cancel_polls=0 must raise ValidationError (ge=1 bound).
+
+        The watcher requires at least one soft-cancel attempt before hard-cancel
+        so a value < 1 is never valid.
+        """
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(terminal_status_hard_cancel_polls=0)
+
 
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):

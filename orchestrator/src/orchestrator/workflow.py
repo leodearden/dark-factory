@@ -493,6 +493,21 @@ class TaskWorkflow:
         - syncs per-worktree venvs unless the worktree is external
         - removes any ``.task/`` paths inherited as tracked from main
         """
+        # Pre-empt race: read live status BEFORE claiming 'in-progress'.
+        # If the task was cancelled (or otherwise terminal) out-of-band in the
+        # ~3 s window between acquire and dispatch, raise TerminalExitRejection
+        # so run()'s existing 1489 handler converts it to WorkflowOutcome.CANCELLED
+        # without an 'in-progress' write, no escalation, and no reopen.
+        # A None / get_status failure is not in TERMINAL_STATUSES → fall through.
+        live_status = await self.scheduler.get_status(self.task_id)
+        if live_status in TERMINAL_STATUSES:
+            raise TerminalExitRejection(
+                task_id=self.task_id,
+                old_status=live_status,
+                target_status='in-progress',
+                raw='preempt: task terminal at dispatch',
+            )
+
         await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
         # Create worktree (captures base commit for stable diffs).
@@ -1062,14 +1077,47 @@ class TaskWorkflow:
             return await self._mark_blocked(reason, detail=detail)
 
         except SetTaskStatusRejected as exc:
-            # Fast-path: an authoritative user/manual cancellation arrived
-            # out-of-band before setup completed.  Release locks (via the
-            # finally block) and exit gracefully — no reopen, no escalation,
-            # no phase transition to BLOCKED.
+            # Fast-path: a terminal-status rejection arrived out-of-band before
+            # setup completed (either from the pre-empt live-status read or from
+            # set_task_status('in-progress') itself).  Route through the same
+            # bypass-discrimination helpers 1489 introduced for mid-flight aborts:
+            # - 'cancelled'  → CANCELLED, no reopen, no escalation (sub-case 0).
+            # - 'done', provenance on main  → DONE, no escalation (legitimate done).
+            # - 'done', provenance missing / off-main  → reopen + L1 bypass_done +
+            #   BLOCKED (bypass detected).
+            # Only non-TerminalExitRejection subclasses (rare persistence errors)
+            # fall through to the 'unhandled rejection' L1 path below.
             if isinstance(exc, TerminalExitRejection):
-                outcome = self._handle_cancelled_terminal_exit(exc)
-                if outcome is not None:
-                    return outcome
+                cancelled_outcome = self._handle_cancelled_terminal_exit(exc)
+                if cancelled_outcome is not None:
+                    return cancelled_outcome
+
+                # Not 'cancelled' (must be 'done' given TERMINAL_STATUSES).
+                # Reuse the bypass-discrimination helper: returns BLOCKED when a
+                # bypass is detected (reopen + bypass_done L1 already filed), or
+                # None when provenance is legitimate (commit reachable from main).
+                bypass_outcome = await self._handle_terminal_exit_on_block(
+                    exc,
+                    reason=(
+                        f'terminal at dispatch (old_status={exc.old_status!r})'
+                    ),
+                    detail='preempt: task terminal at dispatch',
+                )
+                if bypass_outcome is not None:
+                    # Bypass done detected — helper already reopened the row and
+                    # filed an L1 with category='bypass_done'.
+                    return bypass_outcome
+
+                # Legitimate done: provenance commit is reachable from main.
+                # The row is already terminal-done out-of-band (e.g. a human
+                # marked done during the ~3s acquire→dispatch window). Accept it.
+                logger.info(
+                    'Task %s: already legitimately done at dispatch (old_status=%r) '
+                    '— accepting, no reopen, no escalation',
+                    self.task_id, exc.old_status,
+                )
+                self._enter_phase(WorkflowState.DONE)
+                return WorkflowOutcome.DONE
 
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
