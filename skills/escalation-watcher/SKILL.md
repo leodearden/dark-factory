@@ -57,7 +57,7 @@ This skill drains and waits only on **level-2 escalations**. Both the watcher su
 - **L0** is owned by per-task stewards — do not drain or handle L0 escalations here.
 - **L1** is owned by escalation-watcher-auto — do not drain or handle L1 escalations here.
 
-Never process L0 or L1 from this skill, even if explicitly asked — if the user wants to handle lower-level escalations, they should invoke the appropriate skill for that level.
+Never process L0 or L1 from this skill, even if explicitly asked — doing so would race with the per-task steward and escalation-watcher-auto, which own those queues and rely on their own resolution callbacks. If the user wants to handle lower-level escalations, they should invoke the appropriate skill for that level.
 
 ### Starting the watcher
 
@@ -122,10 +122,14 @@ It is better to stall development than to bake in a significant bad decision.
 
 ## Handling Escalations by Category
 
-For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. At level-2, interpret it through this lens:
+For every escalation, read the `suggested_action` field. It's a free-text hint — sometimes a conventional verb, sometimes natural language. First determine the escalation's **L2 origin**, then interpret the hint accordingly:
 
+**Born-at-L2** (severity `critical` or `urgent` at creation — bypassed L0 and L1 entirely):
+Neither the per-task steward nor the auto-watcher has seen this record. Read `suggested_action` as the originating agent's own annotation — a starting point, not evidence of prior triage. `investigate_and_retry` here means what it says: a retry may well succeed since no automated attempt has been made yet.
+
+**Promoted-from-L1** (the auto-watcher attempted resolution and escalated to human):
 - **`manual_intervention`** — The auto-watcher explicitly gave up. This is authoritative: the issue genuinely needs human judgment. Always respect it.
-- **`investigate_and_retry`** — Misleading at level-2. The item has already passed through *both* the per-task steward (L0) *and* the auto-watcher (L1) and persisted through their combined triage and retry budgets. Treat as a deeply persistent problem, not transient. Don't just retry.
+- **`investigate_and_retry`** — Misleading for promoted items. The item has already passed through *both* the per-task steward (L0) *and* the auto-watcher (L1) and persisted through their combined triage and retry budgets. Treat as a deeply persistent problem, not transient. Don't just retry.
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
 
@@ -417,6 +421,8 @@ The `resolution` text matters — for `terminate=false`, it's injected directly 
 For `terminate=true` (dismiss), the resolution is recorded for audit but the task is abandoned. The task can be rescheduled later.
 
 **L2 cluster cascade:** when a resolved L2 represents a causal cluster (multiple member L1 escalations grouped by the auto-watcher), resolving the L2 here cascades to close its L1 members via the escalation server — this skill resolves only the L2 itself, never each member directly. For design details, see `plans/escalation-l2-tiering.md`. Note: the cascade activates once the server-side `promote_to_l2` mechanic (E2) is shipped; prior to that, only the L2 itself closes — the behaviour of this skill is unchanged either way.
+
+**Transition period (until E2 ships):** L1 clustering by the auto-watcher is not yet active. Multiple simultaneous L2 escalations may share a common root cause without being packaged as a named cluster. When you see more than one L2 pending, scan them for shared files, summaries, or task IDs — if they share a root cause, handle them together and note the relationship in your resolution text.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
