@@ -97,6 +97,86 @@ A hypothesis is a **stable, human-readable string** you will pass as `root_cause
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
 
+## Promote to L2
+
+Use `mcp__escalation__promote_to_l2` whenever an escalation (or cluster of escalations) requires human judgment. This replaces leaving items pending at L1.
+
+### Call shape
+
+```python
+result = mcp__escalation__promote_to_l2(
+    task_id="<first member's task_id>",   # used for id generation
+    agent_role="escalation-watcher-auto",
+    member_ids=["esc-XX-N", ...],         # L1 escalation ids in this cluster
+    root_cause="<stable-dedup-key>",      # see Hypothesis formation above
+    evidence="<supporting context>",      # stored in the L2's detail field
+    options=["A: ...", "B: ...", "C: ...", "D: something else"],
+    summary="<one-line cluster hypothesis>",
+    category="<category>",                # e.g. "infra_issue", "design_concern"
+    severity="blocking",                  # default; use "critical" for urgent
+)
+# result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...]}
+```
+
+### Case A — single judgement-class item (1-member L2)
+
+When a single escalation requires human judgment and there is no evidence of a common cause with other pending items:
+
+```python
+result = mcp__escalation__promote_to_l2(
+    task_id=escalation["task_id"],
+    agent_role="escalation-watcher-auto",
+    member_ids=[escalation["id"]],
+    root_cause="<category>:<task_id>:<brief-slug>",
+    evidence=escalation["detail"] or escalation["summary"],
+    options=["A: investigate and retry", "B: terminate and reschedule", "C: something else"],
+    summary=escalation["summary"],
+    category=escalation["category"],
+)
+```
+
+Add to digest: `PROMOTED (L2 <result['id']>): <category> — <task_id> — <summary>`
+
+### Case B — causal cluster (multiple members)
+
+When RCA identifies a shared root cause across two or more L1 escalations, file **one L2** covering all members:
+
+```python
+result = mcp__escalation__promote_to_l2(
+    task_id=members[0]["task_id"],        # first member's task_id
+    agent_role="escalation-watcher-auto",
+    member_ids=[m["id"] for m in members],
+    root_cause="<stable-hypothesis-key>", # e.g. "bad-merge-to-main-breaks-scheduler"
+    evidence=(
+        "Tasks affected: <task_ids>. "
+        "Shared symptom: <description>. "
+        "Supporting git evidence: <commit/diff summary>."
+    ),
+    options=[
+        "A: <concrete resolution path>",
+        "B: <alternative resolution path>",
+        "C: <third option if applicable>",
+        "D: something else",
+    ],
+    summary="Cluster: <brief hypothesis — what is forming around what>",
+    category="<dominant category>",
+)
+```
+
+Clusters are **causal, not superficial** — members need not share category or error signature; the common factor is the hypothesized underlying cause.
+
+Add to digest: `PROMOTED cluster (L2 <result['id']>): <root_cause> — <N> members: [<ids>]`
+
+### One-evolving-L2-per-root-cause (dedup)
+
+Pass the same `root_cause` string for escalations that share a hypothesis. The server deduplicates:
+- `status: 'created'` — new L2 was filed
+- `status: 'updated'` — an existing pending L2 with the same `root_cause` was updated (new members appended)
+
+**Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly.
+
+Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent.
+
 ## Main Loop
 
 ```
