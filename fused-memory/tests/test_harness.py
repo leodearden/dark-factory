@@ -5507,3 +5507,158 @@ async def test_unresolved_after_remediation_escalates_when_persistence_meets_thr
         f'Expected dedupe_fingerprint == {expected_fp!r}, '
         f'got: {esc.dedupe_fingerprint!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_non_actionable_finding_from_remediation_pass_is_never_escalated_even_at_threshold(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """Non-actionable findings from the remediation pass must never reach the
+    persistence-gated escalation branch, even when their recurrence exceeds threshold.
+
+    Regression test for design_inconsistency review finding: the persistence-gated
+    escalation loop in _run_remediation_pass must not be reachable by non-actionable
+    findings regardless of how many cycles they persist.
+
+    Setup:
+    - Pre-seed THRESHOLD+1 completed runs containing non-actionable finding F so that
+      if the filter were absent, persistence would meet/exceed the threshold and the
+      bug would fire.
+    - Parent S3 returns both an actionable A (to trigger remediation) and F together.
+    - Remediation S3 returns only [F] (still 'unresolved' but non-actionable).
+
+    Asserts:
+    (a) No 'Persistently unresolved after remediation' escalation for F.
+    (b) caplog has 'reconciliation.non_actionable_integrity_finding' from the
+        remediation pass (finding_category='systemic_pattern', F description).
+    (c) No 'reconciliation.unresolved_after_remediation_suppressed' record for F —
+        the non-actionable branch must NOT reach the persistence-gated suppression
+        log either, because it is filtered out before the persistence-count call.
+
+    This test FAILS on the unfixed code (which would escalate F once persistence
+    meets threshold) and PASSES after the step-10 fix.
+
+    Task 1512 / plans/afk-A7-recon-closure.md / design_inconsistency review finding.
+    """
+    import uuid as _uuid
+    from datetime import timedelta
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # F is non-actionable (systemic_pattern); A is actionable (memory_stale)
+    s3_findings = _make_s3_findings()
+    actionable_a = s3_findings[0]    # category='memory_stale', actionable=True
+    non_actionable_f = s3_findings[2]  # category='systemic_pattern', actionable=False
+    assert actionable_a['actionable'] is True
+    assert non_actionable_f['actionable'] is False
+    assert non_actionable_f['category'] == 'systemic_pattern'
+
+    # Pre-seed THRESHOLD+1 completed runs containing F so that — if the filter were
+    # missing — persistence would reach/exceed the threshold and _escalate would fire.
+    n_seed = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD + 1
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 2)
+    for i in range(n_seed):
+        run_id = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(run_id, {
+            'integrity_check': {'items_flagged': [non_actionable_f]},
+        })
+        await journal.complete_run(run_id, 'completed')
+
+    # Push one event for the current cycle
+    await event_buffer.push(_make_event())
+
+    # S3 call counter: call 1 = parent pass (returns [A, F]), call 2 = remediation pass (returns [F])
+    call_count = {'s3': 0}
+
+    async def s3_returns_by_call(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        call_count['s3'] += 1
+        if call_count['s3'] == 1:
+            # Parent pass: return both actionable A and non-actionable F to trigger remediation
+            items = [actionable_a, non_actionable_f]
+        else:
+            # Remediation pass: return only non-actionable F (still 'unresolved')
+            items = [non_actionable_f]
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items,
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])  # S1: always empty
+    _mock_stage_run(harness.stages[1])  # S2: always empty
+    harness.stages[2].run = s3_returns_by_call
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # S3 must have been called twice (parent + remediation)
+    assert call_count['s3'] == 2, (
+        f'Expected S3 called twice (parent + remediation), got {call_count["s3"]}'
+    )
+
+    # (a) No 'Persistently unresolved after remediation' escalation for F
+    pending = esc_queue.get_pending()
+    f_desc = non_actionable_f['description']
+    persistent_for_f = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+        and f_desc in e.summary
+    ]
+    assert persistent_for_f == [], (
+        f'Expected no "Persistently unresolved" escalation for non-actionable F, '
+        f'got: {[e.summary for e in persistent_for_f]}'
+    )
+
+    # (b) caplog must contain a 'reconciliation.non_actionable_integrity_finding' record
+    # from the remediation pass (second S3 call returned [F], so _run_remediation_pass
+    # must have emitted this log after the step-10 fix)
+    non_actionable_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.non_actionable_integrity_finding'
+        and r.__dict__.get('finding_category') == 'systemic_pattern'
+        and f_desc in r.__dict__.get('description', '')
+    ]
+    assert len(non_actionable_records) >= 1, (
+        f'Expected at least one "reconciliation.non_actionable_integrity_finding" record '
+        f'with finding_category="systemic_pattern" and description containing {f_desc!r}, '
+        f'got records: {[(r.getMessage(), r.__dict__.get("finding_category"), r.__dict__.get("description")) for r in caplog.records]}'
+    )
+
+    # (c) No 'reconciliation.unresolved_after_remediation_suppressed' record for F —
+    # non-actionable findings must be filtered OUT before the persistence-count call
+    # and must NOT appear in the suppression log (which is for actionable findings only)
+    suppressed_for_f = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.unresolved_after_remediation_suppressed'
+        and f_desc in r.__dict__.get('description', '')
+    ]
+    assert suppressed_for_f == [], (
+        f'Expected NO "reconciliation.unresolved_after_remediation_suppressed" record for '
+        f'non-actionable F (it should be filtered before the persistence-count call), '
+        f'got: {[(r.__dict__.get("description"), r.__dict__.get("finding_category")) for r in suppressed_for_f]}'
+    )
