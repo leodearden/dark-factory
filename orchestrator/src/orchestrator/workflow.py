@@ -193,6 +193,7 @@ class WorkflowOutcome(enum.Enum):
     BLOCKED = 'blocked'
     REQUEUED = 'requeued'
     ESCALATED = 'escalated'
+    CANCELLED = 'cancelled'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
@@ -4280,16 +4281,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Detect ``update_task(status='done')`` bypass after a terminal-exit rejection.
 
         When ``set_task_status('blocked')`` raises ``TerminalExitRejection``
-        the row is already terminal. Two sub-cases:
+        the row is already terminal. Three sub-cases, branching on ``exc.old_status``:
 
-        1. Legitimate done — ``metadata.done_provenance.commit`` is reachable
-           from main. Return ``None`` so the existing flow continues; the
+        0. Cancelled (``old_status == 'cancelled'``) — a user/manual cancellation
+           landed out-of-band. This is authoritative; the workflow must NOT reopen
+           the row or file any escalation. Log an info line and return
+           ``WorkflowOutcome.CANCELLED`` immediately (before any ``get_task``
+           round-trip or provenance read).
+        1. Legitimate done (``old_status == 'done'``, provenance commit reachable
+           from main) — return ``None`` so the existing flow continues; the
            post-steward branch at ``current == 'done'`` returns DONE.
-        2. Bypass — provenance missing or commit not on main. Reopen the row
-           via ``set_task_status('blocked', reopen_reason='bypass detected: …')``
-           (which the server accepts), file an L1 with
-           ``category='bypass_done'``, and return ``WorkflowOutcome.BLOCKED``.
+        2. Bypass (``old_status == 'done'``, provenance missing or commit not on
+           main) — reopen the row via
+           ``set_task_status('blocked', reopen_reason='bypass detected: …')``,
+           file an L1 with ``category='bypass_done'``, and return
+           ``WorkflowOutcome.BLOCKED``.
         """
+        # Sub-case 0: authoritative user/manual cancellation — abort gracefully.
+        if exc.old_status == 'cancelled':
+            logger.info(
+                'Task %s: cancelled out-of-band; aborting gracefully '
+                '(no reopen, no escalation)',
+                self.task_id,
+            )
+            return WorkflowOutcome.CANCELLED
+
         task = await self.scheduler.get_task(self.task_id)
         # Scheduler.get_task normalises task['metadata'] to a dict at the
         # boundary (via _normalize_task_metadata) so we can read it directly.
