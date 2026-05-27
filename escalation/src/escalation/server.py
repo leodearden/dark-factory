@@ -413,7 +413,9 @@ def create_server(
             Escalation category; defaults to ``'design_concern'``.
         severity:
             Severity tag; defaults to ``'blocking'``.  Decoupled from
-            ``level=2`` — the tool sets ``level=2`` explicitly.
+            ``level=2`` — the tool sets ``level=2`` explicitly.  Must be one
+            of ``models.KNOWN_SEVERITIES``; unknown values return
+            ``{'error': ...}`` (mirrors ``escalate_blocker`` validation).
 
         Response shapes
         ---------------
@@ -434,18 +436,36 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
+        if severity not in KNOWN_SEVERITIES:
+            return {
+                'error': (
+                    f'invalid severity {severity!r}; '
+                    f'expected one of {sorted(KNOWN_SEVERITIES)}'
+                ),
+            }
 
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
-            updated = queue.add_members_to_l2(existing_id, list(member_ids))
-            return {
-                'id': existing_id,
-                'status': 'updated',
-                'members': updated.members if updated else [],
-            }
+            updated = queue.add_members_to_l2(existing_id, list(dict.fromkeys(member_ids)))
+            if updated is not None:
+                return {
+                    'id': existing_id,
+                    'status': 'updated',
+                    'members': updated.members,
+                }
+            # Race: the pending L2 was resolved/archived between find and update.
+            # Fall through to the create path so the caller gets a valid result
+            # rather than a misleading {'status': 'updated', 'members': []}.
+            logger.warning(
+                'promote_to_l2: pending L2 %s disappeared during member-update (race); '
+                'creating a new L2 for root_cause=%r',
+                existing_id, root_cause,
+            )
 
         # Create path: build a fresh L2 and submit it.
+        # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
+        # do not create duplicate entries in the on-disk record.
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,
@@ -455,7 +475,7 @@ def create_server(
             summary=summary,
             detail=evidence,
             level=2,
-            members=list(member_ids),
+            members=list(dict.fromkeys(member_ids)),
             root_cause=root_cause.strip(),
             options=list(options),
         )

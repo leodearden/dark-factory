@@ -608,6 +608,99 @@ class TestPromoteToL2Create:
         assert 'error' in result, f'Expected error for whitespace root_cause, got: {result}'
         assert len(queue.get_pending()) == 0, 'Nothing should be queued on error'
 
+    @pytest.mark.asyncio
+    async def test_invalid_severity_returns_error(self, tmp_path: Path):
+        """Suggestion-1: unknown severity returns {'error': ...} and nothing is queued.
+
+        Unlike escalate_blocker/escalate_info, promote_to_l2 previously lacked
+        this guard.  A misconfigured caller (e.g. severity='CRITICAL' due to
+        case error, or severity='warn') would silently create an L2 with an
+        arbitrary severity tag.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': 'CRITICAL'},
+        )
+
+        assert 'error' in result, (
+            f"Expected error for unknown severity 'CRITICAL' (case-sensitive gate), got: {result}"
+        )
+        assert len(queue.get_pending()) == 0, 'Nothing should be queued when severity is invalid'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['CRITICAL', 'Urgent', 'warn', 'INFO', 'BLOCKING'])
+    async def test_known_severity_variants_are_rejected(self, tmp_path: Path, severity: str):
+        """Suggestion-1: severity gate is case-sensitive; mixed-case/unknown values rejected."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': severity},
+        )
+
+        assert 'error' in result, (
+            f"Expected error for severity={severity!r} (case-sensitive gate), got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_known_severities_accepted(self, tmp_path: Path):
+        """Suggestion-1: all KNOWN_SEVERITIES values are accepted by promote_to_l2."""
+        from escalation.models import KNOWN_SEVERITIES
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        for sev in KNOWN_SEVERITIES:
+            result = await _promote_to_l2(
+                server,
+                task_id=f'task-{sev}',
+                agent_role='watcher',
+                member_ids=[f'esc-l1-{sev}'],
+                root_cause=f'root cause for {sev}',
+                evidence='e',
+                options=['A'],
+                summary='s',
+                severity=sev,
+            )
+            assert 'error' not in result, (
+                f"Known severity {sev!r} should be accepted, got error: {result}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_member_ids_in_create_path_are_deduplicated(self, tmp_path: Path):
+        """Suggestion-3: duplicate member_ids in the create path produce a single entry.
+
+        Passing member_ids=['a', 'a', 'b'] must result in members=['a', 'b'] on
+        the on-disk record — the create path must apply dict.fromkeys dedup.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-1', 'esc-l1-1', 'esc-l1-2'],
+                'root_cause': 'dedup create test',
+            },
+        )
+
+        assert result['status'] == 'created'
+        assert result['members'].count('esc-l1-1') == 1, (
+            f"Duplicate 'esc-l1-1' must appear once, got members={result['members']}"
+        )
+        assert 'esc-l1-2' in result['members']
+        assert len(result['members']) == 2, f"Expected 2 unique members, got {result['members']}"
+
+        # Verify durability: on-disk record also has deduped members
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.members.count('esc-l1-1') == 1
+        assert len(esc.members) == 2
+
 
 # ---------------------------------------------------------------------------
 # TestPromoteToL2Dedup: dedup / update path
@@ -754,6 +847,43 @@ class TestPromoteToL2Dedup:
             f"Expected 'created' (resolved L2 should not block new one): {second}"
         )
         assert second['id'] != first['id'], 'New L2 must have a different id'
+
+    @pytest.mark.asyncio
+    async def test_race_archived_l2_falls_through_to_create(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Suggestion-2: when add_members_to_l2 returns None (race — L2 archived between
+        find and update), the tool falls through to create a new L2 rather than returning
+        a misleading {'status': 'updated', 'members': []}.
+
+        The race: find_pending_l2_by_root_cause returns a stale id (L2 was pending
+        at scan time), but by the time add_members_to_l2 runs the L2 has been
+        resolved/archived and the queue root file is gone — so add_members_to_l2
+        returns None.  The correct response is to create a fresh L2 (status='created')
+        rather than lying to the caller.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        # Simulate the race via monkeypatching:
+        # find_pending_l2_by_root_cause returns a stale id,
+        # but add_members_to_l2 returns None (archived between calls).
+        monkeypatch.setattr(queue, 'find_pending_l2_by_root_cause', lambda rc: 'esc-stale-id')
+        monkeypatch.setattr(queue, 'add_members_to_l2', lambda esc_id, ids: None)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+
+        # Must NOT return {'status': 'updated', 'members': []}  — that was the bug.
+        assert result.get('status') == 'created', (
+            f"Expected 'created' on race fallthrough, got: {result}"
+        )
+        assert 'id' in result
+        assert result['id'] != 'esc-stale-id', (
+            'New L2 must have a different id from the stale one'
+        )
+        assert result['members'] == ['esc-l1-1']
 
 
 # ---------------------------------------------------------------------------
