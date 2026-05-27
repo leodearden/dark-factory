@@ -775,3 +775,69 @@ def test_curator_endpoint_paused_reason_none_when_helper_offline(tmp_path: Path)
     assert state['paused_reason'] is None, (
         f'Expected paused_reason=None when gate helper offline; got {state["paused_reason"]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task-1510): shape_curator accounts_summary kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_shape_curator_passes_accounts_summary():
+    """shape_curator propagates accounts_summary kwarg into the state dict.
+
+    RED baseline: shape_curator does not accept accounts_summary -> TypeError.
+    """
+    from dashboard.data.redux_api import shape_curator
+
+    curator_sparks = {
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+        'pending': {'labels': [], 'values': []},
+    }
+    capped_spark = {'labels': [], 'values': []}
+    accounts_summary = {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a']}
+
+    result = shape_curator(
+        pending=[],
+        curator_sparks=curator_sparks,
+        capped_spark=capped_spark,
+        capped_now=0,
+        paused_reason=None,
+        pending_total=0,
+        accounts_summary=accounts_summary,
+    )
+
+    assert 'CURATOR_STATE' in result
+    state = result['CURATOR_STATE']['state']
+    assert state['accounts_summary'] == {'total': 3, 'capped': 1, 'available': 2, 'capped_accounts': ['a']}, (
+        f'Expected accounts_summary to flow through shape_curator, got {state.get("accounts_summary")!r}'
+    )
+
+
+def test_shape_curator_default_accounts_summary():
+    """Omitting accounts_summary kwarg yields the empty default dict."""
+    from dashboard.data.redux_api import shape_curator
+
+    curator_sparks = {
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+        'pending': {'labels': [], 'values': []},
+    }
+    capped_spark = {'labels': [], 'values': []}
+
+    result = shape_curator(
+        pending=[],
+        curator_sparks=curator_sparks,
+        capped_spark=capped_spark,
+        capped_now=0,
+        paused_reason=None,
+        pending_total=0,
+        # accounts_summary deliberately omitted
+    )
+
+    state = result['CURATOR_STATE']['state']
+    assert state['accounts_summary'] == {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}, (
+        f'Expected default empty accounts_summary when kwarg omitted, got {state.get("accounts_summary")!r}'
+    )
