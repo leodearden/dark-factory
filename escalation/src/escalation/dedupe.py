@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 import hashlib
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
