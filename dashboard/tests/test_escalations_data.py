@@ -650,20 +650,32 @@ class TestResolveOwningProjectPrefixRegression:
         )
 
     def test_dot_worktrees_archive_suffix_does_not_false_match(self, tmp_path):
-        """Worktree under .worktrees-archive must NOT match the .worktrees form.
+        """A sibling dir named .worktrees-archive must NOT match a root named .worktrees.
 
-        Pre-fix bug: ``str(root/'.worktrees-archive'/'42').startswith(
-        str(root/'.worktrees'))`` is True because the raw strings share a prefix.
+        The root here is ``projA/.worktrees`` (the worktrees directory itself).
+        Its sibling ``projA/.worktrees-archive`` shares the string prefix
+        ``.../projA/.worktrees`` but is NOT a child of root — it is a sibling.
+
+        Pre-fix bug: ``str(projA/'.worktrees-archive'/'42').startswith(
+        str(projA/'.worktrees'))`` is True because the raw string
+        ``.worktrees-archive`` starts with ``.worktrees``.
+
+        Post-fix: ``Path(...).is_relative_to(Path(projA/'.worktrees'))`` is False
+        because ``.worktrees-archive`` is a different path component from ``.worktrees``.
         """
         from dashboard.data.escalations import resolve_owning_project
 
         proj_a = tmp_path / 'projA'
-        roots = [(proj_a, [])]
+        # The ROOT is the .worktrees dir itself — the path to resolve against.
+        worktrees_root = proj_a / '.worktrees'
+        roots = [(worktrees_root, [])]
 
+        # Sibling of worktrees_root: .worktrees-archive (same level, different name).
+        # Its name string-starts-with ".worktrees" but it is NOT under worktrees_root.
         wt = str(proj_a / '.worktrees-archive' / '42')
         esc = _esc('esc-reg-3', task_id='42', worktree=wt)
         result = resolve_owning_project(esc, roots)
         assert result is None, (
             f"Expected None but got {result!r} — "
-            ".worktrees-archive false-matched .worktrees prefix"
+            ".worktrees-archive false-matched .worktrees root via string prefix"
         )

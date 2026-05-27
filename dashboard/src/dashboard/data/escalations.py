@@ -75,9 +75,15 @@ def resolve_owning_project(
     worktree = esc.get('worktree') or ''
 
     # Pass 1: worktree prefix matching
+    # Use Path.is_relative_to (Python ≥ 3.9) rather than raw str.startswith to
+    # avoid false positives where a sibling root name is a string-prefix of
+    # another (e.g. "workspace" matching ".../workspace-2/...") or where a
+    # sibling directory suffix causes a false ".worktrees-archive" → ".worktrees"
+    # match.  is_relative_to compares path *components*, not raw characters.
     if worktree:
+        wt = Path(worktree)
         for root, _task_map in roots:
-            if worktree.startswith(str(root)) or worktree.startswith(str(root / '.worktrees')):
+            if wt.is_relative_to(root) or wt.is_relative_to(root / '.worktrees'):
                 return root.name
 
     # Pass 2: task-map probe
