@@ -1,6 +1,29 @@
-# AFK A8: Wire fused-memory recon to orchestrator escalation MCP via HTTP (paused — gated on A7)
+# AFK A8: Wire fused-memory recon to orchestrator escalation MCP via HTTP — CANCELLED 2026-05-26
 
 ## Status
+
+**CANCELLED.** A8's entire premise — that fused-memory's recon harness needs an HTTP client to reach
+the *orchestrator's* escalation MCP (8102/8100) in order to close escalations — was based on a
+misunderstanding of where recon escalations live. The 2026-05-26 A7 re-investigation (see
+`afk-A7-recon-closure.md`) established:
+
+- Recon files its escalations into its **own** in-process `EscalationQueue` at
+  `data/reconciliation/escalations/` (port 8103), NOT the orchestrator's queue. Closure is therefore
+  a direct in-process `self._escalation_queue.resolve(...)` call — **no HTTP, no cross-process
+  transport, no port mapping**.
+- A watcher consuming 8103 connects as an ordinary MCP client (point its `.mcp.json` `escalation`
+  server at 8103); fused-memory itself never needs to originate HTTP calls to the orchestrator.
+
+The re-scoped A7 (deterministic dedup + backfill + in-process staleness closure + a 8103 watcher)
+needs nothing from A8. The original plan below is retained only as a record of the abandoned approach.
+
+> If a future design deliberately *routes* recon findings into the orchestrator queue (so they surface
+> on the orch dashboard / are handled by the orch escalation-watcher), an HTTP client like A8 would
+> become relevant again — but that was explicitly NOT the chosen A7 direction.
+
+---
+
+## (Superseded) original status note
 
 **Paused.** A8 is the HTTP transport for A7's closure wiring. A7 was paused on 2026-05-15 pending investigation into the actual problem (5,315 actionable findings sit dormant in `stage_reports` without escalations; see afk-A7-recon-closure.md). With no A7 consumer, A8 has no caller. Revisit when A7 scope is settled.
 
