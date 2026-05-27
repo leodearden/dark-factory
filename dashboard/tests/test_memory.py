@@ -641,7 +641,7 @@ class TestGetCuratorState:
     @pytest.mark.asyncio
     async def test_get_curator_state_returns_offline_dict_when_all_urls_fail(self):
         """Helper returns offline dict and calls mcp_tool_call once per URL on failure."""
-        from unittest.mock import AsyncMock, call, patch
+        from unittest.mock import AsyncMock, patch
 
         from dashboard.data.memory import get_curator_state
 

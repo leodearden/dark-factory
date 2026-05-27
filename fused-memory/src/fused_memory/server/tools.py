@@ -30,12 +30,13 @@ from fused_memory.utils.validation import (
 )
 
 if TYPE_CHECKING:
+    from shared.usage_gate import UsageGate
+
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.services.write_journal import WriteJournal
-    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 

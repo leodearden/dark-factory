@@ -739,9 +739,9 @@ def test_curator_endpoint_flows_paused_reason_from_mcp(tmp_path: Path):
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
         patch('dashboard.app.memory_data.get_curator_state',
               new=AsyncMock(return_value=curator_state_payload)),
+        _override_client(config) as client,
     ):
-        with _override_client(config) as client:
-            resp = client.get('/api/v2/dashboard/curator')
+        resp = client.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     data = resp.json()
@@ -765,9 +765,9 @@ def test_curator_endpoint_paused_reason_none_when_helper_offline(tmp_path: Path)
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_tickets)),
         patch('dashboard.app.memory_data.get_curator_state',
               new=AsyncMock(return_value=offline_payload)),
+        _override_client(config) as client,
     ):
-        with _override_client(config) as client:
-            resp = client.get('/api/v2/dashboard/curator')
+        resp = client.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     data = resp.json()

@@ -18,7 +18,6 @@ from shared.usage_gate import UsageGate
 
 from fused_memory.server.tools import create_mcp_server
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -71,6 +70,7 @@ class TestGetCuratorStateLiveGate:
         db_path = tmp_path / 'curator_events.db'
         store = CostStore(db_path)
         await store.open()
+        gate: UsageGate | None = None
         try:
             acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
             config = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -102,8 +102,9 @@ class TestGetCuratorStateLiveGate:
                 'account_count': 1,
             }, f'Unexpected result: {result!r}'
         finally:
-            pending = list(gate._background_tasks)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            await gate.shutdown()
+            if gate is not None:
+                pending = list(gate._background_tasks)
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                await gate.shutdown()
             await store.close()
