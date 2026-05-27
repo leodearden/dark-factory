@@ -342,6 +342,10 @@ class TicketJanitor:
                             logger.exception(
                                 'ticket_janitor: _surface_probe_defect raised for %s', pid,
                             )
+                else:
+                    # Probe returned cleanly — reset consecutive-failure counter so
+                    # intermittent blips never accumulate toward the threshold.
+                    self._probe_failures.pop(pid, None)
                 if not alive:
                     try:
                         n = await self._store.mark_pending_failed_for_project(
