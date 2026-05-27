@@ -7,12 +7,13 @@ import contextlib
 import json
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
+from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.usage_gate import InvokeSlot
@@ -122,17 +123,26 @@ def mock_briefing():
     return briefing
 
 
-@pytest.fixture
-def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
+def _build_steward(worktree, config, mcp, briefing, escalation_queue):
+    """Shared factory used by both `steward` and `steward_with_real_queue` fixtures.
+
+    Centralises TaskSteward construction so that if new required constructor
+    parameters are added later, only this one place needs updating.
+    """
     return TaskSteward(
         task_id='42',
         task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
         worktree=worktree,
-        config=mock_config,
-        mcp=mock_mcp,
-        escalation_queue=mock_queue,
-        briefing=mock_briefing,
+        config=config,
+        mcp=mcp,
+        escalation_queue=escalation_queue,
+        briefing=briefing,
     )
+
+
+@pytest.fixture
+def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
+    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, mock_queue)
 
 
 def _make_result(
@@ -2509,15 +2519,7 @@ def steward_with_real_queue(tmp_path, worktree, mock_config, mock_mcp, mock_brie
     on-disk write location (queue root vs archive) can be directly asserted.
     """
     real_queue = EscalationQueue(tmp_path / 'escalations')
-    return TaskSteward(
-        task_id='42',
-        task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
-        worktree=worktree,
-        config=mock_config,
-        mcp=mock_mcp,
-        escalation_queue=real_queue,
-        briefing=mock_briefing,
-    )
+    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, real_queue)
 
 
 class TestPatchResolutionMetadataDefect2:
@@ -2547,7 +2549,7 @@ class TestPatchResolutionMetadataDefect2:
         assert not (queue.queue_dir / 'esc-42-7.json').exists(), (
             'queue root must be empty after resolve() archives the file'
         )
-        archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-7.json'))
+        archive_files = list((queue.queue_dir / archive.ARCHIVE_SUBDIR).rglob('esc-42-7.json'))
         assert len(archive_files) == 1, 'exactly one archive copy must exist after resolve()'
         archived_data = json.loads(archive_files[0].read_text())
         assert archived_data['resolved_by'] is None, (
@@ -2564,7 +2566,7 @@ class TestPatchResolutionMetadataDefect2:
             'into the queue root (should have updated the archive copy in place)'
         )
         # Post-condition (b): archive still has exactly one copy (no duplication).
-        post_archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-7.json'))
+        post_archive_files = list((queue.queue_dir / archive.ARCHIVE_SUBDIR).rglob('esc-42-7.json'))
         assert len(post_archive_files) == 1, 'archive must still have exactly one copy'
         # Post-condition (c): archive copy carries the patched fields.
         patched = json.loads(post_archive_files[0].read_text())
@@ -2584,10 +2586,13 @@ class TestPatchResolutionMetadataDefect2:
             id='esc-42-1', status='resolved', resolved_by=None
         )
         steward._patch_resolution_metadata('esc-42-1', _make_result(turns=7))
-        steward.escalation_queue.patch_resolution_metadata.assert_called_once_with(
-            'esc-42-1', resolved_by='steward', resolution_turns=7
-        )
-        steward.escalation_queue._rewrite.assert_not_called()
+        # Assert the FULL method call list — this positively verifies which methods
+        # were called AND implicitly confirms _rewrite (or any other unwanted private
+        # method) was NOT called, which is stronger than a bare _rewrite.assert_not_called().
+        assert steward.escalation_queue.method_calls == [
+            call.get('esc-42-1'),
+            call.patch_resolution_metadata('esc-42-1', resolved_by='steward', resolution_turns=7),
+        ]
 
     def test_skips_when_status_pending(self, steward):
         """When the escalation is still pending, patch_resolution_metadata is NOT called."""
