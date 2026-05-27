@@ -235,9 +235,20 @@ class TicketJanitor:
         """Surface an infra_issue escalation when the liveness probe has raised consecutively.
 
         Mirrors the routing guard ladder used by tick() step 4:
-        HAS_ESCALATION → _known_projects → _orchestrator_running → submit.
-        Bail-out branches do NOT record the cooldown so the next tick retries.
+        cooldown → HAS_ESCALATION → _known_projects → _orchestrator_running → submit.
+        Bail-out branches (no orchestrator / unresolved root / submit failure) do NOT
+        record the cooldown so the next tick retries — identical to the ticket_failure
+        flow.  Only a successful queue.submit records the cooldown timestamp.
         """
+        now = time.monotonic()
+        key = (pid, _PROBE_DEFECT, _PROBE_DEFECT)
+        if self._cooldown_blocks(key, now):
+            logger.info(
+                'ticket_janitor: cooldown suppressed probe-defect escalation '
+                'for %s (consecutive raises: %d)', pid, count,
+            )
+            return
+
         if not HAS_ESCALATION:
             logger.warning(
                 'ticket_janitor: probe defect for %s (count=%d) but escalation '
@@ -283,16 +294,20 @@ class TicketJanitor:
         )
         try:
             queue.submit(escalation)
-            logger.warning(
-                'ticket_janitor: surfaced probe-defect escalation %s for '
-                'project %s (consecutive probe raises: %d)',
-                escalation.id, pid, count,
-            )
         except Exception:
             logger.warning(
                 'ticket_janitor: failed to submit probe-defect escalation for '
                 'project %s (count=%d); will retry next tick', pid, count,
             )
+            return
+
+        # Record in the cooldown log only after a successful submit.
+        self._escalation_log[key].append(now)
+        logger.warning(
+            'ticket_janitor: surfaced probe-defect escalation %s for '
+            'project %s (consecutive probe raises: %d)',
+            escalation.id, pid, count,
+        )
 
     async def tick(self) -> None:
         """One janitor pass.
