@@ -302,6 +302,20 @@ class EscalationQueue:
         Idempotent: if the escalation is already resolved or dismissed, this
         method returns the existing escalation unchanged without re-archiving
         or re-firing the _resolve_callback.
+
+        Cascade: if the escalation is an L2 with a non-empty ``members`` list,
+        after archiving the L2 each member id is resolved recursively with the
+        same *resolution* text.  The cascade uses
+        ``resolved_by='l2-cascade:{escalation_id}'`` so the audit trail
+        distinguishes direct resolves from cascades.  *dismiss* is propagated
+        so a dismissed L2 dismisses its members too.
+
+        Cascade contract:
+        - Recursion terminates because L1 members carry empty ``members`` lists.
+        - Per-member exceptions are caught and logged; a single bad member id
+          never blocks the remaining cascade.
+        - ``resolve()`` is idempotent, so cascading to an already-resolved member
+          is a safe no-op.
         """
         esc = self.get(escalation_id)
         if esc is None:
@@ -330,6 +344,24 @@ class EscalationQueue:
                 self._resolve_callback(esc)
             except Exception as e:
                 logger.warning(f'Resolve callback failed for {escalation_id}: {e}')
+
+        # Cascade to member L1s (L2 clusters only — L0/L1 have empty members).
+        # Recursion is bounded: L1 members carry empty members[], so no deeper nesting.
+        if esc.members:
+            cascade_resolved_by = f'l2-cascade:{escalation_id}'
+            for member_id in esc.members:
+                try:
+                    self.resolve(
+                        member_id,
+                        resolution,
+                        dismiss=dismiss,
+                        resolved_by=cascade_resolved_by,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        'cascade: failed to resolve member %s of L2 %s: %s',
+                        member_id, escalation_id, e,
+                    )
 
         return esc
 
