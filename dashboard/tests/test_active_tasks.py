@@ -197,6 +197,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'description': '', 'details': '', 'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [], 'locks': [],
+        'meta_files': [],
     }]
 
 
