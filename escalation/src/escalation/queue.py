@@ -449,9 +449,8 @@ class EscalationQueue:
         atomic write is created in the target file's parent directory, so the rename
         stays within the same filesystem subtree.
 
-        Returns None when:
-        - The escalation id is not found (no file in root or archive).
-        - The escalation is still pending — caller must have already resolved/dismissed it.
+        Returns None when the escalation is missing OR still pending — caller must have
+        already resolved/dismissed it.
 
         Returns the updated Escalation on success.
         """
