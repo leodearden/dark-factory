@@ -58,6 +58,45 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
 - RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
 
+## Shallow-by-default → Deepen-on-signal RCA
+
+RCA stays **shallow** until escalations carry signals of a common cause. Deepening costs context budget — this rotation runs on opus/high-effort under a $50/day ceiling, so a quiet queue must stay cheap.
+
+### When to deepen
+
+Deepen RCA when you observe **any** of the following signals:
+
+- **Repeated failures on the same module or merge** — two or more `task_failure` escalations referencing the same file path or recent commit
+- **Burst of infra symptoms** — three or more `infra_issue` or MCP-error escalations in one drain cycle, especially from unrelated tasks
+- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_tasks`)
+- **Same category + overlapping summaries** from distinct tasks with no obvious individual root cause
+
+Without these signals, log the escalation category and summary, apply the routing table (step 5), and move on.
+
+### Read-only investigation toolset
+
+The auto-watcher's allowed tools strictly limit what you can access. Use these for RCA reads:
+
+| Tool | Purpose |
+|------|---------|
+| `Read` / `Glob` / `Grep` | Read source files, find symbols, grep for patterns |
+| `Bash(git log ...)` | Inspect recent commits on a module or branch |
+| `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
+| `Bash(git show ...)` | Read a specific commit's diff |
+| `Bash(git status ...)` | Working-tree state at the project root |
+| `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
+| `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
+| `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
+
+**You do NOT have** `df`, `systemctl`, `docker`, `kill`, or any host-health tool — you form infra hypotheses from symptom patterns only.
+
+### Hypothesis formation
+
+A hypothesis is a **stable, human-readable string** you will pass as `root_cause` to `promote_to_l2`. It should be specific enough to deduplicate (the server uses it as a dedup key) but not so specific that it prevents the L2 from evolving as more members are added:
+- Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"neo4j-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
+- Too vague: `"infra"`, `"failure"`
+- Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
+
 ## Main Loop
 
 ```
