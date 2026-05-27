@@ -4283,7 +4283,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     def _handle_cancelled_terminal_exit(
         self, exc: TerminalExitRejection,
-    ) -> 'WorkflowOutcome | None':
+    ) -> WorkflowOutcome | None:
         """Return ``WorkflowOutcome.CANCELLED`` when *exc* signals an authoritative
         user/manual cancellation (``exc.old_status == 'cancelled'``), else ``None``.
 
