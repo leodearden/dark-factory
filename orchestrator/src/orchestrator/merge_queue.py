@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import logging
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +116,72 @@ def _verify_hit_enospc(verify: VerifyResult) -> bool:
         ) if isinstance(s, str)
     ).lower()
     return any(marker in haystack for marker in _ENOSPC_MARKERS)
+
+
+async def _ensure_verify_disk_space(
+    git_ops: GitOps,
+    merge_wt: Path,
+    min_free_bytes: int,
+    task_id: str,
+) -> str | None:
+    """Pre-verify disk guard.  Returns a blocked-reason string (prefixed with
+    ``TRANSIENT_INFRA_REASON_PREFIX``) when free space on *merge_wt*'s volume
+    is still below *min_free_bytes* after pruning stale ``_merge-*`` worktrees
+    — the caller should clean up the merge worktree and short-circuit to the
+    L1 infra_issue path WITHOUT running a doomed build.  Returns ``None`` to
+    proceed with verify (either there was already enough space, or pruning
+    freed enough).
+
+    Fails open: any ``shutil.disk_usage`` ``OSError`` returns ``None``.  A
+    merge must never be blocked because we couldn't stat the volume — the
+    post-verify ENOSPC retry/escalate path is the backstop for builds that
+    pass this guard (≥ threshold free) but still exhaust the disk mid-run.
+
+    Scope: post-merge verify only.  The non-merge task-verify path
+    (``run_verification`` during implement→verify) still classifies a
+    disk-full failure by return code and can route to the steward; guarding
+    that path is deliberately out of scope here.
+    """
+    gib = 1024**3
+    try:
+        free = shutil.disk_usage(merge_wt).free
+    except OSError as exc:
+        logger.warning(
+            'Task %s: pre-verify disk guard: disk_usage(%s) failed (%s); '
+            'failing open (proceeding with verify)',
+            task_id, merge_wt, exc,
+        )
+        return None
+    if free >= min_free_bytes:
+        return None
+    logger.warning(
+        'Task %s: pre-verify disk guard: %.2f GiB free < %.2f GiB threshold; '
+        'pruning stale _merge-* worktrees before verify',
+        task_id, free / gib, min_free_bytes / gib,
+    )
+    pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+    try:
+        free = shutil.disk_usage(merge_wt).free
+    except OSError as exc:
+        logger.warning(
+            'Task %s: pre-verify disk guard: post-prune disk_usage(%s) failed '
+            '(%s); failing open (proceeding with verify)',
+            task_id, merge_wt, exc,
+        )
+        return None
+    if free >= min_free_bytes:
+        logger.info(
+            'Task %s: pre-verify disk guard: pruning %d stale merge '
+            'worktree(s) freed enough space (%.2f GiB free); proceeding',
+            task_id, len(pruned), free / gib,
+        )
+        return None
+    return (
+        f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard found only '
+        f'{free / gib:.2f} GiB free (threshold {min_free_bytes / gib:.2f} GiB) '
+        f'after pruning {len(pruned)} stale merge worktree(s); skipping '
+        f'post-merge verify to avoid a doomed build under disk pressure.'
+    )
 
 
 async def _check_plan_targets_in_tree(
@@ -897,6 +964,16 @@ class MergeWorker:
                 f'(pre-rebased, main unchanged)'
             )
         if not skip_verify:
+            # Pre-verify disk guard: if free space is low, prune stale merge
+            # worktrees; if still low, skip the build and escalate as transient
+            # infra rather than entering a doomed multi-minute ENOSPC build.
+            disk_reason = await _ensure_verify_disk_space(
+                self._git_ops, merge_wt,
+                req.config.merge_verify_min_free_disk_bytes, req.task_id,
+            )
+            if disk_reason is not None:
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                return MergeOutcome('blocked', reason=disk_reason)
             # max_retries=0: post-merge verify hangs are usually deterministic
             # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
             # is_merge_verify=True: merge worktrees are freshly created per
@@ -1875,6 +1952,20 @@ class SpeculativeMergeWorker:
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
             )
+            # Pre-verify disk guard: if free space is low, prune stale merge
+            # worktrees; if still low, skip the build and escalate as transient
+            # infra rather than entering a doomed multi-minute ENOSPC build.
+            disk_reason = await _ensure_verify_disk_space(
+                self._git_ops, merge_wt,
+                req.config.merge_verify_min_free_disk_bytes, req.task_id,
+            )
+            if disk_reason is not None:
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(
+                        MergeOutcome('blocked', reason=disk_reason),
+                    )
+                return False
             try:
                 # max_retries=0: a hung post-merge verify is almost always a
                 # deterministic failure (e.g. deadlocked test); retries just
