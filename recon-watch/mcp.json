@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "escalation":   { "type": "http", "url": "http://127.0.0.1:8103/mcp" },
+    "fused-memory": { "type": "http", "url": "http://127.0.0.1:8002/mcp" }
+  }
+}
