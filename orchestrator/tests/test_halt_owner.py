@@ -40,9 +40,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
 
 def _make_wip_esc(
-    queue: EscalationQueue, task_id: str, *, category: str = 'wip_conflict',
+    queue: EscalationQueue,
+    task_id: str,
+    *,
+    category: str = 'wip_conflict',
+    timestamp: str | None = None,
 ) -> Escalation:
-    esc = Escalation(
+    kwargs: dict = dict(
         id=queue.make_id(task_id),
         task_id=task_id,
         agent_role='orchestrator',
@@ -53,6 +57,9 @@ def _make_wip_esc(
         suggested_action='manual_intervention',
         level=1,
     )
+    if timestamp is not None:
+        kwargs['timestamp'] = timestamp
+    esc = Escalation(**kwargs)
     queue.submit(esc)
     return esc
 
@@ -197,6 +204,82 @@ class TestRehydrateMergeHalt:
         assert worker.is_wip_halted is True
         assert worker.halt_owner_esc_id == esc.id
         assert result == esc.id
+
+    def test_rehydrate_restores_from_unmerged_state(self, harness: Harness):
+        """Single preserved level-1 unmerged_state L1 restores halt+owner."""
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '2222', category='unmerged_state')
+
+        result = harness._rehydrate_merge_halt()
+
+        assert worker.is_wip_halted is True
+        assert worker.halt_owner_esc_id == esc.id
+        assert result == esc.id
+
+    @pytest.mark.parametrize('setup', [
+        'empty_queue',
+        'wrong_category',
+        'wrong_level',
+    ])
+    def test_rehydrate_noop_when_no_relevant_l1(
+        self, harness: Harness, setup: str
+    ):
+        """No qualifying L1 means no-op: worker stays un-halted, result is None."""
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        if setup == 'empty_queue':
+            pass  # nothing submitted
+        elif setup == 'wrong_category':
+            # level-1 but irrelevant category
+            _make_wip_esc(queue, '3333', category='infra_issue')
+        elif setup == 'wrong_level':
+            # wip_conflict but level-0 (not a preserved L1)
+            esc = Escalation(
+                id=queue.make_id('4444'),
+                task_id='4444',
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary='test wip escalation',
+                detail='detail',
+                suggested_action='manual_intervention',
+                level=0,
+            )
+            queue.submit(esc)
+
+        result = harness._rehydrate_merge_halt()
+
+        assert worker.is_wip_halted is False
+        assert worker.halt_owner_esc_id is None
+        assert result is None
+
+    def test_rehydrate_picks_most_recent_l1(self, harness: Harness):
+        """When two preserved L1s qualify, the most recent by timestamp wins."""
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc_older = _make_wip_esc(
+            queue, '5555', timestamp='2026-05-27T10:00:00+00:00'
+        )
+        esc_newer = _make_wip_esc(
+            queue, '6666', timestamp='2026-05-27T11:00:00+00:00'
+        )
+
+        result = harness._rehydrate_merge_halt()
+
+        # The most recent escalation must own the halt
+        assert worker.halt_owner_esc_id == esc_newer.id
+        assert result == esc_newer.id
+        _ = esc_older  # referenced for clarity
 
 
 class TestForceUnhaltMergeQueue:
