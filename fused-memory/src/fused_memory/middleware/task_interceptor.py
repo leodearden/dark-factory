@@ -1711,7 +1711,11 @@ class TaskInterceptor:
         registers an asyncio.Event and awaits it (optionally with
         *timeout_seconds*).  On timeout, returns a synthetic failed dict
         WITHOUT mutating the ticket row — the worker may still resolve it later,
-        and the TTL sweep cleans truly abandoned rows.
+        and the worker-liveness reaper (TicketJanitor.tick) terminalises
+        pending tickets whose project's curator worker has died, marking them
+        failed with reason='worker_dead' (the retired wall-clock TTL janitor
+        no longer runs; ``expires_at`` is a non-load-bearing far-future
+        placeholder).
 
         Returns ``{status, task_id?, reason?}`` — does NOT expose ``result_json``.
 
