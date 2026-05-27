@@ -88,6 +88,15 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
+# Task 1512: minimum number of consecutive completed runs that must contain a
+# finding before it is escalated from _run_remediation_pass.  Below this count
+# the finding is suppressed (emitting a structured log instead) on the grounds
+# that remediation is likely to fix it on the next attempt.
+# Three cycles ≈ 15–90 minutes given the per-project 5-second cooldown and
+# typical cycle durations — short enough that a genuinely-broken finding still
+# escalates within a watchable window, long enough to filter transient findings.
+_INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 3
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
@@ -1399,7 +1408,16 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # After second-pass S3: escalate ALL remaining findings (never a third pass)
+            # After second-pass S3: gate escalation on persistence (task 1512 /
+            # plans/afk-A7-recon-closure.md).  Never a third pass.
+            # A finding is only escalated when it has appeared in at least
+            # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD completed runs, which signals
+            # that remediation cannot fix it on its own.  Below the threshold we
+            # suppress the escalation and emit a structured log so the finding
+            # stays observable without polluting the queue.
+            # The except handlers further below (AllAccountsCappedException and
+            # bare Exception) are untouched — they fire on stage *exceptions*, not
+            # on Stage-3 findings, and are the genuine "needs human" signals.
             s3_report = run.stage_reports.get('integrity_check')
             if s3_report is not None:
                 if isinstance(s3_report, dict):
@@ -1407,13 +1425,29 @@ class ReconciliationHarness:
                 else:
                     remaining = s3_report.items_flagged
                 for finding in remaining:
-                    self._escalate(
-                        'recon_integrity_issue',
-                        run_id,
-                        f'Unresolved after remediation: {finding.get("description", "?")}',
-                        detail=json.dumps(finding, default=str),
-                        finding=finding,
-                    )
+                    persistence = await self._finding_persistence_count(project_id, finding)
+                    if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
+                        self._escalate(
+                            'recon_integrity_issue',
+                            run_id,
+                            f'Unresolved after remediation: {finding.get("description", "?")}',
+                            detail=json.dumps(finding, default=str),
+                            finding=finding,
+                        )
+                    else:
+                        logger.info(
+                            'reconciliation.unresolved_after_remediation_suppressed',
+                            extra={
+                                'project_id': project_id,
+                                'run_id': run_id,
+                                'parent_run_id': parent_run_id,
+                                'finding_category': finding.get('category', ''),
+                                'affected_ids': list(finding.get('affected_ids') or []),
+                                'description': finding.get('description', ''),
+                                'persistence': persistence,
+                                'threshold': _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+                            },
+                        )
 
             logger.info(
                 'reconciliation.remediation_completed',
