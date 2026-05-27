@@ -44,6 +44,7 @@ def _submit_aged(
     *,
     level: int = 0,
     category: str = 'design_concern',
+    worktree: str | None = None,
 ) -> Escalation:
     """Submit an escalation whose timestamp is ``seconds_ago`` in the past."""
     ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
@@ -57,6 +58,7 @@ def _submit_aged(
         detail='detail',
         suggested_action='investigate',
         timestamp=ts,
+        worktree=worktree,
         level=level,
     )
     queue.submit(esc)
@@ -85,6 +87,7 @@ class TestOrphanL0Reaper:
         assert harness._escalation_queue is not None
         original = _submit_aged(
             harness._escalation_queue, 'review-abc', seconds_ago=300.0,
+            worktree='/home/leo/src/dark-factory/.worktrees/review-abc',
         )
 
         count = harness._reap_orphan_l0_escalations()
@@ -110,6 +113,47 @@ class TestOrphanL0Reaper:
         assert l1.suggested_action == 'manual_intervention'
         assert l1.status == 'pending'
         assert original.summary in l1.summary  # original summary preserved
+        # A1: the promoted L1 cites a durable branch ref, not the ephemeral
+        # worktree (which is reaped before a human reads it).
+        assert l1.worktree is None
+        assert 'branch=task/review-abc' in (l1.detail or '')
+
+    def test_aged_orphan_l0_with_open_l1_dismissed_not_promoted(
+        self, harness: Harness,
+    ):
+        """B2: an aged orphan L0 for a task that already has an open L1 is
+        dismissed by the reaper, not promoted to a duplicate "echo" L1.
+
+        Reproduces the 3843/3861/3555 echo pattern: a still-pending L0 was
+        re-promoted ~10 min after the workflow had already raised an L1 for
+        the same condition.
+        """
+        assert harness._escalation_queue is not None
+        # An L1 is already open for this task (e.g. raised by the workflow).
+        _submit_aged(
+            harness._escalation_queue, 'task-99', seconds_ago=5.0, level=1,
+        )
+        # A separate aged orphan L0 exists for the same task.
+        orphan = _submit_aged(
+            harness._escalation_queue, 'task-99', seconds_ago=300.0, level=0,
+        )
+
+        count = harness._reap_orphan_l0_escalations()
+        assert count == 0  # nothing promoted
+
+        # The orphan L0 was dismissed by the reaper...
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+
+        # ...and no second L1 was created — only the pre-existing one remains.
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
 
     def test_active_workflow_l0_not_promoted(self, harness: Harness):
         """An L0 for a task_id with an active workflow is left alone."""

@@ -2674,6 +2674,29 @@ Output JSON matching the schema. Every task must appear in the output.
             if age_secs < timeout:
                 continue
 
+            # Defense-in-depth: never double-escalate a task a human is
+            # already looking at.  B1 (commit 1a1eca9a67) stopped the main
+            # orphan source by skipping L0 creation on escalate_to_human
+            # paths, but other L0 sources remain (agent escalate_info,
+            # deep-reviewer L0s, steward-chained L0s) and an /unblock can be
+            # in flight.  If an L1 is already open for this task, dismiss the
+            # orphan L0 rather than promoting it to a duplicate "echo" L1.
+            if self._escalation_queue.has_open_l1(esc.task_id):
+                self._escalation_queue.resolve(
+                    esc.id,
+                    (
+                        'Dismissed by orphan reaper — open L1 already covers '
+                        f'this task (task_id={esc.task_id})'
+                    ),
+                    dismiss=True,
+                    resolved_by='harness-orphan-reaper',
+                )
+                continue
+
+            # Cite a durable branch ref instead of the originating worktree:
+            # the orphan's worktree is ephemeral and likely reaped before a
+            # human reads the promoted L1 (see workflow._durable_ref_suffix).
+            branch = f'{self.config.git.branch_prefix}{esc.task_id}'
             reesc = Escalation(
                 id=self._escalation_queue.make_id(esc.task_id),
                 task_id=esc.task_id,
@@ -2684,9 +2707,13 @@ Output JSON matching the schema. Every task must appear in the output.
                     f'Orphan L0 ({age_secs:.0f}s old, no active workflow): '
                     f'{esc.summary}'
                 ),
-                detail=esc.detail,
+                detail=(
+                    (esc.detail or '')
+                    + f'\n\n[note] originating worktree may be reaped; '
+                    f'branch={branch}'
+                ),
                 suggested_action='manual_intervention',
-                worktree=esc.worktree,
+                worktree=None,
                 workflow_state=esc.workflow_state,
                 level=1,
             )

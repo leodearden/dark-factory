@@ -2982,9 +2982,9 @@ class TestMarkBlockedFalseDoneGuard:
         self, config, git_ops, task_assignment, tmp_path
     ):
         """Fix C: ``escalate_to_human=True`` must NOT invoke the steward —
-        it goes straight to L0 + L1 + BLOCKED.  Pin this contract so
-        future refactors don't accidentally re-enable steward involvement
-        on confirmed-loop failures.
+        it goes straight to L1 + BLOCKED (no L0, per commit 1a1eca9a67).
+        Pin this contract so future refactors don't accidentally re-enable
+        steward involvement on confirmed-loop failures.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3028,6 +3028,13 @@ class TestMarkBlockedFalseDoneGuard:
         l0 = queue.get_by_task(task_assignment.task_id, level=0)
         assert len(l0) == 0
         assert queue.has_open_l1(task_assignment.task_id)
+        # A1: the human-facing L1 cites durable refs (branch + base SHA) in
+        # its detail and does NOT store the ephemeral worktree path — the
+        # worktree is reaped before a human reads the escalation.
+        l1 = queue.get_by_task(task_assignment.task_id, status='pending', level=1)[0]
+        assert l1.worktree is None
+        assert 'branch=task/' in (l1.detail or '')
+        assert 'base=' in (l1.detail or '')
 
     async def test_dropped_plan_targets_routes_to_l1_directly(
         self, config, git_ops, task_assignment, tmp_path
