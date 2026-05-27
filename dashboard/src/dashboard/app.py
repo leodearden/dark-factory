@@ -38,6 +38,7 @@ from dashboard.data.burndown import (
     downsample,
 )
 from dashboard.data.cap_history import (
+    AccountsSummary,
     CapInterval,
     bucketise_cap_sparkline,
     compute_capped_now_and_windows,
@@ -884,9 +885,9 @@ async def api_curator(request: Request) -> JSONResponse:
 
     # Compute per-account availability summary in its own try/except so a failure
     # here does not affect capped_now / capped_spark (or vice versa).
-    _empty_summary: dict = {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}
+    _empty_summary: AccountsSummary = {'total': 0, 'capped': 0, 'available': 0, 'capped_accounts': []}
     try:
-        accounts_summary: dict = summarize_accounts(intervals, total_accounts=account_count)
+        accounts_summary: AccountsSummary = summarize_accounts(intervals, total_accounts=account_count)
     except Exception:
         logger.debug('curator/accounts_summary computation failed', exc_info=True)
         accounts_summary = _empty_summary
