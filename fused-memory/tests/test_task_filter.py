@@ -14,6 +14,7 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     _flatten_with_subtasks,
     _render_task_line,
+    detect_census_inconsistency,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -2486,4 +2487,85 @@ class TestFormatHeaderHighestTaskId:
         # New field must also be present
         assert 'highest task id: 500' in output, (
             f'Expected "highest task id: 500" in header. Got:\n{output!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 5: detect_census_inconsistency (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectCensusInconsistency:
+    """RED tests for detect_census_inconsistency(max_task_id, referenced_ids) (step-5).
+
+    Returns sorted, deduplicated list of ids that STRICTLY exceed max_task_id.
+    """
+
+    def test_returns_ids_exceeding_max_task_id(self):
+        """detect_census_inconsistency returns sorted list of ids strictly > max_task_id.
+
+        With max_task_id=1515 and referenced ids [3438, '4026', '12', '4044.1', 'x']:
+        - 3438 > 1515 → included
+        - '4026' → 4026 > 1515 → included
+        - '12' → 12 ≤ 1515 → excluded
+        - '4044.1' → first-segment 4044 > 1515 → included
+        - 'x' → unparseable → silently ignored
+
+        Expected: [3438, 4026, 4044] (sorted ascending, deduplicated)
+        """
+        result = detect_census_inconsistency(1515, [3438, '4026', '12', '4044.1', 'x'])
+        assert result == [3438, 4026, 4044], (
+            f'Expected [3438, 4026, 4044], got {result}'
+        )
+
+    def test_returns_empty_when_no_ids_exceed_max(self):
+        """Returns [] when all referenced ids are <= max_task_id."""
+        result = detect_census_inconsistency(5000, [1, 100, '2000', '5000'])
+        assert result == [], (
+            f'Expected [], got {result}'
+        )
+
+    def test_strictly_exceeds_not_equal(self):
+        """IDs equal to max_task_id are NOT returned (strictly greater)."""
+        result = detect_census_inconsistency(1515, [1515, 1516, 1514])
+        assert result == [1516], (
+            f'Expected [1516] (1515 excluded as equal, 1514 excluded as lesser), got {result}'
+        )
+
+    def test_deduplicates_repeated_ids(self):
+        """Duplicate ids in referenced_ids appear only once in the result."""
+        result = detect_census_inconsistency(100, [200, 200, 300, 200])
+        assert result == [200, 300], (
+            f'Expected [200, 300] (deduplicated), got {result}'
+        )
+
+    def test_parses_dotted_ids_via_first_segment_rule(self):
+        """Dotted subtask ids use the first dot-segment as the int value."""
+        # '4044.2' → first segment 4044; '500.1.1' → first segment 500
+        result = detect_census_inconsistency(1000, ['4044.2', '500.1.1', '999.9'])
+        # 4044 > 1000 → included; 500 ≤ 1000 → excluded; 999 ≤ 1000 → excluded
+        assert result == [4044], (
+            f'Expected [4044], got {result}'
+        )
+
+    def test_silently_ignores_unparseable_entries(self):
+        """Non-parseable entries (non-int, non-dotted-int) are silently ignored."""
+        result = detect_census_inconsistency(100, ['x', None, {}, [], 'abc', '3000'])
+        # '3000' → 3000 > 100; others → ignored
+        assert result == [3000], (
+            f'Expected [3000] (only parseable id 3000 exceeds 100), got {result}'
+        )
+
+    def test_returns_sorted_ascending(self):
+        """Result is always sorted ascending regardless of input order."""
+        result = detect_census_inconsistency(0, [300, 100, 200, 50, 1])
+        assert result == [1, 50, 100, 200, 300], (
+            f'Expected [1, 50, 100, 200, 300] (ascending), got {result}'
+        )
+
+    def test_empty_referenced_ids_returns_empty(self):
+        """Empty referenced_ids returns []."""
+        result = detect_census_inconsistency(1000, [])
+        assert result == [], (
+            f'Expected [] for empty referenced_ids, got {result}'
         )
