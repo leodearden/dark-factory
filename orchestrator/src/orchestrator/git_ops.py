@@ -556,9 +556,21 @@ class GitOps:
         # train) and train=None both fall through to _freshen_main().
         # The predecessor-branch path is implemented in steps 9-12.
         if train is not None and train.get('order', 0) > 0:
-            # Train path (order > 0) — implemented in step-10.
-            # Placeholder: fall through to _freshen_main() until step-10.
-            start_ref, stale_commits = await self._freshen_main()
+            # ── Train path: branch from predecessor's tip ─────────────────
+            # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
+            # as start_ref so the new worktree stacks directly on top.
+            # The missing-branch guard (raise RuntimeError) is in step-12.
+            predecessor = await self._train_predecessor(train)
+            predecessor_sha = await self.resolve_branch_sha(predecessor.branch)
+            if predecessor_sha is None:
+                raise RuntimeError(
+                    f'create_worktree: predecessor branch {predecessor.branch!r} '
+                    f'does not exist (train_id={train.get("id")!r}, '
+                    f'order={train.get("order")}, branch_name={branch_name!r}). '
+                    'The predecessor worktree must be created before the successor.'
+                )
+            start_ref = predecessor_sha
+            stale_commits = None  # "behind remote" does not apply to sibling branches
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
             # If origin/main has advanced since session start, use the remote-

@@ -3188,3 +3188,62 @@ class TestCreateWorktreeTrain:
         )
 
         assert info.base_commit == main_sha
+
+    async def test_train_order_gt_zero_branches_from_predecessor_tip(
+        self, git_ops: GitOps
+    ):
+        """PRD § 10 scenario-2: β branches from α's tip, not from main."""
+        from orchestrator.git_ops import TrainMembership
+
+        # Create α worktree and commit one file in it
+        alpha_info = await git_ops.create_worktree('alpha')
+        (alpha_info.path / 'alpha.py').write_text('x = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # Create β with train metadata pointing to α as predecessor
+        beta_info = await git_ops.create_worktree(
+            'beta',
+            train=TrainMembership(id='T1', order=1, members=['alpha', 'beta']),
+        )
+
+        # (1) WorktreeInfo.base_commit == α's branch tip SHA
+        assert beta_info.base_commit == alpha_tip
+
+        # (2) stale_commits is None for train-based worktrees
+        assert beta_info.stale_commits is None
+
+        # (3) git merge-base task/beta task/alpha == α's tip (β forks from α)
+        _, mb, _ = await _run(
+            ['git', 'merge-base', 'task/beta', 'task/alpha'],
+            cwd=git_ops.project_root,
+        )
+        assert mb.strip() == alpha_tip
+
+        # (4) git log task/beta..task/alpha is empty (β already has all of α's commits)
+        _, log_out, _ = await _run(
+            ['git', 'log', 'task/beta..task/alpha', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_out.strip() == ''
+
+    async def test_missing_predecessor_branch_raises(self, git_ops: GitOps):
+        """RuntimeError when the predecessor branch doesn't exist; no stale dir left."""
+        from orchestrator.git_ops import TrainMembership
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.create_worktree(
+                'beta',
+                train=TrainMembership(
+                    id='T1', order=1, members=['nonexistent-task', 'beta']
+                ),
+            )
+
+        msg = str(exc_info.value)
+        assert 'task/nonexistent-task' in msg
+        assert 'T1' in msg
+        assert 'beta' in msg
+
+        # No stale worktree directory left on disk
+        worktree_path = git_ops.worktree_base / 'beta'
+        assert not worktree_path.exists()
