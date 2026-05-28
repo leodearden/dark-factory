@@ -2,7 +2,7 @@
 const { useState: uS, useEffect: uE } = React;
 const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
-const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab } = window.DF_TABS;
+const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
@@ -83,6 +83,7 @@ function App() {
     { id: 'merge',    label: 'Merge Queue' },
     { id: 'cost',     label: 'Costs' },
     { id: 'burn',     label: 'Burndown' },
+    { id: 'esc',      label: 'Escalations' },
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
@@ -102,6 +103,7 @@ function App() {
     tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
     recon: DD.RECON_STATE.runs.filter(r => r.status === 'failed' || r.status === 'partial').length,
     merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
+    esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
 
   const ts = now.toLocaleTimeString('en-GB', { hour12: false });
@@ -119,6 +121,7 @@ function App() {
       case 'merge':    return <MergeTab projectFilter={projects} />;
       case 'cost':     return <CostsTab projectFilter={projects} />;
       case 'burn':     return <BurnTab projectFilter={projects} />;
+      case 'esc':      return <EscalationsTab projectFilter={projects} />;
       default: return null;
     }
   }
@@ -145,6 +148,7 @@ function App() {
     merge:    { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
+    esc:      { showWindow: false,                        showAgents: false, search: false },
   }[tab] || {};
 
   return (
