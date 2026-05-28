@@ -5047,6 +5047,61 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         tip = (self._merge_sha or '')[:12] or f'{branch}@HEAD'
         return f'\n\n[durable refs] branch={branch} base={base} tip={tip}'
 
+    async def _build_train_state(self) -> dict | None:
+        """Build per-train context for L1 escalation payloads (PRD § 9.8).
+
+        Returns None when this task carries no valid metadata.train (non-train
+        task or malformed metadata).  When valid, returns::
+
+            {'id': str, 'order': int,
+             'parked_members': list[str],  # siblings at merge-deferred, excl. self
+             'failing_member': str}        # this task's id
+
+        Fast path: if metadata.train.members is a list, call get_statuses on
+        those ids and filter.  Fallback: scan get_tasks() for tasks whose
+        metadata.train.id matches, then call get_statuses on the discovered ids.
+
+        Reuses the TrainMembership cast/isinstance convention from task 1522
+        (git_ops.py:54-62); cast and TrainMembership are already imported.
+        """
+        metadata = self.task.get('metadata') or {}
+        train_meta = metadata.get('train')
+        if not isinstance(train_meta, dict):
+            return None
+        train = cast(TrainMembership, train_meta)
+
+        train_id = train.get('id')
+        train_order = train.get('order')
+        if train_id is None or train_order is None:
+            return None
+
+        # Discover candidate sibling task ids.
+        members_cache = train.get('members')
+        if isinstance(members_cache, list):
+            # Fast path — use the cached members list.
+            candidates: list[str] = [str(m) for m in members_cache]
+        else:
+            # Fallback scan — discover siblings via get_tasks().
+            tasks = await self.scheduler.get_tasks()
+            candidates = [
+                str(t['id'])
+                for t in tasks
+                if isinstance((t.get('metadata') or {}).get('train'), dict)
+                and cast(TrainMembership, (t.get('metadata') or {}).get('train')).get('id') == train_id
+            ]
+
+        statuses, _ = await self.scheduler.get_statuses(candidates)
+        parked_members = [
+            c for c in candidates
+            if c != self.task_id and statuses.get(c) == 'merge-deferred'
+        ]
+        return {
+            'id': train_id,
+            'order': train_order,
+            'parked_members': parked_members,
+            'failing_member': self.task_id,
+        }
+
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
     ) -> None:
