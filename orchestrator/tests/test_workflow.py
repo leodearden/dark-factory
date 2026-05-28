@@ -24,6 +24,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import PlanFilesTouchedResult
+from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -289,3 +290,74 @@ class TestSubmitToMergeQueuePlanTightening:
         assert second is False
         # Architect invoked exactly once across both calls.
         assert len(invocations) == 1
+
+
+_PASSING_VERIFY_RESULT = VerifyResult(
+    passed=True,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='all green',
+)
+
+
+@pytest.mark.asyncio
+class TestVerifyDebugfixLoopForceWorkspace:
+    """_verify_debugfix_loop forwards force_workspace based on train membership (γ₁).
+
+    When self._train is not None the call to run_scoped_verification must receive
+    force_workspace=True so the workspace-wide command runs.  Non-train tasks must
+    receive force_workspace=False — byte-identical existing behaviour.
+    """
+
+    def _setup_wf(self, tmp_path: Path) -> TaskWorkflow:
+        wf = _make_workflow(tmp_path=tmp_path)
+        # Point _task_files (property reads from self.plan['files']) at a known file.
+        wf.plan['files'] = ['orchestrator/x.py']
+        # Skip the pre-verify rebase step to keep the loop tight.
+        wf.config.rebase_before_verify = False
+        wf._inter_iteration_rebase = AsyncMock()  # type: ignore[method-assign]
+        return wf
+
+    async def test_train_member_passes_force_workspace_true(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A task with metadata.train set must call run_scoped_verification with
+        force_workspace=True so the workspace-wide command runs instead of the
+        per-module scoped command.
+        """
+        wf = self._setup_wf(tmp_path)
+        wf.task['metadata'] = {'train': {'id': 'T1', 'order': 0, 'members': ['1523']}}
+
+        spy = AsyncMock(return_value=_PASSING_VERIFY_RESULT)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', spy)
+
+        outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        spy.assert_awaited_once()
+        _, kwargs = spy.call_args
+        assert kwargs.get('force_workspace') is True, (
+            f'Expected force_workspace=True for train member; got call_args={spy.call_args}'
+        )
+
+    async def test_non_train_task_passes_force_workspace_false(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A task without metadata.train must call run_scoped_verification with
+        force_workspace=False — byte-identical behaviour to the pre-γ₁ baseline.
+        """
+        wf = self._setup_wf(tmp_path)
+        # No train metadata — plain task.
+
+        spy = AsyncMock(return_value=_PASSING_VERIFY_RESULT)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', spy)
+
+        outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        spy.assert_awaited_once()
+        _, kwargs = spy.call_args
+        assert kwargs.get('force_workspace') is False, (
+            f'Expected force_workspace=False for non-train task; got call_args={spy.call_args}'
+        )
