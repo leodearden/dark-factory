@@ -623,7 +623,7 @@ def shape_costs(
 
 def shape_escalations(
     queues: Mapping[str, Any],
-    task_maps: Mapping[str, Iterable[Mapping[str, Any]]],
+    task_maps: Mapping[str, Iterable[dict[str, Any]]],
 ) -> dict[str, Any]:
     """Reshape build_escalation_queues output into the ESCALATIONS DF_DATA key.
 
