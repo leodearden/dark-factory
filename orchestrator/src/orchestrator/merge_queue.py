@@ -1688,6 +1688,27 @@ class SpeculativeMergeWorker:
                     actual_main = await self._git_ops.get_main_sha()
                     base_for_merge = spec_base if spec_base else actual_main
 
+                    # ── Train dispatch: GroupMergeRequest bypasses speculative pipeline ──
+                    # A train changes main topology atomically; the next item must not be
+                    # pre-merged against an unverified train commit, so NO speculative
+                    # look-ahead is performed.  _do_train_merge owns its own rebase /
+                    # merge / verify / advance / cleanup pipeline; the outcome rides the
+                    # verifier queue via immediate_outcome so the standard future-resolution
+                    # path handles it.
+                    if isinstance(req, GroupMergeRequest):
+                        outcome = await _do_train_merge(
+                            self._git_ops, req, self._event_store,
+                        )
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=None, merge_wt=None,
+                            base_sha=actual_main, speculative=False,
+                            skip_verify=False, immediate_outcome=outcome,
+                            started_monotonic=t0,
+                        ))
+                        spec_base = None
+                        self._inflight_req = None
+                        continue
+
                     # ── Step 0: loop-breaker short-circuit ────────────────────
                     # If this task has already timed out in post-merge verify
                     # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon
