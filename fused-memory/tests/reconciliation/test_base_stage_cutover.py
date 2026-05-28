@@ -9,14 +9,51 @@ import pytest_asyncio
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+
+class _StubStage(BaseStage):
+    """Minimal BaseStage stub for testing BaseStage.run logic directly."""
+
+    def get_disallowed_tools(self) -> list[str]:
+        return []
+
+    def get_system_prompt(self) -> str:
+        return 'test prompt'
+
+    def get_report_schema(self) -> dict:
+        return STAGE_REPORT_SCHEMA
+
+    async def assemble_payload(self, events, watermark, prior_reports) -> str:
+        return 'test payload'
 
 
 def _make_stage(
     recon_report_port: int = 8003,
     recon_report_state=None,
-) -> MemoryConsolidator:
-    """Build a MemoryConsolidator stub with minimal mock deps and a given recon_report_port."""
+) -> _StubStage:
+    """Build a _StubStage with minimal mock deps."""
+    config = ReconciliationConfig()
+    memory_mock = AsyncMock()
+
+    stage = _StubStage(
+        StageId.memory_consolidator,
+        memory_mock,
+        AsyncMock(),  # taskmaster
+        AsyncMock(),  # journal
+        config,
+        recon_report_port=recon_report_port,
+        recon_report_state=recon_report_state,
+    )
+    stage.project_id = 'test_project'
+    stage.project_root = '/tmp/test'
+    return stage
+
+
+def _make_consolidator(recon_report_port: int = 8003) -> MemoryConsolidator:
+    """Build a MemoryConsolidator with mocked deps for _build_mcp_config tests."""
     config = ReconciliationConfig()
     memory_mock = AsyncMock()
     memory_mock.get_episodes = AsyncMock(return_value=[])
@@ -31,7 +68,6 @@ def _make_stage(
         AsyncMock(),  # journal
         config,
         recon_report_port=recon_report_port,
-        recon_report_state=recon_report_state,
     )
     stage.project_id = 'test_project'
     stage.project_root = '/tmp/test'
@@ -155,7 +191,7 @@ class TestBuildMcpConfigReconReport:
 
     def test_recon_report_entry_default_port(self):
         """recon-report server entry present with default port 8003."""
-        stage = _make_stage(recon_report_port=8003)
+        stage = _make_consolidator(recon_report_port=8003)
         mcp_config = stage._build_mcp_config()
         servers = mcp_config['mcpServers']
         assert 'recon-report' in servers, 'recon-report must be in mcpServers'
@@ -164,14 +200,14 @@ class TestBuildMcpConfigReconReport:
 
     def test_recon_report_entry_custom_port(self):
         """recon-report entry uses the port passed at construction, not a hard-coded value."""
-        stage = _make_stage(recon_report_port=9999)
+        stage = _make_consolidator(recon_report_port=9999)
         mcp_config = stage._build_mcp_config()
         entry = mcp_config['mcpServers']['recon-report']
         assert entry == {'type': 'http', 'url': 'http://127.0.0.1:9999/mcp/'}
 
     def test_existing_entries_preserved(self):
         """fused-memory and jcodemunch entries still present after recon-report injection."""
-        stage = _make_stage(recon_report_port=8003)
+        stage = _make_consolidator(recon_report_port=8003)
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'

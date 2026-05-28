@@ -142,7 +142,24 @@ class BaseStage:
         disallowed = self.get_disallowed_tools()
         mcp_config = self._build_mcp_config()
 
+        # PRD γ: signal the recon_report state machine that this stage is starting.
+        # The CLI agent will call recon_report.add_finding / cite_* / complete via MCP;
+        # the harness then reads back the assembled report after the CLI returns.
+        if self._recon_report_state is not None:
+            self._recon_report_state.start_report(
+                run_id=run_id,
+                stage=self.stage_id.value,
+                project_id=self.project_id,
+            )
+
         started = datetime.now(UTC)
+
+        # When recon_report_state is active, drop the output_schema requirement —
+        # the assembled in-process state is the source of truth, not the LLM's JSON.
+        effective_output_schema = (
+            None if self._recon_report_state is not None
+            else self.get_report_schema()
+        )
 
         stage_result = await run_stage_via_cli(
             system_prompt=self.get_system_prompt(),
@@ -153,10 +170,29 @@ class BaseStage:
             usage_gate=self._usage_gate,
             model=model,
             cwd=Path(self.config.explore_codebase_root),
-            output_schema=self.get_report_schema(),
+            output_schema=effective_output_schema,
         )
 
         completed = datetime.now(UTC)
+
+        # PRD γ: read assembled report from in-process state (overrides stage_result.report).
+        # Falls back to stage_result.report when recon_report_state is not configured
+        # (back-compat path for non-recon stages).
+        if self._recon_report_state is not None:
+            assembled = self._recon_report_state.get_assembled_report(
+                run_id, self.stage_id.value
+            )
+            if assembled is not None:
+                stage_result.report = assembled
+            else:
+                # Agent crashed / timed out before calling recon_report.complete.
+                # Substitute empty assembled dict — matches today's malformed-JSON outcome.
+                logger.warning(
+                    'Stage %s: get_assembled_report returned None for run_id=%s '
+                    '(agent may have crashed before calling recon_report.complete)',
+                    self.stage_id.value, run_id,
+                )
+                stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
 
         report_data = stage_result.report
         stage_report = StageReport(
