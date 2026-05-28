@@ -451,3 +451,41 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     assert v >= 10, (
         f'index.html cache-buster version is {v}, expected >= 10.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11 test: tab_escalations.jsx has sort state and expand/collapse-all
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must have sort state persisted with 'df.esc.sort',
+    a numeric-aware task_id comparator using Number() with timestamp as secondary,
+    a direction toggle that flips between 'asc'/'desc', and an expand/collapse-all
+    control wired to useOpenSet's setAll.
+    """
+    # Sort state persisted with the correct key
+    assert "'df.esc.sort'" in tab_escalations_jsx_body, (
+        "tab_escalations.jsx does not call usePersistedState with 'df.esc.sort' — "
+        "add `const [sort, setSort] = usePersistedState('df.esc.sort', ...)` for persisted sort."
+    )
+    # Numeric-aware comparator uses Number()
+    assert 'Number(' in tab_escalations_jsx_body, (
+        "tab_escalations.jsx sort comparator does not use Number( for numeric task_id — "
+        'add `Number(a.task_id)` / `Number(b.task_id)` for numeric-aware sort.'
+    )
+    # Secondary sort key: timestamp
+    assert 'timestamp' in tab_escalations_jsx_body, (
+        "tab_escalations.jsx does not reference 'timestamp' in a sort/compare context — "
+        'add timestamp as a secondary sort key in the comparator.'
+    )
+    # Direction toggle flips between 'asc' and 'desc'
+    assert "'asc'" in tab_escalations_jsx_body and "'desc'" in tab_escalations_jsx_body, (
+        "tab_escalations.jsx does not reference both 'asc' and 'desc' — "
+        "add a direction toggle that flips sort.dir between 'asc' and 'desc'."
+    )
+    # Expand/collapse-all via setAll
+    assert 'setAll' in tab_escalations_jsx_body, (
+        "tab_escalations.jsx does not use setAll (from useOpenSet) for expand/collapse-all — "
+        'wire GroupAllToggle or a button to the setAll function returned by useOpenSet.'
+    )
