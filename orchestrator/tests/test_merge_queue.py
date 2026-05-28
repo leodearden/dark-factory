@@ -5782,3 +5782,69 @@ class TestGroupMergeRequestTrainIncomplete:
 
         # No member callbacks
         req.mark_member_done.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestRebaseConflict (MergeWorker) — step-7 RED / step-8 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestRebaseConflict:
+    """PRD scenario 8 conflict variant: tip conflicts with advanced main."""
+
+    async def test_rebase_conflict_blocks_without_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Conflicting main advance → TRAIN_REBASE_CONFLICT, no merge commit, no callbacks."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Commit a conflicting change on main AFTER the train was built.
+        # The tip branch (trn-c) touched trn-c.py; we clobber the same file
+        # on main so the rebase of the tip will conflict.
+        conflict_file = git_ops.project_root / 'trn-c.py'
+        conflict_file.write_text('# main version — conflicts with tip\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Conflicting commit on main'], cwd=git_ops.project_root)
+
+        # Record main SHA (includes the conflicting commit, tip is no longer a descendant)
+        _, main_sha_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_sha_after = main_sha_after.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_REBASE_CONFLICT_REASON_PREFIX), (
+            f'expected TRAIN_REBASE_CONFLICT prefix, got: {outcome.reason!r}'
+        )
+
+        # Main must not have advanced beyond the conflicting commit
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_sha_after, (
+            'main must not advance when rebase conflicts'
+        )
+
+        # No merge work done
+        spy_merge.assert_not_called()
+
+        # No callbacks
+        req.mark_member_done.assert_not_called()
+
+        # Tip worktree must be clean (rebase was aborted)
+        _, status_out, _ = await _run(
+            ['git', 'status', '--porcelain'], cwd=req.worktree,
+        )
+        assert status_out.strip() == '', f'tip worktree not clean: {status_out!r}'
+        # Must not be mid-rebase
+        assert not (req.worktree / '.git').exists() or not (req.worktree / '.git' / 'rebase-merge').exists(), (
+            'rebase-merge dir exists — rebase was not aborted'
+        )
