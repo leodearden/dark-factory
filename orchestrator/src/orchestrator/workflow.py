@@ -2236,6 +2236,19 @@ class TaskWorkflow:
 
         metadata = self.task.get('metadata') or {}
 
+        # PRD § 9.8 — train members bypass this counter entirely.
+        # The loop-guard (γ₂/task 1523) owns train verify-phase thrash;
+        # the train-merge worker owns the merge phase.  The counter adds
+        # no value for train members and risks false-trips on legitimate
+        # merge-deferred → merge-deferred re-stamps from sibling activity.
+        if isinstance(metadata.get('train'), dict):
+            logger.debug(
+                'Task %s: train member — bypassing infra-resume thrash counter '
+                '(loop-guard owns train thrash)',
+                self.task_id,
+            )
+            return None
+
         # Determine the category of the most recent resolved L0 (the one
         # the steward just handled).  If no escalation queue is wired up
         # (e.g. eval mode), we cannot classify — fall through.
@@ -2343,6 +2356,18 @@ class TaskWorkflow:
         through to the resubmit.
         """
         metadata = self.task.get('metadata') or {}
+
+        # PRD § 9.8 — train members bypass this counter entirely.
+        # The train-merge worker owns the merge phase for train members;
+        # the counter adds no value and risks false-trips on legitimate
+        # merge-deferred → merge-deferred re-stamps.
+        if isinstance(metadata.get('train'), dict):
+            logger.debug(
+                'Task %s: train member — bypassing merge-outcome thrash counter '
+                '(train-merge worker owns merge phase)',
+                self.task_id,
+            )
+            return None
 
         try:
             counter = int(metadata.get('consecutive_merge_thrash') or 0)
