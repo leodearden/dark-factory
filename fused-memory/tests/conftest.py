@@ -31,6 +31,8 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
+from _fm_helpers import pydantic_spec  # noqa: E402
+
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,
@@ -70,8 +72,12 @@ def standard_mock_config() -> MagicMock:
 
         def test_something(self, standard_mock_config):
             standard_mock_config.embedder.dimensions = 768
+
+    Note: spec_set only constrains top-level attributes; nested attribute typos
+    (e.g. cfg.embedder.dimensionz) are still silently accepted because cfg.embedder
+    resolves to an unconstrained child MagicMock.
     """
-    cfg = MagicMock()
+    cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     cfg.embedder.dimensions = 1536
     cfg.embedder.providers.openai = None
     cfg.embedder.model = 'text-embedding-3-small'

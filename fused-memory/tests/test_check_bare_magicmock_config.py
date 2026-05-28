@@ -642,3 +642,30 @@ class TestHooksIntegration:
                 f'Expected scan target {expected_dir!r} in check_bare_magicmock_config.py '
                 f'invocation line(s) in hooks/project-checks, got: {invocation_code!r}'
             )
+
+
+class TestFusedMemoryTestsDirectoryClean:
+    """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
+
+    Task 1531 migrated all 26 violation sites in fused-memory/tests off bare
+    MagicMock() and onto MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).
+    This test re-runs the hook script against the real fused-memory/tests
+    directory so that any future reintroduction is caught at pytest time (not
+    only at commit time, since the hook is repo-wide and operators may skip it
+    locally).
+    """
+
+    def test_fused_memory_tests_directory_has_zero_violations(self):
+        """Running the checker against fused-memory/tests must exit 0 with empty stdout."""
+        tests_dir = Path(__file__).parent
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tests_dir)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f'check_bare_magicmock_config found violations in fused-memory/tests '
+            f'(task 1531 regression). Fix by wrapping each bare MagicMock() config '
+            f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
+            f'Violations:\n{result.stdout}'
+        )

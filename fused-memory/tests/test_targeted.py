@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import make_8df8_scenario
+from _fm_helpers import make_8df8_scenario, pydantic_spec
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -1009,7 +1009,7 @@ class TestServerWiringContract:
         # Construct a minimal TargetedReconciler (registry starts as None by default)
         mock_taskmaster = MagicMock()
         mock_journal = MagicMock()
-        mock_config = MagicMock()
+        mock_config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         targeted = TargetedReconciler(
             mock_memory_service, mock_taskmaster, mock_journal, mock_config
         )
