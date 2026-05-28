@@ -9,23 +9,33 @@ Covers:
   (TestStage2PromptMandatesUniquenessToken)
 - A7b: harness._escalate fingerprint stamping and dedup routing
   (TestReconEscalationDedup)
+- Step-11: MemoryConsolidator.run() wiring — deletion guard (filter_false_absence_flags)
+  and census inconsistency detection (detect_census_inconsistency)
+  (TestMemoryConsolidatorRunWiring)
 """
 
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    EventSource,
+    EventType,
+    ReconciliationEvent,
     StageId,
+    StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 
 def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
@@ -681,4 +691,213 @@ class TestReconEscalationDedup:
         assert data['dedupe_fingerprint'] == expected_fp, (
             f'Expected finding-based fingerprint {expected_fp!r}, '
             f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: MemoryConsolidator.run() wiring — deletion guard + census check
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorRunWiring:
+    """MemoryConsolidator.run() must:
+
+    (a) pipe items_flagged through filter_false_absence_flags after dedup_flags,
+        dropping absence-type flags whose tasks are confirmed PRESENT (fail-closed
+        guard against phantom-task false positives), and
+    (b) detect census inconsistency from this cycle's events and set
+        report.stats['task_tree_census_inconsistent'] when events reference task IDs
+        that exceed the census max from filtered_task_tree.
+
+    RED until step-12 wires filter_false_absence_flags and detect_census_inconsistency
+    into MemoryConsolidator.run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_false_absence_flag_dropped_for_present_task(self):
+        """Absence-type flag for a PRESENT task must be dropped from items_flagged.
+
+        Simulates the main fix: a 'task_absent' flag emitted by Stage 1 for task 3438,
+        but get_task returns a real record -> filter_false_absence_flags drops the flag.
+        A non-absence flag for the same task must survive unchanged.
+
+        RED before step-12: filter_false_absence_flags is not called, so the
+        absence flag remains in items_flagged.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        # get_task returns a present record — task is real, not absent
+        stage.taskmaster.get_task.return_value = {'id': '3438', 'title': 'real task 3438'}
+
+        absence_flag = {
+            'task_id': '3438',
+            'flag_type': 'task_absent',
+            'description': 'Task 3438 not found in task tree — may be phantom',
+        }
+        normal_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+        all_flags = [absence_flag, normal_flag]
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(all_flags),
+            stats={},
+        )
+        # dedup_flags passes all flags through unchanged
+        dedup_mock = AsyncMock(return_value=list(all_flags))
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-a',
+            )
+
+        flag_types = [f.get('flag_type') for f in report.items_flagged]
+        assert 'task_absent' not in flag_types, (
+            "filter_false_absence_flags must drop 'task_absent' flags for tasks that "
+            "are PRESENT (get_task returns a real record); "
+            f"got items_flagged={report.items_flagged!r}. "
+            "RED: filter_false_absence_flags is not yet wired into run()."
+        )
+        assert 'missing_deliverable' in flag_types, (
+            "Non-absence flag 'missing_deliverable' must survive filter_false_absence_flags; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_census_inconsistency_detected_from_events(self):
+        """Census inconsistency: events referencing task IDs > census max must set stats.
+
+        Sets filtered_task_tree.max_task_id=1515 and passes an event with task_id=3438
+        (> 1515). After run(), report.stats['task_tree_census_inconsistent'] must be
+        set and contain 3438 (or its count).
+
+        RED before step-12: detect_census_inconsistency is not called, so the stat
+        is not set.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        stage.filtered_task_tree = FilteredTaskTree(max_task_id=1515, total_count=1515)
+
+        # Event with task_id exceeding the census max
+        event_high_id = ReconciliationEvent(
+            id='evt-3438',
+            type=EventType.task_status_changed,
+            source=EventSource.agent,
+            project_id='test_project',
+            timestamp=datetime.now(UTC),
+            payload={'task_id': 3438},
+        )
+        # Event with task_id within census max — must NOT appear in stat
+        event_low_id = ReconciliationEvent(
+            id='evt-0012',
+            type=EventType.task_created,
+            source=EventSource.agent,
+            project_id='test_project',
+            timestamp=datetime.now(UTC),
+            payload={'task_id': 12},
+        )
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[event_high_id, event_low_id],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-b',
+            )
+
+        assert 'task_tree_census_inconsistent' in report.stats, (
+            "run() must set report.stats['task_tree_census_inconsistent'] when events "
+            "reference task IDs exceeding the census max (1515 < 3438); "
+            f"got stats={report.stats!r}. "
+            "RED: detect_census_inconsistency is not yet wired into run()."
+        )
+        val = report.stats['task_tree_census_inconsistent']
+        assert val, (
+            f"task_tree_census_inconsistent must be truthy (non-empty); got {val!r}"
+        )
+        # The offending ID 3438 must be represented; the in-range ID 12 must not
+        if isinstance(val, list):
+            assert 3438 in val, f"Expected 3438 in census inconsistency list {val!r}"
+            assert 12 not in val, f"In-range task 12 must not appear in {val!r}"
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_skips_absence_filter(self):
+        """Remediation runs (remediation_findings set) skip dedup AND the absence filter.
+
+        The early-return for remediation_findings must fire before filter_false_absence_flags
+        is applied, so absence flags are passed through unchanged.
+
+        This test remains GREEN after step-12 as long as the early-return is preserved.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        stage.remediation_findings = [{'description': 'fix this'}]  # remediation mode
+        # get_task must NOT be called at all for remediation runs
+        stage.taskmaster.get_task.side_effect = AssertionError(
+            'get_task must NOT be called during a remediation run'
+        )
+
+        absence_flag = {
+            'task_id': '3438',
+            'flag_type': 'task_absent',
+            'description': 'phantom task',
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[absence_flag],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[absence_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-c',
+            )
+
+        # Remediation early-return fires before filter_false_absence_flags —
+        # get_task must never be called, and the flag must survive unchanged.
+        assert report is not None
+        assert report.items_flagged == [absence_flag], (
+            "Remediation run must return items_flagged unchanged (early return before "
+            f"filter_false_absence_flags); got {report.items_flagged!r}"
         )
