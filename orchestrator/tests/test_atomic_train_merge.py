@@ -384,3 +384,187 @@ class TestScenario1HappyPath:
                 ["git", "worktree", "remove", "--force", str(main_wt)],
                 cwd=repo,
             )
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 2, 3, 4 (dispatch + worktree base) — step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScenario2WorktreeBase:
+    """PRD §10 row 2: β's worktree branches off α's tip (not main).
+
+    Uses real git_ops.create_worktree(train={order:1, ...}).
+    No cargo needed.
+    """
+
+    async def test_sibling_tip_worktree_base(self, tmp_path: Path) -> None:
+        """β worktree base == α tip SHA; git log task/beta..task/alpha is empty."""
+        from orchestrator.git_ops import GitOps, _run
+
+        # Seed a plain git repo (no cargo fixture needed for this scenario).
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        await _run(["git", "init", "-b", "main"], cwd=repo)
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+        await _run(["git", "config", "user.name", "Test"], cwd=repo)
+        (repo / "README.md").write_text("# Test\n")
+        await _run(["git", "add", "-A"], cwd=repo)
+        await _run(["git", "commit", "-m", "initial"], cwd=repo)
+
+        git_config = GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        )
+        git_ops = GitOps(git_config, repo)
+
+        # Create α branch off main with one commit so it has a non-main tip.
+        wt_a, alpha_sha = await make_stacked_member(
+            git_ops, "alpha", (await git_ops._freshen_main())[0],
+            lambda wt: (wt / "alpha.txt").write_text("alpha\n"),
+        )
+
+        # Now create β using train metadata: order=1, predecessor=alpha.
+        # create_worktree branches β off α's tip (PRD §9.4).
+        train_meta = {
+            "id": "T-worktree",
+            "order": 1,
+            "members": ["alpha", "beta"],
+        }
+        wt_b_info = await git_ops.create_worktree("beta", train=train_meta)
+        wt_b = wt_b_info.path
+
+        # Set git identity in β's worktree.
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_b)
+        await _run(["git", "config", "user.name", "Test"], cwd=wt_b)
+
+        # Assert: merge-base(task/beta, task/alpha) == alpha's tip SHA.
+        _, merge_base_out, _ = await _run(
+            ["git", "merge-base", "task/beta", "task/alpha"], cwd=repo
+        )
+        assert merge_base_out.strip() == alpha_sha, (
+            f"expected merge-base == alpha tip {alpha_sha!r}, "
+            f"got {merge_base_out.strip()!r}"
+        )
+
+        # Assert: git log task/beta..task/alpha is empty
+        # (β branched exactly off α's tip, so no commits between them).
+        _, log_out, _ = await _run(
+            ["git", "log", "--oneline", "task/beta..task/alpha"], cwd=repo
+        )
+        assert log_out.strip() == "", (
+            f"expected empty log between task/beta and task/alpha, "
+            f"got: {log_out!r}"
+        )
+
+
+@pytest.mark.asyncio
+class TestScenario3IntraTrainDispatch:
+    """PRD §10 row 3: β dispatches when α is merge-deferred (intra-train allowance).
+
+    Drives real scheduler._deps_satisfied with a status_map containing
+    α='merge-deferred' and both tasks sharing train.id='T1'.
+    """
+
+    async def test_intra_train_dispatch(self, tmp_path: Path, caplog) -> None:
+        """_deps_satisfied returns True for same-train merge-deferred predecessor."""
+        import logging
+
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        scheduler = Scheduler(config)
+
+        alpha_task = {
+            "id": "alpha",
+            "title": "Alpha",
+            "description": "",
+            "dependencies": [],
+            "metadata": {"train": {"id": "T1", "order": 0, "members": ["alpha", "beta"]}},
+        }
+        beta_task = {
+            "id": "beta",
+            "title": "Beta",
+            "description": "",
+            "dependencies": [{"id": "alpha"}],
+            "metadata": {"train": {"id": "T1", "order": 1, "members": ["alpha", "beta"]}},
+        }
+
+        status_map = {"alpha": "merge-deferred", "beta": "in-progress"}
+        tasks_by_id = {"alpha": alpha_task, "beta": beta_task}
+
+        with caplog.at_level(logging.DEBUG, logger="orchestrator.scheduler"):
+            result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
+
+        assert result is True, (
+            "Expected _deps_satisfied to return True for intra-train merge-deferred dep"
+        )
+        debug_text = " ".join(r.getMessage() for r in caplog.records)
+        assert "intra-train dep satisfied" in debug_text, (
+            f"Expected 'intra-train dep satisfied' in logs; got: {debug_text!r}"
+        )
+
+
+@pytest.mark.asyncio
+class TestScenario4ExtraTrainDispatchBlocked:
+    """PRD §10 row 4: non-train task blocked by merge-deferred dep (no allowance).
+
+    Regression: merge-deferred must NOT be treated as terminal for deps that
+    cross train boundaries (or where the dependent has no train metadata).
+    """
+
+    async def test_extra_train_dispatch_blocked(self, tmp_path: Path) -> None:
+        """_deps_satisfied returns False when dependent has no train metadata."""
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        scheduler = Scheduler(config)
+
+        alpha_task = {
+            "id": "alpha",
+            "title": "Alpha",
+            "description": "",
+            "dependencies": [],
+            "metadata": {"train": {"id": "T1", "order": 0, "members": ["alpha"]}},
+        }
+        # δ has NO train metadata — plain task depending on α.
+        delta_task = {
+            "id": "delta",
+            "title": "Delta",
+            "description": "",
+            "dependencies": [{"id": "alpha"}],
+            "metadata": {},  # no train key
+        }
+
+        status_map = {"alpha": "merge-deferred", "delta": "pending"}
+        tasks_by_id = {"alpha": alpha_task, "delta": delta_task}
+
+        result = scheduler._deps_satisfied(delta_task, status_map, tasks_by_id)
+
+        assert result is False, (
+            "Expected _deps_satisfied to return False for non-train task "
+            "blocked by merge-deferred dep (merge-deferred is not terminal for "
+            "cross-train or plain-task deps)"
+        )
