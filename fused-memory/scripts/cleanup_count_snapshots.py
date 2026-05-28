@@ -577,7 +577,20 @@ async def run(
     try:
         project_ids = select_projects(known_projects_map, getattr(args, 'project_id', None))
     except ValueError as exc:
-        return {'error': str(exc), 'aborted': True, 'dry_run': not args.apply}
+        abort_payload: dict[str, Any] = {
+            'error': str(exc),
+            'aborted': True,
+            'dry_run': not args.apply,
+            'generated_at': generated_at,
+        }
+        print(json.dumps(abort_payload, indent=2, default=str))
+        filter_val = getattr(args, 'project_id', None)
+        print(
+            f'ABORT: unknown --project-id {filter_val!r}; '
+            f'known: {sorted(known_projects_map)}',
+            file=sys.stderr,
+        )
+        return abort_payload
 
     # First pass: fetch entity counts for the safety cap check.
     # We do this BEFORE calling get_all_valid_edges / scanning so that an
@@ -596,13 +609,20 @@ async def run(
         args.yes_i_am_sure,
     )
     if abort:
-        return {
+        cap_payload: dict[str, Any] = {
             'aborted': True,
             'dry_run': not args.apply,
             'exceeding_projects': exceeding,
             'limit_per_project': args.limit_per_project,
             'generated_at': generated_at,
         }
+        print(json.dumps(cap_payload, indent=2, default=str))
+        print(
+            f'ABORT: projects exceeding --limit-per-project={args.limit_per_project}: '
+            f'{exceeding}. Pass --yes-i-am-sure to override.',
+            file=sys.stderr,
+        )
+        return cap_payload
 
     # Second pass: scan only projects that passed the cap
     scan_results_by_project: dict[str, list[EntityScanResult]] = {}
@@ -675,11 +695,11 @@ def main() -> int:
         memory = MemoryService(config)
         await memory.initialize()
         try:
-            await run(args, memory=memory)
+            report = await run(args, memory=memory)
         finally:
             if hasattr(memory, 'close'):
                 await memory.close()
-        return 0
+        return 1 if report.get('aborted') else 0
 
     return asyncio.run(_run_live())
 
