@@ -1288,11 +1288,15 @@ class TestCapRetryEdgeCases:
         assert got.success is False
 
     async def test_zero_cost_unknown_message_still_cap(self):
-        """A zero-cost instant exit with an UNRECOGNISED message is still a cap.
+        """A zero-cost instant exit with a cap-hit-style stderr is still a cap.
 
-        Guards against over-narrowing the new CLI-error carve-out: when stderr is
-        empty (and output carries no known CLI-error marker), the heuristic must
-        still treat the result as a cap hit and fail over.
+        Guards against over-narrowing the new CLI-error carve-out: a realistic
+        cap-hit message that contains NO substring from NON_CAP_CLI_ERROR_MARKERS
+        must still route through the heuristic cap path (sleep + retry).  Using a
+        realistic phrase (rather than empty stderr) also guards against future
+        over-broadening: if a new marker like 'limit reached' were added to
+        NON_CAP_CLI_ERROR_MARKERS, this test would catch the accidental
+        reclassification of a genuine cap message as a CLI error.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1302,7 +1306,8 @@ class TestCapRetryEdgeCases:
         )
         gate._handle_cap_detected = MagicMock(return_value=True)
         capped = make_result(
-            success=False, cost_usd=0, turns=0, duration_ms=300, stderr='',
+            success=False, cost_usd=0, turns=0, duration_ms=300,
+            stderr='Claude usage limit reached - resets at 2026-01-01T00:00:00Z',
         )
         ok = make_result()
         with (
