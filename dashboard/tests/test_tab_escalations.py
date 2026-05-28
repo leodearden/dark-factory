@@ -275,3 +275,61 @@ def test_tab_escalations_jsx_served_and_exports_component(_client) -> None:
         "tab_escalations.jsx does not reference the localStorage key 'df.open.esc' — "
         "pass it as the storageKey argument to useOpenSet so fold state is persisted."
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5 test: app.jsx wires the escalations tab
+# ---------------------------------------------------------------------------
+
+
+def test_app_jsx_wires_escalations_tab(app_jsx_body: str) -> None:
+    """app.jsx must destructure EscalationsTab from window.DF_TABS, add an 'esc'
+    tab entry, handle it in renderTab, include it in railCounts, and configure toolbarConfig.
+
+    Asserts five structural wiring contracts:
+    (a) EscalationsTab is destructured from window.DF_TABS.
+    (b) tabs[] contains an entry with id 'esc'.
+    (c) renderTab switch has a `case 'esc':` branch.
+    (d) railCounts includes an `esc:` key that references ESCALATIONS.pending.
+    (e) toolbarConfig has an `esc:` entry.
+    """
+    # (a) EscalationsTab destructured from window.DF_TABS
+    assert re.search(
+        r'const\s*\{[^}]*EscalationsTab[^}]*\}\s*=\s*window\.DF_TABS', app_jsx_body
+    ) or 'EscalationsTab' in (app_jsx_body.split('window.DF_TABS')[1] if 'window.DF_TABS' in app_jsx_body else ''), (
+        'app.jsx does not destructure EscalationsTab from window.DF_TABS — add '
+        '`EscalationsTab` to the `const { ... } = window.DF_TABS;` destructure.'
+    )
+    # (b) tabs[] entry
+    assert "id: 'esc'" in app_jsx_body, (
+        "app.jsx tabs array does not contain an entry with `id: 'esc'` — "
+        "add `{ id: 'esc', ... }` to the tabs array."
+    )
+    # (c) renderTab switch case
+    assert "case 'esc':" in app_jsx_body, (
+        "app.jsx renderTab switch does not have `case 'esc':` — add the case "
+        'branch to render <EscalationsTab projectFilter={projects} />.'
+    )
+    # (d) railCounts esc key references ESCALATIONS and pending
+    assert re.search(r'esc\s*:', app_jsx_body), (
+        "app.jsx railCounts does not contain an `esc:` key — add "
+        "`esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0` to railCounts."
+    )
+    assert 'ESCALATIONS' in app_jsx_body, (
+        'app.jsx does not reference ESCALATIONS — add `esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0` '
+        'to railCounts so the escalations count shows in the rail.'
+    )
+    assert 'pending' in app_jsx_body.split('ESCALATIONS')[1][:200], (
+        "app.jsx railCounts esc entry does not reference 'pending' near ESCALATIONS — "
+        'ensure esc count reads by_status.pending from ESCALATIONS.'
+    )
+    # (e) toolbarConfig esc entry
+    # Check that 'esc:' appears in a config-like context (toolbarConfig block)
+    esc_in_toolbar = False
+    parts = app_jsx_body.split('toolbarConfig')
+    if len(parts) > 1:
+        esc_in_toolbar = "esc:" in parts[1] or "'esc'" in parts[1]
+    assert esc_in_toolbar, (
+        "app.jsx toolbarConfig does not have an 'esc:' entry — add "
+        "`esc: { showWindow: false, showAgents: false, search: false }` to toolbarConfig."
+    )
