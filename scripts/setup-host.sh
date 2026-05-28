@@ -133,6 +133,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5. Orchestrator systemd units + watchdog
+# ---------------------------------------------------------------------------
+# Installs and enables:
+#   - /home/leo/bin/wait-for-port.py        (port-wait helper used by ExecStartPre)
+#   - orchestrator-dark-factory.service     (dark-factory orchestrator, supervised)
+#   - orchestrator-reify.service            (reify orchestrator, supervised)
+#   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
+#
+# The unit files reference /home/leo/bin/wait-for-port.py from ExecStartPre,
+# so the helper lives under ~/bin (stable absolute path across repo moves).
+# curl is broken on this host (libcurl.so.4 load failure), so all port probes
+# use python urllib / raw sockets.
+info "Installing orchestrator units + watchdog"
+
+mkdir -p "$HOME/bin"
+install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.py"
+
+cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-reify.service"        "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"     "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"       "$UNIT_DIR/"
+
+systemctl --user daemon-reload
+# Watchdog timer always enabled — it's the safety net that revives a
+# dead-enabled orchestrator (e.g. after a boot-race dependency cancel).
+systemctl --user enable orchestrator-watchdog.timer
+# Both orchestrators enabled by default to match the running production stack
+# (they coexist on separate escalation ports: reify=8100, dark-factory=8102).
+# Disable selectively if a host should not be part of the unattended workload.
+systemctl --user enable orchestrator-reify.service
+systemctl --user enable orchestrator-dark-factory.service
+ok "orchestrator units + watchdog installed and enabled"
+
+# ---------------------------------------------------------------------------
 # 6. jCodeMunch — structured code retrieval for coding agents
 # ---------------------------------------------------------------------------
 info "Installing jCodeMunch (AST-based code indexing)"

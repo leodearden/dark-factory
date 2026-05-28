@@ -2,8 +2,8 @@
 
 These tests read the source-controlled service definition files directly —
 no systemd runtime is required.  They guard the shape of:
-  - scripts/dark-factory-orchestrator.service
-  - scripts/reify-orchestrator.service
+  - scripts/orchestrator-dark-factory.service
+  - scripts/orchestrator-reify.service
   - scripts/orchestrator-watchdog.service
   - scripts/orchestrator-watchdog.timer
 
@@ -16,19 +16,19 @@ import pathlib
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-DF_SERVICE = REPO_ROOT / "scripts" / "dark-factory-orchestrator.service"
-REIFY_SERVICE = REPO_ROOT / "scripts" / "reify-orchestrator.service"
+DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
+REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
 WATCHDOG_SERVICE = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
 WATCHDOG_TIMER = REPO_ROOT / "scripts" / "orchestrator-watchdog.timer"
 
 
 # ---------------------------------------------------------------------------
-# dark-factory-orchestrator.service
+# orchestrator-dark-factory.service
 # ---------------------------------------------------------------------------
 
 
 def test_dark_factory_orchestrator_service_structure() -> None:
-    """scripts/dark-factory-orchestrator.service must have the required systemd shape."""
+    """scripts/orchestrator-dark-factory.service must have the required systemd shape."""
     content = DF_SERVICE.read_text(encoding="utf-8")
 
     # --- sections ---
@@ -46,11 +46,26 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     assert "fused-memory.service" in after_line
     assert "reify-jobserver.service" in after_line
     assert "pytest-jobserver.service" in after_line
-    assert "Requires=fused-memory.service" in content
+    # Wants=, NOT Requires=: a hard Requires= turns a single fused-memory
+    # first-start failure (boot race) into a permanent cancel of our start
+    # job — systemd never retries a dependency-failed job. See 2026-05-27
+    # post-powercut hardening.
+    assert "Wants=fused-memory.service" in content
+    assert "Requires=fused-memory.service" not in content, (
+        "Requires=fused-memory.service is a regression — use Wants= so a "
+        "transient fused-memory blip doesn't permanently cancel our start job"
+    )
 
     # --- [Service] ---
     assert "Type=simple" in content
     assert "WorkingDirectory=/home/leo/src/dark-factory" in content
+    # Port-wait ExecStartPre: gate startup on fused-memory's MCP port (8002)
+    # being live. Pairs with Wants= above — waits cleanly instead of
+    # crash-looping while fused-memory comes up.
+    assert (
+        "ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002"
+        in content
+    ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
         "uv run --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml"
         in content
@@ -60,7 +75,11 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     assert "RestartMaxDelaySec=60" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
-    assert "TimeoutStopSec=30" in content
+    assert "TimeoutStopSec=90" in content
+    # TimeoutStartSec must exceed the ExecStartPre poll budget (280s) so a slow
+    # fused-memory cold-start is covered by ONE start attempt rather than
+    # burning StartLimit.
+    assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
     assert "StandardError=journal" in content
 
@@ -69,12 +88,12 @@ def test_dark_factory_orchestrator_service_structure() -> None:
 
 
 # ---------------------------------------------------------------------------
-# reify-orchestrator.service
+# orchestrator-reify.service
 # ---------------------------------------------------------------------------
 
 
 def test_reify_orchestrator_service_structure() -> None:
-    """scripts/reify-orchestrator.service must have the required systemd shape."""
+    """scripts/orchestrator-reify.service must have the required systemd shape."""
     content = REIFY_SERVICE.read_text(encoding="utf-8")
 
     # --- sections ---
@@ -91,7 +110,11 @@ def test_reify_orchestrator_service_structure() -> None:
     assert "fused-memory.service" in after_line
     assert "reify-jobserver.service" in after_line
     assert "pytest-jobserver.service" in after_line
-    assert "Requires=fused-memory.service" in content
+    assert "Wants=fused-memory.service" in content
+    assert "Requires=fused-memory.service" not in content, (
+        "Requires=fused-memory.service is a regression — use Wants= so a "
+        "transient fused-memory blip doesn't permanently cancel our start job"
+    )
 
     # --- [Service] ---
     assert "Type=simple" in content
@@ -102,6 +125,10 @@ def test_reify_orchestrator_service_structure() -> None:
         "(uv --project orchestrator requires the orchestrator/ subdir to live under cwd)"
     )
     assert (
+        "ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002"
+        in content
+    ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
+    assert (
         "uv run --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the reify config"
@@ -110,7 +137,8 @@ def test_reify_orchestrator_service_structure() -> None:
     assert "RestartMaxDelaySec=60" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
-    assert "TimeoutStopSec=30" in content
+    assert "TimeoutStopSec=90" in content
+    assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
     assert "StandardError=journal" in content
 
@@ -236,12 +264,12 @@ def _parse_sections(content: str) -> dict[str, list[str]]:
     "service_path",
     [
         pytest.param(
-            REPO_ROOT / "scripts" / "dark-factory-orchestrator.service",
-            id="dark-factory-orchestrator",
+            REPO_ROOT / "scripts" / "orchestrator-dark-factory.service",
+            id="orchestrator-dark-factory",
         ),
         pytest.param(
-            REPO_ROOT / "scripts" / "reify-orchestrator.service",
-            id="reify-orchestrator",
+            REPO_ROOT / "scripts" / "orchestrator-reify.service",
+            id="orchestrator-reify",
         ),
     ],
 )

@@ -1,0 +1,56 @@
+[Unit]
+Description=Reify Orchestrator (supervised)
+Documentation=file:///home/leo/src/dark-factory/plans/afk-C1-systemd.md
+After=network.target fused-memory.service reify-jobserver.service pytest-jobserver.service
+# Wants=, not Requires=: a hard Requires= turns a single fused-memory first-start
+# failure (boot race) into a PERMANENT cancel of our start job — systemd never
+# retries a dependency-failed job. Wants= still orders us after fused-memory but
+# lets us proceed; the ExecStartPre below then waits for port 8002, and
+# Restart=on-failure self-heals if fused-memory is mid-restart.
+Wants=fused-memory.service
+
+# Restart-rate guard: 10 starts within 600s tolerates cap-rotation churn and
+# recoverable cascades but blocks a true crash loop. Default StartLimitAction
+# (none) stops auto-restart so an operator inspects the journal, then restarts
+# manually -- the intended fail-safe.
+# Per systemd >=230 these MUST live under [Unit]; placing them under [Service]
+# is silently ignored (guarded by test_start_limit_directives_under_unit_section).
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# CWD must be dark-factory so `uv run --project orchestrator` can resolve the
+# orchestrator/ project dir (its pyproject lives only under this repo). The
+# app's load_dotenv() then reads /home/leo/src/dark-factory/.env.
+WorkingDirectory=/home/leo/src/dark-factory
+# Gate startup on fused-memory's MCP port (8002) being live. Pairs with Wants=
+# above: waits cleanly instead of crash-looping while fused-memory comes up.
+ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
+ExecStart=/home/leo/.local/bin/uv run --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml
+
+# PATH replicated from the working manual process so verify subprocesses find
+# cargo / node / npm / sccache. (A systemd user service otherwise gets a
+# minimal PATH.) Secrets load via the app's own dotenv -- same pattern as
+# fused-memory.service, which also keeps secrets out of the unit file.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+Environment=LANG=en_US.UTF-8
+
+# Auto-restart on crash; back off up to 60s.
+Restart=on-failure
+RestartSec=10
+RestartMaxDelaySec=60
+
+# Orchestrator shutdown cancels in-flight tasks, reaps agent subprocesses, and
+# releases the fcntl lock. Give the async cleanup room before SIGKILL.
+TimeoutStopSec=90
+
+# Must exceed the ExecStartPre poll budget (280s) so a slow fused-memory
+# cold-start is covered by ONE start attempt rather than burning StartLimit.
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
