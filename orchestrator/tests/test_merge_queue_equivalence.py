@@ -28,6 +28,7 @@ from orchestrator.merge_queue import (
     MergeRequest,
     MergeWorker,
     PostMergePyrightResult,
+    SpeculativeMergeWorker,
     _check_post_merge_pyright,
 )
 
@@ -536,4 +537,136 @@ class TestMergeWorkerPyrightCallSite:
         outcomes = [r[0] for r in rows]
         assert 'post_merge_pyright_broken' in outcomes, (
             f'Expected post_merge_pyright_broken event, got: {outcomes!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# SpeculativeMergeWorker._verifier_loop call-site integration tests  (step-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorkerPyrightCallSite:
+    """Integration: SpeculativeMergeWorker._verifier_loop calls _check_post_merge_pyright."""
+
+    async def test_broken_pyright_blocks_speculative_merge_without_push(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Broken pyright in speculative path → blocked outcome, reason starts with prefix, push NOT called."""
+        worktree = (await git_ops.create_worktree('smw-pyright-broken')).path
+        (worktree / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add mod.py')
+
+        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        push_mock = AsyncMock(return_value='pushed')
+        with (
+            patch.object(git_ops, 'push_main', push_mock),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_scoped_verify_pass(),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                _mock_pyright_broken('subpkg'),
+            ),
+        ):
+            req = _make_merge_request(
+                'smw-pyright-broken', 'smw-pyright-broken', worktree, config,
+                module_configs=[mc],
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
+        assert 'subpkg' in outcome.reason
+        push_mock.assert_not_awaited()
+
+    async def test_clean_pyright_allows_speculative_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Clean pyright in speculative path → 'done' outcome."""
+        worktree = (await git_ops.create_worktree('smw-pyright-clean')).path
+        (worktree / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add mod.py')
+
+        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_scoped_verify_pass(),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                _mock_pyright_clean(),
+            ),
+        ):
+            req = _make_merge_request(
+                'smw-pyright-clean', 'smw-pyright-clean', worktree, config,
+                module_configs=[mc],
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert outcome.status == 'done'
+
+    async def test_broken_pyright_cleans_up_merge_worktree(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Broken pyright → merge_wt is cleaned up (cleanup_merge_worktree awaited)."""
+        worktree = (await git_ops.create_worktree('smw-pyright-cleanup')).path
+        (worktree / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add mod.py')
+
+        mc = _make_module_config(prefix='subpkg', type_check_command='pyright src/')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_cleanup = git_ops.cleanup_merge_worktree
+        cleanup_spy = AsyncMock(wraps=original_cleanup)
+        with (
+            patch.object(git_ops, 'cleanup_merge_worktree', cleanup_spy),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_scoped_verify_pass(),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                _mock_pyright_broken('subpkg'),
+            ),
+        ):
+            req = _make_merge_request(
+                'smw-pyright-cleanup', 'smw-pyright-cleanup', worktree, config,
+                module_configs=[mc],
+            )
+            await queue.put(req)
+            await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert cleanup_spy.await_count >= 1, (
+            'cleanup_merge_worktree must be awaited on the broken pyright path'
         )
