@@ -269,6 +269,66 @@ class TestHarnessForwardsReconState:
             )
 
 
+class TestMainWiringReconState:
+    """Verify that run_server threads the recon_report state into ReconciliationHarness.
+
+    Part 1 (functional): tests that _build_recon_report_components() returns a
+    ReconReportState that can be passed to ReconciliationHarness and is preserved
+    as harness._recon_report_state (identity check).
+
+    Part 2 (structural / RED): tests that run_server's source actually contains the
+    wiring call so the live process — not just a manual construction — threads the
+    state. This assertion FAILS until step-12 changes run_server.
+    """
+
+    def test_build_recon_report_components_returns_recon_report_state(self):
+        """_build_recon_report_components returns a ReconReportState instance."""
+        from fused_memory.config.schema import FusedMemoryConfig, ServerConfig
+        from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_report import ReconReportState
+
+        config = FusedMemoryConfig(server=ServerConfig(recon_report_port=8099))
+        state, _, _ = _build_recon_report_components(config)
+        assert isinstance(state, ReconReportState)
+
+    def test_harness_preserves_state_identity(self):
+        """ReconciliationHarness preserves the exact state object passed at construction."""
+        from fused_memory.config.schema import FusedMemoryConfig, ServerConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = FusedMemoryConfig(server=ServerConfig(recon_report_port=8099))
+        state, _, _ = _build_recon_report_components(config)
+
+        harness = ReconciliationHarness(
+            memory_service=AsyncMock(),
+            taskmaster=None,
+            journal=AsyncMock(),
+            event_buffer=MagicMock(),
+            config=config,
+            recon_report_state=state,
+        )
+        assert harness._recon_report_state is state
+
+    def test_run_server_wires_recon_report_state_into_harness(self):
+        """run_server must pass recon_report_state to ReconciliationHarness.
+
+        RED: run_server currently constructs ReconciliationHarness WITHOUT
+        recon_report_state. Step-12 adds the wiring. After step-12, the
+        ReconciliationHarness construction line in run_server will contain
+        'recon_report_state=recon_report_state' (or equivalent).
+        """
+        import inspect
+
+        from fused_memory.server import main as main_mod
+
+        src = inspect.getsource(main_mod.run_server)
+        assert 'recon_report_state=recon_report_state' in src, (
+            'run_server must pass recon_report_state= to ReconciliationHarness '
+            '(step-12 wires this). Source currently lacks the kwarg.'
+        )
+
+
 class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
