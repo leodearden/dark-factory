@@ -75,3 +75,94 @@ class EntityScanResult:
     edge_matches: list[EdgeMatch] = field(default_factory=list)
     summary_matched: bool = False
     summary_excerpt: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Pure core: scan
+# ---------------------------------------------------------------------------
+
+def scan_entities_for_snapshots(
+    project_id: str,
+    entities: list[dict[str, Any]],
+    edges_by_entity: dict[str, list[dict[str, Any]]],
+) -> list[EntityScanResult]:
+    """Scan entity nodes and their edges for count-snapshot pollution.
+
+    Parameters
+    ----------
+    project_id:
+        The Graphiti group_id / project identifier.
+    entities:
+        List of entity dicts from ``memory.graphiti.list_entity_nodes``.
+        Each has at minimum ``{'uuid': ..., 'name': ..., 'summary': ...}``.
+    edges_by_entity:
+        Mapping from entity_uuid to list of edge dicts, as returned by
+        ``memory.graphiti.get_all_valid_edges``.  The same edge_uuid may
+        appear under multiple entity_uuids (double-attribution); we dedupe.
+
+    Returns
+    -------
+    List of ``EntityScanResult``, one per entity, sorted by ``entity_uuid``.
+    Each result's ``edge_matches`` are sorted by ``edge_uuid``.
+    """
+    # First pass: build a global edge_uuid -> EdgeMatch dict to dedupe
+    # double-attributed edges across all entities.
+    edge_map: dict[str, EdgeMatch] = {}
+
+    sorted_entities = sorted(entities, key=lambda e: e['uuid'])
+
+    for entity in sorted_entities:
+        euuid = entity['uuid']
+        for edge in edges_by_entity.get(euuid, []):
+            edge_uuid = edge['uuid']
+            fact = edge.get('fact') or ''
+            if not is_count_snapshot(fact):
+                continue
+            if edge_uuid in edge_map:
+                # Already seen — just accumulate the endpoint
+                if euuid not in edge_map[edge_uuid].entity_uuids:
+                    edge_map[edge_uuid].entity_uuids.append(euuid)
+            else:
+                excerpt = fact[:200]
+                edge_map[edge_uuid] = EdgeMatch(
+                    edge_uuid=edge_uuid,
+                    fact_excerpt=excerpt,
+                    project_id=project_id,
+                    entity_uuids=[euuid],
+                )
+
+    # Second pass: build per-entity results, referencing the deduped EdgeMatch
+    # objects so entity_uuids stay consistent.
+    results: list[EntityScanResult] = []
+    for entity in sorted_entities:
+        euuid = entity['uuid']
+        summary = entity.get('summary') or ''
+
+        # Collect EdgeMatches where this entity is an endpoint
+        entity_edges = [
+            m for m in edge_map.values() if euuid in m.entity_uuids
+        ]
+        entity_edges.sort(key=lambda m: m.edge_uuid)
+
+        # Summary-level snapshot detection (report-only)
+        summary_matched = is_count_snapshot(summary)
+        summary_excerpt: str | None = None
+        if summary_matched:
+            # Return the first matching line as excerpt
+            for line in summary.splitlines():
+                if is_count_snapshot(line):
+                    summary_excerpt = line[:200]
+                    break
+            if summary_excerpt is None:
+                summary_excerpt = summary[:200]
+
+        results.append(EntityScanResult(
+            project_id=project_id,
+            entity_uuid=euuid,
+            entity_name=entity.get('name', ''),
+            edge_matches=entity_edges,
+            summary_matched=summary_matched,
+            summary_excerpt=summary_excerpt,
+        ))
+
+    return results
