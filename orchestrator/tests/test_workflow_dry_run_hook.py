@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -273,3 +274,14 @@ class TestMarkBlockedDeduplicatesDryRun:
         hang_event.set()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Protocol-conformance assertion (static-only; never executes at runtime).
+# Mirrors the pattern at test_workflow_e2e.py:6109-6114.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.workflow import _SchedulerLike
+
+    _scheduler_conforms: _SchedulerLike = _Scheduler()
