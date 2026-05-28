@@ -252,7 +252,7 @@ async def run_stage_via_cli(
             max_budget_usd=5.0,
             disallowed_tools=disallowed_tools,
             mcp_config=mcp_config,
-            output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA,
+            output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
@@ -348,4 +348,7 @@ def _extract_report(result: AgentResult) -> dict:
         # Fallback: wrap raw text as summary
         return {'summary': result.output[:2000]}
 
-    return {'summary': 'No output from agent'}
+    # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
+    # fallback path (empty assembled dict) triggers cleanly rather than masking
+    # a missing report with a fake 'No output' summary.
+    return {}
