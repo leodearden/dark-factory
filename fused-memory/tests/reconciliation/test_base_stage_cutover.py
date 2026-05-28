@@ -226,6 +226,49 @@ class TestReconStateFallbackToEmpty:
         assert report.completed_at is not None
 
 
+class TestHarnessForwardsReconState:
+    """ReconciliationHarness must accept recon_report_state and forward it to all stages."""
+
+    def _make_harness(self, state):
+        from unittest.mock import MagicMock
+
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        config = FusedMemoryConfig()
+        memory_mock = AsyncMock()
+        journal_mock = AsyncMock()
+        event_buffer_mock = MagicMock()
+
+        return ReconciliationHarness(
+            memory_service=memory_mock,
+            taskmaster=None,
+            journal=journal_mock,
+            event_buffer=event_buffer_mock,
+            config=config,
+            recon_report_state=state,
+        )
+
+    def test_stages_receive_recon_report_state(self):
+        """All three stages get _recon_report_state set to the injected state object."""
+        state = _FakeReconState()
+        harness = self._make_harness(state)
+        for stage in harness.stages:
+            assert stage._recon_report_state is state, (
+                f'Stage {stage.stage_id} must have _recon_report_state set'
+            )
+
+    def test_stages_receive_recon_report_port_from_config(self):
+        """All three stages get _recon_report_port from config.server.recon_report_port."""
+        state = _FakeReconState()
+        harness = self._make_harness(state)
+        # Default ServerConfig has recon_report_port=8003
+        for stage in harness.stages:
+            assert stage._recon_report_port == 8003, (
+                f'Stage {stage.stage_id} must have _recon_report_port=8003 from config'
+            )
+
+
 class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
