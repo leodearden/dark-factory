@@ -19,7 +19,11 @@ from pathlib import Path
 import pytest
 from shared.async_sqlite_base import CheckpointResult
 
-from fused_memory.server.tools import _checkpoint_overrides_db, _connect_overrides_db, _open_overrides_db
+from fused_memory.server.tools import (
+    _checkpoint_overrides_db,
+    _connect_overrides_db,
+    _open_overrides_db,
+)
 
 # ---------------------------------------------------------------------------
 # TestOpenOverridesDbPragmas
