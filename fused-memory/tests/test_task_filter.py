@@ -8,7 +8,9 @@ from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
+    MAX_ACTIVE_TASKS_RENDERED,
     MAX_CANCELLED_TASKS_RETAINED,
+    MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
     _flatten_with_subtasks,
     _render_task_line,
@@ -2255,4 +2257,127 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
         completion_order = [1369, 1355, 1361]
         assert id_order != completion_order, (
             'done_tasks id order matches completion order — nlargest reorder path not exercised'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 1: max_task_id field (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterTaskTreeMaxTaskId:
+    """RED tests for FilteredTaskTree.max_task_id (step-1).
+
+    max_task_id must be the global maximum TOP-LEVEL task id across the FULL
+    input, independent of the active/done/cancelled render caps.
+    """
+
+    def test_max_task_id_populated_across_full_input_ignoring_render_caps(self):
+        """max_task_id equals the global max id even when done/cancelled/active lists are capped.
+
+        Build a tasks_data with:
+          - MAX_DONE_TASKS_RETAINED + 5 done tasks (ids 1..35), caps at 30
+          - MAX_CANCELLED_TASKS_RETAINED + 5 cancelled tasks (ids 36..55), caps at 15
+          - MAX_ACTIVE_TASKS_RENDERED + 5 active (pending) tasks (ids 56..110)
+          - One active task with id 4044 (the global max)
+          - One done task with a dotted subtask id '4044.2' that maps to parent 4044
+
+        Expected: result.max_task_id == 4044 even though none of these tasks
+        necessarily appear in the capped done_tasks/cancelled_tasks lists.
+        """
+        # Build done tasks: ids 1..MAX_DONE_TASKS_RETAINED+5 (capped at MAX_DONE_TASKS_RETAINED=30)
+        done_tasks = [_make_task(i, 'done') for i in range(1, MAX_DONE_TASKS_RETAINED + 6)]
+
+        # Build cancelled tasks: ids starting after done tasks
+        # (capped at MAX_CANCELLED_TASKS_RETAINED=15)
+        cancelled_start = MAX_DONE_TASKS_RETAINED + 6
+        cancelled_tasks = [
+            _make_task(cancelled_start + i, 'cancelled')
+            for i in range(MAX_CANCELLED_TASKS_RETAINED + 5)
+        ]
+
+        # Build active tasks: MAX_ACTIVE_TASKS_RENDERED + 5 = 55 active tasks
+        active_start = cancelled_start + MAX_CANCELLED_TASKS_RETAINED + 5
+        active_tasks = [
+            _make_task(active_start + i, 'pending')
+            for i in range(MAX_ACTIVE_TASKS_RENDERED + 5)
+        ]
+
+        # Add the highest-id task: id=4044 as active
+        high_id_task = _make_task(4044, 'pending', 'High ID task')
+        active_tasks.append(high_id_task)
+
+        # Add a subtask with dotted id '4044.2' as done — maps to parent 4044
+        subtask_4044_2 = {
+            'id': '4044.2',
+            'title': 'Subtask of 4044',
+            'status': 'done',
+            'dependencies': [],
+        }
+
+        all_tasks = done_tasks + cancelled_tasks + active_tasks + [subtask_4044_2]
+        tasks_data = {'tasks': all_tasks}
+
+        result = filter_task_tree(tasks_data)
+
+        # The done/cancelled lists are capped — verify caps are active
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'done_tasks should be capped at {MAX_DONE_TASKS_RETAINED}'
+        )
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'cancelled_tasks should be capped at {MAX_CANCELLED_TASKS_RETAINED}'
+        )
+
+        # max_task_id must equal 4044 — the global max across the FULL input
+        # (id 4044 is active and its subtask '4044.2' maps to parent 4044 via id_key)
+        assert result.max_task_id == 4044, (
+            f'max_task_id should be 4044 (global max), got {result.max_task_id}'
+        )
+
+    def test_max_task_id_uses_first_segment_rule_for_dotted_subtask_ids(self):
+        """max_task_id maps dotted subtask ids to their parent via the first-segment int rule.
+
+        A subtask with id='4044.2' contributes parent id 4044 to max_task_id,
+        not 2 and not a parsing error.
+        """
+        tasks_data = {
+            'tasks': [
+                _make_task(100, 'pending'),
+                {'id': '4044.2', 'title': 'Subtask', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+        assert result.max_task_id == 4044, (
+            f"Dotted id '4044.2' must map to parent 4044 via first-segment rule, "
+            f"got max_task_id={result.max_task_id}"
+        )
+
+    def test_max_task_id_zero_for_empty_input(self):
+        """filter_task_tree returns max_task_id == 0 for empty/non-dict inputs."""
+        # Empty dict (no 'tasks' key)
+        result = filter_task_tree({})
+        assert result.max_task_id == 0, (
+            f'Empty dict input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        # tasks is an empty list
+        result = filter_task_tree({'tasks': []})
+        assert result.max_task_id == 0, (
+            f'Empty tasks list: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        # Non-dict input
+        result = filter_task_tree(None)
+        assert result.max_task_id == 0, (
+            f'None input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        result = filter_task_tree('bad')
+        assert result.max_task_id == 0, (
+            f'String input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        result = filter_task_tree([{'id': 1, 'status': 'pending'}])
+        assert result.max_task_id == 0, (
+            f'List input: expected max_task_id==0, got {result.max_task_id}'
         )
