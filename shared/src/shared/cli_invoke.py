@@ -566,6 +566,32 @@ async def invoke_with_cap_retry(
                     # Couldn't attribute — fall through; downstream heuristic
                     # or return handles it.
 
+                # Wedge guard: a full-timeout CLI call (timed_out=True with zero
+                # turns and zero cost) means the subprocess never executed any
+                # agentic work.  Its provider-side session is orphaned; re-resuming
+                # it just perpetuates the same hang (observed:
+                # esc-task-curator-3/-5/-6, session
+                # c5d446f5-6339-4291-81d6-1d26b5e2f199, 2026-05-27).  Without this
+                # guard, the cap-hit branch below would re-set
+                # invoke_kwargs['resume_session_id'] = result.session_id from the
+                # wedge's session_id, perpetuating the wedge across every retry.
+                # Analogous to the fused_memory/reconciliation/agent_loop.py:368
+                # "clear stale session id" defence, applied at the cap-retry layer.
+                if (
+                    result.timed_out
+                    and result.turns == 0
+                    and result.cost_usd == 0.0
+                    and invoke_kwargs.get('resume_session_id')
+                ):
+                    logger.warning(
+                        f'{label}: zero-output timed-out invocation '
+                        f'(duration_ms={result.duration_ms}) — clearing wedged '
+                        f'resume_session_id={invoke_kwargs["resume_session_id"]} '
+                        f'before retry',
+                    )
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    continue  # __aexit__ releases probe slot
+
                 if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
