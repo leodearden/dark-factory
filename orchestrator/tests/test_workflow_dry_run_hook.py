@@ -57,6 +57,20 @@ class _Scheduler:
     def release(self, tid):
         pass
 
+    async def get_tasks(self) -> list[dict]:
+        return []
+
+    async def get_statuses(
+        self, ids: list[str] | None = None,
+    ) -> tuple[dict[str, str], Exception | None]:
+        return ({}, None)
+
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]:
+        return []
+
+    def clear_requeue_count(self, task_id: str, /) -> None:
+        pass
+
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',
                    enabled: bool = True) -> tuple[TaskWorkflow, _Scheduler]:
