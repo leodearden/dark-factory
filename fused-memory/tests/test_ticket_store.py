@@ -28,34 +28,38 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
     first_db = store._db
+    # Close the first connection before the idempotent re-init so it is not
+    # orphaned (task 1560: its non-daemon worker would otherwise leak).
+    await store.close()
     # Second call must be idempotent (CREATE IF NOT EXISTS)
     await store.initialize()
+    try:
+        # Verify the table exists with the expected columns
+        db = store._db
+        assert db is not None
+        cursor = await db.execute("PRAGMA table_info(tickets)")
+        rows = await cursor.fetchall()
+        col_names = {row[1] for row in rows}
 
-    # Verify the table exists with the expected columns
-    db = store._db
-    assert db is not None
-    cursor = await db.execute("PRAGMA table_info(tickets)")
-    rows = await cursor.fetchall()
-    col_names = {row[1] for row in rows}
-
-    expected_columns = {
-        'ticket_id',
-        'project_id',
-        'candidate_json',
-        'status',
-        'task_id',
-        'reason',
-        'result_json',
-        'created_at',
-        'resolved_at',
-        'expires_at',
-        'escalated_at',
-    }
-    assert expected_columns == col_names, (
-        f"Missing columns: {expected_columns - col_names}; "
-        f"Extra columns: {col_names - expected_columns}"
-    )
-    await store.close()
+        expected_columns = {
+            'ticket_id',
+            'project_id',
+            'candidate_json',
+            'status',
+            'task_id',
+            'reason',
+            'result_json',
+            'created_at',
+            'resolved_at',
+            'expires_at',
+            'escalated_at',
+        }
+        assert expected_columns == col_names, (
+            f"Missing columns: {expected_columns - col_names}; "
+            f"Extra columns: {col_names - expected_columns}"
+        )
+    finally:
+        await store.close()
     # task 1560: every connection this test opened must now be closed.
     assert first_db._connection is None, (
         'first TicketStore connection orphaned by the idempotent re-init was left'
@@ -350,12 +354,18 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
     first_db = store._db
-    assert store._db is not None
-    cursor = await store._db.execute('PRAGMA table_info(tickets)')
-    cols = {r[1] for r in await cursor.fetchall()}
-    assert 'escalated_at' in cols
-    # And idempotent: re-initialising must not raise.
-    await store.initialize()
+    try:
+        assert store._db is not None
+        cursor = await store._db.execute('PRAGMA table_info(tickets)')
+        cols = {r[1] for r in await cursor.fetchall()}
+        assert 'escalated_at' in cols
+        # Close the first connection before the idempotent re-init so it is not
+        # orphaned (task 1560).
+        await store.close()
+        # And idempotent: re-initialising must not raise.
+        await store.initialize()
+    finally:
+        await store.close()
     # task 1560: every connection this test opened must now be closed.
     assert first_db._connection is None, (
         'first TicketStore connection orphaned by the idempotent re-init was left'
@@ -442,8 +452,10 @@ async def test_list_tickets_filters_by_project(store):
     a_id = await store.submit(project_id='proj-a', candidate_json='{}')
     b_id = await store.submit(project_id='proj-b', candidate_json='{}')
 
-    a_rows = await store.list_tickets('proj-a')
-    assert {r['ticket_id'] for r in a_rows} == {a_id}
-    b_rows = await store.list_tickets('proj-b')
-    assert {r['ticket_id'] for r in b_rows} == {b_id}
-    await store.close()
+    try:
+        a_rows = await store.list_tickets('proj-a')
+        assert {r['ticket_id'] for r in a_rows} == {a_id}
+        b_rows = await store.list_tickets('proj-b')
+        assert {r['ticket_id'] for r in b_rows} == {b_id}
+    finally:
+        await store.close()
