@@ -15,6 +15,7 @@ in-flight queue state is in-memory and not persisted to the events table.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -442,6 +443,56 @@ async def recent_merges(
     return await with_db(db, _query, [])
 
 
+async def recent_train_events(
+    db: aiosqlite.Connection | None,
+    *,
+    limit: int = 50,
+    hours: int = 168,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Most recent train_* lifecycle events, newest first.
+
+    Args:
+        db: Async SQLite connection, or None (returns []).
+        limit: Maximum number of rows to return.
+        hours: Look-back window in hours (default 168 = 7 days).
+        now: Reference timestamp for the cutoff window (default:
+            ``datetime.now(UTC)``).
+
+    Returns list of {'task_id', 'run_id', 'event_type', 'timestamp', 'data'} dicts
+    where 'data' is a parsed dict.
+    """
+    if db is None:
+        return []
+
+    async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        since = _cutoff_iso(hours, now=now)
+        sql = (
+            "SELECT task_id, run_id, event_type, timestamp, data "
+            "FROM events "
+            "WHERE event_type IN ("
+            "  'train_started', 'train_member_deferred', "
+            "  'train_merged', 'train_derailed'"
+            ") "
+            "  AND timestamp >= ? "
+            "ORDER BY timestamp DESC "
+            "LIMIT ?"
+        )
+        rows = list(await conn.execute_fetchall(sql, (since, limit)))
+        return [
+            {
+                'task_id': row['task_id'],
+                'run_id': row['run_id'],
+                'event_type': row['event_type'],
+                'timestamp': row['timestamp'],
+                'data': json.loads(row['data'] or '{}'),
+            }
+            for row in rows
+        ]
+
+    return await with_db(db, _query, [])
+
+
 # ---------------------------------------------------------------------------
 # 5. Speculative stats
 # ---------------------------------------------------------------------------
@@ -729,13 +780,14 @@ async def build_per_project_merge_queue(
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r = await asyncio.gather(
+            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
                 outcome_distribution(db, hours=hours, now=now),
                 latency_stats(db, hours=hours, now=now),
                 recent_merges(db, limit=None, hours=recent_hours, now=now),
                 speculative_stats(db, hours=hours, now=now),
                 active_queued_merges(db, ttl_minutes=30, now=now),
+                recent_train_events(db, hours=hours, now=now),
                 return_exceptions=True,
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
@@ -744,6 +796,7 @@ async def build_per_project_merge_queue(
             recent_raw = safe_gather_result(recent_r, [], f'{pid}/recent')
             spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
             active_list = safe_gather_result(active_r, [], f'{pid}/active')
+            train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
             if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'
@@ -766,6 +819,7 @@ async def build_per_project_merge_queue(
                 'recent': recent_trimmed,
                 'speculative': spec,
                 'active': active_list,
+                'train_events': train_events_list,
             }
         except Exception as exc:
             logger.warning(
@@ -780,6 +834,7 @@ async def build_per_project_merge_queue(
                 'recent': [],
                 'speculative': _DEFAULT_SPEC,
                 'active': [],
+                'train_events': [],
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
