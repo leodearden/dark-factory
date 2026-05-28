@@ -451,6 +451,13 @@ def _format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
 
 
 def _format_findings(findings: list[dict]) -> str:
+    """Render a list of finding dicts as a human-readable string.
+
+    Each finding is formatted with its header fields (description, severity,
+    category, suggested_action) followed by the four typed citation lists
+    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
+    Empty citation lists are omitted from output.
+    """
     if not findings:
         return 'No findings.'
     lines = []
@@ -459,12 +466,45 @@ def _format_findings(findings: list[dict]) -> str:
         severity = f.get('severity', '?')
         category = f.get('category', '?')
         action = f.get('suggested_action', '?')
-        affected = f.get('affected_ids', [])
-        lines.append(
-            f'{i}. [{severity}/{category}] {desc}\n'
-            f'   Affected: {affected}\n'
-            f'   Suggested action: {action}'
-        )
+
+        parts = [
+            f'{i}. [{severity}/{category}] {desc}',
+            f'   Suggested action: {action}',
+        ]
+
+        cited_entities = f.get('cited_entities', [])
+        if cited_entities:
+            entity_strs = ', '.join(
+                f"{e.get('canonical_name', '?')} ({e.get('entity_uuid', '?')})"
+                for e in cited_entities
+            )
+            parts.append(f'   Cited entities: {entity_strs}')
+
+        cited_edges = f.get('cited_edges', [])
+        if cited_edges:
+            edge_strs = ', '.join(
+                f"{e.get('edge_uuid', '?')}: {e.get('fact_text_snapshot', '?')}"
+                for e in cited_edges
+            )
+            parts.append(f'   Cited edges: {edge_strs}')
+
+        cited_tasks = f.get('cited_tasks', [])
+        if cited_tasks:
+            task_strs = ', '.join(
+                f"{t.get('project_id', '?')}/{t.get('task_id', '?')}"
+                for t in cited_tasks
+            )
+            parts.append(f'   Cited tasks: {task_strs}')
+
+        cited_memories = f.get('cited_memories', [])
+        if cited_memories:
+            memory_strs = ', '.join(
+                f"{m.get('memory_id', '?')} ({m.get('store', '?')})"
+                for m in cited_memories
+            )
+            parts.append(f'   Cited memories: {memory_strs}')
+
+        lines.append('\n'.join(parts))
     return '\n'.join(lines)
 
 
