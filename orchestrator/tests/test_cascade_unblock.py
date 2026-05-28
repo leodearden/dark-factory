@@ -19,12 +19,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
 from orchestrator.harness import Harness
 from orchestrator.scheduler import SetTaskStatusRejected
-
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -93,7 +92,7 @@ class TestCascadeUnblockUnit:
             harness._on_escalation_resolved(esc)
             await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_awaited_once_with('3438', 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with('3438', 'pending')  # type: ignore[attr-defined]
         assert any('esc-4000-39' in r.message for r in caplog.records), (
             "Expected INFO record citing L2 id 'esc-4000-39'"
         )
@@ -135,7 +134,7 @@ class TestCascadeUnblockUnit:
             harness._on_escalation_resolved(esc)
             await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(r.levelno == logging.DEBUG for r in caplog.records), (
             "Expected a DEBUG record for deferred carve-out"
         )
@@ -151,7 +150,7 @@ class TestCascadeUnblockUnit:
             harness._on_escalation_resolved(esc)
             await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(r.levelno == logging.DEBUG for r in caplog.records), (
             "Expected a DEBUG record for in-progress carve-out"
         )
@@ -166,7 +165,7 @@ class TestCascadeUnblockUnit:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +228,7 @@ class TestCascadeUnblockIntegration:
         await asyncio.gather(*list(harness._background_tasks))
 
         # Member has status='dismissed', so the helper should NOT flip
-        harness.scheduler.set_task_status.assert_not_awaited()
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_criterion_7_mixed_status_cascade(
         self, harness: Harness, tmp_path: Path, caplog
