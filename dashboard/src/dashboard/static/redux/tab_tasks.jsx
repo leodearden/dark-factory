@@ -407,7 +407,7 @@ function TasksTab({ projectFilter, search }) {
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
             const counts = {
               total:    projTasks.length,
-              active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
+              active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
               pending:  projTasks.filter(t => t.status === 'pending').length,
               complete: projTasks.filter(t => t.status === 'done').length,
             };
