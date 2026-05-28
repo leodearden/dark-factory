@@ -197,46 +197,49 @@ An episode can use either parameter independently, but retrospective summaries \
 should always use both to fully prevent temporal contamination.
 
 ## Snapshot Discipline
-Recurring temporal-fact snapshots (task-count, task-status, run summaries, system stats) \
-are written every reconciliation cycle. Every cycle the values change; prior snapshot \
-edges from older episodes stay valid in storage, but **accumulation is acceptable**: \
-Graphiti's `valid_at`-descending search ordering guarantees every downstream reader \
-(`search`, `get_entity`) sees the most recent snapshot first, so older edges are \
-naturally superseded without you invalidating them.
 
-**Async-queue indexing latency**: snapshot writes via `add_memory(category='temporal_facts')` \
-are async-enqueued through the durable queue (see `## Graphiti Queued Writes` for the \
-`memory_ids: []` invariant). Graphiti embedding indexing trails Stage 1's search window, \
-so a pre-write `search()` CANNOT return the current cycle's own snapshot writes. Searching \
-for your own snapshot before writing it is a provable no-op — do not do it. Rely instead \
-on temporal supersession: each fresh snapshot carries a newer `valid_at`, so readers \
-querying by `valid_at` desc always see the most recent value without you needing to \
-invalidate prior edges.
+### Task-count and task-status values — DO NOT persist as durable edges
+Task-count and task-status values (total, done, blocked, in_progress, highest task id, \
+etc.) are computed at READ time from the live task store and surfaced authoritatively \
+in the `## Active Task Tree` header at the top of every Stage 1 payload. That header \
+is the single source of truth for the current cycle.
+
+**MUST NOT**: write recurring task-count or task-status values as durable \
+`temporal_facts` edges in Graphiti (via `add_memory(category='temporal_facts')` or \
+any other write tool). These values change every cycle; persisting them as durable \
+edges causes runaway entity proliferation (FLAG-S2-ENTITY-PROLIFERATION) and misleads \
+future cycles with stale counts. The payload already carries authoritative values — \
+no durable snapshot edge is needed.
+
+**MUST NOT**: infer or estimate task counts from the rendered active-task lines in \
+the payload. The `## Active Task Tree` header contains the authoritative \
+`highest task id`, `total`, `done`, and `cancelled` values computed over the FULL \
+task list (independent of any render caps). Read those values from the header — do \
+not guess from line counts.
+
+**Run summaries** (e.g. "Cycle completed at {{ISO_date}}: N flags, M ops, summary of \
+key actions taken") are NOT volatile counts and may still be written as \
+`temporal_facts` edges when they capture non-recoverable per-cycle decisions or \
+observations. Keep run summaries concise and deduplicated across cycles.
+
+### Asserting task absence — emit a validatable flag
+When you believe a task is absent, phantom, or does not exist in the task store: \
+**do NOT delete knowledge edges or Mem0 entries for that task in this stage.** Instead, \
+emit a flag with `flag_type='task_absent'` and the `task_id` field set to the task's \
+ID. The Stage 1 code-side gate (`filter_false_absence_flags`) will call `get_task` to \
+positively confirm absence before the flag reaches Stage 2. If the task exists or the \
+lookup is inconclusive, the flag is silently dropped — preventing irreversible \
+`delete_memory` ops on real tasks. Only positively-confirmed-absent tasks reach Stage 2 \
+for knowledge cleanup.
 
 **Never use `add_episode` for recurring temporal-fact snapshot writes.** `add_episode` \
-triggers Graphiti's extraction pipeline, which produces 4 identical edges per write that \
-dedup loops must clean up next cycle. Do not use `add_episode` for task-count, task-status, \
-run summary, or system-stat snapshots.
-
-For each recurring snapshot write, follow this discipline:
-
-1. Call `add_memory(category='temporal_facts')` directly with the new fact text. \
-   Encode the effective ISO date in the fact text itself \
-   (e.g. `"As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 42 total."`). \
-   Each write carries the current ingestion time as `valid_at`; newer writes naturally \
-   supersede older ones in temporal queries.
-2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: J blocked, \
-   M done, K in_progress, N total") over multiple sibling edges — fewer surfaces \
-   means fewer stale facts next cycle.
-
-Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
-surface you or a later cycle will have to clean up.
+triggers Graphiti's extraction pipeline, which produces multiple edges per write that \
+dedup loops must clean up next cycle. Do not use `add_episode` for task-count, \
+task-status, or system-stat snapshots.
 
 **Note**: the `## update_edge Temporal Limitation` two-step workaround (invalidate + \
 add_memory) still applies to NON-snapshot temporal edge updates (status flips, decision \
-retractions, etc.) where you are updating a specific known edge. The snapshot simplification \
-above (write-fresh, skip pre-search) applies only to recurring snapshot writes where \
-temporal supersession via `valid_at` is sufficient.
+retractions, etc.) where you are updating a specific known edge.
 
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
