@@ -14,6 +14,7 @@ WHERE ts > strftime(...)' `` returning >= 7) validates this shell.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,23 +31,39 @@ logger = logging.getLogger('sampler')
 
 
 def main() -> None:
-    """Collect one tick of metrics and write them to data/load-samples.db."""
-    db_path = Path('data/load-samples.db')
-    store = LoadSampleStore(db_path)
+    """Collect one tick of metrics and write them to data/load-samples.db.
+
+    The DB path is ``<root>/data/load-samples.db`` where ``<root>`` defaults to
+    the process's CWD (set by the systemd ``WorkingDirectory=`` to the repo
+    root) or is overridden by the ``DARK_FACTORY_ROOT`` environment variable.
+    This allows relocating the checkout without editing the unit file.
+    """
+    root = os.environ.get('DARK_FACTORY_ROOT', '.')
+    db_path = Path(root) / 'data/load-samples.db'
+
+    try:
+        store = LoadSampleStore(db_path)
+    except Exception:
+        logger.exception('Failed to open/create store at %s; aborting tick', db_path)
+        sys.exit(1)
 
     now = int(time.time())
 
+    # Degrade-and-continue: a failure in one collection group (e.g. kernel
+    # lacking PSI support) should not discard the other group's metrics.
+    # Each tick is independent, so partial writes are better than no write.
+    # Only store-construction failure justifies a non-zero exit.
     try:
         psi = collect_psi()
     except Exception:
-        logger.exception('Failed to collect PSI metrics')
-        sys.exit(1)
+        logger.exception('Failed to collect PSI metrics; writing process metrics only')
+        psi = {}
 
     try:
         process_metrics = collect_process_metrics()
     except Exception:
-        logger.exception('Failed to collect process metrics')
-        sys.exit(1)
+        logger.exception('Failed to collect process metrics; writing PSI metrics only')
+        process_metrics = {}
 
     run_tick(store, now, psi=psi, process_metrics=process_metrics)
     store.maybe_vacuum(now)

@@ -31,6 +31,7 @@ trailing_window(metric, current_value, window=60):
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import statistics
 from pathlib import Path
@@ -38,6 +39,8 @@ from pathlib import Path
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 __all__ = ['LoadSampleStore']
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS samples (
@@ -190,11 +193,22 @@ class LoadSampleStore:
         """Run VACUUM and record the timestamp if the daily interval has elapsed."""
         if not self.should_vacuum(now):
             return
-        # VACUUM must run outside of a transaction
-        conn = self._connect()
+        # VACUUM must run outside a transaction.  Connect with isolation_level=None
+        # (autocommit) from the start so that pragma application inside
+        # apply_full_durability_pragmas_sync cannot begin an implicit transaction
+        # that would cause VACUUM to error with
+        # "cannot VACUUM from within a transaction".
+        conn = sqlite3.connect(str(self.db_path), isolation_level=None)
         try:
-            conn.isolation_level = None  # autocommit
+            apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
             conn.execute('VACUUM')
+            # Record the timestamp only after a successful VACUUM so that a
+            # transient VACUUM failure doesn't suppress retries for 24h.
+            conn.execute(
+                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+                ('last_vacuum_ts', str(now)),
+            )
+        except Exception:
+            logger.exception('VACUUM failed; will retry on next eligible tick')
         finally:
             conn.close()
-        self._set_meta('last_vacuum_ts', str(now))

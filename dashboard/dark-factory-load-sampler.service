@@ -4,8 +4,12 @@ After=network.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project sampler python -m sampler
+# %h expands to the user home directory (systemd user-unit specifier), making
+# the username non-hardcoded.  Adjust "src/dark-factory" if your checkout path
+# differs.  Alternatively set DARK_FACTORY_ROOT=<repo-root> in an
+# EnvironmentFile= to override the DB path without editing this unit.
+WorkingDirectory=%h/src/dark-factory
+ExecStart=%h/.local/bin/uv run --project sampler python -m sampler
 
 # Logging goes to journalctl --user -u dark-factory-load-sampler
 StandardOutput=journal

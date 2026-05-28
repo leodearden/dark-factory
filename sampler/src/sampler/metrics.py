@@ -152,29 +152,30 @@ def sum_verify_rss(procs: Iterable[Any]) -> int:
     """Sum RSS (bytes) over all verify.sh processes and their child trees.
 
     Shared PIDs are de-duplicated so each process's RSS is counted only once.
+    For each verify.sh root, ``children(recursive=True)`` is called once to
+    obtain the full descendant list in a single flat pass.  This avoids the
+    exponential revisiting that a per-child recursive call produces:
+    ``children(recursive=True)`` already returns all descendants, so recursing
+    into each returned child would visit a node at depth N up to 2^N times.
     """
     seen_pids: set[int] = set()
     total = 0
-
-    def _add(proc: Any) -> None:
-        if proc.pid in seen_pids:
-            return
-        seen_pids.add(proc.pid)
-        try:
-            total_ref[0] += proc.memory_info().rss
-        except Exception:
-            pass
-        try:
-            for child in proc.children(recursive=True):
-                _add(child)
-        except Exception:
-            pass
-
-    total_ref = [0]
     for proc in procs:
-        if _is_verify_sh(proc):
-            _add(proc)
-    return total_ref[0]
+        if not _is_verify_sh(proc):
+            continue
+        try:
+            subtree = [proc] + proc.children(recursive=True)
+        except Exception:
+            subtree = [proc]
+        for p in subtree:
+            if p.pid in seen_pids:
+                continue
+            seen_pids.add(p.pid)
+            try:
+                total += p.memory_info().rss
+            except Exception:
+                pass
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -209,17 +210,12 @@ def collect_process_metrics(
     except Exception:
         procs = []
 
-    # Guard per-process access errors
-    safe_procs: list[Any] = []
-    for p in procs:
-        try:
-            p.cmdline()  # probe; raises NoSuchProcess/AccessDenied if gone
-            safe_procs.append(p)
-        except Exception:
-            pass
-
+    # No separate cmdline() probe loop: _is_occt_gated and _is_verify_sh each
+    # have their own try/except that silently skips processes that died or are
+    # access-denied between listing and inspection.  A separate p.cmdline()
+    # probe here would add a redundant OS call per process on the 5s hot path.
     return {
-        'occt_queue_depth': float(count_occt_queue_depth(safe_procs, fd9_exists)),
-        'verify_concurrency': float(count_verify_concurrency(safe_procs)),
-        'verify_rss_total_bytes': float(sum_verify_rss(safe_procs)),
+        'occt_queue_depth': float(count_occt_queue_depth(procs, fd9_exists)),
+        'verify_concurrency': float(count_verify_concurrency(procs)),
+        'verify_rss_total_bytes': float(sum_verify_rss(procs)),
     }

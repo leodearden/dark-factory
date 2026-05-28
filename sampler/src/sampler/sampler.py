@@ -55,6 +55,15 @@ def run_tick(
         process_metrics: Dict of 3 non-PSI values (occt_queue_depth,
                          verify_concurrency, verify_rss_total_bytes).
     """
+    # Guard against unexpected/misspelled metric keys that would silently
+    # persist without matching any consumer.  Subset checks (<=) rather than
+    # equality allow partial dicts when a collection group degrades to {} on
+    # error (see __main__.py degrade-and-continue handling).
+    assert set(psi) <= _PSI_METRICS, f'unexpected PSI keys: {set(psi) - _PSI_METRICS}'
+    assert set(process_metrics) <= _PROCESS_METRICS, (
+        f'unexpected process metric keys: {set(process_metrics) - _PROCESS_METRICS}'
+    )
+
     # 1. Write PSI rows (NULL windows — PSI is already kernel-windowed)
     for metric, value in psi.items():
         store.insert_sample(now, metric, value, window_mean=None, window_max=None)
