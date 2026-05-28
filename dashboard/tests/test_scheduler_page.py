@@ -115,7 +115,7 @@ def test_module_contention_counts_sorted_desc():
 def test_compose_rows_joins_active_tasks_with_snapshot():
     """_compose_rows produces correctly joined rows with priority_differs flag.
 
-    Feed a synthetic active-tasks list (with ``locks`` and ``priority``) and a
+    Feed a synthetic active-tasks list (with ``meta_files`` and ``priority``) and a
     synthetic snapshot dict; assert each row has all expected fields, and that
     ``priority_differs=True`` when effective_priority != declared priority.
     """
@@ -131,7 +131,7 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
             'priority': 'high',
             'status': 'in-progress',
             'started': 10,  # minutes
-            'locks': ['src/a.py', 'src/b.py'],
+            'meta_files': ['src/a.py', 'src/b.py'],
         },
         {
             'id': 'proj/T-2',
@@ -140,7 +140,7 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
             'priority': 'medium',
             'status': 'pending',
             'started': 5,
-            'locks': ['src/c.py'],
+            'meta_files': ['src/c.py'],
         },
     ]
 
@@ -321,7 +321,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
             'priority': 'medium',
             'status': 'in-progress',
             'started': 5,
-            'locks': ['src/a.py', 'src/b.py'],
+            'meta_files': ['src/a.py', 'src/b.py'],
         }
     ]
 
@@ -1503,7 +1503,7 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
             'priority': 'high',
             'status': 'in-progress',
             'started': 1,
-            'locks': ['src/utils.py'],
+            'meta_files': ['src/utils.py'],
         },
         {
             'id': f'{p2.name}/T-5',
@@ -1512,7 +1512,7 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
             'priority': 'high',
             'status': 'in-progress',
             'started': 1,
-            'locks': ['src/utils.py'],
+            'meta_files': ['src/utils.py'],
         },
     ]
     mock_active = AsyncMock(return_value=(active_tasks, []))
@@ -1671,11 +1671,14 @@ def test_compose_rows_normalizes_meta_files_to_module_locks():
     )
 
 
-def test_compose_rows_falls_back_to_locks_when_no_meta_files():
-    """When meta_files is absent/empty, lock_set falls back to `locks` (normalized).
+def test_compose_rows_with_no_meta_files_produces_empty_lock_set():
+    """Tasks without meta_files produce an empty lock_set.
 
-    Keeps behavior for tasks whose taskmaster metadata is untagged but which
-    still have a worktree plan.json footprint.
+    The scheduler derives module locks exclusively from meta_files (taskmaster
+    ``metadata.files``).  A task whose taskmaster metadata carries no file
+    footprint holds no scheduler locks and correctly produces lock_set=[].
+    Such tasks are invisible to the contention view, which is correct — the
+    scheduler would not block on them.
     """
     from dashboard.data.scheduler import _compose_rows
 
@@ -1685,13 +1688,12 @@ def test_compose_rows_falls_back_to_locks_when_no_meta_files():
             'title': 'No metadata',
             'priority': 'high',
             'started': 1,
-            'locks': ['crates/reify-types/src/persistent.rs'],
             'meta_files': [],
         }
     ]
 
     rows = _compose_rows(active_tasks, _scheduler_snapshot(), depth=2)
-    assert rows[0]['lock_set'] == ['crates/reify-types']
+    assert rows[0]['lock_set'] == []
 
 
 def test_compose_rows_deep_path_holder_resolves_in_module_contention():

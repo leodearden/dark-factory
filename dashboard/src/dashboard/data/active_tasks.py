@@ -18,7 +18,8 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'loops': 2,                 # iterations.jsonl line count
         'attempts': 3,              # review files count
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
-        'meta_files': ['src/...py', ...],  # taskmaster metadata.files (module lock source)
+        'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
+                                           # debugging/tooling — no frontend UI reads it directly
     }
 
 Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).

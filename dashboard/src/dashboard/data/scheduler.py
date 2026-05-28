@@ -141,9 +141,10 @@ def _compose_rows(
     The row's ``lock_set`` is the task's footprint **normalized to module locks**
     at *depth* (the scheduler's ``lock_depth``) via ``files_to_modules`` — so the
     values match the snapshot's ``current_holders`` keys.  The footprint is
-    sourced from ``meta_files`` (taskmaster ``metadata.files``, what the scheduler
-    locks on), falling back to ``locks`` (worktree plan.json file paths) when a
-    task carries no metadata footprint.
+    sourced exclusively from ``meta_files`` (taskmaster ``metadata.files``, the
+    file footprint the scheduler actually locks on).  Tasks that carry no
+    ``meta_files`` produce an empty ``lock_set`` and are correctly invisible to
+    the contention view — they hold no scheduler locks.
 
     Snapshot keys consumed: ``skip_counts``, ``parks``, ``effective_priorities``,
     ``overrides``.
@@ -195,9 +196,7 @@ def _compose_rows(
             'skip_count': skip_counts.get(tid, 0),
             'park_state': park_state,
             'age_seconds': age_seconds,
-            'lock_set': files_to_modules(
-                task.get('meta_files') or task.get('locks') or [], depth
-            ),
+            'lock_set': files_to_modules(task.get('meta_files') or [], depth),
             'pinned': bool(ov.get('pinned')),
             'reserve_now': bool(ov.get('reserve_now')),
             'boost_tier': ov.get('boost_tier'),

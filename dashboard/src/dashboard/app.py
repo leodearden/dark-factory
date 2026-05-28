@@ -476,7 +476,12 @@ async def api_orchestrators(request: Request) -> JSONResponse:
 
 @app.get('/api/v2/dashboard/tasks')
 async def api_tasks(request: Request) -> JSONResponse:
-    """ACTIVE_TASKS (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler)."""
+    """ACTIVE_TASKS (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
+
+    Each task in ACTIVE_TASKS includes a ``meta_files`` field (taskmaster
+    ``metadata.files``) that is retained on the wire for debugging and tooling.
+    No frontend UI reads it directly — lock display routes through D.SCHEDULER.
+    """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     active, offline_projects = await collect_active_tasks(http_client, config)

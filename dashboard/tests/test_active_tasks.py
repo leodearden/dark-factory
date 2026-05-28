@@ -102,7 +102,8 @@ def two_project_config(tmp_path, monkeypatch):
         project_dir='dark-factory',
         tasks=[
             {'id': 19, 'title': 'consolidation retry', 'status': 'in-progress',
-             'dependencies': [15, 17]},
+             'dependencies': [15, 17],
+             'metadata': {'files': ['src/agents/consolidation.py', 'src/store/graphiti_adapter.py']}},
             {'id': 17, 'title': 'pre-filter', 'status': 'done', 'dependencies': []},
             {'id': 15, 'title': 'partitioning', 'status': 'done', 'dependencies': []},
             {'id': 23, 'title': 'collision', 'status': 'pending', 'dependencies': [21]},
@@ -143,18 +144,6 @@ def two_project_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_returns_2tuple_active_and_offline(two_project_config, dummy_client):
-    """collect_active_tasks must return a 2-tuple (active_tasks, offline_projects)."""
-    result = await collect_active_tasks(client=dummy_client, config=two_project_config)
-    assert len(result) == 2, (
-        f'Expected 2-tuple (active, offline_projects); got {len(result)}-tuple'
-    )
-    active, offline_projects = result
-    assert isinstance(active, list)
-    assert isinstance(offline_projects, list)
-
-
-@pytest.mark.asyncio
 async def test_collect_active_tasks_filters_to_active_statuses(two_project_config, dummy_client):
     active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
     statuses = {t['status'] for t in active}
@@ -188,6 +177,8 @@ async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config,
     assert t19['attempts'] == 3
     # `started` is the minutes-since difference, allow a small slack vs 14.
     assert 13 <= t19['started'] <= 15
+    # meta_files is the module lock source used by the scheduler pipeline.
+    assert 'src/agents/consolidation.py' in t19['meta_files']
 
 
 @pytest.mark.asyncio
