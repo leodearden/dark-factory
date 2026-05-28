@@ -21,7 +21,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
@@ -938,12 +938,26 @@ def _emit_merge_coalesced(
     )
 
 
+class _FindInflightWorktreeP(Protocol):
+    """Narrow protocol for the disk-scan used by coalesce_or_enqueue_merge_request.
+
+    Only :meth:`find_inflight_merge_worktree` is called on *git_ops* inside
+    :func:`coalesce_or_enqueue_merge_request`.  Declaring the parameter with
+    this Protocol (rather than the concrete :class:`~orchestrator.git_ops.GitOps`)
+    lets test stubs that implement only this method satisfy the type-checker
+    without inheriting from the full ``GitOps`` class.
+    """
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None: ...
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None: ...
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
     event_store: EventStore | None,
     registry: InFlightMergeRegistry,
-    git_ops: GitOps | None = None,
+    git_ops: _FindInflightWorktreeP | None = None,
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
 ) -> MergeDispatchResult:

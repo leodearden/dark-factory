@@ -6775,6 +6775,9 @@ class TestCoalesceOrEnqueueRegistryOnly:
                 await asyncio.sleep(0)  # let _acquirer actually run & acquire
                 return None
 
+            async def cleanup_merge_worktree(self, merge_wt: object) -> None:
+                pass  # never reached — find_inflight returns None
+
         other_future: asyncio.Future = asyncio.get_running_loop().create_future()
 
         async def _acquirer() -> None:
