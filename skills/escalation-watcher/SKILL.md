@@ -22,11 +22,7 @@ Before starting, verify these are in place. If anything is missing, ask the user
 2. **Running orchestrator** with escalation MCP accessible (default port 8102, configured in the project's `.mcp.json`)
 3. **Escalation queue directory** at `<project_root>/data/escalations/`
 
-Discover the terminal command for spawning interactive sessions:
-1. Check `$ESCALATION_TERMINAL_CMD` (e.g., `gnome-terminal`, `kitty`, `tmux new-window`)
-2. Try known emulators directly: `gnome-terminal`, `kitty`, `konsole`, `xterm` (avoid the `x-terminal-emulator` wrapper — it doesn't reliably pass command arguments)
-3. On macOS, `open -a Terminal`
-4. If nothing found, ask the user once. Suggest they set `ESCALATION_TERMINAL_CMD` for future sessions.
+Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
 
 ## The Main Loop
 
@@ -252,30 +248,13 @@ Blocking issues found during code review — the review cycle exhausted without 
 
 This is distinct from `review_suggestions` (info-level, non-blocking). Review issues are real problems that prevented the task from merging.
 
-**Spawn an interactive `/unblock` session** (see `task_failure` below for the explicit invocation pattern). The human needs to see the specific blocking issues and decide how to fix them.
+**Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
 
 ### `task_failure` (blocking)
 
 Merge conflicts, verification failures, build breaks. The task agent is stopped and waiting.
 
-**Spawn an interactive `/unblock` session** so the human can investigate and resolve it:
-
-```python
-# Discover terminal command (do this once at startup, cache the result)
-# 1. Check $ESCALATION_TERMINAL_CMD env var
-# 2. Try gnome-terminal, kitty, or other known emulators directly
-#    (avoid x-terminal-emulator wrapper — it doesn't reliably pass command args)
-# 3. On macOS, open -a Terminal
-# 4. If nothing found, ask the user
-
-# Then spawn the session (note: must cd to project root first):
-Bash(
-  command='gnome-terminal -- bash -c \'cd <project_root> && claude --dangerously-skip-permissions "/unblock <task_id>"\'',
-  run_in_background=true
-)
-```
-
-Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
+**Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
 
 ### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
 
@@ -292,7 +271,7 @@ Two flavours:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
 
-**Spawn an interactive `/unblock` session** (same invocation pattern as `task_failure` above) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished.
+**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished.
 
 **Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
 
@@ -325,7 +304,7 @@ Agent found it depends on work that isn't done yet.
      resolved_by="escalation-watcher"
    )
    ```
-3. **If no matching task exists**: spawn an interactive `/unblock` session (see `task_failure` above for the explicit invocation pattern).
+3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
 
 ### `design_concern` (info or blocking)
 
@@ -359,7 +338,7 @@ Technical debt or cleanup discovered during development.
      ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
-- **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
+- **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
 
 ### `infra_issue` (blocking)
 
