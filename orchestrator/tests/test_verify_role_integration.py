@@ -64,9 +64,9 @@ def _command_lines(stdout: str) -> list[str]:
     Algorithm:
     - Split stdout into lines via .splitlines().
     - Find the first line that starts with '# --- commands'.
-    - Take lines AFTER that marker.  If the marker is absent fall back to ALL lines
-      (defensive — keeps the function useful even against future verify.sh layout
-      changes).
+    - Take lines AFTER that marker.  If the marker is absent, raise ValueError
+      (loud failure — surfaces a cross-repo contract break rather than silently
+      scanning the entire stdout and creating false positives from comment substrings).
     - Return those that are non-blank AND do not .lstrip().startswith('#').
     """
     lines = stdout.splitlines()
@@ -74,8 +74,17 @@ def _command_lines(stdout: str) -> list[str]:
         (i for i, ln in enumerate(lines) if ln.startswith("# --- commands")),
         None,
     )
-    candidates = lines[marker_idx + 1 :] if marker_idx is not None else lines
-    return [ln for ln in candidates if ln.strip() and not ln.lstrip().startswith("#")]
+    if marker_idx is None:
+        raise ValueError(
+            "verify.sh --print-plan stdout is missing the '# --- commands' marker; "
+            "this likely indicates a cross-repo contract break — verify.sh may have "
+            "renamed or dropped the separator between the env-comment block and the "
+            "command list. stdout excerpt:\n" + stdout[:400]
+        )
+    return [
+        ln for ln in lines[marker_idx + 1 :]
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
 
 
 def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
@@ -154,9 +163,12 @@ def test_role_env_propagates_to_reify_verify_plan(
 
     # Scan only real command lines (post-marker, non-comment) to avoid false
     # positives from env-comment substrings like 'cargo uses its own job pool'.
+    # Use \bcargo\s (word-boundary + whitespace) so embedded 'cargo' substrings in
+    # positional args (e.g. 'cargo-test-occt-gated.sh', '--feature cargo-something')
+    # are not mistaken for real cargo invocations.
     total_cargo_count = 0
     for line in cmd_lines:
-        for m in re.finditer(r"cargo ", line):
+        for m in re.finditer(r"\bcargo\s", line):
             pos = m.start()
             prefix_start = pos - len(expected_prefix)
             actual_prefix = line[prefix_start:pos] if prefix_start >= 0 else ""
