@@ -827,7 +827,14 @@ class InFlightMergeRegistry:
         if e is None:
             return None
         elapsed = time.monotonic() - e.enqueued_monotonic
-        return max(0, int(_INFLIGHT_MERGE_ETA_ESTIMATE_SECS - elapsed))
+        remaining = _INFLIGHT_MERGE_ETA_ESTIMATE_SECS - elapsed
+        if remaining <= 0:
+            # Estimate exceeded — return None so callers fall back to a fixed
+            # backoff rather than busy-polling with a saturated 0 estimate.
+            # (ETA window is 600 s; liveness window is 3600 s — a worktree can
+            # legitimately be in-flight long after the ETA estimate runs out.)
+            return None
+        return int(remaining)
 
     def _release(self, branch: str) -> None:
         """Remove *branch* from the in-flight registry.  Called by done_callback."""
@@ -1020,7 +1027,15 @@ async def coalesce_or_enqueue_merge_request(
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result):
-        await enqueue_merge_request(queue, req, event_store)
+        try:
+            await enqueue_merge_request(queue, req, event_store)
+        except BaseException:
+            # Slot leak guard: if the enqueue raises (e.g. queue closed,
+            # cancellation) before the worker can ever resolve req.result,
+            # the done_callback will never fire.  Release the slot explicitly
+            # so a future merge_request for this branch can proceed.
+            registry._release(branch)
+            raise
         return MergeDispatchResult(
             dispatched=True,
             in_flight=False,

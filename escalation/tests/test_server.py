@@ -1086,7 +1086,7 @@ class TestMergeRequestDedup:
         registry = self._make_registry()
 
         # Pre-seed the registry: acquire branch 'X' with a never-resolving future
-        never_future: asyncio.Future = asyncio.get_event_loop().create_future()
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
         acquired = registry.acquire('X', 'existing-task', never_future)
         assert acquired, 'Prerequisite: registry must accept first acquire'
 

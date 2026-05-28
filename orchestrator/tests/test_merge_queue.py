@@ -6512,7 +6512,7 @@ class TestInFlightMergeRegistry:
     """Tests for InFlightMergeRegistry — per-branch in-flight de-dup slot."""
 
     def _make_future(self) -> asyncio.Future:
-        return asyncio.get_event_loop().create_future()
+        return asyncio.get_running_loop().create_future()
 
     async def test_acquire_free_branch_returns_true(self):
         """(a) Acquiring a free branch returns True; is_inflight becomes True."""
@@ -6746,6 +6746,58 @@ class TestCoalesceOrEnqueueRegistryOnly:
         assert queue.qsize() == 2
         # No coalesce events
         assert _count_events(event_store.db_path, 'merge_coalesced') == 0
+
+    async def test_concurrent_acquire_during_scan_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(race) Concurrent dispatch claims the slot during the disk-scan await.
+
+        The only ``await`` between the ``is_inflight`` check and the ``acquire``
+        call is inside ``find_inflight_merge_worktree``.  A second caller can
+        win the acquire race while the first is suspended there.  We simulate
+        this by injecting a fake git_ops whose scan yields twice (two
+        ``sleep(0)``s) while a background task grabs the slot between them.
+
+        The original caller should observe acquire returning False and fall
+        through to the race-fallback coalesce path: ``in_flight=True``,
+        ``source='registry'``, one ``merge_coalesced`` event, empty queue.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('race', 'race', tmp_path, config)
+
+        # Fake git_ops: yields control twice so the concurrent acquirer can
+        # grab the slot between the two sleep(0)s.
+        class _SlowGitOps:
+            async def find_inflight_merge_worktree(self, branch: str):
+                await asyncio.sleep(0)  # let _acquirer get scheduled
+                await asyncio.sleep(0)  # let _acquirer actually run & acquire
+                return None
+
+        other_future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _acquirer() -> None:
+            await asyncio.sleep(0)  # wait until main is inside find_inflight
+            registry.acquire('race', 'other-task', other_future)
+
+        asyncio.create_task(_acquirer())
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=_SlowGitOps(),
+        )
+
+        assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+        assert result.dispatched is False
+        assert result.source == 'registry', (
+            f'Expected source=registry (race-fallback path), got {result.source!r}'
+        )
+        assert queue.qsize() == 0, 'No enqueue should happen on race-fallback coalesce'
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        other_future.cancel()
 
 
 # ---------------------------------------------------------------------------

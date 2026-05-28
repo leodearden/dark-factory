@@ -515,7 +515,17 @@ def create_server(
 
         Use this instead of directly merging into main.  The merge worker
         handles verification, conflict detection, and atomic ref advancement.
-        Returns the merge outcome (done, conflict, blocked, already_merged).
+
+        Response shapes:
+        - Normal outcome: ``{status, reason, conflict_details, push_status}``
+          (plus optional ``failure_diagnostic`` on failure).
+          ``status`` is one of: ``done``, ``conflict``, ``blocked``,
+          ``already_merged``, ``failed``.
+        - Already in flight: ``{status='in_flight', branch, inflight_task_id,
+          eta_seconds, reason, conflict_details=None, push_status=None}``.
+          A merge for *branch* is already running; the caller should poll
+          rather than re-queuing.  ``eta_seconds`` is a best-effort hint
+          (``None`` once the estimate window is exceeded).
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -537,7 +547,7 @@ def create_server(
         # instantiation configs never call load_config, so _module_configs stays None).
         # See OrchestratorConfig.module_configs_or_empty (config.py) for details.
         module_configs = list(orch_config.module_configs_or_empty.values())
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         merge_req = MergeRequest(
             task_id=task_id,
             branch=branch,
@@ -554,7 +564,7 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
-        git_ops_for_scan = harness.git_ops if harness is not None else None
+        git_ops_for_scan = getattr(harness, 'git_ops', None)
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -565,7 +575,11 @@ def create_server(
 
         if dispatch.in_flight:
             # Branch already being merged — return in_flight immediately so the
-            # caller can poll rather than block.  ETA is a best-effort heuristic.
+            # caller can poll rather than block.  ETA is a best-effort heuristic
+            # (None once the estimate window is exceeded).
+            # conflict_details / push_status are included with None for shape
+            # stability: callers that access result['conflict_details'] or
+            # result['push_status'] must not KeyError on a coalesced response.
             return {
                 'status': 'in_flight',
                 'branch': branch,
@@ -575,6 +589,8 @@ def create_server(
                     f'A merge for branch {branch!r} is already in flight '
                     f'(source={dispatch.source!r}). Poll for completion.'
                 ),
+                'conflict_details': None,
+                'push_status': None,
             }
 
         outcome = await future
