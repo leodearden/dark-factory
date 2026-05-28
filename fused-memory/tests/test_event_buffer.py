@@ -130,6 +130,53 @@ async def test_mark_run_complete_allows_new_run(buf):
 
 
 @pytest.mark.asyncio
+async def test_mark_run_complete_with_instance_id_only_deletes_matching_lock(tmp_path):
+    """instance_id filter must scope DELETE to that lock holder only.
+
+    Regression guard for the 2026-05-28 cross-instance lock-theft RCA
+    (``plans/recon-stale-recovery-rca.md``): callers releasing "their own"
+    lock must not be able to evict a lock currently held by a different
+    instance on the same project.
+    """
+    buf_live = EventBuffer(
+        db_path=tmp_path / 'scoped.db',
+        buffer_size_threshold=5,
+        max_staleness_seconds=300,
+    )
+    await buf_live.initialize()
+    try:
+        # Live instance acquires the lock for its own cycle.
+        assert await buf_live.mark_run_active('test-project') is True
+
+        # A different instance attempts a scoped release.  Must be a no-op.
+        deleted = await buf_live.mark_run_complete(
+            'test-project', instance_id='some-other-instance',
+        )
+        assert deleted == 0
+        # The live lock is still in place — a fresh acquisition still
+        # contends against it.
+        buf_other = EventBuffer(
+            db_path=tmp_path / 'scoped.db',
+            buffer_size_threshold=5,
+            max_staleness_seconds=300,
+        )
+        await buf_other.initialize()
+        try:
+            assert await buf_other.mark_run_active('test-project') is False
+        finally:
+            await buf_other.close()
+
+        # The live instance releasing its own lock by id succeeds.
+        deleted = await buf_live.mark_run_complete(
+            'test-project', instance_id=buf_live.instance_id,
+        )
+        assert deleted == 1
+        assert await buf_live.mark_run_active('test-project') is True
+    finally:
+        await buf_live.close()
+
+
+@pytest.mark.asyncio
 async def test_separate_project_buffers(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'sep.db', buffer_size_threshold=2, conditional_trigger_ratio=0.0)
     await buf.initialize()
