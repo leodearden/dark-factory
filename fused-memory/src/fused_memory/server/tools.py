@@ -30,6 +30,7 @@ from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES, is_cou
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
+    validate_known_project_id,
     validate_project_id,
     validate_project_root,
 )
@@ -418,6 +419,7 @@ def create_mcp_server(
     backlog_policy: BacklogPolicy | None = None,
     event_queue: EventQueue | None = None,
     curator_usage_gate: UsageGate | None = None,
+    known_projects: dict[str, str] | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -436,6 +438,18 @@ def create_mcp_server(
         if verdict.is_rejection:
             return verdict.to_error_dict()
         return None
+
+    # WP-E (task 1549): reject write-tool calls whose project_id is absent from
+    # the known_projects registry.  Mirrors _backlog_gate but is synchronous and
+    # fires BEFORE _backlog_gate so an unknown id never touches downstream state.
+    # Read tools are left ungated — unknown project_id reads return empty today,
+    # matching current behaviour.  See task 1143 (read-side strictness) and task
+    # 1549 (this write-side complement).
+    _kp = known_projects or {}
+
+    def _known_project_gate(project_id: str) -> dict | None:
+        """Return an error dict if project_id is absent from the known_projects registry."""
+        return validate_known_project_id(project_id, _kp)
 
     async def _log_read(
         operation: str,
@@ -555,6 +569,8 @@ def create_mcp_server(
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
             return err
+        if err := _known_project_gate(project_id):
+            return err
         if err := await _backlog_gate(project_id):
             return err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
@@ -625,6 +641,8 @@ def create_mcp_server(
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
             return err
         if err := await _backlog_gate(project_id):
             return err
@@ -899,6 +917,8 @@ def create_mcp_server(
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
             return err
+        if err := _known_project_gate(project_id):
+            return err
         if store not in _VALID_STORES:
             return {
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
@@ -1004,6 +1024,8 @@ def create_mcp_server(
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
             return err
         if not edge_uuid or not edge_uuid.strip():
             return {'error': 'edge_uuid is required', 'error_type': 'ValidationError'}
