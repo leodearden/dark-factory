@@ -60,6 +60,11 @@ class Escalation:
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
     root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
+    # PRD § 9.8 — per-train context for park-prefix derail L2 escalations.
+    # Shape: {id: str, order: int, parked_members: list[str], failing_member: str}.
+    # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
+    # via the from_dict __dataclass_fields__ filter — no migration required.
+    train_state: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
