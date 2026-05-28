@@ -1,0 +1,9 @@
+[Unit]
+Description=Dark Factory load sampler timer — fires every 5s via dark-factory-load-sampler.service
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=5s
+
+[Install]
+WantedBy=timers.target

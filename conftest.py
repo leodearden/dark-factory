@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).parent
-for subproject in ['dashboard', 'escalation', 'fused-memory', 'orchestrator', 'shared']:
+for subproject in ['dashboard', 'escalation', 'fused-memory', 'orchestrator', 'sampler', 'shared']:
     _src = _ROOT / subproject / 'src'
     if _src.exists() and str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
@@ -18,7 +18,7 @@ for subproject in ['dashboard', 'escalation', 'fused-memory', 'orchestrator', 's
 # Pre-import the real package so pytest's rootdir-relative collection does not
 # register the subproject directory (e.g. dashboard/) as a namespace package
 # pointing at the project folder instead of its src/<name>/ subtree.
-for pkg_name in ['dashboard', 'escalation', 'orchestrator', 'shared']:
+for pkg_name in ['dashboard', 'escalation', 'orchestrator', 'sampler', 'shared']:
     try:
         __import__(pkg_name)
     except ImportError:
