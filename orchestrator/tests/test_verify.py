@@ -875,6 +875,98 @@ class TestScopeModuleConfigReturnsNone:
         assert result is not None
         assert result.test_command == mc.test_command
 
+    def test_structural_protocol_file_unscopes_type_check(self, tmp_path: Path):
+        """A Protocol-defining .py file must trigger verbatim unscoped type_check_command.
+
+        Mirrors test_conftest_only_uses_full_test_suite: when a changed file
+        carries cross-file invariants (Protocol/TypedDict), pyright must see the
+        full package so it can verify all implementors still conform.
+        The --directory flag must be preserved verbatim (NOT stripped) so uv can
+        resolve src/ and tests/ relative to the module subdirectory.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        rel_path = 'orchestrator/src/orchestrator/interfaces.py'
+        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
+        (tmp_path / rel_path).write_text('class Fetcher(Protocol):\n    def fetch(self) -> str: ...\n')
+        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
+        assert result is not None
+        assert result.type_check_command == mc.type_check_command
+
+    def test_structural_typeddict_file_unscopes_type_check(self, tmp_path: Path):
+        """A TypedDict-defining .py file must trigger verbatim unscoped type_check_command."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        rel_path = 'orchestrator/src/orchestrator/types.py'
+        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
+        (tmp_path / rel_path).write_text('class EdgeDict(TypedDict):\n    source: str\n    target: str\n')
+        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
+        assert result is not None
+        assert result.type_check_command == mc.type_check_command
+
+    def test_non_structural_file_scopes_type_check(self, tmp_path: Path):
+        """A regular .py source file must still produce a SCOPED type_check_command.
+
+        Regression guard: structural detection must not widen type-check scope
+        for ordinary files.  The scoped form has --directory stripped and
+        contains the individual file path.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        rel_path = 'orchestrator/src/orchestrator/utils.py'
+        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
+        (tmp_path / rel_path).write_text('def helper() -> None:\n    pass\n')
+        result = scope_module_config(mc, [rel_path], worktree=tmp_path)
+        assert result is not None
+        # Scoped form: individual file must appear and --directory must be stripped
+        assert rel_path in (result.type_check_command or '')
+        assert '--directory orchestrator' not in (result.type_check_command or '')
+
+    def test_mixed_structural_and_plain_files_unscopes_type_check(self, tmp_path: Path):
+        """When at least one structural file is present, type check must be unscoped."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        proto_path = 'orchestrator/src/orchestrator/proto.py'
+        plain_path = 'orchestrator/src/orchestrator/utils.py'
+        (tmp_path / 'orchestrator' / 'src' / 'orchestrator').mkdir(parents=True)
+        (tmp_path / proto_path).write_text('class Srv(Protocol):\n    pass\n')
+        (tmp_path / plain_path).write_text('def noop() -> None: pass\n')
+        result = scope_module_config(mc, [proto_path, plain_path], worktree=tmp_path)
+        assert result is not None
+        assert result.type_check_command == mc.type_check_command
+
+    def test_no_worktree_structural_file_still_scoped(self):
+        """Without worktree arg, no file content is read and type check stays scoped.
+
+        Backward-compat guard: the default path (worktree=None) must be unchanged
+        so that all existing callers that omit worktree continue to get scoped
+        type-check commands.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        # Path looks structural but we don't pass worktree — no file read happens
+        rel_path = 'orchestrator/src/orchestrator/interfaces.py'
+        result = scope_module_config(mc, [rel_path])
+        assert result is not None
+        # Must still be scoped (file not read, so structural check is skipped)
+        assert rel_path in (result.type_check_command or '')
+        assert '--directory orchestrator' not in (result.type_check_command or '')
+
 
 class TestRunScopedVerificationSkipsUntouched:
     """End-to-end: run_scoped_verification skips subprojects with no matching files."""
