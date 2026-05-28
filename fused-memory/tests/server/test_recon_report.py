@@ -15,7 +15,6 @@ Covers:
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # step-1: Config schema — RED until step-2 adds the fields
 # ---------------------------------------------------------------------------
@@ -156,7 +155,7 @@ class TestReconReportInRunDedup:
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         return state
 
-    def _finding(self, state, task_id='42', flag_type='orphaned_knowledge', **kwargs):
+    def _finding(self, state, task_id: str | None = '42', flag_type: str | None = 'orphaned_knowledge', **kwargs):
         defaults = dict(
             run_id='r1',
             severity='moderate',
@@ -231,6 +230,7 @@ class TestReconReportCompleteIdempotence:
         result = state.complete('r1', 'summary A')
         assert result == {'flagged_count': 1, 'stats': {'k': 7}}
         report = state.get_assembled_report('r1', 's1')
+        assert report is not None
         assert report['summary'] == 'summary A'
 
     def test_second_same_summary_is_noop(self):
@@ -239,6 +239,7 @@ class TestReconReportCompleteIdempotence:
         r2 = state.complete('r1', 'summary A')
         assert r2 == r1  # identical response
         report = state.get_assembled_report('r1', 's1')
+        assert report is not None
         assert report['summary'] == 'summary A'
         assert report['summary_warnings'] == []
 
@@ -249,6 +250,7 @@ class TestReconReportCompleteIdempotence:
         # Response is the cached one, not an error
         assert result == {'flagged_count': 1, 'stats': {'k': 7}}
         report = state.get_assembled_report('r1', 's1')
+        assert report is not None
         # Original summary preserved
         assert report['summary'] == 'summary A'
         # Warning recorded
@@ -332,6 +334,8 @@ class TestReconReportStateIsolation:
 
         r1 = state.get_assembled_report('r1', 'stage1')
         r2 = state.get_assembled_report('r2', 'stage2')
+        assert r1 is not None
+        assert r2 is not None
         assert len(r1['flagged_items']) == 1
         assert r1['flagged_items'][0]['description'] == 'r1-finding'
         assert len(r2['flagged_items']) == 1
@@ -343,8 +347,12 @@ class TestReconReportStateIsolation:
         state.start_report('r2', 's2', 'p')
         state.set_stat('r1', 'scanned', 10)
         state.set_stat('r2', 'scanned', 99)
-        assert state.get_assembled_report('r1', 's1')['stats'] == {'scanned': 10}
-        assert state.get_assembled_report('r2', 's2')['stats'] == {'scanned': 99}
+        r1 = state.get_assembled_report('r1', 's1')
+        r2 = state.get_assembled_report('r2', 's2')
+        assert r1 is not None
+        assert r2 is not None
+        assert r1['stats'] == {'scanned': 10}
+        assert r2['stats'] == {'scanned': 99}
 
     def test_finding_ids_are_distinct(self):
         state = self._make_state()
@@ -364,6 +372,7 @@ class TestReconReportStateIsolation:
         state.start_report('r2', 's2', 'p')
         state.complete('r1', 'done r1')
         r2 = state.get_assembled_report('r2', 's2')
+        assert r2 is not None
         assert r2['summary'] == ''  # still in-progress
 
 
@@ -482,6 +491,7 @@ class TestCreateReconReportServer:
 
         # Verify state mutated
         report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
         assert report['summary'] == 'done'
         assert len(report['flagged_items']) == 1
 

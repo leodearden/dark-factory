@@ -12,10 +12,12 @@ for task α — see task β.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +200,9 @@ class ReconReportState:
         if entry is None:
             return _ERR_RUN_UNKNOWN.copy()
 
-        current = entry.stats.get(key, 0)
+        current_raw = entry.stats.get(key, 0)
+        # stats may hold str values (set via set_stat); treat those as 0 for inc
+        current: int | float = current_raw if not isinstance(current_raw, str) else 0
         new_value = current + delta
         entry.stats[key] = new_value
         return {'value': new_value}
@@ -331,10 +335,8 @@ class ReconReportState:
         """Cancel and await the reaper task."""
         if self._reaper_task is not None and not self._reaper_task.done():
             self._reaper_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._reaper_task
-            except asyncio.CancelledError:
-                pass
             self._reaper_task = None
 
 

@@ -692,7 +692,7 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     watchdog_task: asyncio.Task[None] | None = None
-    recon_report_state: Any | None = None
+    recon_report_state: Any = None
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
