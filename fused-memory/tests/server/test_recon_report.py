@@ -198,3 +198,59 @@ class TestReconReportInRunDedup:
         assert 'finding_id' in r1
         assert 'finding_id' in r2
         assert r1['finding_id'] != r2['finding_id']
+
+
+# ---------------------------------------------------------------------------
+# step-7: complete() idempotence — RED until step-8 implements it
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCompleteIdempotence:
+    """Verify PRD §9.2 idempotence rules for complete()."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='cat',
+            description='d',
+            suggested_action='a',
+            task_id='1',
+            flag_type='f',
+        )
+        state.set_stat('r1', 'k', 7)
+        return state, t
+
+    def test_first_complete_stamps_summary(self):
+        state, _ = self._make_state()
+        result = state.complete('r1', 'summary A')
+        assert result == {'flagged_count': 1, 'stats': {'k': 7}}
+        report = state.get_assembled_report('r1', 's1')
+        assert report['summary'] == 'summary A'
+
+    def test_second_same_summary_is_noop(self):
+        state, _ = self._make_state()
+        r1 = state.complete('r1', 'summary A')
+        r2 = state.complete('r1', 'summary A')
+        assert r2 == r1  # identical response
+        report = state.get_assembled_report('r1', 's1')
+        assert report['summary'] == 'summary A'
+        assert report['summary_warnings'] == []
+
+    def test_second_different_summary_warns_does_not_overwrite(self):
+        state, _ = self._make_state()
+        state.complete('r1', 'summary A')
+        result = state.complete('r1', 'summary B')
+        # Response is the cached one, not an error
+        assert result == {'flagged_count': 1, 'stats': {'k': 7}}
+        report = state.get_assembled_report('r1', 's1')
+        # Original summary preserved
+        assert report['summary'] == 'summary A'
+        # Warning recorded
+        assert len(report['summary_warnings']) == 1
+        assert 'summary B' in report['summary_warnings'][0]
