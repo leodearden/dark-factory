@@ -3338,6 +3338,47 @@ async def test_recover_stale_runs_recovers_pre_migration_run_with_null_instance(
     assert err.get('error_type') == 'StaleRunRecovery'
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_does_not_release_live_lock(
+    journal, event_buffer, mock_memory_service,
+):
+    """Recovering an orphan must NOT delete a lock held by the live instance.
+
+    Regression for the false-positive recon_stale_run cascade observed
+    2026-05-28 (rca: plans/recon-stale-recovery-rca.md): the reaper used
+    to call mark_run_complete unconditionally on the project, stripping
+    the lock held by the live cycle on the same project; the next reaper
+    tick then saw lock_holder=None and misclassified the live run as
+    stale, marking it failed, restoring its drained events, and filing
+    a recon_stale_run escalation.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan from a dead instance, old enough to trip the age cutoff.
+    orphan = ReconciliationRun(
+        id='run-orphan-dead',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance',
+    )
+    await journal.start_run(orphan)
+
+    # The live instance currently holds the project lock for its own cycle.
+    assert await event_buffer.mark_run_active(project_id) is True
+    live_iid = event_buffer.instance_id
+
+    await harness._recover_stale_runs()
+
+    # Lock must still belong to the live instance — the orphan recovery
+    # must not have evicted it.
+    assert await event_buffer.get_lock_holder_instance_id(project_id) == live_iid
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
@@ -5012,9 +5053,9 @@ def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
         lock_held_during_replay.append(await event_buffer.is_full_recon_active(pid))
         return await original_replay(pid)
 
-    async def spy_complete(pid):
+    async def spy_complete(pid, *args, **kwargs):
         call_order.append('complete')
-        return await original_complete(pid)
+        return await original_complete(pid, *args, **kwargs)
 
     return spy_replay, spy_complete, call_order, lock_held_during_replay
 
@@ -5076,9 +5117,9 @@ async def test_project_loop_releases_lock_when_replay_raises(
     complete_called: list[bool] = []
     original_complete = harness.buffer.mark_run_complete
 
-    async def spy_complete(pid):
+    async def spy_complete(pid, *args, **kwargs):
         complete_called.append(True)
-        return await original_complete(pid)
+        return await original_complete(pid, *args, **kwargs)
 
     with (
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
