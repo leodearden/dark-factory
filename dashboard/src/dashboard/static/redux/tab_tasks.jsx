@@ -298,18 +298,16 @@ function TaskDetail({ task, allTasks }) {
           </div>}
 
       {(() => {
-        const rawTaskId = String(task.id).split('/T-').pop();
-        const sched = DF_T.SCHEDULER || {};
-        const schedRows = sched.rows || [];
-        const schedModules = sched.modules || [];
-        const myRow = schedRows.find(r => r.project === task.project && r.task_id === rawTaskId);
-        const lockSet = (myRow && myRow.lock_set) || [];
+        const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+        const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+          ? buildSchedLockInfo(task, DF_T.SCHEDULER)
+          : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
         if (!lockSet.length) return null;
         return (<>
           <div className="section-lbl">Module locks ({lockSet.length})</div>
           <div className="chips column">
             {lockSet.map(modPath => {
-              const m = schedModules.find(mm => mm.project === task.project && mm.path === modPath);
+              const m = moduleByPath.get(modPath);
               const holder = m && m.holder;
               const holderProject = m && m.holder_project;
               const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;

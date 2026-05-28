@@ -159,22 +159,19 @@ function DepsCell({ task }) {
 }
 
 function LocksCell({ task }) {
-  const rawTaskId = String(task.id).split('/T-').pop();
-  const sched = DF.SCHEDULER || {};
-  const schedRows = sched.rows || [];
-  const schedModules = sched.modules || [];
-  const myRow = schedRows.find(r => r.project === task.project && r.task_id === rawTaskId);
-  const lockSet = (myRow && myRow.lock_set) || [];
+  const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+  const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+    ? buildSchedLockInfo(task, DF.SCHEDULER)
+    : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
   const sorted = [...lockSet].sort((a, b) => {
-    const ma = schedModules.find(mm => mm.project === task.project && mm.path === a);
-    const mb = schedModules.find(mm => mm.project === task.project && mm.path === b);
+    const ma = moduleByPath.get(a), mb = moduleByPath.get(b);
     const ha = ma && ma.holder, hb = mb && mb.holder;
     const blockedA = ha && ha !== rawTaskId ? 0 : 1;
     const blockedB = hb && hb !== rawTaskId ? 0 : 1;
     return blockedA - blockedB; // blocked-by-other first
   });
   return <ChipList items={sorted} renderChip={(modPath) => {
-    const m = schedModules.find(mm => mm.project === task.project && mm.path === modPath);
+    const m = moduleByPath.get(modPath);
     return <LockChip key={modPath} path={modPath} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} />;
   }} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
 }

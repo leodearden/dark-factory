@@ -136,12 +136,20 @@ function OverviewTab({ paused }) {
                   </td>
                   <td className="num">{(() => {
                     const projMods = schedModules.filter(m => m.project === o.project);
-                    const held = projMods.filter(m => m.holder).length;
-                    const contended = projMods.filter(m => (m.contention || 0) > 1).length;
-                    const heldTitle = projMods.filter(m => m.holder).map(m => m.path).join('\n') || 'none held';
+                    const heldMods = projMods.filter(m => m.holder);
+                    const contendedMods = projMods.filter(m => (m.contention || 0) > 1);
+                    const held = heldMods.length;
+                    const contended = contendedMods.length;
+                    const heldTitle = [
+                      heldMods.length ? 'held:\n' + heldMods.map(m => m.path).join('\n') : 'none held',
+                      contendedMods.length ? 'contended:\n' + contendedMods.map(m => m.path).join('\n') : '',
+                    ].filter(Boolean).join('\n\n');
+                    if (held === 0 && contended === 0) {
+                      return <span style={{ color: 'var(--fg-3)' }}>—</span>;
+                    }
                     return (
                       <span className="mono" style={{ fontSize: 11 }} title={heldTitle}>
-                        {held > 0 ? <span className="badge warn">{held}h</span> : <span style={{ color: 'var(--fg-3)' }}>—</span>}
+                        <span className="badge warn">{held}h</span>
                         {contended > 0 && <span className="badge bad" style={{ marginLeft: 2 }}>{contended}c</span>}
                       </span>
                     );
