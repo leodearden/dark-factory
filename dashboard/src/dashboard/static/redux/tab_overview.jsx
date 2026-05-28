@@ -6,13 +6,46 @@ const { useState, useEffect } = React;
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
 
+const METRICS = [
+  { key: 'psi_cpu_some_avg10',  label: 'CPU pressure · some',  type: 'psi' },
+  { key: 'psi_cpu_full_avg10',  label: 'CPU pressure · full',  type: 'psi' },
+  { key: 'psi_mem_some_avg10',  label: 'Mem pressure · some',  type: 'psi' },
+  { key: 'psi_mem_full_avg10',  label: 'Mem pressure · full',  type: 'psi' },
+  { key: 'psi_io_some_avg10',   label: 'IO pressure · some',   type: 'psi' },
+  { key: 'psi_io_full_avg10',   label: 'IO pressure · full',   type: 'psi' },
+  { key: 'occt_queue_depth',    label: 'OCCT queue depth',     type: 'int' },
+  { key: 'verify_concurrency',  label: 'Verify concurrency',   type: 'int' },
+  { key: 'verify_rss_total_bytes', label: 'Verify RSS total',  type: 'bytes' },
+];
+
 function HostLoadCard() {
+  const [load, setLoad] = useState(null);
+
   return (
     <div className="panel">
       <div className="panel-head">
         <span className="title">Host load</span>
+        <span className="meta">5-min window · 5s poll</span>
       </div>
       <div className="panel-body">
+        <table className="tbl" style={{ width: '100%' }}>
+          <tbody>
+            {METRICS.map(m => {
+              const datum = (load && load[m.key]) || { current: null, sparkline: [] };
+              return (
+                <tr key={m.key}>
+                  <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{m.label}</td>
+                  <td className="num mono" style={{ width: '12%', fontSize: 12 }}>
+                    {datum.current == null ? '—' : String(datum.current)}
+                  </td>
+                  <td style={{ width: '58%' }}>
+                    <Sparkline values={datum.sparkline} color={P.accent} />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
