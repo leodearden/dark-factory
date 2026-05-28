@@ -489,3 +489,39 @@ def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body:
         "tab_escalations.jsx does not use setAll (from useOpenSet) for expand/collapse-all — "
         'wire GroupAllToggle or a button to the setAll function returned by useOpenSet.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-13 test: tab_escalations.jsx has global level+status filter chips
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_global_filter_chips(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must persist filter state with 'df.esc.filter', render
+    level chips for 0/1/2 and status chips for pending/resolved/dismissed, and
+    apply a filter predicate to rows of every subsection.
+    """
+    # Filter state persisted with the correct key
+    assert "'df.esc.filter'" in tab_escalations_jsx_body, (
+        "tab_escalations.jsx does not call usePersistedState with 'df.esc.filter' — "
+        "add `const [filter, setFilter] = usePersistedState('df.esc.filter', ...)` for persisted filter."
+    )
+    # Level chip values 0, 1, 2
+    for lv in ('0', '1', '2'):
+        assert lv in tab_escalations_jsx_body, (
+            f"tab_escalations.jsx does not reference level '{lv}' in a filter-chip context — "
+            f'add a chip for level {lv} in the controls header.'
+        )
+    # Status chip values
+    for st in ('pending', 'resolved', 'dismissed'):
+        assert st in tab_escalations_jsx_body, (
+            f"tab_escalations.jsx does not reference status '{st}' in a filter-chip context — "
+            f"add a chip for status '{st}' in the controls header."
+        )
+    # Filter predicate function references the filter state
+    assert 'matchesFilter' in tab_escalations_jsx_body or (
+        'filter.levels' in tab_escalations_jsx_body and 'filter.statuses' in tab_escalations_jsx_body
+    ), (
+        "tab_escalations.jsx does not apply a filter predicate referencing filter state to rows — "
+        'add a matchesFilter(row) function using filter.levels[row.level] && filter.statuses[row.status].'
+    )
