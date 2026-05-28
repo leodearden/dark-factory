@@ -17,9 +17,10 @@ import contextlib
 import logging
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run

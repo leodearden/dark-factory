@@ -5715,10 +5715,10 @@ class TestGroupMergeRequestHappyPath:
         assert 'trn-c.py' in main_files
 
         # mark_member_done called exactly 3 times, all with the SAME merge SHA
-        assert req.mark_member_done.call_count == 3, (
-            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
         )
-        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
         assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
         called_sha = next(iter(called_shas))
         assert called_sha == outcome.merge_sha
@@ -5781,7 +5781,7 @@ class TestGroupMergeRequestTrainIncomplete:
         spy_merge.assert_not_called()
 
         # No member callbacks
-        req.mark_member_done.assert_not_called()
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
 
 
 # ---------------------------------------------------------------------------
@@ -5837,7 +5837,7 @@ class TestGroupMergeRequestRebaseConflict:
         spy_merge.assert_not_called()
 
         # No callbacks
-        req.mark_member_done.assert_not_called()
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
 
         # Tip worktree must be clean (rebase was aborted)
         _, status_out, _ = await _run(
@@ -5906,8 +5906,8 @@ class TestGroupMergeRequestMainAdvancedClean:
         )
 
         # All members marked done with same SHA
-        assert req.mark_member_done.call_count == 3
-        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        assert req.mark_member_done.call_count == 3  # type: ignore[reportFunctionMemberAccess]
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
         assert len(called_shas) == 1
         assert next(iter(called_shas)) == outcome.merge_sha
 
@@ -5965,7 +5965,7 @@ class TestGroupMergeRequestVerifyGate:
         assert main_after.strip() == main_before, 'main must not advance on red verify'
 
         # No member callbacks
-        req.mark_member_done.assert_not_called()
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
 
 
 # ---------------------------------------------------------------------------
@@ -6031,10 +6031,10 @@ class TestGroupMergeRequestSpeculativeWorker:
         assert 'trn-c.py' in main_files
 
         # mark_member_done called exactly 3 times, all with the SAME merge SHA
-        assert req.mark_member_done.call_count == 3, (
-            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
         )
-        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
         assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
         assert next(iter(called_shas)) == outcome.merge_sha
 
