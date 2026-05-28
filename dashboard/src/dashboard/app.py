@@ -55,6 +55,7 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
+from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -91,9 +92,8 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import collect_scheduler_state
-from dashboard.data.utils import safe_gather_result
-from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.tasks import fetch_tasks
+from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
     get_operations_breakdown,

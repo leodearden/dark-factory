@@ -652,7 +652,7 @@ def shape_escalations(
     # Build roots list for reconciliation resolution (worktree-prefix + task-map probe).
     # Each element is (Path(root_str), list_of_tasks) matching resolve_owning_project contract.
     roots_for_resolution: list[tuple[Path, list[dict[str, Any]]]] = [
-        (Path(root_str), list(task_list))
+        (Path(root_str), [dict(t) for t in task_list])
         for root_str, task_list in task_maps.items()
     ]
 
