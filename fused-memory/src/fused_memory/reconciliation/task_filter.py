@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 # --------------------------------------------------------------------------- #
 # Status constants
@@ -280,6 +280,44 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         total_count=total,
         max_task_id=max_task_id,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Census-inconsistency helper
+# --------------------------------------------------------------------------- #
+
+
+def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
+    """Return referenced task ids that strictly exceed the census maximum.
+
+    Surfaces the 'highest-ID below known task IDs' inconsistency signature
+    produced by a partial or wrong-source bulk task read: when an event or flag
+    references a task id higher than the FilteredTaskTree's max_task_id, the
+    bulk read did not cover that id — it may have been truncated or pointed at
+    a different project_root.
+
+    Args:
+        max_task_id: The authoritative maximum task id from FilteredTaskTree
+            (computed over the full flattened input, not the capped lists).
+        referenced_ids: Iterable of candidate ids to check.  Each entry is
+            parsed using the id_key first-dot-segment-to-int rule:
+            integers are used directly; strings are split on '.' and the first
+            segment is coerced to int; unparseable entries are silently ignored.
+
+    Returns:
+        Sorted, deduplicated list of ints that strictly exceed max_task_id.
+        Returns [] when referenced_ids is empty or no entry exceeds max_task_id.
+    """
+    exceeding: set[int] = set()
+    for ref in referenced_ids:
+        try:
+            ref_str = str(ref)
+            val = int(ref_str.split('.')[0])
+        except (TypeError, ValueError, AttributeError):
+            continue  # silently ignore unparseable entries
+        if val > max_task_id:
+            exceeding.add(val)
+    return sorted(exceeding)
 
 
 # --------------------------------------------------------------------------- #
