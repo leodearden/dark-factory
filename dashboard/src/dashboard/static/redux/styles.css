@@ -246,6 +246,16 @@ table { border-collapse: collapse; width: 100%; }
 .badge.accent{ color: var(--accent); border-color: oklch(0.72 0.14 230 / 0.4); background: oklch(0.72 0.14 230 / 0.10); }
 .badge.muted { color: var(--fg-2); }
 
+/* Escalation level pills (L0 = info, L1 = warn, L2 = bad) */
+.badge.esc-level-0 { color: var(--info); border-color: oklch(0.62 0.20 305 / 0.45); background: oklch(0.62 0.20 305 / 0.12); }
+.badge.esc-level-1 { color: var(--warn); border-color: oklch(0.80 0.14 80  / 0.4);  background: oklch(0.80 0.14 80  / 0.10); }
+.badge.esc-level-2 { color: var(--bad);  border-color: oklch(0.68 0.18 25  / 0.4);  background: oklch(0.68 0.18 25  / 0.10); }
+
+/* Escalation severity pills (high/critical = bad, medium = warn, low = muted) */
+.badge.esc-sev-high   { color: var(--bad);  border-color: oklch(0.68 0.18 25  / 0.4);  background: oklch(0.68 0.18 25  / 0.10); }
+.badge.esc-sev-medium { color: var(--warn); border-color: oklch(0.80 0.14 80  / 0.4);  background: oklch(0.80 0.14 80  / 0.10); }
+.badge.esc-sev-low    { color: var(--fg-2); border-color: var(--line); background: var(--bg-2); }
+
 .bar {
   position: relative; height: 4px; background: var(--bg-2); border-radius: 2px; overflow: hidden;
 }
