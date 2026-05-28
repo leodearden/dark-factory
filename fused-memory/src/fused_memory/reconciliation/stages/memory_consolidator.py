@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 from fused_memory.models.reconciliation import (
@@ -13,7 +14,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
-from fused_memory.reconciliation.flag_dedup import dedup_flags
+from fused_memory.reconciliation.flag_dedup import dedup_flags, filter_false_absence_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stage1_stall_detector import (
@@ -23,7 +24,13 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     track_human_operator_stalls,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.task_filter import FilteredTaskTree, format_filtered_task_tree
+from fused_memory.reconciliation.task_filter import (
+    FilteredTaskTree,
+    detect_census_inconsistency,
+    format_filtered_task_tree,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryConsolidator(BaseStage):
@@ -74,6 +81,42 @@ class MemoryConsolidator(BaseStage):
                 run_id=run_id,
                 flags=report.items_flagged,
             )
+            # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
+            # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
+            # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
+            # inconclusive → drop to prevent irreversible delete_memory ops on real tasks.
+            report.items_flagged = await filter_false_absence_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
+
+        # ── Census inconsistency detection ────────────────────────────────────
+        # Compare task IDs referenced in this cycle's events against the census
+        # max from the filtered task tree.  IDs exceeding the max indicate a
+        # partial/wrong-source bulk task read (the "highest-ID below known task IDs"
+        # signature) and should be surfaced as a structured observation so operators
+        # can investigate the root cause.
+        if self.filtered_task_tree is not None:
+            event_task_ids = [
+                e.payload.get('task_id')
+                for e in events
+                if e.payload.get('task_id') is not None
+            ]
+            inconsistent = detect_census_inconsistency(
+                self.filtered_task_tree.max_task_id, event_task_ids
+            )
+            if inconsistent:
+                report.stats['task_tree_census_inconsistent'] = inconsistent
+                logger.warning(
+                    'reconciliation.task_tree_census_inconsistent',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'census_max': self.filtered_task_tree.max_task_id,
+                        'offending_ids': inconsistent,
+                    },
+                )
 
         # ── Stale human-operator-required detector (task 1201) ────────────────
         # Short-circuit when the escalation queue is unavailable — writing Mem0
