@@ -848,3 +848,50 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     if task_id is None or flag_type is None:
         return None
     return (str(task_id), str(flag_type))
+
+
+# --------------------------------------------------------------------------- #
+# Absence guard helpers
+# --------------------------------------------------------------------------- #
+
+#: Flag types that assert a task is absent or phantom.  Flags of these types
+#: must be validated by filter_false_absence_flags before Stage 2 can act on
+#: them, because delete_memory is irreversible.
+ABSENCE_FLAG_TYPES: frozenset[str] = frozenset({
+    'task_absent',
+    'phantom_task',
+    'orphaned_knowledge',
+})
+
+#: Phrase produced by the sqlite backend when a task ID is not found.
+#: Matched case-insensitively to tolerate minor message variations.
+_NOT_FOUND_PHRASE: str = 'no tasks found for id'
+
+
+def confirm_task_absent(get_task_result: object) -> bool:
+    """Fail-closed classifier: True ONLY when get_task POSITIVELY confirms absence.
+
+    Recognises the not-found signal produced by the SQLite task backend /
+    get_task MCP wrapper: a dict with an ``error`` key whose value contains
+    the phrase 'No tasks found for ID(s)' (case-insensitive).
+
+    All other inputs — a valid task record, a generic/inconclusive error, None,
+    an empty dict, or a non-dict value — return False (fail-closed).  The
+    fail-closed contract is intentional: delete_memory is irreversible, so an
+    inconclusive lookup must block deletion exactly like a present task.
+
+    Args:
+        get_task_result: The raw value returned by taskmaster.get_task() (or
+            mcp__fused-memory__get_task).  Expected to be either a task dict
+            (present) or an error dict (absent / inconclusive).
+
+    Returns:
+        True if and only if the result is a dict with an ``error`` string
+        containing the canonical not-found phrase.  False in all other cases.
+    """
+    if not isinstance(get_task_result, dict):
+        return False
+    error = get_task_result.get('error')
+    if not isinstance(error, str):
+        return False
+    return _NOT_FOUND_PHRASE in error.lower()
