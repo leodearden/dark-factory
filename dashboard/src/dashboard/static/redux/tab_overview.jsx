@@ -18,6 +18,17 @@ const METRICS = [
   { key: 'verify_rss_total_bytes', label: 'Verify RSS total',  type: 'bytes' },
 ];
 
+/* Format a host-load metric value for display.
+ *  type 'psi'   → "X.XX%"  (avg10 stall %; some = tasks stalling, full = all stalling)
+ *  type 'bytes' → "X.X GiB" (verify_rss_total_bytes via 1024**3 = 1073741824)
+ *  type 'int'   → integer (occt_queue_depth, verify_concurrency)
+ */
+function formatLoadValue(key, type, v) {
+  if (type === 'psi')   return `${v.toFixed(2)}%`;
+  if (type === 'bytes') return `${(v / 1073741824).toFixed(1)} GiB`;
+  /* type === 'int' */  return `${Math.round(v)}`;
+}
+
 function HostLoadCard() {
   const [load, setLoad] = useState(null);
 
@@ -36,7 +47,7 @@ function HostLoadCard() {
                 <tr key={m.key}>
                   <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{m.label}</td>
                   <td className="num mono" style={{ width: '12%', fontSize: 12 }}>
-                    {datum.current == null ? '—' : String(datum.current)}
+                    {datum.current == null ? '—' : formatLoadValue(m.key, m.type, datum.current)}
                   </td>
                   <td style={{ width: '58%' }}>
                     <Sparkline values={datum.sparkline} color={P.accent} />
