@@ -59,6 +59,11 @@ DISALLOW_SUBTASK_CREATE = ['mcp__fused-memory__add_subtask']
 STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
 STAGE2_DISALLOWED = DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE  # Full memory + task tools EXCEPT add_subtask (see DISALLOW_SUBTASK_CREATE)
 STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
+# NOTE: `mcp__recon-report__*` tools are intentionally NOT included in DISALLOW_MEMORY_WRITES
+# or DISALLOW_TASK_WRITES and therefore NOT in STAGE3_DISALLOWED.  These tools write only
+# to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster) so they do not violate
+# Stage 3's read-only contract.  Do NOT add them to either disallow list.
+# See PRD §9.1 / §11 task γ for the rationale.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {

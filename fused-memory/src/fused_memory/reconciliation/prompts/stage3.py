@@ -40,44 +40,42 @@ serious (fundamentally contradictory state).
 - When you have completed your work, produce your final structured report as your response.
 
 ## Finding Classification (REQUIRED)
-Each finding in your report MUST include these fields:
+Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
-- `severity`: One of "minor", "moderate", or "serious".
+- `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
 - `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
 contradictions, task mismatches); `false` if it needs human judgment.
 - `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
 `task_memory_mismatch`, `missing_knowledge`, `cross_store_inconsistency`, `systemic_pattern`, `other`.
-- `affected_ids`: List of memory IDs, entity names, or task IDs involved.
 - `suggested_action`: What the remediation stage should do to fix this finding.
 
-Example finding:
-```json
-{{
-  "description": "Edge 'uses_framework→React' on entity 'project_alpha' last updated 2025-01, but project switched to Vue in 2025-09",
-  "severity": "moderate",
-  "actionable": true,
-  "category": "memory_stale",
-  "affected_ids": ["edge-abc123", "project_alpha"],
-  "suggested_action": "Delete stale edge 'uses_framework→React' and verify Vue edge exists"
-}}
-```
+Instead of an `affected_ids` list, attach typed citations via the recon_report tools \
+(see Report Channel section below).
 
-## Output Format
+## Report Channel — recon_report MCP Tools (PRD γ §9)
+The harness calls `mcp__recon-report__start_report` before the stage begins — do NOT call \
+it yourself. For each finding, call `mcp__recon-report__add_finding(...)` with the required \
+fields above and capture the `finding_id` from the response. Then attach typed citations:
 
-When you have completed your work, produce your final structured JSON report as your response. \
-Your output MUST conform to the following structure:
+- `mcp__recon-report__cite_entity(finding_id=..., name=<canonical entity name>)` — pass the \
+  ENTITY NAME (not a UUID); the server resolves the UUID internally.
+- `mcp__recon-report__cite_edge(finding_id=..., edge_uuid=<full 36-char UUID>)` — copy the \
+  UUID verbatim from the `id` field of a fresh tool result \
+  (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.
+- `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>, task_id=<task_id>)` \
+  — both `project_id` and `task_id` are required.
+- `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>, store=<'mem0'|'graphiti'>)` \
+  — `memory_id` must be the full 36-char UUID from the `id` field of a fresh tool result.
 
-- `summary` (string, required): Human-readable summary of what was verified and found.
-- `flagged_items` (array): **All findings go here** — do NOT use a `findings` key. \
-  Each item in `flagged_items` must include:
-  - `description`: What the inconsistency is, with specific IDs and evidence.
-  - `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
-  - `actionable`: `true` or `false`.
-  - `category`: One of the categories listed above.
-  - `affected_ids`: List of memory IDs, entity names, or task IDs.
-  - `suggested_action`: What the remediation stage should do.
-- `stats` (object, optional): Counts and metrics (e.g. items checked, findings by severity).
+**NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
+state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \
+They do NOT violate the read-only contract. See PRD §9.1 / §11 task γ.
 
-**Important**: The output key is `flagged_items`, not `findings`. Place every finding \
-inside the `flagged_items` array.
+For stats counters use `mcp__recon-report__set_stat(key=..., value=...)` or \
+`mcp__recon-report__inc_stat(key=..., amount=...)`.
+
+When all findings are recorded and all work is done, call \
+`mcp__recon-report__complete(summary=<brief human-readable summary of what was verified and \
+found>)` as your terminal action — do NOT produce a structured JSON response; the assembled \
+recon_report state is the authoritative output channel for this stage.
 """

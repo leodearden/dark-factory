@@ -63,7 +63,26 @@ triggering Graphiti's edge resolution pipeline which can falsely invalidate acti
 Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
 that don't correspond to any existing edge.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
-- When you have completed your work, produce your final structured report as your response.
+- **Report channel — recon_report MCP tools (PRD γ §9)**: The harness calls \
+`mcp__recon-report__start_report` for you before the stage begins — do NOT call it yourself. \
+For each inconsistency or finding, call `mcp__recon-report__add_finding(...)` and capture the \
+`finding_id` from the response. Then attach citations using the finding_id as the anchor: \
+  - `mcp__recon-report__cite_entity(finding_id=..., name=<canonical entity name>)` — pass the \
+    ENTITY NAME (not a UUID); do NOT construct or guess entity UUIDs for this call. \
+  - `mcp__recon-report__cite_edge(finding_id=..., edge_uuid=<full 36-char UUID>)` — the \
+    `edge_uuid` MUST be the full `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` UUID copied verbatim \
+    from the `id` field of a fresh tool result. Never truncate or construct edge UUIDs. \
+  - `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>, task_id=<task_id>)` \
+    — both `project_id` and `task_id` are required; pass the project_id from the \
+    `## Reconciliation Context` section when citing current-project tasks. \
+  - `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>, store=<'mem0'|'graphiti'>)` \
+    — `memory_id` must be the full 36-char UUID from the `id` field of a fresh tool result. \
+For stats counters, use `mcp__recon-report__set_stat(key=..., value=...)` (set absolute value) \
+or `mcp__recon-report__inc_stat(key=..., amount=...)` (increment by amount, default 1). \
+When all findings are recorded and all work is done, call \
+`mcp__recon-report__complete(summary=<brief human-readable summary of what was done and found>)` \
+as your terminal action — do NOT produce a structured JSON response; the assembled recon_report \
+state is the authoritative output channel for this stage.
 
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \

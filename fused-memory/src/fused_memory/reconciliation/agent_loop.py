@@ -80,6 +80,12 @@ class AgentLoop:
         terminal_tool: str = 'stage_complete',
         usage_gate=None,
     ):
+        # NOTE: for recon stages running via the CLI path (production), the effective
+        # terminal action is `mcp__recon-report__complete` — the stage agent calls that
+        # tool to signal completion and the assembled ReconReportState is the authoritative
+        # output channel.  `terminal_tool` here gates the in-process anthropic/openai path
+        # only; the CLI path terminates on the agent's own stop signal after the last tool
+        # result, so the default 'stage_complete' value is not exercised in that path.
         self.config = config
         self.system_prompt = system_prompt
         self.tools = tools
