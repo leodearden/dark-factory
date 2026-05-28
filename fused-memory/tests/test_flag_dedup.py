@@ -4427,3 +4427,159 @@ class TestConfirmTaskAbsent:
             )
 
 
+# ---------------------------------------------------------------------------
+# Step 9: filter_false_absence_flags (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterFalseAbsenceFlags:
+    """RED tests for async filter_false_absence_flags(taskmaster, project_root, flags) (step-9).
+
+    Keeps an absence-type flag ONLY when get_task POSITIVELY confirms absence.
+    All other cases (present, inconclusive, error, no task_id) use fail-closed semantics.
+    """
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_for_present_task_is_dropped(self):
+        """Absence flag whose task is PRESENT (get_task returns a record) is DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '3438', 'title': 'Real task', 'status': 'in-progress',
+        })
+        project_root = '/proj'
+
+        flags = [{'task_id': '3438', 'flag_type': 'task_absent', 'description': 'looks absent'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag for a present task must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_for_confirmed_absent_task_is_kept(self):
+        """Absence flag whose task is confirmed ABSENT (get_task returns not-found) is KEPT."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
+            'error_type': 'TaskmasterError',
+        })
+        project_root = '/proj'
+
+        flag = {'task_id': '9999', 'flag_type': 'task_absent', 'description': 'ghost task'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'Absence flag for a confirmed-absent task must be kept'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_with_inconclusive_lookup_is_dropped(self):
+        """Absence flag whose lookup is INCONCLUSIVE (generic error) is DROPPED (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'error': 'Connection timeout', 'error_type': 'TimeoutError',
+        })
+        project_root = '/proj'
+
+        flags = [{'task_id': '42', 'flag_type': 'phantom_task', 'description': 'maybe phantom'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag with inconclusive lookup must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_when_get_task_raises_is_dropped(self):
+        """Absence flag whose get_task raises an exception is DROPPED (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('backend down'))
+        project_root = '/proj'
+
+        flags = [{'task_id': '100', 'flag_type': 'orphaned_knowledge', 'description': 'orphan?'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag when get_task raises must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_absence_flag_is_kept_regardless_of_existence(self):
+        """Non-absence flag is KEPT untouched regardless of get_task result."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        # get_task should NOT be called for non-absence flags
+        taskmaster.get_task = AsyncMock(return_value={'id': '7', 'status': 'pending'})
+        project_root = '/proj'
+
+        non_absence_flag = {'task_id': '7', 'flag_type': 'missing_deliverable', 'description': 'no output'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [non_absence_flag])
+
+        assert result == [non_absence_flag], (
+            'Non-absence flag must pass through unchanged'
+        )
+        # get_task must NOT be called for non-absence flags
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_without_task_id_is_kept_unchanged(self):
+        """Absence flag missing task_id is KEPT unchanged (no task to evaluate)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock()
+        project_root = '/proj'
+
+        no_id_flag = {'flag_type': 'task_absent', 'description': 'no task_id set'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [no_id_flag])
+
+        assert result == [no_id_flag], (
+            'Absence flag without task_id must be kept (cannot evaluate absence)'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_flags_processed_correctly(self):
+        """Mixed list: absence-present dropped, absence-absent kept, non-absence kept."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        project_root = '/proj'
+
+        not_found_response = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 200',
+            'error_type': 'TaskmasterError',
+        }
+        present_response = {'id': '100', 'title': 'Real', 'status': 'pending'}
+
+        async def _mock_get_task(task_id, project_root, **_kw):
+            if str(task_id) == '100':
+                return present_response
+            if str(task_id) == '200':
+                return not_found_response
+            return {'error': 'unexpected', 'error_type': 'RuntimeError'}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        absent_for_present = {'task_id': '100', 'flag_type': 'task_absent', 'description': 'wrong'}
+        absent_for_absent = {'task_id': '200', 'flag_type': 'phantom_task', 'description': 'ok'}
+        non_absence = {'task_id': '999', 'flag_type': 'missing_deliverable', 'description': 'x'}
+        no_id = {'flag_type': 'task_absent', 'description': 'no task_id'}
+
+        flags = [absent_for_present, absent_for_absent, non_absence, no_id]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert absent_for_present not in result, 'Flag for present task must be dropped'
+        assert absent_for_absent in result, 'Flag for confirmed-absent task must be kept'
+        assert non_absence in result, 'Non-absence flag must be kept'
+        assert no_id in result, 'Absence flag without task_id must be kept'
+
+
