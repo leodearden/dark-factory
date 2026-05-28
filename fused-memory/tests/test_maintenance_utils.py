@@ -4,7 +4,9 @@ import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import pydantic_spec
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance._utils import override_config_path
 
 
@@ -81,7 +83,7 @@ class TestMaintenanceService:
         """maintenance_service yields a (FusedMemoryConfig, MemoryService) tuple."""
         from fused_memory.maintenance._utils import maintenance_service
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
 
         with (
@@ -98,7 +100,7 @@ class TestMaintenanceService:
         from fused_memory.maintenance._utils import maintenance_service
 
         call_order = []
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.initialize = AsyncMock(side_effect=lambda: call_order.append('initialize'))
 
@@ -116,7 +118,7 @@ class TestMaintenanceService:
         """maintenance_service calls service.close() when the body exits normally."""
         from fused_memory.maintenance._utils import maintenance_service
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
 
         with (
@@ -133,7 +135,7 @@ class TestMaintenanceService:
         """maintenance_service calls service.close() even when the body raises."""
         from fused_memory.maintenance._utils import maintenance_service
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
 
         with (
@@ -151,7 +153,7 @@ class TestMaintenanceService:
         """When both the body and close() raise, the original body error propagates."""
         from fused_memory.maintenance._utils import maintenance_service
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
 
