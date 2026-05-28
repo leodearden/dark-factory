@@ -732,13 +732,22 @@ async def run_server():
             )
             server = uvicorn.Server(uv_config)
 
+            # Second uvicorn: recon_report MCP namespace on port recon_report_port.
+            # Constructed BEFORE _install_operator_stop_handler so that the stop
+            # callback can reference both servers — stopping only the primary would
+            # leave asyncio.gather(server.serve(), recon_server.serve()) unresolved
+            # and hang run_server() until SIGKILL.
+            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(config)
+            recon_server = uvicorn.Server(recon_uv_config)
+            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+
             # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
             # install its own handlers. We need to differentiate operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
             server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
-                lambda: setattr(server, 'should_exit', True),
+                _make_operator_stop_callback(server, recon_server),
             )
 
             # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
@@ -751,10 +760,6 @@ async def run_server():
 
             watchdog_task = asyncio.create_task(_watchdog_heartbeat())
 
-            # Second uvicorn: recon_report MCP namespace on port recon_report_port
-            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(config)
-            recon_server = uvicorn.Server(recon_uv_config)
-            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
             await recon_report_state.start_reaper()
             logger.info(
                 '  Recon Report Endpoint: http://%s:%d/mcp/',
@@ -1187,6 +1192,34 @@ def _build_recon_report_components(
         log_level='info',
     )
     return state, mcp, uv_config
+
+
+def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
+    """Return a callback that sets ``should_exit = True`` on every passed server.
+
+    Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
+    so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
+    and the recon_report uvicorn.Server simultaneously.
+
+    Without this, ``asyncio.gather(server.serve(), recon_server.serve())`` never
+    resolves on operator shutdown because only the primary server's ``should_exit``
+    flag was flipped — the recon_report server kept running, blocking the gather,
+    and ``run_server()`` hung until SIGKILL.
+
+    Args:
+        *servers: Zero or more server objects exposing a writable ``should_exit``
+            attribute (typically :class:`uvicorn.Server` instances, but any object
+            with the attribute works — including test fakes).
+
+    Returns:
+        A zero-argument callable that flips ``should_exit = True`` on each server.
+    """
+
+    def _stop() -> None:
+        for s in servers:
+            s.should_exit = True
+
+    return _stop
 
 
 def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None:
