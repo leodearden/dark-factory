@@ -212,7 +212,10 @@ _OPAQUE_TIMEOUT_CAUSE_RE = re.compile(r'^Command timed out after \d+(\.\d+)?s:')
 # Order of application: ANSI first (so coloured file:line refs are cleaned
 # before the file:line pattern matches them), then file:line, then whitespace.
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
-_FILE_LINE_RE = re.compile(r'\b\S+\.\w+:\d+(:\d+)?\b')
+_FILE_LINE_RE = re.compile(
+    r'\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|sh|md|yaml|yml|json|toml)'
+    r':\d+(:\d+)?\b'
+)
 _WHITESPACE_RE = re.compile(r'\s+')
 
 
@@ -3119,6 +3122,10 @@ class TaskWorkflow:
             # Uses the last-N-equal window so an early "blip" of a different
             # category does not prevent the guard from firing once the loop
             # settles into a repeat pattern.
+            # Empty-string signatures ('', '') count as identical triples and
+            # trigger the guard intentionally: if the verifier repeatedly
+            # returns opaque output with no category or cause_hint, escalating
+            # to L1 is still the right response.
             _sig = (result.category or '', _normalize_cause_hint(result.cause_hint))
             self._failure_signature_history.append(_sig)
             _N = self.config.max_failure_signature_repeat
