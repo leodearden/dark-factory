@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import aiosqlite
 import pytest
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -23,6 +24,31 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 from fused_memory.services.write_journal import WriteJournal
+
+# ---------------------------------------------------------------------------
+# Shared assertion helper — imported by test_overrides_db_durability.py too
+# ---------------------------------------------------------------------------
+
+
+def assert_connection_thread_is_daemon(conn: aiosqlite.Connection, label: str = '') -> None:
+    """Assert that an aiosqlite connection's worker thread is alive and daemon-marked.
+
+    Centralises the ``._thread`` access pattern so that a future aiosqlite
+    rename is caught in one place rather than across three test modules.
+
+    Args:
+        conn: An open :class:`aiosqlite.Connection` to inspect.
+        label: Optional label prepended to assertion failure messages (e.g.
+            the store class name or helper function name).
+    """
+    prefix = f'{label}: ' if label else ''
+    thread = conn._thread
+    assert thread.is_alive(), f'{prefix}worker thread should be alive while connection is open'
+    assert thread.daemon is True, (
+        f'{prefix}aiosqlite worker thread must be daemon so a leaked '
+        'connection cannot block interpreter shutdown'
+    )
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle helpers
@@ -111,11 +137,6 @@ async def test_store_connection_is_daemon(
     try:
         conn = get_conn(store, project_root)
         assert conn is not None, 'Expected an open connection'
-        thread = conn._thread
-        assert thread.is_alive(), 'Worker thread should be alive while connection is open'
-        assert thread.daemon is True, (
-            f'{type(store).__name__}: aiosqlite worker thread must be daemon so a '
-            'leaked connection cannot block interpreter shutdown'
-        )
+        assert_connection_thread_is_daemon(conn, label=type(store).__name__)
     finally:
         await store.close()

@@ -24,6 +24,7 @@ from fused_memory.server.tools import (
     _connect_overrides_db,
     _open_overrides_db,
 )
+from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 # ---------------------------------------------------------------------------
 # TestOpenOverridesDbPragmas
@@ -211,12 +212,7 @@ class TestOverridesDbConnectIsDaemon:
         project_root = str(tmp_path / 'proj')
         db = await _open_overrides_db(project_root, autocommit=autocommit)
         try:
-            thread = db._thread
-            assert thread.is_alive()
-            assert thread.daemon is True, (
-                f'_open_overrides_db(autocommit={autocommit}): worker thread must be daemon '
-                'so a leaked connection cannot block interpreter shutdown'
-            )
+            assert_connection_thread_is_daemon(db, label=f'_open_overrides_db(autocommit={autocommit})')
         finally:
             await db.close()
 
@@ -230,11 +226,6 @@ class TestOverridesDbConnectIsDaemon:
 
         db = await _connect_overrides_db(project_root, autocommit=autocommit)
         try:
-            thread = db._thread
-            assert thread.is_alive()
-            assert thread.daemon is True, (
-                f'_connect_overrides_db(autocommit={autocommit}): worker thread must be daemon '
-                'so a leaked connection cannot block interpreter shutdown'
-            )
+            assert_connection_thread_is_daemon(db, label=f'_connect_overrides_db(autocommit={autocommit})')
         finally:
             await db.close()

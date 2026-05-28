@@ -655,6 +655,27 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
 # ---------------------------------------------------------------------------
 
 
+def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
+    """Assert that an aiosqlite connection's worker thread is alive and daemon-marked.
+
+    Centralises the ``._thread`` access pattern so that a future aiosqlite
+    rename is caught in one place rather than in every daemon-related test
+    method.  The fused-memory counterpart lives in
+    ``fused-memory/tests/test_daemon_connect_consolidation.py``.
+
+    Args:
+        conn: An open :class:`aiosqlite.Connection` to inspect.
+        label: Optional label prepended to assertion failure messages.
+    """
+    prefix = f'{label}: ' if label else ''
+    thread = conn._thread
+    assert thread.is_alive(), f'{prefix}worker thread should be alive while connection is open'
+    assert thread.daemon is True, (
+        f'{prefix}aiosqlite worker thread must be daemon so a leaked '
+        'connection cannot block interpreter shutdown'
+    )
+
+
 @pytest.mark.asyncio
 class TestWorkerThreadIsDaemon:
     """AsyncSqliteBase.open() marks aiosqlite's worker thread as daemon.
@@ -673,13 +694,8 @@ class TestWorkerThreadIsDaemon:
             assert store._conn is not None
             # aiosqlite Connection stores its worker as ._thread (private).
             # If aiosqlite ever renames this, the guard in open() silently
-            # degrades — this test fails loudly so we notice.
-            thread = store._conn._thread
-            assert thread.is_alive()
-            assert thread.daemon is True, (
-                'aiosqlite worker thread must be daemon so a leaked '
-                'connection cannot block interpreter shutdown'
-            )
+            # degrades — _assert_daemon_thread fails loudly so we notice.
+            _assert_daemon_thread(store._conn, label='AsyncSqliteBase.open()')
         finally:
             await store.close()
 
@@ -703,12 +719,7 @@ class TestConnectDaemon:
         """connect_daemon returns a live connection whose worker thread is daemon."""
         conn = await connect_daemon(str(tmp_path / 'x.db'))
         try:
-            thread = conn._thread
-            assert thread.is_alive()
-            assert thread.daemon is True, (
-                'aiosqlite worker thread must be daemon so a leaked '
-                'connection cannot block interpreter shutdown'
-            )
+            _assert_daemon_thread(conn, label='connect_daemon')
         finally:
             await conn.close()
 
@@ -721,9 +732,7 @@ class TestConnectDaemon:
         """
         conn = await connect_daemon(str(tmp_path / 'y.db'), timeout=30, isolation_level=None)
         try:
-            assert conn._thread.daemon is True, (
-                'worker thread must be daemon even when connect kwargs are supplied'
-            )
+            _assert_daemon_thread(conn, label='connect_daemon(kwargs)')
             # Connection must be usable with the supplied kwargs
             async with conn.execute('SELECT 1') as cur:
                 row = await cur.fetchone()

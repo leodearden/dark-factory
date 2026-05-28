@@ -86,7 +86,7 @@ async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_time
     await conn.execute('PRAGMA journal_size_limit=67108864')
 
 
-async def connect_daemon(database: str, **kwargs) -> aiosqlite.Connection:
+async def connect_daemon(database: str | Path, **kwargs) -> aiosqlite.Connection:
     """Open an aiosqlite connection with its background worker thread marked daemon.
 
     The worker thread is marked daemon *before* the thread starts (i.e. before
@@ -101,8 +101,11 @@ async def connect_daemon(database: str, **kwargs) -> aiosqlite.Connection:
     fused-memory stores that do not subclass ``AsyncSqliteBase``.
 
     Args:
-        database: Path (or ``':memory:'``) passed straight through to
-            ``aiosqlite.connect()``.
+        database: Path to the database file (a :class:`str`, :class:`~pathlib.Path`,
+            or the special ``':memory:'`` string) passed straight through to
+            ``aiosqlite.connect()``.  Both ``str`` and ``Path`` are accepted because
+            ``sqlite3.connect`` — which aiosqlite delegates to — accepts any
+            :class:`os.PathLike`, and callers may hold either type.
         **kwargs: Any extra keyword arguments (e.g. ``timeout=30``,
             ``isolation_level=None``) forwarded verbatim to ``aiosqlite.connect()``.
 
