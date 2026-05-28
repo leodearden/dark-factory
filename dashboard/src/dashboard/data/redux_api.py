@@ -638,9 +638,18 @@ def shape_escalations(
     Returns:
         ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
     """
+    out_subsections: list[dict[str, Any]] = []
+    for sub in queues.get('subsections') or []:
+        out_subsections.append({
+            'id': sub.get('id'),
+            'label': sub.get('label'),
+            'kind': sub.get('kind'),
+            'summary': dict(sub.get('summary') or {}),
+            'escalations': [],  # rows added in later steps
+        })
     return {
         'ESCALATIONS': {
-            'subsections': [],
+            'subsections': out_subsections,
             'summary': dict(queues.get('summary') or {}),
         },
     }
