@@ -1239,7 +1239,16 @@ class TestCapRetryEdgeCases:
         assert mock_inv.call_args_list[2].kwargs['prompt'] == 'precious prompt'
         assert mock_inv.call_args_list[3].kwargs['prompt'] == 'precious prompt'
 
-    async def test_zero_cost_cli_error_not_treated_as_cap(self):
+    @pytest.mark.parametrize('marker', [
+        'is already in use',
+        'unrecognized arguments',
+        'unknown option',
+        'invalid value',
+        'no such file or directory',
+        'permission denied',
+    ])
+    @pytest.mark.parametrize('placement', ['stderr', 'output'])
+    async def test_zero_cost_cli_error_not_treated_as_cap(self, marker, placement):
         """A recognised CLI error (zero-cost instant exit) is NOT counted as a cap.
 
         Regression for reify-3604: ``claude --session-id <X>`` on a reused UUID
@@ -1247,7 +1256,14 @@ class TestCapRetryEdgeCases:
         The zero-cost heuristic must recognise that as a concrete CLI error and
         fall through (no cap mark, no sleep, no unbounded retry) so the caller
         gets the failed result for normal verify/steward handling.
+
+        Expanded to cover all 6 NON_CAP_CLI_ERROR_MARKERS (hardcoded here to
+        catch regressions if a marker is later removed from the production list)
+        and both stderr and output placements (``_is_non_cap_cli_error`` checks
+        both fields).
         """
+        stderr = f'Error: {marker} foo bar' if placement == 'stderr' else ''
+        output = f'CLI exited: {marker}' if placement == 'output' else ''
         gate = _mock_gate(
             account_count=1,
             detect_cap_hit=MagicMock(return_value=False),
@@ -1255,7 +1271,7 @@ class TestCapRetryEdgeCases:
         gate._handle_cap_detected = MagicMock(return_value=True)
         result = make_result(
             success=False, cost_usd=0, turns=0, duration_ms=300,
-            stderr='Error: Session ID x is already in use.',
+            stderr=stderr, output=output,
         )
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
