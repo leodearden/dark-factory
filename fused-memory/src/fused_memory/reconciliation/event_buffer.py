@@ -658,13 +658,33 @@ class EventBuffer:
             # _txn() already rolled back.
             return False
 
-    async def mark_run_complete(self, project_id: str) -> None:
-        """Release the reconciliation lock."""
+    async def mark_run_complete(
+        self, project_id: str, instance_id: str | None = None,
+    ) -> int:
+        """Release the reconciliation lock for ``project_id``.
+
+        When ``instance_id`` is provided, the DELETE is scoped to that lock
+        holder, so a caller intending to release *its own* lock cannot
+        accidentally evict a different live instance's row (regression guard
+        for the 2026-05-28 cross-instance lock-theft incident — see
+        ``plans/recon-stale-recovery-rca.md``).  When omitted, behaviour is
+        unchanged: the row is removed regardless of holder.
+
+        Returns the rowcount so callers can detect a no-op release.
+        """
         async with self._txn() as db:
-            await db.execute(
-                'DELETE FROM reconciliation_locks WHERE project_id = ?',
-                (project_id,),
-            )
+            if instance_id is None:
+                cursor = await db.execute(
+                    'DELETE FROM reconciliation_locks WHERE project_id = ?',
+                    (project_id,),
+                )
+            else:
+                cursor = await db.execute(
+                    'DELETE FROM reconciliation_locks '
+                    'WHERE project_id = ? AND instance_id = ?',
+                    (project_id, instance_id),
+                )
+            return cursor.rowcount
 
     async def heartbeat(self, project_id: str) -> None:
         """Update lock heartbeat to prevent stale-lock recovery."""

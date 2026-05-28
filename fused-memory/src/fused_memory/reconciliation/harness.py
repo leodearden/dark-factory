@@ -575,7 +575,7 @@ class ReconciliationHarness:
     async def _recover_stale_runs(self) -> None:
         """Find runs stuck in 'running' state and mark them failed.
 
-        Uses stale_run_recovery_seconds as the age cutoff (default 600s),
+        Uses stale_run_recovery_seconds as the age cutoff (default 1800s),
         then double-checks that the *same* instance still holds the project's
         reconciliation lock before skipping — protecting legitimately long-running
         cycles owned by this process while still recovering orphans whose owning
@@ -614,7 +614,25 @@ class ReconciliationHarness:
             restored = await self.buffer.restore_drained(run.project_id)
             if restored:
                 logger.info(f'Restored {restored} drained events for stale run {run.id}')
-            await self.buffer.mark_run_complete(run.project_id)
+            # Ownership-scoped release: see plans/recon-stale-recovery-rca.md.
+            # Releasing without an instance_id filter would strip a live cycle's
+            # lock on the same project, causing the next reaper tick to
+            # misclassify the live run as stale (cross-instance lock theft, the
+            # 2026-05-28 false-positive cascade).  Only release when the
+            # orphan's instance_id is known AND owns the current lock — the
+            # `continue` above guarantees we're not on the "same live instance"
+            # branch, so a match here means a defunct previous incarnation of
+            # this very instance left the row behind.  Genuinely-abandoned
+            # locks held by other dead instances are cleaned up by the
+            # heartbeat-staleness sweep (stale_lock_seconds = 7200s) inside
+            # mark_run_active / get_lock_holder_instance_id.
+            if (
+                run.instance_id is not None
+                and lock_holder == run.instance_id
+            ):
+                await self.buffer.mark_run_complete(
+                    run.project_id, instance_id=run.instance_id,
+                )
             await self._replay_deferred_writes(run.project_id)
             self._escalate('recon_stale_run', run.id, f'Run stale (>{cutoff}s, lock expired), recovered')
 
@@ -938,7 +956,11 @@ class ReconciliationHarness:
                     try:
                         await self._replay_deferred_writes(project_id)
                     finally:
-                        await self.buffer.mark_run_complete(project_id)
+                        # Scope the release to this instance — see
+                        # plans/recon-stale-recovery-rca.md.
+                        await self.buffer.mark_run_complete(
+                            project_id, instance_id=self.buffer.instance_id,
+                        )
                     return  # Don't keep spinning on a halted project
 
                 # Decrement post-unhalt grace counter. A just-unhalted project
@@ -981,7 +1003,11 @@ class ReconciliationHarness:
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
-                        await self.buffer.mark_run_complete(project_id)
+                        # Scope the release to this instance — see
+                        # plans/recon-stale-recovery-rca.md.
+                        await self.buffer.mark_run_complete(
+                            project_id, instance_id=self.buffer.instance_id,
+                        )
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown

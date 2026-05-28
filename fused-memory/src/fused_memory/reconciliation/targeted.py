@@ -144,6 +144,14 @@ class TargetedReconciler:
             started_at=start,
             events_processed=1,
             status=RunStatus.running,
+            # Hygiene: stamp the journal row with our identity so the
+            # NULL-instance bucket isn't a mix of pre-migration debris and
+            # currently-active targeted-recon code (see RCA section
+            # "Targeted-recon side-issue" in
+            # plans/recon-stale-recovery-rca.md).  Falls back to None when
+            # the targeted reconciler is constructed without an event
+            # buffer (test wiring), matching prior behaviour.
+            instance_id=self.buffer.instance_id if self.buffer is not None else None,
         )
         await self.journal.start_run(run)
 
