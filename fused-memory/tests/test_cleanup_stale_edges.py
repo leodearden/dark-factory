@@ -4,9 +4,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import extract_params
+from _fm_helpers import extract_params, pydantic_spec
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup
 
 # ---------------------------------------------------------------------------
@@ -269,7 +270,7 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_calls_cleanup_with_correct_args(self, make_fake_maintenance_service):
         """run_cleanup() constructs CleanupManager and calls cleanup with correct args."""
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = CleanupResult(edges_found=2, edges_deleted=2)
@@ -301,7 +302,7 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_passes_dry_run_flag(self, make_fake_maintenance_service):
         """run_cleanup(dry_run=True) passes dry_run=True to CleanupManager.cleanup()."""
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = CleanupResult(edges_found=3, edges_deleted=0)
@@ -341,7 +342,7 @@ class TestRunCleanupDelegation:
     @pytest.mark.asyncio
     async def test_delegates_to_maintenance_service(self, make_fake_maintenance_service):
         """run_cleanup() calls maintenance_service(config_path) and uses yielded service.graphiti."""
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = CleanupResult(edges_found=1, edges_deleted=1)
