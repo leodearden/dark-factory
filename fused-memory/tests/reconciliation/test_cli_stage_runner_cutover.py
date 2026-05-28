@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
+import pytest_asyncio
 
 from fused_memory.reconciliation.cli_stage_runner import (
     FINDING_ITEM_SCHEMA,
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
+    _extract_report,
 )
 
 
@@ -104,3 +108,83 @@ class TestStage3ReportSchemaShape:
         props = items_schema.get('properties', {})
         for key in ('cited_entities', 'cited_edges', 'cited_tasks', 'cited_memories'):
             assert key in props, f'STAGE3_REPORT_SCHEMA.flagged_items.items missing {key!r}'
+
+
+class TestOutputSchemaNonePassthrough:
+    """run_stage_via_cli must pass output_schema=None straight through (PRD γ step-14).
+
+    When recon_report_state is active, the harness passes output_schema=None to
+    run_stage_via_cli so the CLI agent can terminate with a short text turn after
+    recon_report.complete instead of re-emitting a JSON report.
+
+    RED: currently run_stage_via_cli replaces None with STAGE_REPORT_SCHEMA
+    (line 255: output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA).
+    Step-14 changes this so None is passed straight through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_none_schema_reaches_invoke_with_cap_retry(self):
+        """Passing output_schema=None must send output_schema=None to invoke_with_cap_retry.
+
+        RED: Currently, None is replaced by STAGE_REPORT_SCHEMA before invoke.
+        """
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import (
+            StageResult,
+            run_stage_via_cli,
+        )
+
+        captured_kwargs: dict = {}
+
+        async def _capture_invoke(**kwargs):
+            captured_kwargs.update(kwargs)
+            # Return a minimal AgentResult
+            result = MagicMock()
+            result.structured_output = None
+            result.output = None
+            result.turns = 0
+            result.cost_usd = 0.0
+            result.success = True
+            return result
+
+        config = ReconciliationConfig()
+        mcp_config = {'mcpServers': {}}
+
+        with patch(
+            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+            new=_capture_invoke,
+        ):
+            await run_stage_via_cli(
+                system_prompt='test',
+                payload='test payload',
+                disallowed_tools=[],
+                config=config,
+                mcp_config=mcp_config,
+                output_schema=None,
+            )
+
+        assert captured_kwargs.get('output_schema') is None, (
+            'output_schema=None must be passed straight through to invoke_with_cap_retry, '
+            'not replaced by STAGE_REPORT_SCHEMA'
+        )
+
+    def test_extract_report_returns_empty_dict_when_no_output(self):
+        """_extract_report must return {} (not a placeholder) when structured_output and output are empty.
+
+        RED: Currently _extract_report returns {'summary': 'No output from agent'} as a placeholder.
+        After step-14, it returns {} so BaseStage.run gets an empty dict that triggers the
+        recon_report fallback path.
+        """
+        from shared.cli_invoke import AgentResult
+
+        result = AgentResult(
+            output=None,
+            structured_output=None,
+            turns=0,
+            cost_usd=0.0,
+            success=True,
+        )
+        report = _extract_report(result)
+        assert report == {}, (
+            f'_extract_report must return {{}} when output is empty, got {report!r}'
+        )
