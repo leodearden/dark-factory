@@ -32,14 +32,20 @@ python scripts/cleanup_count_snapshots.py
 This is the **default mode** (`--apply` is NOT set).  No writes are made.
 
 Output:
-- JSON audit report to stdout with keys `dry_run`, `generated_at`, `projects`,
-  `matches`, `totals`, `failed_refreshes`.
-- Human-readable per-project summary table.
+- **stdout** — JSON audit report with keys `dry_run`, `generated_at`, `projects`,
+  `matches`, `totals`, `summaries_matched`, `failed_refreshes`, `failed_invalidations`.
+- **stderr** — Human-readable per-project summary table (not part of the JSON).
 
-Redirect to a file for review:
+Redirect the JSON to a file for review (summary table stays on terminal via stderr):
 
 ```bash
-python scripts/cleanup_count_snapshots.py > /tmp/snapshot_audit.json 2>&1
+python scripts/cleanup_count_snapshots.py > /tmp/snapshot_audit.json
+```
+
+Parse the JSON file directly:
+
+```bash
+python -m json.tool /tmp/snapshot_audit.json | less
 ```
 
 ---

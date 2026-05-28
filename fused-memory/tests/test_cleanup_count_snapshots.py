@@ -295,8 +295,7 @@ class TestBuildAuditReport:
         results = {}
         failures = [{'entity_uuid': 'e1', 'error': 'NodeNotFound'}]
         report = _mod.build_audit_report(results, set(), failures, False, 1000, 'now')
-        assert report['totals'].get('refresh_failures') == 1 or \
-               any('refresh_failures' in str(v) for v in report.values())
+        assert report['totals']['refresh_failures'] == 1
 
     def test_deterministic_match_ordering(self):
         """Matches are ordered deterministically (by edge_uuid)."""
@@ -307,6 +306,41 @@ class TestBuildAuditReport:
         report = _mod.build_audit_report(results, set(), [], True, 1000, 'now')
         uuids = [m['edge_uuid'] for m in report['matches']]
         assert uuids == sorted(uuids)
+
+    def test_summaries_matched_in_report(self):
+        """Entities with summary_matched=True appear in report['summaries_matched']."""
+        r = EntityScanResult(
+            project_id='proj',
+            entity_uuid='e-sm',
+            entity_name='SummaryEntity',
+            edge_matches=[],
+            summary_matched=True,
+            summary_excerpt='3355 done / 290 cancelled',
+        )
+        report = _mod.build_audit_report({'proj': [r]}, set(), [], True, 1000, 'now')
+        assert 'summaries_matched' in report
+        assert len(report['summaries_matched']) == 1
+        sm = report['summaries_matched'][0]
+        assert sm['entity_uuid'] == 'e-sm'
+        assert sm['project_id'] == 'proj'
+        assert '3355 done' in (sm['summary_excerpt'] or '')
+
+    def test_summaries_matched_empty_when_none(self):
+        """summaries_matched is an empty list when no entity has summary_matched."""
+        r = EntityScanResult('proj', 'e1', 'E', [], False, None)
+        report = _mod.build_audit_report({'proj': [r]}, set(), [], True, 1000, 'now')
+        assert report['summaries_matched'] == []
+
+    def test_failed_invalidations_in_report(self):
+        """failed_invalidations passed in are surfaced in the report."""
+        fi = [{'edge_uuid': 'edg1', 'project_id': 'proj', 'error': 'err', 'phase': 'update_edge'}]
+        report = _mod.build_audit_report({}, set(), [], True, 1000, 'now', failed_invalidations=fi)
+        assert report['failed_invalidations'] == fi
+
+    def test_failed_invalidations_defaults_to_empty(self):
+        """failed_invalidations defaults to [] when not passed."""
+        report = _mod.build_audit_report({}, set(), [], True, 1000, 'now')
+        assert report['failed_invalidations'] == []
 
 
 class TestFormatSummaryTable:
@@ -469,6 +503,49 @@ class TestApplyCleanup:
         memory.refresh_entity_summary.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_update_edge_failure_non_fatal(self):
+        """When update_edge raises, the edge is skipped, failure recorded in
+        failed_invalidations, and remaining edges are still processed."""
+        memory = self._make_memory()
+        memory.update_edge = AsyncMock(side_effect=Exception('StoreError'))
+        now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        r1 = EntityScanResult('proj', 'e1', 'E1', [
+            EdgeMatch('edg1', 'snap', 'proj', ['e1']),
+        ])
+        r2 = EntityScanResult('proj', 'e2', 'E2', [
+            EdgeMatch('edg2', 'snap', 'proj', ['e2']),
+        ])
+        result = await _mod.apply_cleanup(memory, [r1, r2], now)
+        # update_edge was attempted for both edges
+        assert memory.update_edge.await_count == 2
+        # Neither edge was invalidated (both failed)
+        assert result['applied_edges'] == set()
+        # Both failures recorded in failed_invalidations with phase=update_edge
+        assert len(result['failed_invalidations']) == 2
+        phases = {f['phase'] for f in result['failed_invalidations']}
+        assert phases == {'update_edge'}
+        # add_memory never called (edges were skipped)
+        memory.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_after_update_recorded(self):
+        """When update_edge succeeds but add_memory fails, the edge IS in
+        applied_edges (already invalidated) but the failure is surfaced in
+        failed_invalidations with phase=add_memory."""
+        memory = self._make_memory()
+        memory.add_memory = AsyncMock(side_effect=Exception('MemError'))
+        now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        scan_results = [self._make_scan_result()]
+        result = await _mod.apply_cleanup(memory, scan_results, now)
+        # Edge was invalidated
+        assert 'edg1' in result['applied_edges']
+        # Failure surfaced in failed_invalidations
+        assert len(result['failed_invalidations']) == 1
+        fi = result['failed_invalidations'][0]
+        assert fi['phase'] == 'add_memory'
+        assert fi['edge_uuid'] == 'edg1'
+
+    @pytest.mark.asyncio
     async def test_refresh_failure_is_non_fatal(self):
         """A refresh failure does not abort processing; it is recorded in failed_refreshes."""
         memory = self._make_memory()
@@ -490,7 +567,7 @@ class TestApplyCleanup:
 
     @pytest.mark.asyncio
     async def test_returns_applied_edges_and_failed_refreshes(self):
-        """Return value includes applied_edges (set) and failed_refreshes (list)."""
+        """Return value includes applied_edges, failed_refreshes, and failed_invalidations."""
         memory = self._make_memory()
         now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
         scan_results = [self._make_scan_result()]
@@ -499,6 +576,8 @@ class TestApplyCleanup:
         assert 'edg1' in result['applied_edges']
         assert 'failed_refreshes' in result
         assert result['failed_refreshes'] == []
+        assert 'failed_invalidations' in result
+        assert result['failed_invalidations'] == []
 
 
 # ===========================================================================
@@ -582,5 +661,7 @@ class TestRun:
         result = await _mod.run(args, memory=memory, known_projects_map=known_map)
 
         memory.update_edge.assert_not_awaited()
+        memory.graphiti.get_all_valid_edges.assert_not_awaited()
         # Result should indicate abort
-        assert result.get('aborted') is True or 'aborted' in str(result)
+        assert result.get('aborted') is True
+        assert result.get('exceeding_projects') == ['dark_factory']

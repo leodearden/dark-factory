@@ -228,6 +228,7 @@ def build_audit_report(
     dry_run: bool,
     limit_per_project: int,
     generated_at: str,
+    failed_invalidations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the structured JSON audit report.
 
@@ -245,14 +246,23 @@ def build_audit_report(
         The safety cap that was in effect.
     generated_at:
         ISO timestamp string.
+    failed_invalidations:
+        List of ``{edge_uuid, project_id, error, phase}`` dicts for edges that
+        could not be invalidated or whose audit memory could not be written.
 
     Returns
     -------
-    Dict with keys: dry_run, generated_at, limit_per_project, projects, matches, totals.
+    Dict with keys: dry_run, generated_at, limit_per_project, projects, matches,
+    totals, summaries_matched, failed_invalidations.
     """
     # Collect all matches in deterministic order (by edge_uuid globally)
     all_matches: list[dict[str, Any]] = []
     per_project_summary: dict[str, dict[str, Any]] = {}
+
+    # Collect entities whose summary contains a snapshot (report-only; the edge
+    # invalidation removes the text from the rebuilt summary, but we surface these
+    # so the operator can spot any residual summaries not covered by the edge scan).
+    summaries_matched: list[dict[str, Any]] = []
 
     for pid in sorted(scan_results_by_project.keys()):
         results = scan_results_by_project[pid]
@@ -285,6 +295,15 @@ def build_audit_report(
             'refresh_failures': len(proj_refresh_failures),
         }
 
+        for r in results:
+            if r.summary_matched:
+                summaries_matched.append({
+                    'entity_uuid': r.entity_uuid,
+                    'entity_name': r.entity_name,
+                    'project_id': r.project_id,
+                    'summary_excerpt': r.summary_excerpt,
+                })
+
     all_matches.sort(key=lambda x: x['edge_uuid'])
 
     totals: dict[str, Any] = {
@@ -302,6 +321,8 @@ def build_audit_report(
         'matches': all_matches,
         'totals': totals,
         'failed_refreshes': failed_refreshes,
+        'summaries_matched': summaries_matched,
+        'failed_invalidations': failed_invalidations or [],
     }
 
 
@@ -431,23 +452,64 @@ async def apply_cleanup(
                 all_edges[m.edge_uuid] = m
 
     applied_edges: set[str] = set()
+    failed_invalidations: list[dict[str, Any]] = []
 
-    # Invalidate each unique edge + write audit memory
+    # Invalidate each unique edge + write audit memory.
+    # Each (update_edge, add_memory) pair is wrapped in its own try/except so
+    # a transient error on one edge does not abort the sweep and leave other
+    # edges partially invalidated or without their audit record.
+    # - update_edge failure: edge skipped entirely (not added to applied_edges).
+    # - add_memory failure after a successful update_edge: the edge is already
+    #   invalidated (a safe re-run will skip it via get_all_valid_edges); the
+    #   failure is surfaced in failed_invalidations so the operator knows the
+    #   rollback-audit record is missing for that edge.
     for edge_uuid, match in sorted(all_edges.items()):
-        await memory.update_edge(
-            edge_uuid=edge_uuid,
-            project_id=match.project_id,
-            invalid_at=now,
-            _source='cleanup_count_snapshots',
-        )
+        try:
+            await memory.update_edge(
+                edge_uuid=edge_uuid,
+                project_id=match.project_id,
+                invalid_at=now,
+                _source='cleanup_count_snapshots',
+            )
+        except Exception as exc:
+            logger.warning('Failed to invalidate edge %s: %s', edge_uuid, exc)
+            failed_invalidations.append({
+                'edge_uuid': edge_uuid,
+                'project_id': match.project_id,
+                'error': str(exc),
+                'phase': 'update_edge',
+            })
+            continue  # Skip audit memory; edge was not invalidated
+
         applied_edges.add(edge_uuid)
 
         # Use the lexicographically-first entity_uuid as canonical representative
         canonical_entity = sorted(match.entity_uuids)[0]
         payload = build_audit_memory_payload(match, canonical_entity, now_iso)
-        await memory.add_memory(**payload, _source='cleanup_count_snapshots')
+        try:
+            await memory.add_memory(**payload, _source='cleanup_count_snapshots')
+        except Exception as exc:
+            logger.warning('Failed to write audit memory for edge %s: %s', edge_uuid, exc)
+            # Edge is already invalidated; record so operator can write the
+            # audit memory manually if the rollback guarantee matters.
+            failed_invalidations.append({
+                'edge_uuid': edge_uuid,
+                'project_id': match.project_id,
+                'error': str(exc),
+                'phase': 'add_memory',
+            })
 
-    # Refresh entity summaries for all affected entities (once per entity)
+    # Refresh entity summaries for all affected entities (once per entity).
+    # NOTE: update_edge already rebuilds BOTH endpoint summaries internally on
+    # each call, so by the time we reach here summaries have been rebuilt once
+    # per edge invalidation.  This explicit pass is kept because:
+    #   1. It consolidates the refresh to once per entity AFTER all its edges
+    #      are invalidated — the authoritative final state.
+    #   2. It lets the report track refresh failures explicitly (a
+    #      NodeNotFoundError must not abort the whole sweep — PRD §2 issue #1).
+    #   3. It is robust to any best-effort nature of update_edge's internal
+    #      refresh.
+    # A refresh failure here is non-fatal; log and continue.
     affected_entities: dict[str, str] = {}  # entity_uuid -> project_id
     for r in scan_results:
         if r.edge_matches:
@@ -477,6 +539,7 @@ async def apply_cleanup(
     return {
         'applied_edges': applied_edges,
         'failed_refreshes': failed_refreshes,
+        'failed_invalidations': failed_invalidations,
     }
 
 
@@ -516,17 +579,17 @@ async def run(
     except ValueError as exc:
         return {'error': str(exc), 'aborted': True, 'dry_run': not args.apply}
 
-    # Enumerate entities per project for the limit cap check
+    # First pass: fetch entity counts for the safety cap check.
+    # We do this BEFORE calling get_all_valid_edges / scanning so that an
+    # oversized project is rejected cheaply, without enumerating its edges.
     per_project_counts: dict[str, int] = {}
-    scan_results_by_project: dict[str, list[EntityScanResult]] = {}
-
+    entities_by_project: dict[str, list[Any]] = {}
     for pid in project_ids:
         entities = await memory.graphiti.list_entity_nodes(group_id=pid)
+        entities_by_project[pid] = entities
         per_project_counts[pid] = len(entities)
-        edges_by_entity = await memory.graphiti.get_all_valid_edges(group_id=pid)
-        scan_results_by_project[pid] = scan_entities_for_snapshots(pid, entities, edges_by_entity)
 
-    # Safety cap
+    # Safety cap — abort before issuing get_all_valid_edges / scanning
     exceeding, abort = check_limit_cap(
         per_project_counts,
         args.limit_per_project,
@@ -541,9 +604,18 @@ async def run(
             'generated_at': generated_at,
         }
 
+    # Second pass: scan only projects that passed the cap
+    scan_results_by_project: dict[str, list[EntityScanResult]] = {}
+    for pid in project_ids:
+        edges_by_entity = await memory.graphiti.get_all_valid_edges(group_id=pid)
+        scan_results_by_project[pid] = scan_entities_for_snapshots(
+            pid, entities_by_project[pid], edges_by_entity
+        )
+
     # Apply or dry-run
     applied_edges: set[str] = set()
     failed_refreshes: list[dict[str, Any]] = []
+    failed_invalidations: list[dict[str, Any]] = []
 
     if args.apply:
         all_results = [r for results in scan_results_by_project.values() for r in results]
@@ -551,18 +623,21 @@ async def run(
         apply_result = await apply_cleanup(memory, all_results, now)
         applied_edges = apply_result['applied_edges']
         failed_refreshes = apply_result['failed_refreshes']
+        failed_invalidations = apply_result.get('failed_invalidations', [])
 
     report = build_audit_report(
         scan_results_by_project=scan_results_by_project,
         applied_edges=applied_edges,
         failed_refreshes=failed_refreshes,
+        failed_invalidations=failed_invalidations,
         dry_run=not args.apply,
         limit_per_project=args.limit_per_project,
         generated_at=generated_at,
     )
 
+    # JSON report goes to stdout (machine-readable); summary table to stderr.
     print(json.dumps(report, indent=2, default=str))
-    print(format_summary_table(report))
+    print(format_summary_table(report), file=sys.stderr)
 
     return report
 
