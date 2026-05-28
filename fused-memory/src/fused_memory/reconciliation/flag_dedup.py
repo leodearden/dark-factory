@@ -840,10 +840,27 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     Falsy-but-valid values like ``task_id=0`` or ``flag_type=''`` are accepted
     — only ``None`` (absent key) triggers a ``None`` return.
 
+    **cited_tasks fallback (PRD γ §9.3):** when the top-level ``task_id`` key
+    is absent (``None``), the function attempts to read ``cited_tasks[0]['task_id']``
+    as a best-effort fallback.  The fallback only applies when ``cited_tasks``
+    is a non-empty list whose first element has a non-``None`` ``task_id``.
+    This preserves deduplication for findings that carry citations but omit the
+    top-level convenience field.
+
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
     task_id = flag.get('task_id')
+
+    # Best-effort fallback: derive task_id from the first cited task when the
+    # top-level field is absent.  flag_type is still required at the top level.
+    if task_id is None:
+        cited_tasks = flag.get('cited_tasks')
+        if cited_tasks and isinstance(cited_tasks, list):
+            first = cited_tasks[0]
+            if isinstance(first, dict):
+                task_id = first.get('task_id')
+
     flag_type = flag.get('flag_type')
     if task_id is None or flag_type is None:
         return None
