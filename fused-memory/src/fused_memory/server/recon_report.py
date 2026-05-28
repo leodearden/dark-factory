@@ -99,8 +99,12 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 # Compiled UUID shape gate: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+# re.IGNORECASE: Graphiti/Neo4j and mem0 do not normalise UUID case on read-back,
+# and Python's stdlib uuid.UUID accepts mixed case — rejecting uppercase here would
+# mask real edges/memories as malformed before the service is even called.
 _UUID_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
 )
 
 _ERR_FINDING_UNKNOWN: dict[str, str] = {
