@@ -534,6 +534,7 @@ async def invoke_with_cap_retry(
                     config_dir.write_credentials(slot.token)
 
                 started_at = datetime.now(UTC).isoformat()
+                logger.info(f'{label}: dispatching on account {account_name!r}')
                 result = await invoke(
                     **invoke_kwargs,
                     oauth_token=slot.token,
@@ -1003,6 +1004,10 @@ async def _run_subprocess(
                 await terminate_process_group(proc, pgid, grace_secs=_SIGTERM_GRACE_SECS)
                 stdout_text = ''
                 stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
+                logger.warning(
+                    f'Subprocess SIGKILLed after {timeout_seconds}s timeout: '
+                    f'model={model} pgid={pgid} — no stdout produced before kill'
+                )
             else:
                 stdout_text = stdout.decode() if stdout else ''
                 stderr_text = stderr.decode()[-2000:] if stderr else ''

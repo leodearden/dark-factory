@@ -465,7 +465,10 @@ class CuratorConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     model: str = Field(default='sonnet')
-    timeout_seconds: float = Field(default=300.0)
+    # 180s bounds a silent Anthropic-API hang for the curator's best-effort
+    # contract while still giving ~20% headroom over the slowest legitimate
+    # single-item decision observed in production (~150s); see esc-task-curator-20.
+    timeout_seconds: float = Field(default=180.0)
     max_budget_usd: float = Field(default=0.30)
     # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn, an
     # optional reasoning turn may precede it, and the final assistant
@@ -506,7 +509,7 @@ class CuratorConfig(BaseModel):
     per_item_slack_seconds: float = Field(default=30.0)
     per_item_turns: int = Field(default=1)
     per_item_budget_usd: float = Field(default=0.30)
-    batch_timeout_cap_seconds: float = Field(default=540.0)
+    batch_timeout_cap_seconds: float = Field(default=360.0)
     batch_turns_cap: int = Field(default=10)
     batch_budget_cap_usd: float = Field(default=2.00)
     # Soft cap on batched user-prompt tokens: the worker stops adding tickets
