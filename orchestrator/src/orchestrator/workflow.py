@@ -208,6 +208,40 @@ class WorkflowOutcome(enum.Enum):
 # surface on attempt 1 for any genuine in-test hang.
 _OPAQUE_TIMEOUT_CAUSE_RE = re.compile(r'^Command timed out after \d+(\.\d+)?s:')
 
+# Regexes used by ``_normalize_cause_hint`` — compiled once at module level.
+# Order of application: ANSI first (so coloured file:line refs are cleaned
+# before the file:line pattern matches them), then file:line, then whitespace.
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+_FILE_LINE_RE = re.compile(r'\b\S+\.\w+:\d+(:\d+)?\b')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
+def _normalize_cause_hint(hint: str | None) -> str:
+    """Normalise a VerifyResult cause_hint for equality comparison.
+
+    Strips ANSI colour escape sequences, removes file:line (and file:line:col)
+    numeric tails, collapses contiguous whitespace to a single space,
+    lowercases, and strips leading/trailing whitespace.
+
+    Returns an empty string for empty or None input — never raises.
+
+    Used by the verify-loop signature-repetition guard to detect consecutive
+    identical failures even when line numbers shift between retries.
+    """
+    if not hint:
+        return ''
+    # 1. Strip ANSI colour codes (e.g. \x1b[31m...\x1b[0m) first so that
+    #    coloured file:line references like \x1b[31mfoo.py:42\x1b[0m become
+    #    plain foo.py:42 before the file:line pattern runs.
+    result = _ANSI_ESCAPE_RE.sub('', hint)
+    # 2. Strip file:line and file:line:col numeric tails
+    #    (e.g. "tests/test_x.py:42" or "foo.py:42:7").
+    result = _FILE_LINE_RE.sub('', result)
+    # 3. Collapse contiguous whitespace (spaces, tabs, newlines) to one space.
+    result = _WHITESPACE_RE.sub(' ', result)
+    # 4. Lowercase and strip.
+    return result.lower().strip()
+
 
 @dataclass
 class WorkflowMetrics:
