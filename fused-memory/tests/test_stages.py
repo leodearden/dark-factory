@@ -1506,11 +1506,12 @@ class TestStage2GuardrailProjectIdGating:
             "the ceiling concept has been removed in favour of content-based detection."
         )
 
-        # (c) content-based phrasing is present
+        # (c) content-based phrasing is present — require specific multi-word phrases
+        # to avoid false-positive matches on incidental single words like 'path'.
         guardrail_lower = guardrail_block.lower()
-        assert any(keyword in guardrail_lower for keyword in ('path', 'cited', 'cross-project routing')), (
-            "Expected content-based phrasing (e.g. 'path', 'cited', or 'Cross-Project Routing') "
-            "in the guardrail block — contamination must be judged by file paths/modules, "
+        assert any(phrase in guardrail_lower for phrase in ('file path', 'cross-project routing')), (
+            "Expected specific content-based phrasing ('file path' or 'Cross-Project Routing') "
+            "in the guardrail block — contamination must be judged by cited file paths/modules, "
             "not task-ID magnitude."
         )
 
@@ -1573,7 +1574,22 @@ class TestStage2NoTaskIdCeiling:
             ]
         }
 
-        await stage.assemble_payload([], watermark, [])
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # assemble_payload must complete without aborting and include the
+        # high-ID tasks in the rendered output.  Tasks 607 and 608 are
+        # active (pending / in-progress) so they appear in the active task
+        # tree section with the format '- [607] (pending) Task 607 deps=[]'.
+        # If a numeric-ID gate were re-introduced and fired early, these
+        # tasks would be absent from the payload.
+        assert '[607]' in payload, (
+            "Task 607 must appear in the rendered payload — "
+            "assemble_payload must not abort on task IDs above the old 606 ceiling."
+        )
+        assert '[608]' in payload, (
+            "Task 608 must appear in the rendered payload — "
+            "assemble_payload must not short-circuit on high task IDs."
+        )
 
         assert stage.get_disallowed_tools() == STAGE2_DISALLOWED, (
             f'Expected get_disallowed_tools() == STAGE2_DISALLOWED but got '
