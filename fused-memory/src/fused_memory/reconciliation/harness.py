@@ -922,9 +922,20 @@ class ReconciliationHarness:
                 #     during instance handover; naturally recoverable next cycle)
                 #   - stages/memory_consolidator.py: unset episode_limit/memory_limit
                 #     (programming bug; should surface and retry, not abort the loop)
-                logger.error(
-                    f'Project loop aborting for {project_id}: misconfiguration — {e}. '
-                    f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to include this project (task 1143).'
+                #
+                # task 1549: quarantine buffered events so get_active_projects()
+                # (WHERE status='buffered') stops returning this project_id, ending
+                # the management-loop respawn storm (2026-05-28 'know-live' incident).
+                # The dead_letter flip + WARNING below make the incident observable to
+                # the recon-watcher; no escalation is emitted (deferred per design).
+                # See task 1143 (read-side strictness) and task 1549 (this complement).
+                quarantined = await self.buffer.mark_project_dead_letter(project_id)
+                logger.warning(
+                    f'Project loop quarantined {quarantined} buffered dead_letter event(s) '
+                    f'for unknown project_id={project_id!r} and is aborting. '
+                    f'Misconfiguration: {e}. '
+                    f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to register this project '
+                    f'(task 1143 / task 1549).'
                 )
                 return
             except Exception as e:
