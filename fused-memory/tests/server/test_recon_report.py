@@ -138,3 +138,63 @@ class TestReconReportStateHappyPath:
         assert item['cited_edges'] == []
         assert item['cited_tasks'] == []
         assert item['cited_memories'] == []
+
+
+# ---------------------------------------------------------------------------
+# step-5: In-run dedup — RED until step-6 wires the dedup logic
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportInRunDedup:
+    """Verify (task_id, flag_type) dedup inside a single (run_id, stage) pair."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _finding(self, state, task_id='42', flag_type='orphaned_knowledge', **kwargs):
+        defaults = dict(
+            run_id='r1',
+            severity='moderate',
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+            actionable=True,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_second_same_sig_returns_duplicate_error(self):
+        state = self._make_state()
+        first = self._finding(state, task_id='42', flag_type='orphaned_knowledge')
+        assert 'finding_id' in first
+        id1 = first['finding_id']
+
+        second = self._finding(state, task_id='42', flag_type='orphaned_knowledge',
+                               description='different text still same sig')
+        assert second['error'] == 'duplicate_finding'
+        assert second['error_type'] == 'ReconReportDuplicateFinding'
+        assert second['existing_finding_id'] == id1
+
+    def test_different_sig_both_succeed(self):
+        state = self._make_state()
+        r1 = self._finding(state, task_id='42', flag_type='orphaned_knowledge')
+        r2 = self._finding(state, task_id='99', flag_type='stale_edge')
+        assert 'finding_id' in r1
+        assert 'finding_id' in r2
+        assert r1['finding_id'] != r2['finding_id']
+
+    def test_both_none_no_dedup(self):
+        """Two (None, None) findings are both allocated (informational)."""
+        state = self._make_state()
+        r1 = self._finding(state, task_id=None, flag_type=None)
+        r2 = self._finding(state, task_id=None, flag_type=None)
+        assert 'finding_id' in r1
+        assert 'finding_id' in r2
+        assert r1['finding_id'] != r2['finding_id']
