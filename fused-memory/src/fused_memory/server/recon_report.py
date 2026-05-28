@@ -539,6 +539,7 @@ class ReconReportState:
         Appends to finding.cited_memories only on success.
         """
         from graphiti_core.errors import EdgeNotFoundError
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -556,10 +557,7 @@ class ReconReportState:
             fingerprint = await self._memory_service.get_memory(
                 memory_id, store, entry.project_id
             )
-        except (EdgeNotFoundError, KeyError, ValueError):
-            return _ERR_MEMORY_NOT_FOUND.copy()
-
-        if fingerprint is None:
+        except (EdgeNotFoundError, MemoryNotFoundError):
             return _ERR_MEMORY_NOT_FOUND.copy()
 
         mem_entry = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}

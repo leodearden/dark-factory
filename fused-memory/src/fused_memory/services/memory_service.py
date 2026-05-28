@@ -48,6 +48,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class MemoryNotFoundError(Exception):
+    """Raised when a mem0 memory id is not found."""
+
+
 def _serialize_temporal(
     valid_at: Any,
     invalid_at: Any,
@@ -1107,7 +1111,7 @@ class MemoryService:
         scope = Scope(project_id=project_id)
         rec = await self.mem0.get(memory_id, scope)
         if rec is None:
-            raise ValueError(f'mem0 memory not found: {memory_id}')
+            raise MemoryNotFoundError(memory_id)
         metadata = rec.get('metadata') or {}
         return {
             'category': rec.get('category'),
