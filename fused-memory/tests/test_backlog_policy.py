@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import submit_and_resolve
+from _fm_helpers import pydantic_spec, submit_and_resolve
+from fused_memory.config.schema import FusedMemoryConfig
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -409,7 +410,7 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
         lambda _: False,
         hard_limit=500,
     )
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     config.curator.enabled = False
     store = TicketStore(tmp_path / 'ok_tickets.db')
     await store.initialize()
