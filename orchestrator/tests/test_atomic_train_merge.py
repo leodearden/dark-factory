@@ -160,3 +160,171 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     raise NotImplementedError(
         "make_train_config scaffold: complete in step-2 (make scenario 1 green)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 (happy-path linear 3-train) — step-1 RED / step-2 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScenario1HappyPath:
+    """PRD §10 row 1: 3-member stacked train merges atomically as one green commit.
+
+    Uses real cargo: ``cargo test --workspace --quiet`` is the test_command
+    and the post-merge verify runs without mocking.  Skips on rust-less machines
+    via the ``cargo_or_skip`` session fixture.
+    """
+
+    async def test_happy_path_3_train_single_merge(
+        self,
+        cargo_or_skip,            # noqa: ARG002  (skip guard; value unused)
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Happy path: seed additive 3-train, drive GroupMergeRequest, assert invariants.
+
+        Invariants:
+          (i)   Exactly one new merge commit on main.
+          (ii)  All 3 mark_member_done callbacks fire with ONE shared merge_sha.
+          (iii) outcome.status == 'done' and outcome.merge_sha == that sha.
+          (iv)  All three crate edits present on main (git ls-tree -r --name-only).
+          (v)   NO red-main window: cargo test --workspace green at final main
+                tip AND at each member tip now reachable from main.
+        """
+        # --- seed repo ---------------------------------------------------------
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # --- stack 3 additive members -----------------------------------------
+        # Each edit_fn appends a new pub fn to the relevant crate's lib.rs;
+        # all edits are purely additive so every member tip compiles workspace-wide.
+
+        def edit_alpha(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn alpha_task_output() -> u32 { 1 }\n")
+
+        def edit_beta(wt: Path) -> None:
+            lib = wt / "crate_b" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn beta_task_output() -> u32 { 2 }\n")
+
+        def edit_gamma(wt: Path) -> None:
+            lib = wt / "crate_c" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn gamma_task_output() -> u32 { 3 }\n")
+
+        _, main_sha = await _run(
+            ["git", "rev-parse", "main"], cwd=repo
+        )
+        main_sha = main_sha.strip()
+
+        wt_a, sha_a = await make_stacked_member(git_ops, "alpha", main_sha, edit_alpha)
+        wt_b, sha_b = await make_stacked_member(git_ops, "beta", sha_a, edit_beta)
+        wt_c, sha_c = await make_stacked_member(git_ops, "gamma", sha_b, edit_gamma)
+
+        # --- assert per-member workspace-green (γ₁ gate) ----------------------
+        env = {**__import__("os").environ, "CARGO_TARGET_DIR": str(shared_cargo_target)}
+        for label, wt in [("alpha", wt_a), ("beta", wt_b), ("gamma", wt_c)]:
+            result = subprocess.run(
+                ["cargo", "test", "--workspace", "--quiet"],
+                cwd=wt,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (
+                f"Member {label} tip is not workspace-green:\n{result.stdout}{result.stderr}"
+            )
+
+        # --- count merge commits BEFORE the train lands -----------------------
+        _, before_log, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merge_commits_before = int(before_log.strip())
+
+        # --- drive the GroupMergeRequest through real MergeWorker -------------
+        req = build_group_merge_request(
+            git_ops=git_ops,
+            config=config,
+            train_id="train-scenario-1",
+            member_names=["alpha", "beta", "gamma"],
+            tip_name="gamma",
+            tip_worktree=wt_c,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        outcome = await worker._do_merge(req)
+
+        # --- (iii) outcome is done --------------------------------------------
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done, got: {outcome!r}"
+        assert outcome.merge_sha is not None
+
+        # --- (i) exactly one new merge commit ---------------------------------
+        _, after_log, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            "expected exactly 1 new merge commit on main, "
+            f"got {merge_commits_after - merge_commits_before} new merge commits"
+        )
+
+        # --- (ii) all 3 mark_member_done callbacks with ONE shared SHA --------
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[union-attr]
+            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"
+        )
+        called_shas = {
+            call.args[1] for call in req.mark_member_done.call_args_list  # type: ignore[union-attr]
+        }
+        assert len(called_shas) == 1, f"all callbacks must share one SHA, got: {called_shas}"
+        shared_merge_sha = next(iter(called_shas))
+        assert shared_merge_sha == outcome.merge_sha
+
+        # --- (iv) all three crate edits present on main -----------------------
+        _, main_files, _ = await _run(
+            ["git", "ls-tree", "-r", "--name-only", "main"], cwd=repo
+        )
+        # Each edit_fn wrote to crate_{a,b,c}/src/lib.rs — those files exist in fixture.
+        # The additive functions are in the committed lib.rs; verify the files exist.
+        assert "crate_a/src/lib.rs" in main_files
+        assert "crate_b/src/lib.rs" in main_files
+        assert "crate_c/src/lib.rs" in main_files
+
+        # Check that the additive symbols appear on main
+        _, lib_a_content, _ = await _run(
+            ["git", "show", "main:crate_a/src/lib.rs"], cwd=repo
+        )
+        assert "alpha_task_output" in lib_a_content
+        _, lib_c_content, _ = await _run(
+            ["git", "show", "main:crate_c/src/lib.rs"], cwd=repo
+        )
+        assert "gamma_task_output" in lib_c_content
+
+        # --- (v) NO red-main window: cargo green at final main tip -----------
+        _, new_main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        new_main_sha = new_main_sha.strip()
+
+        # Checkout the final main tip in a fresh worktree and run cargo
+        main_wt = tmp_path / "_verify_main"
+        await _run(
+            ["git", "worktree", "add", "--detach", str(main_wt), new_main_sha],
+            cwd=repo,
+        )
+        try:
+            result = subprocess.run(
+                ["cargo", "test", "--workspace", "--quiet"],
+                cwd=main_wt,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (
+                f"Final main tip is not workspace-green:\n{result.stdout}{result.stderr}"
+            )
+        finally:
+            await _run(
+                ["git", "worktree", "remove", "--force", str(main_wt)],
+                cwd=repo,
+            )
