@@ -5848,3 +5848,65 @@ class TestGroupMergeRequestRebaseConflict:
         assert not (req.worktree / '.git').exists() or not (req.worktree / '.git' / 'rebase-merge').exists(), (
             'rebase-merge dir exists — rebase was not aborted'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestMainAdvancedClean (MergeWorker) — step-9 RED / step-10 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestMainAdvancedClean:
+    """PRD scenario 8 clean variant: non-conflicting main advance; rebase + merge atomic."""
+
+    async def test_clean_advance_includes_external_commit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Non-conflicting external commit on main → rebase succeeds, train lands, all files present."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Commit an EXTERNAL (non-conflicting) change on main AFTER the train
+        # was built (different file so no rebase conflict on the tip).
+        external_file = git_ops.project_root / 'external.py'
+        external_file.write_text('external = True\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'External non-conflicting commit'], cwd=git_ops.project_root)
+        _, external_sha_out, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        external_sha = external_sha_out.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Main must contain external commit AND all train member files
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'external.py' in main_files
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # The advanced SHA must be a descendant of the external commit
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', external_sha, outcome.merge_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, (
+            f'merge_sha {outcome.merge_sha[:8]} is not a descendant of external commit {external_sha[:8]}'
+        )
+
+        # All members marked done with same SHA
+        assert req.mark_member_done.call_count == 3
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        assert len(called_shas) == 1
+        assert next(iter(called_shas)) == outcome.merge_sha
