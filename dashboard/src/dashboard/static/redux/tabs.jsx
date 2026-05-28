@@ -956,13 +956,18 @@ function MergeTab({ projectFilter }) {
                         <tbody>
                           {(d.train_events || []).map((ev, i) => {
                             const dt = (ev.data || {});
-                            const detail = ev.event_type === 'train_member_deferred'
+                            const rawDetail = ev.event_type === 'train_member_deferred'
                               ? `deferred: ${dt.deferred_reason || '—'}`
                               : ev.event_type === 'train_derailed'
                               ? `reason: ${dt.derail_reason || '—'}`
                               : dt.member_task_ids
                               ? `members: ${(dt.member_task_ids || []).join(', ')}`
                               : '—';
+                            // Truncate long strings (e.g. verify failure reports) to keep
+                            // the column width sane; full text is exposed via title attr.
+                            const detail = rawDetail.length > 120
+                              ? rawDetail.slice(0, 120) + '…'
+                              : rawDetail;
                             const evBadge = ev.event_type === 'train_merged' ? 'ok'
                               : ev.event_type === 'train_derailed' ? 'bad'
                               : ev.event_type === 'train_member_deferred' ? 'warn'
@@ -972,7 +977,7 @@ function MergeTab({ projectFilter }) {
                                 <td><span className={`badge ${evBadge}`}>{ev.event_type}</span></td>
                                 <td className="mono">{dt.train_id || '—'}</td>
                                 <td className="mono">{ev.task_id}</td>
-                                <td style={{ color: 'var(--fg-3)', fontSize: 11 }}>{detail}</td>
+                                <td style={{ color: 'var(--fg-3)', fontSize: 11 }} title={rawDetail}>{detail}</td>
                                 <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(ev.timestamp)}</td>
                               </tr>
                             );

@@ -1224,8 +1224,21 @@ async def _do_train_merge(
         'member_task_ids': req.member_task_ids,
     }
 
-    # Telemetry: read base_sha at t0 (BEFORE any rebase moves main).
-    base_sha_t0 = await git_ops.get_main_sha()
+    # Telemetry: emit train_started once per *attempt*.  Because the workflow
+    # re-parks an incomplete train (MERGE_DEFERRED) for retry, the same
+    # train_id can fire train_started on each scheduler iteration until all
+    # members are ready.  Consumers should treat train_started as
+    # "merge-attempt started" and correlate by (train_id, timestamp) rather
+    # than expecting a single occurrence per train lifecycle.
+    #
+    # base_sha_t0 is a best-effort telemetry read (main at the START of this
+    # attempt); it is NOT the CAS expected_main used for the actual advance
+    # (that is read after rebase at the (c) anchor below).  A transient git
+    # failure here must not abort the core merge path, hence the try/except.
+    try:
+        base_sha_t0: str = await git_ops.get_main_sha()
+    except Exception:
+        base_sha_t0 = ''
     _emit_train_event(
         event_store, EventType.train_started,
         task_id=req.task_id, train_id=req.train_id,

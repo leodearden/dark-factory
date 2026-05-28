@@ -769,7 +769,7 @@ async def build_per_project_merge_queue(
             the Python post-filter tightens to the exact minute boundary.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events}}``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
     _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
