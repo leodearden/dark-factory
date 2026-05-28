@@ -4520,3 +4520,25 @@ class TestRoleThreading:
         assert all(env['DF_VERIFY_ROLE'] == 'merge' for env in captured), (
             f'Expected DF_VERIFY_ROLE=merge in global mode; got: {captured}'
         )
+
+    @pytest.mark.asyncio
+    async def test_run_scoped_verification_global_propagates_role_task(self, tmp_path: Path):
+        """run_scoped_verification(role='task') in global mode propagates DF_VERIFY_ROLE='task'.
+
+        PRD-named code-level signal: verify_env['DF_VERIFY_ROLE'] == 'task' for the
+        per-task path, consumed by δ.  Cross-layer contract guard for
+        run_scoped_verification → run_verification → _resolve_verify_env → _run_cmd.
+        """
+        (tmp_path / '.task').mkdir()
+        config = self._make_config()
+        fake_cmd, captured = self._make_env_capture_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            # task_files=None triggers global mode (no scoping)
+            await run_scoped_verification(tmp_path, config, [], task_files=None, role='task')
+
+        assert captured, '_run_cmd was never called'
+        assert all(env is not None for env in captured), f'env was None: {captured}'
+        assert all(env['DF_VERIFY_ROLE'] == 'task' for env in captured), (
+            f'Expected DF_VERIFY_ROLE=task in global mode; got: {captured}'
+        )
