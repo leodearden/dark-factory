@@ -18,9 +18,29 @@ async def store(tmp_path):
     await s.close()
 
 
+def _assert_connection_closed(conn) -> None:
+    """Assert that an aiosqlite Connection is fully closed.
+
+    Checks ``Connection._connection`` (set to ``None`` by ``close()``).
+    Isolated here so the internal-attribute dependency lives in one place — a
+    future aiosqlite rename only needs updating here (task 1560).
+    """
+    assert conn._connection is None, (
+        'aiosqlite connection was not closed — its non-daemon worker thread '
+        'stays alive and raises "Event loop is closed" on GC (task 1560)'
+    )
+
+
 @pytest.mark.asyncio
-async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
-    """initialize() creates the tickets table; calling it twice does not raise."""
+async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path):
+    """initialize() creates the tickets table; re-initializing after close() does not raise.
+
+    Tests the init→close→init cycle (safe usage pattern).  Back-to-back
+    initialize() without an intervening close() is not covered here because
+    initialize() unconditionally opens a new connection, orphaning the previous
+    one.  The production footgun is out of scope for task 1560 (flagged via
+    escalate_info); tests exercise the safe pattern and guard against leaks.
+    """
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
     # task 1560: capture the first connection before the idempotent re-init;
@@ -62,11 +82,7 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
         await store.close()
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
-    assert first_db._connection is None, (
-        'first TicketStore connection orphaned by the idempotent re-init was left'
-        ' open — its non-daemon aiosqlite worker leaks and trips "Event loop is'
-        ' closed" (task 1560)'
-    )
+    _assert_connection_closed(first_db)
     assert store._db is None, 'store._db must be None after close() (task 1560)'
 
 
@@ -369,11 +385,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
         await store.close()
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
-    assert first_db._connection is None, (
-        'first TicketStore connection orphaned by the idempotent re-init was left'
-        ' open — its non-daemon aiosqlite worker leaks and trips "Event loop is'
-        ' closed" (task 1560)'
-    )
+    _assert_connection_closed(first_db)
     assert store._db is None, 'store._db must be None after close() (task 1560)'
 
 
