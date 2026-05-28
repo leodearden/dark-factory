@@ -1154,6 +1154,22 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
+    def test_stage2_prompt_no_longer_mentions_add_subtask(self):
+        """STAGE2_SYSTEM_PROMPT must not list add_subtask as an available tool.
+
+        Stage 2 no longer has access to add_subtask (blocked via DISALLOW_SUBTASK_CREATE).
+        The prompt must not advertise the tool or agents will attempt to call it
+        and receive a permission error.  Use the flatten recipe instead
+        (submit_task(planning_mode=True) + commit_planning), documented in
+        the '## Splitting Tasks' section.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'add_subtask' not in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must not mention add_subtask — '
+            'the tool is blocked via DISALLOW_SUBTASK_CREATE.'
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
@@ -1755,6 +1771,20 @@ class TestProjectIdGuidelineConstants:
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
+
+    def test_stage2_guideline_no_longer_mentions_add_subtask(self):
+        """_STAGE2_PROJECT_ID_GUIDELINE must not list add_subtask.
+
+        The guideline tells Stage 2 agents which tools to pass project_id to.
+        Since add_subtask is now blocked via DISALLOW_SUBTASK_CREATE, advertising
+        it in the guideline would mislead agents into attempting a disallowed call.
+        """
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+
+        assert 'add_subtask' not in _STAGE2_PROJECT_ID_GUIDELINE, (
+            '_STAGE2_PROJECT_ID_GUIDELINE must not mention add_subtask — '
+            'the tool is blocked via DISALLOW_SUBTASK_CREATE.'
+        )
 
 
 class TestStagePayloadProjectIdGuideline:
