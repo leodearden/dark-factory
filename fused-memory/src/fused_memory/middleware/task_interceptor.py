@@ -109,6 +109,13 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
 # and orchestrator are independent modules, and the set is effectively
 # ossified; duplication is cheaper than cross-package coupling.
+#
+# 'merge-deferred' is deliberately NOT in this set per PRD
+# orchestrator-atomic-train-merge §9.2 (task 1519): it is a non-terminal
+# holding state for atomic-train members awaiting the group merge.
+# Transitions out of merge-deferred to done/in-progress/blocked are routine
+# and must not require a reopen_reason. The regression guard
+# test_merge_deferred_is_non_terminal locks this contract.
 TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
 
 
@@ -191,6 +198,12 @@ def _format_ticket_result(row: dict) -> dict:
 class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
 
+    # Status values that cause set_task_status to fire targeted reconciliation.
+    # 'merge-deferred' is deliberately excluded per PRD orchestrator-atomic-train-merge
+    # §9.2 (task 1519): targeted reconciliation does not fire on entry to the holding
+    # state because no downstream consumer needs the signal until the group merge
+    # eventually flips members to 'done'. The regression guard
+    # test_set_task_status_merge_deferred_does_not_trigger_reconciliation locks this contract.
     STATUS_TRIGGERS = {'done', 'blocked', 'cancelled', 'deferred'}
 
     def __init__(
