@@ -510,13 +510,23 @@ class GitOps:
         )
 
     async def create_worktree(
-        self, branch_name: str, *, expected_title: str | None = None,
+        self,
+        branch_name: str,
+        *,
+        expected_title: str | None = None,
+        train: TrainMembership | None = None,
     ) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
         Returns a WorktreeInfo with the worktree path and the base commit SHA
         (main's SHA at creation time) so diffs remain stable even if main
         advances during task execution.
+
+        ``train`` — when supplied and ``train['order'] > 0``, the worktree is
+        branched from the prior train member's branch tip instead of
+        ``origin/main``.  See PRD § 9.4 for the full train-branching spec.
+        ``train=None`` (default) and ``train['order'] == 0`` both fall through
+        to the existing ``_freshen_main()`` path unchanged.
 
         If the worktree/branch already exist (e.g., from a requeued task),
         reuses them instead of failing — UNLESS ``expected_title`` is supplied
@@ -540,13 +550,23 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        # ── Freshen main from remote (best-effort) ────────────────────
-        # If origin/main has advanced since session start, use the remote-
-        # tracking ref as the worktree base so agents start from the freshest
-        # code.  Falls back to local main silently when no remote is configured
-        # (e.g. in test repos).  Never mutates the local main ref — that would
-        # interfere with advance_main's CAS logic.
-        start_ref, stale_commits = await self._freshen_main()
+        # ── Resolve start-ref: train-predecessor tip or freshened main ──
+        # PRD § 9.4: when a train member has order > 0, branch from the prior
+        # member's branch tip so the chain is contiguous.  order=0 (degenerate
+        # train) and train=None both fall through to _freshen_main().
+        # The predecessor-branch path is implemented in steps 9-12.
+        if train is not None and train.get('order', 0) > 0:
+            # Train path (order > 0) — implemented in step-10.
+            # Placeholder: fall through to _freshen_main() until step-10.
+            start_ref, stale_commits = await self._freshen_main()
+        else:
+            # ── Freshen main from remote (best-effort) ────────────────────
+            # If origin/main has advanced since session start, use the remote-
+            # tracking ref as the worktree base so agents start from the freshest
+            # code.  Falls back to local main silently when no remote is configured
+            # (e.g. in test repos).  Never mutates the local main ref — that would
+            # interfere with advance_main's CAS logic.
+            start_ref, stale_commits = await self._freshen_main()
         logger.info(
             'create_worktree: freshening result: ref=%s, stale_commits=%s',
             start_ref, stale_commits,

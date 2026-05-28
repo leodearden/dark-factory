@@ -3156,3 +3156,35 @@ class TestTrainPredecessor:
             await git_ops._train_predecessor(
                 TrainMembership(id='T1', order=2, members=['a'])
             )
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeTrain:
+    async def test_train_none_regression(self, git_ops: GitOps):
+        """train=None must produce byte-identical behaviour to the old default."""
+        # Capture main SHA before creating the worktree
+        _, main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root
+        )
+        main_sha = main_sha.strip()
+
+        info = await git_ops.create_worktree('feature-notrain', train=None)
+
+        assert info.base_commit == main_sha
+        assert info.stale_commits is None  # no remote in git_repo fixture
+
+    async def test_train_order_zero_degenerate(self, git_ops: GitOps):
+        """order=0 is degenerate — must branch from main, same as train=None."""
+        from orchestrator.git_ops import TrainMembership
+
+        _, main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root
+        )
+        main_sha = main_sha.strip()
+
+        info = await git_ops.create_worktree(
+            'feature-order0',
+            train=TrainMembership(id='T1', order=0, members=['feature-z']),
+        )
+
+        assert info.base_commit == main_sha
