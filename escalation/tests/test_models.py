@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation, TrainState
 
 
 class TestBornAtL2Severities:
@@ -239,7 +239,7 @@ class TestEscalationTrainState:
 
     def test_train_state_round_trip_via_to_dict_from_dict(self):
         """train_state dict is preserved through to_dict() / from_dict()."""
-        ts = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
         esc = Escalation(
             id='esc-task-103-0001',
             task_id='103',
@@ -255,7 +255,7 @@ class TestEscalationTrainState:
 
     def test_train_state_round_trip_via_to_json_from_json(self):
         """train_state dict is preserved through to_json() / from_json()."""
-        ts = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
         esc = Escalation(
             id='esc-task-103-0001',
             task_id='103',
@@ -271,7 +271,7 @@ class TestEscalationTrainState:
 
     def test_train_state_appears_in_to_json_output(self):
         """train_state is serialised (not silently dropped) when set."""
-        ts = {'id': 'T1', 'order': 2, 'parked_members': ['101'], 'failing_member': '103'}
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101'], 'failing_member': '103'}
         esc = Escalation(
             id='esc-task-103-0001',
             task_id='103',

@@ -75,7 +75,7 @@ class _StewardReescalated(Exception):
         self.escalations = escalations
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
+    from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
     from orchestrator.usage_gate import UsageGate
@@ -5051,7 +5051,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         tip = (self._merge_sha or '')[:12] or f'{branch}@HEAD'
         return f'\n\n[durable refs] branch={branch} base={base} tip={tip}'
 
-    async def _build_train_state(self) -> dict | None:
+    async def _build_train_state(self) -> TrainState | None:
         """Build per-train context for L1 escalation payloads (PRD § 9.8).
 
         Returns None when this task carries no valid metadata.train (non-train
@@ -5103,12 +5103,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             c for c in candidates
             if c != self.task_id and statuses.get(c) == 'merge-deferred'
         ]
-        return {
+        return cast('TrainState', {
             'id': train_id,
             'order': train_order,
             'parked_members': parked_members,
             'failing_member': self.task_id,
-        }
+        })
 
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',

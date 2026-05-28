@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TypedDict
 
+
 class TrainState(TypedDict):
     """Per-train context embedded in L1/L2 escalations for park-prefix derail triage.
 
