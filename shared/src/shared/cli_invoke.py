@@ -577,6 +577,16 @@ async def invoke_with_cap_retry(
                 # wedge's session_id, perpetuating the wedge across every retry.
                 # Analogous to the fused_memory/reconciliation/agent_loop.py:368
                 # "clear stale session id" defence, applied at the cap-retry layer.
+                #
+                # NOTE — cap-as-wedge edge case: if a genuine rate-cap manifests as
+                # a full-timeout zero-output result (no stderr cap-pattern, but the
+                # account is capped), this branch fires before detect_cap_hit and
+                # retries fresh without incrementing consecutive_cap_hits or applying
+                # exponential cooldown.  This is intentional: the fresh retry against
+                # the still-capped account will produce a fast (sub-5 s) zero-cost
+                # response whose cap-pattern IS detectable, so cap accounting resumes
+                # on the very next iteration.  At most one extra full-timeout
+                # (~configured_timeout_ms) is incurred before the cap is re-detected.
                 if (
                     result.timed_out
                     and result.turns == 0
