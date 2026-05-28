@@ -1854,6 +1854,12 @@ class SpeculativeMergeWorker:
                         logger.warning(
                             f'Task {req.task_id}: rev-parse HEAD failed: {err.strip()}'
                         )
+                        # failure_diagnostic is NOT populated here: this failure
+                        # occurs before a merge attempt (git cannot even read the
+                        # worktree HEAD), so the merge_to_main diagnostic fields
+                        # (base_sha, branch_ref_in_worktree, etc.) are meaningless.
+                        # failure_diagnostic is only set on genuine merge_to_main
+                        # non-conflict failures downstream.
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
@@ -2207,7 +2213,16 @@ class SpeculativeMergeWorker:
         base_label: str,
         git_stderr: str,
     ) -> dict[str, str]:
-        """Build the four-key failure diagnostic dict for a non-conflict merge failure."""
+        """Build the four-key failure diagnostic dict for a non-conflict merge failure.
+
+        ``branch_ref_in_worktree`` is resolved via ``resolve_branch_sha`` which runs
+        ``git rev-parse`` against ``project_root`` (the primary repo), not the temporary
+        merge worktree.  The value is equivalent: git ref namespaces (``refs/heads/*``)
+        are shared across all worktrees of a repository, so project_root and the merge
+        worktree always agree on the branch HEAD SHA.  The key name uses the worktree
+        framing because that is the conceptually meaningful question ("what SHA would the
+        merge worktree have seen for this branch?").
+        """
         full_branch = f'{self._git_ops.config.branch_prefix}{req.branch}'
         resolved = await self._git_ops.resolve_branch_sha(full_branch)
         return {
@@ -2219,14 +2234,19 @@ class SpeculativeMergeWorker:
 
     @staticmethod
     def _render_failure_diagnostic(diag: dict[str, str]) -> str:
-        """Render the diagnostic dict as a labelled key=value line for inclusion in reason."""
-        stderr_first = diag['git_stderr'].splitlines()[0] if diag['git_stderr'] else ''
+        """Render the diagnostic dict as a labelled key=value line for inclusion in reason.
+
+        ``git_stderr`` is intentionally omitted from the rendered line: the full git
+        output is already prepended to ``reason`` via ``merge_result.details``, so
+        repeating even a truncated first line would be redundant noise in the human-
+        facing field.  The structured ``git_stderr`` value remains accessible via the
+        ``failure_diagnostic`` dict.
+        """
         return (
             f"[merge-failure] "
             f"base_sha={diag['base_sha']} "
             f"base_label={diag['base_label']} "
-            f"branch_ref_in_worktree={diag['branch_ref_in_worktree']} "
-            f"git_stderr={stderr_first}"
+            f"branch_ref_in_worktree={diag['branch_ref_in_worktree']}"
         )
 
     async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
