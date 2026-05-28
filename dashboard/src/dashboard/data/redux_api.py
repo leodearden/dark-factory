@@ -616,6 +616,37 @@ def shape_costs(
 
 
 # ---------------------------------------------------------------------------
+# ESCALATIONS
+# ---------------------------------------------------------------------------
+
+
+def shape_escalations(
+    queues: Mapping[str, Any],
+    task_maps: Mapping[str, Iterable[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    """Reshape build_escalation_queues output into the ESCALATIONS DF_DATA key.
+
+    Contract:
+        ``queues``    — dict returned by ``build_escalation_queues(config)``:
+                        ``{subsections: [...], summary: {...}}``.
+        ``task_maps`` — ``{root_path_str: list[task_dict]}`` keyed by the same
+                        absolute root path strings used as subsection ``id`` values
+                        for orchestrator subsections.  Reconciliation subsections
+                        use the literal ``'reconciliation'`` key which is never in
+                        ``task_maps``.
+
+    Returns:
+        ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
+    """
+    return {
+        'ESCALATIONS': {
+            'subsections': [],
+            'summary': dict(queues.get('summary') or {}),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # PERFORMANCE
 # ---------------------------------------------------------------------------
 
