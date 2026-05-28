@@ -28,6 +28,7 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
     format_filtered_task_tree,
+    strip_snapshot_lines,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,9 @@ class MemoryConsolidator(BaseStage):
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
 
+    # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
+    _entity_summary_snapshot_lines_stripped: int = 0
+
     async def run(
         self,
         events: list[ReconciliationEvent],
@@ -69,6 +73,9 @@ class MemoryConsolidator(BaseStage):
         dedup on those flags would defeat the remediation contract.
         """
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
+        report.stats['entity_summary_snapshot_lines_stripped'] = (
+            self._entity_summary_snapshot_lines_stripped
+        )
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -245,6 +252,10 @@ class MemoryConsolidator(BaseStage):
         task_tree_section = self._build_task_tree_section()
 
         # 8. Format
+        episodes_str, ep_n = _format_episodes(new_episodes)
+        memories_str, mem_n = _format_memories(new_memories)
+        self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
+
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -252,10 +263,10 @@ class MemoryConsolidator(BaseStage):
 {event_summary}
 
 ### New Episodes Since Last Reconciliation ({len(new_episodes)})
-{_format_episodes(new_episodes)}
+{episodes_str}
 
 ### New Mem0 Memories Since Last Reconciliation ({len(new_memories)})
-{_format_memories(new_memories)}
+{memories_str}
 
 ### Store Status
 {json.dumps(status, indent=2, default=str)}
@@ -310,6 +321,9 @@ Review the above data and perform memory consolidation:
         # Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        ctx_str, ctx_n = _format_context_items(ap.context_items)
+        self._entity_summary_snapshot_lines_stripped = ctx_n
+
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -317,7 +331,7 @@ Review the above data and perform memory consolidation:
 {event_summary}
 
 ### Related Context ({len(ap.context_items)} items)
-{_format_context_items(ap.context_items)}
+{ctx_str}
 
 ### Store Status
 {json.dumps(status, indent=2, default=str)}
@@ -360,6 +374,7 @@ Review the above data and perform memory consolidation:
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
+        self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
@@ -387,41 +402,52 @@ def _format_events(events: list[ReconciliationEvent]) -> str:
     return '\n'.join(lines)
 
 
-def _format_episodes(episodes: list[dict]) -> str:
+def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     if not episodes:
-        return 'No new episodes.'
+        return 'No new episodes.', 0
     lines = []
+    total_stripped = 0
     for ep in episodes:
-        content = (ep.get('content') or '')[:500]
+        raw = ep.get('content') or ''
+        cleaned, n = strip_snapshot_lines(raw)
+        total_stripped += n
+        content = cleaned[:500]
         lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
-    return '\n'.join(lines)
+    return '\n'.join(lines), total_stripped
 
 
-def _format_memories(memories: list[dict]) -> str:
+def _format_memories(memories: list[dict]) -> tuple[str, int]:
     if not memories:
-        return 'No memories.'
+        return 'No memories.', 0
     lines = []
+    total_stripped = 0
     for m in memories:
-        content = (m.get('memory') or '')[:500]
+        raw = m.get('memory') or ''
+        cleaned, n = strip_snapshot_lines(raw)
+        total_stripped += n
+        content = cleaned[:500]
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
         lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
-    return '\n'.join(lines)
+    return '\n'.join(lines), total_stripped
 
 
-def _format_context_items(items: dict[str, ContextItem]) -> str:
-    """Format context items grouped by source."""
+def _format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
+    """Format context items grouped by source, stripping count-snapshot lines."""
     if not items:
-        return 'No related context.'
+        return 'No related context.', 0
     by_source: dict[str, list[ContextItem]] = {}
     for item in items.values():
         by_source.setdefault(item.source, []).append(item)
     sections = []
+    total_stripped = 0
     for source, source_items in sorted(by_source.items()):
         sections.append(f'**{source}** ({len(source_items)})')
         for item in source_items:
-            sections.append(item.formatted)
-    return '\n'.join(sections)
+            cleaned, n = strip_snapshot_lines(item.formatted)
+            total_stripped += n
+            sections.append(cleaned)
+    return '\n'.join(sections), total_stripped
 
 
 def _format_findings(findings: list[dict]) -> str:
