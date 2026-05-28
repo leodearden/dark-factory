@@ -380,6 +380,9 @@ class TestEnterMergeDeferred:
         wf.task['metadata'] = {'train': {'id': 'T1', 'order': 1, 'members': ['a', '1523']}}
         wf.scheduler.set_task_status = AsyncMock()
         wf.scheduler.clear_requeue_count = MagicMock()
+        # δ₂: _maybe_enqueue_group_merge calls tasks_by_train; return [] so
+        # the trigger parks (all members not deferred) → MERGE_DEFERRED path.
+        wf.scheduler.tasks_by_train = AsyncMock(return_value=[])
 
         result = await wf._enter_merge_deferred()
 

@@ -120,6 +120,7 @@ class _SchedulerLike(Protocol):
     async def get_statuses(
         self, ids: list[str] | None = ...,
     ) -> tuple[dict[str, str], Exception | None]: ...
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]: ...
     def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
@@ -459,11 +460,16 @@ class TaskWorkflow:
         to ``status='merge-deferred'`` and waits for the group-merge worker (δ₁)
         to drive the eventual done transition once all siblings are ready.
 
+        After writing merge-deferred, invokes ``_maybe_enqueue_group_merge()``
+        (δ₂).  When the trigger fires (all members deferred, self is tip), that
+        method awaits the GroupMergeRequest and returns the final outcome
+        directly.  When the train is incomplete (or self is not the tip), the
+        trigger returns ``None`` and this method returns ``MERGE_DEFERRED`` to
+        park the workflow.
+
         The worktree is NOT cleaned up here — the merge-queue worker's
         post-merge ``cleanup_worktree`` never runs for merge-deferred tasks,
         so the worktree is naturally preserved as γ₁'s observable signal.
-
-        Returns ``WorkflowOutcome.MERGE_DEFERRED``.
         """
         self._enter_phase(WorkflowState.MERGE_DEFERRED)
         await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
@@ -478,7 +484,161 @@ class TaskWorkflow:
             '(group-merge worker owns done transition)',
             self.task_id,
         )
+        trigger_outcome = await self._maybe_enqueue_group_merge()
+        if trigger_outcome is not None:
+            return trigger_outcome
         return WorkflowOutcome.MERGE_DEFERRED
+
+    async def _maybe_enqueue_group_merge(self) -> WorkflowOutcome | None:
+        """δ₂ trigger: enqueue a GroupMergeRequest when all train members are merge-deferred.
+
+        Called immediately after ``_enter_merge_deferred`` writes the
+        merge-deferred status.  Evaluates whether this task is the tip of a
+        complete train and, if so, builds and enqueues a
+        :class:`~orchestrator.merge_queue.GroupMergeRequest` from self's
+        context (branch/worktree/task_files/module_configs/config).
+
+        Gating (step-6 adds full guards; initial impl fires unconditionally
+        when train metadata is present):
+
+        * ``self._train is None`` → return ``None`` (non-train task; unreachable
+          from ``_enter_merge_deferred`` but defensive).
+        * ``members`` is empty → return ``None`` (no tasks found).
+        * Any member is not merge-deferred (with self's status trusted as
+          merge-deferred regardless of the get_tasks read lag) → return ``None``.
+        * Self is not the tip (highest order) → return ``None`` (only the tip's
+          branch contains all member commits).
+        * ``self.worktree is None`` or ``self.merge_queue is None`` → log and
+          return ``None``.
+
+        Outcome mapping after awaiting the future:
+        * ``None`` (soft-cancel) → ``_handle_soft_cancel('group-merge')``
+        * ``result.status == 'done'`` → ``WorkflowOutcome.DONE``
+        * Any other status → ``_mark_blocked(..., escalate_to_human=True)``
+
+        Returns the mapped ``WorkflowOutcome``, or ``None`` to signal the caller
+        to park the workflow as ``MERGE_DEFERRED``.
+        """
+        from orchestrator.merge_queue import (
+            TRAIN_INCOMPLETE_REASON_PREFIX,
+            GroupMergeRequest,
+            MergeOutcome,  # noqa: F401 — kept for type completeness
+            enqueue_merge_request,
+        )
+
+        train = self._train
+        if train is None:
+            return None
+
+        train_id: str = train.get('id', '')  # type: ignore[assignment]
+        if not train_id:
+            return None
+
+        members = await self.scheduler.tasks_by_train(train_id)
+        if not members:
+            return None
+
+        # Guard: all members must be merge-deferred.
+        # Trust self's just-written status (the get_tasks read may lag the write).
+        def _effective_status(m: dict) -> str:
+            return 'merge-deferred' if str(m.get('id')) == self.task_id else str(m.get('status', 'unknown'))
+
+        if not all(_effective_status(m) == 'merge-deferred' for m in members):
+            return None
+
+        # Guard: self must be the tip (highest order → members[-1] after ascending sort).
+        # Correctness depends on dispatch gating: β₁'s intra-train allowance lets
+        # order=k start only once order=k-1 is merge-deferred, which guarantees the
+        # tip (highest order) enters merge-deferred LAST.  The δ₁ group-merge worker
+        # acts as a backstop: if this trigger does not fire (e.g. the tip re-enters
+        # merge-deferred before a sibling propagates), the worker's own status pre-check
+        # will reject the request and return TRAIN_INCOMPLETE, parking the train for retry.
+        tip = members[-1]
+        if str(tip.get('id')) != self.task_id:
+            return None
+
+        # Guard: infrastructure must be available.
+        if self.worktree is None or self.merge_queue is None:
+            logger.warning(
+                'Task %s: train tip reached but worktree=%r merge_queue=%r — parking',
+                self.task_id, self.worktree, self.merge_queue,
+            )
+            return None
+
+        member_ids = [str(m.get('id')) for m in members]
+        branch_name = self.task_id  # matches _submit_to_merge_queue convention
+
+        async def _status_check(ids: list[str]) -> dict[str, str]:
+            statuses, err = await self.scheduler.get_statuses(ids)
+            if err is not None:
+                # Log the transient MCP/read error so the silent discard is
+                # visible.  We return the (possibly empty/partial) dict rather
+                # than raising so the worker's existing train_incomplete pre-check
+                # fires and routes back to the MERGE_DEFERRED park (see outcome
+                # mapping below) instead of surfacing an unclassified 'Merge
+                # worker error' that would escalate to a human.
+                logger.warning(
+                    'Task %s: train %r status_check got error from get_statuses '
+                    '(will return partial %d-entry dict): %s',
+                    self.task_id, train_id, len(statuses or {}), err,
+                )
+            return statuses or {}  # type: ignore[return-value]
+
+        async def _mark_member_done(mid: str, sha: str) -> None:
+            await self.scheduler.mark_done(
+                mid, kind='merged', sha=sha, note=f'train {train_id}',
+            )
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id=self.task_id,
+            branch=branch_name,
+            worktree=self.worktree,
+            pre_rebased=False,
+            task_files=self._task_files,
+            module_configs=self._module_configs,
+            config=self.config,
+            result=future,
+            train_id=train_id,
+            member_task_ids=member_ids,
+            tip_branch=branch_name,
+            tip_task_id=self.task_id,
+            status_check=_status_check,
+            mark_member_done=_mark_member_done,
+        )
+
+        logger.info(
+            'Task %s: all %d train members merge-deferred — enqueuing GroupMergeRequest '
+            '(train=%r, members=%r)',
+            self.task_id, len(member_ids), train_id, member_ids,
+        )
+        await enqueue_merge_request(self.merge_queue, req, self.event_store)
+
+        result = await self._await_cancellable(future)
+        if result is None:
+            return await self._handle_soft_cancel('group-merge')
+        if result.status == 'done':
+            if result.merge_sha:
+                self._merge_sha = result.merge_sha
+            return WorkflowOutcome.DONE
+        # Distinguish transient from genuine failures.
+        # train_incomplete: one or more members haven't propagated their
+        # merge-deferred write yet (or a transient get_statuses error returned
+        # a partial dict).  This is a timing artefact, not a real failure — park
+        # the train and let δ₁ retry when the tip re-enters merge-deferred.
+        if result.reason and result.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX):
+            logger.info(
+                'Task %s: GroupMergeRequest returned train_incomplete for train %r '
+                '— parking (MERGE_DEFERRED) for δ₁ retry. reason: %s',
+                self.task_id, train_id, result.reason,
+            )
+            return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Genuine failure (conflict/verify-red/rebase-conflict) → escalate to human
+        # so a broken train is never silently parked forever (scenarios 5/8).
+        return await self._mark_blocked(
+            f'Group merge for train {train_id!r} failed: {result.status} — {result.reason}',
+            escalate_to_human=True,
+        )
 
     async def _finalise_merged_done(self) -> WorkflowOutcome:
         """Common DONE-finalisation for the happy-path merge.

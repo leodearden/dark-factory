@@ -5761,3 +5761,126 @@ class TestAcquireNextTrainDispatch:
         assert result is None, (
             'Expected None — δ (no train metadata) must be blocked by merge-deferred α'
         )
+
+
+class TestTasksByTrain:
+    """Unit tests for Scheduler.tasks_by_train(train_id) — δ₂ member-discovery helper.
+
+    tasks_by_train does NOT exist yet → these tests are RED until step-2 adds
+    the implementation.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def _mixed_tasks(self) -> list[dict]:
+        """Return a mixed task list: 3 T1 members (out of order), 1 T2, 1 non-train."""
+        return [
+            {
+                'id': '201',
+                'title': 'T1 order 2',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T1', 'order': 2}},
+            },
+            {
+                'id': '199',
+                'title': 'T1 order 0',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T1', 'order': 0}},
+            },
+            {
+                'id': '200',
+                'title': 'T1 order 1',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T1', 'order': 1}},
+            },
+            {
+                'id': '300',
+                'title': 'T2 member',
+                'status': 'pending',
+                'metadata': {'train': {'id': 'T2', 'order': 0}},
+            },
+            {
+                'id': '400',
+                'title': 'Non-train task',
+                'status': 'in-progress',
+                'metadata': {},
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_returns_t1_members_sorted_ascending(self, scheduler: Scheduler):
+        """tasks_by_train('T1') returns exactly the 3 T1 members, sorted root→tip."""
+        scheduler.get_tasks = AsyncMock(return_value=self._mixed_tasks())
+
+        result = await scheduler.tasks_by_train('T1')
+
+        assert len(result) == 3, f'Expected 3 T1 members, got {len(result)}'
+        ids = [str(t.get('id')) for t in result]
+        assert ids == ['199', '200', '201'], (
+            f'Expected ascending order [199, 200, 201], got {ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_excludes_other_train_and_non_train(self, scheduler: Scheduler):
+        """tasks_by_train('T1') excludes T2 members and non-train tasks."""
+        scheduler.get_tasks = AsyncMock(return_value=self._mixed_tasks())
+
+        result = await scheduler.tasks_by_train('T1')
+
+        returned_ids = {str(t.get('id')) for t in result}
+        assert '300' not in returned_ids, 'T2 member must not appear in T1 results'
+        assert '400' not in returned_ids, 'Non-train task must not appear in T1 results'
+
+    @pytest.mark.asyncio
+    async def test_unknown_train_returns_empty(self, scheduler: Scheduler):
+        """tasks_by_train('UNKNOWN') returns [] when no task has that train_id."""
+        scheduler.get_tasks = AsyncMock(return_value=self._mixed_tasks())
+
+        result = await scheduler.tasks_by_train('UNKNOWN')
+
+        assert result == [], f'Expected [], got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_empty_train_id_returns_empty(self, scheduler: Scheduler):
+        """tasks_by_train('') returns [] without calling get_tasks (falsy guard)."""
+        scheduler.get_tasks = AsyncMock(return_value=self._mixed_tasks())
+
+        result = await scheduler.tasks_by_train('')
+
+        assert result == [], f'Expected [], got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_missing_order_sorts_last_no_crash(self, scheduler: Scheduler):
+        """Members with missing/non-int 'order' sort last deterministically — no crash."""
+        tasks = [
+            {
+                'id': '501',
+                'title': 'T3 order 0',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T3', 'order': 0}},
+            },
+            {
+                'id': '502',
+                'title': 'T3 missing order',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T3'}},          # no 'order' key
+            },
+            {
+                'id': '503',
+                'title': 'T3 non-int order',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T3', 'order': 'X'}},  # non-int
+            },
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+        result = await scheduler.tasks_by_train('T3')
+
+        assert len(result) == 3, f'Expected 3 members, got {len(result)}'
+        # The first member must have id=='501' (order 0 — the only valid int)
+        assert str(result[0].get('id')) == '501', (
+            f'Expected 501 first (order=0), got {result[0].get("id")!r}'
+        )
