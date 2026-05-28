@@ -3881,41 +3881,32 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
 
-        Allowlist carve-out: only status=='blocked' or status in TERMINAL_STATUSES
-        reaches the set_task_status attempt block. Every other non-None status
-        (deferred, in-progress, pending, merge-deferred, and any future non-terminal
-        status) is DEBUG-skipped — writing 'pending' onto them would clobber a
-        deliberate state that the server terminal-exit gate does NOT protect.
+        Only 'blocked' tasks are flipped. Every other status — including
+        terminal statuses (done, cancelled), non-terminal live statuses
+        (deferred, in-progress, pending, merge-deferred), and any future
+        status — is DEBUG-skipped. The intent of this feature is purely to
+        unblock 'blocked' tasks; terminal members completing normally while
+        their L2 cluster is still pending is an expected, common outcome and
+        should not produce operator-visible WARNINGs.
 
-        For {blocked, done, cancelled}:
-          - blocked → set_task_status('pending') succeeds → INFO citing L2 id.
-          - done/cancelled → rejected by the terminal-exit gate → SetTaskStatusRejected
-            caught → WARNING (no re-raise, best-effort policy).
+        TOCTOU note: get_status and set_task_status are separate MCP
+        round-trips with no atomic compare-and-set. If the task transitions
+        away from 'blocked' between the read and the write (e.g. a workflow
+        picks it up → 'in-progress'), set_task_status('pending') may succeed
+        and clobber the newer status. This is accepted as a best-effort
+        policy; the race window is narrow in practice.
         """
         task_id = escalation.task_id
         status = await self.scheduler.get_status(task_id)
 
-        if status is None:
+        if status != 'blocked':
             logger.debug(
-                'cascade-unblock: task %s status unknown; skipping (via %s)',
-                task_id, escalation.resolved_by,
-            )
-            return
-
-        # Allowlist: only 'blocked' and terminal statuses (done/cancelled) proceed.
-        # All other non-terminal statuses (deferred, in-progress, pending,
-        # merge-deferred, and any future status) are carved out to prevent clobbering
-        # deliberate state that the server gate does not protect.
-        from orchestrator.task_status import TERMINAL_STATUSES
-        if status not in TERMINAL_STATUSES and status != 'blocked':
-            logger.debug(
-                'cascade-unblock: task %s is %s (non-terminal non-blocked carve-out); '
-                'not flipping (via %s)',
+                'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
                 task_id, status, escalation.resolved_by,
             )
             return
 
-        # For blocked, done, cancelled — attempt the flip
+        # Only 'blocked' reaches here — attempt the flip
         try:
             await self.scheduler.set_task_status(task_id, 'pending')
             logger.info(
@@ -3923,8 +3914,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 task_id, escalation.resolved_by,
             )
         except SetTaskStatusRejected as e:
+            # Defensive TOCTOU guard: task may have transitioned to a terminal
+            # status between the read and the write.
             logger.warning(
-                'cascade-unblock: refused to flip %s (terminal/guard): %s',
+                'cascade-unblock: refused to flip %s (TOCTOU race or guard): %s',
                 task_id, e,
             )
 

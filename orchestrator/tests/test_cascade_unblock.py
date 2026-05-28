@@ -2,12 +2,12 @@
 
 Acceptance criteria:
   1. Cascade-resolved L1 member with task status 'blocked' → set_task_status('pending'), INFO cites L2 id.
-  2. Member status 'done' → set_task_status attempted → SetTaskStatusRejected caught → WARNING, no raise.
+  2. Member status 'done' → set_task_status NOT called (DEBUG-skipped; terminal members need no flip).
   3. Member status 'deferred' → set_task_status NOT called (carve-out), DEBUG logged.
   4. Member status 'in-progress' → set_task_status NOT called (carve-out), DEBUG logged.
   5. Dismissed cascade (dismiss=True) → members have status='dismissed' → no flip.
   6. Direct/steward-resolved L1 (resolved_by='steward') → no flip (guard: l2-cascade prefix).
-  7. Mixed-status cascade: blocked member flipped, done member WARNING, deferred member skipped.
+  7. Mixed-status cascade: blocked member flipped, done member DEBUG-skipped, deferred member skipped.
   8. Wake events still fire for every member (regression: synchronous wake unaffected by async flip).
 """
 
@@ -23,7 +23,6 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.scheduler import SetTaskStatusRejected
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -97,30 +96,28 @@ class TestCascadeUnblockUnit:
             "Expected INFO record citing L2 id 'esc-4000-39'"
         )
 
-    async def test_criterion_2_done_task_raises_warning(
+    async def test_criterion_2_done_task_not_flipped(
         self, harness: Harness, caplog
     ):
-        """[Criterion 2] member status 'done' → attempt made, SetTaskStatusRejected caught → WARNING."""
+        """[Criterion 2] member status 'done' → set_task_status NOT called, DEBUG logged.
+
+        A member completing normally while its L2 cluster is still pending is
+        an expected, common outcome. Attempting a write just to produce a
+        WARNING (relying on the server gate to reject it) generates noise for
+        a routine case. Skip it silently with DEBUG instead.
+        """
         esc = _make_l1_esc(task_id='3438', resolved_by='l2-cascade:esc-4000-39')
         harness.scheduler.get_status = AsyncMock(return_value='done')
-        harness.scheduler.set_task_status = AsyncMock(
-            side_effect=SetTaskStatusRejected(
-                task_id='3438',
-                error_code='terminal_exit_rejected',
-                raw='terminal row',
-            )
-        )
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             harness._on_escalation_resolved(esc)
-            # Must NOT raise even though the mock raises SetTaskStatusRejected
             await asyncio.gather(*list(harness._background_tasks))
 
-        # Attempt WAS made
-        harness.scheduler.set_task_status.assert_awaited_once_with('3438', 'pending')
-        # A WARNING was logged
-        assert any(r.levelno == logging.WARNING for r in caplog.records), (
-            "Expected a WARNING record when set_task_status raises SetTaskStatusRejected"
+        # No attempt made
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # A DEBUG record was logged (not blocked; skipping)
+        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
+            "Expected a DEBUG record for done (not-blocked) carve-out"
         )
 
     async def test_criterion_3_deferred_task_not_flipped(
@@ -275,7 +272,7 @@ class TestCascadeUnblockIntegration:
     async def test_criterion_7_mixed_status_cascade(
         self, harness: Harness, tmp_path: Path, caplog
     ):
-        """[Criterion 7] 3-member cascade: blocked→flipped, done→WARNING, deferred→skipped."""
+        """[Criterion 7] 3-member cascade: blocked→flipped, done→DEBUG-skipped, deferred→skipped."""
         queue = EscalationQueue(tmp_path / 'esc')
         l1_blocked = _make_l1_in_queue(queue, 'esc-l1-blocked', 'task-blocked')
         l1_done = _make_l1_in_queue(queue, 'esc-l1-done', 'task-done')
@@ -292,23 +289,12 @@ class TestCascadeUnblockIntegration:
                 'task-blocked': 'blocked',
                 'task-done': 'done',
                 'task-deferred': 'deferred',
-                # L2's own task_id — should be skipped (level==2 guard)
+                # L2's own task_id — should be skipped (level==2 guard, not level==1)
                 'task-cluster': 'pending',
             }
             return mapping.get(task_id, 'blocked')
 
         harness.scheduler.get_status = AsyncMock(side_effect=_get_status_side_effect)
-
-        def _set_status_side_effect(task_id: str, status: str):
-            if task_id == 'task-done':
-                raise SetTaskStatusRejected(
-                    task_id=task_id,
-                    error_code='terminal_exit_rejected',
-                    raw='done row',
-                )
-            # blocked and others succeed
-
-        harness.scheduler.set_task_status = AsyncMock(side_effect=_set_status_side_effect)
 
         with caplog.at_level(logging.DEBUG):
             queue.resolve(l2.id, 'root cause fixed', dismiss=False)
@@ -316,15 +302,21 @@ class TestCascadeUnblockIntegration:
 
         # blocked task was flipped
         harness.scheduler.set_task_status.assert_any_await('task-blocked', 'pending')
+        # done task was NOT flipped (DEBUG-skipped; normal case, not an error)
+        assert not any(
+            call.args == ('task-done', 'pending')
+            for call in harness.scheduler.set_task_status.await_args_list
+        ), "done task should be DEBUG-skipped, not flipped"
         # deferred task was NOT flipped
         assert not any(
             call.args == ('task-deferred', 'pending')
             for call in harness.scheduler.set_task_status.await_args_list
         ), "deferred task should not be flipped"
-        # done task generated a WARNING
-        assert any(r.levelno == logging.WARNING for r in caplog.records), (
-            "Expected WARNING for done task SetTaskStatusRejected"
-        )
+        # L2's own task ('task-cluster') was NOT flipped — level==2 guard
+        assert not any(
+            call.args == ('task-cluster', 'pending')
+            for call in harness.scheduler.set_task_status.await_args_list
+        ), "L2's own task should not be flipped (level==2 guard)"
 
     async def test_criterion_8_wake_events_still_fire(
         self, harness: Harness, tmp_path: Path
