@@ -12,6 +12,9 @@ Covers:
 - Step-11: MemoryConsolidator.run() wiring — deletion guard (filter_false_absence_flags)
   and census inconsistency detection (detect_census_inconsistency)
   (TestMemoryConsolidatorRunWiring)
+- Step-16: end-to-end fidelity — genuinely-absent task's flag survives run() when
+  get_task RAISES the not-found TaskmasterError (real backend behavior)
+  (TestMemoryConsolidatorRunWiring.test_genuine_absence_flag_survives_run)
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -904,4 +908,69 @@ class TestMemoryConsolidatorRunWiring:
         assert report.items_flagged == [absence_flag], (
             "Remediation run must return items_flagged unchanged (early return before "
             f"filter_false_absence_flags); got {report.items_flagged!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_absence_flag_survives_run(self):
+        """Step-16 end-to-end: a genuinely-absent task's flag SURVIVES run().
+
+        Mirrors real sqlite backend behavior: self.taskmaster.get_task RAISES
+        TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 3438')
+        on absence (sqlite_task_backend.py:497-499).  The interceptor re-raises
+        (middleware/task_interceptor.py:3361-3363).
+
+        After step-17's fix, filter_false_absence_flags normalizes the raised
+        exception to {error: str(exc), error_type: typename} and passes it to
+        confirm_task_absent, which recognises the not-found phrase and returns
+        True → the flag is KEPT (task positively absent).
+
+        RED against current impl: the `except Exception` handler unconditionally
+        drops every raise as inconclusive, so the flag is removed from items_flagged
+        even though the task is genuinely absent.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        # Simulate real sqlite backend: RAISES not-found on absence
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_task.side_effect = TaskmasterError(  # type: ignore[union-attr]
+            'TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 3438'
+        )
+
+        absence_flag = {
+            'task_id': '3438',
+            'flag_type': 'task_absent',
+            'description': 'Task 3438 not found — genuinely absent',
+        }
+        all_flags = [absence_flag]
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(all_flags),
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=list(all_flags))
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step16',
+            )
+
+        flag_types = [f.get('flag_type') for f in report.items_flagged]
+        assert 'task_absent' in flag_types, (
+            "filter_false_absence_flags must KEEP 'task_absent' flags when get_task "
+            "RAISES the not-found TaskmasterError (real sqlite backend behavior for "
+            "genuinely absent tasks). "
+            f"got items_flagged={report.items_flagged!r}. "
+            "RED: current impl's except handler drops ALL raises as inconclusive."
         )
