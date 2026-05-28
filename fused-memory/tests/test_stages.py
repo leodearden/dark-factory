@@ -1472,31 +1472,45 @@ class TestStage2GuardrailProjectIdGating:
     """
 
     def test_guardrail_renders_for_autopilot_video_project(self):
-        """build_stage2_system_prompt('autopilot_video') must include the
-        Contamination Guardrail section, ceiling value, before ## Available Tools,
-        and at least one representative forbidden tool name."""
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
-        )
+        """build_stage2_system_prompt('autopilot_video') must include a
+        content-based Contamination Guardrail section with no numeric task-ID
+        ceiling, positioned before ## Available Tools."""
+        import re
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
         prompt = build_stage2_system_prompt(project_id='autopilot_video')
+
+        # (a) guardrail heading is present and precedes ## Available Tools
         assert 'Contamination Guardrail' in prompt, (
             "Expected 'Contamination Guardrail' in the autopilot_video prompt — "
             "the guardrail must be injected when project_id == 'autopilot_video'."
-        )
-        assert str(AUTOPILOT_VIDEO_TASK_CEILING) in prompt, (
-            f"Expected the ceiling value {AUTOPILOT_VIDEO_TASK_CEILING!r} to appear "
-            "in the rendered autopilot_video prompt — a typo in the f-string would "
-            "silently omit it."
         )
         assert prompt.index('Contamination Guardrail') < prompt.index('## Available Tools'), (
             "Contamination Guardrail section must appear BEFORE ## Available Tools "
             "in the autopilot_video prompt so the LLM reads the gate before any "
             "tool-use guidance."
         )
-        assert 'set_task_status' in prompt, (
-            "Expected 'set_task_status' to appear in the guardrail block — "
-            "the list of forbidden actions must include at least this representative tool."
+
+        # (b) no numeric task-ID ceiling in the guardrail block
+        guardrail_block = _extract_section(prompt, 'Contamination Guardrail')
+        assert '606' not in guardrail_block, (
+            "The guardrail block must not contain the legacy numeric ceiling '606' — "
+            "high task IDs are normal project growth, not contamination."
+        )
+        assert not re.search(r'exceeds\s+\d+', guardrail_block), (
+            "The guardrail block must not use 'exceeds <number>' phrasing — "
+            "cross-project contamination is content-based, not ID-magnitude-based."
+        )
+        assert 'task ceiling' not in guardrail_block.lower(), (
+            "The guardrail block must not reference a 'task ceiling' — "
+            "the ceiling concept has been removed in favour of content-based detection."
+        )
+
+        # (c) content-based phrasing is present
+        guardrail_lower = guardrail_block.lower()
+        assert any(keyword in guardrail_lower for keyword in ('path', 'cited', 'cross-project routing')), (
+            "Expected content-based phrasing (e.g. 'path', 'cited', or 'Cross-Project Routing') "
+            "in the guardrail block — contamination must be judged by file paths/modules, "
+            "not task-ID magnitude."
         )
 
     def test_guardrail_omitted_for_other_projects(self):
