@@ -52,6 +52,32 @@ _INTEGRATION_SKIP = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+def _command_lines(stdout: str) -> list[str]:
+    """Return only the real command lines from verify.sh --print-plan stdout.
+
+    verify.sh emits a '# --- commands' marker line that separates the process-level
+    env-comment block from the actual command list.  Lines in the env block are
+    '# ...' comments; some contain lowercase 'cargo ' substrings (e.g.
+    '# CARGO_MAKEFLAGS left unset ... cargo uses its own job pool') that must not
+    be scanned as cargo invocations.
+
+    Algorithm:
+    - Split stdout into lines via .splitlines().
+    - Find the first line that starts with '# --- commands'.
+    - Take lines AFTER that marker.  If the marker is absent fall back to ALL lines
+      (defensive — keeps the function useful even against future verify.sh layout
+      changes).
+    - Return those that are non-blank AND do not .lstrip().startswith('#').
+    """
+    lines = stdout.splitlines()
+    marker_idx = next(
+        (i for i, ln in enumerate(lines) if ln.startswith("# --- commands")),
+        None,
+    )
+    candidates = lines[marker_idx + 1 :] if marker_idx is not None else lines
+    return [ln for ln in candidates if ln.strip() and not ln.lstrip().startswith("#")]
+
+
 def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
     """Run reify verify.sh --print-plan test and return stdout.
 
@@ -124,31 +150,33 @@ def test_role_env_propagates_to_reify_verify_plan(
 
     # --- consumer side (α): reify emits the correct CARGO_PRIO prefix ---
     stdout = _run_reify_print_plan(verify_env)
+    cmd_lines = _command_lines(stdout)
 
-    # Find all real cargo command positions: `cargo ` (trailing space) to exclude
-    # cargo-test-occt-gated.sh (cargo+hyphen), .cargo/env (cargo+slash), and
-    # uppercase CARGO_* env-comment lines.
-    cargo_positions = [m.start() for m in re.finditer(r"cargo ", stdout)]
+    # Scan only real command lines (post-marker, non-comment) to avoid false
+    # positives from env-comment substrings like 'cargo uses its own job pool'.
+    total_cargo_count = 0
+    for line in cmd_lines:
+        for m in re.finditer(r"cargo ", line):
+            pos = m.start()
+            prefix_start = pos - len(expected_prefix)
+            actual_prefix = line[prefix_start:pos] if prefix_start >= 0 else ""
+            assert actual_prefix == expected_prefix, (
+                f"cargo command in line {line!r} has prefix {actual_prefix!r},"
+                f" expected {expected_prefix!r} for role={role!r}.\nstdout:\n{stdout}"
+            )
+            total_cargo_count += 1
 
     # Anti-vacuous guard: the plan must contain at least one cargo invocation.
-    assert len(cargo_positions) >= 1, (
+    assert total_cargo_count >= 1, (
         f"Expected at least one 'cargo ' command in verify.sh --print-plan output"
         f" for role={role!r}, but found none.\nstdout:\n{stdout}"
     )
 
-    # Every real cargo command must be immediately preceded by the role's prefix.
-    for pos in cargo_positions:
-        prefix_start = pos - len(expected_prefix)
-        actual_prefix = stdout[prefix_start:pos] if prefix_start >= 0 else ""
-        assert actual_prefix == expected_prefix, (
-            f"cargo command at stdout[{pos}] has prefix {actual_prefix!r},"
-            f" expected {expected_prefix!r} for role={role!r}.\nstdout:\n{stdout}"
-        )
-
-    # For merge role: ionice must not appear anywhere in the plan output.
+    # For merge role: ionice must not appear in any real command line.
     if forbid_ionice:
-        assert "ionice" not in stdout, (
-            f"ionice must not appear in merge-role plan, but found it.\nstdout:\n{stdout}"
+        assert "ionice" not in "\n".join(cmd_lines), (
+            f"ionice must not appear in merge-role command lines, but found it."
+            f"\nstdout:\n{stdout}"
         )
 
 
