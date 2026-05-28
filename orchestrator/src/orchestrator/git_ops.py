@@ -556,8 +556,7 @@ class GitOps:
         # PRD § 9.4: when a train member has order > 0, branch from the prior
         # member's branch tip so the chain is contiguous.  order=0 (degenerate
         # train) and train=None both fall through to _freshen_main().
-        _from_train = train is not None and train.get('order', 0) > 0
-        if _from_train:
+        if train is not None and train.get('order', 0) > 0:
             # ── Train path: branch from predecessor's tip ─────────────────
             # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
             # as start_ref so the new worktree stacks directly on top.
@@ -592,7 +591,7 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
-            if _from_train:
+            if train is not None and train.get('order', 0) > 0:
                 # start_ref was a SHA just verified by resolve_branch_sha; if
                 # rev-parse fails here it indicates git state corruption, not a
                 # missing remote ref.  Falling back to main would silently violate
