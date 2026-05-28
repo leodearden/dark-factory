@@ -14,6 +14,20 @@ exercises _command_lines() with a synthetic fixture and requires no subprocess.
 
 Conventional environment-gated integration-test idiom (cf. test_landlock.py:106,
 test_reviewer_trial_corpus.py:129).
+
+Environment
+-----------
+REIFY_ROOT
+    Path to the reify repository checkout.  Defaults to ``/home/leo/src/reify``
+    (mirrors the hardcoded path already in config.py / evals/reviewer_trial/corpus.py).
+    Override this in CI or on machines that check out reify at a different location:
+
+        export REIFY_ROOT=/path/to/reify
+
+    When the integration test is skipped because the path is absent or nice/ionice
+    are unavailable, a ``UserWarning`` is emitted in CI runs (``CI`` env-var set) so
+    the silent no-op is visible in the CI log rather than silently providing no
+    cross-repo coverage.
 """
 from __future__ import annotations
 
@@ -43,9 +57,30 @@ _INTEGRATION_SKIP = pytest.mark.skipif(
     or shutil.which("ionice") is None,
     reason=(
         "reify checkout or nice/ionice unavailable — cross-repo integration gate"
-        " cannot run; reify verify.sh degrades its CARGO_PRIO without nice/ionice"
+        " cannot run; reify verify.sh degrades its CARGO_PRIO without nice/ionice."
+        " Set REIFY_ROOT env-var to enable."
     ),
 )
+
+# Emit a visible warning when the integration gate is silently skipped in CI so
+# the coverage gap is not hidden.  Fires at collection time (module import).
+if os.environ.get("CI") and (
+    not REIFY_VERIFY_SH.exists()
+    or shutil.which("nice") is None
+    or shutil.which("ionice") is None
+):
+    import warnings
+
+    warnings.warn(
+        f"Integration gate test_role_env_propagates_to_reify_verify_plan will be "
+        f"SKIPPED in this CI run: "
+        f"REIFY_VERIFY_SH={REIFY_VERIFY_SH} exists={REIFY_VERIFY_SH.exists()}, "
+        f"nice={shutil.which('nice')!r}, ionice={shutil.which('ionice')!r}. "
+        f"Set REIFY_ROOT env-var to a reify checkout path to enable cross-repo "
+        f"integration coverage.",
+        UserWarning,
+        stacklevel=1,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -224,15 +259,16 @@ def test_command_lines_excludes_env_comment_substrings() -> None:
     """
     synthetic = _SYNTHETIC_PRINT_PLAN_STDOUT
 
-    # (1) Naive whole-stdout scan finds MORE 'cargo ' matches than the helper-scoped
-    #     scan: the comment-trap line contributes one extra match.
-    naive_count = len(re.findall(r"cargo ", synthetic))
+    # (1) Pin the exact post-marker output: both the comment-trap exclusion AND the
+    #     real-command inclusion are captured in a single assertion.  This is strictly
+    #     stronger than a naive_count > helper_count inequality — it catches bugs that
+    #     drop one real cargo line while still filtering the comment trap (which the
+    #     inequality would silently pass).
     helper_lines = _command_lines(synthetic)
-    helper_count = len(re.findall(r"cargo ", "\n".join(helper_lines)))
-    assert naive_count > helper_count, (
-        f"Expected naive_count ({naive_count}) > helper_count ({helper_count});"
-        f" comment-trap 'cargo ' should be filtered out but was not."
-    )
+    assert helper_lines == [
+        "./scripts/tree-sitter-generate.sh",
+        "timeout --kill-after=60 30m nice -n 15 ionice -c 2 -n 7 cargo nextest run --workspace",
+    ], f"_command_lines returned unexpected lines: {helper_lines!r}"
 
     # (2) Every returned line is a real command: non-blank and not a comment.
     for line in helper_lines:
