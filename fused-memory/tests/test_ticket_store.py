@@ -61,6 +61,7 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
     finally:
         await store.close()
     # task 1560: every connection this test opened must now be closed.
+    assert first_db is not None, 'first_db should have been set after initialize()'
     assert first_db._connection is None, (
         'first TicketStore connection orphaned by the idempotent re-init was left'
         ' open — its non-daemon aiosqlite worker leaks and trips "Event loop is'
@@ -367,6 +368,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     finally:
         await store.close()
     # task 1560: every connection this test opened must now be closed.
+    assert first_db is not None, 'first_db should have been set after initialize()'
     assert first_db._connection is None, (
         'first TicketStore connection orphaned by the idempotent re-init was left'
         ' open — its non-daemon aiosqlite worker leaks and trips "Event loop is'
