@@ -638,14 +638,39 @@ def shape_escalations(
     Returns:
         ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
     """
+    # Build fast per-root task-id lookup: {root_str: {str(task_id): task_dict}}
+    tasks_by_root_id: dict[str, dict[str, Any]] = {
+        root_str: {
+            str(t['id']): dict(t)
+            for t in task_list
+            if t.get('id') is not None
+        }
+        for root_str, task_list in task_maps.items()
+    }
+
     out_subsections: list[dict[str, Any]] = []
     for sub in queues.get('subsections') or []:
+        sub_id = sub.get('id') or ''
+        sub_label = sub.get('label')
+        sub_kind = sub.get('kind')
+        root_tasks = tasks_by_root_id.get(sub_id, {})
+
+        rows: list[dict[str, Any]] = []
+        for esc in sub.get('escalations') or []:
+            task_dict = root_tasks.get(str(esc.get('task_id', '')))
+            rows.append({
+                **esc,
+                'project': sub_label,
+                'task': task_dict,
+                'task_unresolved': task_dict is None,
+            })
+
         out_subsections.append({
-            'id': sub.get('id'),
-            'label': sub.get('label'),
-            'kind': sub.get('kind'),
+            'id': sub_id,
+            'label': sub_label,
+            'kind': sub_kind,
             'summary': dict(sub.get('summary') or {}),
-            'escalations': [],  # rows added in later steps
+            'escalations': rows,
         })
     return {
         'ESCALATIONS': {
