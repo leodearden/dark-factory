@@ -1,12 +1,10 @@
-"""recon_report MCP namespace — in-process state + tool scaffold (task α).
+"""recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides five tools: start_report / add_finding / set_stat / inc_stat / complete.
+Provides nine tools: start_report / add_finding / set_stat / inc_stat / complete /
+cite_entity / cite_edge / cite_task / cite_memory.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
-
-cite_entity / cite_edge / cite_task / cite_memory are explicitly out of scope
-for task α — see task β.
 """
 
 from __future__ import annotations
@@ -14,10 +12,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+from graphiti_core.errors import EdgeNotFoundError
+
+from fused_memory.services.memory_service import MemoryNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +99,60 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# cite_* error helpers (task β)
+# ---------------------------------------------------------------------------
+
+# Compiled UUID shape gate: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+# re.IGNORECASE: Graphiti/Neo4j and mem0 do not normalise UUID case on read-back,
+# and Python's stdlib uuid.UUID accepts mixed case — rejecting uppercase here would
+# mask real edges/memories as malformed before the service is even called.
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+
+_ERR_FINDING_UNKNOWN: dict[str, str] = {
+    'error': 'finding_unknown',
+    'error_type': 'ReconReportFindingUnknown',
+}
+
+_ERR_ENTITY_NOT_FOUND: dict[str, str] = {
+    'error': 'entity_not_found',
+    'error_type': 'ReconReportEntityNotFound',
+}
+
+_ERR_EDGE_NOT_FOUND: dict[str, str] = {
+    'error': 'edge_not_found',
+    'error_type': 'ReconReportEdgeNotFound',
+}
+
+_ERR_TASK_NOT_FOUND: dict[str, str] = {
+    'error': 'task_not_found',
+    'error_type': 'ReconReportTaskNotFound',
+}
+
+_ERR_UNKNOWN_PROJECT: dict[str, str] = {
+    'error': 'unknown_project',
+    'error_type': 'ReconReportUnknownProject',
+}
+
+_ERR_MEMORY_NOT_FOUND: dict[str, str] = {
+    'error': 'memory_not_found',
+    'error_type': 'ReconReportMemoryNotFound',
+}
+
+_ERR_INVALID_UUID_SHAPE: dict[str, str] = {
+    'error': 'invalid_uuid_shape',
+    'error_type': 'ReconReportInvalidUuid',
+}
+
+_ERR_SERVICE_UNAVAILABLE: dict[str, str] = {
+    'error': 'service_not_configured',
+    'error_type': 'ReconReportServiceUnavailable',
+}
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -119,6 +176,8 @@ class ReconReportState:
         ttl_seconds: float,
         clock: Callable[[], float] | None = None,
         reaper_interval: float = 60.0,
+        memory_service: Any = None,
+        task_interceptor: Any = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -126,6 +185,10 @@ class ReconReportState:
         self._state: dict[tuple[str, str], _ReportEntry] = {}
         self._active: dict[str, str] = {}  # run_id → current stage
         self._reaper_task: asyncio.Task | None = None
+        # cite_* service injection (task β)
+        self._memory_service = memory_service
+        self._task_interceptor = task_interceptor
+        self.known_projects: dict[str, str] = {}  # project_id → project_root
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
@@ -350,6 +413,175 @@ class ReconReportState:
             return None
         return self._state.get((run_id, stage))
 
+    def _resolve_finding(
+        self, run_id: str, finding_id: str
+    ) -> tuple[_ReportEntry, _Finding] | None:
+        """Return (entry, finding) or None if either run_id or finding_id is unknown."""
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return None
+        for f in entry.findings:
+            if f.finding_id == finding_id:
+                return entry, f
+        return None  # finding_id not in this run
+
+    # ------------------------------------------------------------------
+    # cite_* tools (task β)
+    # ------------------------------------------------------------------
+
+    async def cite_entity(
+        self,
+        run_id: str,
+        finding_id: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Resolve *name* to a Graphiti entity and record the citation.
+
+        Returns {entity_uuid, canonical_name} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / entity_not_found).
+        Appends to finding.cited_entities only on success — never on error.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        result = await self._memory_service.get_entity(name, entry.project_id)
+        nodes = result.get('nodes', [])
+        if not nodes:
+            return _ERR_ENTITY_NOT_FOUND.copy()
+
+        node = nodes[0]
+        citation = {'entity_uuid': node['uuid'], 'canonical_name': node['name']}
+        finding.cited_entities.append(citation)
+        return citation
+
+    async def cite_edge(
+        self,
+        run_id: str,
+        finding_id: str,
+        edge_uuid: str,
+    ) -> dict[str, Any]:
+        """Validate *edge_uuid* shape, fetch the edge, and record the citation.
+
+        Returns {edge_uuid, fact_text_snapshot} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / invalid_uuid_shape /
+        edge_not_found).  UUID shape is checked before any service call.
+        Appends to finding.cited_edges only on success.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if not _UUID_RE.match(edge_uuid):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        try:
+            result = await self._memory_service.get_edge(edge_uuid, entry.project_id)
+        except EdgeNotFoundError:
+            return _ERR_EDGE_NOT_FOUND.copy()
+
+        citation = {'edge_uuid': edge_uuid, 'fact_text_snapshot': result['fact']}
+        finding.cited_edges.append(citation)
+        return citation
+
+    async def cite_task(
+        self,
+        run_id: str,
+        finding_id: str,
+        project_id: str,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Look up *task_id* in *project_id* and record the citation.
+
+        Returns {project_id, task_id, title} on success, or a structured error
+        dict (run_id_unknown / finding_unknown / unknown_project / task_not_found).
+        project_id is validated against self.known_projects before any service call.
+        Appends to finding.cited_tasks only on success.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if project_id not in self.known_projects:
+            return _ERR_UNKNOWN_PROJECT.copy()
+
+        if self._task_interceptor is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        project_root = self.known_projects[project_id]
+        result = await self._task_interceptor.get_task(task_id, project_root)
+
+        if not result or 'error' in result:
+            return _ERR_TASK_NOT_FOUND.copy()
+
+        # Guard against data=None (some get_task paths return data: null explicitly)
+        data = result.get('data') if isinstance(result.get('data'), dict) else {}
+        title = result.get('title') or data.get('title', '')
+        citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
+        finding.cited_tasks.append(citation)
+        return citation
+
+    async def cite_memory(
+        self,
+        run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: str,
+    ) -> dict[str, Any]:
+        """Validate *memory_id* shape, fetch fingerprint, and record the citation.
+
+        Returns {memory_id, store, metadata_fingerprint} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / invalid_uuid_shape /
+        memory_not_found).  UUID shape is checked before any service call.
+        Appends to finding.cited_memories only on success.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if not _UUID_RE.match(memory_id):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        try:
+            fingerprint = await self._memory_service.get_memory(
+                memory_id, store, entry.project_id
+            )
+        except (EdgeNotFoundError, MemoryNotFoundError):
+            return _ERR_MEMORY_NOT_FOUND.copy()
+
+        citation = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}
+        finding.cited_memories.append(citation)
+        return citation
+
     # ------------------------------------------------------------------
     # Reaper
     # ------------------------------------------------------------------
@@ -406,13 +638,20 @@ RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
-Tools: start_report, add_finding, set_stat, inc_stat, complete.
+Tools: start_report, add_finding, set_stat, inc_stat, complete,
+       cite_entity, cite_edge, cite_task, cite_memory.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
 2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type).
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
+
+Citation tools (call after add_finding, before or after complete):
+5. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
+6. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
+7. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
+8. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
 """
 
 
@@ -493,5 +732,66 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         summary appends a warning but does NOT overwrite the original.
         """
         return state.complete(run_id=run_id, summary=summary)
+
+    @mcp.tool()
+    async def cite_entity(run_id: str, finding_id: str, name: str) -> dict:
+        """Resolve a Graphiti entity by name and attach it to a finding.
+
+        PRD §9.2 (task β) — cite_entity(run_id, finding_id, name).
+        Returns {entity_uuid, canonical_name} or a structured error dict.
+        entity_not_found when the name resolves to no nodes.
+        """
+        return await state.cite_entity(run_id=run_id, finding_id=finding_id, name=name)
+
+    @mcp.tool()
+    async def cite_edge(run_id: str, finding_id: str, edge_uuid: str) -> dict:
+        """Validate an edge UUID shape and attach the edge fact to a finding.
+
+        PRD §9.2 (task β) — cite_edge(run_id, finding_id, edge_uuid).
+        Returns {edge_uuid, fact_text_snapshot} or a structured error dict.
+        invalid_uuid_shape when edge_uuid doesn't match the canonical UUID regex.
+        edge_not_found when the UUID is valid but not in the graph.
+        """
+        return await state.cite_edge(
+            run_id=run_id, finding_id=finding_id, edge_uuid=edge_uuid
+        )
+
+    @mcp.tool()
+    async def cite_task(
+        run_id: str, finding_id: str, project_id: str, task_id: str
+    ) -> dict:
+        """Look up a task and attach it to a finding.
+
+        PRD §9.2 (task β) — cite_task(run_id, finding_id, project_id, task_id).
+        Both project_id and task_id are required; omitting either raises a
+        validation error (PRD D4 / P4 boundary guard).
+        Returns {project_id, task_id, title} or a structured error dict.
+        unknown_project when project_id is not in the known_projects registry.
+        task_not_found when the task does not exist in the project.
+        """
+        return await state.cite_task(
+            run_id=run_id,
+            finding_id=finding_id,
+            project_id=project_id,
+            task_id=task_id,
+        )
+
+    @mcp.tool()
+    async def cite_memory(
+        run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: Literal['graphiti', 'mem0'],
+    ) -> dict:
+        """Validate a memory UUID shape and attach the memory fingerprint to a finding.
+
+        PRD §9.2 (task β) — cite_memory(run_id, finding_id, memory_id, store).
+        Returns {memory_id, metadata_fingerprint} or a structured error dict.
+        invalid_uuid_shape when memory_id doesn't match the canonical UUID regex.
+        memory_not_found when the UUID is valid but the memory doesn't exist.
+        """
+        return await state.cite_memory(
+            run_id=run_id, finding_id=finding_id, memory_id=memory_id, store=store
+        )
 
     return mcp
