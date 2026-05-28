@@ -48,7 +48,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.reconciliation.task_filter import COUNT_SNAPSHOT_RE, is_count_snapshot  # noqa: F401
+from fused_memory.reconciliation.task_filter import (  # noqa: F401
+    COUNT_SNAPSHOT_RE,
+    is_count_snapshot,
+)
 
 logger = logging.getLogger('cleanup_count_snapshots')
 
@@ -503,10 +506,10 @@ async def run(
     generated_at = datetime.now(UTC).isoformat()
 
     if known_projects_map is None:
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
         from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
+        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
         cfg = _FMC()
-        known_projects_map = build_known_projects_map(cfg.taskmaster.project_root)
+        known_projects_map = build_known_projects_map(cfg.taskmaster.project_root if cfg.taskmaster else '')
 
     try:
         project_ids = select_projects(known_projects_map, getattr(args, 'project_id', None))
