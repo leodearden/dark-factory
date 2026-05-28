@@ -200,6 +200,44 @@ This rule applies to all task-operation counters: do not increment any task-succ
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
 
+## Knowledge-Deletion Absence Pre-Check
+Before deleting ANY knowledge edge or Mem0 entry that is attributed to a task being \
+absent, phantom, or non-existent (e.g. flagged as `task_absent`, `phantom_task`, or \
+`orphaned_knowledge`), you MUST verify the task's existence with a live lookup:
+
+1. Call `mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to \
+   read the live task record from Taskmaster.
+2. **Only delete the knowledge if the response positively confirms absence** — i.e., \
+   the response contains an `error` field (or `error_type`) that conveys "No tasks found \
+   for ID(s)" or equivalent not-found signal.
+3. If the task EXISTS (response is a valid task record), do NOT delete. Instead, \
+   invalidate stale knowledge via `mcp__fused-memory__update_edge(edge_uuid=..., \
+   invalid_at=now)` or emit a new flag for the next cycle — the task is real and its \
+   knowledge edges must be preserved.
+4. If the response is INCONCLUSIVE (contains an `error` field that is NOT a not-found \
+   signal, e.g. timeout, backend error, or any other error), do NOT delete — treat as \
+   "task may still exist" and skip the deletion. Flag for re-evaluation in the next cycle.
+
+**Fail-closed semantics**: absence must be POSITIVELY confirmed. Present OR inconclusive \
+→ preserve knowledge, do not delete.
+
+This check is the Stage 2 complement to the Stage 1 code-side gate \
+(`filter_false_absence_flags`), which drops `task_absent` flags from Stage 1's output \
+when `get_task` returns present or inconclusive. Because the code gate operates on flags \
+before they reach this stage, any `task_absent` flag you receive has already been \
+pre-validated by `get_task`. Nevertheless, you MUST perform this independent pre-check \
+before issuing `delete_memory` — this provides defence-in-depth against: \
+(a) the code gate being bypassed by a direct flag injection, \
+(b) the task's status changing between Stage 1 and Stage 2, and \
+(c) `orphaned_knowledge`/`phantom_task` flags not passing through the code gate.
+
+**`mcp__fused-memory__get_task` is a permitted read-only verification call — it does \
+not modify task state and does not violate the Stage 1 / Stage 2 separation.**
+
+Skipping this check risks issuing irreversible `delete_memory` operations against \
+knowledge for real tasks — the original incident (task 1516) permanently lost edge \
+a744f5db for the real task 3438 via this exact failure mode.
+
 ## Briefing-Refresh Tasks
 Tasks titled "Refresh briefing: remove task <N> from known_gaps" may appear in the \
 task tree. These are queued automatically by the reconciliation harness (not by an \

@@ -14,6 +14,7 @@ intent without regressions. (ref: task 455)
 from __future__ import annotations
 
 import heapq
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,6 +98,13 @@ class FilteredTaskTree:
     contain only ``dict`` elements.  ``filter_task_tree`` enforces this via
     ``isinstance`` checks; direct constructors (e.g. in tests) must honour the
     same invariant — downstream consumers omit per-element type guards.
+
+    max_task_id: Comprehensive (uncapped) maximum top-level task id across the
+        FULL flattened input, computed via the id_key first-dot-segment-to-int
+        rule.  Dotted subtask ids (e.g. '4044.2') contribute their parent int
+        (4044).  Defaults to 0 when the input is empty or contains no parseable
+        ids.  This field is independent of the done/cancelled/active render caps
+        and provides ground truth for detecting partial/wrong-source bulk reads.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -111,6 +119,7 @@ class FilteredTaskTree:
     cancelled_count: int = 0
     other_count: int = 0
     total_count: int = 0
+    max_task_id: int = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +264,13 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     ]
 
     total = len(active) + done_count + cancelled_count + other_count
+
+    # Compute comprehensive max task id over the FULL flattened list (not the
+    # capped done_retained / cancelled_retained slices).  Dotted subtask ids
+    # contribute their parent int via id_key's first-dot-segment rule.
+    # Defaults to 0 when all_tasks is empty or every id_key returns 0.
+    max_task_id = max((id_key(t) for t in all_tasks), default=0)
+
     return FilteredTaskTree(
         active_tasks=active,
         done_tasks=done_retained,
@@ -263,7 +279,46 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         cancelled_count=cancelled_count,
         other_count=other_count,
         total_count=total,
+        max_task_id=max_task_id,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Census-inconsistency helper
+# --------------------------------------------------------------------------- #
+
+
+def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
+    """Return referenced task ids that strictly exceed the census maximum.
+
+    Surfaces the 'highest-ID below known task IDs' inconsistency signature
+    produced by a partial or wrong-source bulk task read: when an event or flag
+    references a task id higher than the FilteredTaskTree's max_task_id, the
+    bulk read did not cover that id — it may have been truncated or pointed at
+    a different project_root.
+
+    Args:
+        max_task_id: The authoritative maximum task id from FilteredTaskTree
+            (computed over the full flattened input, not the capped lists).
+        referenced_ids: Iterable of candidate ids to check.  Each entry is
+            parsed using the id_key first-dot-segment-to-int rule:
+            integers are used directly; strings are split on '.' and the first
+            segment is coerced to int; unparseable entries are silently ignored.
+
+    Returns:
+        Sorted, deduplicated list of ints that strictly exceed max_task_id.
+        Returns [] when referenced_ids is empty or no entry exceeds max_task_id.
+    """
+    exceeding: set[int] = set()
+    for ref in referenced_ids:
+        try:
+            ref_str = str(ref)
+            val = int(ref_str.split('.')[0])
+        except (TypeError, ValueError, AttributeError):
+            continue  # silently ignore unparseable entries
+        if val > max_task_id:
+            exceeding.add(val)
+    return sorted(exceeding)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +376,10 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
     cheaply (varying only 'shown') without re-running the cancelled-section /
     summary-line logic inside _build_surrounding.
 
+    Includes an authoritative 'highest task id: N' token derived from
+    tree.max_task_id so the LLM receives ground truth instead of inferring
+    the maximum from the (possibly capped or wrong-source) rendered body.
+
     Args:
         shown: Number of active tasks actually rendered in the body.
         omitted_active: Count of tasks omitted by the max_tasks cap only (not
@@ -332,7 +391,8 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
-        f'{tree.other_count} other, {tree.total_count} total)\n'
+        f'{tree.other_count} other, {tree.total_count} total, '
+        f'highest task id: {tree.max_task_id})\n'
     )
 
 

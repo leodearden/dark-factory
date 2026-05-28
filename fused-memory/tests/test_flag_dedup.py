@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.flag_dedup import _marker_query, build_suppression_payload
 
@@ -4322,5 +4323,314 @@ class TestWriteAndConfirmMarker:
         assert '42' in warning_msgs[0]
         assert 'missing_deliverable' in warning_msgs[0]
         assert 'failed to write marker' in warning_msgs[0]
+
+
+# ---------------------------------------------------------------------------
+# Step 7: confirm_task_absent fail-closed classifier (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmTaskAbsent:
+    """RED tests for confirm_task_absent(get_task_result) (step-7).
+
+    confirm_task_absent is fail-closed: returns True ONLY when the result
+    positively confirms the task does not exist (not-found error dict).
+    Any present, inconclusive, or non-dict result returns False.
+    """
+
+    def test_true_for_not_found_error_dict(self):
+        """Returns True when get_task returns the canonical not-found error dict.
+
+        The sqlite backend raises TaskmasterError('TASKMASTER_TOOL_ERROR',
+        'No tasks found for ID(s): N') on missing tasks; the server surfaces it
+        as {'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): N',
+            'error_type': 'TaskmasterError'}.
+        """
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3438',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(not_found) is True, (
+            'confirm_task_absent must return True for canonical not-found error dict'
+        )
+
+    def test_true_for_not_found_lowercase_variant(self):
+        """Returns True for case-insensitive variant of not-found message."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: no tasks found for id(s): 42',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(not_found) is True, (
+            'confirm_task_absent must return True for case-insensitive not-found message'
+        )
+
+    def test_false_for_present_task_dict(self):
+        """Returns False when get_task returns a valid task record (task is present)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        task_record = {
+            'id': '3438',
+            'title': 'Some real task',
+            'status': 'in-progress',
+            'dependencies': [],
+        }
+        assert confirm_task_absent(task_record) is False, (
+            'confirm_task_absent must return False when task record is present'
+        )
+
+    def test_false_for_generic_error_dict(self):
+        """Returns False for a generic/inconclusive error dict (e.g. timeout, backend error)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        timeout_error = {
+            'error': 'Connection timeout reaching Taskmaster backend',
+            'error_type': 'TimeoutError',
+        }
+        assert confirm_task_absent(timeout_error) is False, (
+            'confirm_task_absent must return False for inconclusive errors (fail-closed)'
+        )
+
+        backend_error = {
+            'error': 'TASKMASTER_UNAVAILABLE: backend not reachable',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(backend_error) is False, (
+            'confirm_task_absent must return False for TASKMASTER_UNAVAILABLE (inconclusive)'
+        )
+
+    def test_false_for_none(self):
+        """Returns False for None input (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        assert confirm_task_absent(None) is False, (
+            'confirm_task_absent must return False for None (fail-closed)'
+        )
+
+    def test_false_for_empty_dict(self):
+        """Returns False for empty dict (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        assert confirm_task_absent({}) is False, (
+            'confirm_task_absent must return False for empty dict (fail-closed)'
+        )
+
+    def test_false_for_non_dict_inputs(self):
+        """Returns False for non-dict inputs (str, int, list) — fail-closed."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        for bad in ['no tasks found for id(s)', 42, [], True]:
+            assert confirm_task_absent(bad) is False, (
+                f'confirm_task_absent must return False for non-dict {bad!r} (fail-closed)'
+            )
+
+
+# ---------------------------------------------------------------------------
+# Step 9: filter_false_absence_flags (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterFalseAbsenceFlags:
+    """RED tests for async filter_false_absence_flags(taskmaster, project_root, flags) (step-9).
+
+    Keeps an absence-type flag ONLY when get_task POSITIVELY confirms absence.
+    All other cases (present, inconclusive, error, no task_id) use fail-closed semantics.
+    """
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_for_present_task_is_dropped(self):
+        """Absence flag whose task is PRESENT (get_task returns a record) is DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '3438', 'title': 'Real task', 'status': 'in-progress',
+        })
+        project_root = '/proj'
+
+        flags = [{'task_id': '3438', 'flag_type': 'task_absent', 'description': 'looks absent'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag for a present task must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_for_confirmed_absent_task_is_kept(self):
+        """Absence flag whose task is confirmed ABSENT is KEPT.
+
+        The REAL backend (sqlite_task_backend.py:497-499) RAISES TaskmasterError
+        with 'No tasks found for ID(s): N' on absence — it does NOT return a dict.
+        Only the MCP server wrapper (server/tools.py:1827-1829) converts that
+        exception to the {error, error_type} dict.  The production self.taskmaster
+        is the RAW TaskBackendProtocol, so filter_false_absence_flags must KEEP the
+        flag when the raised exception's str() contains the not-found phrase.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '9999', 'flag_type': 'task_absent', 'description': 'ghost task'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'Absence flag for a confirmed-absent task must be kept when '
+            'get_task raises the not-found TaskmasterError (real backend behavior). '
+            'RED: current impl treats ALL raises as inconclusive and drops the flag.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_with_inconclusive_lookup_is_dropped(self):
+        """Absence flag whose lookup is INCONCLUSIVE (generic error) is DROPPED (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={
+            'error': 'Connection timeout', 'error_type': 'TimeoutError',
+        })
+        project_root = '/proj'
+
+        flags = [{'task_id': '42', 'flag_type': 'phantom_task', 'description': 'maybe phantom'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag with inconclusive lookup must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_when_get_task_raises_is_dropped(self):
+        """Absence flag whose get_task raises a GENERIC exception is DROPPED (fail-closed).
+
+        RuntimeError('backend down') does NOT contain 'No tasks found for ID(s)',
+        so after normalizing to {error: str(exc), error_type: ...}, confirm_task_absent
+        returns False → flag is dropped.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('backend down'))
+        project_root = '/proj'
+
+        flags = [{'task_id': '100', 'flag_type': 'orphaned_knowledge', 'description': 'orphan?'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == [], (
+            'Absence flag when get_task raises a generic exception must be dropped (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_when_get_task_raises_not_found_is_kept(self):
+        """Absence flag whose get_task RAISES the not-found TaskmasterError is KEPT.
+
+        This pins the fix for the production path: self.taskmaster is the RAW
+        TaskBackendProtocol whose get_task RAISES TaskmasterError(
+        'TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): N') on absence
+        (sqlite_task_backend.py:497-499) rather than returning an {error} dict.
+
+        The fix normalizes the exception as {error: str(exc), error_type: typename}
+        and passes it to confirm_task_absent, which detects the not-found phrase and
+        returns True → the flag is KEPT (task positively absent).
+
+        RED against the current impl, which unconditionally drops every raise as
+        inconclusive, making the KEEP path dead code in production.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            side_effect=TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
+        )
+        project_root = '/proj'
+
+        flags = [{'task_id': '9999', 'flag_type': 'task_absent', 'description': 'confirmed absent'}]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert result == flags, (
+            'Absence flag must be KEPT when get_task raises the not-found TaskmasterError '
+            '(real sqlite backend behavior). '
+            'RED: current impl treats ALL raises as inconclusive and drops this flag.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_absence_flag_is_kept_regardless_of_existence(self):
+        """Non-absence flag is KEPT untouched regardless of get_task result."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        # get_task should NOT be called for non-absence flags
+        taskmaster.get_task = AsyncMock(return_value={'id': '7', 'status': 'pending'})
+        project_root = '/proj'
+
+        non_absence_flag = {'task_id': '7', 'flag_type': 'missing_deliverable', 'description': 'no output'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [non_absence_flag])
+
+        assert result == [non_absence_flag], (
+            'Non-absence flag must pass through unchanged'
+        )
+        # get_task must NOT be called for non-absence flags
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absence_flag_without_task_id_is_kept_unchanged(self):
+        """Absence flag missing task_id is KEPT unchanged (no task to evaluate)."""
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock()
+        project_root = '/proj'
+
+        no_id_flag = {'flag_type': 'task_absent', 'description': 'no task_id set'}
+        result = await filter_false_absence_flags(taskmaster, project_root, [no_id_flag])
+
+        assert result == [no_id_flag], (
+            'Absence flag without task_id must be kept (cannot evaluate absence)'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_flags_processed_correctly(self):
+        """Mixed list: absence-present dropped, absence-absent kept, non-absence kept.
+
+        The id-200 leg now RAISES the not-found TaskmasterError (real backend behavior)
+        instead of returning an {error} dict (MCP wrapper behavior).
+        filter_false_absence_flags must normalise the raised exception to the same dict
+        shape confirm_task_absent uses, so the absent-task flag is kept.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_false_absence_flags
+
+        project_root = '/proj'
+
+        present_response = {'id': '100', 'title': 'Real', 'status': 'pending'}
+
+        async def _mock_get_task(task_id, project_root, **_kw):
+            if str(task_id) == '100':
+                return present_response
+            if str(task_id) == '200':
+                # Real sqlite backend RAISES, not returns, on absence
+                raise TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 200')
+            return {'error': 'unexpected', 'error_type': 'RuntimeError'}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        absent_for_present = {'task_id': '100', 'flag_type': 'task_absent', 'description': 'wrong'}
+        absent_for_absent = {'task_id': '200', 'flag_type': 'phantom_task', 'description': 'ok'}
+        non_absence = {'task_id': '999', 'flag_type': 'missing_deliverable', 'description': 'x'}
+        no_id = {'flag_type': 'task_absent', 'description': 'no task_id'}
+
+        flags = [absent_for_present, absent_for_absent, non_absence, no_id]
+        result = await filter_false_absence_flags(taskmaster, project_root, flags)
+
+        assert absent_for_present not in result, 'Flag for present task must be dropped'
+        assert absent_for_absent in result, 'Flag for confirmed-absent task must be kept'
+        assert non_absence in result, 'Non-absence flag must be kept'
+        assert no_id in result, 'Absence flag without task_id must be kept'
 
 

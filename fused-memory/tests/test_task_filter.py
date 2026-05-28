@@ -8,10 +8,13 @@ from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
+    MAX_ACTIVE_TASKS_RENDERED,
     MAX_CANCELLED_TASKS_RETAINED,
+    MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
     _flatten_with_subtasks,
     _render_task_line,
+    detect_census_inconsistency,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -398,8 +401,10 @@ class TestFormatFilteredTaskTree:
         #       within budget and emitting the truncation notice.
         # The exact byte counts are intentionally not pinned here; the assertions below
         # validate the invariants directly from the rendered output.
+        # Note: max_chars was raised from 240 to 270 when the header grew by the
+        # 'highest task id: N' token (~20 chars) added in step-4 of task 1516.
         max_tasks = 5
-        max_chars = 240
+        max_chars = 270
         output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
 
         # Output must honour the char budget
@@ -2255,4 +2260,312 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
         completion_order = [1369, 1355, 1361]
         assert id_order != completion_order, (
             'done_tasks id order matches completion order — nlargest reorder path not exercised'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 1: max_task_id field (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterTaskTreeMaxTaskId:
+    """RED tests for FilteredTaskTree.max_task_id (step-1).
+
+    max_task_id must be the global maximum TOP-LEVEL task id across the FULL
+    input, independent of the active/done/cancelled render caps.
+    """
+
+    def test_max_task_id_populated_across_full_input_ignoring_render_caps(self):
+        """max_task_id equals the global max id even when done/cancelled/active lists are capped.
+
+        Build a tasks_data with:
+          - MAX_DONE_TASKS_RETAINED + 5 done tasks (ids 1..35), caps at 30
+          - MAX_CANCELLED_TASKS_RETAINED + 5 cancelled tasks (ids 36..55), caps at 15
+          - MAX_ACTIVE_TASKS_RENDERED + 5 active (pending) tasks (ids 56..110)
+          - One active task with id 4044 (the global max)
+          - One done task with a dotted subtask id '4044.2' that maps to parent 4044
+
+        Expected: result.max_task_id == 4044 even though none of these tasks
+        necessarily appear in the capped done_tasks/cancelled_tasks lists.
+        """
+        # Build done tasks: ids 1..MAX_DONE_TASKS_RETAINED+5 (capped at MAX_DONE_TASKS_RETAINED=30)
+        done_tasks = [_make_task(i, 'done') for i in range(1, MAX_DONE_TASKS_RETAINED + 6)]
+
+        # Build cancelled tasks: ids starting after done tasks
+        # (capped at MAX_CANCELLED_TASKS_RETAINED=15)
+        cancelled_start = MAX_DONE_TASKS_RETAINED + 6
+        cancelled_tasks = [
+            _make_task(cancelled_start + i, 'cancelled')
+            for i in range(MAX_CANCELLED_TASKS_RETAINED + 5)
+        ]
+
+        # Build active tasks: MAX_ACTIVE_TASKS_RENDERED + 5 = 55 active tasks
+        active_start = cancelled_start + MAX_CANCELLED_TASKS_RETAINED + 5
+        active_tasks = [
+            _make_task(active_start + i, 'pending')
+            for i in range(MAX_ACTIVE_TASKS_RENDERED + 5)
+        ]
+
+        # Add the highest-id task: id=4044 as active
+        high_id_task = _make_task(4044, 'pending', 'High ID task')
+        active_tasks.append(high_id_task)
+
+        # Add a subtask with dotted id '4044.2' as done — maps to parent 4044
+        subtask_4044_2 = {
+            'id': '4044.2',
+            'title': 'Subtask of 4044',
+            'status': 'done',
+            'dependencies': [],
+        }
+
+        all_tasks = done_tasks + cancelled_tasks + active_tasks + [subtask_4044_2]
+        tasks_data = {'tasks': all_tasks}
+
+        result = filter_task_tree(tasks_data)
+
+        # The done/cancelled lists are capped — verify caps are active
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'done_tasks should be capped at {MAX_DONE_TASKS_RETAINED}'
+        )
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'cancelled_tasks should be capped at {MAX_CANCELLED_TASKS_RETAINED}'
+        )
+
+        # max_task_id must equal 4044 — the global max across the FULL input
+        # (id 4044 is active and its subtask '4044.2' maps to parent 4044 via id_key)
+        assert result.max_task_id == 4044, (
+            f'max_task_id should be 4044 (global max), got {result.max_task_id}'
+        )
+
+    def test_max_task_id_uses_first_segment_rule_for_dotted_subtask_ids(self):
+        """max_task_id maps dotted subtask ids to their parent via the first-segment int rule.
+
+        A subtask with id='4044.2' contributes parent id 4044 to max_task_id,
+        not 2 and not a parsing error.
+        """
+        tasks_data = {
+            'tasks': [
+                _make_task(100, 'pending'),
+                {'id': '4044.2', 'title': 'Subtask', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+        assert result.max_task_id == 4044, (
+            f"Dotted id '4044.2' must map to parent 4044 via first-segment rule, "
+            f"got max_task_id={result.max_task_id}"
+        )
+
+    def test_max_task_id_zero_for_empty_input(self):
+        """filter_task_tree returns max_task_id == 0 for empty/non-dict inputs."""
+        # Empty dict (no 'tasks' key)
+        result = filter_task_tree({})
+        assert result.max_task_id == 0, (
+            f'Empty dict input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        # tasks is an empty list
+        result = filter_task_tree({'tasks': []})
+        assert result.max_task_id == 0, (
+            f'Empty tasks list: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        # Non-dict input
+        result = filter_task_tree(None)
+        assert result.max_task_id == 0, (
+            f'None input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        result = filter_task_tree('bad')
+        assert result.max_task_id == 0, (
+            f'String input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+        result = filter_task_tree([{'id': 1, 'status': 'pending'}])
+        assert result.max_task_id == 0, (
+            f'List input: expected max_task_id==0, got {result.max_task_id}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: format_filtered_task_tree header includes 'highest task id' (RED)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatHeaderHighestTaskId:
+    """RED tests for 'highest task id' token in format_filtered_task_tree header (step-3).
+
+    The header must render an authoritative 'highest task id: N' token derived
+    from tree.max_task_id, even when max_task_id does NOT appear in any rendered
+    active task line (e.g. because it belongs to a capped or done task).
+    """
+
+    def test_header_includes_highest_task_id_token(self):
+        """format_filtered_task_tree header includes 'highest task id: N' from tree.max_task_id.
+
+        Build a tree where max_task_id=4044 but only small-id active tasks are
+        present (id=1..3), so 4044 never appears as a rendered task line.
+        Assert the header contains 'highest task id: 4044'.
+        """
+        active = [_make_task(i, 'pending') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=100,
+            cancelled_count=10,
+            other_count=0,
+            total_count=113,
+            max_task_id=4044,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 4044' in output, (
+            f'Header must contain "highest task id: 4044" (from tree.max_task_id=4044). '
+            f'Got:\n{output!r}'
+        )
+
+    def test_header_highest_task_id_equals_max_task_id_not_max_rendered(self):
+        """Rendered highest task id equals tree.max_task_id, not the max id among rendered lines.
+
+        Set max_task_id=4044 but the ONLY rendered active task has id=10.
+        The header must show 'highest task id: 4044', not 'highest task id: 10'.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(10, 'pending')],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+            max_task_id=4044,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 4044' in output, (
+            f'Expected "highest task id: 4044" (from max_task_id), not the rendered max id. '
+            f'Got:\n{output!r}'
+        )
+        assert 'highest task id: 10' not in output, (
+            f'Header must not show the rendered max id (10) as highest task id. '
+            f'Got:\n{output!r}'
+        )
+
+    def test_header_highest_task_id_zero_when_max_task_id_zero(self):
+        """When tree.max_task_id=0 (empty input), header shows 'highest task id: 0'."""
+        tree = FilteredTaskTree(
+            active_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=0,
+            max_task_id=0,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 0' in output, (
+            f'Expected "highest task id: 0" for empty tree. Got:\n{output!r}'
+        )
+
+    def test_existing_header_count_fields_still_present(self):
+        """Existing count fields (active shown, done, cancelled, total) are preserved alongside highest task id."""
+        active = [_make_task(i, 'pending') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=7,
+            cancelled_count=2,
+            other_count=1,
+            total_count=13,
+            max_task_id=500,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Existing fields must still be present
+        assert '3 active shown' in output, (
+            f'Expected "3 active shown" in header. Got:\n{output!r}'
+        )
+        assert '7 done' in output, f'Expected "7 done" in header. Got:\n{output!r}'
+        assert '2 cancelled' in output, f'Expected "2 cancelled" in header. Got:\n{output!r}'
+        assert '13 total' in output, f'Expected "13 total" in header. Got:\n{output!r}'
+
+        # New field must also be present
+        assert 'highest task id: 500' in output, (
+            f'Expected "highest task id: 500" in header. Got:\n{output!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 5: detect_census_inconsistency (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectCensusInconsistency:
+    """RED tests for detect_census_inconsistency(max_task_id, referenced_ids) (step-5).
+
+    Returns sorted, deduplicated list of ids that STRICTLY exceed max_task_id.
+    """
+
+    def test_returns_ids_exceeding_max_task_id(self):
+        """detect_census_inconsistency returns sorted list of ids strictly > max_task_id.
+
+        With max_task_id=1515 and referenced ids [3438, '4026', '12', '4044.1', 'x']:
+        - 3438 > 1515 → included
+        - '4026' → 4026 > 1515 → included
+        - '12' → 12 ≤ 1515 → excluded
+        - '4044.1' → first-segment 4044 > 1515 → included
+        - 'x' → unparseable → silently ignored
+
+        Expected: [3438, 4026, 4044] (sorted ascending, deduplicated)
+        """
+        result = detect_census_inconsistency(1515, [3438, '4026', '12', '4044.1', 'x'])
+        assert result == [3438, 4026, 4044], (
+            f'Expected [3438, 4026, 4044], got {result}'
+        )
+
+    def test_returns_empty_when_no_ids_exceed_max(self):
+        """Returns [] when all referenced ids are <= max_task_id."""
+        result = detect_census_inconsistency(5000, [1, 100, '2000', '5000'])
+        assert result == [], (
+            f'Expected [], got {result}'
+        )
+
+    def test_strictly_exceeds_not_equal(self):
+        """IDs equal to max_task_id are NOT returned (strictly greater)."""
+        result = detect_census_inconsistency(1515, [1515, 1516, 1514])
+        assert result == [1516], (
+            f'Expected [1516] (1515 excluded as equal, 1514 excluded as lesser), got {result}'
+        )
+
+    def test_deduplicates_repeated_ids(self):
+        """Duplicate ids in referenced_ids appear only once in the result."""
+        result = detect_census_inconsistency(100, [200, 200, 300, 200])
+        assert result == [200, 300], (
+            f'Expected [200, 300] (deduplicated), got {result}'
+        )
+
+    def test_parses_dotted_ids_via_first_segment_rule(self):
+        """Dotted subtask ids use the first dot-segment as the int value."""
+        # '4044.2' → first segment 4044; '500.1.1' → first segment 500
+        result = detect_census_inconsistency(1000, ['4044.2', '500.1.1', '999.9'])
+        # 4044 > 1000 → included; 500 ≤ 1000 → excluded; 999 ≤ 1000 → excluded
+        assert result == [4044], (
+            f'Expected [4044], got {result}'
+        )
+
+    def test_silently_ignores_unparseable_entries(self):
+        """Non-parseable entries (non-int, non-dotted-int) are silently ignored."""
+        result = detect_census_inconsistency(100, ['x', None, {}, [], 'abc', '3000'])
+        # '3000' → 3000 > 100; others → ignored
+        assert result == [3000], (
+            f'Expected [3000] (only parseable id 3000 exceeds 100), got {result}'
+        )
+
+    def test_returns_sorted_ascending(self):
+        """Result is always sorted ascending regardless of input order."""
+        result = detect_census_inconsistency(0, [300, 100, 200, 50, 1])
+        assert result == [1, 50, 100, 200, 300], (
+            f'Expected [1, 50, 100, 200, 300] (ascending), got {result}'
+        )
+
+    def test_empty_referenced_ids_returns_empty(self):
+        """Empty referenced_ids returns []."""
+        result = detect_census_inconsistency(1000, [])
+        assert result == [], (
+            f'Expected [] for empty referenced_ids, got {result}'
         )
