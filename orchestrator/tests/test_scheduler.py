@@ -5652,3 +5652,81 @@ class TestDepsSatisfiedTrainAware:
         assert result is False, (
             'stale-snapshot: β must be blocked when dep is absent from tasks_by_id'
         )
+
+
+class TestAcquireNextTrainDispatch:
+    """End-to-end: acquire_next dispatches intra-train members when predecessor is merge-deferred.
+
+    PRD § 9.3: β (pending, same train as α) must dispatch when α is merge-deferred.
+    Non-train task δ must stay blocked by merge-deferred α (extra-train).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_dispatches_train_member_when_predecessor_merge_deferred(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns β when α (same train, merge-deferred) unblocks it.
+
+        α is in status 'merge-deferred' (non-terminal but intra-train allowed).
+        β is pending with dep α and shares train_id 'T1'.
+        acquire_next must return a TaskAssignment with task_id == 'B'.
+        """
+        alpha = {
+            'id': 'A',
+            'title': 'Train alpha',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'files': ['backend'], 'train': {'id': 'T1', 'order': 0}},
+        }
+        beta = {
+            'id': 'B',
+            'title': 'Train beta',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['frontend'], 'train': {'id': 'T1', 'order': 1}},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[alpha, beta])
+
+        result = await scheduler.acquire_next()
+        assert result is not None, (
+            'Expected β to be dispatched (intra-train allowance: α is merge-deferred, same T1)'
+        )
+        assert result.task_id == 'B', (
+            f'Expected task_id == "B", got {result.task_id!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_blocks_non_train_dep_on_merge_deferred_predecessor(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns None when δ (no train metadata) depends on merge-deferred α.
+
+        α is merge-deferred with train_id T1.  δ has no train metadata — it is
+        extra-train and must not benefit from the intra-train allowance.
+        acquire_next must return None (δ is blocked).
+        """
+        alpha = {
+            'id': 'A',
+            'title': 'Train alpha',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'files': ['backend'], 'train': {'id': 'T1', 'order': 0}},
+        }
+        delta = {
+            'id': 'D',
+            'title': 'Plain delta',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['frontend']},  # no train metadata
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[alpha, delta])
+
+        result = await scheduler.acquire_next()
+        assert result is None, (
+            'Expected None — δ (no train metadata) must be blocked by merge-deferred α'
+        )
