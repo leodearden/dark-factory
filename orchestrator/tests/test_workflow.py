@@ -379,6 +379,7 @@ class TestEnterMergeDeferred:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.task['metadata'] = {'train': {'id': 'T1', 'order': 1, 'members': ['a', '1523']}}
         wf.scheduler.set_task_status = AsyncMock()
+        wf.scheduler.clear_requeue_count = MagicMock()
 
         result = await wf._enter_merge_deferred()
 

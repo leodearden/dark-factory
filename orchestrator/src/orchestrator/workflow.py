@@ -120,6 +120,7 @@ class _SchedulerLike(Protocol):
     async def get_statuses(
         self, ids: list[str] | None = ...,
     ) -> tuple[dict[str, str], Exception | None]: ...
+    def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
 class _McpLike(Protocol):
