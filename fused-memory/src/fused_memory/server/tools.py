@@ -24,9 +24,9 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
