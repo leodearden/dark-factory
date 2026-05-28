@@ -4299,7 +4299,7 @@ class TestRoleThreading:
         captured_envs: list[dict[str, str]] = []
 
         async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None):
-            assert env is not None, f'_run_cmd called with env=None; expected DF_VERIFY_ROLE to be set'
+            assert env is not None, '_run_cmd called with env=None; expected DF_VERIFY_ROLE to be set'
             captured_envs.append(env)
             return 0, '', False
 
