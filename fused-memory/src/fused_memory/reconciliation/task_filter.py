@@ -97,6 +97,13 @@ class FilteredTaskTree:
     contain only ``dict`` elements.  ``filter_task_tree`` enforces this via
     ``isinstance`` checks; direct constructors (e.g. in tests) must honour the
     same invariant — downstream consumers omit per-element type guards.
+
+    max_task_id: Comprehensive (uncapped) maximum top-level task id across the
+        FULL flattened input, computed via the id_key first-dot-segment-to-int
+        rule.  Dotted subtask ids (e.g. '4044.2') contribute their parent int
+        (4044).  Defaults to 0 when the input is empty or contains no parseable
+        ids.  This field is independent of the done/cancelled/active render caps
+        and provides ground truth for detecting partial/wrong-source bulk reads.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -111,6 +118,7 @@ class FilteredTaskTree:
     cancelled_count: int = 0
     other_count: int = 0
     total_count: int = 0
+    max_task_id: int = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +263,13 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     ]
 
     total = len(active) + done_count + cancelled_count + other_count
+
+    # Compute comprehensive max task id over the FULL flattened list (not the
+    # capped done_retained / cancelled_retained slices).  Dotted subtask ids
+    # contribute their parent int via id_key's first-dot-segment rule.
+    # Defaults to 0 when all_tasks is empty or every id_key returns 0.
+    max_task_id = max((id_key(t) for t in all_tasks), default=0)
+
     return FilteredTaskTree(
         active_tasks=active,
         done_tasks=done_retained,
@@ -263,6 +278,7 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         cancelled_count=cancelled_count,
         other_count=other_count,
         total_count=total,
+        max_task_id=max_task_id,
     )
 
 
