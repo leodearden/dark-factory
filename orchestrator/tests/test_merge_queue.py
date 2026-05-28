@@ -1701,6 +1701,46 @@ class TestSpeculativeMergeWorker:
             f'merge-queue verify must pass max_retries=0; got {captured_kwargs[0]!r}'
         )
 
+    async def test_speculative_verify_called_with_role_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Merge-queue post-merge verify must pass role='merge' to run_scoped_verification.
+
+        DF_VERIFY_ROLE=merge is injected so reify's verify.sh can apply
+        the merge-role priority prefix (nice -n 5) for OCCT throttling.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'rolem', 'rolem.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_verify(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            result = AsyncMock()
+            result.passed = True
+            result.summary = ''
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=spy_verify,
+        ):
+            req = _make_request('rolem', 'rolem', wt, config)
+            await queue.put(req)
+            await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        await worker_task
+
+        assert captured_kwargs, 'run_scoped_verification was not invoked'
+        assert captured_kwargs[0].get('role') == 'merge', (
+            f"merge-queue verify must pass role='merge'; got {captured_kwargs[0]!r}"
+        )
+
     async def test_speculative_shutdown_drains_both(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -6223,4 +6263,61 @@ class TestGroupMergeRequestPartialMemberFlipFailure:
         )
         assert 'trn-b' in outcome.reason, (
             f'expected offending member task_id (trn-b) in reason, got: {outcome.reason!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestTrainVerifyRole — train-merge callsite role injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestTrainVerifyRole:
+    """_do_train_merge must pass role='merge' to run_scoped_verification.
+
+    _do_train_merge (merge_queue.py:717) is the shared train-merge pipeline
+    reached from both the deprecated MergeWorker._do_merge and the active
+    SpeculativeMergeWorker.  Its post-merge verify (line ~811) sets
+    is_merge_verify=True; under the invariant "every merge-queue verify
+    carries role='merge'" it must also pass role='merge' so reify's
+    verify.sh applies the merge-role priority prefix (nice -n 5).
+    """
+
+    async def test_train_merge_verify_called_with_role_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Train-merge post-merge verify must pass role='merge'.
+
+        Drive a GroupMergeRequest through MergeWorker._do_merge (which
+        dispatches to _do_train_merge) and capture the kwargs passed to
+        run_scoped_verification.  Assert role='merge' is present.
+        RED: the run_scoped_verification call at merge_queue.py:811 inside
+        _do_train_merge does not pass role='merge' yet, so the captured role
+        is absent (None).
+        """
+        req = await _make_stacked_train(git_ops, config)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_verify(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            result = AsyncMock()
+            result.passed = True
+            result.summary = ''
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=spy_verify,
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert captured_kwargs, 'run_scoped_verification was not invoked'
+        assert captured_kwargs[0].get('role') == 'merge', (
+            f"train-merge verify must pass role='merge'; got {captured_kwargs[0]!r}"
         )
