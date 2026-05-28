@@ -23,16 +23,17 @@ const METRICS = [
  *  type 'bytes' → "X.X GiB" (verify_rss_total_bytes via 1024**3 = 1073741824)
  *  type 'int'   → integer (occt_queue_depth, verify_concurrency)
  */
-function formatLoadValue(key, type, v) {
+function formatLoadValue(type, v) {
   if (type === 'psi')   return `${v.toFixed(2)}%`;
   if (type === 'bytes') return `${(v / 1073741824).toFixed(1)} GiB`;
   /* type === 'int' */  return `${Math.round(v)}`;
 }
 
-function HostLoadCard() {
+function HostLoadCard({ paused }) {
   const [load, setLoad] = useState(null);
 
   useEffect(() => {
+    if (paused) return;
     let alive = true;
     async function fetchLoad() {
       try {
@@ -45,7 +46,7 @@ function HostLoadCard() {
     fetchLoad();
     const id = setInterval(fetchLoad, 5000);
     return () => { alive = false; clearInterval(id); };
-  }, []);
+  }, [paused]);
 
   return (
     <div className="panel">
@@ -62,7 +63,7 @@ function HostLoadCard() {
                 <tr key={m.key}>
                   <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{m.label}</td>
                   <td className="num mono" style={{ width: '12%', fontSize: 12 }}>
-                    {datum.current == null ? '—' : formatLoadValue(m.key, m.type, datum.current)}
+                    {datum.current == null ? '—' : formatLoadValue(m.type, datum.current)}
                   </td>
                   <td style={{ width: '58%' }}>
                     <Sparkline values={datum.sparkline} color={P.accent} />
@@ -297,7 +298,7 @@ function OverviewTab({ paused }) {
 
       {/* Row 4: Host load card */}
       <div className="col-span-12">
-        <HostLoadCard />
+        <HostLoadCard paused={paused} />
       </div>
     </div>
   );
