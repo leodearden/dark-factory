@@ -181,3 +181,37 @@ def test_burndown_returns_aggregate_and_per_project(client):
     assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
+
+
+# ---------------------------------------------------------------------------
+# Escalations endpoint
+# ---------------------------------------------------------------------------
+
+_EMPTY_SUMMARY = {
+    'by_level': {0: 0, 1: 0, 2: 0},
+    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
+}
+
+_EMPTY_QUEUES = {
+    'subsections': [],
+    'summary': _EMPTY_SUMMARY,
+}
+
+
+def test_escalations_endpoint_returns_escalations_block(client):
+    """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
+    with patch(
+        'dashboard.app.build_escalation_queues',
+        return_value=_EMPTY_QUEUES,
+    ), patch(
+        'dashboard.app.fetch_tasks',
+        new=AsyncMock(return_value=[]),
+    ):
+        resp = client.get('/api/v2/dashboard/escalations')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert 'ESCALATIONS' in body
+    esc = body['ESCALATIONS']
+    assert 'subsections' in esc
+    assert 'summary' in esc
+    assert esc['subsections'] == []
