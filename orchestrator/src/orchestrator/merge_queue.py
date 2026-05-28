@@ -1241,6 +1241,19 @@ async def _do_train_merge(
         if statuses.get(mid) != 'merge-deferred'
     ]
     if incomplete:
+        # Emit train_member_deferred for each incomplete member (retryable, NOT a derail).
+        for mid, status in incomplete:
+            deferred_reason = f"status is {status!r}, expected merge-deferred"
+            remaining = [m for m in req.member_task_ids if m != mid]
+            _emit_train_event(
+                event_store, EventType.train_member_deferred,
+                task_id=req.task_id, train_id=req.train_id,
+                data={
+                    'deferred_task_id': mid,
+                    'deferred_reason': deferred_reason,
+                    'remaining_members': remaining,
+                },
+            )
         first_id, first_status = incomplete[0]
         reason = (
             f'{TRAIN_INCOMPLETE_REASON_PREFIX}: member {first_id!r} is '
