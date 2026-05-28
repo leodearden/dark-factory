@@ -1224,6 +1224,15 @@ async def _do_train_merge(
         'member_task_ids': req.member_task_ids,
     }
 
+    # Telemetry: read base_sha at t0 (BEFORE any rebase moves main).
+    base_sha_t0 = await git_ops.get_main_sha()
+    _emit_train_event(
+        event_store, EventType.train_started,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'member_count': len(req.member_task_ids), 'base_sha': base_sha_t0},
+    )
+
     # (a) Status pre-check: all members must be 'merge-deferred'.
     statuses = await req.status_check(req.member_task_ids)
     incomplete = [
@@ -1328,6 +1337,13 @@ async def _do_train_merge(
         return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
 
     advanced_sha: str = pre_cleanup_advanced_sha or merge_commit
+
+    _emit_train_event(
+        event_store, EventType.train_merged,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'merge_commit_sha': advanced_sha, 'base_sha': main_sha},
+    )
 
     # (g) Flip all members done — ONLY after advance succeeds.
     # Each callback is wrapped in try/except so a single scheduler blip does
