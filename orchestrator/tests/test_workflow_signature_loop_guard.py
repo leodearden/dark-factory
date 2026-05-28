@@ -32,7 +32,6 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, _normalize_cause_hint
 
-
 # ---------------------------------------------------------------------------
 # Unit tests for _normalize_cause_hint
 # ---------------------------------------------------------------------------
