@@ -91,6 +91,26 @@ class ServerConfig(BaseModel):
             'Above the observed ~40-thread normal but low enough to flag a real leak quickly.'
         ),
     )
+    recon_report_port: int = Field(
+        default=8003,
+        description='Second uvicorn port for the recon_report MCP namespace (PRD §12 OQ1)',
+    )
+
+    @model_validator(mode='after')
+    def _validate_port_uniqueness(self) -> 'ServerConfig':
+        """Ensure recon_report_port and port are distinct.
+
+        If an operator misconfigures both to the same value the second uvicorn
+        server fails to bind, asyncio.gather raises at startup, and the failure
+        mode would be non-obvious.  Catching it at config-load time surfaces a
+        clear error message immediately.
+        """
+        if self.recon_report_port == self.port:
+            raise ValueError(
+                f'recon_report_port ({self.recon_report_port}) must differ from '
+                f'port ({self.port}): both uvicorn servers cannot bind to the same port.'
+            )
+        return self
 
 
 # --- LLM ---
@@ -436,6 +456,13 @@ class ReconciliationConfig(BaseModel):
 
     # Usage cap detection and multi-account failover
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
+
+    # Recon-report in-process state TTL
+    recon_report_state_ttl_seconds: int = Field(
+        default=300,
+        gt=0,
+        description='TTL after complete() before reaper sweeps the entry (PRD §9.4)',
+    )
 
 
 class TicketJanitorConfig(BaseModel):

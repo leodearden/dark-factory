@@ -215,6 +215,26 @@ async def _run_shielded(
         logger.exception('_graceful_shutdown: %s raised', name)
 
 
+def _add_json_http_error_handler(starlette_app: Any) -> None:
+    """Register a JSON error handler for HTTP exceptions on *starlette_app*.
+
+    Without this, MCP/OAuth-discovery clients crash on ``JSON.parse("Not Found")``
+    when the server returns plain-text 404s from Starlette's default handler.
+    Applied to **both** the primary and recon_report Starlette apps so both
+    endpoints guard against the same failure mode.
+
+    Must be called BEFORE wrapping the app in :class:`_ASGIExceptionShield`.
+    """
+    from starlette.exceptions import HTTPException
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import JSONResponse
+
+    async def _json_http_error(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
+        return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
+
+    starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
+
+
 class _ASGIExceptionShield:
     """ASGI middleware that contains BaseException escapes from the MCP app.
 
@@ -692,6 +712,9 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     watchdog_task: asyncio.Task[None] | None = None
+    recon_report_state: Any = None
+    server: Any | None = None  # primary uvicorn.Server
+    recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
@@ -708,14 +731,7 @@ async def run_server():
             # Return JSON (not plain-text) for 404s so that MCP SDK
             # clients attempting OAuth discovery against well-known
             # endpoints don't crash on JSON.parse("Not Found").
-            from starlette.exceptions import HTTPException
-            from starlette.requests import Request as StarletteRequest
-            from starlette.responses import JSONResponse
-
-            async def _json_http_error(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
-                return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
-
-            starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
+            _add_json_http_error_handler(starlette_app)
 
             # Outermost ASGI layer: catches any BaseException escaping the
             # MCP app before it can poison the SDK's shared task group.
@@ -730,13 +746,22 @@ async def run_server():
             )
             server = uvicorn.Server(uv_config)
 
+            # Second uvicorn: recon_report MCP namespace on port recon_report_port.
+            # Constructed BEFORE _install_operator_stop_handler so that the stop
+            # callback can reference both servers — stopping only the primary would
+            # leave asyncio.gather(server.serve(), recon_server.serve()) unresolved
+            # and hang run_server() until SIGKILL.
+            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(config)
+            recon_server = uvicorn.Server(recon_uv_config)
+            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+
             # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
             # install its own handlers. We need to differentiate operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
             server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
-                lambda: setattr(server, 'should_exit', True),
+                _make_operator_stop_callback(server, recon_server),
             )
 
             # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
@@ -748,11 +773,51 @@ async def run_server():
                     await asyncio.sleep(_WATCHDOG_INTERVAL)
 
             watchdog_task = asyncio.create_task(_watchdog_heartbeat())
+
+            await recon_report_state.start_reaper()
+            logger.info(
+                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                display_host,
+                config.server.recon_report_port,
+            )
+
             _sd_notify('READY=1')
-            await server.serve()
+            # Wrap both serve() coroutines in named tasks so that a failure in
+            # one (e.g. port-already-bound on the recon port) automatically
+            # cancels the other rather than leaving it running unmanaged.
+            # asyncio.gather() with bare coroutines wraps them in Tasks internally
+            # but does NOT cancel the sibling on first failure — the surviving
+            # Task would continue serving while the finally block runs, emitting
+            # "Task was destroyed but it is pending!" on loop teardown.
+            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
+            try:
+                await asyncio.gather(_primary_task, _recon_task)
+            except BaseException:
+                # Cancel whichever task is still running to prevent orphaned tasks.
+                _primary_task.cancel()
+                _recon_task.cancel()
+                # Await with return_exceptions=True so CancelledErrors are collected
+                # as values rather than re-raised; the outer finally handles shutdown.
+                await asyncio.gather(_primary_task, _recon_task, return_exceptions=True)
+                raise
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
+        if recon_report_state is not None:
+            with contextlib.suppress(BaseException):
+                await recon_report_state.stop_reaper()
+        # Symmetrically tear down both servers so that a failure in either
+        # (e.g. recon_server port-already-bound) doesn't leave the primary
+        # server serving while the rest of the app shuts down.
+        if server is not None:
+            server.should_exit = True
+            with contextlib.suppress(BaseException):
+                await server.shutdown()
+        if recon_server is not None:
+            recon_server.should_exit = True
+            with contextlib.suppress(BaseException):
+                await recon_server.shutdown()
         if watchdog_task is not None:
             watchdog_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1128,6 +1193,76 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
     tool_manager.call_tool = _safe_call_tool
     tool_manager._fused_memory_safe_wrapped = True
+
+
+def _build_recon_report_components(
+    config: FusedMemoryConfig,
+) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
+    """Construct the recon_report state, FastMCP server, and uvicorn.Config.
+
+    Extracted from run_server() so it can be unit-tested without starting
+    any sockets.  Only run_server() starts the reaper and calls uvicorn.Server.serve().
+
+    Returns:
+        (ReconReportState, FastMCP, uvicorn.Config)
+    """
+    import uvicorn
+
+    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+    ttl = config.reconciliation.recon_report_state_ttl_seconds
+    state = ReconReportState(ttl_seconds=ttl)
+
+    mcp = create_recon_report_server(state)
+    _install_safe_tool_wrapper(mcp)
+
+    mcp.settings.host = config.server.host
+    mcp.settings.port = config.server.recon_report_port
+    mcp.settings.stateless_http = config.server.stateless_http
+    mcp.settings.json_response = config.server.json_response
+
+    starlette_app = mcp.streamable_http_app()
+    # Apply the same JSON-404 handler as the primary server so that
+    # MCP/OAuth-discovery clients don't crash on plain-text 404s from
+    # this endpoint either (reviewer design_consistency finding).
+    _add_json_http_error_handler(starlette_app)
+    shielded_app = _ASGIExceptionShield(starlette_app)
+
+    uv_config = uvicorn.Config(
+        shielded_app,
+        host=config.server.host,
+        port=config.server.recon_report_port,
+        log_level='info',
+    )
+    return state, mcp, uv_config
+
+
+def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
+    """Return a callback that sets ``should_exit = True`` on every passed server.
+
+    Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
+    so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
+    and the recon_report uvicorn.Server simultaneously.
+
+    Without this, ``asyncio.gather(server.serve(), recon_server.serve())`` never
+    resolves on operator shutdown because only the primary server's ``should_exit``
+    flag was flipped — the recon_report server kept running, blocking the gather,
+    and ``run_server()`` hung until SIGKILL.
+
+    Args:
+        *servers: Zero or more server objects exposing a writable ``should_exit``
+            attribute (typically :class:`uvicorn.Server` instances, but any object
+            with the attribute works — including test fakes).
+
+    Returns:
+        A zero-argument callable that flips ``should_exit = True`` on each server.
+    """
+
+    def _stop() -> None:
+        for s in servers:
+            s.should_exit = True
+
+    return _stop
 
 
 def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None:
