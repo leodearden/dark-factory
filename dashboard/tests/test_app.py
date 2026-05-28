@@ -82,17 +82,17 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
     assert 'values' in body['ORCHESTRATORS_SPARK']
 
 
-def test_tasks_returns_active_tasks_and_file_locks(client):
+def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.app.collect_active_tasks',
-        new=AsyncMock(return_value=([], {}, [])),
+        new=AsyncMock(return_value=([], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'ACTIVE_TASKS', 'FILE_LOCKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS'} <= set(body)
+    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS'}
+    assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
-    assert isinstance(body['FILE_LOCKS'], dict)
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
 
@@ -101,7 +101,7 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When collect_active_tasks reports offline projects, the payload sets ``offline=True``."""
     with patch(
         'dashboard.app.collect_active_tasks',
-        new=AsyncMock(return_value=([], {}, ['dark-factory'])),
+        new=AsyncMock(return_value=([], ['dark-factory'])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200

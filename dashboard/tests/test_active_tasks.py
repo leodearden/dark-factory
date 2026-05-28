@@ -102,7 +102,8 @@ def two_project_config(tmp_path, monkeypatch):
         project_dir='dark-factory',
         tasks=[
             {'id': 19, 'title': 'consolidation retry', 'status': 'in-progress',
-             'dependencies': [15, 17]},
+             'dependencies': [15, 17],
+             'metadata': {'files': ['src/agents/consolidation.py', 'src/store/graphiti_adapter.py']}},
             {'id': 17, 'title': 'pre-filter', 'status': 'done', 'dependencies': []},
             {'id': 15, 'title': 'partitioning', 'status': 'done', 'dependencies': []},
             {'id': 23, 'title': 'collision', 'status': 'pending', 'dependencies': [21]},
@@ -144,7 +145,7 @@ def two_project_config(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_collect_active_tasks_filters_to_active_statuses(two_project_config, dummy_client):
-    active, _, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
     statuses = {t['status'] for t in active}
     assert statuses <= {'in-progress', 'blocked', 'pending'}
     # Done tasks (17, 15) should not appear.
@@ -155,7 +156,7 @@ async def test_collect_active_tasks_filters_to_active_statuses(two_project_confi
 
 @pytest.mark.asyncio
 async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config, dummy_client):
-    active, _, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
     by_id = {t['id']: t for t in active}
     t19 = by_id['dark-factory/T-19']
     assert {d['id']: d['done'] for d in t19['deps']} == {
@@ -168,15 +169,16 @@ async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_co
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_pulls_metadata_and_locks(two_project_config, dummy_client):
-    active, _, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config, dummy_client):
+    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
     t19 = next(t for t in active if t['id'] == 'dark-factory/T-19')
     assert t19['agent'] == 'claude-task-19'
     assert t19['loops'] == 2
     assert t19['attempts'] == 3
-    assert 'src/agents/consolidation.py' in t19['locks']
     # `started` is the minutes-since difference, allow a small slack vs 14.
     assert 13 <= t19['started'] <= 15
+    # meta_files is the module lock source used by the scheduler pipeline.
+    assert 'src/agents/consolidation.py' in t19['meta_files']
 
 
 @pytest.mark.asyncio
@@ -192,24 +194,13 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, _, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'description': '', 'details': '', 'status': 'pending', 'agent': None,
-        'started': 0, 'loops': 0, 'attempts': 0, 'deps': [], 'locks': [],
+        'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [],
     }]
-
-
-@pytest.mark.asyncio
-async def test_collect_active_tasks_inverts_locks_into_file_locks(two_project_config, dummy_client):
-    _, locks, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
-    df = locks['dark-factory']
-    assert df['src/agents/consolidation.py'] == {'holder': 'dark-factory/T-19'}
-    assert df['src/store/dedup.py'] == {'holder': 'dark-factory/T-21'}
-    # blocked tasks count as holders too
-    reify = locks['reify']
-    assert reify['parser/recovery.rs'] == {'holder': 'reify/T-8'}
 
 
 @pytest.mark.asyncio
@@ -223,7 +214,6 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, locks, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == []
-    assert locks == {}
     assert offline_projects == ['offline-project']

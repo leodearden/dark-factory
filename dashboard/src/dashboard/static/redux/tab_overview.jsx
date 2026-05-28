@@ -6,6 +6,8 @@ const D = window.DF_DATA;
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
 
 function OverviewTab({ paused }) {
+  const schedModules = (D.SCHEDULER && D.SCHEDULER.modules) || [];
+
   // Compute live numbers
   const orchRunning = D.ORCHESTRATORS.filter(o => o.running).length;
   const tasksTotal = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.total, 0);
@@ -117,7 +119,7 @@ function OverviewTab({ paused }) {
         <div className="panel-body flush">
           <table className="tbl">
             <thead>
-              <tr><th>Orch</th><th>Project</th><th>Current task</th><th className="num">Done</th><th className="num">⏱</th></tr>
+              <tr><th>Orch</th><th>Project</th><th>Current task</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th></tr>
             </thead>
             <tbody>
               {D.ORCHESTRATORS.map(o => (
@@ -132,6 +134,26 @@ function OverviewTab({ paused }) {
                   <td style={{ color: 'var(--fg-2)', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {o.current_task}
                   </td>
+                  <td className="num">{(() => {
+                    const projMods = schedModules.filter(m => m.project === o.project);
+                    const heldMods = projMods.filter(m => m.holder);
+                    const contendedMods = projMods.filter(m => (m.contention || 0) > 1);
+                    const held = heldMods.length;
+                    const contended = contendedMods.length;
+                    const heldTitle = [
+                      heldMods.length ? 'held:\n' + heldMods.map(m => m.path).join('\n') : 'none held',
+                      contendedMods.length ? 'contended:\n' + contendedMods.map(m => m.path).join('\n') : '',
+                    ].filter(Boolean).join('\n\n');
+                    if (held === 0 && contended === 0) {
+                      return <span style={{ color: 'var(--fg-3)' }}>—</span>;
+                    }
+                    return (
+                      <span className="mono" style={{ fontSize: 11 }} title={heldTitle}>
+                        <span className="badge warn">{held}h</span>
+                        {contended > 0 && <span className="badge bad" style={{ marginLeft: 2 }}>{contended}c</span>}
+                      </span>
+                    );
+                  })()}</td>
                   <td className="num"><span className="mono">{o.summary.done}/{o.summary.total}</span></td>
                   <td className="num" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{o.started}</td>
                 </tr>

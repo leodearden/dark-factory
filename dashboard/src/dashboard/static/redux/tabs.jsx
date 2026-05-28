@@ -111,11 +111,12 @@ function DepChip({ dep }) {
   );
 }
 
-function LockChip({ path, holder, currentTaskId }) {
+function LockChip({ path, holder, holderProject, currentTaskId, currentProject }) {
   let cls, hint;
-  const holderDisplay = window.DF_SHELL.taskId(holder);
+  const isOwn = holder && holder === currentTaskId && (holderProject || currentProject) === currentProject;
+  const holderDisplay = holder ? `T-${holder}` : null;
   if (!holder) { cls = 'lock-free'; hint = 'available'; }
-  else if (holder === currentTaskId) { cls = 'lock-mine'; hint = 'held by this task'; }
+  else if (isOwn) { cls = 'lock-mine'; hint = 'held by this task'; }
   else { cls = 'lock-taken'; hint = `held by ${holderDisplay}`; }
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
@@ -158,14 +159,21 @@ function DepsCell({ task }) {
 }
 
 function LocksCell({ task }) {
-  const fileLocks = (DF.FILE_LOCKS && DF.FILE_LOCKS[task.project]) || {};
-  const sorted = [...(task.locks || [])].sort((a, b) => {
-    const ha = fileLocks[a]?.holder, hb = fileLocks[b]?.holder;
-    const blockedA = ha && ha !== task.id ? 0 : 1;
-    const blockedB = hb && hb !== task.id ? 0 : 1;
+  const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+  const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+    ? buildSchedLockInfo(task, DF.SCHEDULER)
+    : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
+  const sorted = [...lockSet].sort((a, b) => {
+    const ma = moduleByPath.get(a), mb = moduleByPath.get(b);
+    const ha = ma && ma.holder, hb = mb && mb.holder;
+    const blockedA = ha && ha !== rawTaskId ? 0 : 1;
+    const blockedB = hb && hb !== rawTaskId ? 0 : 1;
     return blockedA - blockedB; // blocked-by-other first
   });
-  return <ChipList items={sorted} renderChip={(p) => <LockChip key={p} path={p} holder={fileLocks[p]?.holder} currentTaskId={task.id} />} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
+  return <ChipList items={sorted} renderChip={(modPath) => {
+    const m = moduleByPath.get(modPath);
+    return <LockChip key={modPath} path={modPath} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} />;
+  }} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
 }
 
 // ── Orchestrators ──

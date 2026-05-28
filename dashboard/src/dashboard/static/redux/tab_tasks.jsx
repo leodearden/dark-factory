@@ -297,22 +297,31 @@ function TaskDetail({ task, allTasks }) {
             <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
           </div>}
 
-      {task.locks && task.locks.length > 0 && (<>
-        <div className="section-lbl">File locks ({task.locks.length})</div>
-        <div className="chips column">
-          {task.locks.map(p => {
-            const fl = (DF_T.FILE_LOCKS && DF_T.FILE_LOCKS[task.project]) || {};
-            const holder = fl[p]?.holder;
-            const cls = !holder ? 'lock-free' : holder === task.id ? 'lock-mine' : 'lock-taken';
-            return (
-              <span key={p} className={`chip ${cls}`} title={p}>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p}</span>
-                {cls === 'lock-taken' && <span className="holder">⊘ {holder}</span>}
-              </span>
-            );
-          })}
-        </div>
-      </>)}
+      {(() => {
+        const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+        const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+          ? buildSchedLockInfo(task, DF_T.SCHEDULER)
+          : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
+        if (!lockSet.length) return null;
+        return (<>
+          <div className="section-lbl">Module locks ({lockSet.length})</div>
+          <div className="chips column">
+            {lockSet.map(modPath => {
+              const m = moduleByPath.get(modPath);
+              const holder = m && m.holder;
+              const holderProject = m && m.holder_project;
+              const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;
+              const cls = !holder ? 'lock-free' : isMine ? 'lock-mine' : 'lock-taken';
+              return (
+                <span key={modPath} className={`chip ${cls}`} title={modPath}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{modPath.split('/').pop()}</span>
+                  {cls === 'lock-taken' && <span className="holder">⊘ T-{holder}</span>}
+                </span>
+              );
+            })}
+          </div>
+        </>);
+      })()}
     </div>
   );
 }
