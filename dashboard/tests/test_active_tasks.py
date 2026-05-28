@@ -199,7 +199,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'description': '', 'details': '', 'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
-        'meta_files': [],
+        'meta_files': [], 'train': None,
     }]
 
 
@@ -217,3 +217,64 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
     active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == []
     assert offline_projects == ['offline-project']
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
+    tmp_path, monkeypatch, dummy_client
+):
+    """merge-deferred tasks survive the active filter and carry the `train` field.
+
+    Task 101 has metadata.train set; the output dict must have train={'id', 'order'}
+    (members[] is intentionally omitted from the projected wire shape).
+    Task 102 has no train metadata; the output dict must have train=None.
+    """
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='trainyard',
+        tasks=[
+            {
+                'id': 101,
+                'title': 'train task with metadata',
+                'status': 'merge-deferred',
+                'dependencies': [],
+                'metadata': {
+                    'train': {'id': 'demo', 'order': 0, 'members': ['T-101', 'T-102']},
+                    'files': [],
+                },
+            },
+            {
+                'id': 102,
+                'title': 'merge-deferred without train metadata',
+                'status': 'merge-deferred',
+                'dependencies': [],
+                'metadata': {'files': []},
+            },
+        ],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    cfg = DashboardConfig(project_root=root)
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    ids = {t['id'] for t in active}
+    assert 'trainyard/T-101' in ids, (
+        "merge-deferred task 101 was dropped by the active-status filter — "
+        "add 'merge-deferred' to _ACTIVE_STATUSES"
+    )
+    assert 'trainyard/T-102' in ids, (
+        "merge-deferred task 102 was dropped by the active-status filter — "
+        "add 'merge-deferred' to _ACTIVE_STATUSES"
+    )
+
+    by_id = {t['id']: t for t in active}
+    assert by_id['trainyard/T-101']['train'] == {'id': 'demo', 'order': 0}, (
+        "task 101 with train metadata should have train={'id': 'demo', 'order': 0} "
+        "(members[] is intentionally omitted from the projected wire shape)"
+    )
+    assert by_id['trainyard/T-102']['train'] is None, (
+        "task 102 without train metadata should have train=None"
+    )

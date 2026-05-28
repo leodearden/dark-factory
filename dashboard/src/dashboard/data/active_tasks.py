@@ -20,6 +20,7 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
+        'train': {'id': 'demo', 'order': 0},  # present when metadata.train is set; None otherwise
     }
 
 Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).
@@ -39,7 +40,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_tasks
 
-_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending'}
+_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
 
 
 def _project_label(root: Path) -> str:
@@ -140,6 +141,15 @@ async def _shape_one_project(
         # lock display is routed through D.SCHEDULER.{rows,modules} on the frontend.
         meta_files = list((task.get('metadata') or {}).get('files') or [])
 
+        # Projected train shape: {id, order} only — members[] and other internal
+        # fields are intentionally excluded to keep the wire contract narrow.
+        train_meta = (task.get('metadata') or {}).get('train')
+        train = (
+            {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
+            if isinstance(train_meta, dict) and train_meta.get('id')
+            else None
+        )
+
         uid = _task_uid(project, task_id)
         agent = f'claude-task-{task_id}' if wt else None
         active.append({
@@ -155,6 +165,7 @@ async def _shape_one_project(
             'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
             'deps': deps,
             'meta_files': meta_files,
+            'train': train,
         })
 
     return active, False
