@@ -242,3 +242,51 @@ class TestOpaqueTimeoutFastFail:
         # so the regex check fails too.
         assert outcome == WorkflowOutcome.BLOCKED
         assert verify_mock.await_count == config.max_verify_attempts
+
+
+def _passing_result() -> VerifyResult:
+    return VerifyResult(
+        passed=True,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='ok',
+        timed_out=False,
+    )
+
+
+@pytest.mark.asyncio
+class TestPerTaskVerifyRole:
+    """Call-site spy: _verify_debugfix_loop must pass role='task' explicitly.
+
+    Because β (task 1533) made 'task' the default, an env-only assertion would
+    pass whether or not the call site is explicit.  Only a kwarg spy goes red
+    before the workflow.py edit and green after — the true red→green guard for γ.
+    """
+
+    async def test_verify_debugfix_loop_passes_role_task(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """_verify_debugfix_loop must await run_scoped_verification with role='task'.
+
+        Fails if workflow.py:~3329 omits the role kwarg (kwargs.get('role') is None).
+        Passes once role='task' is added explicitly to that call site.
+        """
+        wt = (await git_ops.create_worktree(task_assignment.task_id)).path
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow._inter_iteration_rebase = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        verify_mock = AsyncMock(return_value=_passing_result())
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', verify_mock,
+        )
+
+        outcome = await workflow._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE, f'expected DONE, got {outcome}'
+        assert verify_mock.await_count == 1, (
+            f'expected exactly 1 verify call, got {verify_mock.await_count}'
+        )
+        assert verify_mock.call_args.kwargs.get('role') == 'task', (
+            f"expected role='task' kwarg; got call_args={verify_mock.call_args}"
+        )
