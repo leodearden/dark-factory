@@ -56,6 +56,7 @@ from dashboard.data.costs import (
 )
 from dashboard.data.db import DbPool
 from dashboard.data.escalations import build_escalation_queues
+from dashboard.data.load import get_load_metrics
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -1245,6 +1246,16 @@ async def api_burndown(request: Request) -> JSONResponse:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
     return JSONResponse(redux_api.shape_burndown(series))
+
+
+@app.get('/api/load')
+async def api_load(request: Request) -> JSONResponse:
+    """Host load metrics — latest value + 60-sample sparkline for each of the 9 known metrics."""
+    config: DashboardConfig = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.load_samples_db)
+    result = await get_load_metrics(db)
+    return JSONResponse(result)
 
 
 @app.get('/api/v2/dashboard/escalations')
