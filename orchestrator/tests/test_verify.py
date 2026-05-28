@@ -801,6 +801,22 @@ class TestIsStructuralPythonFile:
         content = 'class Foo(Protocol):\n    pass\n'
         assert _is_structural_python_file('orchestrator/src/orchestrator/iface.pyi', content) is False
 
+    def test_known_false_positive_protocol_as_type_argument(self):
+        """Protocol used as a type argument (not a base class) is a known false positive.
+
+        ``class Foo(Dict[str, Protocol]):`` — Protocol appears inside the base
+        list parens but is a type argument, not a direct base.  The cheap regex
+        cannot distinguish this from a real structural definition and returns
+        True, causing an unnecessary package-wide pyright run.
+
+        This test documents the accepted false-positive behavior: the cost is
+        one extra pyright run, which is far cheaper than silently missing a
+        real cross-file invariance break.
+        """
+        content = 'from typing import Dict, Protocol\nclass Foo(Dict[str, Protocol]):\n    pass\n'
+        # The regex matches — this IS the documented false positive, not a bug.
+        assert _is_structural_python_file('orchestrator/src/orchestrator/container.py', content) is True
+
 
 class TestScopeModuleConfigReturnsNone:
     """`scope_module_config` returns None when no task_files match the prefix.

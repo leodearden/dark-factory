@@ -99,6 +99,18 @@ def _is_structural_python_file(path: str, content: str) -> bool:
     definition widens.  Returning True causes ``scope_module_config`` to fall
     back to the full package-wide type-check command so pyright sees the
     complete picture.
+
+    Scope notes:
+    - ``.pyi`` stub files are explicitly excluded (``path.endswith('.py')``
+      check).  Stub-defined Protocols create the same cross-file invariant
+      trap, but ``.pyi`` stubs are filtered from ``scoped`` before this
+      helper is reached (see ``scope_module_config``'s ``endswith('.py')``
+      filter), so they would never be passed here in normal operation.
+    - Type-argument usage such as ``class Foo(Dict[str, Protocol]):`` is a
+      known false positive: the regex matches ``Protocol`` inside the base
+      list even when it is not a direct base.  The cost is an extra
+      package-wide pyright run — acceptable given the alternative is silently
+      missing a real invariance break.
     """
     if not path.endswith('.py'):
         return False
@@ -912,9 +924,12 @@ def scope_module_config(
     # Detect structural files (Protocol/TypedDict definitions) when we have a
     # worktree to read from.  File-scoped pyright misses cross-file invariance
     # breaks; the package-wide command is the only safe scope.
+    # Guard: skip the I/O loop entirely when there is no type-check command to
+    # widen — has_structural can only affect type_cmd, so reading files is
+    # wasted work when mc.type_check_command is None/empty.
     has_structural = False
     structural_trigger: str | None = None
-    if worktree is not None:
+    if worktree is not None and mc.type_check_command:
         for f in scoped:
             full = worktree / f
             if full.is_file():
