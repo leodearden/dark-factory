@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import pydantic_spec
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
     CuratorDecision,
     PreparedCandidate,
@@ -2003,7 +2005,7 @@ class TestCuratorWorkerBatchDrain:
         _process_add_tickets_batch call (which is only possible when batch_max >= 3).
         """
         # Config with non-int batch_max (MagicMock — mimics a mock/sentinel escaping validation)
-        mock_config = MagicMock()
+        mock_config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_config.curator.batch_max = MagicMock()  # non-int
 
         ti = TaskInterceptor(
@@ -2104,7 +2106,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         ``batch_token_threshold=1000``: first batch is [400] alone (because
         adding 700 would exceed 1000); the parked 700 plus the next 200
         form a 900-token follow-up batch."""
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.curator.batch_max = 5
         config.curator.batch_token_threshold = 1000
 
@@ -2192,7 +2194,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
     ):
         """A single ticket bigger than ``batch_token_threshold`` still
         proceeds (first ticket is always included so the queue can drain)."""
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.curator.batch_max = 5
         config.curator.batch_token_threshold = 100  # tiny
 
