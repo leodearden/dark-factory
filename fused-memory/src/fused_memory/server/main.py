@@ -307,6 +307,34 @@ def configure_uvicorn_logging():
         uv_logger.propagate = False
 
 
+def _require_http_transport_for_reconciliation(config: Any) -> None:
+    """Guard: raise if reconciliation is enabled but transport is not 'http'.
+
+    The recon-report MCP server (PRD §9 / §11 task γ) is only started under
+    the http transport.  Running reconciliation with stdio or sse transport
+    would inject recon-report server URLs into stage MCP configs that point at
+    a non-existent server, silently producing empty StageReports every cycle.
+
+    Call this at the very top of run_server's reconciliation-enabled path —
+    BEFORE ReconciliationHarness is constructed — so the failure is raised
+    before TaskInterceptor is started or any stage is built.
+
+    Raises:
+        ValueError: if config.reconciliation is set and .enabled is True and
+            config.server.transport != 'http'.
+    """
+    if (
+        config.reconciliation
+        and config.reconciliation.enabled
+        and config.server.transport != 'http'
+    ):
+        raise ValueError(
+            f"reconciliation.enabled=True requires server.transport='http' "
+            f"(got '{config.server.transport}'); the recon-report MCP server "
+            "is only started under the http transport."
+        )
+
+
 async def run_server():
     """Parse args, load config, init service, run MCP transport."""
     parser = argparse.ArgumentParser(description='Fused Memory MCP Server')
@@ -450,6 +478,9 @@ async def run_server():
     # duplicate init at the old site avoids overwriting a value set here.
     recon_report_state: Any = None
     _pre_recon_uv_config: Any = None
+    # PRD γ §11: fail loudly before harness construction if reconciliation is
+    # enabled but the transport cannot host the recon-report MCP server.
+    _require_http_transport_for_reconciliation(config)
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
