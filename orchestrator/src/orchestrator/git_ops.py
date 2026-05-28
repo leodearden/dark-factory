@@ -640,6 +640,9 @@ class GitOps:
                     'chore: save WIP before requeue rebase',
                 )
 
+                # TODO(train, β₂ follow-up): the reuse-existing-worktree path
+                # below still rebases onto main; train γ₁/γ₂ phase will address
+                # mid-verify reuse for stacked trains.
                 # Rebase onto freshened main so the worktree starts from
                 # the latest code — critical for plan revalidation, which
                 # needs the architect to see current file contents.
