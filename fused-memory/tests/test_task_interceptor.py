@@ -185,7 +185,11 @@ async def test_merge_deferred_is_non_terminal(interceptor, taskmaster):
 
     merge-deferred is NOT in TERMINAL_STATUSES = {done, cancelled}; the
     terminal-exit gate must not fire on transitions: merge-deferred → in-progress
-    and merge-deferred → blocked.
+    and merge-deferred → review.
+    The second leg uses 'review' (not 'blocked') because 'blocked' is in
+    STATUS_TRIGGERS and would spawn a fire-and-forget reconciliation task that
+    the test teardown would destroy with a warning. The terminal-exit invariant
+    is orthogonal to whether the target status fires reconciliation.
     Regression guard: will FAIL if merge-deferred is ever added to TERMINAL_STATUSES.
     """
     # Simulate a task that is currently in merge-deferred holding state.
@@ -203,10 +207,15 @@ async def test_merge_deferred_is_non_terminal(interceptor, taskmaster):
 
     taskmaster.set_task_status.reset_mock()
 
-    # merge-deferred → blocked (derail), no reopen_reason.
-    result_blocked = await interceptor.set_task_status('1', 'blocked', '/project')
-    assert 'error' not in result_blocked, (
-        f"Expected success for merge-deferred→blocked, got: {result_blocked}"
+    # merge-deferred → review (e.g. operator inspects the hold), no reopen_reason.
+    # Using 'review' rather than 'blocked' here because 'blocked' IS in STATUS_TRIGGERS;
+    # that would spawn a fire-and-forget reconciliation task, causing 'Task was destroyed
+    # but it is pending!' warnings on some runners. The invariant being locked is purely
+    # 'old_status=merge-deferred bypasses the terminal-exit gate', which is orthogonal
+    # to whether the NEW status triggers reconciliation.
+    result_review = await interceptor.set_task_status('1', 'review', '/project')
+    assert 'error' not in result_review, (
+        f"Expected success for merge-deferred→review, got: {result_review}"
     )
     taskmaster.set_task_status.assert_called()
 
