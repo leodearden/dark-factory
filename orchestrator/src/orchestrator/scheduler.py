@@ -1399,7 +1399,12 @@ class Scheduler:
             )
             return False
 
-    def _deps_satisfied(self, task: dict, status_map: dict[str, str]) -> bool:
+    def _deps_satisfied(
+        self,
+        task: dict,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+    ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
         A dep is satisfied when its status is in :data:`TERMINAL_STATUSES`
@@ -1408,6 +1413,22 @@ class Scheduler:
         dependent re-architects against current main and either finds the
         work already merged or escalates for a different reason.
 
+        **Intra-train allowance (PRD § 9.3):** when *tasks_by_id* is supplied,
+        a dep in status ``merge-deferred`` is also treated as satisfied provided
+        that BOTH the dependent (*task*) and the dep carry ``metadata.train.id``
+        AND their train IDs match.  This allows the next member of an atomic
+        train to dispatch as soon as its predecessor has been parked by the
+        merge-deferred gate, without waiting for a full ``done`` transition.
+
+        When *tasks_by_id* is ``None`` (the default), the allowance is disabled
+        and behaviour is byte-identical to today — ``merge-deferred`` blocks like
+        any other non-terminal status.  This preserves backward compatibility for
+        the existing unit tests (TestDepsSatisfied, TestDepsSatisfiedLogging) and
+        any external callers that don't pass the new parameter.
+
+        The allowance also requires the dep record to be present in *tasks_by_id*.
+        A missing dep (stale snapshot) is treated conservatively as blocking.
+
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
           - integer: ``1``
@@ -1415,21 +1436,48 @@ class Scheduler:
 
         Emits a DEBUG log when a dependency blocks dispatch, naming the dep
         ID and its current status to aid diagnosis of premature-dispatch issues.
+        Emits a separate DEBUG log when the intra-train allowance fires.
         """
         deps = task.get('dependencies', [])
         task_id = str(task.get('id', '?'))
+        # Resolve this task's train id once (None if not a train member).
+        task_train = (task.get('metadata') or {}).get('train')
+        task_train_id: str | None = (
+            task_train.get('id') if isinstance(task_train, dict) else None
+        )
         for d in deps:
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
             dep_status = status_map.get(dep_id, 'unknown')
-            if dep_status not in TERMINAL_STATUSES:
-                logger.debug(
-                    'Task %s blocked: dep %s has status %s, '
-                    'need done or cancelled',
-                    task_id,
-                    dep_id,
-                    dep_status,
-                )
-                return False
+            if dep_status in TERMINAL_STATUSES:
+                continue
+            # Intra-train allowance: merge-deferred predecessor in same train.
+            if (
+                dep_status == 'merge-deferred'
+                and task_train_id is not None
+                and tasks_by_id is not None
+            ):
+                dep_task = tasks_by_id.get(dep_id)
+                if dep_task is not None:
+                    dep_train = (dep_task.get('metadata') or {}).get('train')
+                    dep_train_id: str | None = (
+                        dep_train.get('id') if isinstance(dep_train, dict) else None
+                    )
+                    if dep_train_id == task_train_id:
+                        logger.debug(
+                            'Task %s: intra-train dep satisfied: dep=%s train_id=%s',
+                            task_id,
+                            dep_id,
+                            task_train_id,
+                        )
+                        continue
+            logger.debug(
+                'Task %s blocked: dep %s has status %s, '
+                'need done or cancelled',
+                task_id,
+                dep_id,
+                dep_status,
+            )
+            return False
         return True
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
