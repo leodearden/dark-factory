@@ -5569,3 +5569,150 @@ class TestGroupMergeRequestDataclass:
         req = self._make_instance(config, tmp_path)
         assert callable(req.status_check)
         assert callable(req.mark_member_done)
+
+
+# ---------------------------------------------------------------------------
+# Train helpers (shared by all TestGroupMergeRequest* classes)
+# ---------------------------------------------------------------------------
+
+
+async def _make_stacked_train(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    train_id: str = 'train-test',
+    member_names: tuple[str, str, str] = ('trn-a', 'trn-b', 'trn-c'),
+) -> GroupMergeRequest:
+    """Build a 3-member stacked train in the tmp repo.
+
+    Creates branch A off main, B stacked on A, C (tip) stacked on B.
+    Each branch adds its own unique file (a.py, b.py, c.py).
+
+    Returns a GroupMergeRequest with:
+    - status_check: AsyncMock returning all 'merge-deferred'
+    - mark_member_done: AsyncMock recording (task_id, sha) calls
+    """
+    a_name, b_name, c_name = member_names
+
+    # Branch A: from main
+    wt_a = (await git_ops.create_worktree(a_name)).path
+    (wt_a / f'{a_name}.py').write_text(f'{a_name} = 1\n')
+    await git_ops.commit(wt_a, f'Add {a_name}.py')
+    rc, a_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt_a)
+    a_head = a_head.strip()
+
+    # Branch B: stacked on A's HEAD
+    b_full = f'task/{b_name}'
+    wt_b_path = git_ops.worktree_base / b_name
+    wt_b_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', b_full, str(wt_b_path), a_head],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_b_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_b_path)
+    (wt_b_path / f'{b_name}.py').write_text(f'{b_name} = 2\n')
+    await git_ops.commit(wt_b_path, f'Add {b_name}.py')
+    rc, b_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt_b_path)
+    b_head = b_head.strip()
+
+    # Branch C (tip): stacked on B's HEAD
+    c_full = f'task/{c_name}'
+    wt_c_path = git_ops.worktree_base / c_name
+    wt_c_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', c_full, str(wt_c_path), b_head],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_c_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_c_path)
+    (wt_c_path / f'{c_name}.py').write_text(f'{c_name} = 3\n')
+    await git_ops.commit(wt_c_path, f'Add {c_name}.py')
+
+    # Callbacks
+    status_check = AsyncMock(return_value={
+        a_name: 'merge-deferred',
+        b_name: 'merge-deferred',
+        c_name: 'merge-deferred',
+    })
+    mark_member_done = AsyncMock()
+
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+
+    return GroupMergeRequest(
+        task_id=c_name,
+        branch=c_name,
+        worktree=wt_c_path,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+        train_id=train_id,
+        member_task_ids=[a_name, b_name, c_name],
+        tip_branch=c_name,
+        tip_task_id=c_name,
+        status_check=status_check,
+        mark_member_done=mark_member_done,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestHappyPath (MergeWorker) — step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestHappyPath:
+    """PRD scenario 1: 3-train merges atomically via MergeWorker."""
+
+    async def test_single_merge_commit_all_members_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Happy path: 3-member train → 1 merge commit, 3 callbacks, same SHA."""
+        req = await _make_stacked_train(git_ops, config)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Count merge commits on main before the train lands
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Exactly one new merge commit added to main
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main'
+        )
+
+        # All three member files present on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called exactly 3 times, all with the SAME merge SHA
+        assert req.mark_member_done.call_count == 3, (
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'
+        )
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+        called_sha = next(iter(called_shas))
+        assert called_sha == outcome.merge_sha
