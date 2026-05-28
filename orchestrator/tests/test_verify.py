@@ -4275,3 +4275,79 @@ class TestResolveVerifyEnv:
         mc = self._make_mc(verify_env={'KEY': 'module_val'})
         result = _resolve_verify_env(config, mc, role='task')
         assert result['KEY'] == 'module_val'
+
+
+class TestRoleThreading:
+    """Tests that role='merge' propagates through run_verification and run_scoped_verification.
+
+    Mirrors TestRunVerificationColdFirstUse's _run_cmd-patch pattern but captures
+    the env kwarg to assert DF_VERIFY_ROLE reaches the subprocess runner.
+    """
+
+    def _make_config(self, warm=1800.0, cold: float | None = 5400.0):
+        return OrchestratorConfig(
+            verify_command_timeout_secs=warm,
+            verify_cold_command_timeout_secs=cold,
+            verify_timeout_retries=0,
+            test_command='echo test',
+            lint_command='echo lint',
+            type_check_command='echo type',
+        )
+
+    def _make_env_capture_mock(self):
+        """Fake _run_cmd that captures the env kwarg and returns success."""
+        captured_envs: list[dict | None] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            captured_envs.append(env)
+            return 0, '', False
+
+        return fake_run_cmd, captured_envs
+
+    @pytest.mark.asyncio
+    async def test_run_verification_propagates_role_merge(self, tmp_path: Path):
+        """run_verification(role='merge') passes DF_VERIFY_ROLE='merge' in env to _run_cmd."""
+        (tmp_path / '.task').mkdir()
+        config = self._make_config()
+        fake_cmd, captured = self._make_env_capture_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config, role='merge')
+
+        assert captured, '_run_cmd was never called'
+        assert all(env is not None for env in captured), f'env was None in some calls: {captured}'
+        assert all(env['DF_VERIFY_ROLE'] == 'merge' for env in captured), (
+            f'Expected DF_VERIFY_ROLE=merge in all _run_cmd calls; got: {captured}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_verification_role_task_default(self, tmp_path: Path):
+        """run_verification without role kwarg defaults to DF_VERIFY_ROLE='task'."""
+        (tmp_path / '.task').mkdir()
+        config = self._make_config()
+        fake_cmd, captured = self._make_env_capture_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
+
+        assert captured, '_run_cmd was never called'
+        assert all(env['DF_VERIFY_ROLE'] == 'task' for env in captured), (
+            f'Expected DF_VERIFY_ROLE=task (default); got: {captured}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_scoped_verification_global_propagates_role_merge(self, tmp_path: Path):
+        """run_scoped_verification(role='merge') in global mode propagates DF_VERIFY_ROLE='merge'."""
+        (tmp_path / '.task').mkdir()
+        config = self._make_config()
+        fake_cmd, captured = self._make_env_capture_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            # task_files=None triggers global mode (no scoping)
+            await run_scoped_verification(tmp_path, config, [], task_files=None, role='merge')
+
+        assert captured, '_run_cmd was never called'
+        assert all(env is not None for env in captured), f'env was None: {captured}'
+        assert all(env['DF_VERIFY_ROLE'] == 'merge' for env in captured), (
+            f'Expected DF_VERIFY_ROLE=merge in global mode; got: {captured}'
+        )
