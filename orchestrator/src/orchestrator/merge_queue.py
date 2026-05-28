@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import logging
 import shutil
 import time
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -120,6 +121,46 @@ that some member tasks still need their status flipped.  Downstream classifiers
 pattern-match this prefix to distinguish a fully-clean landing
 (``reason=None``) from a partial-flip that requires manual / automated
 cleanup."""
+
+
+POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
+unscoped pyright check detects a cross-PR union break.  After
+``advance_main`` succeeds, a full package-wide type-check is run against the
+advanced main SHA for each subproject that declares a ``type_check_command``
+in its ``ModuleConfig``.  Unlike per-PR scoped verify, this catches the case
+where PR A widens a Protocol and PR B (verified against pre-A main) adds a
+conformer satisfying the OLD Protocol — after both land the union has a
+conformer missing the new method; each PR verified clean, but only the
+post-merge whole-package check sees it.
+
+This is a SIGNAL, not a gate: the merge has already landed (``update-ref``
+ran), so we do NOT revert.  We skip ``push_main`` (same as the equivalence
+check), emit an L1 blocked outcome, and route to human / auto-watcher for a
+fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX``:
+a landed merge must never be blocked by a flaky hang or infra error, so the
+check fails open on timeouts and worktree-create exceptions."""
+
+
+@dataclass
+class PostMergePyrightResult:
+    """Structured return value from :func:`_check_post_merge_pyright`.
+
+    Attributes:
+        failing_subprojects: Prefixes of subprojects whose unscoped
+            type-check command exited non-zero (genuine type failure, not
+            a timeout or infra error).  Empty list means clean.
+        detail: Bounded human-readable detail from the first failing
+            subproject's output, for inclusion in the escalation reason.
+    """
+
+    failing_subprojects: list[str] = field(default_factory=list)
+    detail: str = ''
+
+    @property
+    def broken(self) -> bool:
+        """True when at least one subproject's type-check genuinely failed."""
+        return bool(self.failing_subprojects)
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
@@ -521,6 +562,103 @@ async def _check_post_merge_equivalence(
         return []
 
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+# Maximum number of characters to include in the detail field of a
+# ``PostMergePyrightResult`` — keeps the blocked reason string in the
+# escalation payload under reasonable size limits.
+_POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
+
+
+async def _check_post_merge_pyright(
+    advanced_sha: str,
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run an unscoped, package-wide type-check against the post-merge main SHA.
+
+    Second post-merge "equivalence" signal: after ``advance_main`` succeeds,
+    runs each subproject's ``type_check_command`` VERBATIM (unscoped —
+    ``scope_module_config``/``_scope_command`` are NOT called) in a fresh
+    detached worktree at ``advanced_sha``.
+
+    Returns a :class:`PostMergePyrightResult` whose ``broken`` property is
+    ``True`` when at least one subproject's type-check reports a genuine
+    failure (``not passed AND not timed_out``).
+
+    Early returns:
+    - Empty or no-type-check-command module_configs → clean (no-op).
+
+    Fail-open:
+    - Timeouts (``verify.timed_out``) → skip, log WARNING, treat as clean.
+    - Any exception creating the worktree or during verify → log WARNING,
+      treat as clean.
+
+    The merge has already landed via ``update-ref`` before this runs; we NEVER
+    block a landed merge on a flaky hang or transient infra error.
+    """
+    # Quick-exit: if no module defines a type_check_command there is nothing to check.
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    merge_wt: Path | None = None
+    try:
+        merge_wt, _ = await git_ops._create_merge_worktree(advanced_sha)
+
+        failing_subprojects: list[str] = []
+        detail_parts: list[str] = []
+
+        for mc in active:
+            # Run only the type-check command verbatim (unscoped).
+            # Null out test/lint so run_verification skips them (None => skip).
+            type_only_mc = dataclasses.replace(
+                mc, test_command=None, lint_command=None,
+            )
+            verify = await run_verification(
+                merge_wt, config, type_only_mc,
+                max_retries=0, is_merge_verify=True, role='merge',
+            )
+
+            if verify.timed_out:
+                logger.warning(
+                    'post-merge-pyright: type-check for %r timed out on %s; '
+                    'failing open. task_id=%s',
+                    mc.prefix, advanced_sha[:12], task_id or '<unknown>',
+                )
+                continue  # fail open on timeout
+
+            if not verify.passed:
+                failing_subprojects.append(mc.prefix)
+                # Collect bounded detail from the first failure.
+                raw = verify.failure_report() or verify.type_output or ''
+                if isinstance(raw, str) and raw:
+                    remaining = _POST_MERGE_PYRIGHT_MAX_DETAIL - sum(
+                        len(d) for d in detail_parts
+                    )
+                    if remaining > 0:
+                        detail_parts.append(raw[:remaining])
+
+        detail = '\n'.join(detail_parts)
+        return PostMergePyrightResult(
+            failing_subprojects=failing_subprojects,
+            detail=detail,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            'post-merge-pyright: infra error checking %s — failing open. '
+            'task_id=%s error=%s',
+            advanced_sha[:12], task_id or '<unknown>', exc,
+        )
+        return PostMergePyrightResult()
+
+    finally:
+        if merge_wt is not None:
+            await git_ops.cleanup_merge_worktree(merge_wt)
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
