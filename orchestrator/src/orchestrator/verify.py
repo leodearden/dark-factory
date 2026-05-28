@@ -1694,6 +1694,7 @@ async def run_scoped_verification(
     attempt_id: int | None = None,
     task_id: str | None = None,
     archive_root: Path | None = None,
+    force_workspace: bool = False,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -1708,6 +1709,12 @@ async def run_scoped_verification(
        :func:`_build_fallback_config`, bypassing the global commands entirely.
     3. **Global** — when *task_files* is ``None`` (or falsy) with no
        module_configs, or when fallback returns ``None`` (no .py files).
+    4. **Workspace (train-member override)** — when *force_workspace* is
+       ``True``, all scoping is bypassed and the project-wide commands from
+       *config* (e.g. ``cargo test --workspace``) run against the worktree
+       branch tip.  Mirrors the *is_merge_verify* flag-threading pattern
+       (PRD §9.5, γ₁).  Non-train callers leave this at its default ``False``
+       for byte-identical existing behaviour.
 
     *max_retries* overrides ``config.verify_timeout_retries`` for this call;
     pass ``0`` from the merge-queue path so a deterministic hang doesn't
@@ -1721,14 +1728,34 @@ async def run_scoped_verification(
     """
     scope_cargo_enabled = config.scope_cargo
 
-    # When the plan didn't provide a file list, try to derive one from git.
-    if task_files is None:
+    # When the plan didn't provide a file list, try to derive one from git —
+    # but only when we're not bypassing scoping entirely (force_workspace=True
+    # goes straight to the global run_verification call without needing a file
+    # list).
+    if task_files is None and not force_workspace:
         task_files = await _derive_task_files_from_git(worktree, config)
 
     # _prune_archive runs exactly once in the finally block regardless of which
     # branch returns, preventing concurrent per-module prune races and removing
     # the repetitive guard at every return site.
     try:
+        # Train-member workspace override: bypass ALL scoping and run the
+        # project-wide workspace command verbatim (config.test_command/…).
+        # Cargo --workspace→-p rewrites only fire when task_files are passed,
+        # so this path runs `cargo test --workspace` (or the configured command)
+        # unchanged against the worktree branch tip.
+        if force_workspace:
+            logger.info(
+                'Verification mode: workspace (train member — file-scoping bypassed)'
+            )
+            return await run_verification(
+                worktree, config,
+                max_retries=max_retries,
+                is_merge_verify=is_merge_verify,
+                attempt_id=attempt_id,
+                task_id=task_id,
+                archive_root=archive_root,
+            )
         if module_configs:
             # Apply file-level scoping within each subproject when task_files given
             if task_files:

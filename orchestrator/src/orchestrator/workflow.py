@@ -120,6 +120,7 @@ class _SchedulerLike(Protocol):
     async def get_statuses(
         self, ids: list[str] | None = ...,
     ) -> tuple[dict[str, str], Exception | None]: ...
+    def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
 class _McpLike(Protocol):
@@ -190,6 +191,7 @@ class WorkflowState(enum.Enum):
     VERIFY = 'verify'
     REVIEW = 'review'
     MERGE = 'merge'
+    MERGE_DEFERRED = 'merge-deferred'
     DONE = 'done'
     BLOCKED = 'blocked'
     ESCALATED = 'escalated'
@@ -202,6 +204,7 @@ class WorkflowOutcome(enum.Enum):
     REQUEUED = 'requeued'
     ESCALATED = 'escalated'
     CANCELLED = 'cancelled'
+    MERGE_DEFERRED = 'merge-deferred'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
@@ -435,6 +438,47 @@ class TaskWorkflow:
         """Return the file list from the current plan, or None if unavailable/empty."""
         files = self.plan.get('files', [])
         return files if files else None
+
+    @property
+    def _train(self) -> TrainMembership | None:
+        """Return the train membership dict if this task is a train member, else None.
+
+        Reads ``task.metadata.train`` using the same dict-or-None shape that
+        git_ops and scheduler already consume (β₂/β₁).  A non-dict value
+        (e.g. a stale string) is treated as absent so callers get a clean
+        ``is not None`` check.
+        """
+        train = (self.task.get('metadata') or {}).get('train')
+        return cast(TrainMembership, train) if isinstance(train, dict) else None
+
+    async def _enter_merge_deferred(self) -> WorkflowOutcome:
+        """Park this train member in the merge-deferred holding state (γ₁, PRD §9.5).
+
+        Called after the full execute→verify→review pipeline succeeds for a
+        train member.  Instead of entering the merge phase, the task transitions
+        to ``status='merge-deferred'`` and waits for the group-merge worker (δ₁)
+        to drive the eventual done transition once all siblings are ready.
+
+        The worktree is NOT cleaned up here — the merge-queue worker's
+        post-merge ``cleanup_worktree`` never runs for merge-deferred tasks,
+        so the worktree is naturally preserved as γ₁'s observable signal.
+
+        Returns ``WorkflowOutcome.MERGE_DEFERRED``.
+        """
+        self._enter_phase(WorkflowState.MERGE_DEFERRED)
+        await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
+        # Clear any requeue counter accumulated from prior failed attempts: the
+        # task is workspace-green now, so those attempts are no longer relevant.
+        # The harness's _handle_outcome_post only special-cases REQUEUED/DONE;
+        # MERGE_DEFERRED falls through with requeued=False, leaving a stranded
+        # counter if we don't clear it here.
+        self.scheduler.clear_requeue_count(self.task_id)
+        logger.info(
+            'Task %s: train member workspace-green — parking in merge-deferred '
+            '(group-merge worker owns done transition)',
+            self.task_id,
+        )
+        return WorkflowOutcome.MERGE_DEFERRED
 
     async def _finalise_merged_done(self) -> WorkflowOutcome:
         """Common DONE-finalisation for the happy-path merge.
@@ -945,6 +989,16 @@ class TaskWorkflow:
 
                 # MERGE (skip for eval mode — no merge into main)
                 if not self._worktree_external:
+                    # Train members hold at merge-deferred instead of merging;
+                    # the group-merge worker (δ₁) owns the eventual done
+                    # transition once all siblings are workspace-green (PRD §9.5,
+                    # γ₁).  The full execute→verify→review pipeline still ran
+                    # above (PRD acceptance criterion 5).  Non-train path is
+                    # byte-identical — this guard only fires when metadata.train
+                    # is a dict.
+                    if self._train is not None:
+                        return await self._enter_merge_deferred()
+
                     self._enter_phase(WorkflowState.MERGE)
 
                     # Defense-in-depth: any blocking L0 escalation created
@@ -3117,6 +3171,7 @@ class TaskWorkflow:
                 attempt_id=verify_attempt + 1,
                 task_id=self.task_id,
                 archive_root=self.config.project_root / 'data' / 'verify-logs',
+                force_workspace=self._train is not None,
             )
             if not result.passed:
                 self._last_verify_result = result
