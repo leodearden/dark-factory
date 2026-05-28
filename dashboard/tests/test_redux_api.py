@@ -654,3 +654,13 @@ class TestShapeEscalations:
         # original esc fields preserved
         assert row['id'] == 'esc-unres'
         assert row['summary'] == 'unresolvable'
+
+    def test_shape_escalations_top_level_summary_passthrough(self):
+        """Non-trivial top-level summary passes through verbatim (not recomputed)."""
+        top_summary = {
+            'by_level': {0: 2, 1: 1, 2: 1},
+            'by_status': {'pending': 3, 'resolved': 1, 'dismissed': 0},
+        }
+        queues = {'subsections': [], 'summary': top_summary}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        assert body['ESCALATIONS']['summary'] == top_summary
