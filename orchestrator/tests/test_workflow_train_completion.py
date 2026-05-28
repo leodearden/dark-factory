@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -29,7 +29,6 @@ from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-
 
 # ---------------------------------------------------------------------------
 # Shared fixture helper (mirrors test_workflow_train_state_escalation._make)
