@@ -453,3 +453,27 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
     body = redux_api.shape_burndown(series)
     assert body['BURNDOWN']['completed'] == 0
     assert body['BURNDOWN']['velocity'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# shape_escalations
+# ---------------------------------------------------------------------------
+
+_EMPTY_SUMMARY = {
+    'by_level': {0: 0, 1: 0, 2: 0},
+    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
+}
+
+
+class TestShapeEscalations:
+    """Tests for redux_api.shape_escalations."""
+
+    def test_shape_escalations_basic_envelope(self):
+        """Empty queues → correct envelope with passthrough summary."""
+        queues = {'subsections': [], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        assert set(body.keys()) == {'ESCALATIONS'}
+        esc = body['ESCALATIONS']
+        assert set(esc.keys()) == {'subsections', 'summary'}
+        assert esc['subsections'] == []
+        assert esc['summary'] == _EMPTY_SUMMARY
