@@ -82,6 +82,9 @@ STAGE_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 # Structured schema for individual finding items (Stage 3)
+# PRD §9.3: four typed citation lists replace the retired `affected_ids` field.
+# Top-level task_id / flag_type / actionable are preserved for flag_dedup and
+# stats_verifier compatibility.
 FINDING_ITEM_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'properties': {
@@ -98,6 +101,14 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
             'type': 'boolean',
             'description': 'True if Stage 1/Stage 2 can fix it automatically',
         },
+        'task_id': {
+            'type': ['string', 'null'],
+            'description': 'Task ID associated with this finding, if any',
+        },
+        'flag_type': {
+            'type': ['string', 'null'],
+            'description': 'Machine-readable flag type for deduplication',
+        },
         'category': {
             'type': 'string',
             'enum': [
@@ -108,18 +119,65 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
                 'missing_knowledge',
                 'cross_store_inconsistency',
                 'systemic_pattern',
+                'cross_project_routing',
                 'other',
             ],
             'description': 'Category of the finding',
         },
-        'affected_ids': {
-            'type': 'array',
-            'items': {'type': 'string'},
-            'description': 'Memory IDs, entity names, or task IDs involved',
-        },
         'suggested_action': {
             'type': 'string',
             'description': 'What the remediation stage should do to fix this finding',
+        },
+        # PRD §9.3 typed citation lists — replace retired `affected_ids`
+        'cited_entities': {
+            'type': 'array',
+            'description': 'Entities cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'entity_uuid': {'type': 'string', 'description': 'UUID of the entity node'},
+                    'canonical_name': {'type': 'string', 'description': 'Entity canonical name'},
+                },
+                'required': ['entity_uuid', 'canonical_name'],
+            },
+        },
+        'cited_edges': {
+            'type': 'array',
+            'description': 'Graphiti edges cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'edge_uuid': {'type': 'string', 'description': 'UUID of the edge'},
+                    'fact_text_snapshot': {'type': 'string', 'description': 'Snapshot of the edge fact text'},
+                },
+                'required': ['edge_uuid', 'fact_text_snapshot'],
+            },
+        },
+        'cited_tasks': {
+            'type': 'array',
+            'description': 'Tasks cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'project_id': {'type': 'string', 'description': 'Project ID containing the task'},
+                    'task_id': {'type': 'string', 'description': 'Task ID'},
+                    'title': {'type': 'string', 'description': 'Task title'},
+                },
+                'required': ['project_id', 'task_id', 'title'],
+            },
+        },
+        'cited_memories': {
+            'type': 'array',
+            'description': 'Mem0 memory entries cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'memory_id': {'type': 'string', 'description': 'Memory ID'},
+                    'store': {'type': 'string', 'description': 'Store type (mem0/graphiti)'},
+                    'metadata_fingerprint': {'type': 'string', 'description': 'Fingerprint of memory metadata'},
+                },
+                'required': ['memory_id', 'store', 'metadata_fingerprint'],
+            },
         },
     },
     'required': ['description', 'severity'],
