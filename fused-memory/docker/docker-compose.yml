@@ -20,7 +20,13 @@ services:
     volumes:
       - ../data/qdrant:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      # qdrant image has bash + the qdrant binary but no curl/wget, so the
+      # previous curl-based check failed every probe and the container was
+      # permanently "unhealthy" (also breaking any depends_on:service_healthy
+      # consumers, e.g. the fused-mcp service below). Use bash's /dev/tcp
+      # builtin to GET /readyz and require HTTP 200 — no extra tooling needed.
+      # (2026-05-28)
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
       interval: 5s
       timeout: 3s
       retries: 5

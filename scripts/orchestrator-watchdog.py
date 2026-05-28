@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """Orchestrator escalation-MCP watchdog.
 
-Probes the escalation-MCP TCP ports for the dark-factory and reify
-orchestrators via ``ss``, then performs a three-phase
-``systemctl --user stop`` → ``systemctl --user reset-failed`` →
-``systemctl --user start`` on any that are not listening.
-Runs as a oneshot systemd service on a 60-second timer.
+For each enabled orchestrator (dark-factory + reify): probes its escalation-MCP
+TCP port via ``ss``, and performs a three-phase ``systemctl --user stop`` →
+``reset-failed`` → ``start`` if the port is not listening. The probe-fails →
+restart path covers BOTH failure modes:
+
+  * **Wedged** (alive-but-hung): the unit is active but the port stopped
+    answering — systemd Restart= won't fire. The watchdog forces a restart.
+  * **Dead-but-enabled** (e.g. a boot-race dependency-cancel that systemd
+    never retries, or a unit that gave up after exhausting StartLimitBurst):
+    the unit is inactive, the port isn't listening, ``stop`` is a no-op, and
+    ``reset-failed`` + ``start`` revives it. This is what self-heals the
+    2026-05-27 powercut failure mode.
+
+Disabled units are skipped — disabling is explicit operator intent. Runs as a
+oneshot systemd service on a 60-second timer.
 
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
@@ -18,8 +28,8 @@ import time
 # orchestrator's configured escalation.port (guarded by the drift test in
 # tests/scripts/test_orchestrator_watchdog.py).
 WATCHED = [
-    (8102, "dark-factory-orchestrator.service"),
-    (8100, "reify-orchestrator.service"),
+    (8102, "orchestrator-dark-factory.service"),
+    (8100, "orchestrator-reify.service"),
 ]
 
 # Skip the port probe for a unit that started within this many seconds.
@@ -180,10 +190,37 @@ def _unit_start_elapsed_secs(unit: str) -> float | None:
         return None
 
 
+def is_unit_enabled(unit: str) -> bool:
+    """Return True iff ``systemctl --user is-enabled <unit>`` exits 0.
+
+    Disabling a unit is explicit operator intent (a staged-but-not-yet-active
+    deployment, or a temporarily-disabled service) — the watchdog must respect
+    it and not auto-revive. ``is-enabled`` exits 0 for ``enabled`` /
+    ``enabled-runtime`` / ``static`` / ``alias``; non-zero for ``disabled`` /
+    ``masked`` / unknown. Subprocess errors fall safe to False (skip).
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "--quiet", unit],
+            check=False,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log(
+            f"is-enabled probe for {unit} could not complete "
+            f"({type(exc).__name__}); skipping unit"
+        )
+        return False
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
         try:
+            if not is_unit_enabled(unit):
+                # Disabled (or unknown) — respect operator intent, skip silently.
+                continue
             elapsed = _unit_start_elapsed_secs(unit)
             if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
                 log(
@@ -192,6 +229,9 @@ def main() -> None:
                 )
                 continue
             if not probe_port(port):
+                # Covers both wedged-active and dead-enabled (boot-race
+                # cancelled, or StartLimit-exhausted): restart_unit's
+                # stop+reset-failed+start sequence revives either case.
                 log(f"{unit} escalation port {port} not listening; restarting")
                 restart_unit(unit)
                 log(f"{unit} restart issued")

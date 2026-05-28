@@ -3,6 +3,13 @@ Description=Fused Memory MCP Server (dark-factory)
 Documentation=file://__REPO_ROOT__/DESIGN.md
 After=network.target
 
+# Restart-rate guard: 10 starts within 600s is generous enough for cap-rotation
+# churn and recoverable cascades, but blocks a true tight loop. No
+# StartLimitAction set — default `none` simply stops auto-restart, which is
+# the intended fail-safe (operator inspects journal, then restarts manually).
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
 [Service]
 # Type=notify: process signals readiness via sd_notify("READY=1") and
 # heartbeats via sd_notify("WATCHDOG=1"). See fused_memory/server/main.py.
@@ -13,6 +20,17 @@ Type=notify
 NotifyAccess=all
 WatchdogSec=30
 WorkingDirectory=__REPO_ROOT__
+# Backing stores (falkordb:6379, qdrant:6333) run under the SYSTEM docker
+# manager, which a `systemctl --user` unit cannot order against via After=.
+# Step 1: reconcile containers to compose-defined state — starts them if
+# missing AND recreates any whose config drifted (e.g. healthcheck edits).
+# Lets compose-file changes go live on the next restart without manual
+# `docker compose up -d`. Named services only — don't auto-start fused-mcp.
+ExecStartPre=/usr/bin/docker compose -f __REPO_ROOT__/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+# Step 2: poll their published ports so our FIRST start stops losing the boot
+# race — the failure mode that cancelled the dependent orchestrators (which
+# had a hard Requires= on us) on 2026-05-27. Budget 280s < TimeoutStartSec=300.
+ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:6379 127.0.0.1:6333
 ExecStart=__UV_PATH__ run --project fused-memory \
   python -m fused_memory.server.main \
   --transport http \
@@ -27,6 +45,10 @@ Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
 # the dashboard reads — keep in sync with dashboard.service.template. Comma-separated
 # (no spaces — systemd treats them as assignment separators).
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
+# F-infra T-8: pre-done hook for Reify project. Calls reify-audit P5 check
+# before any set_task_status(done) transition. {id} is substituted by the
+# upstream hook (pre_done_hook.py) with the actual task id at invocation time.
+Environment="FUSED_MEMORY_PREDONE_HOOK_REIFY=/home/leo/.cargo/bin/reify-audit --task {id} --pre-done"
 
 # Restart policy: always restart on failure (including watchdog-triggered),
 # back off up to 60s
@@ -36,7 +58,7 @@ RestartMaxDelaySec=60
 
 # Give it time to shut down gracefully (async cleanup). Must exceed the
 # in-process shutdown watchdog (_FORCE_EXIT_BUDGET in main.py).
-TimeoutStopSec=60
+TimeoutStopSec=90
 
 # Startup can take longer than systemd's 90s default: FalkorDB + Qdrant
 # cold-start handshake plus event-buffer replay routinely runs 30-60s.

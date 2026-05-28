@@ -190,12 +190,12 @@ def test_restart_unit_stop_reset_failed_start(monkeypatch: pytest.MonkeyPatch) -
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    wdog.restart_unit("dark-factory-orchestrator.service")
+    wdog.restart_unit("orchestrator-dark-factory.service")
 
     assert len(calls) == 3, f"Expected exactly 3 systemctl calls, got {len(calls)}: {calls}"
-    assert calls[0] == ["systemctl", "--user", "stop", "dark-factory-orchestrator.service"]
-    assert calls[1] == ["systemctl", "--user", "reset-failed", "dark-factory-orchestrator.service"]
-    assert calls[2] == ["systemctl", "--user", "start", "dark-factory-orchestrator.service"]
+    assert calls[0] == ["systemctl", "--user", "stop", "orchestrator-dark-factory.service"]
+    assert calls[1] == ["systemctl", "--user", "reset-failed", "orchestrator-dark-factory.service"]
+    assert calls[2] == ["systemctl", "--user", "start", "orchestrator-dark-factory.service"]
 
 
 def test_restart_unit_never_uses_kill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,7 +208,7 @@ def test_restart_unit_never_uses_kill(monkeypatch: pytest.MonkeyPatch) -> None:
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    wdog.restart_unit("dark-factory-orchestrator.service")
+    wdog.restart_unit("orchestrator-dark-factory.service")
 
     for argv in calls:
         for token in argv:
@@ -242,7 +242,7 @@ def test_restart_unit_handles_stop_timeout(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("dark-factory-orchestrator.service")
+    wdog.restart_unit("orchestrator-dark-factory.service")
 
     systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
     verbs = [c[2] for c in systemctl_cmds]
@@ -266,7 +266,7 @@ def test_restart_unit_handles_start_timeout(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("dark-factory-orchestrator.service")
+    wdog.restart_unit("orchestrator-dark-factory.service")
 
     assert len(log_messages) >= 1, "start timeout must be logged via log()"
 
@@ -294,7 +294,7 @@ def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("dark-factory-orchestrator.service")
+    wdog.restart_unit("orchestrator-dark-factory.service")
 
     systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
     verbs = [c[2] for c in systemctl_cmds]
@@ -503,9 +503,9 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
     df_config_path = REPO_ROOT / "orchestrator" / "config.yaml"
     df_cfg = yaml.safe_load(df_config_path.read_text())
     df_port = _extract_escalation_port(df_cfg, df_config_path)
-    assert unit_to_port["dark-factory-orchestrator.service"] == df_port, (
-        f"WATCHED port for dark-factory-orchestrator.service "
-        f"({unit_to_port['dark-factory-orchestrator.service']}) != "
+    assert unit_to_port["orchestrator-dark-factory.service"] == df_port, (
+        f"WATCHED port for orchestrator-dark-factory.service "
+        f"({unit_to_port['orchestrator-dark-factory.service']}) != "
         f"orchestrator/config.yaml escalation.port ({df_port})"
     )
 
@@ -515,9 +515,9 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
         pytest.skip("reify orchestrator.yaml not reachable in this environment")
     reify_cfg = yaml.safe_load(reify_config_path.read_text())
     reify_port = _extract_escalation_port(reify_cfg, reify_config_path)
-    assert unit_to_port["reify-orchestrator.service"] == reify_port, (
-        f"WATCHED port for reify-orchestrator.service "
-        f"({unit_to_port['reify-orchestrator.service']}) != "
+    assert unit_to_port["orchestrator-reify.service"] == reify_port, (
+        f"WATCHED port for orchestrator-reify.service "
+        f"({unit_to_port['orchestrator-reify.service']}) != "
         f"reify/orchestrator.yaml escalation.port ({reify_port})"
     )
 
@@ -532,8 +532,8 @@ def test_main_targets_expected_pairs() -> None:
     wdog = _load_watchdog()
     assert hasattr(wdog, "WATCHED"), "Module must expose a WATCHED constant"
     assert wdog.WATCHED == [
-        (8102, "dark-factory-orchestrator.service"),
-        (8100, "reify-orchestrator.service"),
+        (8102, "orchestrator-dark-factory.service"),
+        (8100, "orchestrator-reify.service"),
     ]
 
 
@@ -558,11 +558,12 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
 
-    assert restarted == ["dark-factory-orchestrator.service"], (
+    assert restarted == ["orchestrator-dark-factory.service"], (
         f"Expected only df unit restarted, got: {restarted}"
     )
 
@@ -587,14 +588,15 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
 
     assert len(log_messages) >= 1, "Expected at least one log() call for the restarted unit"
     # At least one message must mention the unit being restarted
-    assert any("dark-factory-orchestrator.service" in m for m in log_messages), (
-        f"No log message mentions dark-factory-orchestrator.service: {log_messages}"
+    assert any("orchestrator-dark-factory.service" in m for m in log_messages), (
+        f"No log message mentions orchestrator-dark-factory.service: {log_messages}"
     )
 
 
@@ -624,12 +626,13 @@ def test_main_isolates_per_unit_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     # Must not raise
     wdog.main()
 
-    assert "reify-orchestrator.service" in restarted, (
+    assert "orchestrator-reify.service" in restarted, (
         "reify unit must still be processed even if df probe raised"
     )
 
@@ -656,6 +659,7 @@ def test_main_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -687,6 +691,7 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -720,6 +725,7 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
 
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
     monkeypatch.setattr(wdog, "probe_port", fake_probe)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
     wdog.main()
@@ -727,3 +733,122 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     assert len(probed) == 2, (
         f"When elapsed is None, both ports must be probed; probed: {probed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# is_unit_enabled() tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_unit_enabled_true_on_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_unit_enabled returns True when ``systemctl is-enabled`` exits 0."""
+    wdog = _load_watchdog()
+
+    class _R:
+        returncode = 0
+
+    def fake_run(*_a, **_kw):
+        return _R()
+
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    assert wdog.is_unit_enabled("orchestrator-reify.service") is True
+
+
+def test_is_unit_enabled_false_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_unit_enabled returns False when ``systemctl is-enabled`` exits non-zero.
+
+    Non-zero is what ``disabled``/``masked``/unknown all return — the watchdog
+    must respect the disabled state and skip the unit.
+    """
+    wdog = _load_watchdog()
+
+    class _R:
+        returncode = 1
+
+    def fake_run(*_a, **_kw):
+        return _R()
+
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    assert wdog.is_unit_enabled("orchestrator-reify.service") is False
+
+
+def test_is_unit_enabled_false_on_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_unit_enabled returns False (skip) if systemctl isn't on PATH."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+
+    def fake_run(*_a, **_kw):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    assert wdog.is_unit_enabled("orchestrator-reify.service") is False
+    assert any("FileNotFoundError" in m for m in logged), (
+        "missing-systemctl path must emit a diagnostic"
+    )
+
+
+def test_is_unit_enabled_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_unit_enabled returns False (skip) if the systemctl call times out."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+
+    def fake_run(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd="systemctl", timeout=5)
+
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    assert wdog.is_unit_enabled("orchestrator-reify.service") is False
+    assert any("TimeoutExpired" in m for m in logged), (
+        "timeout path must emit a diagnostic"
+    )
+
+
+# ---------------------------------------------------------------------------
+# main() must skip disabled units entirely (no probe, no restart)
+# ---------------------------------------------------------------------------
+
+
+def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() must NOT probe or restart a unit that is_unit_enabled reports False.
+
+    Disabling is explicit operator intent (e.g. a staged-but-not-yet-active
+    deployment). The watchdog must respect it — no probe, no restart, no logs.
+    """
+    wdog = _load_watchdog()
+    probed: list[int] = []
+    restarted: list[str] = []
+
+    def fake_enabled(unit: str) -> bool:
+        # Only orchestrator-reify is enabled; df is disabled and must be skipped.
+        return unit == "orchestrator-reify.service"
+
+    def fake_elapsed(unit: str) -> None:
+        return None
+
+    def fake_probe(port: int) -> bool:
+        probed.append(port)
+        return False  # would normally trigger a restart
+
+    def fake_restart(unit: str) -> None:
+        restarted.append(unit)
+
+    monkeypatch.setattr(wdog, "is_unit_enabled", fake_enabled)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", fake_elapsed)
+    monkeypatch.setattr(wdog, "probe_port", fake_probe)
+    monkeypatch.setattr(wdog, "restart_unit", fake_restart)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    # df is disabled → skipped (port 8102 never probed)
+    assert 8102 not in probed, (
+        f"Disabled unit's port (8102) must not be probed; probed: {probed}"
+    )
+    assert "orchestrator-dark-factory.service" not in restarted, (
+        "Disabled unit must not be restarted"
+    )
+    # reify is enabled → probed, and the failed probe triggers a restart
+    assert probed == [8100]
+    assert restarted == ["orchestrator-reify.service"]
+
