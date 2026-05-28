@@ -1,0 +1,12 @@
+[Unit]
+Description=Dark Factory load sampler — writes PSI + verify metrics to SQLite
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/.local/bin/uv run --project sampler python -m sampler
+
+# Logging goes to journalctl --user -u dark-factory-load-sampler
+StandardOutput=journal
+StandardError=journal
