@@ -1501,6 +1501,39 @@ class MergeWorker:
                     ),
                 )
 
+            # Decision-3 post-merge unscoped type-check: catch cross-PR union
+            # breaks that per-PR scoped verify cannot detect (PR A widens a
+            # Protocol; PR B, verified against pre-A main, adds a conformer
+            # satisfying the OLD Protocol; only the post-merge whole-package
+            # check catches the missing method after both land).
+            # No-op when module_configs is empty (preserves existing tests).
+            # Merge has already landed; we never revert — skip push instead.
+            pyright_result = await _check_post_merge_pyright(
+                advanced_sha, self._git_ops, req.config, req.module_configs,
+                task_id=req.task_id,
+            )
+            if pyright_result.broken:
+                logger.warning(
+                    'Task %s: post-merge unscoped type-check failed for %s on %s',
+                    req.task_id,
+                    ', '.join(pyright_result.failing_subprojects),
+                    advanced_sha[:12],
+                )
+                _emit_merge_attempt(
+                    self._event_store, req.task_id,
+                    'post_merge_pyright_broken',
+                    duration_ms=_elapsed_ms(t0),
+                )
+                return MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                        f'post-merge unscoped type-check failed for '
+                        f'{", ".join(pyright_result.failing_subprojects)} '
+                        f'on {advanced_sha[:12]}. {pyright_result.detail}'
+                    ),
+                )
+
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
             push_status = await self._git_ops.push_main()
