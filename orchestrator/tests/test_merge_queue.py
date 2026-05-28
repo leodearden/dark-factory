@@ -25,6 +25,7 @@ from orchestrator.merge_queue import (
     WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
     GroupMergeRequest,
+    InFlightMergeRegistry,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
@@ -6498,3 +6499,124 @@ class TestMergeFailureDiagnostic:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestInFlightMergeRegistry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightMergeRegistry:
+    """Tests for InFlightMergeRegistry — per-branch in-flight de-dup slot."""
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_event_loop().create_future()
+
+    async def test_acquire_free_branch_returns_true(self):
+        """(a) Acquiring a free branch returns True; is_inflight becomes True."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire('101', 'task-101', fut)
+
+        assert result is True
+        assert registry.is_inflight('101') is True
+
+    async def test_acquire_held_branch_returns_false(self):
+        """(b) A second acquire for the same branch returns False while first holds."""
+        registry = InFlightMergeRegistry()
+        fut1 = self._make_future()
+        fut2 = self._make_future()
+
+        first = registry.acquire('202', 'task-202a', fut1)
+        second = registry.acquire('202', 'task-202b', fut2)
+
+        assert first is True
+        assert second is False
+        # Branch still held by the first
+        assert registry.is_inflight('202') is True
+
+    async def test_resolving_future_releases_slot(self):
+        """(c) Resolving the future auto-releases the slot via add_done_callback."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('303', 'task-303', fut)
+        assert registry.is_inflight('303') is True
+
+        # Resolve the future — the callback should fire
+        fut.set_result(None)
+        # Yield control so the done_callback runs
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('303') is False
+
+    async def test_cancelling_future_releases_slot(self):
+        """(c) Cancelling the future also auto-releases the slot."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('404', 'task-404', fut)
+        assert registry.is_inflight('404') is True
+
+        fut.cancel()
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('404') is False
+
+    async def test_different_branches_are_independent(self):
+        """(d) Acquiring different branches is fully independent."""
+        registry = InFlightMergeRegistry()
+        futA = self._make_future()
+        futB = self._make_future()
+
+        a = registry.acquire('A', 'task-A', futA)
+        b = registry.acquire('B', 'task-B', futB)
+
+        assert a is True
+        assert b is True
+        assert registry.is_inflight('A') is True
+        assert registry.is_inflight('B') is True
+
+        # Releasing A does not affect B
+        futA.set_result(None)
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('A') is False
+        assert registry.is_inflight('B') is True
+
+    async def test_entry_exposes_task_id_and_eta(self):
+        """(e) entry(branch) exposes task_id; eta_seconds returns an int >= 0."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('505', 'task-505', fut)
+
+        entry = registry.entry('505')
+        assert entry is not None
+        assert entry.task_id == 'task-505'
+
+        eta = registry.eta_seconds('505')
+        assert eta is not None
+        assert isinstance(eta, int)
+        assert eta >= 0
+
+    async def test_entry_and_eta_none_for_free_branch(self):
+        """entry() and eta_seconds() return None for a branch not in-flight."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.entry('unknown') is None
+        assert registry.eta_seconds('unknown') is None
+
+    async def test_acquire_after_release_dispatches_again(self):
+        """After release a new acquire succeeds for the same branch."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('606', 'task-606', fut)
+
+        fut.set_result(None)
+        await asyncio.sleep(0)
+
+        fut2 = self._make_future()
+        result = registry.acquire('606', 'task-606b', fut2)
+        assert result is True
+        assert registry.is_inflight('606') is True
