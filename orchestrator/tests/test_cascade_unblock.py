@@ -301,21 +301,21 @@ class TestCascadeUnblockIntegration:
             await asyncio.gather(*list(harness._background_tasks))
 
         # blocked task was flipped
-        harness.scheduler.set_task_status.assert_any_await('task-blocked', 'pending')
+        harness.scheduler.set_task_status.assert_any_await('task-blocked', 'pending')  # type: ignore[attr-defined]
         # done task was NOT flipped (DEBUG-skipped; normal case, not an error)
         assert not any(
             call.args == ('task-done', 'pending')
-            for call in harness.scheduler.set_task_status.await_args_list
+            for call in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
         ), "done task should be DEBUG-skipped, not flipped"
         # deferred task was NOT flipped
         assert not any(
             call.args == ('task-deferred', 'pending')
-            for call in harness.scheduler.set_task_status.await_args_list
+            for call in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
         ), "deferred task should not be flipped"
         # L2's own task ('task-cluster') was NOT flipped — level==2 guard
         assert not any(
             call.args == ('task-cluster', 'pending')
-            for call in harness.scheduler.set_task_status.await_args_list
+            for call in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
         ), "L2's own task should not be flipped (level==2 guard)"
 
     async def test_criterion_8_wake_events_still_fire(
