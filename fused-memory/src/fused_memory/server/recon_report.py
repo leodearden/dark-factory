@@ -1,12 +1,10 @@
-"""recon_report MCP namespace — in-process state + tool scaffold (task α).
+"""recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides five tools: start_report / add_finding / set_stat / inc_stat / complete.
+Provides nine tools: start_report / add_finding / set_stat / inc_stat / complete /
+cite_entity / cite_edge / cite_task / cite_memory.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
-
-cite_entity / cite_edge / cite_task / cite_memory are explicitly out of scope
-for task α — see task β.
 """
 
 from __future__ import annotations
@@ -14,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -96,6 +95,51 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# cite_* error helpers (task β)
+# ---------------------------------------------------------------------------
+
+# Compiled UUID shape gate: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
+_ERR_FINDING_UNKNOWN: dict[str, str] = {
+    'error': 'finding_unknown',
+    'error_type': 'ReconReportFindingUnknown',
+}
+
+_ERR_ENTITY_NOT_FOUND: dict[str, str] = {
+    'error': 'entity_not_found',
+    'error_type': 'ReconReportEntityNotFound',
+}
+
+_ERR_EDGE_NOT_FOUND: dict[str, str] = {
+    'error': 'edge_not_found',
+    'error_type': 'ReconReportEdgeNotFound',
+}
+
+_ERR_TASK_NOT_FOUND: dict[str, str] = {
+    'error': 'task_not_found',
+    'error_type': 'ReconReportTaskNotFound',
+}
+
+_ERR_UNKNOWN_PROJECT: dict[str, str] = {
+    'error': 'unknown_project',
+    'error_type': 'ReconReportUnknownProject',
+}
+
+_ERR_MEMORY_NOT_FOUND: dict[str, str] = {
+    'error': 'memory_not_found',
+    'error_type': 'ReconReportMemoryNotFound',
+}
+
+_ERR_INVALID_UUID_SHAPE: dict[str, str] = {
+    'error': 'invalid_uuid_shape',
+    'error_type': 'ReconReportInvalidUuid',
+}
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -119,6 +163,8 @@ class ReconReportState:
         ttl_seconds: float,
         clock: Callable[[], float] | None = None,
         reaper_interval: float = 60.0,
+        memory_service: Any = None,
+        task_interceptor: Any = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -126,6 +172,10 @@ class ReconReportState:
         self._state: dict[tuple[str, str], _ReportEntry] = {}
         self._active: dict[str, str] = {}  # run_id → current stage
         self._reaper_task: asyncio.Task | None = None
+        # cite_* service injection (task β)
+        self._memory_service = memory_service
+        self._task_interceptor = task_interceptor
+        self.known_projects: dict[str, str] = {}  # project_id → project_root
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
@@ -349,6 +399,53 @@ class ReconReportState:
         if stage is None:
             return None
         return self._state.get((run_id, stage))
+
+    def _resolve_finding(
+        self, run_id: str, finding_id: str
+    ) -> tuple[_ReportEntry, _Finding] | None:
+        """Return (entry, finding) or None if either run_id or finding_id is unknown."""
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return None
+        for f in entry.findings:
+            if f.finding_id == finding_id:
+                return entry, f
+        return None  # finding_id not in this run
+
+    # ------------------------------------------------------------------
+    # cite_* tools (task β)
+    # ------------------------------------------------------------------
+
+    async def cite_entity(
+        self,
+        run_id: str,
+        finding_id: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Resolve *name* to a Graphiti entity and record the citation.
+
+        Returns {entity_uuid, canonical_name} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / entity_not_found).
+        Appends to finding.cited_entities only on success — never on error.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        result = await self._memory_service.get_entity(name, entry.project_id)
+        nodes = result.get('nodes', [])
+        if not nodes:
+            return _ERR_ENTITY_NOT_FOUND.copy()
+
+        node = nodes[0]
+        citation = {'entity_uuid': node['uuid'], 'canonical_name': node['name']}
+        finding.cited_entities.append(citation)
+        return citation
 
     # ------------------------------------------------------------------
     # Reaper
