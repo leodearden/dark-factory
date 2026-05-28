@@ -167,6 +167,48 @@ class TestCascadeUnblockUnit:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
+    async def test_merge_deferred_task_not_flipped(
+        self, harness: Harness, caplog
+    ):
+        """[Review fix] member status 'merge-deferred' → set_task_status NOT called, DEBUG logged.
+
+        'merge-deferred' is a LIVE non-terminal holding status for atomic-train members
+        (workflow.py:475). The server terminal-exit gate does NOT protect it, so a
+        set_task_status('pending') call would SUCCEED and clobber the deliberate holding
+        state. The allowlist carve-out must exclude it.
+        """
+        esc = _make_l1_esc(task_id='3438', resolved_by='l2-cascade:esc-4000-39')
+        harness.scheduler.get_status = AsyncMock(return_value='merge-deferred')
+
+        with caplog.at_level(logging.DEBUG):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(r.levelno == logging.DEBUG and 'merge-deferred' in r.message for r in caplog.records), (
+            "Expected a DEBUG record mentioning 'merge-deferred'"
+        )
+
+    async def test_unknown_nonterminal_status_not_flipped(
+        self, harness: Harness, caplog
+    ):
+        """[Review fix] novel non-terminal status 'review' → set_task_status NOT called.
+
+        Pins allowlist semantics: any status not in {blocked} ∪ TERMINAL_STATUSES is
+        skipped, future-proofing against newly introduced statuses.
+        """
+        esc = _make_l1_esc(task_id='3438', resolved_by='l2-cascade:esc-4000-39')
+        harness.scheduler.get_status = AsyncMock(return_value='review')
+
+        with caplog.at_level(logging.DEBUG):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
+            "Expected a DEBUG record for unknown non-terminal status carve-out"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration tests — real EscalationQueue.resolve()
