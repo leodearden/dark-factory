@@ -68,12 +68,30 @@ _ERR_RUN_UNKNOWN: dict[str, str] = {
     'error_type': 'ReconReportRunUnknown',
 }
 
+# Returned when add_finding / set_stat / inc_stat are called after complete()
+# has already stamped completed_at.  complete() is documented as the closing
+# call; mutating a completed entry would silently corrupt the assembled report
+# and the next complete()'s cached flagged_count/stats.
+_ERR_ALREADY_COMPLETED: dict[str, str] = {
+    'error': 'report_already_completed',
+    'error_type': 'ReconReportAlreadyCompleted',
+}
+
 
 def _duplicate_finding_error(existing_id: str) -> dict[str, str]:
     return {
         'error': 'duplicate_finding',
         'error_type': 'ReconReportDuplicateFinding',
         'existing_finding_id': existing_id,
+    }
+
+
+def _stat_type_mismatch_error(key: str) -> dict[str, str]:
+    return {
+        'error': 'stat_type_mismatch',
+        'error_type': 'ReconReportStatTypeMismatch',
+        'key': key,
+        'current_type': 'str',
     }
 
 
@@ -151,6 +169,17 @@ class ReconReportState:
         if entry is None:
             return _ERR_RUN_UNKNOWN.copy()
 
+        # Guard: reject mutations after complete() to prevent silent corruption
+        # of the assembled report.  cite_* tools (task β) operate on _Finding
+        # objects directly and are not affected by this guard.
+        if entry.completed_at is not None:
+            logger.warning(
+                'recon_report: add_finding called after complete() for run_id=%r stage=%r; rejected',
+                run_id,
+                entry.stage,
+            )
+            return _ERR_ALREADY_COMPLETED.copy()
+
         # In-run dedup: skip when both are None (informational findings)
         sig = (task_id, flag_type)
         if sig != (None, None):
@@ -186,6 +215,15 @@ class ReconReportState:
         if entry is None:
             return _ERR_RUN_UNKNOWN.copy()
 
+        if entry.completed_at is not None:
+            logger.warning(
+                'recon_report: set_stat called after complete() for run_id=%r stage=%r key=%r; rejected',
+                run_id,
+                entry.stage,
+                key,
+            )
+            return _ERR_ALREADY_COMPLETED.copy()
+
         entry.stats[key] = value
         return {'value': value}
 
@@ -200,10 +238,30 @@ class ReconReportState:
         if entry is None:
             return _ERR_RUN_UNKNOWN.copy()
 
+        if entry.completed_at is not None:
+            logger.warning(
+                'recon_report: inc_stat called after complete() for run_id=%r stage=%r key=%r; rejected',
+                run_id,
+                entry.stage,
+                key,
+            )
+            return _ERR_ALREADY_COMPLETED.copy()
+
         current_raw = entry.stats.get(key, 0)
-        # stats may hold str values (set via set_stat); treat those as 0 for inc
-        current: int | float = current_raw if not isinstance(current_raw, str) else 0
-        new_value = current + delta
+        # Guard: if a caller has previously set this key to a string via
+        # set_stat and now calls inc_stat, silently coercing to 0 would lose
+        # the original value with no diagnostic.  Return a structured error
+        # so the caller can diagnose the key-type conflict explicitly.
+        if isinstance(current_raw, str):
+            logger.warning(
+                'recon_report: inc_stat called on string-valued stat key=%r '
+                'for run_id=%r stage=%r; use set_stat to replace it',
+                key,
+                run_id,
+                entry.stage,
+            )
+            return _stat_type_mismatch_error(key)
+        new_value = current_raw + delta
         entry.stats[key] = new_value
         return {'value': new_value}
 

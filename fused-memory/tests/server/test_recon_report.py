@@ -35,6 +35,16 @@ class TestConfigSchema:
         cfg = ReconciliationConfig()
         assert cfg.recon_report_state_ttl_seconds == 300
 
+    def test_server_config_port_collision_raises(self):
+        """recon_report_port == port must be a config-time error (suggestion 3)."""
+        import pytest
+        from pydantic import ValidationError
+
+        from fused_memory.config.schema import ServerConfig
+
+        with pytest.raises(ValidationError, match='recon_report_port'):
+            ServerConfig(port=8002, recon_report_port=8002)
+
 
 # ---------------------------------------------------------------------------
 # step-3: ReconReportState happy path — RED until step-4 creates the module
@@ -256,6 +266,117 @@ class TestReconReportCompleteIdempotence:
         # Warning recorded
         assert len(report['summary_warnings']) == 1
         assert 'summary B' in report['summary_warnings'][0]
+
+
+# ---------------------------------------------------------------------------
+# amend: Post-completion mutation guard (suggestion 4)
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportPostCompletionGuard:
+    """add_finding / set_stat / inc_stat must be rejected after complete() stamps
+    completed_at, preventing silent corruption of the assembled report.
+    """
+
+    def _make_completed_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='s1', project_id='p')
+        state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='1',
+            flag_type='f',
+        )
+        state.complete('r1', 'summary')
+        return state
+
+    def test_add_finding_after_complete_is_rejected(self):
+        state = self._make_completed_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='c',
+            description='late finding',
+            suggested_action='a',
+        )
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+        # The finding must NOT have been added
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1  # only the original one
+
+    def test_set_stat_after_complete_is_rejected(self):
+        state = self._make_completed_state()
+        result = state.set_stat('r1', 'new_key', 42)
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+        # Stat must NOT have been written
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert 'new_key' not in report['stats']
+
+    def test_inc_stat_after_complete_is_rejected(self):
+        state = self._make_completed_state()
+        result = state.inc_stat('r1', 'counter', 5)
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+
+
+# ---------------------------------------------------------------------------
+# amend: inc_stat type mismatch (suggestion 5)
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportIncStatTypeMismatch:
+    """inc_stat on a string-valued stat key must return a structured error,
+    not silently coerce the string to 0 and lose the original value.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='s1', project_id='p')
+        return state
+
+    def test_inc_stat_on_string_valued_key_returns_error(self):
+        state = self._make_state()
+        state.set_stat('r1', 'label', 'some-string')
+        result = state.inc_stat('r1', 'label', 1)
+        assert result['error'] == 'stat_type_mismatch'
+        assert result['error_type'] == 'ReconReportStatTypeMismatch'
+        assert result['key'] == 'label'
+        assert result['current_type'] == 'str'
+
+    def test_inc_stat_preserves_original_string(self):
+        """The string value must not be overwritten by the failed inc."""
+        state = self._make_state()
+        state.set_stat('r1', 'label', 'keep-me')
+        state.inc_stat('r1', 'label', 1)  # rejected
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['stats']['label'] == 'keep-me'
+
+    def test_inc_stat_on_numeric_key_still_works(self):
+        """Normal numeric increment path is unaffected."""
+        state = self._make_state()
+        state.set_stat('r1', 'count', 10)
+        result = state.inc_stat('r1', 'count', 3)
+        assert result == {'value': 13}
+
+    def test_inc_stat_on_absent_key_initialises_to_zero(self):
+        """Missing key is still treated as 0 (original behaviour)."""
+        state = self._make_state()
+        result = state.inc_stat('r1', 'fresh', 7)
+        assert result == {'value': 7}
 
 
 # ---------------------------------------------------------------------------
