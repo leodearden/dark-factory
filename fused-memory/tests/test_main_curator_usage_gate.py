@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
+from _fm_helpers import pydantic_spec
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import UsageGate
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.main import _resolve_curator_cost_store_path
 
 # ---------------------------------------------------------------------------
@@ -100,7 +102,7 @@ class TestCuratorCapEventPersisted:
 )
 def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
     """Path helper returns correct db path based on reconciliation config."""
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     config.reconciliation = reconciliation_cfg
     assert _resolve_curator_cost_store_path(config) == expected
 
@@ -130,7 +132,7 @@ class TestCuratorUsageGateLeakGuard:
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = usage_cap_cfg
         config.reconciliation = MagicMock(data_dir=str(tmp_path))
 
@@ -182,7 +184,7 @@ class TestCuratorUsageGateLeakGuard:
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = usage_cap_cfg
         config.reconciliation = MagicMock(data_dir=str(tmp_path))
 
@@ -244,7 +246,7 @@ class TestCuratorUsageGateLeakGuard:
             accounts=[acct_cfg],
             wait_for_reset=False,
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = usage_cap_cfg
         config.reconciliation = MagicMock(data_dir=str(tmp_path))
 
@@ -270,7 +272,7 @@ class TestCuratorUsageGateLeakGuard:
 
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = None
 
         result = asyncio.run(_setup_curator_usage_gate(config))
@@ -283,7 +285,7 @@ class TestCuratorUsageGateLeakGuard:
 
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = UsageCapConfig(enabled=False)
 
         result = asyncio.run(_setup_curator_usage_gate(config))
@@ -305,7 +307,7 @@ class TestCuratorUsageGateLeakGuard:
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = usage_cap_cfg
         config.reconciliation = MagicMock(data_dir=str(tmp_path))
 
