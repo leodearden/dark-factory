@@ -1239,15 +1239,34 @@ class TestCapRetryEdgeCases:
         assert mock_inv.call_args_list[2].kwargs['prompt'] == 'precious prompt'
         assert mock_inv.call_args_list[3].kwargs['prompt'] == 'precious prompt'
 
-    async def test_zero_cost_cli_error_not_treated_as_cap(self):
-        """A recognised CLI error (zero-cost instant exit) is NOT counted as a cap.
+    @pytest.mark.parametrize('marker', [
+        'is already in use',
+        'unrecognized arguments',
+        'unknown option',
+        'invalid value',
+        'no such file or directory',
+        'permission denied',
+    ])
+    @pytest.mark.parametrize('placement', ['stderr', 'output'])
+    async def test_zero_cost_cli_error_not_treated_as_cap(self, marker, placement):
+        """Any recognised NON_CAP_CLI_ERROR_MARKERS substring in stderr or output bypasses the cap path.
 
-        Regression for reify-3604: ``claude --session-id <X>`` on a reused UUID
-        exits in ~300ms with empty cost and 'Session ID … is already in use'.
-        The zero-cost heuristic must recognise that as a concrete CLI error and
-        fall through (no cap mark, no sleep, no unbounded retry) so the caller
-        gets the failed result for normal verify/steward handling.
+        When a zero-cost instant-exit result contains a known CLI error phrase in
+        either ``stderr`` or ``output``, the heuristic must NOT mark the account
+        capped — it must fall through (no cap mark, no sleep, no unbounded retry)
+        so the caller gets the failed result for normal verify/steward handling.
+
+        Each NON_CAP_CLI_ERROR_MARKERS entry is hardcoded here (rather than
+        imported) so that removing a marker from the production list causes the
+        affected parametrize case to fail — catching silent regression.  Both
+        placement fields are tested because ``_is_non_cap_cli_error`` checks both.
+
+        Historically: reify-3604 — ``claude --session-id <X>`` on a reused UUID
+        exits in ~300ms with empty cost and 'Session ID … is already in use',
+        triggering this path.
         """
+        stderr = f'Error: {marker} foo bar' if placement == 'stderr' else ''
+        output = f'CLI exited: {marker}' if placement == 'output' else ''
         gate = _mock_gate(
             account_count=1,
             detect_cap_hit=MagicMock(return_value=False),
@@ -1255,7 +1274,7 @@ class TestCapRetryEdgeCases:
         gate._handle_cap_detected = MagicMock(return_value=True)
         result = make_result(
             success=False, cost_usd=0, turns=0, duration_ms=300,
-            stderr='Error: Session ID x is already in use.',
+            stderr=stderr, output=output,
         )
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
@@ -1272,11 +1291,15 @@ class TestCapRetryEdgeCases:
         assert got.success is False
 
     async def test_zero_cost_unknown_message_still_cap(self):
-        """A zero-cost instant exit with an UNRECOGNISED message is still a cap.
+        """A zero-cost instant exit with a cap-hit-style stderr is still a cap.
 
-        Guards against over-narrowing the new CLI-error carve-out: when stderr is
-        empty (and output carries no known CLI-error marker), the heuristic must
-        still treat the result as a cap hit and fail over.
+        Guards against over-narrowing the new CLI-error carve-out: a realistic
+        cap-hit message that contains NO substring from NON_CAP_CLI_ERROR_MARKERS
+        must still route through the heuristic cap path (sleep + retry).  Using a
+        realistic phrase (rather than empty stderr) also guards against future
+        over-broadening: if a new marker like 'limit reached' were added to
+        NON_CAP_CLI_ERROR_MARKERS, this test would catch the accidental
+        reclassification of a genuine cap message as a CLI error.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1286,7 +1309,8 @@ class TestCapRetryEdgeCases:
         )
         gate._handle_cap_detected = MagicMock(return_value=True)
         capped = make_result(
-            success=False, cost_usd=0, turns=0, duration_ms=300, stderr='',
+            success=False, cost_usd=0, turns=0, duration_ms=300,
+            stderr='Claude usage limit reached - resets at 2026-01-01T00:00:00Z',
         )
         ok = make_result()
         with (
