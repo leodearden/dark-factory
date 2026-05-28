@@ -113,7 +113,7 @@ def _is_occt_gated(proc: Any) -> bool:
         cmdline = proc.cmdline()
     except Exception:
         return False
-    return 'cargo-test-occt-gated' in cmdline
+    return any('cargo-test-occt-gated' in part for part in cmdline)
 
 
 def count_occt_queue_depth(
