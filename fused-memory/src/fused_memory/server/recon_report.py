@@ -447,6 +447,121 @@ class ReconReportState:
         finding.cited_entities.append(citation)
         return citation
 
+    async def cite_edge(
+        self,
+        run_id: str,
+        finding_id: str,
+        edge_uuid: str,
+    ) -> dict[str, Any]:
+        """Validate *edge_uuid* shape, fetch the edge, and record the citation.
+
+        Returns {edge_uuid, fact_text_snapshot} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / invalid_uuid_shape /
+        edge_not_found).  UUID shape is checked before any service call.
+        Appends to finding.cited_edges only on success.
+        """
+        from graphiti_core.errors import EdgeNotFoundError
+
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if not _UUID_RE.match(edge_uuid):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        try:
+            result = await self._memory_service.get_edge(edge_uuid, entry.project_id)
+        except EdgeNotFoundError:
+            return _ERR_EDGE_NOT_FOUND.copy()
+
+        citation = {'edge_uuid': edge_uuid, 'fact_text_snapshot': result['fact']}
+        finding.cited_edges.append(citation)
+        return citation
+
+    async def cite_task(
+        self,
+        run_id: str,
+        finding_id: str,
+        project_id: str,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Look up *task_id* in *project_id* and record the citation.
+
+        Returns {project_id, task_id, title} on success, or a structured error
+        dict (run_id_unknown / finding_unknown / unknown_project / task_not_found).
+        project_id is validated against self.known_projects before any service call.
+        Appends to finding.cited_tasks only on success.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if project_id not in self.known_projects:
+            return _ERR_UNKNOWN_PROJECT.copy()
+
+        project_root = self.known_projects[project_id]
+        result = await self._task_interceptor.get_task(task_id, project_root)
+
+        if not result or 'error' in result:
+            return _ERR_TASK_NOT_FOUND.copy()
+
+        title = result.get('title') or result.get('data', {}).get('title', '')
+        citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
+        finding.cited_tasks.append(citation)
+        return citation
+
+    async def cite_memory(
+        self,
+        run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: str,
+    ) -> dict[str, Any]:
+        """Validate *memory_id* shape, fetch fingerprint, and record the citation.
+
+        Returns {memory_id, metadata_fingerprint} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / invalid_uuid_shape /
+        memory_not_found).  UUID shape is checked before any service call.
+        Appends to finding.cited_memories only on success.
+        """
+        from graphiti_core.errors import EdgeNotFoundError
+
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        _, finding = resolved
+
+        if not _UUID_RE.match(memory_id):
+            return _ERR_INVALID_UUID_SHAPE.copy()
+
+        try:
+            fingerprint = await self._memory_service.get_memory(
+                memory_id, store, entry.project_id
+            )
+        except (EdgeNotFoundError, KeyError, ValueError):
+            return _ERR_MEMORY_NOT_FOUND.copy()
+
+        if fingerprint is None:
+            return _ERR_MEMORY_NOT_FOUND.copy()
+
+        mem_entry = {'memory_id': memory_id, 'store': store, 'metadata_fingerprint': fingerprint}
+        finding.cited_memories.append(mem_entry)
+        return {'memory_id': memory_id, 'metadata_fingerprint': fingerprint}
+
     # ------------------------------------------------------------------
     # Reaper
     # ------------------------------------------------------------------
