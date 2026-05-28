@@ -25,6 +25,7 @@ from orchestrator.merge_queue import (
     WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
     GroupMergeRequest,
+    InFlightMergeRegistry,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
@@ -35,6 +36,7 @@ from orchestrator.merge_queue import (
     _check_post_merge_equivalence,
     _ensure_verify_disk_space,
     _verify_hit_enospc,
+    coalesce_or_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
 
@@ -6498,3 +6500,437 @@ class TestMergeFailureDiagnostic:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestInFlightMergeRegistry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightMergeRegistry:
+    """Tests for InFlightMergeRegistry — per-branch in-flight de-dup slot."""
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_acquire_free_branch_returns_true(self):
+        """(a) Acquiring a free branch returns True; is_inflight becomes True."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire('101', 'task-101', fut)
+
+        assert result is True
+        assert registry.is_inflight('101') is True
+
+    async def test_acquire_held_branch_returns_false(self):
+        """(b) A second acquire for the same branch returns False while first holds."""
+        registry = InFlightMergeRegistry()
+        fut1 = self._make_future()
+        fut2 = self._make_future()
+
+        first = registry.acquire('202', 'task-202a', fut1)
+        second = registry.acquire('202', 'task-202b', fut2)
+
+        assert first is True
+        assert second is False
+        # Branch still held by the first
+        assert registry.is_inflight('202') is True
+
+    async def test_resolving_future_releases_slot(self):
+        """(c) Resolving the future auto-releases the slot via add_done_callback."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('303', 'task-303', fut)
+        assert registry.is_inflight('303') is True
+
+        # Resolve the future — the callback should fire
+        fut.set_result(None)
+        # Yield control so the done_callback runs
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('303') is False
+
+    async def test_cancelling_future_releases_slot(self):
+        """(c) Cancelling the future also auto-releases the slot."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('404', 'task-404', fut)
+        assert registry.is_inflight('404') is True
+
+        fut.cancel()
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('404') is False
+
+    async def test_different_branches_are_independent(self):
+        """(d) Acquiring different branches is fully independent."""
+        registry = InFlightMergeRegistry()
+        futA = self._make_future()
+        futB = self._make_future()
+
+        a = registry.acquire('A', 'task-A', futA)
+        b = registry.acquire('B', 'task-B', futB)
+
+        assert a is True
+        assert b is True
+        assert registry.is_inflight('A') is True
+        assert registry.is_inflight('B') is True
+
+        # Releasing A does not affect B
+        futA.set_result(None)
+        await asyncio.sleep(0)
+
+        assert registry.is_inflight('A') is False
+        assert registry.is_inflight('B') is True
+
+    async def test_entry_exposes_task_id_and_eta(self):
+        """(e) entry(branch) exposes task_id; eta_seconds returns an int >= 0."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('505', 'task-505', fut)
+
+        entry = registry.entry('505')
+        assert entry is not None
+        assert entry.task_id == 'task-505'
+
+        eta = registry.eta_seconds('505')
+        assert eta is not None
+        assert isinstance(eta, int)
+        assert eta >= 0
+
+    async def test_entry_and_eta_none_for_free_branch(self):
+        """entry() and eta_seconds() return None for a branch not in-flight."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.entry('unknown') is None
+        assert registry.eta_seconds('unknown') is None
+
+    async def test_acquire_after_release_dispatches_again(self):
+        """After release a new acquire succeeds for the same branch."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('606', 'task-606', fut)
+
+        fut.set_result(None)
+        await asyncio.sleep(0)
+
+        fut2 = self._make_future()
+        result = registry.acquire('606', 'task-606b', fut2)
+        assert result is True
+        assert registry.is_inflight('606') is True
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueue — registry-only path (git_ops=None)
+# ---------------------------------------------------------------------------
+
+
+def _count_events(db_path, event_type: str) -> int:
+    """Query the EventStore SQLite DB for a specific event type count."""
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            'SELECT COUNT(*) FROM events WHERE event_type = ?', (event_type,),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueRegistryOnly:
+    """Tests for coalesce_or_enqueue_merge_request with git_ops=None.
+
+    Exercises the registry-only fast-path: no disk scan, no worktree
+    creation needed.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'coalesce_events.db'
+        return EventStore(db_path=db, run_id='coalesce-test')
+
+    async def test_first_call_dispatches(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) First call: dispatched=True, in_flight=False, queue has 1 item,
+        registry.is_inflight(branch) is True."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('111', '111', tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.dispatched is True
+        assert result.in_flight is False
+        assert queue.qsize() == 1
+        assert registry.is_inflight('111') is True
+
+    async def test_second_call_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) Second call for same branch: in_flight=True, no duplicate enqueue,
+        merge_coalesced event emitted."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req1 = _make_request('222', '222', tmp_path, config)
+        req2 = _make_request('222', '222', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None,
+        )
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, event_store, registry, git_ops=None,
+        )
+
+        assert result2.in_flight is True
+        assert result2.dispatched is False
+        # No duplicate enqueue
+        assert queue.qsize() == 1
+        # Exactly one merge_coalesced event
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+    async def test_third_call_dispatches_after_release(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) After the first future resolves, a third call dispatches again."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req1 = _make_request('333', '333', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None,
+        )
+
+        # Resolve the first future — releases the registry slot
+        req1.result.set_result(MergeOutcome(status='done'))
+        await asyncio.sleep(0)
+        assert registry.is_inflight('333') is False
+
+        req3 = _make_request('333', '333', tmp_path, config)
+        result3 = await coalesce_or_enqueue_merge_request(
+            queue, req3, event_store, registry, git_ops=None,
+        )
+
+        assert result3.dispatched is True
+        assert result3.in_flight is False
+        assert queue.qsize() == 2  # both requests enqueued (queue not drained)
+
+    async def test_different_branches_always_dispatch(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) Different branches are always dispatched independently."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req_a = _make_request('A', 'branchA', tmp_path, config)
+        req_b = _make_request('B', 'branchB', tmp_path, config)
+
+        result_a = await coalesce_or_enqueue_merge_request(
+            queue, req_a, event_store, registry, git_ops=None,
+        )
+        result_b = await coalesce_or_enqueue_merge_request(
+            queue, req_b, event_store, registry, git_ops=None,
+        )
+
+        assert result_a.dispatched is True
+        assert result_b.dispatched is True
+        assert queue.qsize() == 2
+        # No coalesce events
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 0
+
+    async def test_concurrent_acquire_during_scan_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(race) Concurrent dispatch claims the slot during the disk-scan await.
+
+        The only ``await`` between the ``is_inflight`` check and the ``acquire``
+        call is inside ``find_inflight_merge_worktree``.  A second caller can
+        win the acquire race while the first is suspended there.  We simulate
+        this by injecting a fake git_ops whose scan yields twice (two
+        ``sleep(0)``s) while a background task grabs the slot between them.
+
+        The original caller should observe acquire returning False and fall
+        through to the race-fallback coalesce path: ``in_flight=True``,
+        ``source='registry'``, one ``merge_coalesced`` event, empty queue.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('race', 'race', tmp_path, config)
+
+        # Fake git_ops: yields control twice so the concurrent acquirer can
+        # grab the slot between the two sleep(0)s.
+        class _SlowGitOps:
+            async def find_inflight_merge_worktree(self, branch: str):
+                await asyncio.sleep(0)  # let _acquirer get scheduled
+                await asyncio.sleep(0)  # let _acquirer actually run & acquire
+                return None
+
+            async def cleanup_merge_worktree(self, merge_wt: object) -> None:
+                pass  # never reached — find_inflight returns None
+
+        other_future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _acquirer() -> None:
+            await asyncio.sleep(0)  # wait until main is inside find_inflight
+            registry.acquire('race', 'other-task', other_future)
+
+        asyncio.create_task(_acquirer())
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=_SlowGitOps(),
+        )
+
+        assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+        assert result.dispatched is False
+        assert result.source == 'registry', (
+            f'Expected source=registry (race-fallback path), got {result.source!r}'
+        )
+        assert queue.qsize() == 0, 'No enqueue should happen on race-fallback coalesce'
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        other_future.cancel()
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueWorktreePath:
+    """Tests for coalesce_or_enqueue_merge_request disk-scan branch.
+
+    Uses a real GitOps and _merge-* worktree to simulate the cross-actor
+    scenario where the in-memory registry is empty (e.g. after restart) but
+    an in-progress merger's worktree exists on disk.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'wt_coalesce_events.db'
+        return EventStore(db_path=db, run_id='wt-coalesce-test')
+
+    async def test_alive_worktree_coalesces_without_enqueue(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Disk-scan detects a recent _merge-* worktree → in_flight=True,
+        source='worktree', queue stays empty, worktree NOT removed."""
+        from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        # Create a real _merge-* worktree via merge_to_main
+        branch = 'wt-coalesce-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'wt_coalesce.py', 'x = 42\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()   # EMPTY — simulates restart
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('wt-coalesce', branch, tmp_path, config)
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                liveness_secs=INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+
+            # Queue must be EMPTY — no duplicate enqueue
+            assert queue.qsize() == 0, f'Expected empty queue, got {queue.qsize()}'
+
+            # Worktree must NOT have been removed (it is alive)
+            assert merge_wt.exists(), f'Alive worktree {merge_wt} was unexpectedly removed'
+
+            # merge_coalesced event must be emitted
+            assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+        finally:
+            # Clean up the merge worktree
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueueStaleWorktreeReap — reap abandoned worktree then dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueStaleWorktreeReap:
+    """Tests for the stale-worktree reap-then-dispatch path.
+
+    When a _merge-* worktree exists on disk but is older than liveness_secs,
+    coalesce_or_enqueue_merge_request should reap it and dispatch a fresh merge.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'reap_events.db'
+        return EventStore(db_path=db, run_id='reap-test')
+
+    async def test_stale_worktree_is_reaped_and_dispatched(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Stale _merge-* worktree → reap + worktree_reaped event +
+        dispatch new request (dispatched=True, queue size 1)."""
+        import os
+
+        branch = 'stale-reap-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'stale_reap.py', 'x = 1\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        # Force mtime to ancient past so liveness check fails
+        ancient_mtime = 0  # 1970-01-01
+        os.utime(str(merge_wt), (ancient_mtime, ancient_mtime))
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('stale-reap', branch, tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=git_ops,
+            liveness_secs=1,  # tiny window so age=ancient >> 1
+        )
+
+        # (a) stale worktree should be reaped
+        assert not merge_wt.exists(), (
+            f'Stale worktree {merge_wt} should have been removed'
+        )
+        # Confirm reaped by checking find_inflight returns None
+        found = await git_ops.find_inflight_merge_worktree(branch)
+        assert found is None, f'Worktree still registered after reap: {found}'
+
+        # (b) worktree_reaped event emitted
+        assert _count_events(event_store.db_path, 'worktree_reaped') == 1
+
+        # (c) new request dispatched
+        assert result.dispatched is True, f'Expected dispatched=True, got {result}'
+        assert result.in_flight is False
+        assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
+        # Registry now holds the new request
+        assert registry.is_inflight(branch) is True

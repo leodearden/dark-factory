@@ -1218,6 +1218,40 @@ class GitOps:
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
 
+    async def _iter_merge_worktrees(self):
+        """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
+
+        Private async-generator helper shared by :meth:`prune_stale_merge_worktrees`
+        and :meth:`find_inflight_merge_worktree`.  Enumerates via
+        ``git worktree list --porcelain``, filtering to direct children of
+        ``worktree_base`` whose name starts with ``_merge-``.  Yields nothing
+        on git error (fail-closed).
+
+        *wt_path* is the raw path from porcelain output (used for git commands).
+        *wt_resolved* is the resolved path (used for identity comparisons such
+        as the ``keep`` exclusion in :meth:`prune_stale_merge_worktrees`).
+        """
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return
+
+        for line in out.splitlines():
+            if not line.startswith('worktree '):
+                continue
+            wt_path = Path(line[len('worktree '):].strip())
+            try:
+                wt_resolved = wt_path.resolve()
+            except OSError:
+                wt_resolved = wt_path
+            if wt_resolved.parent != self.worktree_base:
+                continue
+            if not wt_resolved.name.startswith('_merge-'):
+                continue
+            yield wt_path, wt_resolved
+
     async def prune_stale_merge_worktrees(
         self, keep: Path | None = None,
     ) -> list[str]:
@@ -1234,32 +1268,14 @@ class GitOps:
         live builds.  Only paths that are direct children of ``worktree_base``
         AND whose name starts with ``_merge-`` are eligible, so a task whose id
         happens to start with ``_merge`` cannot be caught (task ids are not
-        prefixed that way).  Enumerates via ``git worktree list --porcelain``
-        rather than globbing the filesystem, so a half-created directory git
+        prefixed that way).  Enumerates via :meth:`_iter_merge_worktrees`
+        (``git worktree list --porcelain``), so a half-created directory git
         doesn't track is never removed.
         """
         removed: list[str] = []
         keep_resolved = keep.resolve() if keep else None
 
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            return removed
-
-        for line in out.splitlines():
-            if not line.startswith('worktree '):
-                continue
-            wt_path = Path(line[len('worktree '):].strip())
-            try:
-                wt_resolved = wt_path.resolve()
-            except OSError:
-                wt_resolved = wt_path
-            if wt_resolved.parent != self.worktree_base:
-                continue
-            if not wt_resolved.name.startswith('_merge-'):
-                continue
+        async for wt_path, wt_resolved in self._iter_merge_worktrees():
             if keep_resolved is not None and wt_resolved == keep_resolved:
                 continue
             rc_rm, _, err = await _run(
@@ -1281,6 +1297,49 @@ class GitOps:
                 'worktree(s)', len(removed),
             )
         return removed
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
+        """Find an on-disk ``_merge-*`` worktree whose HEAD matches *branch*.
+
+        Uses :meth:`_iter_merge_worktrees` to enumerate candidates (direct
+        children of ``worktree_base`` whose name starts with ``_merge-``).
+        For each candidate, reads its HEAD commit subject with
+        ``git log -1 --format=%s`` and compares it by **literal equality** to
+        ``_merge_subject(f'{branch_prefix}{branch}', main_branch)``.
+
+        Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
+        match is found.
+
+        Fail-closed on git errors: a candidate whose ``git log`` fails is
+        skipped (logged at WARNING level) rather than raising — avoids
+        crashing the coalesce dispatch on a partially-written worktree.
+
+        Crash-safety / cross-restart source of truth: even if the in-memory
+        ``InFlightMergeRegistry`` was cleared by a process restart, an
+        in-progress merger's ``_merge-*`` worktree persists on disk and is
+        correctly detected here.
+        """
+        target_subject = _merge_subject(
+            f'{self.config.branch_prefix}{branch}',
+            self.config.main_branch,
+        )
+
+        async for wt_path, _ in self._iter_merge_worktrees():
+            # Read HEAD commit subject of this candidate
+            rc_log, subject, err_log = await _run(
+                ['git', 'log', '-1', '--format=%s'],
+                cwd=wt_path,
+            )
+            if rc_log != 0:
+                logger.warning(
+                    'find_inflight_merge_worktree: git log failed for %s: %s',
+                    wt_path, err_log.strip(),
+                )
+                continue
+            if subject.strip() == target_subject:
+                return wt_path
+
+        return None
 
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #

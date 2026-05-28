@@ -21,7 +21,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
@@ -742,6 +742,105 @@ def _emit_merge_attempt(
         )
 
 
+INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
+"""Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
+to be considered actively in-flight rather than abandoned.
+
+The evidence shows a cold npm+cargo verify can run for 10–20 minutes on the
+first run; the scheduler's /unblock backoff is ~1 hour.  A 1-hour window:
+- Covers any plausible in-progress verify (cold build < 1 h in practice).
+- Matches the /unblock backoff so a backoff-fired re-request still coalesces
+  rather than races if the original verify is still running.
+- Flags as abandoned any ``_merge-*`` worktree that has not been touched for
+  over an hour — safe to reap and replace with a fresh merger.
+
+Adjusted at module level or injected via `liveness_secs` in tests."""
+
+
+@dataclass
+class _InFlightEntry:
+    """Registry slot for a single in-flight merge branch."""
+
+    task_id: str
+    enqueued_monotonic: float  # time.monotonic() at acquire time
+
+
+_INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
+"""Coarse estimate (seconds) for how long a full post-merge verify takes.
+Used ONLY to compute a best-effort ETA for coalesced callers.  NOT a
+guaranteed bound — cold npm+cargo builds vary widely.  Tests must NOT
+assert a specific numeric value for ETA."""
+
+
+class InFlightMergeRegistry:
+    """Per-branch in-flight de-dup registry for the merge-request chokepoint.
+
+    Tracks at most one in-flight merge request per branch (keyed by the bare
+    branch name, e.g. ``"591"`` not ``"task/591"``).  The slot is acquired at
+    dispatch and auto-released when the request's future resolves — via
+    ``Future.add_done_callback`` — so neither MergeWorker nor
+    SpeculativeMergeWorker needs any change.
+
+    Thread safety: all callers run in the same asyncio event loop; the
+    ``acquire`` check-and-set is synchronous so it is race-free within the
+    loop (no ``await`` between the presence check and the dict write).
+    """
+
+    def __init__(self) -> None:
+        self._slots: dict[str, _InFlightEntry] = {}
+
+    def acquire(self, branch: str, task_id: str, future: asyncio.Future) -> bool:
+        """Atomic check-and-set: claim *branch* for *task_id*.
+
+        Returns True if the slot was free and has been claimed; False if
+        *branch* was already in-flight (caller should coalesce).
+
+        On success, registers a ``done_callback`` on *future* so that
+        ``_release(branch)`` fires automatically on every terminal path
+        (result set, exception set, or cancellation).
+        """
+        if branch in self._slots:
+            return False
+        self._slots[branch] = _InFlightEntry(
+            task_id=task_id,
+            enqueued_monotonic=time.monotonic(),
+        )
+        future.add_done_callback(lambda _: self._release(branch))
+        return True
+
+    def is_inflight(self, branch: str) -> bool:
+        """True when *branch* has an active in-flight slot."""
+        return branch in self._slots
+
+    def entry(self, branch: str) -> _InFlightEntry | None:
+        """Return the in-flight entry for *branch*, or None if free."""
+        return self._slots.get(branch)
+
+    def eta_seconds(self, branch: str) -> int | None:
+        """Best-effort ETA (seconds) for the in-flight merge of *branch*.
+
+        Returns ``max(0, ESTIMATE - elapsed)`` as a coarse hint for pollers.
+        This is NOT a guaranteed bound — cold builds vary widely.  Returns
+        None when *branch* is not in-flight.
+        """
+        e = self._slots.get(branch)
+        if e is None:
+            return None
+        elapsed = time.monotonic() - e.enqueued_monotonic
+        remaining = _INFLIGHT_MERGE_ETA_ESTIMATE_SECS - elapsed
+        if remaining <= 0:
+            # Estimate exceeded — return None so callers fall back to a fixed
+            # backoff rather than busy-polling with a saturated 0 estimate.
+            # (ETA window is 600 s; liveness window is 3600 s — a worktree can
+            # legitimately be in-flight long after the ETA estimate runs out.)
+            return None
+        return int(remaining)
+
+    def _release(self, branch: str) -> None:
+        """Remove *branch* from the in-flight registry.  Called by done_callback."""
+        self._slots.pop(branch, None)
+
+
 def _emit_merge_queued(
     event_store: EventStore | None,
     req: MergeRequest,
@@ -784,6 +883,191 @@ async def enqueue_merge_request(
     """
     await queue.put(req)
     _emit_merge_queued(event_store, req)
+
+
+@dataclass
+class MergeDispatchResult:
+    """Structured return value from :func:`coalesce_or_enqueue_merge_request`.
+
+    Attributes:
+        dispatched: True when the request was enqueued (new work item added).
+        in_flight: True when a merge for *branch* was already in-flight and
+            the caller was coalesced rather than enqueued.
+        branch: The bare branch name (e.g. ``"591"``).
+        inflight_task_id: task_id of the existing in-flight merger, or None
+            when dispatched=True.
+        eta_seconds: Best-effort ETA (coarse heuristic, NOT a bound), or None
+            when dispatched=True or eta is unavailable.
+        source: ``'registry'`` (in-memory) or ``'worktree'`` (disk scan),
+            indicating which source detected the in-flight merger.  None when
+            dispatched=True.
+    """
+
+    dispatched: bool
+    in_flight: bool
+    branch: str
+    inflight_task_id: str | None = None
+    eta_seconds: int | None = None
+    source: str | None = None
+
+
+def _emit_merge_coalesced(
+    event_store: EventStore | None,
+    req: MergeRequest,
+    source: str,
+    eta: int | None,
+) -> None:
+    """Emit a merge_coalesced event.  No-op when *event_store* is None.
+
+    Mirrors the ``_emit_merge_queued`` helper so the coalesced path emits
+    an identical-shape record but with ``merge_coalesced`` as the event type.
+    """
+    if event_store is None:
+        return
+    data: dict = {
+        'branch': req.branch,
+        'source': source,
+    }
+    if eta is not None:
+        data['eta_seconds'] = eta
+    event_store.emit(
+        EventType.merge_coalesced,
+        task_id=req.task_id,
+        phase='merge',
+        data=data,
+    )
+
+
+class _FindInflightWorktreeP(Protocol):
+    """Narrow protocol for the disk-scan used by coalesce_or_enqueue_merge_request.
+
+    Only :meth:`find_inflight_merge_worktree` is called on *git_ops* inside
+    :func:`coalesce_or_enqueue_merge_request`.  Declaring the parameter with
+    this Protocol (rather than the concrete :class:`~orchestrator.git_ops.GitOps`)
+    lets test stubs that implement only this method satisfy the type-checker
+    without inheriting from the full ``GitOps`` class.
+    """
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None: ...
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None: ...
+
+
+async def coalesce_or_enqueue_merge_request(
+    queue: asyncio.Queue,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    registry: InFlightMergeRegistry,
+    git_ops: _FindInflightWorktreeP | None = None,
+    *,
+    liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+) -> MergeDispatchResult:
+    """De-dup gate for the merge_request MCP chokepoint.
+
+    Consults two sources of truth to detect an already-in-flight merge for
+    *req.branch*:
+
+    1. **In-memory registry fast-path** — O(1) dict lookup, covers within-
+       process dispatch races (``merge_request`` /unblock spam).
+    2. **On-disk worktree scan** (when *git_ops* is not None) — detects the
+       workflow's in-flight merger whose ``_merge-*`` worktree exists on disk
+       even after a process restart.  Alive worktrees (mtime ≤ liveness_secs)
+       are coalesced; stale/abandoned worktrees are reaped via
+       ``cleanup_merge_worktree`` and a fresh merge is dispatched (step-10).
+
+    Returns a :class:`MergeDispatchResult` with ``dispatched=True`` if the
+    request was enqueued, or ``in_flight=True`` if it was coalesced.
+
+    On coalesce a ``merge_coalesced`` event is emitted so observers can track
+    the de-dup rate without polling the queue depth.
+
+    **NOT** used by workflow.py's single-task or train paths — those call
+    :func:`enqueue_merge_request` directly.  This function is the
+    ``merge_request`` MCP tool's entry point only.
+    """
+    branch = req.branch
+
+    # ── 1. Registry fast-path ──────────────────────────────────────────
+    if registry.is_inflight(branch):
+        eta = registry.eta_seconds(branch)
+        entry = registry.entry(branch)
+        _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+        return MergeDispatchResult(
+            dispatched=False,
+            in_flight=True,
+            branch=branch,
+            inflight_task_id=entry.task_id if entry else None,
+            eta_seconds=eta,
+            source='registry',
+        )
+
+    # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
+    if git_ops is not None:
+        wt = await git_ops.find_inflight_merge_worktree(branch)
+        if wt is not None:
+            try:
+                age = time.time() - wt.stat().st_mtime
+            except OSError:
+                age = 0.0  # stat failed — treat as alive to be safe
+            if age <= liveness_secs:
+                # ALIVE: coalesce without enqueuing or reaping
+                _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
+                return MergeDispatchResult(
+                    dispatched=False,
+                    in_flight=True,
+                    branch=branch,
+                    source='worktree',
+                )
+            else:
+                # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
+                # can be dispatched.  Foreign-process killing is deliberately out
+                # of scope — there is no cwd-based kill utility in the repo
+                # (terminate_process_group only handles procs the orchestrator
+                # spawned), and git worktree remove --force removes the tree so
+                # any orphaned build procs fail when their cwd vanishes.
+                logger.warning(
+                    'coalesce_or_enqueue_merge_request: reaping stale '
+                    '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
+                    wt, branch, age, liveness_secs,
+                )
+                await git_ops.cleanup_merge_worktree(wt)
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.worktree_reaped,
+                        task_id=req.task_id,
+                        phase='merge',
+                        data={'branch': branch, 'path': str(wt), 'reason': 'stale_inflight'},
+                    )
+                # Fall through to acquire-and-enqueue below
+
+    # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
+    if registry.acquire(branch, req.task_id, req.result):
+        try:
+            await enqueue_merge_request(queue, req, event_store)
+        except BaseException:
+            # Slot leak guard: if the enqueue raises (e.g. queue closed,
+            # cancellation) before the worker can ever resolve req.result,
+            # the done_callback will never fire.  Release the slot explicitly
+            # so a future merge_request for this branch can proceed.
+            registry._release(branch)
+            raise
+        return MergeDispatchResult(
+            dispatched=True,
+            in_flight=False,
+            branch=branch,
+        )
+
+    # Concurrent dispatch won the race during the (currently no-op) scan await
+    eta = registry.eta_seconds(branch)
+    entry = registry.entry(branch)
+    _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+    return MergeDispatchResult(
+        dispatched=False,
+        in_flight=True,
+        branch=branch,
+        inflight_task_id=entry.task_id if entry else None,
+        eta_seconds=eta,
+        source='registry',
+    )
 
 
 @dataclass

@@ -3344,3 +3344,89 @@ class TestCreateWorktreeTrain:
         # DESIRED behaviour (γ₁/γ₂): after reuse, base should still be alpha_tip.
         # CURRENT behaviour: rebases onto main → base_commit == main's SHA (not alpha_tip).
         assert reused_info.base_commit == alpha_tip  # ← currently fails → xfail
+
+
+# ---------------------------------------------------------------------------
+# TestFindInflightMergeWorktree
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFindInflightMergeWorktree:
+    """Tests for GitOps.find_inflight_merge_worktree(branch).
+
+    Uses real _merge-* worktrees created by merge_to_main, verified via HEAD
+    subject matching against _merge_subject.
+    """
+
+    async def _make_branch_with_commit(
+        self, git_ops: GitOps, branch: str, filename: str | None = None
+    ) -> WorktreeInfo:
+        """Create a branch worktree, add a file, and commit."""
+        name = filename or f'{branch}.py'
+        wt_info = await git_ops.create_worktree(branch)
+        (wt_info.path / name).write_text(f'# {branch}\n')
+        await git_ops.commit(wt_info.path, f'Add {name}')
+        return wt_info
+
+    async def test_returns_worktree_path_for_matching_branch(
+        self, git_ops: GitOps,
+    ):
+        """find_inflight_merge_worktree returns the _merge-* path for a matching branch."""
+        branch = 'findme'
+        wt_info = await self._make_branch_with_commit(git_ops, branch)
+        result = await git_ops.merge_to_main(wt_info.path, branch)
+        assert result.success, f'merge_to_main failed: {result}'
+
+        try:
+            found = await git_ops.find_inflight_merge_worktree(branch)
+            assert found is not None, 'Expected a merge worktree to be found'
+            assert found == result.merge_worktree
+        finally:
+            if result.merge_worktree is not None:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_returns_none_when_no_merge_worktree_exists(
+        self, git_ops: GitOps,
+    ):
+        """Returns None when no _merge-* worktree exists for the branch."""
+        found = await git_ops.find_inflight_merge_worktree('nonexistent-branch')
+        assert found is None
+
+    async def test_returns_none_for_subject_mismatch(
+        self, git_ops: GitOps,
+    ):
+        """Returns None when a _merge-* worktree exists but for a DIFFERENT branch.
+
+        Specifically 'X0' must NOT match a query for 'X' — guards against
+        substring-safety issues.
+        """
+        branch_x0 = 'prefixbranch0'
+        branch_x = 'prefixbranch'
+
+        wt_info = await self._make_branch_with_commit(git_ops, branch_x0)
+        result = await git_ops.merge_to_main(wt_info.path, branch_x0)
+        assert result.success, f'merge_to_main failed: {result}'
+
+        try:
+            # Searching for 'prefixbranch' must NOT match the 'prefixbranch0' worktree
+            found = await git_ops.find_inflight_merge_worktree(branch_x)
+            assert found is None, (
+                f'Expected None for branch {branch_x!r} but got {found} '
+                f'(merge worktree is for {branch_x0!r})'
+            )
+        finally:
+            if result.merge_worktree is not None:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_ignores_ordinary_task_worktrees(
+        self, git_ops: GitOps,
+    ):
+        """Ordinary task worktrees (not _merge-*) are never returned."""
+        branch = 'ordinary-task'
+        await self._make_branch_with_commit(git_ops, branch)
+        # the created worktree is a task worktree, NOT a _merge-* worktree
+        found = await git_ops.find_inflight_merge_worktree(branch)
+        assert found is None, (
+            f'find_inflight_merge_worktree must ignore task worktrees, got {found}'
+        )

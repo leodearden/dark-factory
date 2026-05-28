@@ -65,6 +65,7 @@ class EventType(StrEnum):
     merge_attempt = 'merge_attempt'
     merge_queued = 'merge_queued'
     merge_dequeued = 'merge_dequeued'
+    merge_coalesced = 'merge_coalesced'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
 

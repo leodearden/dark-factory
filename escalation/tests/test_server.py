@@ -1036,3 +1036,142 @@ class TestPromoteToL2Cascade:
         assert m2 is not None
         assert m1.status == 'dismissed', f'Expected m1 dismissed, got {m1.status!r}'
         assert m2.status == 'dismissed', f'Expected m2 dismissed, got {m2.status!r}'
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestDedup — step-11: merge_request de-dup wiring (server-level)
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_request MCP tool directly."""
+    tool = await server.get_tool('merge_request')
+    return await tool.fn(**kwargs)
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDedup:
+    """Server-level de-dup tests for merge_request.
+
+    The disk-scan path is covered at the merge_queue/git_ops level (steps 7/9).
+    These tests focus on the registry-only path, using an injected
+    InFlightMergeRegistry (new optional create_server param) so no real git
+    repo or worker is needed.
+    """
+
+    def _make_orch_config(self, tmp_path: Path):
+        """Create a minimal OrchestratorConfig without a git remote."""
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        return OrchestratorConfig(project_root=tmp_path)
+
+    def _make_registry(self):
+        from orchestrator.merge_queue import (
+            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        )
+        return InFlightMergeRegistry()
+
+    async def test_in_flight_branch_returns_immediately(self, tmp_path: Path):
+        """merge_request for an already-in-flight branch returns {status:'in_flight'}
+        immediately (no blocking await) and leaves the queue empty.
+
+        Simulates the /unblock-spam scenario: the registry is pre-seeded with
+        branch 'X' via a never-resolving future, so the second call should
+        coalesce rather than enqueue.
+        """
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        # Pre-seed the registry: acquire branch 'X' with a never-resolving future
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future)
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        # Create server with injected registry (new param added in step-12)
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Call merge_request for branch 'X' — should return in_flight immediately
+        # (asyncio.wait_for with 2s proves it does NOT block on the future)
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'in_flight', (
+            f'Expected status in_flight, got: {result}'
+        )
+        assert mq.empty(), (
+            f'Queue should be empty (no enqueue on in_flight), qsize={mq.qsize()}'
+        )
+        # Clean up the never-resolving future to avoid ResourceWarning
+        never_future.cancel()
+
+    async def test_dispatch_resolves_and_releases_registry(self, tmp_path: Path):
+        """merge_request with empty registry enqueues, awaits outcome, and releases the slot.
+
+        A background task dequeues the MergeRequest and resolves its future with
+        MergeOutcome('done'), proving the full dispatch path through the coalesce fn.
+        After resolution, registry.is_inflight(branch) must be False (auto-released
+        via future.add_done_callback).
+        """
+        import asyncio
+
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        async def _worker():
+            """Dequeue the first MergeRequest and resolve its future with 'done'."""
+            req = await mq.get()
+            req.result.set_result(
+                MergeOutcome('done', merge_sha='abc123', reason='test merge')
+            )
+
+        # Start worker before calling merge_request so it can drain the queue
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='Y',
+                branch='Y',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=5.0,
+        )
+
+        await worker_task  # ensure the worker finished cleanly
+
+        assert result.get('status') == 'done', (
+            f'Expected status done, got: {result}'
+        )
+        # After future resolves, the registry slot should be auto-released
+        await asyncio.sleep(0)  # let add_done_callback fire
+        assert not registry.is_inflight('Y'), (
+            'Registry slot should be released after merge completes'
+        )
