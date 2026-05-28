@@ -10,14 +10,13 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-import contextlib
-import sqlite3
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -31,7 +30,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     _check_post_merge_pyright,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures — shared real-git setup (mirrors TestCheckPostMergeEquivalence)
