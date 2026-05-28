@@ -210,6 +210,20 @@ class TestDefaults:
         assert config.review.full_review_min_tasks == 20
         assert config.idle_poll_secs == 15.0
 
+    def test_max_failure_signature_repeat_default(self, monkeypatch, tmp_path):
+        """max_failure_signature_repeat is loaded from defaults.yaml (expected 3).
+
+        The shipped default must equal the defaults.yaml value so the loop-guard
+        cap is consistent whether the operator omits the key or sets it explicitly.
+        Sibling thrash thresholds max_consecutive_infra_resumes and
+        max_consecutive_merge_thrash follow the same pattern.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert config.max_failure_signature_repeat == defaults['max_failure_signature_repeat']
+
 
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
