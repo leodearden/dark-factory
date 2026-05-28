@@ -506,6 +506,11 @@ def create_mcp_server(
             'deferred',
             'cancelled',
             'blocked',
+            # Non-terminal holding state for atomic-train members that have passed
+            # own-verify-green but are waiting for the group merge.
+            # Deliberately excluded from TERMINAL_STATUSES and STATUS_TRIGGERS —
+            # see PRD orchestrator-atomic-train-merge §9.2 and task 1519.
+            'merge-deferred',
         }
     )
     _VALID_STORES = frozenset(v.value for v in SourceStore)
@@ -1854,7 +1859,10 @@ def create_mcp_server(
 
         Args:
             id: Task ID (comma-separated for multiple)
-            status: pending, done, in-progress, blocked, review, deferred, or cancelled
+            status: pending, done, in-progress, blocked, review, deferred, cancelled, or
+                merge-deferred (non-terminal holding state for atomic-train members
+                awaiting group merge; see PRD orchestrator-atomic-train-merge §9.2,
+                task 1519)
             project_root: Absolute path to project root
             tag: Tag context (optional)
             done_provenance: Verified evidence for a done transition; Stage-2
