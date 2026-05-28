@@ -87,6 +87,40 @@ def _extract_df_data_block(src: str, key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: extract a named JS/JSX function body (brace-aware)
+# ---------------------------------------------------------------------------
+
+
+def _extract_function_body(src: str, fn_name: str) -> str:
+    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
+
+    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
+    named ``function`` declarations — not arrow functions or class methods.
+    Returns the empty string if the function is not found.
+
+    This is used to scope token-presence checks to a specific function body
+    rather than searching the entire file (which would give false confidence
+    when a token appears in an unrelated context).
+    """
+    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
+    if m is None:
+        return ''
+    start = src.find('{', m.end())
+    if start == -1:
+        return ''
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return ''
+
+
+# ---------------------------------------------------------------------------
 # Load-order helpers (copied from test_index_html.py)
 # ---------------------------------------------------------------------------
 
@@ -468,20 +502,27 @@ def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body:
         "tab_escalations.jsx does not call usePersistedState with 'df.esc.sort' — "
         "add `const [sort, setSort] = usePersistedState('df.esc.sort', ...)` for persisted sort."
     )
-    # Numeric-aware comparator uses Number()
-    assert 'Number(' in tab_escalations_jsx_body, (
-        "tab_escalations.jsx sort comparator does not use Number( for numeric task_id — "
+    # Numeric-aware comparator uses Number() — scoped to the sortRows function body
+    # so we don't get a false pass from Number() appearing in an unrelated context.
+    sort_fn = _extract_function_body(tab_escalations_jsx_body, 'sortRows')
+    assert sort_fn, (
+        'tab_escalations.jsx does not define a `function sortRows(` — '
+        'add a named sortRows function to sort escalation rows by numeric task_id.'
+    )
+    assert 'Number(' in sort_fn, (
+        "sortRows function does not use Number( for numeric task_id conversion — "
         'add `Number(a.task_id)` / `Number(b.task_id)` for numeric-aware sort.'
     )
-    # Secondary sort key: timestamp
-    assert 'timestamp' in tab_escalations_jsx_body, (
-        "tab_escalations.jsx does not reference 'timestamp' in a sort/compare context — "
+    # Secondary sort key: timestamp — also scoped to sortRows body
+    assert 'timestamp' in sort_fn, (
+        "sortRows function does not reference 'timestamp' — "
         'add timestamp as a secondary sort key in the comparator.'
     )
-    # Direction toggle flips between 'asc' and 'desc'
-    assert "'asc'" in tab_escalations_jsx_body and "'desc'" in tab_escalations_jsx_body, (
-        "tab_escalations.jsx does not reference both 'asc' and 'desc' — "
-        "add a direction toggle that flips sort.dir between 'asc' and 'desc'."
+    # Direction toggle: 'asc'/'desc' must appear in a ternary flip expression,
+    # e.g. `s.dir === 'asc' ? 'desc' : 'asc'` — asserts co-occurrence not just presence.
+    assert re.search(r"'asc'\s*[?:]\s*'desc'|'desc'\s*[?:]\s*'asc'", tab_escalations_jsx_body), (
+        "tab_escalations.jsx does not flip between 'asc' and 'desc' in a ternary — "
+        "add a direction toggle like `s.dir === 'asc' ? 'desc' : 'asc'`."
     )
     # Expand/collapse-all via setAll
     assert 'setAll' in tab_escalations_jsx_body, (
@@ -505,18 +546,24 @@ def test_tab_escalations_global_filter_chips(tab_escalations_jsx_body: str) -> N
         "tab_escalations.jsx does not call usePersistedState with 'df.esc.filter' — "
         "add `const [filter, setFilter] = usePersistedState('df.esc.filter', ...)` for persisted filter."
     )
-    # Level chip values 0, 1, 2
-    for lv in ('0', '1', '2'):
-        assert lv in tab_escalations_jsx_body, (
-            f"tab_escalations.jsx does not reference level '{lv}' in a filter-chip context — "
-            f'add a chip for level {lv} in the controls header.'
-        )
-    # Status chip values
-    for st in ('pending', 'resolved', 'dismissed'):
-        assert st in tab_escalations_jsx_body, (
-            f"tab_escalations.jsx does not reference status '{st}' in a filter-chip context — "
-            f"add a chip for status '{st}' in the controls header."
-        )
+    # Level chip values 0/1/2 appear together as a mapped array, not just lone
+    # digits elsewhere in the file.  The `[0, 1, 2].map(` idiom is the expected
+    # pattern; a bare `0` in a timeout or index gives a false pass with a lone check.
+    assert re.search(r'\[0,\s*1,\s*2\]', tab_escalations_jsx_body), (
+        "tab_escalations.jsx does not render level chips as a mapped [0, 1, 2] array — "
+        "add `[0, 1, 2].map(lv => ...)` for the level filter chips."
+    )
+    # Status chip values: 'pending', 'resolved', 'dismissed' appear in sequence
+    # (i.e. in a single array literal) rather than scattered through the file.
+    assert re.search(
+        r"'pending'[^']*'resolved'[^']*'dismissed'",
+        tab_escalations_jsx_body,
+        re.DOTALL,
+    ), (
+        "tab_escalations.jsx does not list 'pending', 'resolved', 'dismissed' consecutively "
+        "in an array — add `['pending', 'resolved', 'dismissed'].map(st => ...)` for the "
+        "status filter chips."
+    )
     # Filter predicate function references the filter state
     assert 'matchesFilter' in tab_escalations_jsx_body or (
         'filter.levels' in tab_escalations_jsx_body and 'filter.statuses' in tab_escalations_jsx_body
