@@ -18,9 +18,13 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    TRAIN_INCOMPLETE_REASON_PREFIX,
+    TRAIN_PARTIAL_FLIP_REASON_PREFIX,
+    TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
+    GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
@@ -5496,3 +5500,727 @@ class TestPreVerifyDiskGuardWiring:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestDataclass — step-1 structural contract
+# ---------------------------------------------------------------------------
+
+
+class TestGroupMergeRequestDataclass:
+    """Structural contract tests for GroupMergeRequest."""
+
+    def _make_instance(self, config: OrchestratorConfig, tmp_path: Path) -> GroupMergeRequest:
+        """Build a minimal GroupMergeRequest for introspection."""
+        # Use MagicMock instead of a real asyncio.Future to avoid creating (and
+        # leaking) an event loop just to produce a placeholder field value.
+        # These dataclass tests do not exercise async behaviour.
+        future: asyncio.Future[MergeOutcome] = MagicMock(spec=asyncio.Future)
+        status_check_mock = AsyncMock(return_value={})
+        mark_done_mock = AsyncMock()
+        return GroupMergeRequest(
+            task_id='tip-task',
+            branch='tip-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-42',
+            member_task_ids=['task-a', 'task-b', 'task-c'],
+            tip_branch='tip-branch',
+            tip_task_id='tip-task',
+            status_check=status_check_mock,
+            mark_member_done=mark_done_mock,
+        )
+
+    def test_is_subclass_of_merge_request(self):
+        assert issubclass(GroupMergeRequest, MergeRequest)
+
+    def test_instance_isinstance_merge_request(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert isinstance(req, MergeRequest)
+        assert isinstance(req, GroupMergeRequest)
+
+    def test_base_fields_accessible(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert req.task_id == 'tip-task'
+        assert req.branch == 'tip-branch'
+        assert req.worktree == tmp_path
+        assert req.pre_rebased is False
+        assert req.task_files is None
+        assert req.module_configs == []
+        assert req.config is config
+
+    def test_train_fields(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert req.train_id == 'train-42'
+        assert req.member_task_ids == ['task-a', 'task-b', 'task-c']
+        assert req.tip_branch == 'tip-branch'
+        assert req.tip_task_id == 'tip-task'
+
+    def test_callback_fields_callable(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert callable(req.status_check)
+        assert callable(req.mark_member_done)
+
+
+# ---------------------------------------------------------------------------
+# Train helpers (shared by all TestGroupMergeRequest* classes)
+# ---------------------------------------------------------------------------
+
+
+async def _setup_repo_with_config(repo: Path) -> None:
+    """Set git identity in a repo (required for commits)."""
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+
+
+async def _make_stacked_train(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    train_id: str = 'train-test',
+    member_names: tuple[str, str, str] = ('trn-a', 'trn-b', 'trn-c'),
+) -> GroupMergeRequest:
+    """Build a 3-member stacked train in the tmp repo.
+
+    Creates branch A off main, B stacked on A, C (tip) stacked on B.
+    Each branch adds its own unique file (a.py, b.py, c.py).
+
+    Returns a GroupMergeRequest with:
+    - status_check: AsyncMock returning all 'merge-deferred'
+    - mark_member_done: AsyncMock recording (task_id, sha) calls
+    """
+    a_name, b_name, c_name = member_names
+
+    # Branch A: from main
+    wt_a = (await git_ops.create_worktree(a_name)).path
+    (wt_a / f'{a_name}.py').write_text(f'{a_name} = 1\n')
+    await git_ops.commit(wt_a, f'Add {a_name}.py')
+    rc, a_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt_a)
+    a_head = a_head.strip()
+
+    # Branch B: stacked on A's HEAD
+    b_full = f'task/{b_name}'
+    wt_b_path = git_ops.worktree_base / b_name
+    wt_b_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', b_full, str(wt_b_path), a_head],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_b_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_b_path)
+    (wt_b_path / f'{b_name}.py').write_text(f'{b_name} = 2\n')
+    await git_ops.commit(wt_b_path, f'Add {b_name}.py')
+    rc, b_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt_b_path)
+    b_head = b_head.strip()
+
+    # Branch C (tip): stacked on B's HEAD
+    c_full = f'task/{c_name}'
+    wt_c_path = git_ops.worktree_base / c_name
+    wt_c_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', c_full, str(wt_c_path), b_head],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_c_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_c_path)
+    (wt_c_path / f'{c_name}.py').write_text(f'{c_name} = 3\n')
+    await git_ops.commit(wt_c_path, f'Add {c_name}.py')
+
+    # Callbacks
+    status_check = AsyncMock(return_value={
+        a_name: 'merge-deferred',
+        b_name: 'merge-deferred',
+        c_name: 'merge-deferred',
+    })
+    mark_member_done = AsyncMock()
+
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+
+    return GroupMergeRequest(
+        task_id=c_name,
+        branch=c_name,
+        worktree=wt_c_path,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+        train_id=train_id,
+        member_task_ids=[a_name, b_name, c_name],
+        tip_branch=c_name,
+        tip_task_id=c_name,
+        status_check=status_check,
+        mark_member_done=mark_member_done,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestHappyPath (MergeWorker) — step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestHappyPath:
+    """PRD scenario 1: 3-train merges atomically via MergeWorker."""
+
+    async def test_single_merge_commit_all_members_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Happy path: 3-member train → 1 merge commit, 3 callbacks, same SHA."""
+        req = await _make_stacked_train(git_ops, config)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Count merge commits on main before the train lands
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Exactly one new merge commit added to main
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main'
+        )
+
+        # All three member files present on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called exactly 3 times, all with the SAME merge SHA
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
+        )
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+        called_sha = next(iter(called_shas))
+        assert called_sha == outcome.merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestTrainIncomplete (MergeWorker) — step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestTrainIncomplete:
+    """PRD spec §9.6 step 1: non-merge-deferred member → immediate block."""
+
+    async def test_incomplete_member_blocks_before_git(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """One member not merge-deferred → blocked with TRAIN_INCOMPLETE prefix; no git work."""
+        req = await _make_stacked_train(git_ops, config)
+        # Override status_check to return one non-deferred member
+        req.status_check = AsyncMock(return_value={
+            'trn-a': 'merge-deferred',
+            'trn-b': 'in-progress',  # not deferred
+            'trn-c': 'merge-deferred',
+        })
+
+        # Capture main SHA before calling _do_merge
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_before = main_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Spy on merge_to_main: should NOT be called
+        with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX), (
+            f'expected TRAIN_INCOMPLETE prefix, got: {outcome.reason!r}'
+        )
+        # Naming the offending member in the reason
+        assert 'trn-b' in outcome.reason, (
+            f'expected offending member in reason, got: {outcome.reason!r}'
+        )
+        assert 'in-progress' in outcome.reason, (
+            f'expected offending status in reason, got: {outcome.reason!r}'
+        )
+
+        # Main unchanged (no new commits)
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_before, 'main must not advance on incomplete train'
+
+        # No git merge work done
+        spy_merge.assert_not_called()
+
+        # No member callbacks
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestRebaseConflict (MergeWorker) — step-7 RED / step-8 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestRebaseConflict:
+    """PRD scenario 8 conflict variant: tip conflicts with advanced main."""
+
+    async def test_rebase_conflict_blocks_without_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Conflicting main advance → TRAIN_REBASE_CONFLICT, no merge commit, no callbacks."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Commit a conflicting change on main AFTER the train was built.
+        # The tip branch (trn-c) touched trn-c.py; we clobber the same file
+        # on main so the rebase of the tip will conflict.
+        conflict_file = git_ops.project_root / 'trn-c.py'
+        conflict_file.write_text('# main version — conflicts with tip\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Conflicting commit on main'], cwd=git_ops.project_root)
+
+        # Record main SHA (includes the conflicting commit, tip is no longer a descendant)
+        _, main_sha_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_sha_after = main_sha_after.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_REBASE_CONFLICT_REASON_PREFIX), (
+            f'expected TRAIN_REBASE_CONFLICT prefix, got: {outcome.reason!r}'
+        )
+
+        # Main must not have advanced beyond the conflicting commit
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_sha_after, (
+            'main must not advance when rebase conflicts'
+        )
+
+        # No merge work done
+        spy_merge.assert_not_called()
+
+        # No callbacks
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
+
+        # Tip worktree must be clean (rebase was aborted)
+        _, status_out, _ = await _run(
+            ['git', 'status', '--porcelain'], cwd=req.worktree,
+        )
+        assert status_out.strip() == '', f'tip worktree not clean: {status_out!r}'
+        # Must not be mid-rebase
+        assert not (req.worktree / '.git').exists() or not (req.worktree / '.git' / 'rebase-merge').exists(), (
+            'rebase-merge dir exists — rebase was not aborted'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestMainAdvancedClean (MergeWorker) — step-9 RED / step-10 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestMainAdvancedClean:
+    """PRD scenario 8 clean variant: non-conflicting main advance; rebase + merge atomic."""
+
+    async def test_clean_advance_includes_external_commit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Non-conflicting external commit on main → rebase succeeds, train lands, all files present."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Commit an EXTERNAL (non-conflicting) change on main AFTER the train
+        # was built (different file so no rebase conflict on the tip).
+        external_file = git_ops.project_root / 'external.py'
+        external_file.write_text('external = True\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'External non-conflicting commit'], cwd=git_ops.project_root)
+        _, external_sha_out, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        external_sha = external_sha_out.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Main must contain external commit AND all train member files
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'external.py' in main_files
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # The advanced SHA must be a descendant of the external commit
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', external_sha, outcome.merge_sha],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, (
+            f'merge_sha {outcome.merge_sha[:8]} is not a descendant of external commit {external_sha[:8]}'
+        )
+
+        # All members marked done with same SHA
+        assert req.mark_member_done.call_count == 3  # type: ignore[reportFunctionMemberAccess]
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
+        assert len(called_shas) == 1
+        assert next(iter(called_shas)) == outcome.merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestVerifyGate (MergeWorker) — step-11 RED / step-12 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestVerifyGate:
+    """PRD scenario 5 red gate: verify failure → no advance, no callbacks."""
+
+    async def test_red_verify_blocks_advance_and_callbacks(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Post-merge verify fails → blocked, advance_main not called, callbacks silent."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Record main SHA before the attempt
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_before = main_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Patch verify to FAIL
+        mock_verify_fail = AsyncMock(return_value=MagicMock(
+            passed=False,
+            summary='Tests failed: 3 errors',
+            failure_report=MagicMock(return_value='Tests failed: 3 errors'),
+        ))
+        # Spy on advance_main to assert it's never called
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify_fail),
+            patch.object(git_ops, 'advance_main', wraps=git_ops.advance_main) as spy_advance,
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert 'Post-merge verification failed' in outcome.reason, (
+            f'expected verify-gate reason, got: {outcome.reason!r}'
+        )
+
+        # advance_main must NOT have been called
+        spy_advance.assert_not_called()
+
+        # Main must be unchanged
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_before, 'main must not advance on red verify'
+
+        # No member callbacks
+        req.mark_member_done.assert_not_called()  # type: ignore[reportFunctionMemberAccess]
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestSpeculativeWorker — step-13 RED / step-14 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestSpeculativeWorker:
+    """GroupMergeRequest through SpeculativeMergeWorker (the harness's default worker)."""
+
+    async def test_train_lands_via_speculative_worker(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Happy-path 3-train via SpeculativeMergeWorker: done, 1 merge commit, 3 callbacks.
+
+        Drives the same scenario as TestGroupMergeRequestHappyPath but through
+        SpeculativeMergeWorker — the worker the harness actually instantiates.
+
+        Fails before step-14: _merger_loop falls through to the regular single-task
+        path, which does NOT call mark_member_done (no GroupMergeRequest dispatch).
+        """
+        req = await _make_stacked_train(git_ops, config)
+
+        # Count merge commits on main before the train lands
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        db_path = tmp_path / 'events_spec_train.db'
+        event_store = EventStore(db_path=db_path, run_id='test-spec-train')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Exactly one new merge commit added to main
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main'
+        )
+
+        # All three member files present on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called exactly 3 times, all with the SAME merge SHA
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
+        )
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+        assert next(iter(called_shas)) == outcome.merge_sha
+
+        # No speculative_merge event emitted for the train's task_id —
+        # trains bypass the speculative look-ahead path entirely.
+        conn = sqlite3.connect(str(db_path))
+        spec_rows = conn.execute(
+            "SELECT event_type, task_id FROM events "
+            "WHERE event_type = 'speculative_merge' AND task_id = ?",
+            (req.task_id,),
+        ).fetchall()
+        conn.close()
+        assert len(spec_rows) == 0, (
+            f'speculative_merge events must NOT be emitted for GroupMergeRequest; '
+            f'got: {spec_rows}'
+        )
+
+        # merge_attempt event for the train carries train_id and member_task_ids
+        # so downstream reconciliation can correlate rows with the specific train.
+        conn2 = sqlite3.connect(str(db_path))
+        import json as _json
+        done_rows = conn2.execute(
+            "SELECT data FROM events "
+            "WHERE event_type = 'merge_attempt' AND task_id = ?",
+            (req.task_id,),
+        ).fetchall()
+        conn2.close()
+        assert done_rows, 'expected at least one merge_attempt event for the train'
+        done_payloads = [_json.loads(row[0]) for row in done_rows]
+        # The final 'done' event (or any train event) should carry train_id
+        train_events = [p for p in done_payloads if p.get('outcome') == 'done']
+        assert train_events, f'expected a done merge_attempt event; got: {done_payloads}'
+        assert train_events[-1].get('train_id') == req.train_id, (
+            f'done event missing train_id; payload: {train_events[-1]}'
+        )
+        assert train_events[-1].get('member_task_ids') == req.member_task_ids, (
+            f'done event missing member_task_ids; payload: {train_events[-1]}'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    async def test_regular_then_train_both_land(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A regular MergeRequest followed by a GroupMergeRequest both land cleanly.
+
+        Verifies the ordering contract: regular → train → both on main, no
+        split-brain.  Also documents the pipeline-ordering concern (suggestion 1):
+        the train may dequeue while the regular request's CAS is still pending;
+        advance_main retries absorb the race.
+        """
+        # Build the stacked train (3 members)
+        train_req = await _make_stacked_train(git_ops, config)
+
+        # Build a separate single-task request using git_ops.create_worktree
+        # (which creates branch task/<name>, matching how all other tests work).
+        reg_task_id = 'reg-task'
+        reg_file = 'reg-task.py'
+        reg_wt_info = await git_ops.create_worktree(reg_task_id)
+        reg_wt = reg_wt_info.path
+        (reg_wt / reg_file).write_text('# reg\n')
+        await git_ops.commit(reg_wt, f'add {reg_file}')
+        reg_req = _make_request(reg_task_id, reg_task_id, reg_wt, config)
+
+        db_path = tmp_path / 'events_reg_train.db'
+        event_store = EventStore(db_path=db_path, run_id='test-reg-then-train')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(reg_req)
+            reg_outcome = await asyncio.wait_for(reg_req.result, timeout=60)
+            # Now enqueue the train (after regular has resolved, pipeline is idle)
+            await queue.put(train_req)
+            train_outcome = await asyncio.wait_for(train_req.result, timeout=60)
+
+        assert reg_outcome.status == 'done', f'regular request failed: {reg_outcome!r}'
+        assert train_outcome.status == 'done', f'train request failed: {train_outcome!r}'
+
+        # Both the regular file and all train member files must be on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert reg_file in main_files, f'{reg_file} missing from main'
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called 3 times for the train
+        assert train_req.mark_member_done.call_count == 3  # type: ignore[reportFunctionMemberAccess]
+
+        await worker.stop()
+        await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestPartialMemberFlipFailure (MergeWorker) — step-15 RED / step-16 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestPartialMemberFlipFailure:
+    """Guards atomicity invariant when a per-member mark_member_done callback raises
+    AFTER main has advanced.  The worker must NOT produce a split-brain 'blocked'
+    outcome and must attempt all callbacks even when one fails."""
+
+    async def test_partial_flip_failure_after_advance(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """When one mark_member_done callback raises, worker continues all flips,
+        returns 'done' with TRAIN_PARTIAL_FLIP_REASON_PREFIX reason, and main HAS advanced."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Override mark_member_done: 1st OK, 2nd raises, 3rd OK
+        req.mark_member_done = AsyncMock(side_effect=[  # type: ignore[reportFunctionMemberAccess]
+            None,                                    # trn-a: success
+            RuntimeError('scheduler network blip'),  # trn-b: fails
+            None,                                    # trn-c: success
+        ])
+
+        # Count merge commits before
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        # (a) _do_merge returns normally — no exception propagated
+        assert outcome is not None
+
+        # (b) main HAS advanced: one new merge commit, all 3 member files present
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main even when a callback fails'
+        )
+
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # (c) mark_member_done called 3 times (NOT aborted after second failure)
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls (loop must not abort on failure), '
+            f'got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
+        )
+        # All with the same advanced_sha
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+
+        # (d) outcome.status is 'done' (not 'blocked') — main landed
+        assert outcome.status == 'done', (
+            f'expected done (main advanced), got: {outcome!r}'
+        )
+        assert outcome.merge_sha is not None
+        assert outcome.merge_sha == next(iter(called_shas))
+
+        # (e) reason starts with TRAIN_PARTIAL_FLIP_REASON_PREFIX and names
+        #     the failed count and offending member
+        assert outcome.reason is not None, 'partial-flip outcome must carry a reason'
+        assert outcome.reason.startswith(TRAIN_PARTIAL_FLIP_REASON_PREFIX), (
+            f'expected TRAIN_PARTIAL_FLIP prefix, got: {outcome.reason!r}'
+        )
+        assert '1/3' in outcome.reason, (
+            f'expected failed-count ratio (1/3) in reason, got: {outcome.reason!r}'
+        )
+        assert 'trn-b' in outcome.reason, (
+            f'expected offending member task_id (trn-b) in reason, got: {outcome.reason!r}'
+        )
