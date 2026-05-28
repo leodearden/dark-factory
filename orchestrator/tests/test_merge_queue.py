@@ -26,6 +26,7 @@ from orchestrator.merge_queue import (
     DropGuardResult,
     GroupMergeRequest,
     InFlightMergeRegistry,
+    MergeDispatchResult,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
@@ -36,6 +37,7 @@ from orchestrator.merge_queue import (
     _check_post_merge_equivalence,
     _ensure_verify_disk_space,
     _verify_hit_enospc,
+    coalesce_or_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
 
@@ -6620,3 +6622,128 @@ class TestInFlightMergeRegistry:
         result = registry.acquire('606', 'task-606b', fut2)
         assert result is True
         assert registry.is_inflight('606') is True
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueue — registry-only path (git_ops=None)
+# ---------------------------------------------------------------------------
+
+
+def _count_events(db_path, event_type: str) -> int:
+    """Query the EventStore SQLite DB for a specific event type count."""
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            'SELECT COUNT(*) FROM events WHERE event_type = ?', (event_type,),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueRegistryOnly:
+    """Tests for coalesce_or_enqueue_merge_request with git_ops=None.
+
+    Exercises the registry-only fast-path: no disk scan, no worktree
+    creation needed.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'coalesce_events.db'
+        return EventStore(db_path=db, run_id='coalesce-test')
+
+    async def test_first_call_dispatches(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) First call: dispatched=True, in_flight=False, queue has 1 item,
+        registry.is_inflight(branch) is True."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('111', '111', tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.dispatched is True
+        assert result.in_flight is False
+        assert queue.qsize() == 1
+        assert registry.is_inflight('111') is True
+
+    async def test_second_call_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) Second call for same branch: in_flight=True, no duplicate enqueue,
+        merge_coalesced event emitted."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req1 = _make_request('222', '222', tmp_path, config)
+        req2 = _make_request('222', '222', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None,
+        )
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, event_store, registry, git_ops=None,
+        )
+
+        assert result2.in_flight is True
+        assert result2.dispatched is False
+        # No duplicate enqueue
+        assert queue.qsize() == 1
+        # Exactly one merge_coalesced event
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+    async def test_third_call_dispatches_after_release(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) After the first future resolves, a third call dispatches again."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req1 = _make_request('333', '333', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None,
+        )
+
+        # Resolve the first future — releases the registry slot
+        req1.result.set_result(MergeOutcome(status='done'))
+        await asyncio.sleep(0)
+        assert registry.is_inflight('333') is False
+
+        req3 = _make_request('333', '333', tmp_path, config)
+        result3 = await coalesce_or_enqueue_merge_request(
+            queue, req3, event_store, registry, git_ops=None,
+        )
+
+        assert result3.dispatched is True
+        assert result3.in_flight is False
+        assert queue.qsize() == 2  # both requests enqueued (queue not drained)
+
+    async def test_different_branches_always_dispatch(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) Different branches are always dispatched independently."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req_a = _make_request('A', 'branchA', tmp_path, config)
+        req_b = _make_request('B', 'branchB', tmp_path, config)
+
+        result_a = await coalesce_or_enqueue_merge_request(
+            queue, req_a, event_store, registry, git_ops=None,
+        )
+        result_b = await coalesce_or_enqueue_merge_request(
+            queue, req_b, event_store, registry, git_ops=None,
+        )
+
+        assert result_a.dispatched is True
+        assert result_b.dispatched is True
+        assert queue.qsize() == 2
+        # No coalesce events
+        assert _count_events(event_store.db_path, 'merge_coalesced') == 0
