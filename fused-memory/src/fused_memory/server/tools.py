@@ -19,9 +19,14 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
-from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
+from fused_memory.middleware.task_interceptor import (
+    TERMINAL_STATUSES,
+    _is_ticket_id,
+    _looks_like_task_id,
+)
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
@@ -46,8 +51,8 @@ logger = logging.getLogger(__name__)
 # These are intentional duplicates of orchestrator.overrides._SCHEMA and
 # orchestrator.config.PRIORITY_RANK.  fused-memory has no orchestrator
 # dependency in pyproject.toml; adding one would invert the dependency graph.
-# The same "ossified contract" pattern is used for TERMINAL_STATUSES, which
-# are duplicated at fused_memory/middleware/task_interceptor.py:108-112.
+# (TERMINAL_STATUSES and ACTIVE_TASK_STATUSES are imported directly from their
+# canonical homes rather than duplicated here — see _VALID_TASK_STATUSES below.)
 # ---------------------------------------------------------------------------
 
 _OVERRIDE_SCHEMA = """\
@@ -497,17 +502,16 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
-    _VALID_TASK_STATUSES = frozenset(
-        {
-            'pending',
-            'done',
-            'in-progress',
-            'review',
-            'deferred',
-            'cancelled',
-            'blocked',
-        }
-    )
+    # Derived from the authoritative sets so this validator stays in lockstep
+    # automatically when a new status is added to either partition:
+    #   ACTIVE_TASK_STATUSES  — non-terminal in-flight statuses
+    #                           (fused_memory.reconciliation.task_filter)
+    #   TERMINAL_STATUSES     — terminal statuses requiring reopen_reason to exit
+    #                           (fused_memory.middleware.task_interceptor)
+    # Do NOT hardcode this as a literal; use the union so a future status added
+    # to ACTIVE_TASK_STATUSES is automatically accepted here without a separate
+    # edit to this file.
+    _VALID_TASK_STATUSES: frozenset[str] = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
@@ -1838,7 +1842,9 @@ def create_mcp_server(
         reopen_reason: str | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
-        done/blocked/cancelled/deferred transitions.
+        done/blocked/cancelled/deferred transitions. Entering merge-deferred is
+        a non-terminal hold and does NOT trigger reconciliation; the group merge
+        that flips members to done provides the signal.
 
         Reconciliation may: attach memory_hints to the task, write completion
         knowledge to memory stores, or flag dependent tasks that need attention.
@@ -1854,7 +1860,10 @@ def create_mcp_server(
 
         Args:
             id: Task ID (comma-separated for multiple)
-            status: pending, done, in-progress, blocked, review, deferred, or cancelled
+            status: pending, done, in-progress, blocked, review, deferred, cancelled, or
+                merge-deferred (non-terminal holding state for atomic-train members
+                awaiting group merge; see PRD orchestrator-atomic-train-merge §9.2,
+                task 1519)
             project_root: Absolute path to project root
             tag: Tag context (optional)
             done_provenance: Verified evidence for a done transition; Stage-2

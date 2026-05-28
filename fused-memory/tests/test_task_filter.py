@@ -1387,6 +1387,57 @@ class TestStatusPriorityIncludesDone:
                 f"_STATUS_PRIORITY['{status}'] = {_STATUS_PRIORITY[status]}, expected {priority}"
             )
 
+    def test_status_priority_includes_merge_deferred(self):
+        """_STATUS_PRIORITY must contain 'merge-deferred': 6.
+
+        merge-deferred is a non-terminal holding state for atomic-train members
+        (PRD orchestrator-atomic-train-merge §9.2, task 1519). Priority 6 places
+        it at the bottom of the active task list (below deferred=5).
+        """
+        assert 'merge-deferred' in _STATUS_PRIORITY, (
+            "_STATUS_PRIORITY is missing 'merge-deferred' key; task_filter is the source of truth"
+        )
+        assert _STATUS_PRIORITY['merge-deferred'] == 6, (
+            f"Expected _STATUS_PRIORITY['merge-deferred'] == 6, got {_STATUS_PRIORITY['merge-deferred']}"
+        )
+
+
+class TestFilterTaskTreeClassifiesMergeDeferred:
+    """Tests that filter_task_tree correctly classifies 'merge-deferred' as active."""
+
+    def test_filter_task_tree_classifies_merge_deferred_as_active(self):
+        """filter_task_tree must count merge-deferred tasks as active (not other_count).
+
+        merge-deferred is a non-terminal in-flight state — it should appear in
+        active_tasks so operators and reconciliation prompts see holding-state
+        members. Treating it as other_count would under-report in-flight work.
+        PRD orchestrator-atomic-train-merge §9.2, task 1519.
+        """
+        task_tree = {
+            'tasks': [
+                {
+                    'id': '42',
+                    'status': 'merge-deferred',
+                    'title': 'Atomic-train member holding',
+                    'dependencies': [],
+                }
+            ]
+        }
+        result = filter_task_tree(task_tree)
+        assert len(result.active_tasks) == 1, (
+            f"Expected 1 active task for merge-deferred, got {len(result.active_tasks)}"
+        )
+        assert result.active_tasks[0]['id'] == '42'
+        assert result.done_count == 0, (
+            f"Expected done_count=0, got {result.done_count}"
+        )
+        assert result.cancelled_count == 0, (
+            f"Expected cancelled_count=0, got {result.cancelled_count}"
+        )
+        assert result.other_count == 0, (
+            f"Expected other_count=0 for merge-deferred (it is active), got {result.other_count}"
+        )
+
 
 class TestRenderTaskLineAndFormatTaskList:
     """Tests for _render_task_line and format_task_list helpers."""

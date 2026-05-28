@@ -381,6 +381,33 @@ async def test_set_task_status_valid_status_passes_through(
     assert 'error' not in result
 
 
+@pytest.mark.asyncio
+async def test_set_task_status_accepts_merge_deferred(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """set_task_status with 'merge-deferred' passes validation and forwards to the interceptor.
+
+    merge-deferred is the non-terminal holding state for atomic-train members
+    (PRD orchestrator-atomic-train-merge §9.2, task 1519).
+    """
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'merge-deferred'},
+    )
+    assert 'error' not in result, (
+        f"Expected no error for 'merge-deferred', got: {result.get('error')}"
+    )
+    task_interceptor.set_task_status.assert_called_once_with(
+        task_id='1',
+        status='merge-deferred',
+        project_root='/project',
+        tag=None,
+        done_provenance=None,
+        reopen_reason=None,
+    )
+
+
 # ------------------------------------------------------------------
 # trigger_reconciliation without taskmaster
 # ------------------------------------------------------------------

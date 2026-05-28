@@ -3,12 +3,17 @@
 Extracts active tasks from the full raw get_tasks response, partitions them by
 status, sorts by priority, and provides a budget-capped formatter.
 
-Design decision: active status set = {pending, in-progress, blocked, deferred, review}.
+Design decision: active status set = {pending, in-progress, blocked, deferred, review,
+merge-deferred}.
 The task description says 'pending, in-progress, blocked, deferred' explicitly, but
 existing code (_select_proactive_sample, old Stage 2 filter) treats 'review' as active.
 Excluding it would regress proactive-sampling tests.  The task's intent is
 'exclude done/cancelled', so widening to 'not done/cancelled' preserves that
 intent without regressions. (ref: task 455)
+merge-deferred is a non-terminal holding state for atomic-train members that have
+passed own-verify-green and are awaiting the group merge; classifying it as active
+keeps holding-state members visible in reconciliation prompts until done.
+(ref: PRD orchestrator-atomic-train-merge §9.2, task 1519)
 """
 
 from __future__ import annotations
@@ -29,6 +34,11 @@ ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
         'blocked',
         'deferred',
         'review',
+        # Non-terminal holding state for atomic-train members that have passed
+        # own-verify-green and are awaiting the group merge.
+        # Deliberately excluded from TERMINAL_STATUSES and STATUS_TRIGGERS —
+        # see PRD orchestrator-atomic-train-merge §9.2 and task 1519.
+        'merge-deferred',
     }
 )
 
@@ -67,6 +77,10 @@ _STATUS_PRIORITY: dict[str, int] = {
     'pending': 3,
     'done': 4,
     'deferred': 5,
+    # Priority 6: below deferred since merge-deferred members have completed their
+    # own work and need no active operator attention until the group merge.
+    # (PRD orchestrator-atomic-train-merge §9.2, task 1519)
+    'merge-deferred': 6,
 }
 
 
