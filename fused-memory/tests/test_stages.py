@@ -154,6 +154,17 @@ class TestDisallowedToolLists:
         """add_task facade has been removed — the disallow list must no longer reference a non-existent tool."""
         assert 'mcp__fused-memory__add_task' not in DISALLOW_TASK_WRITES
 
+    def test_stage2_blocks_add_subtask(self):
+        """add_subtask must be blocked in Stage 2.
+
+        The orchestrator scheduler is top-level-only (iterates ``tasks`` without
+        descending into ``t['subtasks']``).  Any subtask created during Stage 2
+        reconciliation is permanently invisible to the dispatcher and will never
+        be executed — a silent orphan.  Closing the CREATION path in Stage 2
+        prevents a planning-budget-overflow escalation from re-introducing the
+        trap (see procedural memory fca61c20).
+        """
+        assert 'mcp__fused-memory__add_subtask' in STAGE2_DISALLOWED
 
 
 class TestStageSubclasses:
