@@ -35,6 +35,7 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     files_to_modules,
 )
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -341,6 +342,9 @@ class Harness:
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
         self._orphan_reaper_task: asyncio.Task | None = None
+        # Fire-and-forget async tasks (strong refs prevent GC mid-flight).
+        # Mirrors the active-set + add_done_callback(discard) idiom at line ~856.
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Idle-while-paused state (task 1322 follow-up).  Throttle timestamp for
         # the "alive but paused" WARNING emitted by the main run loop.
@@ -3703,8 +3707,6 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Returns the number of workflows on which a cancel action was taken.
         """
-        from orchestrator.task_status import TERMINAL_STATUSES
-
         active_ids = list(self._workflow_cancel_events.keys())
         if not active_ids:
             return 0
@@ -3846,6 +3848,77 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_worker.unhalt_wip()
             logger.info(
                 'Merge queue un-halted: halt owner %s resolved', escalation.id,
+            )
+
+        # Auto-flip cascade-resolved L1 member task from blocked→pending.
+        # Guarded by level==1 + status=='resolved' + resolved_by startswith 'l2-cascade:'
+        # so it only fires for members of a resolved (not dismissed) L2 cluster.
+        # The wake event.set() above runs synchronously (criterion 8 regression guard);
+        # the flip is scheduled as a separate async task so it never blocks the callback.
+        if (
+            escalation.level == 1
+            and escalation.status == 'resolved'
+            and isinstance(escalation.resolved_by, str)
+            and escalation.resolved_by.startswith('l2-cascade:')
+        ):
+            # asyncio.create_task requires a running event loop. In production
+            # this callback always fires inside the orchestrator loop, so this
+            # is safe. Guard with RuntimeError so an accidental non-loop
+            # invocation (e.g. a sync test helper or future tooling) is
+            # diagnosable rather than swallowed as a generic callback failure
+            # by the queue's try/except wrapper.
+            try:
+                t = asyncio.create_task(self._cascade_unblock_member(escalation))
+                self._background_tasks.add(t)
+                t.add_done_callback(self._background_tasks.discard)
+            except RuntimeError:
+                logger.warning(
+                    'cascade-unblock: no running event loop; cannot schedule '
+                    'flip for task %s (via %s)',
+                    escalation.task_id, escalation.resolved_by,
+                )
+
+    async def _cascade_unblock_member(self, escalation) -> None:
+        """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
+
+        Only 'blocked' tasks are flipped. Every other status — including
+        terminal statuses (done, cancelled), non-terminal live statuses
+        (deferred, in-progress, pending, merge-deferred), and any future
+        status — is DEBUG-skipped. The intent of this feature is purely to
+        unblock 'blocked' tasks; terminal members completing normally while
+        their L2 cluster is still pending is an expected, common outcome and
+        should not produce operator-visible WARNINGs.
+
+        TOCTOU note: get_status and set_task_status are separate MCP
+        round-trips with no atomic compare-and-set. If the task transitions
+        away from 'blocked' between the read and the write (e.g. a workflow
+        picks it up → 'in-progress'), set_task_status('pending') may succeed
+        and clobber the newer status. This is accepted as a best-effort
+        policy; the race window is narrow in practice.
+        """
+        task_id = escalation.task_id
+        status = await self.scheduler.get_status(task_id)
+
+        if status != 'blocked':
+            logger.debug(
+                'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
+                task_id, status, escalation.resolved_by,
+            )
+            return
+
+        # Only 'blocked' reaches here — attempt the flip
+        try:
+            await self.scheduler.set_task_status(task_id, 'pending')
+            logger.info(
+                'cascade-unblock: task %s flipped blocked→pending (via %s)',
+                task_id, escalation.resolved_by,
+            )
+        except SetTaskStatusRejected as e:
+            # Defensive TOCTOU guard: task may have transitioned to a terminal
+            # status between the read and the write.
+            logger.warning(
+                'cascade-unblock: refused to flip %s (TOCTOU race or guard): %s',
+                task_id, e,
             )
 
     def get_merge_halt_status(self) -> dict[str, Any]:
