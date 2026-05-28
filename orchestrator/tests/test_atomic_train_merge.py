@@ -165,8 +165,7 @@ def build_group_merge_request(
     )
     mark_member_done = AsyncMock()
 
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
     return GroupMergeRequest(
         task_id=tip_name,
@@ -351,11 +350,16 @@ class TestScenario1HappyPath:
         assert "crate_b/src/lib.rs" in main_files
         assert "crate_c/src/lib.rs" in main_files
 
-        # Check that the additive symbols appear on main
+        # Check that ALL THREE additive symbols appear on main.
+        # Asserting α, β, AND γ ensures no member is silently dropped by the worker.
         _, lib_a_content, _ = await _run(
             ["git", "show", "main:crate_a/src/lib.rs"], cwd=repo
         )
         assert "alpha_task_output" in lib_a_content
+        _, lib_b_content, _ = await _run(
+            ["git", "show", "main:crate_b/src/lib.rs"], cwd=repo
+        )
+        assert "beta_task_output" in lib_b_content
         _, lib_c_content, _ = await _run(
             ["git", "show", "main:crate_c/src/lib.rs"], cwd=repo
         )
@@ -572,6 +576,54 @@ class TestScenario4ExtraTrainDispatchBlocked:
             "cross-train or plain-task deps)"
         )
 
+    async def test_extra_train_dispatch_blocked_cross_train(self, tmp_path: Path) -> None:
+        """Cross-train case: δ is in T2, α is in T1; intra-train allowance must NOT apply.
+
+        This is the more interesting regression: the intra-train allowance (scheduler.py:1489-1515)
+        checks same train_id; a different train_id must be rejected even though δ carries
+        train metadata.
+        """
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        scheduler = Scheduler(config)
+
+        alpha_task = {
+            "id": "alpha",
+            "title": "Alpha",
+            "description": "",
+            "dependencies": [],
+            "metadata": {"train": {"id": "T1", "order": 0, "members": ["alpha"]}},
+        }
+        # δ is in a DIFFERENT train (T2), depending on α which is in T1.
+        # The intra-train allowance must not fire because train_id differs.
+        delta_task = {
+            "id": "delta",
+            "title": "Delta",
+            "description": "",
+            "dependencies": [{"id": "alpha"}],
+            "metadata": {"train": {"id": "T2", "order": 0, "members": ["delta"]}},
+        }
+
+        status_map = {"alpha": "merge-deferred", "delta": "pending"}
+        tasks_by_id = {"alpha": alpha_task, "delta": delta_task}
+
+        result = scheduler._deps_satisfied(delta_task, status_map, tasks_by_id)
+
+        assert result is False, (
+            "Expected _deps_satisfied to return False for cross-train dep (T2→T1): "
+            "intra-train allowance must only apply within the SAME train_id"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Scenario 5 (group merge gate = workspace verify) — step-5 RED / step-6 GREEN
@@ -663,7 +715,15 @@ class TestScenario5GroupMergeVerify:
             f"got: {merge_verify_calls[0]['kwargs']}"
         )
 
-        # (iii) All 3 mark_member_done fired.
+        # (iii) All THREE member edits present on main (α, β, γ — no member silently dropped).
+        _, lib_a5, _ = await _run(["git", "show", "main:crate_a/src/lib.rs"], cwd=repo)
+        assert "alpha5_output" in lib_a5
+        _, lib_b5, _ = await _run(["git", "show", "main:crate_b/src/lib.rs"], cwd=repo)
+        assert "beta5_output" in lib_b5
+        _, lib_c5, _ = await _run(["git", "show", "main:crate_c/src/lib.rs"], cwd=repo)
+        assert "gamma5_output" in lib_c5
+
+        # (iv) All 3 mark_member_done fired.
         assert req.mark_member_done.call_count == 3, (  # type: ignore[union-attr]
             f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
@@ -781,20 +841,21 @@ def _make_verify_failure(
     )
 
 
-def _make_train_workflow(
+def _make_workflow(
     config: OrchestratorConfig,
     git_ops: GitOps,
     task_id: str,
-    train_meta: dict,
-    get_statuses_return: tuple[dict[str, str], Exception | None],
     worktree: Path,
+    *,
+    train_meta: dict | None = None,
+    get_statuses_return: tuple[dict[str, str], Exception | None] = ({}, None),
     merge_queue: asyncio.Queue | None = None,
     tasks_by_train_return: list[dict] | None = None,
 ) -> tuple:
-    """Build a minimally-wired TaskWorkflow for a train member.
+    """Build a minimally-wired TaskWorkflow for any task (train or plain).
 
-    Reuses the _make_workflow pattern from test_workflow_signature_loop_guard.py,
-    adapted for train metadata and compatible with both loop-guard and δ₂-trigger tests.
+    Reuses the _make_workflow pattern from test_workflow_signature_loop_guard.py.
+    When *train_meta* is None the task has no 'train' key (plain non-train task).
     Returns (workflow, scheduler_mock).
     """
     from orchestrator.agents.invoke import AgentResult
@@ -803,10 +864,11 @@ def _make_train_workflow(
 
     assignment = MagicMock()
     assignment.task_id = task_id
+    metadata: dict = {"train": train_meta} if train_meta is not None else {}
     assignment.task = {
         "id": task_id, "title": task_id, "description": "",
         "status": "in-progress",
-        "metadata": {"train": train_meta},
+        "metadata": metadata,
     }
     assignment.modules = []
 
@@ -845,61 +907,33 @@ def _make_train_workflow(
     return wf, scheduler
 
 
+# Back-compat shims so existing call-sites keep working unchanged.
+def _make_train_workflow(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_id: str,
+    train_meta: dict,
+    get_statuses_return: tuple[dict[str, str], Exception | None],
+    worktree: Path,
+    merge_queue: asyncio.Queue | None = None,
+    tasks_by_train_return: list[dict] | None = None,
+) -> tuple:
+    return _make_workflow(
+        config, git_ops, task_id, worktree,
+        train_meta=train_meta,
+        get_statuses_return=get_statuses_return,
+        merge_queue=merge_queue,
+        tasks_by_train_return=tasks_by_train_return,
+    )
+
+
 def _make_plain_workflow(
     config: OrchestratorConfig,
     git_ops: GitOps,
     task_id: str,
     worktree: Path,
 ) -> tuple:
-    """Build a minimally-wired TaskWorkflow for a plain (non-train) task.
-
-    Equivalent to _make_train_workflow but with no train metadata in the task.
-    Returns (workflow, scheduler_mock).
-    """
-    from orchestrator.agents.invoke import AgentResult
-    from orchestrator.artifacts import TaskArtifacts
-    from orchestrator.workflow import TaskWorkflow
-
-    assignment = MagicMock()
-    assignment.task_id = task_id
-    assignment.task = {
-        "id": task_id, "title": task_id, "description": "",
-        "status": "in-progress",
-        "metadata": {},  # ← no 'train' key — this is a plain task
-    }
-    assignment.modules = []
-
-    scheduler = MagicMock()
-    scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    scheduler.mark_done = AsyncMock()
-    scheduler.tasks_by_train = AsyncMock(return_value=[])
-    scheduler.update_task = AsyncMock(return_value=True)
-
-    wf = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=MagicMock(),
-        mcp=MagicMock(),
-        merge_queue=None,
-    )
-    wf.worktree = worktree
-    wf.event_store = None
-
-    artifacts = TaskArtifacts(worktree)
-    artifacts.init(task_id, task_id, "desc", base_commit="base-sha")
-    wf.artifacts = artifacts
-    wf.plan = {"task_id": task_id, "steps": []}
-    wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
-    wf.briefing.build_debugger_prompt = AsyncMock(return_value="debug")  # type: ignore[attr-defined]
-    wf._invoke = AsyncMock(  # type: ignore[method-assign]
-        return_value=AgentResult(success=True, output=""),
-    )
-    wf._get_head_commit = AsyncMock(return_value="head-sha")  # type: ignore[method-assign]
-    wf._inter_iteration_rebase = AsyncMock(return_value=None)  # type: ignore[method-assign]
-
-    return wf, scheduler
+    return _make_workflow(config, git_ops, task_id, worktree)
 
 
 @pytest.mark.asyncio
@@ -913,21 +947,19 @@ class TestScenario6ParkPrefixDerail:
     (iii) _reap_orphan_worktrees: α/β worktrees survive (live ids, not reaped).
     """
 
-    async def test_park_prefix_derail(
+    async def test_loop_guard_signature_blocks(
         self,
         tmp_path: Path,
         monkeypatch,
         caplog,
-        mock_orch_config,
     ) -> None:
-        """Three-part park-prefix derail assertion."""
+        """(i) 3× identical-signature failures → BLOCKED (γ₂ loop-guard)."""
         import logging
 
         from orchestrator.workflow import WorkflowOutcome
 
-        # ── Part (i): loop-guard — 3× identical-sig failures → BLOCKED ─────
         # Set up a minimal git repo so create_worktree works.
-        repo6 = tmp_path / "repo6"
+        repo6 = tmp_path / "repo6_lg"
         repo6.mkdir()
         await _run(["git", "init", "-b", "main"], cwd=repo6)
         await _run(["git", "config", "user.email", "test@test.com"], cwd=repo6)
@@ -951,29 +983,27 @@ class TestScenario6ParkPrefixDerail:
         git_ops6 = GitOps(config6.git, repo6)
 
         # Create γ's worktree.
-        wt_info = await git_ops6.create_worktree("gamma6")
+        wt_info = await git_ops6.create_worktree("gamma6lg")
         wt_gamma = wt_info.path
 
-        # γ has train metadata: id=T6, order=2, members=[alpha6,beta6,gamma6].
         train_meta6 = {"id": "T6", "order": 2, "members": ["alpha6", "beta6", "gamma6"]}
-        # α/β are parked (merge-deferred); γ is blocked (failing member).
         get_statuses6 = (
             {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
             None,
         )
-
-        wf6, sched6 = _make_train_workflow(
-            config6, git_ops6, "gamma6", train_meta6, get_statuses6, wt_gamma,
+        wf6, _ = _make_train_workflow(
+            config6, git_ops6, "gamma6lg", train_meta6, get_statuses6, wt_gamma,
         )
 
-        # Inject 3 identical-signature failures: same category + cause_hint
+        # Inject exactly 3 identical-signature failures: same category + cause_hint
         # differing only in file:line (normaliser strips the line number).
+        # Exactly 3 — StopIteration surfaces guard regressions cleanly.
         failures = [
             _make_verify_failure("test_failure", "FAILED tests/test_x.py:42 AssertionError"),
             _make_verify_failure("test_failure", "FAILED tests/test_x.py:99 AssertionError"),
             _make_verify_failure("test_failure", "FAILED tests/test_x.py:155 AssertionError"),
         ]
-        verify_mock = AsyncMock(side_effect=failures * 2)  # provide extra to ensure guard fires at 3
+        verify_mock = AsyncMock(side_effect=failures)
         monkeypatch.setattr("orchestrator.workflow.run_scoped_verification", verify_mock)
 
         with caplog.at_level(logging.WARNING, logger="orchestrator.workflow"):
@@ -991,9 +1021,47 @@ class TestScenario6ParkPrefixDerail:
             f"expected WARNING about consecutive identical failures; got: {warning_text!r}"
         )
 
-        # ── Part (ii): _build_train_state → {id:T6, order:2, parked:[α,β], failing:γ} ─
-        # Reuse the same workflow (already has train metadata + scheduler mock).
-        train_state = await wf6._build_train_state()
+    async def test_build_train_state_reports_parked_failing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """(ii) _build_train_state returns {id:T6, order:2, parked:[α,β], failing:γ}."""
+        # Set up a minimal git repo so create_worktree works.
+        repo6b = tmp_path / "repo6_bts"
+        repo6b.mkdir()
+        await _run(["git", "init", "-b", "main"], cwd=repo6b)
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=repo6b)
+        await _run(["git", "config", "user.name", "Test"], cwd=repo6b)
+        (repo6b / "README.md").write_text("# repo6b\n")
+        await _run(["git", "add", "-A"], cwd=repo6b)
+        await _run(["git", "commit", "-m", "initial"], cwd=repo6b)
+
+        config6b = OrchestratorConfig(
+            project_root=repo6b,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        git_ops6b = GitOps(config6b.git, repo6b)
+
+        wt_info = await git_ops6b.create_worktree("gamma6")
+        wt_gamma = wt_info.path
+
+        train_meta6 = {"id": "T6", "order": 2, "members": ["alpha6", "beta6", "gamma6"]}
+        # α/β are parked (merge-deferred); γ is the failing member (blocked).
+        get_statuses6 = (
+            {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
+            None,
+        )
+        wf6b, _ = _make_train_workflow(
+            config6b, git_ops6b, "gamma6", train_meta6, get_statuses6, wt_gamma,
+        )
+
+        train_state = await wf6b._build_train_state()
 
         assert train_state is not None, "_build_train_state must return a dict for train task"
         assert train_state["id"] == "T6", f"train id mismatch: {train_state!r}"
@@ -1005,8 +1073,12 @@ class TestScenario6ParkPrefixDerail:
             f"expected failing_member=gamma6, got {train_state['failing_member']!r}"
         )
 
-        # ── Part (iii): reaper sweep skips α/β worktrees (live merge-deferred) ─
-        # Build a Harness using mock_orch_config (conftest fixture).
+    async def test_reaper_skips_live_merge_deferred(
+        self,
+        tmp_path: Path,
+        mock_orch_config,
+    ) -> None:
+        """(iii) Reaper sweep skips α/β worktrees (live merge-deferred status)."""
         from orchestrator.harness import Harness
 
         with (
@@ -1160,15 +1232,9 @@ class TestScenario7TrainResume:
             # the GroupMergeRequest and awaits the future.
             enqueue_task = asyncio.create_task(wf7._maybe_enqueue_group_merge())
 
-            # Yield control so the task can call tasks_by_train + enqueue.
-            await asyncio.sleep(0)
-
-            # Extract the enqueued GroupMergeRequest.
-            assert not merge_q.empty(), (
-                "_maybe_enqueue_group_merge must enqueue a GroupMergeRequest "
-                "when all members are merge-deferred and self is the tip"
-            )
-            req7 = merge_q.get_nowait()
+            # Use wait_for instead of sleep(0)+get_nowait: deterministic regardless
+            # of how many internal awaits the implementation does before enqueuing.
+            req7 = await asyncio.wait_for(merge_q.get(), timeout=2.0)
             assert isinstance(req7, GroupMergeRequest), (
                 f"expected GroupMergeRequest in queue, got {type(req7).__name__}"
             )
@@ -1325,9 +1391,11 @@ class TestScenario8MainAdvances:
         assert "crate_b/src/lib.rs" in main_files
         assert "crate_c/src/lib.rs" in main_files
 
-        # Check member edits on main.
+        # Check ALL THREE member edits on main (α, β, γ — no member silently dropped).
         _, lib_a, _ = await _run(["git", "show", "main:crate_a/src/lib.rs"], cwd=repo)
         assert "alpha8c_output" in lib_a
+        _, lib_b, _ = await _run(["git", "show", "main:crate_b/src/lib.rs"], cwd=repo)
+        assert "beta8c_output" in lib_b
         _, lib_c, _ = await _run(["git", "show", "main:crate_c/src/lib.rs"], cwd=repo)
         assert "gamma8c_output" in lib_c
 
@@ -1540,7 +1608,8 @@ class TestScenario9LoopGuardNonTrain:
             _make_verify_failure("test_failure", "FAILED tests/test_plain.py:20 AssertionError"),
             _make_verify_failure("test_failure", "FAILED tests/test_plain.py:30 AssertionError"),
         ]
-        verify_mock9 = AsyncMock(side_effect=failures9 * 2)
+        # Exactly 3 failures — StopIteration surfaces guard regressions cleanly.
+        verify_mock9 = AsyncMock(side_effect=failures9)
         monkeypatch.setattr("orchestrator.workflow.run_scoped_verification", verify_mock9)
 
         with caplog.at_level(logging.WARNING, logger="orchestrator.workflow"):
@@ -1649,8 +1718,7 @@ def _build_plain_merge_request(
 
     branch is the unprefixed task_id; merge_to_main prepends branch_prefix internally.
     """
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
         branch=task_id,
