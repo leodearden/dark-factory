@@ -4,7 +4,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import pydantic_spec
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
 
 # ---------------------------------------------------------------------------
@@ -17,7 +19,7 @@ class TestRunVerifyZombieEdgesDelegation:
     @pytest.mark.asyncio
     async def test_delegates_to_maintenance_service(self, make_fake_maintenance_service):
         """run_verify_zombie_edges() calls maintenance_service(config_path) and uses yielded service.graphiti."""
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = VerifyResult(found=['u1'], missing=[], deleted=0)
