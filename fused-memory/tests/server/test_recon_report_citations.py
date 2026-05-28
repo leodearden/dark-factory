@@ -593,6 +593,95 @@ class TestCiteMemory:
 
 
 # ---------------------------------------------------------------------------
+# step-13: TestCiteMemoryExceptionNarrowing — RED until step-14 narrows except
+# ---------------------------------------------------------------------------
+
+
+class TestCiteMemoryExceptionNarrowing:
+    """Verify cite_memory catches ONLY (EdgeNotFoundError, MemoryNotFoundError).
+
+    After step-14 narrows the except clause, KeyError and ValueError must
+    propagate out of cite_memory instead of being silently swallowed as
+    memory_not_found.
+    """
+
+    _VALID_UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+
+    def _state_and_finding(self, memory_raises):
+        fake = _FakeMemoryService(memory_raises=memory_raises)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+        return state, run_id, finding_id
+
+    @pytest.mark.asyncio
+    async def test_memory_not_found_error_caught_as_memory_not_found(self):
+        """MemoryNotFoundError → {error:'memory_not_found'} and cited_memories unchanged.
+
+        RED until step-14 defines MemoryNotFoundError in memory_service.py.
+        """
+        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=MemoryNotFoundError('not-found')
+        )
+
+        result = await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
+
+        assert result.get('error') == 'memory_not_found'
+        assert result.get('error_type') == 'ReconReportMemoryNotFound'
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
+    @pytest.mark.asyncio
+    async def test_edge_not_found_error_caught_as_memory_not_found_graphiti_parity(self):
+        """EdgeNotFoundError from get_memory (graphiti path) → memory_not_found (parity)."""
+        from graphiti_core.errors import EdgeNotFoundError
+
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=EdgeNotFoundError('not found')
+        )
+
+        result = await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
+
+        assert result.get('error') == 'memory_not_found'
+        assert result.get('error_type') == 'ReconReportMemoryNotFound'
+
+    @pytest.mark.asyncio
+    async def test_key_error_propagates_not_silenced(self):
+        """KeyError from get_memory must propagate — not be caught as memory_not_found.
+
+        RED until step-14 narrows the except clause (current code catches KeyError).
+        """
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=KeyError('transient mem0 bug')
+        )
+
+        with pytest.raises(KeyError):
+            await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
+    @pytest.mark.asyncio
+    async def test_value_error_propagates_not_silenced(self):
+        """ValueError from get_memory must propagate — not be caught as memory_not_found.
+
+        RED until step-14 narrows the except clause (current code catches ValueError).
+        """
+        state, run_id, finding_id = self._state_and_finding(
+            memory_raises=ValueError('unrelated graphiti error')
+        )
+
+        with pytest.raises(ValueError):
+            await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        assert report['flagged_items'][0]['cited_memories'] == []
+
+
+# ---------------------------------------------------------------------------
 # step-9: TestCiteToolsViaFastMCP + TestReconReportComponentsWiring
 #         RED until step-10 registers the tools and extends _build_recon_report_components
 # ---------------------------------------------------------------------------
