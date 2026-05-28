@@ -18,9 +18,12 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    TRAIN_INCOMPLETE_REASON_PREFIX,
+    TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
+    GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
@@ -5496,3 +5499,73 @@ class TestPreVerifyDiskGuardWiring:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestDataclass — step-1 structural contract
+# ---------------------------------------------------------------------------
+
+
+class TestGroupMergeRequestDataclass:
+    """Structural contract tests for GroupMergeRequest."""
+
+    def _make_instance(self, config: OrchestratorConfig, tmp_path: Path) -> GroupMergeRequest:
+        """Build a minimal GroupMergeRequest for introspection."""
+        loop = asyncio.new_event_loop()
+        future: asyncio.Future[MergeOutcome] = loop.create_future()
+        status_check_mock = AsyncMock(return_value={})
+        mark_done_mock = AsyncMock()
+        return GroupMergeRequest(
+            task_id='tip-task',
+            branch='tip-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-42',
+            member_task_ids=['task-a', 'task-b', 'task-c'],
+            tip_branch='tip-branch',
+            tip_task_id='tip-task',
+            status_check=status_check_mock,
+            mark_member_done=mark_done_mock,
+        )
+
+    def test_is_subclass_of_merge_request(self):
+        assert issubclass(GroupMergeRequest, MergeRequest)
+
+    def test_instance_isinstance_merge_request(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert isinstance(req, MergeRequest)
+        assert isinstance(req, GroupMergeRequest)
+
+    def test_base_fields_accessible(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert req.task_id == 'tip-task'
+        assert req.branch == 'tip-branch'
+        assert req.worktree == tmp_path
+        assert req.pre_rebased is False
+        assert req.task_files is None
+        assert req.module_configs == []
+        assert req.config is config
+
+    def test_train_fields(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert req.train_id == 'train-42'
+        assert req.member_task_ids == ['task-a', 'task-b', 'task-c']
+        assert req.tip_branch == 'tip-branch'
+        assert req.tip_task_id == 'tip-task'
+
+    def test_callback_fields_callable(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        req = self._make_instance(config, tmp_path)
+        assert callable(req.status_check)
+        assert callable(req.mark_member_done)
