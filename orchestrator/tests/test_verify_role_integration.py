@@ -56,9 +56,40 @@ pytestmark = pytest.mark.skipif(
 def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
     """Run reify verify.sh --print-plan test and return stdout.
 
-    Implemented in step-2; raises NotImplementedError until then.
+    Merges verify_env onto os.environ before spawning — mirrors orchestrator's
+    _run_cmd merge (verify.py:1131) so the child inherits a working PATH for
+    nice/ionice/cargo/git/bash plus the injected DF_VERIFY_ROLE.
+
+    Invokes the script directly; falls back to `bash <script>` if the +x bit
+    is absent in this checkout.
     """
-    raise NotImplementedError("harness implemented in step-2")
+    reify_root = REIFY_VERIFY_SH.parents[1]
+    child_env = {**os.environ, **verify_env}
+
+    try:
+        result = subprocess.run(
+            [str(REIFY_VERIFY_SH), "--print-plan", "test"],
+            env=child_env,
+            cwd=str(reify_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except PermissionError:
+        # Script lacks +x bit in this checkout — fall back to bash invocation.
+        result = subprocess.run(
+            ["bash", str(REIFY_VERIFY_SH), "--print-plan", "test"],
+            env=child_env,
+            cwd=str(reify_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    assert result.returncode == 0, (
+        f"verify.sh --print-plan exited {result.returncode}; stderr:\n{result.stderr}"
+    )
+    return result.stdout
 
 
 # ---------------------------------------------------------------------------
