@@ -7154,3 +7154,82 @@ class TestSpeculationRaceRetry:
 
         # item.failure_diagnostic must mirror outcome.failure_diagnostic
         assert item.failure_diagnostic == diag
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_base_is_actual_main(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """No retry when base_sha == actual main (genuine main-HEAD failure, not a race).
+
+        When merge_result.pre_merge_sha == actual_main (the merge ran against
+        the real current main), the load-bearing stderr alone must NOT trigger a
+        retry. Only exactly ONE merge_to_main call must be made, and the returned
+        item must be a single-diagnostic blocked outcome (no first_attempt_* keys).
+
+        Also asserts that a non-load-bearing failure with a stale base also
+        yields exactly one call.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        actual_main = await git_ops.get_main_sha()
+        branch = 'no-retry-main'
+        worktree = await _make_branch_with_file(git_ops, branch, 'no_retry.py', 'z = 3\n')
+        req = _make_request('no-retry', branch, worktree, config)
+
+        # Case 1: load-bearing stderr but pre_merge_sha == actual main (not a race)
+        call_count = 0
+
+        async def fake_base_is_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            return MergeResult(
+                success=False, conflicts=False,
+                details=f'merge: task/{br} - not something we can merge',
+                pre_merge_sha=actual_main,  # base == actual main → not a race
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_base_is_main)
+        item = await worker._remerge(req, None)
+
+        assert call_count == 1, (
+            f'Expected exactly 1 call (base==main, not a race), got {call_count}'
+        )
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'blocked'
+        # Must NOT have first_attempt_* keys (single-attempt diagnostic)
+        diag = item.immediate_outcome.failure_diagnostic
+        assert diag is not None
+        assert 'first_attempt_base_sha' not in diag, (
+            f'Unexpected first_attempt_base_sha in diag for non-race failure: {diag!r}'
+        )
+
+        # Case 2: non-load-bearing stderr with stale base → no retry either
+        call_count = 0
+        branch2 = 'no-retry-stale-ok'
+        worktree2 = await _make_branch_with_file(git_ops, branch2, 'no_retry2.py', 'w = 4\n')
+        req2 = _make_request('no-retry-2', branch2, worktree2, config)
+
+        async def fake_non_loadbearing(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            return MergeResult(
+                success=False, conflicts=False,
+                details='fatal: refusing to merge unrelated histories',
+                pre_merge_sha='0' * 40,  # stale base, but NOT the race phrase
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_non_loadbearing)
+        item2 = await worker._remerge(req2, None)
+
+        assert call_count == 1, (
+            f'Expected 1 call (non-race stderr), got {call_count}'
+        )
+        assert item2.immediate_outcome is not None
+        assert item2.immediate_outcome.status == 'blocked'
+        diag2 = item2.immediate_outcome.failure_diagnostic
+        assert diag2 is not None
+        assert 'first_attempt_base_sha' not in diag2
