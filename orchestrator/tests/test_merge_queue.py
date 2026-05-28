@@ -7479,3 +7479,67 @@ class TestSpeculationRaceRetry:
             'run_scoped_verification must be invoked on a race-retry success '
             '(skip_verify=False); verification was skipped.'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTrainLifecycleEvents — train_* event emission integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainLifecycleEvents:
+    """Assert train_started, train_merged, train_derailed, and train_member_deferred
+    are emitted by _do_train_merge at the correct points."""
+
+    async def test_happy_path_emits_train_started_and_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Happy-path 3-member train → train_started then train_merged emitted."""
+        from orchestrator.event_store import EventStore, EventType
+
+        req = await _make_stacked_train(git_ops, config)
+        db_path = tmp_path / 'train_events.db'
+        event_store = EventStore(db_path=db_path, run_id='train-lifecycle-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_merged') ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert 'train_started' in event_types, f'Missing train_started in {event_types}'
+        assert 'train_merged' in event_types, f'Missing train_merged in {event_types}'
+
+        # train_started must come before train_merged (by id order)
+        started_idx = event_types.index('train_started')
+        merged_idx = event_types.index('train_merged')
+        assert started_idx < merged_idx, 'train_started must precede train_merged'
+
+        # Verify train_started payload
+        import json
+        started_row = rows[started_idx]
+        assert started_row[1] == req.task_id  # task_id
+        assert started_row[2] == 'merge'  # phase
+        started_data = json.loads(started_row[3])
+        assert started_data['train_id'] == req.train_id
+        assert started_data['member_task_ids'] == req.member_task_ids
+        assert started_data['member_count'] == 3
+        assert started_data['base_sha'], 'base_sha must be non-empty'
+
+        # Verify train_merged payload
+        merged_row = rows[merged_idx]
+        merged_data = json.loads(merged_row[3])
+        assert merged_data['train_id'] == req.train_id
+        assert merged_data['merge_commit_sha'], 'merge_commit_sha must be non-empty'
+        assert merged_data['base_sha'], 'base_sha must be non-empty'
