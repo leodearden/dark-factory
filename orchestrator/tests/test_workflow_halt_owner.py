@@ -78,7 +78,11 @@ def fake_worker() -> _FakeMergeWorker:
 
 
 @pytest.fixture
-def workflow(tmp_path: Path, fake_worker: _FakeMergeWorker) -> TaskWorkflow:
+def workflow(
+    tmp_path: Path,
+    fake_worker: _FakeMergeWorker,
+    mock_orch_config: MagicMock,
+) -> TaskWorkflow:
     """Minimal TaskWorkflow wired for halt-owner cancellation tests.
 
     Uses a real EscalationQueue (rooted at tmp_path) so submit/make_id work
@@ -98,12 +102,11 @@ def workflow(tmp_path: Path, fake_worker: _FakeMergeWorker) -> TaskWorkflow:
         },
         modules=[],  # empty → _resolve_module_configs returns [] without calling config.for_module
     )
-    config = MagicMock()
     git_ops = MagicMock()
     escalation_event = asyncio.Event()
     return TaskWorkflow(
         assignment=assignment,
-        config=config,
+        config=mock_orch_config,
         git_ops=git_ops,
         scheduler=FakeScheduler(),  # type: ignore[arg-type]
         briefing=FakeBriefing(),    # type: ignore[arg-type]
