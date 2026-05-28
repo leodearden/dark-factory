@@ -77,6 +77,34 @@ def _is_conftest(path: str) -> bool:
     return path.rsplit('/', 1)[-1] == 'conftest.py'
 
 
+# Matches a class that inherits from Protocol or TypedDict (as a base class).
+# Deliberately a cheap content grep rather than an AST parse: structural files
+# almost always use the canonical ``class Foo(Protocol):`` /
+# ``class Bar(TypedDict):`` form, and the cost of a rare false positive (an
+# extra package-wide pyright run) is far cheaper than missing a cross-file
+# invariance break caused by scoping pyright to only the changed file.
+_PROTOCOL_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bProtocol\b')
+_TYPEDDICT_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bTypedDict\b')
+
+
+def _is_structural_python_file(path: str, content: str) -> bool:
+    """Return True when *path* defines a Protocol or TypedDict subclass.
+
+    A deliberately cheap content grep (not an AST parse): matches
+    ``class Foo(Protocol):`` and ``class Bar(TypedDict):`` patterns including
+    multi-base forms such as ``class Foo(Base, Protocol):``.
+
+    Cross-file invariant trap: pyright scoped to a single file cannot verify
+    that all implementors of a Protocol still conform after the Protocol's
+    definition widens.  Returning True causes ``scope_module_config`` to fall
+    back to the full package-wide type-check command so pyright sees the
+    complete picture.
+    """
+    if not path.endswith('.py'):
+        return False
+    return bool(_PROTOCOL_RE.search(content) or _TYPEDDICT_RE.search(content))
+
+
 def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
     """Remove ``--directory <module_prefix>`` from a ``uv run`` command.
 
