@@ -285,3 +285,50 @@ def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp
     assert recon_row['project'] == 'projA'
     assert recon_row['task']['title'] == 'wired'
     assert recon_row['task_unresolved'] is False
+
+
+def test_load_task_cards_caches_within_ttl(client, tmp_path):
+    """_load_task_cards: cache hit within TTL + offline result not cached."""
+    from dashboard.app import _task_cards_cache_clear
+
+    proj_a = tmp_path / 'projA'
+    orch_sub = {
+        'id': str(proj_a),
+        'label': 'projA',
+        'kind': 'orchestrator',
+        'escalations': [],
+        'summary': _EMPTY_SUMMARY,
+    }
+    recon_sub = {
+        'id': 'reconciliation',
+        'label': 'fused-memory',
+        'kind': 'reconciliation',
+        'escalations': [],
+        'summary': _EMPTY_SUMMARY,
+    }
+    one_orch_queues = {
+        'subsections': [orch_sub, recon_sub],
+        'summary': _EMPTY_SUMMARY,
+    }
+    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '', 'status': 'pending',
+                  'priority': 'low', 'dependencies': [], 'metadata': {}}]
+
+    # Case 1: cache hit — second request should NOT call fetch_tasks again.
+    _task_cards_cache_clear()
+    mock_ft = AsyncMock(return_value=task_list)
+    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.app.fetch_tasks', new=mock_ft):
+        client.get('/api/v2/dashboard/escalations')
+        client.get('/api/v2/dashboard/escalations')
+    assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
+
+    # Case 2: offline result NOT cached — each request should call fetch_tasks.
+    _task_cards_cache_clear()
+    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
+    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.app.fetch_tasks', new=mock_offline):
+        r1 = client.get('/api/v2/dashboard/escalations')
+        r2 = client.get('/api/v2/dashboard/escalations')
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
