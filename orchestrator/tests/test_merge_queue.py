@@ -7631,3 +7631,60 @@ class TestTrainLifecycleEvents:
         derailed_idx = event_types.index('train_derailed')
         derailed_data = json.loads(rows[derailed_idx][1])
         assert derailed_data['train_id'] == req.train_id
+
+    async def test_incomplete_emits_train_member_deferred(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Incomplete member → train_started then train_member_deferred, no train_derailed."""
+        import json
+
+        from orchestrator.event_store import EventStore
+
+        req = await _make_stacked_train(git_ops, config)
+        # Override: trn-a has non-deferred status 'planning'
+        req.status_check = AsyncMock(return_value={
+            'trn-a': 'planning',
+            'trn-b': 'merge-deferred',
+            'trn-c': 'merge-deferred',
+        })
+
+        db_path = tmp_path / 'train_member_deferred.db'
+        event_store = EventStore(db_path=db_path, run_id='train-member-deferred-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        outcome = await worker._do_merge(req)
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX), (
+            f'expected TRAIN_INCOMPLETE prefix, got: {outcome.reason!r}'
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_member_deferred', 'train_merged', 'train_derailed') "
+            "ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert event_types[0] == 'train_started', f'First event must be train_started, got {event_types}'
+        assert 'train_member_deferred' in event_types, f'Missing train_member_deferred in {event_types}'
+        assert 'train_merged' not in event_types, f'Unexpected train_merged in {event_types}'
+        assert 'train_derailed' not in event_types, f'Unexpected train_derailed in {event_types}'
+
+        deferred_idx = event_types.index('train_member_deferred')
+        deferred_row = rows[deferred_idx]
+        deferred_data = json.loads(deferred_row[2])
+        assert deferred_data['train_id'] == req.train_id
+        assert deferred_data['deferred_task_id'] == 'trn-a', (
+            f"Expected deferred_task_id='trn-a', got {deferred_data['deferred_task_id']!r}"
+        )
+        assert 'planning' in deferred_data['deferred_reason'], (
+            f"Expected 'planning' in deferred_reason, got: {deferred_data['deferred_reason']!r}"
+        )
+        assert set(deferred_data['remaining_members']) == {'trn-b', 'trn-c'}, (
+            f"Expected remaining_members={{trn-b, trn-c}}, got: {deferred_data['remaining_members']!r}"
+        )
