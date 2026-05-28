@@ -292,7 +292,8 @@ class TestMarkBlockedDeduplicatesDryRun:
 
 # ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
-# Mirrors the pattern at test_workflow_e2e.py:6109-6114.
+# Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
+# bottom of test_workflow_e2e.py.
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:

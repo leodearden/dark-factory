@@ -8,6 +8,8 @@ rationale.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from escalation.queue import EscalationQueue
 
 
@@ -207,3 +209,15 @@ def _make_status_setting_steward(
             pass
 
     return _FakeSteward
+
+
+# ---------------------------------------------------------------------------
+# Protocol-conformance assertion (static-only; never executes at runtime).
+# Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
+# bottom of test_workflow_e2e.py.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
