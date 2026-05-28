@@ -21,6 +21,7 @@ from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
+    CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -626,8 +627,195 @@ class TestCapRetryResume:
 
 
 # ===================================================================
-# TestCapRetryCooldown
+# TestCapRetryWedgeGuard
 # ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryWedgeGuard:
+    """Wedge guard: a zero-output timed-out call clears resume_session_id
+    before the cap-hit branch can re-arm it.
+
+    Covers the esc-task-curator-3/-5/-6 wedge (session c5d446f5-..., 2026-05-27)
+    where cap-hit detection + wedge result perpetuated the same broken session.
+    """
+
+    async def test_wedge_breaks_cap_hit_perpetuation_of_resume_session_id(self):
+        """Cap-hit + wedge result must NOT perpetuate resume_session_id.
+
+        Without the wedge guard, iter 2's cap-hit branch re-sets
+        ``invoke_kwargs['resume_session_id'] = result.session_id = 'wedged-X'``
+        (the wedge result still carries a session_id from SIGTERM-grace partial
+        JSON).  Each subsequent --resume against that orphaned session repeats
+        the same hang.
+
+        With the guard, the guard fires *before* the cap-hit branch on iter 2,
+        calls ``_reset_for_fresh_retry`` to clear resume, and ``continue``s
+        so iter 3 starts completely fresh.
+
+        Iteration trace (with the guard in place):
+        - Iter 1: no resume. wedge result. guard skips (no resume yet).
+          cap-hit fires → sets resume='wedged-X'. sleep. continue.
+        - Iter 2: resume='wedged-X'. wedge result. guard fires →
+          _reset_for_fresh_retry clears resume. continue (cap-hit never runs).
+        - Iter 3: no resume. ok result. confirm. break.
+
+        Note: with the guard in place, detect_cap_hit is called only on iters 1
+        and 3 (not 2), so iter 3 consumes the 2nd side_effect value (True) and
+        triggers an additional cap-hit+fresh-retry cycle; iter 4 is the final
+        success.  The 4-element side_effects accommodate this correctly.
+        The key invariant is resume_ids[2] is None — the wedge-guard-cleared
+        iteration must not pass the wedged session forward.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(side_effect=[True, True, False, False]),
+            active_account_name='acct',
+        )
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='wedged-X',
+            timed_out=True,
+        )
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[wedge, wedge, ok, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='real-prompt')
+
+        resume_ids = [c.kwargs.get('resume_session_id') for c in mock_inv.call_args_list]
+        assert resume_ids[0] is None          # iter 1: no resume before
+        assert resume_ids[1] == 'wedged-X'    # iter 2: cap-hit branch set resume from iter 1
+        # THE KEY ASSERTION: iter 3 must not resume the wedged session.
+        # Without the guard, iter 2's cap-hit branch re-sets resume='wedged-X'
+        # (from wedge.session_id), so iter 3 has resume='wedged-X'.
+        # With the guard, iter 2 clears resume, so iter 3 starts fresh.
+        assert resume_ids[2] is None, (
+            f'iter 3 must not resume the wedged session; got {resume_ids[2]!r} '
+            f'(full sequence: {resume_ids})'
+        )
+        # Original prompt must be restored when the guard fires.
+        assert mock_inv.call_args_list[2].kwargs['prompt'] == 'real-prompt'
+
+    async def test_wedge_with_caller_set_resume_clears_session_on_next_iteration(
+        self, caplog,
+    ):
+        """Caller-set resume_session_id + zero-output wedge → wedge guard fires.
+
+        The guard's diagnostic log ('zero-output timed-out invocation ...') is
+        distinctive from the generic resume-fallback log ('resume failed ...').
+        Without the guard, the existing resume-fallback branch (line 681) fires
+        and clears resume, but emits the wrong log.  After step-2's wedge-guard
+        impl, the guard fires *before* the resume-fallback branch and emits the
+        correct log — verified via caplog.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='wedged-Y',
+            timed_out=True,
+        )
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[wedge, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='real-task-prompt',
+                resume_session_id='wedged-Y',
+            )
+
+        assert mock_inv.await_count == 2
+        # Iter 1: caller-set resume; prompt overwritten to CRASH_RECOVERY_RESUME_PROMPT.
+        first = mock_inv.call_args_list[0]
+        assert first.kwargs.get('resume_session_id') == 'wedged-Y'
+        assert first.kwargs.get('prompt') == CRASH_RECOVERY_RESUME_PROMPT
+        # Iter 2: guard (or fallback) cleared resume + restored original prompt.
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') is None
+        assert second.kwargs.get('prompt') == 'real-task-prompt'
+        # The wedge guard's distinctive log must be present.
+        # Without the guard the generic resume-fallback fires instead, emitting
+        # "resume failed (session_id=...)" — which does NOT contain the substring
+        # 'zero-output timed-out', so this assertion fails.
+        assert any(
+            'zero-output timed-out' in record.message
+            for record in caplog.records
+        ), (
+            "Expected the wedge guard's diagnostic log ('zero-output timed-out'); "
+            "the generic resume-fallback log does not mention this."
+        )
+
+    async def test_happy_path_and_partial_timeout_do_not_trigger_wedge_guard(
+        self, caplog,
+    ):
+        """Negative regression: the wedge guard must not fire on non-wedge results.
+
+        Sub-scenario (a): a successful call with a caller-set resume must not
+        be disrupted by the guard.  Sub-scenario (b): a timed-out result that
+        did real work (turns>0, cost>0) must not emit the guard's 'zero-output
+        timed-out' log.  Both would fail if the guard's condition were
+        broadened to fire on any timed_out result.
+        """
+        # ---- sub-scenario (a): happy-path success ----
+        gate_a = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(return_value='tok'),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        ok = make_result(success=True, cost_usd=0.5)
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=ok) as mock_inv_a,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got_a = await invoke_with_cap_retry(
+                gate_a, 'lbl', prompt='p', resume_session_id='sess-ok',
+            )
+        assert mock_inv_a.await_count == 1       # no retry — succeeded first try
+        assert got_a.success is True
+        assert mock_inv_a.call_args_list[0].kwargs.get('resume_session_id') == 'sess-ok'
+
+        # ---- sub-scenario (b): timed-out with real work (NOT a wedge) ----
+        gate_b = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(return_value='tok'),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        partial = AgentResult(
+            success=False, output='partial work', cost_usd=0.8,
+            duration_ms=300_000, turns=4, session_id='sess-partial',
+            timed_out=True,
+        )
+        partial_ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[partial, partial_ok]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate_b, 'lbl', prompt='p', resume_session_id='sess-partial',
+            )
+        # The wedge guard must NOT have fired: turns=4 fails the turns==0 check.
+        assert not any(
+            'zero-output timed-out' in r.message for r in caplog.records
+        ), (
+            "wedge guard fired on a partial-timeout result (turns=4, cost=0.8); "
+            "the guard condition must require turns==0 AND cost_usd==0.0"
+        )
 
 
 @pytest.mark.asyncio
