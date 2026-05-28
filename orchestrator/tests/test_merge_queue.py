@@ -6813,3 +6813,70 @@ class TestCoalesceOrEnqueueWorktreePath:
             # Clean up the merge worktree
             if merge_wt is not None and merge_wt.exists():
                 await git_ops.cleanup_merge_worktree(merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueueStaleWorktreeReap — reap abandoned worktree then dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueStaleWorktreeReap:
+    """Tests for the stale-worktree reap-then-dispatch path.
+
+    When a _merge-* worktree exists on disk but is older than liveness_secs,
+    coalesce_or_enqueue_merge_request should reap it and dispatch a fresh merge.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'reap_events.db'
+        return EventStore(db_path=db, run_id='reap-test')
+
+    async def test_stale_worktree_is_reaped_and_dispatched(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Stale _merge-* worktree → reap + worktree_reaped event +
+        dispatch new request (dispatched=True, queue size 1)."""
+        import os
+
+        branch = 'stale-reap-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'stale_reap.py', 'x = 1\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        # Force mtime to ancient past so liveness check fails
+        ancient_mtime = 0  # 1970-01-01
+        os.utime(str(merge_wt), (ancient_mtime, ancient_mtime))
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('stale-reap', branch, tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=git_ops,
+            liveness_secs=1,  # tiny window so age=ancient >> 1
+        )
+
+        # (a) stale worktree should be reaped
+        assert not merge_wt.exists(), (
+            f'Stale worktree {merge_wt} should have been removed'
+        )
+        # Confirm reaped by checking find_inflight returns None
+        found = await git_ops.find_inflight_merge_worktree(branch)
+        assert found is None, f'Worktree still registered after reap: {found}'
+
+        # (b) worktree_reaped event emitted
+        assert _count_events(event_store.db_path, 'worktree_reaped') == 1
+
+        # (c) new request dispatched
+        assert result.dispatched is True, f'Expected dispatched=True, got {result}'
+        assert result.in_flight is False
+        assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
+        # Registry now holds the new request
+        assert registry.is_inflight(branch) is True
