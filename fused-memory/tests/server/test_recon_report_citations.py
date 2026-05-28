@@ -685,6 +685,81 @@ class TestCiteToolsViaFastMCP:
             })
 
 
+# ---------------------------------------------------------------------------
+# step-11: TestUuidCaseInsensitive — RED until step-12 adds re.IGNORECASE
+# ---------------------------------------------------------------------------
+
+
+class TestUuidCaseInsensitive:
+    """Valid UUIDs with uppercase hex digits must NOT be rejected as invalid_uuid_shape."""
+
+    _UUID_UPPER = 'F47AC10B-58CC-4372-A567-0E02B2C3D479'
+    _UUID_MIXED = 'F47AC10B-58cc-4372-A567-0e02b2c3d479'
+    _FINGERPRINT = {'category': 'observations_and_summaries', 'agent_id': 'a', 'created_at': '2026-05-28'}
+
+    @pytest.mark.asyncio
+    async def test_cite_edge_accepts_uppercase_uuid(self):
+        """cite_edge with all-caps UUID must NOT return invalid_uuid_shape."""
+        fake = _FakeMemoryService(
+            edge_result={'uuid': self._UUID_UPPER, 'name': 'E', 'fact': 'fact-text'},
+        )
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+
+        result = await state.cite_edge(run_id, finding_id, self._UUID_UPPER)
+
+        # Must NOT be rejected by the shape gate
+        assert 'error' not in result, f"Unexpected error: {result}"
+        assert result.get('edge_uuid') == self._UUID_UPPER
+        assert result.get('fact_text_snapshot') == 'fact-text'
+        # Shape gate must NOT have short-circuited — service was called
+        assert len(fake.get_edge_calls) == 1
+        assert fake.get_edge_calls[0][0] == self._UUID_UPPER
+
+    @pytest.mark.asyncio
+    async def test_cite_edge_cited_edges_gains_citation_for_uppercase_uuid(self):
+        """cited_edges must include the citation when UUID is all-caps."""
+        fake = _FakeMemoryService(
+            edge_result={'uuid': self._UUID_UPPER, 'name': 'E', 'fact': 'fact-text'},
+        )
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+
+        await state.cite_edge(run_id, finding_id, self._UUID_UPPER)
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        edges = report['flagged_items'][0]['cited_edges']
+        assert len(edges) == 1
+        assert edges[0]['edge_uuid'] == self._UUID_UPPER
+
+    @pytest.mark.asyncio
+    async def test_cite_memory_accepts_mixed_case_uuid(self):
+        """cite_memory with mixed-case UUID must NOT return invalid_uuid_shape."""
+        fake = _FakeMemoryService(memory_result=self._FINGERPRINT)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+
+        result = await state.cite_memory(run_id, finding_id, self._UUID_MIXED, 'graphiti')
+
+        # Must NOT be rejected by the shape gate
+        assert 'error' not in result, f"Unexpected error: {result}"
+        assert result.get('memory_id') == self._UUID_MIXED
+        # Shape gate must NOT have short-circuited — service was called
+        assert len(fake.get_memory_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_cite_memory_cited_memories_gains_citation_for_mixed_case_uuid(self):
+        """cited_memories must include the citation when UUID has mixed case."""
+        fake = _FakeMemoryService(memory_result=self._FINGERPRINT)
+        state, run_id, finding_id = _make_state_with_finding(memory_service=fake)
+
+        await state.cite_memory(run_id, finding_id, self._UUID_MIXED, 'graphiti')
+
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        memories = report['flagged_items'][0]['cited_memories']
+        assert len(memories) == 1
+        assert memories[0]['memory_id'] == self._UUID_MIXED
+
+
 class TestReconReportComponentsWiring:
     """Verify _build_recon_report_components passes services into the state."""
 
