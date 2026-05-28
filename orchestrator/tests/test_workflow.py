@@ -361,3 +361,28 @@ class TestVerifyDebugfixLoopForceWorkspace:
         assert kwargs.get('force_workspace') is False, (
             f'Expected force_workspace=False for non-train task; got call_args={spy.call_args}'
         )
+
+
+@pytest.mark.asyncio
+class TestEnterMergeDeferred:
+    """_enter_merge_deferred parks the task in the merge-deferred holding state (γ₁).
+
+    The helper must:
+    1. Return WorkflowOutcome.MERGE_DEFERRED.
+    2. Await scheduler.set_task_status(task_id, 'merge-deferred') exactly once.
+    """
+
+    async def test_returns_merge_deferred_outcome_and_calls_scheduler(
+        self, tmp_path: Path,
+    ):
+        """_enter_merge_deferred parks the train member and returns MERGE_DEFERRED."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.task['metadata'] = {'train': {'id': 'T1', 'order': 1, 'members': ['a', '1523']}}
+        wf.scheduler.set_task_status = AsyncMock()
+
+        result = await wf._enter_merge_deferred()
+
+        assert result == WorkflowOutcome.MERGE_DEFERRED, (
+            f'Expected WorkflowOutcome.MERGE_DEFERRED; got {result!r}'
+        )
+        wf.scheduler.set_task_status.assert_awaited_once_with(wf.task_id, 'merge-deferred')
