@@ -1589,6 +1589,7 @@ class Scheduler:
         task: dict,
         tid: str,
         status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -1603,6 +1604,11 @@ class Scheduler:
         the responsibility of :meth:`_gc_expired_cooldowns`, which is called
         once per tick from :meth:`acquire_next` before either candidate loop.
 
+        *tasks_by_id* is forwarded to :meth:`_deps_satisfied` to enable the
+        intra-train merge-deferred allowance (PRD § 9.3).  When ``None``
+        (the default), the allowance is disabled — behaviour is identical to
+        today.  Both ``acquire_next`` call sites pass the per-tick snapshot.
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -1616,7 +1622,7 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if not self._deps_satisfied(task, status_map):
+        if not self._deps_satisfied(task, status_map, tasks_by_id):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -2064,7 +2070,7 @@ class Scheduler:
                 return True
             if tid not in tasks_by_id:
                 return True
-            return not self._deps_satisfied(tasks_by_id[tid], status_map)
+            return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
 
         gc_evicted = self.lock_table.prune_owners(_park_gc)
         for owner in gc_evicted:
@@ -2260,7 +2266,7 @@ class Scheduler:
             tid_str = str(t.get('id', ''))
             if not tid_str:
                 continue
-            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map)
+            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map, tasks_by_id)
             if not eligible:
                 continue
             # signal_label is stashed and reused at the dispatch arm site so
@@ -2298,7 +2304,7 @@ class Scheduler:
                 # loop to keep both paths in sync.  A future gate addition only
                 # needs to be added to _eligible_for_dispatch.
                 eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map
+                    pin_task, pin_tid, status_map, tasks_by_id
                 )
                 if not eligible:
                     continue
