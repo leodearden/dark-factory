@@ -97,7 +97,11 @@ class MemoryConsolidator(BaseStage):
         # partial/wrong-source bulk task read (the "highest-ID below known task IDs"
         # signature) and should be surfaced as a structured observation so operators
         # can investigate the root cause.
-        if self.filtered_task_tree is not None:
+        #
+        # Guard: skip when max_task_id == 0 (empty tree or all IDs unparseable).
+        # If every referenced task ID is "above" a zero ceiling the result is a
+        # false-positive flood rather than a genuine truncation signal.
+        if self.filtered_task_tree is not None and self.filtered_task_tree.max_task_id > 0:
             event_task_ids = [
                 e.payload.get('task_id')
                 for e in events

@@ -913,31 +913,47 @@ async def filter_false_absence_flags(
     if not taskmaster or not project_root:
         return list(flags)
 
-    kept: list[dict[str, Any]] = []
-    for flag in flags:
-        flag_type = flag.get('flag_type')
-        if flag_type not in ABSENCE_FLAG_TYPES:
-            # Non-absence flags pass through untouched
-            kept.append(flag)
-            continue
+    async def _safe_get_task(task_id: Any) -> Any:
+        """Fetch task with normalised exception handling.
 
-        task_id = flag.get('task_id')
-        if task_id is None:
-            # Cannot evaluate absence without a task_id — keep the flag unchanged
-            kept.append(flag)
-            continue
-
-        # Evaluate absence via get_task (fail-closed).
-        # The RAW backend RAISES TaskmasterError on absence; normalise to the
-        # same {error, error_type} shape the MCP wrapper returns so a single
-        # confirm_task_absent call classifies both paths identically.
+        Returns the raw get_task result on success, or a normalised
+        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
+        ``confirm_task_absent`` can classify both paths identically.
+        """
         try:
-            result = await taskmaster.get_task(task_id, project_root)
+            return await taskmaster.get_task(task_id, project_root)
         except Exception as exc:
             # Normalise: same dict shape as the MCP-wrapper path so
             # confirm_task_absent can classify the raised-exception path.
-            result = {'error': str(exc), 'error_type': type(exc).__name__}
+            return {'error': str(exc), 'error_type': type(exc).__name__}
 
+    # Split flags into those requiring a get_task lookup and pass-throughs.
+    # Track original position so the output list preserves input order.
+    check_positions: list[int] = []  # indices of flags needing lookup
+    check_task_ids: list[Any] = []
+
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if flag_type in ABSENCE_FLAG_TYPES and flag.get('task_id') is not None:
+            check_positions.append(i)
+            check_task_ids.append(flag.get('task_id'))
+
+    # Issue all get_task calls concurrently (typically only a handful per cycle).
+    lookup_results: list[Any] = await asyncio.gather(
+        *[_safe_get_task(tid) for tid in check_task_ids]
+    )
+    results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results))
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in results_by_pos:
+            # Non-absence flag or absence flag without task_id — pass through.
+            kept.append(flag)
+            continue
+
+        result = results_by_pos[i]
+        flag_type = flag.get('flag_type')
+        task_id = flag.get('task_id')
         if confirm_task_absent(result):
             kept.append(flag)
         else:
@@ -955,8 +971,17 @@ def confirm_task_absent(get_task_result: object) -> bool:
     """Fail-closed classifier: True ONLY when get_task POSITIVELY confirms absence.
 
     Recognises the not-found signal produced by the SQLite task backend /
-    get_task MCP wrapper: a dict with an ``error`` key whose value contains
-    the phrase 'No tasks found for ID(s)' (case-insensitive).
+    get_task MCP wrapper: a dict where **both** of the following hold:
+
+    * ``error_type == 'TaskmasterError'`` — tightens the match to the
+      structured backend error class rather than relying on a phrase alone.
+    * The ``error`` string contains 'No tasks found for ID(s)' (case-insensitive).
+
+    Requiring the structured ``error_type`` reduces the risk of misclassifying
+    an unrelated backend message that happens to embed the not-found phrase,
+    while still matching the MCP-wrapper ``{error, error_type}`` dict and the
+    normalised ``{'error': str(exc), 'error_type': type(exc).__name__}`` dict
+    produced by filter_false_absence_flags for raised TaskmasterErrors.
 
     All other inputs — a valid task record, a generic/inconclusive error, None,
     an empty dict, or a non-dict value — return False (fail-closed).  The
@@ -969,12 +994,14 @@ def confirm_task_absent(get_task_result: object) -> bool:
             (present) or an error dict (absent / inconclusive).
 
     Returns:
-        True if and only if the result is a dict with an ``error`` string
-        containing the canonical not-found phrase.  False in all other cases.
+        True if and only if the result is a dict whose ``error_type`` is
+        ``'TaskmasterError'`` and whose ``error`` string contains the canonical
+        not-found phrase.  False in all other cases.
     """
     if not isinstance(get_task_result, dict):
         return False
     error = get_task_result.get('error')
     if not isinstance(error, str):
         return False
-    return _NOT_FOUND_PHRASE in error.lower()
+    error_type = get_task_result.get('error_type', '')
+    return error_type == 'TaskmasterError' and _NOT_FOUND_PHRASE in error.lower()
