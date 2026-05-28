@@ -28,11 +28,15 @@ from typing import Any
 # Count-snapshot detection
 # --------------------------------------------------------------------------- #
 
-# Matches lines containing >=2 occurrences of `\d+ <status>` on a single line.
+# Matches lines containing >=2 occurrences of `\d+ <status>` on a single line,
+# separated by at least one ',' or '/' delimiter.
 # Non-DOTALL so the two tokens cannot span a newline.
+# The delimiter requirement distinguishes count-snapshot lines (e.g. '1505 done / 148 cancelled',
+# '3355 done, 290 cancelled') from incidental two-token sentences that lack delimiters
+# (e.g. '2 review comments and 3 pending follow-ups').
 COUNT_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     r'\b\d+\s+(?:done|cancell?ed|pending|in[-_ ]?progress|blocked|deferred|review|total|merge[-_ ]?deferred)\b'
-    r'.*?'
+    r'[^,/\n]*[,/][^,/\n]*'
     r'\b\d+\s+(?:done|cancell?ed|pending|in[-_ ]?progress|blocked|deferred|review|total|merge[-_ ]?deferred)\b',
     re.IGNORECASE,
 )
@@ -50,7 +54,7 @@ def strip_snapshot_lines(text: str) -> tuple[str, int]:
     and returns (filtered_text, num_dropped).
     """
     lines = text.split('\n')
-    kept = [line for line in lines if not COUNT_SNAPSHOT_RE.search(line)]
+    kept = [line for line in lines if not is_count_snapshot(line)]
     dropped = len(lines) - len(kept)
     return '\n'.join(kept), dropped
 

@@ -82,6 +82,38 @@ class TestAddMemorySnapshotGate:
         mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_allows_snapshot_with_none_category_from_recon_stage_agent(self):
+        """category=None + snapshot content + recon-stage agent → gate does NOT fire.
+
+        The gate is intentionally scoped to category='temporal_facts' only.  When
+        category is None (auto-classification), the gate is bypassed — recon stages
+        are expected to supply category explicitly for the gate to take effect.
+        This test pins that trade-off as intentional so the behaviour cannot regress
+        silently.  See plan design decision: 'Restricting to temporal_facts keeps
+        the gate scoped to durable Graphiti edges.'
+        """
+        mock_service = AsyncMock()
+        _mem_result = MagicMock()
+        _mem_result.model_dump.return_value = {'id': 'z'}
+        mock_service.add_memory.return_value = _mem_result
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _SNAPSHOT_CONTENT,
+                'category': None,  # auto-classification path
+                'agent_id': 'recon-stage-memory_consolidator',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'count_snapshot_write_blocked', (
+            f'Gate must not fire when category=None (auto-classify path); got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_allows_legit_mention_from_recon_stage_agent(self):
         """Legit single-done mention with recon-stage agent → allowed through.
 

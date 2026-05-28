@@ -2691,20 +2691,23 @@ class TestCountSnapshotPrimitives:
     # COUNT_SNAPSHOT_RE — basic contract
     # ------------------------------------------------------------------ #
 
-    def test_count_snapshot_re_is_compiled_pattern(self):
-        """COUNT_SNAPSHOT_RE must be a compiled regex pattern."""
-        import re
+    def test_count_snapshot_re_case_insensitive(self):
+        """is_count_snapshot must match uppercase, lowercase, and mixed-case status words.
 
-        from fused_memory.reconciliation.task_filter import COUNT_SNAPSHOT_RE
+        Behavioral assertion replacing the former implementation-detail check on
+        COUNT_SNAPSHOT_RE.flags.  Pins the case-insensitivity contract via the
+        public function rather than the compiled regex object's attributes.
+        """
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
 
-        assert hasattr(COUNT_SNAPSHOT_RE, 'search'), (
-            'COUNT_SNAPSHOT_RE must be a compiled regex with a .search method'
+        assert is_count_snapshot('1505 DONE / 148 CANCELLED tasks') is True, (
+            'is_count_snapshot must match uppercase status words (DONE, CANCELLED)'
         )
-        assert hasattr(COUNT_SNAPSHOT_RE, 'flags'), (
-            'COUNT_SNAPSHOT_RE must have a .flags attribute (compiled pattern)'
+        assert is_count_snapshot('1505 done / 148 cancelled tasks') is True, (
+            'is_count_snapshot must match lowercase status words (done, cancelled)'
         )
-        assert COUNT_SNAPSHOT_RE.flags & re.IGNORECASE, (
-            'COUNT_SNAPSHOT_RE must be compiled with re.IGNORECASE'
+        assert is_count_snapshot('1505 Done / 148 Cancelled tasks') is True, (
+            'is_count_snapshot must match mixed-case status words (Done, Cancelled)'
         )
 
     # ------------------------------------------------------------------ #
@@ -2755,4 +2758,29 @@ class TestCountSnapshotPrimitives:
         )
         assert count == 0, (
             f'Expected count=0 when no snapshot lines stripped, got count={count}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # is_count_snapshot — negative fixture: incidental two-token sentences
+    # ------------------------------------------------------------------ #
+
+    def test_negative_incidental_two_token_no_separator(self):
+        """Sentences with two digit+status tokens but no ',' or '/' delimiter must NOT
+        be detected as count-snapshots.
+
+        Pins the regex delimiter requirement as intentional: COUNT_SNAPSHOT_RE requires
+        at least one ',' or '/' between the two count+status tokens so that natural-
+        language sentences like '2 review comments and 3 pending follow-ups' are not
+        stripped from context-item or episode payloads.
+        """
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+        assert is_count_snapshot('2 review comments and 3 pending follow-ups') is False, (
+            'Incidental two-token sentence without , or / separator must NOT be '
+            'classified as a count-snapshot; got True. '
+            'The regex delimiter requirement may have been removed.'
+        )
+        assert is_count_snapshot('1 blocked ticket, please keep 2 pending items') is True, (
+            'Sentence with , separator and two tokens must still be detected; '
+            'regression check for the delimiter requirement.'
         )
