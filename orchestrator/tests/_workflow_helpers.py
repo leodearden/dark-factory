@@ -88,6 +88,20 @@ class FakeScheduler:
     def release(self, task_id: str) -> None:
         pass
 
+    async def get_tasks(self) -> list[dict]:
+        return []
+
+    async def get_statuses(
+        self, ids: list[str] | None = None,
+    ) -> tuple[dict[str, str], Exception | None]:
+        return ({}, None)
+
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]:
+        return []
+
+    def clear_requeue_count(self, task_id: str, /) -> None:
+        pass
+
 
 class FakeBriefing:
     """BriefingAssembler that returns canned prompts."""
