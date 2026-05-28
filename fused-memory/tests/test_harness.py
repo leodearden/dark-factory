@@ -5716,12 +5716,11 @@ async def test_project_loop_quarantines_buffered_events_on_unknown_project_error
 
     sleep_mock = AsyncMock()
 
-    with caplog.at_level(logging.WARNING):
-        with patch('fused_memory.reconciliation.harness._sleep', sleep_mock):
-            await asyncio.wait_for(
-                harness._project_loop('know-live'),
-                timeout=10.0,
-            )
+    with caplog.at_level(logging.WARNING), patch('fused_memory.reconciliation.harness._sleep', sleep_mock):
+        await asyncio.wait_for(
+            harness._project_loop('know-live'),
+            timeout=10.0,
+        )
 
     # (1) A WARNING log record must mention quarantine/dead_letter AND the row count.
     warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
