@@ -23,7 +23,7 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
 `mcp__fused-memory__set_task_status`, `mcp__fused-memory__submit_task`, \
 `mcp__fused-memory__resolve_ticket`, `mcp__fused-memory__update_task`, \
-`mcp__fused-memory__add_subtask`, `mcp__fused-memory__remove_task`, \
+`mcp__fused-memory__remove_task`, \
 `mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`
 
 ## Creating Tasks

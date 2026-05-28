@@ -22,7 +22,7 @@ _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
         'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
         'get_tasks, get_task, set_task_status, submit_task, resolve_ticket, '
-        'update_task, add_subtask, remove_task, add_dependency, remove_dependency'
+        'update_task, remove_task, add_dependency, remove_dependency'
     )
 )
 
