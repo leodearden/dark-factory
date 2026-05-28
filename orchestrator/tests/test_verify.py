@@ -18,6 +18,7 @@ from orchestrator.verify import (
     _extract_cause_hint,
     _is_test_file,
     _maybe_prune_archive,
+    _resolve_verify_env,
     _run_cmd,
     _scope_cargo_workspace,
     run_full_verification,
@@ -4218,3 +4219,59 @@ class TestRunScopedVerificationForceWorkspace:
             )
 
         derive_mock.assert_not_awaited()
+
+
+class TestResolveVerifyEnv:
+    """Tests for _resolve_verify_env(config, module_config, *, role) helper.
+
+    Mirrors the structure of TestResolveVerifyTimeout — builds minimal
+    OrchestratorConfig / ModuleConfig instances and calls the helper directly.
+    """
+
+    def _make_config(self, verify_env: dict | None = None):
+        return OrchestratorConfig(verify_env=verify_env or {})
+
+    def _make_mc(self, verify_env: dict | None = None):
+        return ModuleConfig(prefix='test', verify_env=verify_env)
+
+    # --- role injection ---
+
+    def test_role_merge_sets_df_verify_role_merge(self):
+        """role='merge' injects DF_VERIFY_ROLE='merge' into the returned dict."""
+        config = self._make_config()
+        result = _resolve_verify_env(config, None, role='merge')
+        assert result['DF_VERIFY_ROLE'] == 'merge'
+
+    def test_role_task_sets_df_verify_role_task(self):
+        """role='task' injects DF_VERIFY_ROLE='task'."""
+        config = self._make_config()
+        result = _resolve_verify_env(config, None, role='task')
+        assert result['DF_VERIFY_ROLE'] == 'task'
+
+    def test_default_role_sets_df_verify_role_task(self):
+        """Calling without role kwarg defaults to DF_VERIFY_ROLE='task'."""
+        config = self._make_config()
+        result = _resolve_verify_env(config, None)
+        assert result['DF_VERIFY_ROLE'] == 'task'
+
+    def test_role_overrides_config_supplied_df_verify_role(self):
+        """Orchestrator-injected role is authoritative — overrides DF_VERIFY_ROLE in config.verify_env."""
+        config = self._make_config(verify_env={'DF_VERIFY_ROLE': 'wrong'})
+        result = _resolve_verify_env(config, None, role='merge')
+        assert result['DF_VERIFY_ROLE'] == 'merge'
+
+    def test_other_env_keys_preserved(self):
+        """Other verify_env keys from config and module_config survive alongside DF_VERIFY_ROLE."""
+        config = self._make_config(verify_env={'FOO': 'bar'})
+        mc = self._make_mc(verify_env={'BAZ': 'qux'})
+        result = _resolve_verify_env(config, mc, role='merge')
+        assert result['FOO'] == 'bar'
+        assert result['BAZ'] == 'qux'
+        assert result['DF_VERIFY_ROLE'] == 'merge'
+
+    def test_module_env_wins_over_config_env_for_other_keys(self):
+        """Module-level verify_env still overrides config-level for non-role keys."""
+        config = self._make_config(verify_env={'KEY': 'config_val'})
+        mc = self._make_mc(verify_env={'KEY': 'module_val'})
+        result = _resolve_verify_env(config, mc, role='task')
+        assert result['KEY'] == 'module_val'
