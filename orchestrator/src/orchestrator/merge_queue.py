@@ -980,7 +980,23 @@ async def coalesce_or_enqueue_merge_request(
         )
 
     # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
-    # (disk-scan / reap logic added in steps 8 and 10)
+    if git_ops is not None:
+        wt = await git_ops.find_inflight_merge_worktree(branch)
+        if wt is not None:
+            try:
+                age = time.time() - wt.stat().st_mtime
+            except OSError:
+                age = 0.0  # stat failed — treat as alive to be safe
+            if age <= liveness_secs:
+                # ALIVE: coalesce without enqueuing or reaping
+                _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
+                return MergeDispatchResult(
+                    dispatched=False,
+                    in_flight=True,
+                    branch=branch,
+                    source='worktree',
+                )
+            # STALE/ABANDONED: reap and fall through to enqueue (step-10 adds reap)
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result):
