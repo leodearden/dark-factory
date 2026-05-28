@@ -24,6 +24,18 @@ function useOpenSet(ids, defaultOpen = true, storageKey = null) {
     for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
     return init;
   });
+  // Backfill ids that arrive after mount (ESCALATIONS.subsections starts [] and
+  // is populated by the first poll, so groups would otherwise render collapsed).
+  const idsKey = ids.join('\0');
+  uE(() => {
+    setOpenMap(m => {
+      let patch = null;
+      for (const id of ids) {
+        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
+      }
+      return patch ? { ...m, ...patch } : m;
+    });
+  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
   uE(() => {
     if (storageKey) {
       try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
@@ -78,9 +90,15 @@ function EscalationsTab({ projectFilter }) {
   const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
 
   // Filter subsections by project when projectFilter is active.
-  const subsections = escalations.subsections.filter(s =>
-    !projectFilter || projectFilter.length === 0 || projectFilter.includes(s.label)
-  );
+  // Orchestrator subsections: filter by subsection label (label == project name).
+  // Reconciliation subsections: always include — their rows are filtered per-row
+  // by row.project below, because the subsection label is 'fused-memory' (not a
+  // project name) and rows may belong to different owning projects.
+  const subsections = escalations.subsections.filter(s => {
+    if (!projectFilter || projectFilter.length === 0) return true;
+    if (s.kind === 'reconciliation') return true;
+    return projectFilter.includes(s.label);
+  });
   const subsectionIds = subsections.map(s => s.id);
 
   const [openMap, toggle, setAll] = useOpenSet(subsectionIds, true, 'df.open.esc');
@@ -105,22 +123,24 @@ function EscalationsTab({ projectFilter }) {
   }
 
   function sortRows(rows) {
+    const mul = sort.dir === 'asc' ? 1 : -1;
     return [...rows].sort((a, b) => {
-      // Primary: numeric task_id (NaN/null sorts last)
+      // Primary: numeric task_id (NaN/null sorts last regardless of direction)
       const aId = Number(a.task_id);
       const bId = Number(b.task_id);
       const aValid = !isNaN(aId);
       const bValid = !isNaN(bId);
       if (!aValid && !bValid) {
-        // Secondary: timestamp ascending
-        return (a.timestamp || '') < (b.timestamp || '') ? -1 : (a.timestamp || '') > (b.timestamp || '') ? 1 : 0;
+        // Both invalid: secondary tie-break by timestamp, respecting sort direction
+        const ts = (a.timestamp || '') < (b.timestamp || '') ? -1 : (a.timestamp || '') > (b.timestamp || '') ? 1 : 0;
+        return mul * ts;
       }
-      if (!aValid) return 1;
-      if (!bValid) return -1;
-      const mul = sort.dir === 'asc' ? 1 : -1;
+      if (!aValid) return 1;  // invalid always last, regardless of direction
+      if (!bValid) return -1; // invalid always last, regardless of direction
       if (aId !== bId) return mul * (aId - bId);
-      // Secondary: timestamp ascending (stable tie-break)
-      return (a.timestamp || '') < (b.timestamp || '') ? -1 : (a.timestamp || '') > (b.timestamp || '') ? 1 : 0;
+      // Tie-break by timestamp, respecting sort direction
+      const ts = (a.timestamp || '') < (b.timestamp || '') ? -1 : (a.timestamp || '') > (b.timestamp || '') ? 1 : 0;
+      return mul * ts;
     });
   }
 
@@ -172,7 +192,14 @@ function EscalationsTab({ projectFilter }) {
         const secSummary = sec.summary || {};
         const secByLevel = secSummary.by_level || {};
         const secByStatus = secSummary.by_status || {};
-        const filteredRows = sortRows((sec.escalations || []).filter(matchesFilter));
+        const filteredRows = sortRows((sec.escalations || []).filter(row => {
+          if (!matchesFilter(row)) return false;
+          // Reconciliation subsections: filter by row.project (not subsection label).
+          if (sec.kind === 'reconciliation' && projectFilter && projectFilter.length > 0) {
+            return !row.project || projectFilter.includes(row.project);
+          }
+          return true;
+        }));
 
         const summary = (
           <>
@@ -213,7 +240,7 @@ function EscalationsTab({ projectFilter }) {
                   <thead>
                     <tr>
                       <th style={{ cursor: 'pointer', userSelect: 'none' }} onClick={flipDir}>
-                        Task {sort.key === 'task' ? (sort.dir === 'asc' ? '↑' : '↓') : ''}
+                        Task {sort.dir === 'asc' ? '↑' : '↓'}
                       </th>
                       <th>Level</th>
                       <th>Status</th>
@@ -347,9 +374,10 @@ function EscalationSidebar({ row, onClose }) {
         {/* Linked task */}
         <div className="sched-drawer-section">
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Linked Task</div>
-          {row.task_unresolved ? (
+          {row.task_id && row.task_unresolved ? (
+            // task_id present but could not be resolved — distinct from "no task linked"
             <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>
-              Task ID <span className="mono">{row.task_id || '—'}</span> could not be resolved
+              Task ID <span className="mono">{row.task_id}</span> could not be resolved
               {row.worktree && <span> (worktree: <span className="mono">{row.worktree}</span>)</span>}.
             </div>
           ) : task ? (
