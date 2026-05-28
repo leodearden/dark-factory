@@ -436,6 +436,18 @@ class TaskWorkflow:
         files = self.plan.get('files', [])
         return files if files else None
 
+    @property
+    def _train(self) -> TrainMembership | None:
+        """Return the train membership dict if this task is a train member, else None.
+
+        Reads ``task.metadata.train`` using the same dict-or-None shape that
+        git_ops and scheduler already consume (β₂/β₁).  A non-dict value
+        (e.g. a stale string) is treated as absent so callers get a clean
+        ``is not None`` check.
+        """
+        train = (self.task.get('metadata') or {}).get('train')
+        return train if isinstance(train, dict) else None
+
     async def _finalise_merged_done(self) -> WorkflowOutcome:
         """Common DONE-finalisation for the happy-path merge.
 
@@ -3117,6 +3129,7 @@ class TaskWorkflow:
                 attempt_id=verify_attempt + 1,
                 task_id=self.task_id,
                 archive_root=self.config.project_root / 'data' / 'verify-logs',
+                force_workspace=self._train is not None,
             )
             if not result.passed:
                 self._last_verify_result = result
