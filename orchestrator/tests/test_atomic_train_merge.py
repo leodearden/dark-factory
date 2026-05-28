@@ -22,7 +22,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -34,7 +34,7 @@ from orchestrator.merge_queue import (
     MergeRequest,
     MergeWorker,
 )
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # ---------------------------------------------------------------------------
 # Fixture constants
@@ -567,4 +567,187 @@ class TestScenario4ExtraTrainDispatchBlocked:
             "Expected _deps_satisfied to return False for non-train task "
             "blocked by merge-deferred dep (merge-deferred is not terminal for "
             "cross-train or plain-task deps)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 (group merge gate = workspace verify) — step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScenario5GroupMergeVerify:
+    """PRD §10 row 5: post-merge workspace verify is the gate.
+
+    GREEN variant: spy on run_scoped_verification to confirm exactly ONE
+    post-merge call with is_merge_verify=True and role='merge'; real cargo
+    green → advance_main succeeds, all 3 mark_member_done fire.
+
+    RED variant: γ edit references a non-existent symbol; cargo fails on the
+    assembled merge commit → outcome blocked, advance_main NOT called, main
+    SHA unmoved, zero mark_member_done calls.
+
+    Both variants use real cargo (cargo_or_skip).
+    """
+
+    async def test_group_merge_workspace_verify_green(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """GREEN: post-merge verify runs once with is_merge_verify=True/role='merge'."""
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # Additive edits — all member tips compile workspace-wide.
+        def edit_alpha(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn alpha5_output() -> u32 { 5 }\n")
+
+        def edit_beta(wt: Path) -> None:
+            lib = wt / "crate_b" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn beta5_output() -> u32 { 5 }\n")
+
+        def edit_gamma(wt: Path) -> None:
+            lib = wt / "crate_c" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn gamma5_output() -> u32 { 5 }\n")
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        wt_a, sha_a = await make_stacked_member(git_ops, "alpha5", main_sha, edit_alpha)
+        wt_b, sha_b = await make_stacked_member(git_ops, "beta5", sha_a, edit_beta)
+        wt_c, _sha_c = await make_stacked_member(git_ops, "gamma5", sha_b, edit_gamma)
+
+        # Spy: wrap the real run_scoped_verification and record every call.
+        verify_calls: list[dict] = []
+
+        async def _spy_verify(*args, **kwargs):
+            verify_calls.append({"args": args, "kwargs": kwargs})
+            return await run_scoped_verification(*args, **kwargs)
+
+        req = build_group_merge_request(
+            git_ops=git_ops,
+            config=config,
+            train_id="train-scenario-5-green",
+            member_names=["alpha5", "beta5", "gamma5"],
+            tip_name="gamma5",
+            tip_worktree=wt_c,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await worker._do_merge(req)
+
+        # (i) Outcome is done.
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done, got: {outcome!r}"
+
+        # (ii) Exactly ONE post-merge verify call with is_merge_verify=True.
+        merge_verify_calls = [
+            c for c in verify_calls if c["kwargs"].get("is_merge_verify") is True
+        ]
+        assert len(merge_verify_calls) == 1, (
+            f"expected exactly 1 post-merge verify call (is_merge_verify=True), "
+            f"got {len(merge_verify_calls)}; all calls: {verify_calls}"
+        )
+        assert merge_verify_calls[0]["kwargs"].get("role") == "merge", (
+            f"expected role='merge' on post-merge call, "
+            f"got: {merge_verify_calls[0]['kwargs']}"
+        )
+
+        # (iii) All 3 mark_member_done fired.
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[union-attr]
+            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"
+        )
+
+    async def test_group_merge_workspace_verify_red(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """RED: γ edit has broken code; post-merge cargo fails; main unmoved, no flips."""
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # α and β: clean additive edits.
+        def edit_alpha(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn alpha5r_output() -> u32 { 55 }\n")
+
+        def edit_beta(wt: Path) -> None:
+            lib = wt / "crate_b" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn beta5r_output() -> u32 { 55 }\n")
+
+        # γ: deliberately broken edit — references a function that does not
+        # exist in train_b.  This makes cargo test --workspace fail on the
+        # assembled tip (the post-merge merge worktree).
+        def edit_gamma_red(wt: Path) -> None:
+            lib = wt / "crate_c" / "src" / "lib.rs"
+            lib.write_text(
+                lib.read_text()
+                + "\npub fn gamma5r_broken() { train_b::fn_that_does_not_exist_anywhere(); }\n"
+            )
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        wt_a, sha_a = await make_stacked_member(git_ops, "alpha5r", main_sha, edit_alpha)
+        wt_b, sha_b = await make_stacked_member(git_ops, "beta5r", sha_a, edit_beta)
+        wt_c, _sha_c = await make_stacked_member(git_ops, "gamma5r", sha_b, edit_gamma_red)
+
+        # Record main state before the (failed) merge attempt.
+        _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_before = main_sha_before.strip()
+        _, merges_before_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_before = int(merges_before_str.strip())
+
+        req = build_group_merge_request(
+            git_ops=git_ops,
+            config=config,
+            train_id="train-scenario-5-red",
+            member_names=["alpha5r", "beta5r", "gamma5r"],
+            tip_name="gamma5r",
+            tip_worktree=wt_c,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        outcome = await worker._do_merge(req)
+
+        # (i) Outcome is blocked (not done).
+        assert outcome is not None
+        assert outcome.status != "done", (
+            f"expected blocked outcome when post-merge verify is red, got: {outcome!r}"
+        )
+
+        # (ii) advance_main NOT called: main SHA unmoved.
+        _, main_sha_after, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        assert main_sha_after.strip() == main_sha_before, (
+            f"advance_main must NOT fire on post-merge verify failure; "
+            f"main moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (iii) No new merge commits on main.
+        _, merges_after_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_after = int(merges_after_str.strip())
+        assert merges_after == merges_before, (
+            f"no new merge commits expected on main, "
+            f"got {merges_after - merges_before} new commit(s)"
+        )
+
+        # (iv) No mark_member_done flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when verify gate is red, "
+            f"got {req.mark_member_done.call_count} call(s)"
         )
