@@ -1632,3 +1632,253 @@ class TestScenario10DoneProvGateUnweakened:
             f"got {excinfo.value.error_code!r}"
         )
 
+# ---------------------------------------------------------------------------
+# Scenarios 11, 12 (non-train regression + degenerate train-of-one) — step-13 RED / step-14 GREEN
+# ---------------------------------------------------------------------------
+
+
+def _build_plain_merge_request(
+    *,
+    git_ops: "GitOps",
+    config: "OrchestratorConfig",
+    task_id: str,
+    worktree: "Path",
+) -> "MergeRequest":
+    """Build a plain (non-train) MergeRequest for scenario 11.
+
+    branch is the unprefixed task_id; merge_to_main prepends branch_prefix internally.
+    """
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    return MergeRequest(
+        task_id=task_id,
+        branch=task_id,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+
+@pytest.mark.asyncio
+class TestScenario11NonTrainRegression:
+    """PRD §10 row 11: non-train regression — baseline task uses single-task pipeline.
+
+    Verifies the train machinery (α₁-ζ₁) does NOT break the existing single-task
+    merge path:
+    - create_worktree (no train kwarg) → worktree base == main tip
+    - real cargo post-merge verify via test_command (not forced-workspace flag)
+    - single MergeRequest through MergeWorker → done, one merge commit
+    - no merge-deferred state ever entered
+    """
+
+    async def test_non_train_regression(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Baseline non-train task merges cleanly via the single-task path."""
+        repo = await seed_workspace_repo(tmp_path)
+        config11 = make_train_config(repo, shared_cargo_target)
+        git_ops11 = GitOps(config11.git, repo)
+
+        # Capture main tip before worktree creation.
+        _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_before = main_sha_before.strip()
+
+        # (i) Create non-train worktree: no train kwarg → branches from main.
+        wt_info11 = await git_ops11.create_worktree("alpha11")
+        wt_a11 = wt_info11.path
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_a11)
+        await _run(["git", "config", "user.name", "Test"], cwd=wt_a11)
+
+        # Assert worktree base == main tip SHA (non-train branches from main).
+        _, merge_base_out, _ = await _run(
+            ["git", "merge-base", "task/alpha11", "main"], cwd=repo
+        )
+        assert merge_base_out.strip() == main_sha_before, (
+            f"expected merge-base(task/alpha11, main) == main tip {main_sha_before!r}, "
+            f"got {merge_base_out.strip()!r}"
+        )
+
+        # Apply an additive crate edit and commit.
+        lib11 = wt_a11 / "crate_a" / "src" / "lib.rs"
+        lib11.write_text(lib11.read_text() + "\npub fn non_train_output() -> u32 { 11 }\n")
+        await git_ops11.commit(wt_a11, "Add non_train_output function (scenario 11)")
+
+        # Record pre-merge state.
+        _, merges_before_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_before = int(merges_before_str.strip())
+
+        # (ii) Drive a plain MergeRequest through the real single-task worker.
+        req11 = _build_plain_merge_request(
+            git_ops=git_ops11,
+            config=config11,
+            task_id="alpha11",
+            worktree=wt_a11,
+        )
+        queue11: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker11 = MergeWorker(git_ops11, queue11)
+        outcome11 = await worker11._do_merge(req11)
+
+        # (iii) Assertions: done, single new merge commit, merge_sha is set.
+        assert outcome11 is not None
+        assert outcome11.status == "done", (
+            f"expected outcome.status='done' for non-train task, got {outcome11!r}"
+        )
+        assert outcome11.merge_sha is not None, (
+            "expected merge_sha to be set (done provenance) after successful merge"
+        )
+
+        _, merges_after_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_after = int(merges_after_str.strip())
+        assert merges_after == merges_before + 1, (
+            f"expected exactly 1 new merge commit (non-train single-task path); "
+            f"got {merges_after - merges_before}"
+        )
+
+        # (iv) No merge-deferred state ever entered: outcome.status is 'done',
+        # not 'merge-deferred'.  The cargo workspace is green at the final main tip
+        # (post-merge verify ran via test_command, not forced-workspace flag).
+        result11 = subprocess.run(
+            ["cargo", "test", "--workspace", "--quiet"],
+            cwd=repo,
+            env={**os.environ, "CARGO_TARGET_DIR": str(shared_cargo_target)},
+            capture_output=True,
+            text=True,
+        )
+        assert result11.returncode == 0, (
+            f"cargo test --workspace must be green at the final main tip "
+            f"(non-train regression): {result11.stderr}"
+        )
+
+
+@pytest.mark.asyncio
+class TestScenario12DegenerateTrainOfOne:
+    """PRD §10 row 12: degenerate train-of-one is observationally equivalent to non-train.
+
+    A train with a single member (order=0) must:
+    - branch from main (order=0 → same _freshen_main path as non-train)
+    - land as a single merge commit via _do_train_merge (group-merge-of-one)
+    - mark the single member done with a real merge SHA
+    - leave no dangling merge-deferred task
+
+    The degenerate train flows through the group-merge-of-one path but is
+    observationally identical to the non-train single-task path (PRD §10 row 12).
+    """
+
+    async def test_degenerate_train_of_one(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Single-member order=0 train: base==main, single merge commit, member done."""
+        repo = await seed_workspace_repo(tmp_path)
+        config12 = make_train_config(repo, shared_cargo_target)
+        git_ops12 = GitOps(config12.git, repo)
+
+        # Capture main tip before worktree creation.
+        _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_before = main_sha_before.strip()
+
+        # order=0 → create_worktree branches from main, NOT from a predecessor.
+        # This is the degenerate single-member train case.
+        train_meta12 = {"id": "T12", "order": 0, "members": ["alpha12"]}
+        wt_info12 = await git_ops12.create_worktree("alpha12", train=train_meta12)
+        wt_a12 = wt_info12.path
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_a12)
+        await _run(["git", "config", "user.name", "Test"], cwd=wt_a12)
+
+        # (i) Worktree base == main tip (order=0 → identical to non-train path).
+        _, merge_base_out12, _ = await _run(
+            ["git", "merge-base", "task/alpha12", "main"], cwd=repo
+        )
+        assert merge_base_out12.strip() == main_sha_before, (
+            f"expected merge-base(task/alpha12, main) == main tip {main_sha_before!r}, "
+            f"got {merge_base_out12.strip()!r}"
+        )
+
+        # Apply an additive crate edit and commit.
+        lib12 = wt_a12 / "crate_a" / "src" / "lib.rs"
+        lib12.write_text(lib12.read_text() + "\npub fn degenerate_train_output() -> u32 { 12 }\n")
+        await git_ops12.commit(wt_a12, "Add degenerate_train_output function (scenario 12)")
+
+        # (ii) Record pre-merge state.
+        _, merges_before_str12, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_before12 = int(merges_before_str12.strip())
+
+        # (iii) Build GroupMergeRequest with a single member (degenerate train).
+        req12 = build_group_merge_request(
+            git_ops=git_ops12,
+            config=config12,
+            train_id="T12",
+            member_names=["alpha12"],
+            tip_name="alpha12",
+            tip_worktree=wt_a12,
+        )
+
+        queue12: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker12 = MergeWorker(git_ops12, queue12)
+        outcome12 = await worker12._do_merge(req12)
+
+        # (iv) Assertions: done, single merge commit, member marked done once.
+        assert outcome12 is not None
+        assert outcome12.status == "done", (
+            f"expected outcome.status='done' for degenerate train-of-one, "
+            f"got {outcome12!r}"
+        )
+        assert outcome12.merge_sha is not None, (
+            "expected merge_sha to be set after successful degenerate-train merge"
+        )
+
+        _, merges_after_str12, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_after12 = int(merges_after_str12.strip())
+        assert merges_after12 == merges_before12 + 1, (
+            f"expected exactly 1 new merge commit (degenerate train-of-one); "
+            f"got {merges_after12 - merges_before12}"
+        )
+
+        # (v) mark_member_done fired exactly once with the shared merge SHA.
+        # done_provenance.kind=='merged' in the real workflow: the degenerate train
+        # flows through group-merge-of-one but is observationally identical to
+        # the non-train path (PRD §10 row 12).
+        assert req12.mark_member_done.call_count == 1, (  # type: ignore[union-attr]
+            f"expected mark_member_done called once for the single member, "
+            f"got {req12.mark_member_done.call_count}"
+        )
+        called_task_id12, called_sha12 = req12.mark_member_done.call_args[0]  # type: ignore[union-attr]
+        assert called_task_id12 == "alpha12", (
+            f"expected mark_member_done called with task_id='alpha12', "
+            f"got {called_task_id12!r}"
+        )
+        assert called_sha12 == outcome12.merge_sha, (
+            f"expected mark_member_done SHA == outcome.merge_sha {outcome12.merge_sha!r}, "
+            f"got {called_sha12!r}"
+        )
+
+        # (vi) No dangling merge-deferred task: mark_member_done was called once,
+        # signalling the member transitioned to done (not left in merge-deferred).
+        # The cargo workspace is green at the final main tip (post-merge verify).
+        result12 = subprocess.run(
+            ["cargo", "test", "--workspace", "--quiet"],
+            cwd=repo,
+            env={**os.environ, "CARGO_TARGET_DIR": str(shared_cargo_target)},
+            capture_output=True,
+            text=True,
+        )
+        assert result12.returncode == 0, (
+            f"cargo test --workspace must be green at the final main tip "
+            f"(degenerate train-of-one: no red-main window): {result12.stderr}"
+        )
