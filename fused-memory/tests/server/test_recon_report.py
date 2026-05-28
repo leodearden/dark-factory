@@ -418,3 +418,69 @@ class TestReconReportReaper:
         t[0] = 301.0
         evicted = state.tick()
         assert evicted == 2
+
+
+# ---------------------------------------------------------------------------
+# step-15: FastMCP server factory — RED until step-16
+# ---------------------------------------------------------------------------
+
+
+class TestCreateReconReportServer:
+    """Verify create_recon_report_server wires all five tools to state."""
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    def test_returns_fastmcp_instance(self):
+        from mcp.server.fastmcp import FastMCP
+
+        _, mcp = self._make()
+        assert isinstance(mcp, FastMCP)
+
+    def test_mcp_name_is_recon_report(self):
+        _, mcp = self._make()
+        assert mcp.name == 'Recon Report'
+
+    def test_all_five_tools_registered(self):
+        _, mcp = self._make()
+        tools = set(mcp._tool_manager._tools.keys())
+        assert {'start_report', 'add_finding', 'set_stat', 'inc_stat', 'complete'} <= tools
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_via_call_tool(self):
+        """Drive the full lifecycle through mcp._tool_manager.call_tool."""
+        state, mcp = self._make()
+        tm = mcp._tool_manager
+
+        # start_report
+        result = await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+        assert isinstance(result, dict)
+        assert result.get('run_id') == 'r1'
+
+        # add_finding
+        result = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'low',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': 'f',
+        })
+        assert 'finding_id' in result
+
+        # complete
+        result = await tm.call_tool('complete', {'run_id': 'r1', 'summary': 'done'})
+        assert 'flagged_count' in result
+
+        # Verify state mutated
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report['summary'] == 'done'
+        assert len(report['flagged_items']) == 1
