@@ -215,6 +215,26 @@ async def _run_shielded(
         logger.exception('_graceful_shutdown: %s raised', name)
 
 
+def _add_json_http_error_handler(starlette_app: Any) -> None:
+    """Register a JSON error handler for HTTP exceptions on *starlette_app*.
+
+    Without this, MCP/OAuth-discovery clients crash on ``JSON.parse("Not Found")``
+    when the server returns plain-text 404s from Starlette's default handler.
+    Applied to **both** the primary and recon_report Starlette apps so both
+    endpoints guard against the same failure mode.
+
+    Must be called BEFORE wrapping the app in :class:`_ASGIExceptionShield`.
+    """
+    from starlette.exceptions import HTTPException
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import JSONResponse
+
+    async def _json_http_error(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
+        return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
+
+    starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
+
+
 class _ASGIExceptionShield:
     """ASGI middleware that contains BaseException escapes from the MCP app.
 
@@ -693,6 +713,7 @@ async def run_server():
 
     watchdog_task: asyncio.Task[None] | None = None
     recon_report_state: Any = None
+    server: Any | None = None  # primary uvicorn.Server
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
@@ -710,14 +731,7 @@ async def run_server():
             # Return JSON (not plain-text) for 404s so that MCP SDK
             # clients attempting OAuth discovery against well-known
             # endpoints don't crash on JSON.parse("Not Found").
-            from starlette.exceptions import HTTPException
-            from starlette.requests import Request as StarletteRequest
-            from starlette.responses import JSONResponse
-
-            async def _json_http_error(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
-                return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
-
-            starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
+            _add_json_http_error_handler(starlette_app)
 
             # Outermost ASGI layer: catches any BaseException escaping the
             # MCP app before it can poison the SDK's shared task group.
@@ -768,13 +782,38 @@ async def run_server():
             )
 
             _sd_notify('READY=1')
-            await asyncio.gather(server.serve(), recon_server.serve())
+            # Wrap both serve() coroutines in named tasks so that a failure in
+            # one (e.g. port-already-bound on the recon port) automatically
+            # cancels the other rather than leaving it running unmanaged.
+            # asyncio.gather() with bare coroutines wraps them in Tasks internally
+            # but does NOT cancel the sibling on first failure — the surviving
+            # Task would continue serving while the finally block runs, emitting
+            # "Task was destroyed but it is pending!" on loop teardown.
+            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
+            try:
+                await asyncio.gather(_primary_task, _recon_task)
+            except BaseException:
+                # Cancel whichever task is still running to prevent orphaned tasks.
+                _primary_task.cancel()
+                _recon_task.cancel()
+                # Await with return_exceptions=True so CancelledErrors are collected
+                # as values rather than re-raised; the outer finally handles shutdown.
+                await asyncio.gather(_primary_task, _recon_task, return_exceptions=True)
+                raise
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
         if recon_report_state is not None:
             with contextlib.suppress(BaseException):
                 await recon_report_state.stop_reaper()
+        # Symmetrically tear down both servers so that a failure in either
+        # (e.g. recon_server port-already-bound) doesn't leave the primary
+        # server serving while the rest of the app shuts down.
+        if server is not None:
+            server.should_exit = True
+            with contextlib.suppress(BaseException):
+                await server.shutdown()
         if recon_server is not None:
             recon_server.should_exit = True
             with contextlib.suppress(BaseException):
@@ -1183,6 +1222,10 @@ def _build_recon_report_components(
     mcp.settings.json_response = config.server.json_response
 
     starlette_app = mcp.streamable_http_app()
+    # Apply the same JSON-404 handler as the primary server so that
+    # MCP/OAuth-discovery clients don't crash on plain-text 404s from
+    # this endpoint either (reviewer design_consistency finding).
+    _add_json_http_error_handler(starlette_app)
     shielded_app = _ASGIExceptionShield(starlette_app)
 
     uv_config = uvicorn.Config(

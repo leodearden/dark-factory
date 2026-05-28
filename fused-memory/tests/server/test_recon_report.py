@@ -695,6 +695,22 @@ class TestReconReportBoot:
         _, mcp, _ = _build_recon_report_components(config)
         assert getattr(mcp._tool_manager, '_fused_memory_safe_wrapped', False)
 
+    def test_json_404_handler_applied(self):
+        """The recon_report Starlette app must have the JSON HTTPException handler
+        registered (same guard as the primary server — suggestion 2).
+
+        The handler lives on the inner starlette app (uv_cfg.app.app) because
+        _ASGIExceptionShield wraps the app at the outer ASGI layer.
+        """
+        from starlette.exceptions import HTTPException
+
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        _, _, uv_cfg = _build_recon_report_components(config)
+        inner_app = uv_cfg.app.app  # _ASGIExceptionShield.app → the Starlette app
+        assert HTTPException in inner_app.exception_handlers
+
 
 # ---------------------------------------------------------------------------
 # step-19: Reaper interface exposed but NOT started by _build_recon_report_components
