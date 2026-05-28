@@ -90,6 +90,14 @@ STAGE_REPORT_SCHEMA: dict[str, Any] = {
 # PRD §9.3: four typed citation lists replace the retired `affected_ids` field.
 # Top-level task_id / flag_type / actionable are preserved for flag_dedup and
 # stats_verifier compatibility.
+#
+# NOTE — ASSEMBLED REPORT SHAPE (suggestion schema_prompt_mismatch):
+# This schema describes the shape of data in the ASSEMBLED report (after the
+# recon_report server has resolved citations).  It is NOT the shape the LLM
+# emits: the stage prompts instruct the agent to call the cite_* MCP tools
+# (e.g. cite_entity(name=...)); the server resolves UUIDs and fingerprints
+# server-side.  Fields marked "server-resolved" below are therefore optional
+# in the LLM output but present in the assembled dict.
 FINDING_ITEM_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'properties': {
@@ -149,10 +157,13 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
             'items': {
                 'type': 'object',
                 'properties': {
-                    'entity_uuid': {'type': 'string', 'description': 'UUID of the entity node'},
+                    # entity_uuid is server-resolved: the agent calls cite_entity(name=...)
+                    # and the server looks up the UUID.  Present in assembled output, but
+                    # the LLM never produces it directly — do NOT add to required.
+                    'entity_uuid': {'type': 'string', 'description': 'UUID of the entity node (server-resolved)'},
                     'canonical_name': {'type': 'string', 'description': 'Entity canonical name'},
                 },
-                'required': ['entity_uuid', 'canonical_name'],
+                'required': ['canonical_name'],
             },
         },
         'cited_edges': {
@@ -188,9 +199,11 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
                 'properties': {
                     'memory_id': {'type': 'string', 'description': 'Memory ID'},
                     'store': {'type': 'string', 'description': 'Store type (mem0/graphiti)'},
-                    'metadata_fingerprint': {'type': 'string', 'description': 'Fingerprint of memory metadata'},
+                    # metadata_fingerprint is server-derived — present in assembled output
+                    # but not emitted by the LLM (agent calls cite_memory(memory_id, store)).
+                    'metadata_fingerprint': {'type': 'string', 'description': 'Fingerprint of memory metadata (server-derived)'},
                 },
-                'required': ['memory_id', 'store', 'metadata_fingerprint'],
+                'required': ['memory_id', 'store'],
             },
         },
     },

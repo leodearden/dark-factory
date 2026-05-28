@@ -467,6 +467,11 @@ def _format_findings(findings: list[dict]) -> str:
     """
     _CITE_CAP = 5
     _SNAPSHOT_CAP = 120
+    # Caps for LLM-controlled free-text fields (reviewer finding incomplete_rendering):
+    # without a cap, verbose descriptions from a handful of findings can dominate
+    # the downstream stage payload and swamp per-citation limits.
+    _DESC_CAP = 500
+    _ACTION_CAP = 500
 
     if not findings:
         return 'No findings.'
@@ -476,6 +481,11 @@ def _format_findings(findings: list[dict]) -> str:
         severity = f.get('severity', '?')
         category = f.get('category', '?')
         action = f.get('suggested_action', '?')
+
+        if len(desc) > _DESC_CAP:
+            desc = desc[:_DESC_CAP] + '...'
+        if len(action) > _ACTION_CAP:
+            action = action[:_ACTION_CAP] + '...'
 
         parts = [
             f'{i}. [{severity}/{category}] {desc}',
@@ -492,6 +502,7 @@ def _format_findings(findings: list[dict]) -> str:
             extra = len(cited_entities) - len(shown)
             if extra:
                 entity_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_entities truncated (%d dropped)', i, extra)
             parts.append(f'   Cited entities: {entity_strs}')
 
         cited_edges = f.get('cited_edges') or []
@@ -507,6 +518,7 @@ def _format_findings(findings: list[dict]) -> str:
             extra = len(cited_edges) - len(shown)
             if extra:
                 edge_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_edges truncated (%d dropped)', i, extra)
             parts.append(f'   Cited edges: {edge_strs}')
 
         cited_tasks = f.get('cited_tasks') or []
@@ -519,6 +531,7 @@ def _format_findings(findings: list[dict]) -> str:
             extra = len(cited_tasks) - len(shown)
             if extra:
                 task_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_tasks truncated (%d dropped)', i, extra)
             parts.append(f'   Cited tasks: {task_strs}')
 
         cited_memories = f.get('cited_memories') or []
@@ -531,6 +544,7 @@ def _format_findings(findings: list[dict]) -> str:
             extra = len(cited_memories) - len(shown)
             if extra:
                 memory_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
             parts.append(f'   Cited memories: {memory_strs}')
 
         lines.append('\n'.join(parts))

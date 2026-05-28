@@ -192,6 +192,7 @@ class ReconciliationHarness:
         backlog_policy: BacklogPolicy | None = None,
         known_projects: dict[str, str] | None = None,
         recon_report_state=None,
+        server_ready_event: asyncio.Event | None = None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
@@ -200,6 +201,10 @@ class ReconciliationHarness:
         # PRD γ recon_report threading: capture port and state before config is
         # narrowed to config.reconciliation so stages can reach the full config values.
         self._recon_report_state = recon_report_state
+        # Reviewer finding race_condition: run_loop() awaits this event before the
+        # first stage subprocess fires, ensuring the recon-report MCP server is
+        # accepting connections.  None when no recon_report server is started.
+        self._server_ready_event = server_ready_event
         self._recon_report_port: int = config.server.recon_report_port
         _raw_root = config.taskmaster.project_root if config.taskmaster else ''
         if _raw_root:
@@ -801,6 +806,14 @@ class ReconciliationHarness:
     async def run_loop(self) -> None:
         """Management loop — discover active projects, spawn per-project loops."""
         logger.info('Reconciliation harness background loop started')
+        # Reviewer finding race_condition: wait for the recon-report server to be
+        # accepting connections before the first stage subprocess is launched.  This
+        # encodes the ordering invariant in code rather than relying on comment-only
+        # guarantees.  server_ready_event is None when recon_report is not active.
+        if self._server_ready_event is not None:
+            logger.debug('Harness waiting for recon-report server readiness signal...')
+            await self._server_ready_event.wait()
+            logger.debug('Recon-report server ready — starting reconciliation loop')
         if self.usage_gate:
             await self.usage_gate.check_at_startup()
 

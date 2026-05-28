@@ -7,6 +7,7 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
 )
 from fused_memory.reconciliation.prompts import (
+    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
 )
@@ -117,23 +118,9 @@ and done tasks for missing knowledge capture.
 cancel, use `set_task_status('cancelled')`; do not route the status change through \
 `update_task` — the server rejects status writes there.
 - {_STAGE2_PROJECT_ID_GUIDELINE}
-- **Report channel — recon_report MCP tools (PRD γ §9)**: The harness calls \
-`mcp__recon-report__start_report` for you before the stage begins — do NOT call it yourself. \
-For each inconsistency or finding (including cross_project_routing findings above), call \
-`mcp__recon-report__add_finding(...)` and capture the `finding_id` from the response. Then \
-attach citations using the finding_id as the anchor: \
-  - `mcp__recon-report__cite_entity(finding_id=..., name=<canonical entity name>)` — pass the \
-    ENTITY NAME (not a UUID). \
-  - `mcp__recon-report__cite_edge(finding_id=..., edge_uuid=<full 36-char UUID>)` — copy the \
-    UUID verbatim from the `id` field of a fresh tool result; never truncate. \
-  - `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>, task_id=<task_id>)` \
-    — both fields are required. \
-  - `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>, store=<'mem0'|'graphiti'>)` \
-    — `memory_id` must be the full 36-char UUID. \
-For stats counters use `mcp__recon-report__set_stat` / `mcp__recon-report__inc_stat`. \
-When all work is done, call \
-`mcp__recon-report__complete(summary=<brief human-readable summary>)` as your terminal action \
-— do NOT produce a structured JSON response.
+- **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
+(including cross_project_routing findings emitted above): \
+{_RECON_REPORT_TOOL_GUIDANCE}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \
