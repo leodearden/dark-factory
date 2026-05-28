@@ -222,3 +222,133 @@ class TestCheckPostMergePyrightBehavioral:
         )
         assert result.broken is False
         assert result.failing_subprojects == []
+
+
+# ---------------------------------------------------------------------------
+# _check_post_merge_pyright — classification / fail-open edge cases (mocked)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCheckPostMergePyrightClassification:
+    """Classification / fail-open edge cases — mock run_verification and git_ops."""
+
+    def _make_git_ops(self, *, raise_on_create: Exception | None = None):
+        git_ops = MagicMock()
+        if raise_on_create is not None:
+            git_ops._create_merge_worktree = AsyncMock(side_effect=raise_on_create)
+        else:
+            git_ops._create_merge_worktree = AsyncMock(
+                return_value=(Path('/tmp/fake-wt'), 'deadbeef')
+            )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        return git_ops
+
+    def _make_verify_result(
+        self, *, passed: bool, timed_out: bool = False,
+        type_output: str = 'type error output',
+    ) -> MagicMock:
+        v = MagicMock()
+        v.passed = passed
+        v.timed_out = timed_out
+        v.type_output = type_output
+        v.failure_report = MagicMock(return_value='failure report text' if not passed else '')
+        return v
+
+    @pytest.fixture
+    def config(self, tmp_path: Path) -> OrchestratorConfig:
+        """Minimal config for mocked tests."""
+        from orchestrator.config import GitConfig
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+                push_after_advance=False,
+            ),
+        )
+
+    async def test_timeout_treated_as_fail_open(
+        self, config: OrchestratorConfig, caplog,
+    ):
+        """verify.timed_out=True + passed=False → fail open (not broken), warning logged."""
+        git_ops = self._make_git_ops()
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=False, timed_out=True)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_post_merge_pyright(
+                'abc123', git_ops, config, [mc], task_id='timeout-test',
+            )
+
+        assert result.broken is False
+        assert result.failing_subprojects == []
+        assert any('timed out' in r.message.lower() for r in caplog.records)
+
+    async def test_genuine_failure_not_timed_out_is_broken(
+        self, config: OrchestratorConfig,
+    ):
+        """verify.passed=False AND timed_out=False → genuine failure → broken=True."""
+        git_ops = self._make_git_ops()
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(
+            passed=False, timed_out=False, type_output='error: foo.py:10',
+        )
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _check_post_merge_pyright(
+                'abc123', git_ops, config, [mc], task_id='fail-test',
+            )
+
+        assert result.broken is True
+        assert 'pkg' in result.failing_subprojects
+        assert result.detail != ''
+
+    async def test_create_merge_worktree_exception_fails_open(
+        self, config: OrchestratorConfig, caplog,
+    ):
+        """_create_merge_worktree raising RuntimeError → fail open (not broken), WARNING logged."""
+        git_ops = self._make_git_ops(raise_on_create=RuntimeError('git error'))
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_post_merge_pyright(
+                'abc123', git_ops, config, [mc], task_id='infra-error-test',
+            )
+
+        assert result.broken is False
+        assert result.failing_subprojects == []
+        assert any('infra error' in r.message.lower() for r in caplog.records)
+        # cleanup must NOT be called since worktree was never created
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_cleanup_called_even_when_verify_fails(
+        self, config: OrchestratorConfig,
+    ):
+        """Worktree cleanup is awaited in finally even when verify reports a failure."""
+        fake_wt = Path('/tmp/fake-wt')
+        git_ops = self._make_git_ops()
+        git_ops._create_merge_worktree = AsyncMock(
+            return_value=(fake_wt, 'deadbeef')
+        )
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=False, timed_out=False)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _check_post_merge_pyright(
+                'abc123', git_ops, config, [mc], task_id='cleanup-test',
+            )
+
+        assert result.broken is True
+        git_ops.cleanup_merge_worktree.assert_awaited_once_with(fake_wt)
