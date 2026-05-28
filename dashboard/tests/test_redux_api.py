@@ -453,3 +453,214 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
     body = redux_api.shape_burndown(series)
     assert body['BURNDOWN']['completed'] == 0
     assert body['BURNDOWN']['velocity'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# shape_escalations
+# ---------------------------------------------------------------------------
+
+_EMPTY_SUMMARY = {
+    'by_level': {0: 0, 1: 0, 2: 0},
+    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
+}
+
+
+class TestShapeEscalations:
+    """Tests for redux_api.shape_escalations."""
+
+    def test_shape_escalations_basic_envelope(self):
+        """Empty queues → correct envelope with passthrough summary."""
+        queues = {'subsections': [], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        assert set(body.keys()) == {'ESCALATIONS'}
+        esc = body['ESCALATIONS']
+        assert set(esc.keys()) == {'subsections', 'summary'}
+        assert esc['subsections'] == []
+        assert esc['summary'] == _EMPTY_SUMMARY
+
+    def test_shape_escalations_preserves_subsection_metadata(self):
+        """Orchestrator subsection metadata passes through unchanged."""
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        subsections = body['ESCALATIONS']['subsections']
+        assert len(subsections) == 1
+        out = subsections[0]
+        assert out['id'] == '/p/projA'
+        assert out['label'] == 'projA'
+        assert out['kind'] == 'orchestrator'
+        assert out['summary'] == _EMPTY_SUMMARY
+        assert out['escalations'] == []
+
+    def test_shape_escalations_orchestrator_attaches_task_card(self):
+        """Orchestrator row gets project label and resolved task card."""
+        task = {
+            'id': 42, 'title': 'task-42-title', 'description': 'd',
+            'details': 'D', 'status': 'pending', 'priority': 'high',
+            'dependencies': [], 'metadata': {},
+        }
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [{'id': 'esc-1', 'task_id': '42', 'level': 0, 'status': 'pending', 'summary': 'oops'}],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {'/p/projA': [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        # original esc fields preserved
+        assert row['id'] == 'esc-1'
+        assert row['summary'] == 'oops'
+        # new fields
+        assert row['project'] == 'projA'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
+
+    def test_shape_escalations_orchestrator_unresolved_task(self):
+        """Orchestrator row with unknown task_id → task=None, task_unresolved=True."""
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [
+                {'id': 'esc-99', 'task_id': '999', 'level': 1, 'status': 'pending', 'summary': 'gone'},
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        # task_maps has no task with id=999
+        task_maps = {'/p/projA': [{'id': 1, 'title': 'other', 'description': '', 'details': '',
+                                    'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] == 'projA'
+        assert row['task'] is None
+        assert row['task_unresolved'] is True
+        # original esc fields preserved
+        assert row['id'] == 'esc-99'
+        assert row['summary'] == 'gone'
+
+    def test_shape_escalations_reconciliation_resolves_via_worktree(self, tmp_path):
+        """Reconciliation row: worktree under projA root → project='projA', task resolved."""
+        task = {
+            'id': 7, 'title': 'recon-task-7', 'description': 'x',
+            'details': '', 'status': 'pending', 'priority': 'medium',
+            'dependencies': [], 'metadata': {},
+        }
+        projA_root = tmp_path / 'projA'
+        projA_root.mkdir()
+        worktree_path = str(projA_root / '.worktrees' / '7')
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-r1',
+                    'task_id': '7',
+                    'worktree': worktree_path,
+                    'level': 1,
+                    'status': 'pending',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {str(projA_root): [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] == 'projA'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
+
+    def test_shape_escalations_reconciliation_resolves_via_task_map_probe(self, tmp_path):
+        """Reconciliation row without worktree resolves via task-id probe."""
+        task = {
+            'id': 42, 'title': 'probe-task', 'description': '',
+            'details': '', 'status': 'pending', 'priority': 'low',
+            'dependencies': [], 'metadata': {},
+        }
+        projB_root = tmp_path / 'projB'
+        projB_root.mkdir()
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-probe', 'task_id': '42',
+                    # no 'worktree' field
+                    'level': 0, 'status': 'pending',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {str(projB_root): [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        row = rows[0]
+        assert row['project'] == 'projB'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
+
+    def test_shape_escalations_reconciliation_unresolvable(self, tmp_path):
+        """Reconciliation row that can't be resolved → project=None, task=None, task_unresolved=True."""
+        projC_root = tmp_path / 'projC'
+        projC_root.mkdir()
+        # worktree is under a completely unrelated path
+        unrelated_worktree = str(tmp_path / 'other_project' / '.worktrees' / '5')
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-unres',
+                    'task_id': '99',  # not in any task_map
+                    'worktree': unrelated_worktree,
+                    'level': 2,
+                    'status': 'pending',
+                    'summary': 'unresolvable',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        # task_maps only has projC with no matching task
+        task_maps = {str(projC_root): [{'id': 1, 'title': 't', 'description': '', 'details': '',
+                                         'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] is None
+        assert row['task'] is None
+        assert row['task_unresolved'] is True
+        # original esc fields preserved
+        assert row['id'] == 'esc-unres'
+        assert row['summary'] == 'unresolvable'
+
+    def test_shape_escalations_top_level_summary_passthrough(self):
+        """Non-trivial top-level summary passes through verbatim (not recomputed)."""
+        top_summary = {
+            'by_level': {0: 2, 1: 1, 2: 1},
+            'by_status': {'pending': 3, 'resolved': 1, 'dismissed': 0},
+        }
+        queues = {'subsections': [], 'summary': top_summary}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        assert body['ESCALATIONS']['summary'] == top_summary

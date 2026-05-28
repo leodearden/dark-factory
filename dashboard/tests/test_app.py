@@ -181,3 +181,260 @@ def test_burndown_returns_aggregate_and_per_project(client):
     assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
+
+
+# ---------------------------------------------------------------------------
+# Escalations endpoint
+# ---------------------------------------------------------------------------
+
+_EMPTY_SUMMARY = {
+    'by_level': {0: 0, 1: 0, 2: 0},
+    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
+}
+
+_EMPTY_QUEUES = {
+    'subsections': [],
+    'summary': _EMPTY_SUMMARY,
+}
+
+
+def test_escalations_endpoint_returns_escalations_block(client):
+    """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
+    with patch(
+        'dashboard.app.build_escalation_queues',
+        return_value=_EMPTY_QUEUES,
+    ), patch(
+        'dashboard.app.fetch_tasks',
+        new=AsyncMock(return_value=[]),
+    ):
+        resp = client.get('/api/v2/dashboard/escalations')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert 'ESCALATIONS' in body
+    esc = body['ESCALATIONS']
+    assert 'subsections' in esc
+    assert 'summary' in esc
+    assert esc['subsections'] == []
+
+
+def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
+    """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
+    from dashboard.app import _task_cards_cache_clear
+    _task_cards_cache_clear()
+
+    proj_a = tmp_path / 'projA'
+    task_dict = {
+        'id': 11, 'title': 'wired', 'description': '', 'details': '',
+        'status': 'pending', 'priority': 'med', 'dependencies': [], 'metadata': {},
+    }
+    sub_summary = {
+        'by_level': {0: 1, 1: 1, 2: 0},
+        'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
+    }
+    queues = {
+        'subsections': [
+            {
+                'id': str(proj_a),
+                'label': 'projA',
+                'kind': 'orchestrator',
+                'escalations': [{'id': 'e1', 'task_id': 11, 'level': 0, 'status': 'pending', 'summary': 'oops'}],
+                'summary': sub_summary,
+            },
+            {
+                'id': 'reconciliation',
+                'label': 'fused-memory',
+                'kind': 'reconciliation',
+                'escalations': [{
+                    'id': 'er1', 'task_id': 11,
+                    'worktree': str(proj_a / '.worktrees' / '11'),
+                    'level': 1, 'status': 'pending',
+                }],
+                'summary': sub_summary,
+            },
+        ],
+        'summary': {
+            'by_level': {0: 1, 1: 1, 2: 0},
+            'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
+        },
+    }
+
+    with patch(
+        'dashboard.app.build_escalation_queues',
+        return_value=queues,
+    ), patch(
+        'dashboard.app.fetch_tasks',
+        new=AsyncMock(return_value=[task_dict]),
+    ):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    subs = body['ESCALATIONS']['subsections']
+    assert len(subs) == 2
+
+    orch_sub = next(s for s in subs if s['kind'] == 'orchestrator')
+    assert len(orch_sub['escalations']) == 1
+    orch_row = orch_sub['escalations'][0]
+    assert orch_row['project'] == 'projA'
+    assert orch_row['task']['title'] == 'wired'
+    assert orch_row['task_unresolved'] is False
+
+    recon_sub = next(s for s in subs if s['kind'] == 'reconciliation')
+    assert len(recon_sub['escalations']) == 1
+    recon_row = recon_sub['escalations'][0]
+    assert recon_row['project'] == 'projA'
+    assert recon_row['task']['title'] == 'wired'
+    assert recon_row['task_unresolved'] is False
+
+
+def test_load_task_cards_caches_within_ttl(client, tmp_path):
+    """_load_task_cards: cache hit within TTL + offline result not cached."""
+    from dashboard.app import _task_cards_cache_clear
+
+    proj_a = tmp_path / 'projA'
+    orch_sub = {
+        'id': str(proj_a),
+        'label': 'projA',
+        'kind': 'orchestrator',
+        'escalations': [],
+        'summary': _EMPTY_SUMMARY,
+    }
+    recon_sub = {
+        'id': 'reconciliation',
+        'label': 'fused-memory',
+        'kind': 'reconciliation',
+        'escalations': [],
+        'summary': _EMPTY_SUMMARY,
+    }
+    one_orch_queues = {
+        'subsections': [orch_sub, recon_sub],
+        'summary': _EMPTY_SUMMARY,
+    }
+    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '', 'status': 'pending',
+                  'priority': 'low', 'dependencies': [], 'metadata': {}}]
+
+    # Case 1: cache hit — second request should NOT call fetch_tasks again.
+    _task_cards_cache_clear()
+    mock_ft = AsyncMock(return_value=task_list)
+    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.app.fetch_tasks', new=mock_ft):
+        client.get('/api/v2/dashboard/escalations')
+        client.get('/api/v2/dashboard/escalations')
+    assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
+
+    # Case 2: offline result NOT cached — each request should call fetch_tasks.
+    _task_cards_cache_clear()
+    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
+    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.app.fetch_tasks', new=mock_offline):
+        r1 = client.get('/api/v2/dashboard/escalations')
+        r2 = client.get('/api/v2/dashboard/escalations')
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
+
+
+def test_load_task_cards_ttl_expiry(client, tmp_path):
+    """_load_task_cards: after TTL expires, fetch_tasks is called again."""
+    import dashboard.app as app_module
+    from dashboard.app import _task_cards_cache_clear
+
+    proj_a = tmp_path / 'projA'
+    one_orch_queues = {
+        'subsections': [
+            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
+             'escalations': [], 'summary': _EMPTY_SUMMARY},
+            {'id': 'reconciliation', 'label': 'fused-memory', 'kind': 'reconciliation',
+             'escalations': [], 'summary': _EMPTY_SUMMARY},
+        ],
+        'summary': _EMPTY_SUMMARY,
+    }
+    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
+                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
+
+    _task_cards_cache_clear()
+    original_ttl = app_module._TASK_CARDS_TTL_SECONDS
+    mock_ft = AsyncMock(return_value=task_list)
+    try:
+        with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+             patch('dashboard.app.fetch_tasks', new=mock_ft):
+            # First request: cache miss — fetch_tasks called once, result cached.
+            client.get('/api/v2/dashboard/escalations')
+            assert mock_ft.call_count == 1
+
+            # Zero out TTL so the cached entry is immediately treated as expired.
+            app_module._TASK_CARDS_TTL_SECONDS = 0.0
+
+            # Second request: TTL expired — fetch_tasks called again.
+            resp = client.get('/api/v2/dashboard/escalations')
+    finally:
+        app_module._TASK_CARDS_TTL_SECONDS = original_ttl
+
+    assert resp.status_code == 200
+    assert mock_ft.call_count == 2, (
+        f'expected 2 fetch_tasks calls after TTL expiry, got {mock_ft.call_count}'
+    )
+
+
+def test_escalations_endpoint_multi_root_gather(client, tmp_path):
+    """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
+    from dashboard.app import _task_cards_cache_clear
+
+    _task_cards_cache_clear()
+
+    proj_a = tmp_path / 'projA'
+    proj_b = tmp_path / 'projB'
+
+    task_a = {'id': 11, 'title': 'task-A', 'description': '', 'details': '',
+              'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}
+    task_b = {'id': 22, 'title': 'task-B', 'description': '', 'details': '',
+              'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}}
+
+    queues = {
+        'subsections': [
+            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
+             'escalations': [{'id': 'esc-a1', 'task_id': 11, 'level': 0,
+                              'status': 'pending', 'summary': 'a-issue'}],
+             'summary': _EMPTY_SUMMARY},
+            {'id': str(proj_b), 'label': 'projB', 'kind': 'orchestrator',
+             'escalations': [{'id': 'esc-b1', 'task_id': 22, 'level': 1,
+                              'status': 'pending', 'summary': 'b-issue'}],
+             'summary': _EMPTY_SUMMARY},
+        ],
+        'summary': _EMPTY_SUMMARY,
+    }
+
+    async def fetch_side_effect(_client, _config, root_id):
+        if 'projA' in root_id:
+            return [task_a]
+        if 'projB' in root_id:
+            return [task_b]
+        return []
+
+    with patch('dashboard.app.build_escalation_queues', return_value=queues), \
+         patch('dashboard.app.fetch_tasks', side_effect=fetch_side_effect):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    subs = body['ESCALATIONS']['subsections']
+    assert len(subs) == 2
+
+    sub_a = next(s for s in subs if s['label'] == 'projA')
+    sub_b = next(s for s in subs if s['label'] == 'projB')
+
+    # projA subsection gets task-A (id=11), not task-B.
+    assert len(sub_a['escalations']) == 1
+    row_a = sub_a['escalations'][0]
+    assert row_a['project'] == 'projA'
+    assert row_a['task']['id'] == 11
+    assert row_a['task']['title'] == 'task-A'
+    assert row_a['task_unresolved'] is False
+
+    # projB subsection gets task-B (id=22), not task-A.
+    assert len(sub_b['escalations']) == 1
+    row_b = sub_b['escalations'][0]
+    assert row_b['project'] == 'projB'
+    assert row_b['task']['id'] == 22
+    assert row_b['task']['title'] == 'task-B'
+    assert row_b['task_unresolved'] is False

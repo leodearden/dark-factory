@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.stats_utils import percentile
 
 # ---------------------------------------------------------------------------
@@ -613,6 +614,105 @@ def shape_costs(
         'trend': trend_block,
         'events': events_list,
     }}
+
+
+# ---------------------------------------------------------------------------
+# ESCALATIONS
+# ---------------------------------------------------------------------------
+
+
+def shape_escalations(
+    queues: Mapping[str, Any],
+    task_maps: Mapping[str, Iterable[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Reshape build_escalation_queues output into the ESCALATIONS DF_DATA key.
+
+    Contract:
+        ``queues``    — dict returned by ``build_escalation_queues(config)``:
+                        ``{subsections: [...], summary: {...}}``.
+        ``task_maps`` — ``{root_path_str: list[task_dict]}`` keyed by the same
+                        absolute root path strings used as subsection ``id`` values
+                        for orchestrator subsections.  Reconciliation subsections
+                        use the literal ``'reconciliation'`` key which is never in
+                        ``task_maps``.
+
+    Returns:
+        ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
+    """
+    # Build fast per-root task-id lookup: {root_str: {str(task_id): task_dict}}
+    tasks_by_root_id: dict[str, dict[str, Any]] = {
+        root_str: {
+            str(t['id']): dict(t)
+            for t in task_list
+            if t.get('id') is not None
+        }
+        for root_str, task_list in task_maps.items()
+    }
+
+    # Build roots list for reconciliation resolution (worktree-prefix + task-map probe).
+    # Use Path.resolve(strict=False) so root paths are canonicalised — resolve_owning_project
+    # canonicalises the worktree with the same call, and is_relative_to compares path
+    # components, so unresolved symlinked segments would silently break the prefix match.
+    # Passing list(task_list) avoids the O(n) deep-copy; resolve_owning_project only reads
+    # task['id'] and does not mutate the list.
+    roots_for_resolution: list[tuple[Path, list[dict[str, Any]]]] = [
+        (Path(root_str).resolve(strict=False), list(task_list))
+        for root_str, task_list in task_maps.items()
+    ]
+
+    # Build a reverse mapping: resolved root basename → root_str (unresolved, as used in
+    # tasks_by_root_id keys), for task lookup after owning-project resolution.
+    # Multiple roots with the same resolved basename are ambiguous; first-seen wins.
+    basename_to_root_str: dict[str, str] = {}
+    for root_str in task_maps:
+        name = Path(root_str).resolve(strict=False).name
+        if name not in basename_to_root_str:
+            basename_to_root_str[name] = root_str
+
+    out_subsections: list[dict[str, Any]] = []
+    for sub in queues.get('subsections') or []:
+        sub_id = sub.get('id') or ''
+        sub_label = sub.get('label')
+        sub_kind = sub.get('kind')
+
+        rows: list[dict[str, Any]] = []
+        for esc in sub.get('escalations') or []:
+            if sub_kind == 'reconciliation':
+                # Use resolve_owning_project to map reconciliation escalation back to a project.
+                resolved_label = resolve_owning_project(esc, roots_for_resolution)
+                project = resolved_label
+                if resolved_label is not None:
+                    root_str = basename_to_root_str.get(resolved_label)
+                    root_tasks = tasks_by_root_id.get(root_str or '', {})
+                    task_dict = root_tasks.get(str(esc.get('task_id', ''))) if root_str else None
+                else:
+                    task_dict = None
+            else:
+                # Orchestrator: project label is the subsection label, task lookup by subsection id.
+                project = sub_label
+                root_tasks = tasks_by_root_id.get(sub_id, {})
+                task_dict = root_tasks.get(str(esc.get('task_id', '')))
+
+            rows.append({
+                **esc,
+                'project': project,
+                'task': task_dict,
+                'task_unresolved': task_dict is None,
+            })
+
+        out_subsections.append({
+            'id': sub_id,
+            'label': sub_label,
+            'kind': sub_kind,
+            'summary': dict(sub.get('summary') or {}),
+            'escalations': rows,
+        })
+    return {
+        'ESCALATIONS': {
+            'subsections': out_subsections,
+            'summary': dict(queues.get('summary') or {}),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
