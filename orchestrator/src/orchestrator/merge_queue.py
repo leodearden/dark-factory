@@ -694,6 +694,7 @@ class MergeOutcome:
     overlap_files: list[str] | None = None
     merge_sha: str | None = None
     push_status: str | None = None
+    failure_diagnostic: dict[str, str] | None = None
 
 
 @dataclass
@@ -712,6 +713,7 @@ class SpeculativeItem:
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
+    failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
 
 
 async def _do_train_merge(
@@ -1919,13 +1921,23 @@ class SpeculativeMergeWorker:
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
                             )
+                        _diag = await self._build_merge_failure_diagnostic(
+                            req,
+                            base_sha=merge_result.pre_merge_sha or base_for_merge,
+                            base_label='speculative' if speculative else 'main_head',
+                            git_stderr=merge_result.details,
+                        )
+                        _rendered = self._render_failure_diagnostic(_diag)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
                             immediate_outcome=MergeOutcome(
-                                'blocked', reason=merge_result.details,
+                                'blocked',
+                                reason=f'{merge_result.details}\n{_rendered}',
+                                failure_diagnostic=_diag,
                             ),
+                            failure_diagnostic=_diag,
                             started_monotonic=t0,
                         ))
                         spec_base = None
@@ -2188,6 +2200,35 @@ class SpeculativeMergeWorker:
                 remerge_occurred = iteration_did_remerge
                 self._speculation_slot.set()
 
+    async def _build_merge_failure_diagnostic(
+        self,
+        req: MergeRequest,
+        base_sha: str,
+        base_label: str,
+        git_stderr: str,
+    ) -> dict[str, str]:
+        """Build the four-key failure diagnostic dict for a non-conflict merge failure."""
+        full_branch = f'{self._git_ops.config.branch_prefix}{req.branch}'
+        resolved = await self._git_ops.resolve_branch_sha(full_branch)
+        return {
+            'base_sha': base_sha,
+            'base_label': base_label,
+            'branch_ref_in_worktree': resolved or '<unresolved>',
+            'git_stderr': git_stderr,
+        }
+
+    @staticmethod
+    def _render_failure_diagnostic(diag: dict[str, str]) -> str:
+        """Render the diagnostic dict as a labelled key=value line for inclusion in reason."""
+        stderr_first = diag['git_stderr'].splitlines()[0] if diag['git_stderr'] else ''
+        return (
+            f"[merge-failure] "
+            f"base_sha={diag['base_sha']} "
+            f"base_label={diag['base_label']} "
+            f"branch_ref_in_worktree={diag['branch_ref_in_worktree']} "
+            f"git_stderr={stderr_first}"
+        )
+
     async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation."""
         actual_main = await self._git_ops.get_main_sha()
@@ -2209,10 +2250,23 @@ class SpeculativeMergeWorker:
         if not merge_result.success:
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            diag = await self._build_merge_failure_diagnostic(
+                req,
+                base_sha=merge_result.pre_merge_sha or actual_main,
+                base_label='main_head',
+                git_stderr=merge_result.details,
+            )
+            rendered = self._render_failure_diagnostic(diag)
+            outcome = MergeOutcome(
+                'blocked',
+                reason=f'{merge_result.details}\n{rendered}',
+                failure_diagnostic=diag,
+            )
             return SpeculativeItem(
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=actual_main, speculative=False, skip_verify=False,
-                immediate_outcome=MergeOutcome('blocked', reason=merge_result.details),
+                immediate_outcome=outcome,
+                failure_diagnostic=diag,
                 started_monotonic=started_monotonic,
             )
         skip_verify = (
