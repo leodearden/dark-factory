@@ -742,6 +742,98 @@ def _emit_merge_attempt(
         )
 
 
+INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
+"""Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
+to be considered actively in-flight rather than abandoned.
+
+The evidence shows a cold npm+cargo verify can run for 10–20 minutes on the
+first run; the scheduler's /unblock backoff is ~1 hour.  A 1-hour window:
+- Covers any plausible in-progress verify (cold build < 1 h in practice).
+- Matches the /unblock backoff so a backoff-fired re-request still coalesces
+  rather than races if the original verify is still running.
+- Flags as abandoned any ``_merge-*`` worktree that has not been touched for
+  over an hour — safe to reap and replace with a fresh merger.
+
+Adjusted at module level or injected via `liveness_secs` in tests."""
+
+
+@dataclass
+class _InFlightEntry:
+    """Registry slot for a single in-flight merge branch."""
+
+    task_id: str
+    enqueued_monotonic: float  # time.monotonic() at acquire time
+
+
+_INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
+"""Coarse estimate (seconds) for how long a full post-merge verify takes.
+Used ONLY to compute a best-effort ETA for coalesced callers.  NOT a
+guaranteed bound — cold npm+cargo builds vary widely.  Tests must NOT
+assert a specific numeric value for ETA."""
+
+
+class InFlightMergeRegistry:
+    """Per-branch in-flight de-dup registry for the merge-request chokepoint.
+
+    Tracks at most one in-flight merge request per branch (keyed by the bare
+    branch name, e.g. ``"591"`` not ``"task/591"``).  The slot is acquired at
+    dispatch and auto-released when the request's future resolves — via
+    ``Future.add_done_callback`` — so neither MergeWorker nor
+    SpeculativeMergeWorker needs any change.
+
+    Thread safety: all callers run in the same asyncio event loop; the
+    ``acquire`` check-and-set is synchronous so it is race-free within the
+    loop (no ``await`` between the presence check and the dict write).
+    """
+
+    def __init__(self) -> None:
+        self._slots: dict[str, _InFlightEntry] = {}
+
+    def acquire(self, branch: str, task_id: str, future: asyncio.Future) -> bool:
+        """Atomic check-and-set: claim *branch* for *task_id*.
+
+        Returns True if the slot was free and has been claimed; False if
+        *branch* was already in-flight (caller should coalesce).
+
+        On success, registers a ``done_callback`` on *future* so that
+        ``_release(branch)`` fires automatically on every terminal path
+        (result set, exception set, or cancellation).
+        """
+        if branch in self._slots:
+            return False
+        self._slots[branch] = _InFlightEntry(
+            task_id=task_id,
+            enqueued_monotonic=time.monotonic(),
+        )
+        future.add_done_callback(lambda _: self._release(branch))
+        return True
+
+    def is_inflight(self, branch: str) -> bool:
+        """True when *branch* has an active in-flight slot."""
+        return branch in self._slots
+
+    def entry(self, branch: str) -> _InFlightEntry | None:
+        """Return the in-flight entry for *branch*, or None if free."""
+        return self._slots.get(branch)
+
+    def eta_seconds(self, branch: str) -> int | None:
+        """Best-effort ETA (seconds) for the in-flight merge of *branch*.
+
+        Returns ``max(0, ESTIMATE - elapsed)`` as a coarse hint for pollers.
+        This is NOT a guaranteed bound — cold builds vary widely.  Returns
+        None when *branch* is not in-flight.
+        """
+        e = self._slots.get(branch)
+        if e is None:
+            return None
+        elapsed = time.monotonic() - e.enqueued_monotonic
+        return max(0, int(_INFLIGHT_MERGE_ETA_ESTIMATE_SECS - elapsed))
+
+    def _release(self, branch: str) -> None:
+        """Remove *branch* from the in-flight registry.  Called by done_callback."""
+        self._slots.pop(branch, None)
+
+
 def _emit_merge_queued(
     event_store: EventStore | None,
     req: MergeRequest,
