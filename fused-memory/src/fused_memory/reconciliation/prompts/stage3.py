@@ -37,7 +37,6 @@ divergence between stores, or knowledge gaps.
 - Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
 serious (fundamentally contradictory state).
 - {_STAGE3_PROJECT_ID_GUIDELINE}
-- When you have completed your work, produce your final structured report as your response.
 
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
