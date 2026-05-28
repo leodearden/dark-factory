@@ -355,3 +355,99 @@ def test_shell_jsx_registers_escalations_glyph_and_rail_entry(shell_jsx_body: st
         "shell.jsx Glyph switch does not have a `case 'esc':` branch — "
         'add an esc case returning a simple stroke SVG.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-9 test: index.html registers tab_escalations.jsx in correct load order
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -> None:
+    """index.html must include tab_escalations.jsx, loaded AFTER data.js, shell.jsx,
+    and tabs.jsx and BEFORE app.jsx; must be a classic synchronous script (no
+    defer/async/type=module); and all /static/redux/*?v= busters must share a
+    single version >= 10.
+
+    Checks:
+    (a) tab_escalations.jsx script tag exists.
+    (b) Loads after data.js.
+    (c) Loads after shell.jsx.
+    (d) Loads after tabs.jsx.
+    (e) Loads before app.jsx.
+    (f) Not deferred/async/module.
+    (g) All /static/redux/ v= cache-busters share one version >= 10.
+    """
+    _TAB_ESC_PREFIX = '/static/redux/tab_escalations.jsx'
+
+    # (a) tab_escalations.jsx script tag must exist
+    result = _find_script_position(index_html_body, _TAB_ESC_PREFIX)
+    assert result is not None, (
+        f'No <script src="{_TAB_ESC_PREFIX}..."> tag found in index.html — '
+        'add it after tabs.jsx and before app.jsx.'
+    )
+    _, esc_attrs = result
+
+    # (f) Must be a classic synchronous script
+    assert 'defer' not in esc_attrs, (
+        'tab_escalations.jsx script tag has defer= — remove it; classic synchronous '
+        'scripts are required for Babel-standalone transpilation.'
+    )
+    assert 'async' not in esc_attrs, (
+        'tab_escalations.jsx script tag has async= — remove it.'
+    )
+    assert (esc_attrs.get('type') or '').lower() in ('text/babel', ''), (
+        'tab_escalations.jsx script must have type="text/babel" (or no type) — '
+        f'got {esc_attrs.get("type")!r}.'
+    )
+
+    # (b) Loads after data.js
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/data.js',
+        _TAB_ESC_PREFIX,
+        'data.js',
+        'tab_escalations.jsx',
+        'data.js must load before tab_escalations.jsx so window.DF_DATA is seeded.',
+    )
+
+    # (c) Loads after shell.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/shell.jsx',
+        _TAB_ESC_PREFIX,
+        'shell.jsx',
+        'tab_escalations.jsx',
+        'shell.jsx must load before tab_escalations.jsx so window.DF_SHELL is available.',
+    )
+
+    # (d) Loads after tabs.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        '/static/redux/tabs.jsx',
+        _TAB_ESC_PREFIX,
+        'tabs.jsx',
+        'tab_escalations.jsx',
+        'tabs.jsx must load before tab_escalations.jsx so window.DF_TABS is available to mutate.',
+    )
+
+    # (e) Loads before app.jsx
+    _assert_script_loads_before(
+        index_html_body,
+        _TAB_ESC_PREFIX,
+        '/static/redux/app.jsx',
+        'tab_escalations.jsx',
+        'app.jsx',
+        'tab_escalations.jsx must load before app.jsx so EscalationsTab is set on window.DF_TABS.',
+    )
+
+    # (g) All /static/redux/ v= cache-busters share one version >= 10
+    import re as _re
+    versions = set(_re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
+        'bump all of them uniformly to the same value.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 10, (
+        f'index.html cache-buster version is {v}, expected >= 10.'
+    )
