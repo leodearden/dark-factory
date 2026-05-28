@@ -1048,6 +1048,48 @@ class Scheduler:
                 return inner.get(key) if isinstance(inner, dict) else None
         return None
 
+    async def tasks_by_train(self, train_id: str) -> list[dict]:
+        """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
+
+        δ₂ member-discovery helper (PRD §δ₂).  Performs a FRESH ``get_tasks``
+        read — deliberately not a stateful cache — so callers always see the
+        latest member statuses.  For a three-member train the round-trip cost
+        is negligible, and a stale cache would cause the all-deferred check to
+        fire on outdated data.
+
+        Args:
+            train_id: The ``metadata.train.id`` value to filter by.  Returns
+                ``[]`` immediately when falsy (avoids a spurious get_tasks
+                round-trip for empty/None callers).
+
+        Returns:
+            List of task dicts whose ``metadata.train.id == train_id``, sorted
+            ascending by ``metadata.train.order`` (root→tip).  Members whose
+            ``order`` is missing or non-integer are sorted last
+            deterministically (stable, no crash).
+        """
+        if not train_id:
+            return []
+
+        tasks = await self.get_tasks()
+
+        def _order_key(t: dict) -> tuple[int, int]:
+            train = (t.get('metadata') or {}).get('train') or {}
+            order = train.get('order') if isinstance(train, dict) else None
+            try:
+                return (0, int(order))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return (1, 0)  # missing/non-int → sort last
+
+        return sorted(
+            [
+                t for t in tasks
+                if isinstance((t.get('metadata') or {}).get('train'), dict)
+                and (t.get('metadata') or {}).get('train', {}).get('id') == train_id
+            ],
+            key=_order_key,
+        )
+
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
         try:
