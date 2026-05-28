@@ -16,6 +16,7 @@ from orchestrator.verify import (
     _apply_cargo_scope,
     _build_fallback_config,
     _extract_cause_hint,
+    _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
     _resolve_verify_env,
@@ -740,6 +741,65 @@ class TestIsTestFile:
     def test_returns_false_for_regular_source_file(self):
         """A regular source file must return False (negative baseline)."""
         assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
+
+
+class TestIsStructuralPythonFile:
+    """`_is_structural_python_file` detects Protocol/TypedDict base-class usage.
+
+    The helper is a deliberately cheap content grep (not an AST parse) — it
+    returns True when the file content contains a class that inherits from
+    Protocol or TypedDict, which would create cross-file type invariants that
+    file-scoped pyright cannot verify.
+    """
+
+    def test_returns_true_for_protocol_base(self):
+        """A class with Protocol as its sole base must return True."""
+        content = 'class Foo(Protocol):\n    def method(self) -> None: ...\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/interfaces.py', content) is True
+
+    def test_returns_true_for_protocol_multi_base(self):
+        """A class with Protocol as one of several bases must return True."""
+        content = 'class Foo(SomeBase, Protocol):\n    pass\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/proto.py', content) is True
+
+    def test_returns_true_for_typeddict_base(self):
+        """A TypedDict subclass must return True."""
+        content = 'class Bar(TypedDict):\n    name: str\n    value: int\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/types.py', content) is True
+
+    def test_returns_false_for_ordinary_class(self):
+        """A plain class with no Protocol/TypedDict base must return False."""
+        content = 'class Foo:\n    pass\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/foo.py', content) is False
+
+    def test_returns_false_for_basemodel_subclass(self):
+        """A Pydantic BaseModel subclass must return False (not structural)."""
+        content = 'class Config(BaseModel):\n    name: str\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/config.py', content) is False
+
+    def test_returns_false_for_function_only_file(self):
+        """A file with only functions and no classes must return False."""
+        content = 'def do_thing(x: int) -> str:\n    return str(x)\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/utils.py', content) is False
+
+    def test_returns_false_for_empty_file(self):
+        """An empty file must return False."""
+        assert _is_structural_python_file('orchestrator/src/orchestrator/empty.py', '') is False
+
+    def test_returns_false_for_protocol_in_comment(self):
+        """A comment mentioning Protocol) must not trigger a True result.
+
+        This is the regression guard for the documented false-positive territory:
+        a bare string or comment mentioning 'Protocol)' should not match the
+        class-definition regex pattern.
+        """
+        content = '# This is not a Protocol) definition\ndef foo() -> None: pass\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/note.py', content) is False
+
+    def test_returns_false_for_non_py_extension(self):
+        """A non-.py path must return False even if content contains Protocol)."""
+        content = 'class Foo(Protocol):\n    pass\n'
+        assert _is_structural_python_file('orchestrator/src/orchestrator/iface.pyi', content) is False
 
 
 class TestScopeModuleConfigReturnsNone:
