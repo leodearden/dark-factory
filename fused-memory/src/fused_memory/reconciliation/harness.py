@@ -575,7 +575,7 @@ class ReconciliationHarness:
     async def _recover_stale_runs(self) -> None:
         """Find runs stuck in 'running' state and mark them failed.
 
-        Uses stale_run_recovery_seconds as the age cutoff (default 600s),
+        Uses stale_run_recovery_seconds as the age cutoff (default 1800s),
         then double-checks that the *same* instance still holds the project's
         reconciliation lock before skipping — protecting legitimately long-running
         cycles owned by this process while still recovering orphans whose owning

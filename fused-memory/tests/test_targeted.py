@@ -57,6 +57,10 @@ def mock_event_buffer():
     buf = AsyncMock()
     buf.is_full_recon_active = AsyncMock(return_value=False)
     buf.defer_write = AsyncMock(return_value='deferred-id')
+    # Plain string attribute (not an AsyncMock child): matches the real
+    # EventBuffer.instance_id wire shape so ReconciliationRun's
+    # ``instance_id: str | None`` Pydantic field validates.
+    buf.instance_id = 'mock-buffer-instance'
     return buf
 
 

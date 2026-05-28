@@ -358,9 +358,23 @@ class ReconciliationConfig(BaseModel):
     stage_timeout_seconds: int = Field(default=3600, gt=0)
     cycle_timeout_seconds: int = Field(default=21600, gt=0)
     stale_run_recovery_seconds: int = Field(
-        default=600,
+        default=1800,
         gt=0,
-        description='Runs with started_at older than this are recovered on startup if their lock is stale',
+        description=(
+            'Age cutoff (s) for journal rows in status="running" before the '
+            'reaper considers them orphaned.  The primary protection against '
+            'reaping a live cycle is the lock-holder identity check in '
+            'ReconciliationHarness._recover_stale_runs; this value is the '
+            'palliative outer bound for when that primary guard cannot apply '
+            '(brand-new cycle that has not acquired its lock yet, or a future '
+            'regression on the primary guard).  Bumped 600 -> 1800 on '
+            '2026-05-28 after observing real-world cycle envelopes: a full '
+            'cycle measured at 29:58 (run 97b49a64), plus parent + remediation '
+            'comfortably exceeding 30 minutes when actionable findings exist. '
+            '1800 s gives clean separation from typical cycle length while '
+            'still bounding orphan-detection latency well below the lock-'
+            'staleness TTL of 7200 s.  See plans/recon-stale-recovery-rca.md.'
+        ),
     )
     # Per-CLI-invocation wall-clock budgets — semantically distinct from
     # stage_timeout_seconds (the outer stage-level guard).  Task 881 accidentally
