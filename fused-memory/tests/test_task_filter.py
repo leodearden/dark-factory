@@ -400,8 +400,10 @@ class TestFormatFilteredTaskTree:
         #       within budget and emitting the truncation notice.
         # The exact byte counts are intentionally not pinned here; the assertions below
         # validate the invariants directly from the rendered output.
+        # Note: max_chars was raised from 240 to 270 when the header grew by the
+        # 'highest task id: N' token (~20 chars) added in step-4 of task 1516.
         max_tasks = 5
-        max_chars = 240
+        max_chars = 270
         output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
 
         # Output must honour the char budget

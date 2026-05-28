@@ -337,6 +337,10 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
     cheaply (varying only 'shown') without re-running the cancelled-section /
     summary-line logic inside _build_surrounding.
 
+    Includes an authoritative 'highest task id: N' token derived from
+    tree.max_task_id so the LLM receives ground truth instead of inferring
+    the maximum from the (possibly capped or wrong-source) rendered body.
+
     Args:
         shown: Number of active tasks actually rendered in the body.
         omitted_active: Count of tasks omitted by the max_tasks cap only (not
@@ -348,7 +352,8 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
-        f'{tree.other_count} other, {tree.total_count} total)\n'
+        f'{tree.other_count} other, {tree.total_count} total, '
+        f'highest task id: {tree.max_task_id})\n'
     )
 
 
