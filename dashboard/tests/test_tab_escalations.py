@@ -525,3 +525,74 @@ def test_tab_escalations_global_filter_chips(tab_escalations_jsx_body: str) -> N
         "tab_escalations.jsx does not apply a filter predicate referencing filter state to rows — "
         'add a matchesFilter(row) function using filter.levels[row.level] && filter.statuses[row.status].'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-15 test: tab_escalations.jsx has a detail sidebar for selected rows
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must maintain a selected-row state, render a detail
+    sidebar with role="dialog" and a close button (onClose), and the sidebar
+    must reference all required escalation record fields plus the linked task card.
+
+    Asserts:
+    (a) selected-row state maintained (useState for selected row, set from row onClick).
+    (b) sidebar rendered with role="dialog" and an onClose handler / close button.
+    (c) sidebar references escalation record fields: detail, suggested_action,
+        level, category, severity, agent_role, workflow_state, worktree, resolution.
+    (d) sidebar references linked task card fields: task.title, task.status, task.description.
+    (e) renders the resolved project label.
+    (f) task_unresolved fallback branch present.
+    """
+    body = tab_escalations_jsx_body
+
+    # (a) Selected-row state set from a row onClick
+    # useState for selected (uS(null) or useState(null)) and setSelected used in onClick
+    assert 'setSelected' in body, (
+        'tab_escalations.jsx does not maintain a selected-row state with `setSelected` — '
+        'add `const [selected, setSelected] = uS(null)` and wire `onClick={() => setSelected(row)}`.'
+    )
+    assert 'onClick' in body and 'setSelected' in body, (
+        'tab_escalations.jsx does not set selected row from row onClick — '
+        'add `onClick={() => setSelected(row)}` on each row <tr>.'
+    )
+
+    # (b) Sidebar with role="dialog" and close button calling onClose
+    assert 'role="dialog"' in body, (
+        'tab_escalations.jsx detail sidebar does not have `role="dialog"` — '
+        'add role="dialog" to the sidebar container element to match the SchedulerDrawer pattern.'
+    )
+    assert 'onClose' in body, (
+        'tab_escalations.jsx detail sidebar does not reference onClose — '
+        'add an `onClose` prop/handler for the sidebar close button.'
+    )
+
+    # (c) Escalation record fields referenced in the sidebar
+    for field in ('detail', 'suggested_action', 'level', 'category', 'severity',
+                  'agent_role', 'workflow_state', 'worktree', 'resolution'):
+        assert field in body, (
+            f'tab_escalations.jsx detail sidebar does not reference escalation field '
+            f'`{field}` — add it to the sidebar content (section or label).'
+        )
+
+    # (d) Linked task card fields
+    for field in ('task.title', 'task.status', 'task.description'):
+        assert field in body, (
+            f'tab_escalations.jsx detail sidebar does not reference linked task field '
+            f'`{field}` — add it to the sidebar linked-task section.'
+        )
+
+    # (e) Resolved project label
+    assert 'row.project' in body, (
+        'tab_escalations.jsx sidebar does not render the resolved `project` label — '
+        'add `{row.project}` display in the sidebar.'
+    )
+
+    # (f) task_unresolved fallback branch
+    assert 'task_unresolved' in body, (
+        'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
+        'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
+        'escalations whose linked task could not be resolved.'
+    )
