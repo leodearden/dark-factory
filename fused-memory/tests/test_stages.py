@@ -1170,6 +1170,33 @@ class TestProactiveSampling:
             'the tool is blocked via DISALLOW_SUBTASK_CREATE.'
         )
 
+    def test_stage2_prompt_documents_flatten_recipe(self):
+        """STAGE2_SYSTEM_PROMPT must document the flatten recipe as add_subtask replacement.
+
+        When add_subtask is blocked, agents must know the approved alternative:
+        submit_task(planning_mode=True) + optional add_dependency + commit_planning.
+        The section header 'Splitting Tasks' and the procedural-memory anchor
+        'fca61c20' must both be present so agents can find the canonical recipe.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'Splitting Tasks' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain a '## Splitting Tasks' section "
+            "documenting the flatten recipe (add_subtask replacement)."
+        )
+        assert 'commit_planning' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must document commit_planning as part of the "
+            "flatten recipe (submit_task(planning_mode=True) + commit_planning)."
+        )
+        assert 'planning_mode=True' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must show planning_mode=True in the flatten "
+            "recipe so agents know to use the batch-planning flow."
+        )
+        assert 'fca61c20' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must reference procedural memory fca61c20 "
+            "as the canonical source for the flatten recipe."
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
