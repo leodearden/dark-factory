@@ -51,9 +51,13 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__update_edge',
 ]
 
+# Subtask creation (disallowed in Stage 2 — orchestrator scheduler is top-level-only;
+# new subtasks would be silently orphaned and never dispatched, see procedural memory fca61c20)
+DISALLOW_SUBTASK_CREATE = ['mcp__fused-memory__add_subtask']
+
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
-STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Full access to memory + task tools
+STAGE2_DISALLOWED = DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE  # Full memory + task tools EXCEPT add_subtask (see DISALLOW_SUBTASK_CREATE)
 STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
 
 # Output schema for stage reports

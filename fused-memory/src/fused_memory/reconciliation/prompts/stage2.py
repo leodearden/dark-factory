@@ -23,8 +23,9 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
 `mcp__fused-memory__set_task_status`, `mcp__fused-memory__submit_task`, \
 `mcp__fused-memory__resolve_ticket`, `mcp__fused-memory__update_task`, \
-`mcp__fused-memory__add_subtask`, `mcp__fused-memory__remove_task`, \
-`mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`
+`mcp__fused-memory__remove_task`, \
+`mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`, \
+`mcp__fused-memory__commit_planning`
 
 ## Creating Tasks
 Task creation is a two-phase operation:
@@ -39,6 +40,28 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+
+## Splitting Tasks (do NOT create subtasks)
+Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
+The orchestrator scheduler is top-level-only: it iterates `tasks` without descending into \
+`t['subtasks']`, so any nested task you create would be permanently invisible to dispatch \
+and silently orphaned.
+
+When a task needs to be decomposed into parallel or sequential work items, use the \
+**flatten recipe** instead (canonical recipe in procedural memory `fca61c20`):
+
+1. For each child task, call `submit_task(project_root=..., title=..., description=..., \
+   planning_mode=True, metadata={{'decomposed_from': {{'parent_id': <parent_id>, \
+   'parent_title': <parent_title>}}, 'human_decomposed': True}})` → creates the task \
+   directly in `deferred` status, returns \
+   `{{'task_id': ..., 'status': 'deferred', 'planning_mode': True}}`. The task stays \
+   parked in `deferred` until step 3's commit_planning promotes it.
+2. Optionally wire ordering: `add_dependency(id=<child_id>, depends_on=<other_child_id>, \
+   project_root=...)`.
+3. Atomically promote all deferred tasks to pending: \
+   `commit_planning(project_root=..., task_ids='id1,id2,...', target_status='pending')`.
+
+Each resulting task is a top-level task and will be picked up by the dispatcher normally.
 
 ## Your Reconciliation Tasks
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
