@@ -881,6 +881,16 @@ async def filter_false_absence_flags(
     positively absent).  Flags that are present, inconclusive, or whose lookup
     raises are dropped — fail-closed, because delete_memory is irreversible.
 
+    **Raised-exception path** (production RAW backend): The sqlite backend (and
+    its TaskInterceptor middleware) RAISES ``TaskmasterError(
+    'TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): N')`` on absence rather
+    than returning a dict.  When get_task raises, the exception is normalised to
+    ``{'error': str(exc), 'error_type': type(exc).__name__}`` and passed to
+    ``confirm_task_absent``.  If that returns True (the not-found phrase is in
+    ``str(exc)``), the flag is kept (task positively absent); otherwise it is
+    dropped (fail-closed: TASKMASTER_UNAVAILABLE / timeout / generic raise →
+    inconclusive → drop).
+
     Non-absence flags and absence flags without a ``task_id`` are passed through
     unchanged without issuing any get_task call.
 
@@ -889,7 +899,7 @@ async def filter_false_absence_flags(
 
     Structured drop observations are logged via
     ``logger.info('reconciliation.false_absence_flag_dropped', ...)`` with
-    ``task_id`` and the reason (``'present'`` or ``'inconclusive'``).
+    ``task_id`` and the reason (``'present'``, ``'inconclusive'``).
 
     Args:
         taskmaster: Object with an async ``get_task(task_id, project_root)``
@@ -917,15 +927,16 @@ async def filter_false_absence_flags(
             kept.append(flag)
             continue
 
-        # Evaluate absence via get_task (fail-closed)
+        # Evaluate absence via get_task (fail-closed).
+        # The RAW backend RAISES TaskmasterError on absence; normalise to the
+        # same {error, error_type} shape the MCP wrapper returns so a single
+        # confirm_task_absent call classifies both paths identically.
         try:
             result = await taskmaster.get_task(task_id, project_root)
         except Exception as exc:
-            logger.info(
-                'reconciliation.false_absence_flag_dropped task_id=%s flag_type=%s reason=inconclusive error=%s',
-                task_id, flag_type, exc,
-            )
-            continue  # drop: inconclusive (get_task raised)
+            # Normalise: same dict shape as the MCP-wrapper path so
+            # confirm_task_absent can classify the raised-exception path.
+            result = {'error': str(exc), 'error_type': type(exc).__name__}
 
         if confirm_task_absent(result):
             kept.append(flag)
