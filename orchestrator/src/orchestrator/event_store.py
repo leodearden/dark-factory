@@ -170,6 +170,12 @@ class EventType(StrEnum):
     worktree_quarantined = 'worktree_quarantined'
     worktree_reaped = 'worktree_reaped'
 
+    # Atomic train lifecycle (PRD 13.7)
+    train_started = 'train_started'
+    train_member_deferred = 'train_member_deferred'
+    train_merged = 'train_merged'
+    train_derailed = 'train_derailed'
+
 
 class EventStore:
     """Append-only SQLite event store.
