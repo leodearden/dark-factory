@@ -116,6 +116,10 @@ class _SchedulerLike(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
+    async def get_tasks(self) -> list[dict]: ...
+    async def get_statuses(
+        self, ids: list[str] | None = ...,
+    ) -> tuple[dict[str, str], Exception | None]: ...
 
 
 class _McpLike(Protocol):

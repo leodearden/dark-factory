@@ -25,7 +25,6 @@ from escalation.models import Escalation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture helpers (mirrors test_workflow_infra_thrash.py)
 # ---------------------------------------------------------------------------

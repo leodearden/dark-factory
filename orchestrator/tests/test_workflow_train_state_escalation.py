@@ -26,7 +26,6 @@ from escalation.models import Escalation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture helper
 # ---------------------------------------------------------------------------
