@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
-from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas
+from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
@@ -108,13 +108,9 @@ async def _open_overrides_db(
     db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if autocommit:
-        db = await aiosqlite.connect(
-            str(db_path),
-            timeout=30,
-            isolation_level=None,
-        )
+        db = await connect_daemon(str(db_path), timeout=30, isolation_level=None)
     else:
-        db = await aiosqlite.connect(str(db_path))
+        db = await connect_daemon(str(db_path))
     # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
     # to 30s for the write lock (matches source-of-truth timeout=30 above).
     busy_ms = 30000 if autocommit else 5000
@@ -144,13 +140,9 @@ async def _connect_overrides_db(
     db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if autocommit:
-        db = await aiosqlite.connect(
-            str(db_path),
-            timeout=30,
-            isolation_level=None,
-        )
+        db = await connect_daemon(str(db_path), timeout=30, isolation_level=None)
     else:
-        db = await aiosqlite.connect(str(db_path))
+        db = await connect_daemon(str(db_path))
     busy_ms = 30000 if autocommit else 5000
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     return db
