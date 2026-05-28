@@ -1241,6 +1241,7 @@ class MergeWorker:
                 task_files=req.task_files,
                 max_retries=0,
                 is_merge_verify=True,
+                role='merge',
             )
             # Transient-infra (disk pressure) retry: an ENOSPC failure is
             # often a self-healing host condition.  Prune stale _merge-*
@@ -1267,6 +1268,7 @@ class MergeWorker:
                         task_files=req.task_files,
                         max_retries=0,
                         is_merge_verify=True,
+                        role='merge',
                     )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
@@ -2271,6 +2273,7 @@ class SpeculativeMergeWorker:
                     task_files=req.task_files,
                     max_retries=0,
                     is_merge_verify=True,
+                    role='merge',
                 )
             except Exception as exc:
                 logger.info(
@@ -2314,6 +2317,7 @@ class SpeculativeMergeWorker:
                             task_files=req.task_files,
                             max_retries=0,
                             is_merge_verify=True,
+                            role='merge',
                         )
                     except Exception as exc:
                         await self._git_ops.cleanup_merge_worktree(merge_wt)
