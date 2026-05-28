@@ -33,6 +33,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     MergeWorker,
+    TRAIN_REBASE_CONFLICT_REASON_PREFIX,
 )
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
@@ -1154,4 +1155,263 @@ class TestScenario7TrainResume:
         assert sched7.mark_done.call_count == 3, (
             f"expected 3 scheduler.mark_done calls (one per member), "
             f"got {sched7.mark_done.call_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 8 (main advances during holding window) — step-9 RED / step-10 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScenario8MainAdvances:
+    """PRD §10 row 8: main advances while train is in the merge-deferred holding window.
+
+    CLEAN variant: unrelated commit lands on main between stacking and the
+    group merge; the worker rebases the tip onto new main, then merges —
+    main contains both the unrelated commit AND all 3 member files, single
+    new merge commit, outcome done.  Uses real cargo (cargo_or_skip).
+
+    CONFLICT variant: main commit edits the SAME line as a train member,
+    producing a genuine rebase conflict.  Worker returns the
+    TRAIN_REBASE_CONFLICT_REASON_PREFIX outcome; advance_main NOT called,
+    members not flipped.
+    """
+
+    async def test_main_advances_then_train_merges_clean(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """CLEAN: unrelated main commit rebased over, merge lands single clean commit."""
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # Additive member edits.
+        def edit_alpha(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn alpha8c_output() -> u32 { 8 }\n")
+
+        def edit_beta(wt: Path) -> None:
+            lib = wt / "crate_b" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn beta8c_output() -> u32 { 8 }\n")
+
+        def edit_gamma(wt: Path) -> None:
+            lib = wt / "crate_c" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn gamma8c_output() -> u32 { 8 }\n")
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        wt_a, sha_a = await make_stacked_member(git_ops, "alpha8c", main_sha, edit_alpha)
+        wt_b, sha_b = await make_stacked_member(git_ops, "beta8c", sha_a, edit_beta)
+        wt_c, _sha_c = await make_stacked_member(git_ops, "gamma8c", sha_b, edit_gamma)
+
+        # Land an UNRELATED commit directly on main (no-conflict; new file).
+        # git commit-tree approach: commit a new file directly onto main.
+        (repo / "unrelated_main.txt").write_text("unrelated main advance\n")
+        await _run(["git", "add", "unrelated_main.txt"], cwd=repo)
+        await _run(
+            ["git", "commit", "-m", "Unrelated main advance (scenario 8 clean)"],
+            cwd=repo,
+        )
+
+        _, main_sha_after_advance, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_after_advance = main_sha_after_advance.strip()
+
+        # Verify main is now AHEAD of the train branch point.
+        _, merges_before_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_before = int(merges_before_str.strip())
+
+        # Drive the GroupMergeRequest — worker rebases tip onto new main then merges.
+        req = build_group_merge_request(
+            git_ops=git_ops,
+            config=config,
+            train_id="train-scenario-8-clean",
+            member_names=["alpha8c", "beta8c", "gamma8c"],
+            tip_name="gamma8c",
+            tip_worktree=wt_c,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        outcome = await worker._do_merge(req)
+
+        # (i) Outcome done.
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done after clean rebase+merge, got: {outcome!r}"
+        assert outcome.merge_sha is not None
+
+        # (ii) Single new merge commit.
+        _, merges_after_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_after = int(merges_after_str.strip())
+        assert merges_after == merges_before + 1, (
+            f"expected exactly 1 new merge commit, got {merges_after - merges_before}"
+        )
+
+        # (iii) Main contains BOTH the unrelated commit AND all member crate edits.
+        _, main_files, _ = await _run(
+            ["git", "ls-tree", "-r", "--name-only", "main"], cwd=repo
+        )
+        assert "unrelated_main.txt" in main_files, (
+            "main must contain the unrelated advance commit"
+        )
+        assert "crate_a/src/lib.rs" in main_files
+        assert "crate_b/src/lib.rs" in main_files
+        assert "crate_c/src/lib.rs" in main_files
+
+        # Check member edits on main.
+        _, lib_a, _ = await _run(["git", "show", "main:crate_a/src/lib.rs"], cwd=repo)
+        assert "alpha8c_output" in lib_a
+        _, lib_c, _ = await _run(["git", "show", "main:crate_c/src/lib.rs"], cwd=repo)
+        assert "gamma8c_output" in lib_c
+
+        # (iv) 3 mark_member_done with one shared SHA.
+        assert req.mark_member_done.call_count == 3  # type: ignore[union-attr]
+        called_shas = {c.args[1] for c in req.mark_member_done.call_args_list}  # type: ignore[union-attr]
+        assert len(called_shas) == 1
+        assert next(iter(called_shas)) == outcome.merge_sha
+
+        # (v) No red-main window: cargo green at final main tip.
+        env = {**__import__("os").environ, "CARGO_TARGET_DIR": str(shared_cargo_target)}
+        _, new_main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        new_main_sha = new_main_sha.strip()
+        main_wt = tmp_path / "_verify_main8c"
+        await _run(
+            ["git", "worktree", "add", "--detach", str(main_wt), new_main_sha],
+            cwd=repo,
+        )
+        try:
+            result = subprocess.run(
+                ["cargo", "test", "--workspace", "--quiet"],
+                cwd=main_wt, env=env, capture_output=True, text=True,
+            )
+            assert result.returncode == 0, (
+                f"Final main tip must be workspace-green:\n{result.stdout}{result.stderr}"
+            )
+        finally:
+            await _run(
+                ["git", "worktree", "remove", "--force", str(main_wt)], cwd=repo
+            )
+
+    async def test_main_advances_rebase_conflict(self, tmp_path: Path) -> None:
+        """CONFLICT: main edit conflicts with member → TRAIN_REBASE_CONFLICT outcome.
+
+        Lands a commit on main that edits the SAME LINE as gamma's crate_c
+        change.  rebase_onto_main genuinely conflicts → worker returns the
+        TRAIN_REBASE_CONFLICT_REASON_PREFIX reason, advance_main NOT called,
+        main SHA unmoved, zero mark_member_done calls.
+
+        No cargo needed (the rebase conflict is detected before any verify).
+        """
+        # Seed a simple git repo (no cargo fixture needed — conflict happens at rebase).
+        repo = tmp_path
+        await _run(["git", "init", "-b", "main"], cwd=repo)
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+        await _run(["git", "config", "user.name", "Test"], cwd=repo)
+        # Use a simple text file as the "shared" file that both main and γ edit.
+        (repo / "shared.txt").write_text("line1\nCONFLICT_TARGET\nline3\n")
+        await _run(["git", "add", "-A"], cwd=repo)
+        await _run(["git", "commit", "-m", "initial"], cwd=repo)
+
+        config8r = OrchestratorConfig(
+            project_root=repo,
+            test_command="true",
+            lint_command="true",
+            type_check_command="true",
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        git_ops8r = GitOps(config8r.git, repo)
+
+        # Stack α/β/γ — γ modifies shared.txt CONFLICT_TARGET line.
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        wt_a, sha_a = await make_stacked_member(
+            git_ops8r, "alpha8r", main_sha,
+            lambda wt: (wt / "alpha8r.txt").write_text("alpha8r\n"),
+        )
+        wt_b, sha_b = await make_stacked_member(
+            git_ops8r, "beta8r", sha_a,
+            lambda wt: (wt / "beta8r.txt").write_text("beta8r\n"),
+        )
+
+        def edit_gamma_conflict(wt: Path) -> None:
+            (wt / "shared.txt").write_text("line1\nGAMMA_EDIT\nline3\n")
+
+        wt_c, _sha_c = await make_stacked_member(
+            git_ops8r, "gamma8r", sha_b, edit_gamma_conflict,
+        )
+
+        # Land a CONFLICTING commit on main — same line γ edits.
+        (repo / "shared.txt").write_text("line1\nMAIN_EDIT\nline3\n")
+        await _run(["git", "add", "shared.txt"], cwd=repo)
+        await _run(
+            ["git", "commit", "-m", "Conflicting main advance (scenario 8 conflict)"],
+            cwd=repo,
+        )
+
+        # Record main state before the (conflicting) merge attempt.
+        _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_before = main_sha_before.strip()
+        _, merges_before_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_before = int(merges_before_str.strip())
+
+        req = build_group_merge_request(
+            git_ops=git_ops8r,
+            config=config8r,
+            train_id="train-scenario-8-conflict",
+            member_names=["alpha8r", "beta8r", "gamma8r"],
+            tip_name="gamma8r",
+            tip_worktree=wt_c,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops8r, queue)
+        outcome = await worker._do_merge(req)
+
+        # (i) Outcome reason starts with TRAIN_REBASE_CONFLICT_REASON_PREFIX.
+        assert outcome is not None
+        assert outcome.status != "done", (
+            f"expected blocked outcome on rebase conflict, got: {outcome!r}"
+        )
+        assert outcome.reason.startswith(TRAIN_REBASE_CONFLICT_REASON_PREFIX), (
+            f"expected reason to start with TRAIN_REBASE_CONFLICT_REASON_PREFIX, "
+            f"got: {outcome.reason!r}"
+        )
+
+        # (ii) advance_main NOT called: main SHA unmoved.
+        _, main_sha_after, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        assert main_sha_after.strip() == main_sha_before, (
+            f"advance_main must NOT fire on rebase conflict; "
+            f"main moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (iii) No new merge commits.
+        _, merges_after_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=repo
+        )
+        merges_after = int(merges_after_str.strip())
+        assert merges_after == merges_before, (
+            f"no new merge commits expected, got {merges_after - merges_before} new"
+        )
+
+        # (iv) No mark_member_done flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire on rebase conflict, "
+            f"got {req.mark_member_done.call_count} call(s)"
         )
