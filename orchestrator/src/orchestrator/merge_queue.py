@@ -2742,6 +2742,87 @@ class SpeculativeMergeWorker:
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
         )
+
+        # ── Speculation-race retry ─────────────────────────────────────────────
+        # When the first attempt fails with the load-bearing git porcelain phrase
+        # ``not something we can merge`` (detected by _is_speculation_race), main
+        # may have advanced between our get_main_sha() read and merge_to_main's
+        # own get_main_sha() read, leaving the merge worktree built against a
+        # stale base.  Retry exactly once against a freshly-read main HEAD.
+        # merge_to_main self-cleans its worktree on non-conflict failure, so
+        # merge_result.merge_worktree is None here — no pre-retry cleanup needed.
+        if (
+            not merge_result.success
+            and not merge_result.conflicts
+            and _is_speculation_race(merge_result.details)
+        ):
+            retry_main = await self._git_ops.get_main_sha()
+            logger.warning(
+                'Task %s: speculation-race detected (first_base=%s, stderr=%r) '
+                '— retrying against main %s',
+                req.task_id, (merge_result.pre_merge_sha or actual_main)[:8],
+                merge_result.details[:120], retry_main[:8],
+            )
+            retry_result = await self._git_ops.merge_to_main(
+                req.worktree, req.branch, base_sha=retry_main,
+            )
+            if retry_result.success:
+                logger.info(
+                    'Task %s: merge_retry_after_speculation_race succeeded '
+                    '(retry_base=%s)',
+                    req.task_id, retry_main[:8],
+                )
+                skip_verify = (
+                    req.pre_rebased
+                    and retry_result.pre_merge_sha is not None
+                    and retry_result.pre_merge_sha == retry_main
+                )
+                return SpeculativeItem(
+                    request=req, merge_result=retry_result,
+                    merge_wt=retry_result.merge_worktree,
+                    base_sha=retry_main, speculative=False, skip_verify=skip_verify,
+                    started_monotonic=started_monotonic,
+                )
+            if retry_result.conflicts:
+                _emit_merge_attempt(
+                    self._event_store, req.task_id, 'conflict',
+                    duration_ms=_elapsed_ms(started_monotonic),
+                )
+                if retry_result.merge_worktree:
+                    await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
+                return SpeculativeItem(
+                    request=req, merge_result=None, merge_wt=None,
+                    base_sha=retry_main, speculative=False, skip_verify=False,
+                    immediate_outcome=MergeOutcome(
+                        'conflict', conflict_details=retry_result.details,
+                    ),
+                    started_monotonic=started_monotonic,
+                )
+            # Retry non-conflict failure — single μ diagnostic (dual-attempt
+            # surfacing added in step-6 / impl(step-6)).
+            if retry_result.merge_worktree:
+                await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
+            retry_diag = await self._build_merge_failure_diagnostic(
+                req,
+                base_sha=retry_result.pre_merge_sha or retry_main,
+                base_label='main_head',
+                git_stderr=retry_result.details,
+            )
+            retry_rendered = self._render_failure_diagnostic(retry_diag)
+            retry_outcome = MergeOutcome(
+                'blocked',
+                reason=f'{retry_result.details}\n{retry_rendered}',
+                failure_diagnostic=retry_diag,
+            )
+            return SpeculativeItem(
+                request=req, merge_result=None, merge_wt=None,
+                base_sha=retry_main, speculative=False, skip_verify=False,
+                immediate_outcome=retry_outcome,
+                failure_diagnostic=retry_diag,
+                started_monotonic=started_monotonic,
+            )
+        # ── END speculation-race retry ─────────────────────────────────────────
+
         if merge_result.conflicts:
             _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(started_monotonic))
             if merge_result.merge_worktree:
