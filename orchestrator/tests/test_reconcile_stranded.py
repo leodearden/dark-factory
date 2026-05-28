@@ -2448,3 +2448,52 @@ async def test_blocked_with_merge_marker_marked_done(harness: Harness):
             'note': 'reconcile: merge marker found on main while task was blocked',
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# merge-deferred guard tests (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_skips_merge_deferred_status(harness: Harness):
+    """_reconcile_one_stranded('77', 'merge-deferred') returns None without
+    touching the worktree, the status, or any git operations.
+
+    Pins the explicit early-return guard that mirrors the open-L1 /unblock
+    veto (harness.py:1598-1607): merge-deferred tasks are train-parked and
+    must not be reaped or reverted by the stranded-reconciler.
+    """
+    result = await harness._reconcile_one_stranded('77', 'merge-deferred', mid_run=False)
+
+    assert result is None, f'Expected None for merge-deferred, got {result!r}'
+    # Worktree must be left intact: no cleanup, no status change, no git I/O.
+    harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_sweep_excludes_merge_deferred(harness: Harness):
+    """_reconcile_stranded_in_progress with a merge-deferred task in the
+    status map must NOT dispatch _reconcile_one_stranded for that task.
+
+    The implicit sweep_statuses filter (only 'in-progress'/'blocked') already
+    prevents it, but this test pins the observable contract so a future
+    expansion of sweep_statuses can never accidentally include merge-deferred.
+    NOTE: Scheduler.get_statuses returns a (dict, error) tuple.
+    """
+    harness.scheduler.get_statuses.return_value = ({'77': 'merge-deferred'}, None)  # type: ignore[attr-defined]
+
+    # Spy on _reconcile_one_stranded so we can assert it was never called for '77'.
+    spy = AsyncMock(return_value=None)
+    harness._reconcile_one_stranded = spy  # type: ignore[method-assign]
+
+    await harness._reconcile_stranded_in_progress()
+
+    # The spy must never have been invoked for task '77'.
+    for call in spy.call_args_list:
+        tid_arg = call.args[0] if call.args else call.kwargs.get('tid')
+        assert tid_arg != '77', (
+            f'_reconcile_one_stranded was called for merge-deferred task 77: {call}'
+        )
