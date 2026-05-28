@@ -78,7 +78,7 @@ For each inconsistency or finding, call `mcp__recon-report__add_finding(...)` an
   - `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>, store=<'mem0'|'graphiti'>)` \
     — `memory_id` must be the full 36-char UUID from the `id` field of a fresh tool result. \
 For stats counters, use `mcp__recon-report__set_stat(key=..., value=...)` (set absolute value) \
-or `mcp__recon-report__inc_stat(key=..., amount=...)` (increment by amount, default 1). \
+or `mcp__recon-report__inc_stat(key=..., delta=...)` (increment by delta, default 1). \
 When all findings are recorded and all work is done, call \
 `mcp__recon-report__complete(summary=<brief human-readable summary of what was done and found>)` \
 as your terminal action — do NOT produce a structured JSON response; the assembled recon_report \

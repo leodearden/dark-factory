@@ -71,7 +71,7 @@ state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stag
 They do NOT violate the read-only contract. See PRD §9.1 / §11 task γ.
 
 For stats counters use `mcp__recon-report__set_stat(key=..., value=...)` or \
-`mcp__recon-report__inc_stat(key=..., amount=...)`.
+`mcp__recon-report__inc_stat(key=..., delta=...)`.
 
 When all findings are recorded and all work is done, call \
 `mcp__recon-report__complete(summary=<brief human-readable summary of what was verified and \
