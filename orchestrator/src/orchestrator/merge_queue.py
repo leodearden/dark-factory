@@ -2755,6 +2755,8 @@ class SpeculativeMergeWorker:
             not merge_result.success
             and not merge_result.conflicts
             and _is_speculation_race(merge_result.details)
+            and merge_result.pre_merge_sha is not None
+            and merge_result.pre_merge_sha != actual_main
         ):
             retry_main = await self._git_ops.get_main_sha()
             logger.warning(
