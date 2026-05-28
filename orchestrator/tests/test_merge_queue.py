@@ -35,6 +35,7 @@ from orchestrator.merge_queue import (
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _ensure_verify_disk_space,
+    _is_speculation_race,
     _verify_hit_enospc,
     coalesce_or_enqueue_merge_request,
 )
@@ -6934,3 +6935,36 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
         assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
         # Registry now holds the new request
         assert registry.is_inflight(branch) is True
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationRaceRetry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationRaceRetry:
+    """Speculation-race retry: re-merge against actual main when base drifted."""
+
+    def test_is_speculation_race_exact_match(self):
+        """_is_speculation_race matches exactly on git porcelain phrase."""
+        # Exact phrase — load-bearing git porcelain output
+        assert _is_speculation_race('not something we can merge') is True
+        assert _is_speculation_race(
+            "merge: task/feature-foo - not something we can merge"
+        ) is True
+        assert _is_speculation_race(
+            "fatal: 'task/bar' - not something we can merge\nerror: merge failed"
+        ) is True
+
+        # Paraphrases must NOT match
+        assert _is_speculation_race('cannot merge') is False
+        assert _is_speculation_race('not something to merge') is False
+        assert _is_speculation_race('refusing to merge unrelated histories') is False
+        assert _is_speculation_race('fatal: refusing to merge unrelated histories') is False
+        assert _is_speculation_race('not a merge') is False
+
+        # Empty and unrelated fatals
+        assert _is_speculation_race('') is False
+        assert _is_speculation_race('fatal: no such branch') is False
+        assert _is_speculation_race('error: CONFLICT (content)') is False
