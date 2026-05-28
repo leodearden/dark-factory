@@ -501,23 +501,25 @@ class TestCiteMemory:
 
     @pytest.mark.asyncio
     async def test_happy_path_graphiti_store(self):
-        """store='graphiti' → {memory_id, metadata_fingerprint}."""
+        """store='graphiti' → {memory_id, store, metadata_fingerprint}."""
         state, run_id, finding_id, _ = self._state_and_finding()
 
         result = await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
 
         assert result.get('memory_id') == self._VALID_UUID
+        assert result.get('store') == 'graphiti'
         assert result.get('metadata_fingerprint') == self._FINGERPRINT
 
     @pytest.mark.asyncio
     async def test_happy_path_mem0_store(self):
-        """store='mem0' → {memory_id, metadata_fingerprint}."""
+        """store='mem0' → {memory_id, store, metadata_fingerprint}."""
         fingerprint = {'category': 'procedural_knowledge', 'agent_id': 'y', 'created_at': '2026-01-01'}
         state, run_id, finding_id, _ = self._state_and_finding(memory_result=fingerprint)
 
         result = await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'mem0')
 
         assert result.get('memory_id') == self._VALID_UUID
+        assert result.get('store') == 'mem0'
         assert result.get('metadata_fingerprint') == fingerprint
 
     @pytest.mark.asyncio
@@ -598,11 +600,10 @@ class TestCiteMemory:
 
 
 class TestCiteMemoryExceptionNarrowing:
-    """Verify cite_memory catches ONLY (EdgeNotFoundError, MemoryNotFoundError).
+    """Verifies that unexpected exceptions propagate rather than being misclassified as memory_not_found.
 
-    After step-14 narrows the except clause, KeyError and ValueError must
-    propagate out of cite_memory instead of being silently swallowed as
-    memory_not_found.
+    cite_memory catches only (EdgeNotFoundError, MemoryNotFoundError); KeyError and
+    ValueError propagate to the caller unchanged.
     """
 
     _VALID_UUID = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
@@ -614,10 +615,7 @@ class TestCiteMemoryExceptionNarrowing:
 
     @pytest.mark.asyncio
     async def test_memory_not_found_error_caught_as_memory_not_found(self):
-        """MemoryNotFoundError → {error:'memory_not_found'} and cited_memories unchanged.
-
-        RED until step-14 defines MemoryNotFoundError in memory_service.py.
-        """
+        """MemoryNotFoundError → {error:'memory_not_found'} and cited_memories unchanged."""
         from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
 
         state, run_id, finding_id = self._state_and_finding(
@@ -648,10 +646,7 @@ class TestCiteMemoryExceptionNarrowing:
 
     @pytest.mark.asyncio
     async def test_key_error_propagates_not_silenced(self):
-        """KeyError from get_memory must propagate — not be caught as memory_not_found.
-
-        RED until step-14 narrows the except clause (current code catches KeyError).
-        """
+        """KeyError from get_memory must propagate — not be caught as memory_not_found."""
         state, run_id, finding_id = self._state_and_finding(
             memory_raises=KeyError('transient mem0 bug')
         )
@@ -665,10 +660,7 @@ class TestCiteMemoryExceptionNarrowing:
 
     @pytest.mark.asyncio
     async def test_value_error_propagates_not_silenced(self):
-        """ValueError from get_memory must propagate — not be caught as memory_not_found.
-
-        RED until step-14 narrows the except clause (current code catches ValueError).
-        """
+        """ValueError from get_memory must propagate — not be caught as memory_not_found."""
         state, run_id, finding_id = self._state_and_finding(
             memory_raises=ValueError('unrelated graphiti error')
         )
@@ -847,6 +839,77 @@ class TestUuidCaseInsensitive:
         memories = report['flagged_items'][0]['cited_memories']
         assert len(memories) == 1
         assert memories[0]['memory_id'] == self._UUID_MIXED
+
+
+# ---------------------------------------------------------------------------
+# TestServiceNotConfigured — service_not_configured guard when services are None
+# ---------------------------------------------------------------------------
+
+
+class TestServiceNotConfigured:
+    """Guard: cite_* methods return service_not_configured when the injected service is None."""
+
+    _VALID_UUID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+
+    @pytest.mark.asyncio
+    async def test_cite_entity_without_memory_service(self):
+        """cite_entity returns service_not_configured when memory_service is None."""
+        state, run_id, finding_id = _make_state_with_finding()  # memory_service=None
+
+        result = await state.cite_entity(run_id, finding_id, 'SomeName')
+
+        assert result.get('error') == 'service_not_configured'
+        assert result.get('error_type') == 'ReconReportServiceUnavailable'
+
+    @pytest.mark.asyncio
+    async def test_cite_edge_without_memory_service(self):
+        """cite_edge returns service_not_configured after UUID validation when memory_service is None."""
+        state, run_id, finding_id = _make_state_with_finding()
+
+        result = await state.cite_edge(run_id, finding_id, self._VALID_UUID)
+
+        assert result.get('error') == 'service_not_configured'
+        assert result.get('error_type') == 'ReconReportServiceUnavailable'
+
+    @pytest.mark.asyncio
+    async def test_cite_edge_invalid_uuid_still_rejected_before_service_guard(self):
+        """invalid_uuid_shape is returned for bad UUIDs even when memory_service is None."""
+        state, run_id, finding_id = _make_state_with_finding()
+
+        result = await state.cite_edge(run_id, finding_id, 'not-a-uuid')
+
+        assert result.get('error') == 'invalid_uuid_shape'
+
+    @pytest.mark.asyncio
+    async def test_cite_task_without_task_interceptor(self):
+        """cite_task returns service_not_configured after project validation when task_interceptor is None."""
+        state, run_id, finding_id = _make_state_with_finding()
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+
+        result = await state.cite_task(run_id, finding_id, 'dark_factory', '1')
+
+        assert result.get('error') == 'service_not_configured'
+        assert result.get('error_type') == 'ReconReportServiceUnavailable'
+
+    @pytest.mark.asyncio
+    async def test_cite_task_unknown_project_still_rejected_before_service_guard(self):
+        """unknown_project is returned for bad project_id even when task_interceptor is None."""
+        state, run_id, finding_id = _make_state_with_finding()
+        # known_projects is empty by default
+
+        result = await state.cite_task(run_id, finding_id, 'nonexistent', '1')
+
+        assert result.get('error') == 'unknown_project'
+
+    @pytest.mark.asyncio
+    async def test_cite_memory_without_memory_service(self):
+        """cite_memory returns service_not_configured after UUID validation when memory_service is None."""
+        state, run_id, finding_id = _make_state_with_finding()
+
+        result = await state.cite_memory(run_id, finding_id, self._VALID_UUID, 'graphiti')
+
+        assert result.get('error') == 'service_not_configured'
+        assert result.get('error_type') == 'ReconReportServiceUnavailable'
 
 
 class TestReconReportComponentsWiring:
