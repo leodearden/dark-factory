@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -376,7 +376,7 @@ class SqliteTaskBackend:
 
             db_path = self._db_path(project_root)
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = await aiosqlite.connect(str(db_path))
+            conn = await connect_daemon(str(db_path))
             conn.row_factory = aiosqlite.Row
             await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
             await conn.execute('PRAGMA foreign_keys=OFF')

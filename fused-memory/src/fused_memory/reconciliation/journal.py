@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.models.reconciliation import (
     JournalEntry,
@@ -195,7 +195,7 @@ class ReconciliationJournal:
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'reconciliation.db'
-        self._db = await aiosqlite.connect(str(db_path))
+        self._db = await connect_daemon(str(db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.executescript(SCHEMA_SQL)

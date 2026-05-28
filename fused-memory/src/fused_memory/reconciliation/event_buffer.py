@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -111,7 +111,7 @@ class EventBuffer:
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
-        self._db = await aiosqlite.connect(self._db_path)
+        self._db = await connect_daemon(self._db_path)
         self._db.row_factory = aiosqlite.Row
         # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
         # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
