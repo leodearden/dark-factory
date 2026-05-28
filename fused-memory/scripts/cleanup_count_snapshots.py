@@ -212,3 +212,123 @@ def build_audit_memory_payload(
             'invalidated_at': now_iso,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Pure core: audit report + summary table
+# ---------------------------------------------------------------------------
+
+def build_audit_report(
+    scan_results_by_project: dict[str, list[EntityScanResult]],
+    applied_edges: set[str],
+    failed_refreshes: list[dict[str, Any]],
+    dry_run: bool,
+    limit_per_project: int,
+    generated_at: str,
+) -> dict[str, Any]:
+    """Assemble the structured JSON audit report.
+
+    Parameters
+    ----------
+    scan_results_by_project:
+        ``{project_id: [EntityScanResult, ...]}``
+    applied_edges:
+        Set of edge_uuids that were actually invalidated (empty on dry-run).
+    failed_refreshes:
+        List of ``{entity_uuid, project_id, error}`` dicts for refresh errors.
+    dry_run:
+        True when no writes were made.
+    limit_per_project:
+        The safety cap that was in effect.
+    generated_at:
+        ISO timestamp string.
+
+    Returns
+    -------
+    Dict with keys: dry_run, generated_at, limit_per_project, projects, matches, totals.
+    """
+    # Collect all matches in deterministic order (by edge_uuid globally)
+    all_matches: list[dict[str, Any]] = []
+    per_project_summary: dict[str, dict[str, Any]] = {}
+
+    for pid in sorted(scan_results_by_project.keys()):
+        results = scan_results_by_project[pid]
+        entities_scanned = len(results)
+        # Dedupe edges across entities for this project
+        seen_edges: set[str] = set()
+        project_edge_matches: list[dict[str, Any]] = []
+        for r in results:
+            for m in r.edge_matches:
+                if m.edge_uuid not in seen_edges:
+                    seen_edges.add(m.edge_uuid)
+                    project_edge_matches.append({
+                        'edge_uuid': m.edge_uuid,
+                        'entity_uuids': sorted(m.entity_uuids),
+                        'project_id': m.project_id,
+                        'fact_excerpt': m.fact_excerpt,
+                        'invalidated': m.edge_uuid in applied_edges,
+                    })
+        project_edge_matches.sort(key=lambda x: x['edge_uuid'])
+        all_matches.extend(project_edge_matches)
+
+        edges_invalidated = sum(1 for m in project_edge_matches if m['invalidated'])
+        proj_refresh_failures = [
+            f for f in failed_refreshes if f.get('project_id') == pid
+        ]
+        per_project_summary[pid] = {
+            'entities_scanned': entities_scanned,
+            'edges_matched': len(project_edge_matches),
+            'edges_invalidated': edges_invalidated,
+            'refresh_failures': len(proj_refresh_failures),
+        }
+
+    all_matches.sort(key=lambda x: x['edge_uuid'])
+
+    totals: dict[str, Any] = {
+        'entities_scanned': sum(v['entities_scanned'] for v in per_project_summary.values()),
+        'edges_matched': sum(v['edges_matched'] for v in per_project_summary.values()),
+        'edges_invalidated': sum(v['edges_invalidated'] for v in per_project_summary.values()),
+        'refresh_failures': len(failed_refreshes),
+    }
+
+    return {
+        'dry_run': dry_run,
+        'generated_at': generated_at,
+        'limit_per_project': limit_per_project,
+        'projects': per_project_summary,
+        'matches': all_matches,
+        'totals': totals,
+        'failed_refreshes': failed_refreshes,
+    }
+
+
+def format_summary_table(report: dict[str, Any]) -> str:
+    """Render a human-readable per-project summary table from an audit report.
+
+    Produces one row per project plus a TOTALS row.
+    """
+    projects = report.get('projects', {})
+    totals = report.get('totals', {})
+
+    header = f"{'Project':<30} {'Entities':>9} {'Matched':>9} {'Invalidated':>12} {'RefFail':>8}"
+    sep = '-' * len(header)
+    rows = [header, sep]
+
+    for pid in sorted(projects.keys()):
+        p = projects[pid]
+        rows.append(
+            f"{pid:<30} {p.get('entities_scanned', 0):>9} "
+            f"{p.get('edges_matched', 0):>9} {p.get('edges_invalidated', 0):>12} "
+            f"{p.get('refresh_failures', 0):>8}"
+        )
+
+    rows.append(sep)
+    rows.append(
+        f"{'TOTAL':<30} {totals.get('entities_scanned', 0):>9} "
+        f"{totals.get('edges_matched', 0):>9} {totals.get('edges_invalidated', 0):>12} "
+        f"{totals.get('refresh_failures', 0):>8}"
+    )
+
+    dry_tag = ' [DRY RUN]' if report.get('dry_run') else ''
+    rows.insert(0, f"Count-snapshot cleanup report — {report.get('generated_at', '')}{dry_tag}")
+    return '\n'.join(rows)
