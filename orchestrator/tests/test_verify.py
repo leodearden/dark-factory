@@ -4296,9 +4296,10 @@ class TestRoleThreading:
 
     def _make_env_capture_mock(self):
         """Fake _run_cmd that captures the env kwarg and returns success."""
-        captured_envs: list[dict | None] = []
+        captured_envs: list[dict[str, str]] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None):
+            assert env is not None, f'_run_cmd called with env=None; expected DF_VERIFY_ROLE to be set'
             captured_envs.append(env)
             return 0, '', False
 
