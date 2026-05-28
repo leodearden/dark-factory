@@ -25,6 +25,17 @@ class TestTerminalStatuses:
     def test_in_progress_not_terminal(self):
         assert 'in-progress' not in TERMINAL_STATUSES
 
+    def test_merge_deferred_not_terminal(self):
+        """D1 invariant: merge-deferred is a non-terminal holding state.
+
+        A merge-deferred train member transitions to 'done' (via the
+        group-merge worker) or back to 'in-progress' (via re-dispatch
+        after a sibling-driven failure). Promoting it to TERMINAL_STATUSES
+        would silently break the train state machine (server-side terminal-
+        exit FSM would reject the re-open).
+        """
+        assert 'merge-deferred' not in TERMINAL_STATUSES
+
 
 class TestWorkflowPreserveStatuses:
     def test_superset_of_terminal(self):
@@ -35,3 +46,12 @@ class TestWorkflowPreserveStatuses:
 
     def test_includes_blocked(self):
         assert 'blocked' in WORKFLOW_PRESERVE_STATUSES
+
+    def test_includes_merge_deferred(self):
+        """merge-deferred is workflow-preserved: the workflow does not
+        re-execute a merge-deferred task on its own — the train-group-
+        merge worker is the sole transition path from merge-deferred to
+        done.  The preserve-decision in workflow.py reads this set at
+        runtime, so membership here is the authoritative signal.
+        """
+        assert 'merge-deferred' in WORKFLOW_PRESERVE_STATUSES
