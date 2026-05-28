@@ -2798,27 +2798,46 @@ class SpeculativeMergeWorker:
                     ),
                     started_monotonic=started_monotonic,
                 )
-            # Retry non-conflict failure — single μ diagnostic (dual-attempt
-            # surfacing added in step-6 / impl(step-6)).
+            # Retry non-conflict failure — build μ diagnostics for BOTH attempts
+            # and surface them together in reason and failure_diagnostic.
             if retry_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
+            first_diag = await self._build_merge_failure_diagnostic(
+                req,
+                base_sha=merge_result.pre_merge_sha or actual_main,
+                base_label='main_head',
+                git_stderr=merge_result.details,
+            )
             retry_diag = await self._build_merge_failure_diagnostic(
                 req,
                 base_sha=retry_result.pre_merge_sha or retry_main,
                 base_label='main_head',
                 git_stderr=retry_result.details,
             )
+            first_rendered = self._render_failure_diagnostic(first_diag)
             retry_rendered = self._render_failure_diagnostic(retry_diag)
+            # Combined failure_diagnostic: retry (final) attempt's μ 4 keys
+            # plus first-attempt extras under prefixed keys.
+            combined_diag: dict[str, str] = {
+                **retry_diag,
+                'first_attempt_base_sha': first_diag['base_sha'],
+                'first_attempt_git_stderr': first_diag['git_stderr'],
+            }
+            combined_reason = (
+                f'Attempt 1: {merge_result.details}\n{first_rendered}\n'
+                f'Attempt 2 (retry against main {retry_main[:8]}): '
+                f'{retry_result.details}\n{retry_rendered}'
+            )
             retry_outcome = MergeOutcome(
                 'blocked',
-                reason=f'{retry_result.details}\n{retry_rendered}',
-                failure_diagnostic=retry_diag,
+                reason=combined_reason,
+                failure_diagnostic=combined_diag,
             )
             return SpeculativeItem(
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=retry_main, speculative=False, skip_verify=False,
                 immediate_outcome=retry_outcome,
-                failure_diagnostic=retry_diag,
+                failure_diagnostic=combined_diag,
                 started_monotonic=started_monotonic,
             )
         # ── END speculation-race retry ─────────────────────────────────────────
