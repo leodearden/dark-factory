@@ -1309,7 +1309,11 @@ async def run_verification(
     concurrent = _resolve_concurrent_verify(config, module_config)
     verify_env = _resolve_verify_env(config, module_config, role=role)
 
-    if verify_env:
+    # DF_VERIFY_ROLE is always present (injected by _resolve_verify_env); log at
+    # INFO only when user-configured keys also exist so we don't inflate INFO
+    # volume on the hot verify path for plain task verifies.
+    user_env_keys = set(verify_env.keys()) - {'DF_VERIFY_ROLE'}
+    if user_env_keys:
         logger.info(
             'Verification env (mode=%s): %s',
             'concurrent' if concurrent else 'sequential',
