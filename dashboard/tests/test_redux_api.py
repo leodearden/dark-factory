@@ -497,3 +497,31 @@ class TestShapeEscalations:
         assert out['kind'] == 'orchestrator'
         assert out['summary'] == _EMPTY_SUMMARY
         assert out['escalations'] == []
+
+    def test_shape_escalations_orchestrator_attaches_task_card(self):
+        """Orchestrator row gets project label and resolved task card."""
+        task = {
+            'id': 42, 'title': 'task-42-title', 'description': 'd',
+            'details': 'D', 'status': 'pending', 'priority': 'high',
+            'dependencies': [], 'metadata': {},
+        }
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [{'id': 'esc-1', 'task_id': '42', 'level': 0, 'status': 'pending', 'summary': 'oops'}],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {'/p/projA': [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        # original esc fields preserved
+        assert row['id'] == 'esc-1'
+        assert row['summary'] == 'oops'
+        # new fields
+        assert row['project'] == 'projA'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
