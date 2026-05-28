@@ -22,9 +22,10 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import make_rebuild_detail
+from _fm_helpers import make_rebuild_detail, pydantic_spec
 
 from fused_memory.backends.graphiti_client import EdgeDict, GraphitiBackend, StaleSummaryResult
+from fused_memory.config.schema import FusedMemoryConfig
 
 
 def _make_svc(mock_config):
@@ -1344,7 +1345,7 @@ class TestRebuildSummariesManager:
     async def test_run_entrypoint_uses_maintenance_service(self, make_fake_maintenance_service):
         """run_rebuild_summaries() uses maintenance_service context manager."""
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.rebuild_entity_summaries = AsyncMock(return_value={
             'total_entities': 0,
@@ -1366,7 +1367,7 @@ class TestRebuildSummariesManager:
     async def test_run_entrypoint_returns_result(self, make_fake_maintenance_service):
         """Returns the RebuildResult from the manager."""
         from fused_memory.maintenance.rebuild_summaries import RebuildResult, run_rebuild_summaries
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.rebuild_entity_summaries = AsyncMock(return_value={
             'total_entities': 7,
@@ -1403,7 +1404,7 @@ class TestRebuildSummariesManager:
 
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
         mock_service.rebuild_entity_summaries = AsyncMock(return_value={
             'total_entities': 5,
@@ -2762,7 +2763,7 @@ class TestRebuildSummariesManagerWithService:
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
         from fused_memory.services.memory_service import MemoryService
 
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = MagicMock(spec=MemoryService)
         mock_service.rebuild_entity_summaries = AsyncMock(return_value={
             'total_entities': 3,
