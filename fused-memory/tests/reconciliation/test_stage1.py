@@ -391,14 +391,15 @@ class TestReconEscalationDedup:
 
     @pytest.mark.asyncio
     async def test_maybe_remediate_passes_finding_to_escalate(self, tmp_path):
-        """_maybe_remediate non-actionable loop uses finding-based fingerprint.
+        """Non-actionable findings in _maybe_remediate are logged, NOT escalated.
 
-        RED before impl: _maybe_remediate calls _escalate without finding=, so the
-        fingerprint is a summary hash instead of the per-target finding hash.
+        Per Task 1512 / plans/afk-A7-recon-closure.md: non-actionable findings
+        are forward-fed into the next cycle and emitted as structured log records.
+        They must NOT be placed in the escalation queue — escalating them is a
+        category error since the only human action ('accept as known') is achieved
+        by not filing.
         """
         from datetime import UTC, datetime
-
-        from escalation.dedupe import compute_content_fingerprint
 
         from fused_memory.models.reconciliation import (
             ReconciliationRun,
@@ -433,15 +434,9 @@ class TestReconEscalationDedup:
         )
 
         files = list(queue_dir.glob('esc-*.json'))
-        assert len(files) == 1, f'Expected 1 pending file, got {len(files)}'
-
-        data = json.loads(files[0].read_text())
-        expected_fp = compute_content_fingerprint(
-            'recon_integrity_issue', 'memory_stale', ['m1'], 'd1'
-        )
-        assert data['dedupe_fingerprint'] == expected_fp, (
-            f'Expected finding-based fingerprint {expected_fp!r}, '
-            f'got {data.get("dedupe_fingerprint")!r} (likely summary-based before impl)'
+        assert len(files) == 0, (
+            f'Non-actionable findings must NOT be escalated (Task 1512 design: '
+            f'they are logged/forward-fed instead); got {len(files)} file(s)'
         )
 
     # ── Step 9: regression guard — harness never resolves its own escalations ──
@@ -628,8 +623,9 @@ class TestReconEscalationDedup:
     async def test_remediation_residue_passes_finding_to_escalate(self, tmp_path):
         """_run_remediation_pass residue loop uses finding-based fingerprint.
 
-        RED before impl: _run_remediation_pass calls _escalate without finding=, so
-        the fingerprint is summary-based rather than keyed on the finding identity.
+        When an actionable residue finding persists after remediation (persistence
+        count >= threshold), _escalate is called with finding= so the fingerprint
+        is keyed on finding identity rather than a summary hash.
         """
         from datetime import UTC, datetime
         from unittest.mock import AsyncMock as AM
@@ -651,6 +647,7 @@ class TestReconEscalationDedup:
             'category': 'knowledge_stale',
             'affected_ids': ['t99'],
             'description': 'Task 99 stale after remediation',
+            'actionable': True,  # must be actionable to reach the escalation path
         }
         now = datetime.now(UTC)
 
@@ -669,16 +666,21 @@ class TestReconEscalationDedup:
         ))
         harness._make_stages = lambda: stages
 
-        await harness._run_remediation_pass(
-            'test_project', 'parent-run-id',
-            findings=[{
-                'category': 'missing_knowledge', 'affected_ids': ['t1'],
-                'description': 'trigger finding', 'actionable': True,
-            }],
-            tier=TierConfig(),
-            project_root='/tmp/x',
-            filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
-        )
+        # Mock _finding_persistence_count to return the threshold value (4) so
+        # the escalation gate fires without needing a real journal history.
+        with patch.object(
+            harness, '_finding_persistence_count', new=AM(return_value=4),
+        ):
+            await harness._run_remediation_pass(
+                'test_project', 'parent-run-id',
+                findings=[{
+                    'category': 'missing_knowledge', 'affected_ids': ['t1'],
+                    'description': 'trigger finding', 'actionable': True,
+                }],
+                tier=TierConfig(),
+                project_root='/tmp/x',
+                filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
+            )
 
         files = list(queue_dir.glob('esc-*.json'))
         assert len(files) == 1, f'Expected 1 residue escalation, got {len(files)}'
@@ -727,7 +729,8 @@ class TestMemoryConsolidatorRunWiring:
         stage = _make_consolidator(project_root='/tmp/reify')
         stage.project_id = 'test_project'
         # get_task returns a present record — task is real, not absent
-        stage.taskmaster.get_task.return_value = {'id': '3438', 'title': 'real task 3438'}
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_task.return_value = {'id': '3438', 'title': 'real task 3438'}  # type: ignore[union-attr]
 
         absence_flag = {
             'task_id': '3438',
@@ -862,7 +865,8 @@ class TestMemoryConsolidatorRunWiring:
         stage.project_id = 'test_project'
         stage.remediation_findings = [{'description': 'fix this'}]  # remediation mode
         # get_task must NOT be called at all for remediation runs
-        stage.taskmaster.get_task.side_effect = AssertionError(
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_task.side_effect = AssertionError(  # type: ignore[union-attr]
             'get_task must NOT be called during a remediation run'
         )
 

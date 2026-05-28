@@ -14,8 +14,9 @@ intent without regressions. (ref: task 455)
 from __future__ import annotations
 
 import heapq
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 # --------------------------------------------------------------------------- #
 # Status constants
