@@ -617,3 +617,40 @@ class TestShapeEscalations:
         assert row['project'] == 'projB'
         assert row['task'] == task
         assert row['task_unresolved'] is False
+
+    def test_shape_escalations_reconciliation_unresolvable(self, tmp_path):
+        """Reconciliation row that can't be resolved → project=None, task=None, task_unresolved=True."""
+        projC_root = tmp_path / 'projC'
+        projC_root.mkdir()
+        # worktree is under a completely unrelated path
+        unrelated_worktree = str(tmp_path / 'other_project' / '.worktrees' / '5')
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-unres',
+                    'task_id': '99',  # not in any task_map
+                    'worktree': unrelated_worktree,
+                    'level': 2,
+                    'status': 'pending',
+                    'summary': 'unresolvable',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        # task_maps only has projC with no matching task
+        task_maps = {str(projC_root): [{'id': 1, 'title': 't', 'description': '', 'details': '',
+                                         'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] is None
+        assert row['task'] is None
+        assert row['task_unresolved'] is True
+        # original esc fields preserved
+        assert row['id'] == 'esc-unres'
+        assert row['summary'] == 'unresolvable'
