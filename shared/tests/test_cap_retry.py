@@ -1249,18 +1249,21 @@ class TestCapRetryEdgeCases:
     ])
     @pytest.mark.parametrize('placement', ['stderr', 'output'])
     async def test_zero_cost_cli_error_not_treated_as_cap(self, marker, placement):
-        """A recognised CLI error (zero-cost instant exit) is NOT counted as a cap.
+        """Any recognised NON_CAP_CLI_ERROR_MARKERS substring in stderr or output bypasses the cap path.
 
-        Regression for reify-3604: ``claude --session-id <X>`` on a reused UUID
-        exits in ~300ms with empty cost and 'Session ID … is already in use'.
-        The zero-cost heuristic must recognise that as a concrete CLI error and
-        fall through (no cap mark, no sleep, no unbounded retry) so the caller
-        gets the failed result for normal verify/steward handling.
+        When a zero-cost instant-exit result contains a known CLI error phrase in
+        either ``stderr`` or ``output``, the heuristic must NOT mark the account
+        capped — it must fall through (no cap mark, no sleep, no unbounded retry)
+        so the caller gets the failed result for normal verify/steward handling.
 
-        Expanded to cover all 6 NON_CAP_CLI_ERROR_MARKERS (hardcoded here to
-        catch regressions if a marker is later removed from the production list)
-        and both stderr and output placements (``_is_non_cap_cli_error`` checks
-        both fields).
+        Each NON_CAP_CLI_ERROR_MARKERS entry is hardcoded here (rather than
+        imported) so that removing a marker from the production list causes the
+        affected parametrize case to fail — catching silent regression.  Both
+        placement fields are tested because ``_is_non_cap_cli_error`` checks both.
+
+        Historically: reify-3604 — ``claude --session-id <X>`` on a reused UUID
+        exits in ~300ms with empty cost and 'Session ID … is already in use',
+        triggering this path.
         """
         stderr = f'Error: {marker} foo bar' if placement == 'stderr' else ''
         output = f'CLI exited: {marker}' if placement == 'output' else ''
