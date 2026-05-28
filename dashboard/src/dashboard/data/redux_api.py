@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.stats_utils import percentile
 
 # ---------------------------------------------------------------------------
@@ -648,19 +649,48 @@ def shape_escalations(
         for root_str, task_list in task_maps.items()
     }
 
+    # Build roots list for reconciliation resolution (worktree-prefix + task-map probe).
+    # Each element is (Path(root_str), list_of_tasks) matching resolve_owning_project contract.
+    roots_for_resolution: list[tuple[Path, list[dict[str, Any]]]] = [
+        (Path(root_str), list(task_list))
+        for root_str, task_list in task_maps.items()
+    ]
+
+    # Build a reverse mapping: root basename → root_str, for task lookup after resolution.
+    # Multiple roots with the same basename are ambiguous; first-seen wins (same as resolution).
+    basename_to_root_str: dict[str, str] = {}
+    for root_str in task_maps:
+        name = Path(root_str).name
+        if name not in basename_to_root_str:
+            basename_to_root_str[name] = root_str
+
     out_subsections: list[dict[str, Any]] = []
     for sub in queues.get('subsections') or []:
         sub_id = sub.get('id') or ''
         sub_label = sub.get('label')
         sub_kind = sub.get('kind')
-        root_tasks = tasks_by_root_id.get(sub_id, {})
 
         rows: list[dict[str, Any]] = []
         for esc in sub.get('escalations') or []:
-            task_dict = root_tasks.get(str(esc.get('task_id', '')))
+            if sub_kind == 'reconciliation':
+                # Use resolve_owning_project to map reconciliation escalation back to a project.
+                resolved_label = resolve_owning_project(esc, roots_for_resolution)
+                project = resolved_label
+                if resolved_label is not None:
+                    root_str = basename_to_root_str.get(resolved_label)
+                    root_tasks = tasks_by_root_id.get(root_str or '', {})
+                    task_dict = root_tasks.get(str(esc.get('task_id', ''))) if root_str else None
+                else:
+                    task_dict = None
+            else:
+                # Orchestrator: project label is the subsection label, task lookup by subsection id.
+                project = sub_label
+                root_tasks = tasks_by_root_id.get(sub_id, {})
+                task_dict = root_tasks.get(str(esc.get('task_id', '')))
+
             rows.append({
                 **esc,
-                'project': sub_label,
+                'project': project,
                 'task': task_dict,
                 'task_unresolved': task_dict is None,
             })
