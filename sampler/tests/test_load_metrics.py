@@ -197,6 +197,33 @@ class TestCountOcctQueueDepth:
         result = count_occt_queue_depth(procs, lambda pid: True)
         assert result == 0
 
+    def test_realistic_path_with_extension_counted(self):
+        """The real script is invoked with its .sh path — must be recognised.
+
+        Realistic invocation: ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']
+        The bare-token form ['bash', 'cargo-test-occt-gated'] was the only fixture
+        used in prior tests, giving false confidence.  This test proves the
+        path-with-extension form is also counted.
+
+        Current _is_occt_gated uses list membership ('cargo-test-occt-gated' in cmdline),
+        which requires an element to equal the bare token exactly.
+        'reify/scripts/cargo-test-occt-gated.sh' != 'cargo-test-occt-gated', so count==0
+        and this test FAILS against the current impl (confirming the RED phase).
+        """
+        from sampler.metrics import count_occt_queue_depth
+
+        procs = [
+            # Realistic form: bash running the script by its full relative path
+            FakeProc(1, 'bash', ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']),
+            # Another common form: bash + path with leading ./
+            FakeProc(2, 'bash', ['bash', './scripts/cargo-test-occt-gated.sh', 'cargo', 'test']),
+            # Unrelated process — must NOT be counted
+            FakeProc(3, 'python', ['python', 'unrelated']),
+        ]
+        result = count_occt_queue_depth(procs, lambda _pid: False)
+        # pids 1 and 2 match (path contains 'cargo-test-occt-gated'), pid 3 does not
+        assert result == 2
+
 
 class TestCountVerifyConcurrency:
     def test_counts_verify_sh_argv0(self):
