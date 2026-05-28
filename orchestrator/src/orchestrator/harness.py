@@ -35,6 +35,7 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     files_to_modules,
 )
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -3706,8 +3707,6 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Returns the number of workflows on which a cancel action was taken.
         """
-        from orchestrator.task_status import TERMINAL_STATUSES
-
         active_ids = list(self._workflow_cancel_events.keys())
         if not active_ids:
             return 0
@@ -3862,9 +3861,22 @@ Output JSON matching the schema. Every task must appear in the output.
             and isinstance(escalation.resolved_by, str)
             and escalation.resolved_by.startswith('l2-cascade:')
         ):
-            t = asyncio.create_task(self._cascade_unblock_member(escalation))
-            self._background_tasks.add(t)
-            t.add_done_callback(self._background_tasks.discard)
+            # asyncio.create_task requires a running event loop. In production
+            # this callback always fires inside the orchestrator loop, so this
+            # is safe. Guard with RuntimeError so an accidental non-loop
+            # invocation (e.g. a sync test helper or future tooling) is
+            # diagnosable rather than swallowed as a generic callback failure
+            # by the queue's try/except wrapper.
+            try:
+                t = asyncio.create_task(self._cascade_unblock_member(escalation))
+                self._background_tasks.add(t)
+                t.add_done_callback(self._background_tasks.discard)
+            except RuntimeError:
+                logger.warning(
+                    'cascade-unblock: no running event loop; cannot schedule '
+                    'flip for task %s (via %s)',
+                    escalation.task_id, escalation.resolved_by,
+                )
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
