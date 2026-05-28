@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from shared.proc_group import terminate_process_group
 
@@ -1211,16 +1212,21 @@ def _resolve_concurrent_verify(
 def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
+    *,
+    role: Literal['merge', 'task'] = 'task',
 ) -> dict[str, str]:
     """Return the effective env injected into verify commands.
 
     Merges ``config.verify_env`` with ``module_config.verify_env``; module
-    keys override top-level keys.
+    keys override top-level keys.  The orchestrator-supplied *role* is then
+    stamped in as ``DF_VERIFY_ROLE`` and is always authoritative — it overrides
+    any ``DF_VERIFY_ROLE`` entry that may appear in static config.
     """
     merged: dict[str, str] = {}
     merged.update(config.verify_env or {})
     if module_config is not None and module_config.verify_env:
         merged.update(module_config.verify_env)
+    merged['DF_VERIFY_ROLE'] = role
     return merged
 
 
