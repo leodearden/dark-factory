@@ -7,10 +7,12 @@ from fused_memory.utils.validation import (
     _safe_repr,
     _validate_identifier,
     require_int_ids,
+    require_known_project_id,
     require_project_id,
     require_project_root,
     require_run_id,
     validate_int_ids,
+    validate_known_project_id,
     validate_project_id,
     validate_project_root,
     validate_run_id,
@@ -1098,3 +1100,116 @@ class TestRequireIntIds:
         with pytest.raises(InputValidationError) as exc_info:
             require_int_ids([1, 'x'], name='task_ids')
         assert 'task_ids[1]' in str(exc_info.value)
+
+
+class TestValidateKnownProjectId:
+    """validate_known_project_id(project_id, known_projects) — registry membership check.
+
+    Write-side complement of read-side strictness (task 1143); see task 1549.
+    """
+
+    _REGISTRY = {'know_live': '/home/leo/src/know-live', 'dark_factory': '/home/leo/src/dark-factory'}
+
+    def test_non_member_returns_error_dict_with_dashboard_env_hint(self):
+        """An id absent from the registry returns an error mentioning DASHBOARD_KNOWN_PROJECT_ROOTS."""
+        result = validate_known_project_id('know-live', self._REGISTRY)
+        assert result is not None, 'Expected error dict for non-member project_id'
+        assert isinstance(result, dict)
+        assert 'error' in result
+        assert 'error_type' in result
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in result['error'], (
+            f"Error must mention DASHBOARD_KNOWN_PROJECT_ROOTS; got: {result['error']!r}"
+        )
+
+    def test_non_member_error_mentions_rejected_id_repr(self):
+        """The rejected project_id must appear in the error text (as repr or literal)."""
+        result = validate_known_project_id('know-live', self._REGISTRY)
+        assert result is not None
+        # The id or its repr must appear so the operator can diagnose it.
+        assert 'know-live' in result['error'], (
+            f"Rejected id must appear in error; got: {result['error']!r}"
+        )
+
+    def test_non_member_error_type_is_validation_error(self):
+        """error_type must be 'ValidationError' for registry rejection."""
+        result = validate_known_project_id('know-live', self._REGISTRY)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_member_returns_none(self):
+        """A project_id that IS in the registry returns None (no error)."""
+        result = validate_known_project_id('know_live', self._REGISTRY)
+        assert result is None, f'Expected None for registry member; got {result!r}'
+
+    def test_dark_factory_member_returns_none(self):
+        """Another member also returns None."""
+        result = validate_known_project_id('dark_factory', self._REGISTRY)
+        assert result is None
+
+    def test_empty_registry_returns_none_permissive(self):
+        """Empty registry is permissive — any project_id passes (returns None)."""
+        result = validate_known_project_id('anything', {})
+        assert result is None, (
+            f'Empty registry must be permissive and return None; got {result!r}'
+        )
+
+    def test_none_registry_returns_none_permissive(self):
+        """None registry (falsy) is treated same as empty — permissive."""
+        result = validate_known_project_id('anything', None)
+        assert result is None
+
+    def test_warn_once_on_empty_registry(self, monkeypatch, caplog):
+        """Two calls with an empty registry emit exactly one WARNING."""
+        import fused_memory.utils.validation as val_mod
+        monkeypatch.setattr(val_mod, '_empty_registry_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.validation'):
+            validate_known_project_id('pid1', {})
+            validate_known_project_id('pid2', {})
+        warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for empty registry (warn-once); '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+
+
+class TestRequireKnownProjectId:
+    """require_known_project_id(project_id, known_projects) — raises InputValidationError.
+
+    Write-side complement of read-side strictness (task 1143); see task 1549.
+    """
+
+    _REGISTRY = {'know_live': '/home/leo/src/know-live', 'dark_factory': '/home/leo/src/dark-factory'}
+
+    def test_non_member_raises_input_validation_error(self):
+        """Non-member project_id raises InputValidationError."""
+        with pytest.raises(InputValidationError):
+            require_known_project_id('know-live', self._REGISTRY)
+
+    def test_non_member_also_catchable_as_value_error(self):
+        """InputValidationError is a ValueError subclass — catchable as ValueError."""
+        with pytest.raises(ValueError):
+            require_known_project_id('know-live', self._REGISTRY)
+
+    def test_exception_message_matches_validate_error_field(self):
+        """str(exc) must equal the 'error' field from validate_known_project_id."""
+        err_dict = validate_known_project_id('know-live', self._REGISTRY)
+        assert err_dict is not None
+        with pytest.raises(InputValidationError) as exc_info:
+            require_known_project_id('know-live', self._REGISTRY)
+        assert str(exc_info.value) == err_dict['error']
+
+    def test_member_does_not_raise(self):
+        """A project_id in the registry must not raise."""
+        require_known_project_id('know_live', self._REGISTRY)  # must not raise
+
+    def test_dark_factory_does_not_raise(self):
+        """Another registry member also must not raise."""
+        require_known_project_id('dark_factory', self._REGISTRY)
+
+    def test_empty_registry_does_not_raise(self):
+        """Empty registry is permissive — require_known_project_id must not raise."""
+        require_known_project_id('anything', {})  # must not raise
+
+    def test_none_registry_does_not_raise(self):
+        """None registry is treated as empty — permissive, must not raise."""
+        require_known_project_id('anything', None)  # must not raise

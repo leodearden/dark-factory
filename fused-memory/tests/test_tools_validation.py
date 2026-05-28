@@ -178,3 +178,87 @@ class TestSearchIncludePlannedMCPTool:
         assert call_kwargs.get('include_planned') is False, (
             'include_planned=False must be forwarded to memory_service.search'
         )
+
+
+class TestKnownProjectRegistryGate:
+    """MCP write tools gate on known_projects registry when provided (task 1549).
+
+    Mirrors TestToolsValidationIntegration: uses create_mcp_server(AsyncMock()) +
+    server._tool_manager.call_tool + assert_not_called() pattern.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_memory_rejects_unknown_project_id(self):
+        """add_memory is rejected at the MCP boundary when project_id is not in known_projects.
+
+        The service must never be called — the gate short-circuits before any downstream
+        logic including the backlog gate.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(
+            mock_service,
+            known_projects={'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {'content': 'test content', 'project_id': 'know-live', 'metadata': {}},
+        )
+
+        assert isinstance(result, dict), f'Expected error dict, got {type(result)}: {result!r}'
+        assert 'error' in result, f'Expected error key in result: {result!r}'
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in result['error'], (
+            f"Error must mention DASHBOARD_KNOWN_PROJECT_ROOTS; got: {result['error']!r}"
+        )
+        assert result.get('error_type') == 'ValidationError'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_memory_passes_for_known_project_id(self):
+        """add_memory passes the gate and reaches the service for a known project_id."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(
+            mock_service,
+            known_projects={'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {'content': 'test content', 'project_id': 'dark_factory', 'metadata': {}},
+        )
+
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_memory_permissive_without_known_projects(self):
+        """add_memory is permissive when no known_projects registry is provided."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)  # no known_projects
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {'content': 'test content', 'project_id': 'whatever', 'metadata': {}},
+        )
+
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_episode_rejects_unknown_project_id(self):
+        """add_episode is rejected at the MCP boundary for an unknown project_id."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(
+            mock_service,
+            known_projects={'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {'content': 'test content', 'project_id': 'know-live'},
+        )
+
+        assert isinstance(result, dict), f'Expected error dict, got {type(result)}: {result!r}'
+        assert 'error' in result
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in result['error'], (
+            f"Error must mention DASHBOARD_KNOWN_PROJECT_ROOTS; got: {result['error']!r}"
+        )
+        mock_service.add_episode.assert_not_called()

@@ -5683,3 +5683,76 @@ async def test_non_actionable_finding_from_remediation_pass_is_never_escalated_e
         f'non-actionable F (it should be filtered before the persistence-count call), '
         f'got: {[(r.__dict__.get("description"), r.__dict__.get("finding_category")) for r in suppressed_for_f]}'
     )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_quarantines_buffered_events_on_unknown_project_error(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """2026-05-28 regression: _project_loop must quarantine buffered events on UnknownProjectError.
+
+    Before task 1549, the except UnknownProjectError block only logged+returned.
+    get_active_projects() (WHERE status='buffered') kept returning the project_id,
+    causing the management loop to respawn _project_loop every ~5s forever
+    (1022 abort logs observed in the 'know-live' incident).
+
+    After task 1549, mark_project_dead_letter is called before returning.
+    This flips the buffered rows to 'dead_letter', removing them from
+    get_active_projects() and ending the respawn storm.
+
+    Model: test_project_loop_aborts_on_unknown_project_error_no_retry (task 1143 step-22).
+    See task 1143 (read-side strictness: raises UnknownProjectError) and task 1549
+    (this write-side complement: quarantine so get_active_projects stops respawning).
+    """
+    # Registry lacks 'know-live' so _known_project_root_for will raise UnknownProjectError.
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'dark_factory': '/home/leo/src/dark-factory'},
+    )
+
+    # Push enough events to trigger should_trigger (buffer_size_threshold=2 in fixture).
+    for _ in range(2):
+        await event_buffer.push(_make_event('know-live'))
+
+    sleep_mock = AsyncMock()
+
+    with caplog.at_level(logging.WARNING), patch('fused_memory.reconciliation.harness._sleep', sleep_mock):
+        await asyncio.wait_for(
+            harness._project_loop('know-live'),
+            timeout=10.0,
+        )
+
+    # (1) A WARNING log record must mention quarantine/dead_letter AND the row count.
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    dead_letter_warnings = [
+        r for r in warning_records
+        if 'dead_letter' in r.getMessage().lower() or 'quarantin' in r.getMessage().lower()
+    ]
+    assert dead_letter_warnings, (
+        f'Expected a WARNING mentioning quarantine/dead_letter after UnknownProjectError; '
+        f'got records: {[r.getMessage() for r in caplog.records]!r}'
+    )
+    # Row count "2" must appear in one of those warnings.
+    count_mentioned = any('2' in r.getMessage() for r in dead_letter_warnings)
+    assert count_mentioned, (
+        f'Expected row count "2" to appear in dead_letter WARNING; '
+        f'got: {[r.getMessage() for r in dead_letter_warnings]!r}'
+    )
+
+    # (2) The 'know-live' buffered rows must now be 'dead_letter' in the DB.
+    assert await event_buffer.count_buffered('know-live') == 0, (
+        "count_buffered('know-live') must be 0 after quarantine"
+    )
+
+    # (3) 'know-live' must no longer appear in get_active_projects().
+    active = await event_buffer.get_active_projects()
+    assert 'know-live' not in active, (
+        f"'know-live' must not be in get_active_projects() after quarantine; got {active!r}"
+    )
+
+    # (4) No 5-second cooldown sleep — the except UnknownProjectError path returns cleanly.
+    cooldown_calls = [c for c in sleep_mock.await_args_list if c.args and c.args[0] == 5]
+    assert len(cooldown_calls) == 0, (
+        f'_sleep(5) must not be called on UnknownProjectError (no retry); '
+        f'got {len(cooldown_calls)} call(s): {sleep_mock.await_args_list!r}'
+    )

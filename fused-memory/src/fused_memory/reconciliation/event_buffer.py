@@ -583,6 +583,42 @@ class EventBuffer:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
 
+    async def mark_project_dead_letter(self, project_id: str) -> int:
+        """Flip all 'buffered' rows for project_id to 'dead_letter'. Returns row count.
+
+        Called from the reconciliation harness when UnknownProjectError is raised
+        (task 1143, read-side strictness). Quarantining the rows stops
+        get_active_projects() (which selects WHERE status='buffered') from returning
+        the project_id, ending the management-loop respawn storm (2026-05-28 incident).
+
+        Mirrors restore_drained: UPDATE-by-status using the same _txn() pattern.
+        See task 1143 (read-side UnknownProjectError) and task 1549 (this write-side
+        complement: quarantine so get_active_projects stops respawning the loop).
+
+        NOTE — observability / lifecycle of 'dead_letter' rows in this table:
+        These rows are terminal and orphaned.  There is currently no built-in
+        cleanup or operator-facing read path for them in the event_buffer table
+        (the MCP get_dead_letters/delete_dead_letters/replay_dead_letters tools
+        operate on the separate event_queue JSONL file, not this SQLite table).
+        The quarantined rows accumulate indefinitely but are harmless — they are
+        excluded from all active-project queries.  To inspect them, query the
+        event_buffer table directly (``SELECT * FROM event_buffer WHERE
+        status='dead_letter'``).  A cleanup helper can be added as a follow-up.
+        """
+        async with self._txn() as db:
+            cursor = await db.execute(
+                "UPDATE event_buffer SET status = 'dead_letter' "
+                "WHERE project_id = ? AND status = 'buffered'",
+                (project_id,),
+            )
+            count = cursor.rowcount
+        if count:
+            logger.info(
+                f'mark_project_dead_letter: quarantined {count} buffered event(s) '
+                f'for unknown project_id={project_id!r} (task 1143 / task 1549)'
+            )
+        return count
+
     async def count_buffered(self, project_id: str) -> int:
         """Return count of buffered events for a project."""
         db = self._require_db()

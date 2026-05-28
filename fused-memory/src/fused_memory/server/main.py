@@ -619,6 +619,7 @@ async def run_server():
         backlog_policy=backlog_policy,
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
+        known_projects=_known_projects_map,
     )
 
     # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
