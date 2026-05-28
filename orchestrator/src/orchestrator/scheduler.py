@@ -1399,7 +1399,12 @@ class Scheduler:
             )
             return False
 
-    def _deps_satisfied(self, task: dict, status_map: dict[str, str]) -> bool:
+    def _deps_satisfied(
+        self,
+        task: dict,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+    ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
         A dep is satisfied when its status is in :data:`TERMINAL_STATUSES`
@@ -1408,6 +1413,22 @@ class Scheduler:
         dependent re-architects against current main and either finds the
         work already merged or escalates for a different reason.
 
+        **Intra-train allowance (PRD § 9.3):** when *tasks_by_id* is supplied,
+        a dep in status ``merge-deferred`` is also treated as satisfied provided
+        that BOTH the dependent (*task*) and the dep carry ``metadata.train.id``
+        AND their train IDs match.  This allows the next member of an atomic
+        train to dispatch as soon as its predecessor has been parked by the
+        merge-deferred gate, without waiting for a full ``done`` transition.
+
+        When *tasks_by_id* is ``None`` (the default), the allowance is disabled
+        and behaviour is byte-identical to today — ``merge-deferred`` blocks like
+        any other non-terminal status.  This preserves backward compatibility for
+        the existing unit tests (TestDepsSatisfied, TestDepsSatisfiedLogging) and
+        any external callers that don't pass the new parameter.
+
+        The allowance also requires the dep record to be present in *tasks_by_id*.
+        A missing dep (stale snapshot) is treated conservatively as blocking.
+
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
           - integer: ``1``
@@ -1415,21 +1436,51 @@ class Scheduler:
 
         Emits a DEBUG log when a dependency blocks dispatch, naming the dep
         ID and its current status to aid diagnosis of premature-dispatch issues.
+        Emits a separate DEBUG log when the intra-train allowance fires.
         """
         deps = task.get('dependencies', [])
         task_id = str(task.get('id', '?'))
+        # Resolve this task's train id once (None if not a train member).
+        # Coerce empty string to None so that '' does not accidentally match
+        # another task whose id is also '' (ill-formed but defensively handled).
+        task_train = (task.get('metadata') or {}).get('train')
+        task_train_id: str | None = (
+            task_train.get('id') or None if isinstance(task_train, dict) else None
+        )
         for d in deps:
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
             dep_status = status_map.get(dep_id, 'unknown')
-            if dep_status not in TERMINAL_STATUSES:
-                logger.debug(
-                    'Task %s blocked: dep %s has status %s, '
-                    'need done or cancelled',
-                    task_id,
-                    dep_id,
-                    dep_status,
-                )
-                return False
+            if dep_status in TERMINAL_STATUSES:
+                continue
+            # Intra-train allowance: merge-deferred predecessor in same train.
+            if (
+                dep_status == 'merge-deferred'
+                and task_train_id is not None
+                and tasks_by_id is not None
+            ):
+                dep_task = tasks_by_id.get(dep_id)
+                if dep_task is not None:
+                    dep_train = (dep_task.get('metadata') or {}).get('train')
+                    # Coerce empty string to None (see task_train_id note above).
+                    dep_train_id: str | None = (
+                        dep_train.get('id') or None if isinstance(dep_train, dict) else None
+                    )
+                    if dep_train_id == task_train_id:
+                        logger.debug(
+                            'Task %s: intra-train dep satisfied: dep=%s train_id=%s',
+                            task_id,
+                            dep_id,
+                            task_train_id,
+                        )
+                        continue
+            logger.debug(
+                'Task %s blocked: dep %s has status %s, '
+                'need done or cancelled',
+                task_id,
+                dep_id,
+                dep_status,
+            )
+            return False
         return True
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
@@ -1541,6 +1592,7 @@ class Scheduler:
         task: dict,
         tid: str,
         status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -1555,6 +1607,11 @@ class Scheduler:
         the responsibility of :meth:`_gc_expired_cooldowns`, which is called
         once per tick from :meth:`acquire_next` before either candidate loop.
 
+        *tasks_by_id* is forwarded to :meth:`_deps_satisfied` to enable the
+        intra-train merge-deferred allowance (PRD § 9.3).  When ``None``
+        (the default), the allowance is disabled — behaviour is identical to
+        today.  Both ``acquire_next`` call sites pass the per-tick snapshot.
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -1568,7 +1625,7 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if not self._deps_satisfied(task, status_map):
+        if not self._deps_satisfied(task, status_map, tasks_by_id):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -2016,7 +2073,7 @@ class Scheduler:
                 return True
             if tid not in tasks_by_id:
                 return True
-            return not self._deps_satisfied(tasks_by_id[tid], status_map)
+            return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
 
         gc_evicted = self.lock_table.prune_owners(_park_gc)
         for owner in gc_evicted:
@@ -2212,7 +2269,7 @@ class Scheduler:
             tid_str = str(t.get('id', ''))
             if not tid_str:
                 continue
-            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map)
+            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map, tasks_by_id)
             if not eligible:
                 continue
             # signal_label is stashed and reused at the dispatch arm site so
@@ -2250,7 +2307,7 @@ class Scheduler:
                 # loop to keep both paths in sync.  A future gate addition only
                 # needs to be added to _eligible_for_dispatch.
                 eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map
+                    pin_task, pin_tid, status_map, tasks_by_id
                 )
                 if not eligible:
                     continue

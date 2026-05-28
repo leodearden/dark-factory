@@ -5471,3 +5471,293 @@ class TestParkStopDisabled:
         assert callback_count[0] == 0, (
             f'Callback must not fire when park_stop_enabled=False; fired {callback_count[0]} time(s)'
         )
+
+
+class TestDepsSatisfiedTrainAware:
+    """Unit tests for the intra-train merge-deferred allowance in _deps_satisfied.
+
+    PRD § 9.3: a pending train member may dispatch when its immediate predecessor
+    has status 'merge-deferred' IFF both share the same metadata.train.id.
+    Non-train tasks must see no behavioural change.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_intra_train_merge_deferred_dep_satisfied(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """PRD Scenario 3: train β dispatches when train α is merge-deferred (same train_id).
+
+        Both tasks carry metadata.train.id == 'T1'.  The dep is in status
+        'merge-deferred' (non-terminal) but since it shares the train id,
+        _deps_satisfied must return True and emit the intra-train log signal.
+        """
+        import logging
+
+        alpha_task = {
+            'id': '1',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'train': {'id': 'T1', 'order': 0}},
+        }
+        beta_task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T1', 'order': 1}},
+        }
+        status_map = {'1': 'merge-deferred', '2': 'pending'}
+        tasks_by_id = {'1': alpha_task, '2': beta_task}
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduler'):
+            result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
+
+        assert result is True, (
+            'intra-train: β must be satisfied when α is merge-deferred and both share train_id T1'
+        )
+        assert any(
+            'intra-train dep satisfied' in record.message
+            and 'dep=1' in record.message
+            and 'train_id=T1' in record.message
+            for record in caplog.records
+        ), (
+            f'Expected "intra-train dep satisfied" log with dep=1 and train_id=T1. '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+
+    def test_extra_train_dep_no_train_metadata_blocks(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """PRD Scenario 4: task δ with no train metadata is blocked by merge-deferred dep.
+
+        δ has no metadata.train; α is merge-deferred and has train_id T1.
+        The allowance must not fire — δ is extra-train.
+        The existing block log naming dep '1' must appear.
+        """
+        import logging
+
+        alpha_task = {
+            'id': '1',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'train': {'id': 'T1', 'order': 0}},
+        }
+        delta_task = {
+            'id': '5',
+            'dependencies': [{'id': 1}],
+            # no metadata.train
+        }
+        status_map = {'1': 'merge-deferred', '5': 'pending'}
+        tasks_by_id = {'1': alpha_task, '5': delta_task}
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduler'):
+            result = scheduler._deps_satisfied(delta_task, status_map, tasks_by_id)
+
+        assert result is False, (
+            'extra-train: δ (no train metadata) must be blocked by merge-deferred dep'
+        )
+        assert any(
+            '1' in record.message and 'merge-deferred' in record.message
+            for record in caplog.records
+        ), (
+            f'Expected block log about dep 1 being merge-deferred. '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+
+    def test_different_train_id_dep_blocks(self, scheduler: Scheduler):
+        """γ (train_id=T2) with dep α (train_id=T1, merge-deferred) is blocked.
+
+        Different train_ids means the predecessor is from a different train — the
+        intra-train allowance must not fire.
+        """
+        alpha_task = {
+            'id': '1',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'train': {'id': 'T1', 'order': 0}},
+        }
+        gamma_task = {
+            'id': '3',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T2', 'order': 0}},
+        }
+        status_map = {'1': 'merge-deferred', '3': 'pending'}
+        tasks_by_id = {'1': alpha_task, '3': gamma_task}
+
+        result = scheduler._deps_satisfied(gamma_task, status_map, tasks_by_id)
+        assert result is False, (
+            'different-train: γ (T2) must be blocked when dep α (T1) is merge-deferred'
+        )
+
+    def test_non_train_regression_done_dep_satisfied(self, scheduler: Scheduler):
+        """Non-train task with tasks_by_id=None: done dep → satisfied (regression guard)."""
+        task = {'id': '10', 'dependencies': [{'id': 9}]}
+        status_map = {'9': 'done', '10': 'pending'}
+
+        result = scheduler._deps_satisfied(task, status_map, tasks_by_id=None)
+        assert result is True, (
+            'regression: plain task with done dep must remain satisfied when tasks_by_id=None'
+        )
+
+    def test_non_train_regression_merge_deferred_dep_blocks(self, scheduler: Scheduler):
+        """Non-train task with tasks_by_id=None: merge-deferred dep → blocked (PRD Scenario 11).
+
+        Pins that merge-deferred blocks when tasks_by_id is absent — byte-identical to
+        today's behaviour.  tasks_by_id=None is the default when callers omit the arg.
+        """
+        task = {'id': '10', 'dependencies': [{'id': 9}]}
+        status_map = {'9': 'merge-deferred', '10': 'pending'}
+
+        result = scheduler._deps_satisfied(task, status_map, tasks_by_id=None)
+        assert result is False, (
+            'regression: plain task with merge-deferred dep must be blocked when tasks_by_id=None'
+        )
+
+    def test_tasks_by_id_none_disables_train_allowance(self, scheduler: Scheduler):
+        """β has train metadata but caller omits tasks_by_id → merge-deferred dep still blocks.
+
+        Defensive backward-compat: when the caller doesn't pass tasks_by_id,
+        we cannot verify the dep's train_id so we conservatively block.
+        """
+        beta_task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T1', 'order': 1}},
+        }
+        status_map = {'1': 'merge-deferred', '2': 'pending'}
+
+        # Intentionally omit tasks_by_id (uses default None)
+        result = scheduler._deps_satisfied(beta_task, status_map)
+        assert result is False, (
+            'defensive: β (train member) must be blocked when tasks_by_id is absent '
+            '(no way to verify dep train_id)'
+        )
+
+    def test_dep_missing_from_tasks_by_id_blocks(self, scheduler: Scheduler):
+        """β is a train member but dep is absent from tasks_by_id (stale snapshot) → blocks.
+
+        Conservative behaviour: cannot verify train_id match without dep record.
+        """
+        beta_task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T1', 'order': 1}},
+        }
+        status_map = {'1': 'merge-deferred', '2': 'pending'}
+        tasks_by_id = {}  # dep '1' missing from snapshot
+
+        result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
+        assert result is False, (
+            'stale-snapshot: β must be blocked when dep is absent from tasks_by_id'
+        )
+
+    def test_dep_without_train_metadata_blocks_train_member(self, scheduler: Scheduler):
+        """dep in tasks_by_id but has no metadata.train → intra-train allowance must not fire.
+
+        β is a train member (train_id='T1').  α (merge-deferred) is present in
+        tasks_by_id but carries no metadata.train at all.  dep_train_id resolves
+        to None (which != 'T1'), so the allowance must NOT fire and
+        _deps_satisfied must return False.
+
+        Regression guard: a mistaken default of 'satisfied when dep_train_id is
+        None' would slip past the other missing-dep tests.
+        """
+        alpha_task = {
+            'id': '1',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {},  # no 'train' key at all
+        }
+        beta_task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T1', 'order': 1}},
+        }
+        status_map = {'1': 'merge-deferred', '2': 'pending'}
+        tasks_by_id = {'1': alpha_task, '2': beta_task}
+
+        result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
+        assert result is False, (
+            'dep without train metadata must block train member '
+            '(dep_train_id=None cannot match train_id=T1)'
+        )
+
+
+class TestAcquireNextTrainDispatch:
+    """End-to-end: acquire_next dispatches intra-train members when predecessor is merge-deferred.
+
+    PRD § 9.3: β (pending, same train as α) must dispatch when α is merge-deferred.
+    Non-train task δ must stay blocked by merge-deferred α (extra-train).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_dispatches_train_member_when_predecessor_merge_deferred(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns β when α (same train, merge-deferred) unblocks it.
+
+        α is in status 'merge-deferred' (non-terminal but intra-train allowed).
+        β is pending with dep α and shares train_id 'T1'.
+        acquire_next must return a TaskAssignment with task_id == 'B'.
+        """
+        alpha = {
+            'id': 'A',
+            'title': 'Train alpha',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'files': ['backend'], 'train': {'id': 'T1', 'order': 0}},
+        }
+        beta = {
+            'id': 'B',
+            'title': 'Train beta',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['frontend'], 'train': {'id': 'T1', 'order': 1}},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[alpha, beta])
+
+        result = await scheduler.acquire_next()
+        assert result is not None, (
+            'Expected β to be dispatched (intra-train allowance: α is merge-deferred, same T1)'
+        )
+        assert result.task_id == 'B', (
+            f'Expected task_id == "B", got {result.task_id!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_blocks_non_train_dep_on_merge_deferred_predecessor(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns None when δ (no train metadata) depends on merge-deferred α.
+
+        α is merge-deferred with train_id T1.  δ has no train metadata — it is
+        extra-train and must not benefit from the intra-train allowance.
+        acquire_next must return None (δ is blocked).
+        """
+        alpha = {
+            'id': 'A',
+            'title': 'Train alpha',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {'files': ['backend'], 'train': {'id': 'T1', 'order': 0}},
+        }
+        delta = {
+            'id': 'D',
+            'title': 'Plain delta',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['frontend']},  # no train metadata
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[alpha, delta])
+
+        result = await scheduler.acquire_next()
+        assert result is None, (
+            'Expected None — δ (no train metadata) must be blocked by merge-deferred α'
+        )
