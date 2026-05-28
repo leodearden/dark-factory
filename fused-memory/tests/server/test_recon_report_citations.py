@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from mcp.server.fastmcp.exceptions import ToolError
 
 # ---------------------------------------------------------------------------
 # Shared fakes
@@ -675,8 +675,8 @@ class TestCiteToolsViaFastMCP:
         )['finding_id']
         tm = mcp._tool_manager
 
-        # Omit project_id — FastMCP/Pydantic should raise ValidationError
-        with pytest.raises(ValidationError):
+        # Omit project_id — FastMCP/Pydantic raises ToolError wrapping ValidationError
+        with pytest.raises(ToolError):
             await tm.call_tool('cite_task', {
                 'run_id': 'r1',
                 'finding_id': fid,
