@@ -445,6 +445,15 @@ def create_mcp_server(
     # Read tools are left ungated — unknown project_id reads return empty today,
     # matching current behaviour.  See task 1143 (read-side strictness) and task
     # 1549 (this write-side complement).
+    #
+    # Task-mutation tools (set_task_status, submit_task, update_task, …) are
+    # intentionally NOT gated here.  Those tools use project_root (not project_id)
+    # as their primary scope key; applying the gate would require an inversion of
+    # the known_projects map (project_id→root) and additional validation logic
+    # outside this task's scope.  The harness quarantine (mark_project_dead_letter
+    # called from _project_loop's UnknownProjectError handler) provides
+    # defence-in-depth: if a task write buffers an event for an unknown project_id,
+    # the loop quarantines those rows on first encounter and stops respawning.
     _kp = known_projects or {}
 
     def _known_project_gate(project_id: str) -> dict | None:
@@ -967,6 +976,8 @@ def create_mcp_server(
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
             return err
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)

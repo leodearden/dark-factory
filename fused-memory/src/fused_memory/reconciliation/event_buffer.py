@@ -594,6 +594,16 @@ class EventBuffer:
         Mirrors restore_drained: UPDATE-by-status using the same _txn() pattern.
         See task 1143 (read-side UnknownProjectError) and task 1549 (this write-side
         complement: quarantine so get_active_projects stops respawning the loop).
+
+        NOTE — observability / lifecycle of 'dead_letter' rows in this table:
+        These rows are terminal and orphaned.  There is currently no built-in
+        cleanup or operator-facing read path for them in the event_buffer table
+        (the MCP get_dead_letters/delete_dead_letters/replay_dead_letters tools
+        operate on the separate event_queue JSONL file, not this SQLite table).
+        The quarantined rows accumulate indefinitely but are harmless — they are
+        excluded from all active-project queries.  To inspect them, query the
+        event_buffer table directly (``SELECT * FROM event_buffer WHERE
+        status='dead_letter'``).  A cleanup helper can be added as a follow-up.
         """
         async with self._txn() as db:
             cursor = await db.execute(
