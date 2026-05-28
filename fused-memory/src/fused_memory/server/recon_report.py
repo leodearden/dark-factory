@@ -539,6 +539,7 @@ class ReconReportState:
         Appends to finding.cited_memories only on success.
         """
         from graphiti_core.errors import EdgeNotFoundError
+
         from fused_memory.services.memory_service import MemoryNotFoundError
 
         entry = self._resolve_entry(run_id)
