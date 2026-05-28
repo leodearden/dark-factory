@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 # ---------------------------------------------------------------------------
 # Shared fakes
@@ -217,7 +218,6 @@ class TestCiteEntity:
     @pytest.mark.asyncio
     async def test_run_id_unknown_returned_for_bad_run(self):
         """Passing an unregistered run_id returns run_id_unknown."""
-        fake = self._fake()
         state, run_id, finding_id, _ = self._state_and_finding()
 
         result = await state.cite_entity('no-such-run', finding_id, 'foo')
@@ -676,7 +676,7 @@ class TestCiteToolsViaFastMCP:
         tm = mcp._tool_manager
 
         # Omit project_id — FastMCP/Pydantic should raise ValidationError
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             await tm.call_tool('cite_task', {
                 'run_id': 'r1',
                 'finding_id': fid,
