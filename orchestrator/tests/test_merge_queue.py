@@ -6967,3 +6967,92 @@ class TestSpeculationRaceRetry:
         assert _is_speculation_race('') is False
         assert _is_speculation_race('fatal: no such branch') is False
         assert _is_speculation_race('error: CONFLICT (content)') is False
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_succeeds(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Race-retry: 1st merge_to_main fails with stale-base speculation-race
+        stderr; 2nd call (against fresh main) succeeds and the branch lands on main.
+
+        Verifies:
+        - merge_to_main called exactly twice
+        - 2nd call's base_sha == actual main at test time
+        - returned item has no immediate_outcome (flowing, not blocked)
+        - _verify_and_advance returns True and resolves outcome.status == 'done'
+        - caplog contains 'merge_retry_after_speculation_race'
+        """
+        branch = 'race-retry-ok'
+        worktree = await _make_branch_with_file(git_ops, branch, 'race_ok.py', 'x = 1\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-retry', branch, worktree, config)
+
+        real_merge_to_main = git_ops.merge_to_main
+        call_count = 0
+        call_base_shas: list[str | None] = []
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            call_base_shas.append(base_sha)
+            if call_count == 1:
+                return MergeResult(
+                    success=False,
+                    conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: delegate to the real merge_to_main
+            return await real_merge_to_main(wt, br, base_sha=base_sha)
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+        actual_main = await git_ops.get_main_sha()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ), caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            item = await worker._remerge(req, None)
+
+        # merge_to_main must have been called exactly twice
+        assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
+
+        # 2nd call's base_sha must be the actual main SHA (freshly read inside _remerge)
+        assert call_base_shas[1] == actual_main, (
+            f'2nd merge_to_main base_sha {call_base_shas[1]!r} != actual main {actual_main!r}'
+        )
+
+        # item must be flowing (no immediate_outcome), merge succeeded
+        assert item.immediate_outcome is None, (
+            f'Expected flowing item but got immediate_outcome={item.immediate_outcome}'
+        )
+        assert item.merge_result is not None
+        assert item.merge_result.success
+
+        # _verify_and_advance must land the branch on main
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'Expected done, got {outcome.status}: {outcome}'
+
+        # The branch's file must now appear on main
+        rc, file_content, _ = await _run(
+            ['git', 'show', 'main:race_ok.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'race_ok.py not found on main after retry merge'
+        assert 'x = 1' in file_content
+
+        # Structured log note must appear
+        assert 'merge_retry_after_speculation_race' in caplog.text, (
+            'Expected "merge_retry_after_speculation_race" in caplog'
+        )
