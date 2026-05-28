@@ -332,3 +332,85 @@ async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
     assert outcome == WorkflowOutcome.MERGE_DEFERRED, (
         f'Expected MERGE_DEFERRED when trigger parks, got {outcome!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: Failure-path tests (blocked outcome + soft-cancel)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_blocked_outcome_escalates_to_human():
+    """Tip fires but merge fails with status='blocked' → _mark_blocked(escalate_to_human=True).
+
+    _await_cancellable returns MergeOutcome('blocked', reason='...rebase conflict...').
+    Assert:
+      (a) result is WorkflowOutcome.BLOCKED
+      (b) _mark_blocked was awaited once with escalate_to_human=True
+      (c) the reason string passed to _mark_blocked contains the train_id and
+          the failed outcome status/reason.
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+        tasks_by_train_return=members,
+    )
+    failed_outcome = MergeOutcome(
+        'blocked', reason='Train merge rejected: tip branch rebase conflict on main',
+    )
+    f.wf._await_cancellable = AsyncMock(return_value=failed_outcome)  # type: ignore[method-assign]
+
+    result = await f.wf._maybe_enqueue_group_merge()
+
+    # (a)
+    assert result == WorkflowOutcome.BLOCKED, (
+        f'Expected WorkflowOutcome.BLOCKED on merge failure, got {result!r}'
+    )
+
+    # (b) _mark_blocked called with escalate_to_human=True
+    f.mark_blocked.assert_awaited_once()
+    call_args = f.mark_blocked.call_args
+    kwargs = call_args.kwargs if call_args.kwargs else {}
+    # escalate_to_human may come as a positional or keyword arg
+    all_args = str(call_args)
+    assert 'escalate_to_human=True' in all_args or kwargs.get('escalate_to_human') is True, (
+        f'Expected escalate_to_human=True in _mark_blocked call: {call_args!r}'
+    )
+
+    # (c) reason contains train_id and outcome info
+    reason_arg = call_args.args[0] if call_args.args else ''
+    assert 'T1' in reason_arg, f'Expected train_id "T1" in reason: {reason_arg!r}'
+    assert 'blocked' in reason_arg, f'Expected "blocked" in reason: {reason_arg!r}'
+
+
+@pytest.mark.asyncio
+async def test_soft_cancel_delegates_to_handle_soft_cancel():
+    """_await_cancellable returns None → _handle_soft_cancel('group-merge') is invoked.
+
+    Patch _handle_soft_cancel to return WorkflowOutcome.REQUEUED; assert
+    _maybe_enqueue_group_merge returns that value.
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+        tasks_by_train_return=members,
+    )
+    f.wf._await_cancellable = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    handle_soft_cancel = AsyncMock(return_value=WorkflowOutcome.REQUEUED)
+    f.wf._handle_soft_cancel = handle_soft_cancel  # type: ignore[method-assign]
+
+    result = await f.wf._maybe_enqueue_group_merge()
+
+    handle_soft_cancel.assert_awaited_once_with('group-merge')
+    assert result == WorkflowOutcome.REQUEUED, (
+        f'Expected REQUEUED from _handle_soft_cancel, got {result!r}'
+    )
