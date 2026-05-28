@@ -996,7 +996,27 @@ async def coalesce_or_enqueue_merge_request(
                     branch=branch,
                     source='worktree',
                 )
-            # STALE/ABANDONED: reap and fall through to enqueue (step-10 adds reap)
+            else:
+                # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
+                # can be dispatched.  Foreign-process killing is deliberately out
+                # of scope — there is no cwd-based kill utility in the repo
+                # (terminate_process_group only handles procs the orchestrator
+                # spawned), and git worktree remove --force removes the tree so
+                # any orphaned build procs fail when their cwd vanishes.
+                logger.warning(
+                    'coalesce_or_enqueue_merge_request: reaping stale '
+                    '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
+                    wt, branch, age, liveness_secs,
+                )
+                await git_ops.cleanup_merge_worktree(wt)
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.worktree_reaped,
+                        task_id=req.task_id,
+                        phase='merge',
+                        data={'branch': branch, 'path': str(wt), 'reason': 'stale_inflight'},
+                    )
+                # Fall through to acquire-and-enqueue below
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result):
