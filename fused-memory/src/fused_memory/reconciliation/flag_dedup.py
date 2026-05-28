@@ -942,7 +942,7 @@ async def filter_false_absence_flags(
     lookup_results: list[Any] = await asyncio.gather(
         *[_safe_get_task(tid) for tid in check_task_ids]
     )
-    results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results))
+    results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
     kept: list[dict[str, Any]] = []
     for i, flag in enumerate(flags):
