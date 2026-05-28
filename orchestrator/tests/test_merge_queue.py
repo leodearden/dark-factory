@@ -5966,3 +5966,91 @@ class TestGroupMergeRequestVerifyGate:
 
         # No member callbacks
         req.mark_member_done.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestSpeculativeWorker — step-13 RED / step-14 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestSpeculativeWorker:
+    """GroupMergeRequest through SpeculativeMergeWorker (the harness's default worker)."""
+
+    async def test_train_lands_via_speculative_worker(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Happy-path 3-train via SpeculativeMergeWorker: done, 1 merge commit, 3 callbacks.
+
+        Drives the same scenario as TestGroupMergeRequestHappyPath but through
+        SpeculativeMergeWorker — the worker the harness actually instantiates.
+
+        Fails before step-14: _merger_loop falls through to the regular single-task
+        path, which does NOT call mark_member_done (no GroupMergeRequest dispatch).
+        """
+        req = await _make_stacked_train(git_ops, config)
+
+        # Count merge commits on main before the train lands
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        db_path = tmp_path / 'events_spec_train.db'
+        event_store = EventStore(db_path=db_path, run_id='test-spec-train')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.merge_sha is not None
+
+        # Exactly one new merge commit added to main
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main'
+        )
+
+        # All three member files present on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called exactly 3 times, all with the SAME merge SHA
+        assert req.mark_member_done.call_count == 3, (
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'
+        )
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+        assert next(iter(called_shas)) == outcome.merge_sha
+
+        # No speculative_merge event emitted for the train's task_id —
+        # trains bypass the speculative look-ahead path entirely.
+        conn = sqlite3.connect(str(db_path))
+        spec_rows = conn.execute(
+            "SELECT event_type, task_id FROM events "
+            "WHERE event_type = 'speculative_merge' AND task_id = ?",
+            (req.task_id,),
+        ).fetchall()
+        conn.close()
+        assert len(spec_rows) == 0, (
+            f'speculative_merge events must NOT be emitted for GroupMergeRequest; '
+            f'got: {spec_rows}'
+        )
+
+        await worker.stop()
+        await worker_task
