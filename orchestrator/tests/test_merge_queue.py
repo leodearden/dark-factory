@@ -6747,3 +6747,69 @@ class TestCoalesceOrEnqueueRegistryOnly:
         assert queue.qsize() == 2
         # No coalesce events
         assert _count_events(event_store.db_path, 'merge_coalesced') == 0
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceOrEnqueueWorktreePath:
+    """Tests for coalesce_or_enqueue_merge_request disk-scan branch.
+
+    Uses a real GitOps and _merge-* worktree to simulate the cross-actor
+    scenario where the in-memory registry is empty (e.g. after restart) but
+    an in-progress merger's worktree exists on disk.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'wt_coalesce_events.db'
+        return EventStore(db_path=db, run_id='wt-coalesce-test')
+
+    async def test_alive_worktree_coalesces_without_enqueue(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Disk-scan detects a recent _merge-* worktree → in_flight=True,
+        source='worktree', queue stays empty, worktree NOT removed."""
+        from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        # Create a real _merge-* worktree via merge_to_main
+        branch = 'wt-coalesce-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'wt_coalesce.py', 'x = 42\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()   # EMPTY — simulates restart
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('wt-coalesce', branch, tmp_path, config)
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                liveness_secs=INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+
+            # Queue must be EMPTY — no duplicate enqueue
+            assert queue.qsize() == 0, f'Expected empty queue, got {queue.qsize()}'
+
+            # Worktree must NOT have been removed (it is alive)
+            assert merge_wt.exists(), f'Alive worktree {merge_wt} was unexpectedly removed'
+
+            # merge_coalesced event must be emitted
+            assert _count_events(event_store.db_path, 'merge_coalesced') == 1
+
+        finally:
+            # Clean up the merge worktree
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
