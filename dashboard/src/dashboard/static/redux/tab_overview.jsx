@@ -2,8 +2,81 @@
 const { Sparkline, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, HistBar, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed } = window.DF_SHELL;
 const D = window.DF_DATA;
+const { useState, useEffect } = React;
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
+
+const METRICS = [
+  { key: 'psi_cpu_some_avg10',  label: 'CPU pressure · some',  type: 'psi' },
+  { key: 'psi_cpu_full_avg10',  label: 'CPU pressure · full',  type: 'psi' },
+  { key: 'psi_mem_some_avg10',  label: 'Mem pressure · some',  type: 'psi' },
+  { key: 'psi_mem_full_avg10',  label: 'Mem pressure · full',  type: 'psi' },
+  { key: 'psi_io_some_avg10',   label: 'IO pressure · some',   type: 'psi' },
+  { key: 'psi_io_full_avg10',   label: 'IO pressure · full',   type: 'psi' },
+  { key: 'occt_queue_depth',    label: 'OCCT queue depth',     type: 'int' },
+  { key: 'verify_concurrency',  label: 'Verify concurrency',   type: 'int' },
+  { key: 'verify_rss_total_bytes', label: 'Verify RSS total',  type: 'bytes' },
+];
+
+/* Format a host-load metric value for display.
+ *  type 'psi'   → "X.XX%"  (avg10 stall %; some = tasks stalling, full = all stalling)
+ *  type 'bytes' → "X.X GiB" (verify_rss_total_bytes via 1024**3 = 1073741824)
+ *  type 'int'   → integer (occt_queue_depth, verify_concurrency)
+ */
+function formatLoadValue(type, v) {
+  if (type === 'psi')   return `${v.toFixed(2)}%`;
+  if (type === 'bytes') return `${(v / 1073741824).toFixed(1)} GiB`;
+  /* type === 'int' */  return `${Math.round(v)}`;
+}
+
+function HostLoadCard({ paused }) {
+  const [load, setLoad] = useState(null);
+
+  useEffect(() => {
+    if (paused) return;
+    let alive = true;
+    async function fetchLoad() {
+      try {
+        const resp = await fetch('/api/load', { credentials: 'same-origin' });
+        if (!resp.ok) return;
+        const body = await resp.json();
+        if (alive) setLoad(body);
+      } catch (_) { /* keep prior values on network blip */ }
+    }
+    fetchLoad();
+    const id = setInterval(fetchLoad, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, [paused]);
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <span className="title">Host load</span>
+        <span className="meta">5-min window · 5s poll</span>
+      </div>
+      <div className="panel-body">
+        <table className="tbl" style={{ width: '100%' }}>
+          <tbody>
+            {METRICS.map(m => {
+              const datum = (load && load[m.key]) || { current: null, sparkline: [] };
+              return (
+                <tr key={m.key}>
+                  <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{m.label}</td>
+                  <td className="num mono" style={{ width: '12%', fontSize: 12 }}>
+                    {datum.current == null ? '—' : formatLoadValue(m.type, datum.current)}
+                  </td>
+                  <td style={{ width: '58%' }}>
+                    <Sparkline values={datum.sparkline} color={P.accent} />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 
 function OverviewTab({ paused }) {
   const schedModules = (D.SCHEDULER && D.SCHEDULER.modules) || [];
@@ -221,6 +294,11 @@ function OverviewTab({ paused }) {
             <LiveFeed paused={paused} />
           </div>
         </div>
+      </div>
+
+      {/* Row 4: Host load card */}
+      <div className="col-span-12">
+        <HostLoadCard paused={paused} />
       </div>
     </div>
   );
