@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 from shared.cli_invoke import (
     AllAccountsCappedException,
@@ -41,7 +41,7 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, TrainMembership, _run
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TaskAssignment,
@@ -583,7 +583,7 @@ class TaskWorkflow:
                     if self.config.worktree_identity_guard_enabled
                     else None
                 ),
-                train=train_meta if isinstance(train_meta, dict) else None,
+                train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
             )
             self.worktree = worktree_info.path
             base_commit = worktree_info.base_commit

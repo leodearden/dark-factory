@@ -74,6 +74,7 @@ async def test_train_metadata_forwarded_to_create_worktree(tmp_path: Path):
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
         await wf._setup_worktree_and_artifacts('task/101')
 
+    assert wf.git_ops.create_worktree.await_args is not None
     call_kwargs = wf.git_ops.create_worktree.await_args.kwargs
     assert call_kwargs.get('train') == train_meta
 
@@ -92,6 +93,7 @@ async def test_no_train_metadata_passes_none(tmp_path: Path):
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
         await wf._setup_worktree_and_artifacts('task/101')
 
+    assert wf.git_ops.create_worktree.await_args is not None
     call_kwargs = wf.git_ops.create_worktree.await_args.kwargs
     assert call_kwargs.get('train') is None
 
@@ -110,5 +112,6 @@ async def test_no_metadata_key_at_all_passes_none(tmp_path: Path):
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
         await wf._setup_worktree_and_artifacts('task/101')
 
+    assert wf.git_ops.create_worktree.await_args is not None
     call_kwargs = wf.git_ops.create_worktree.await_args.kwargs
     assert call_kwargs.get('train') is None
