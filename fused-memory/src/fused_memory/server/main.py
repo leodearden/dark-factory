@@ -692,6 +692,8 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     watchdog_task: asyncio.Task[None] | None = None
+    recon_report_state: Any | None = None
+    recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
@@ -748,11 +750,30 @@ async def run_server():
                     await asyncio.sleep(_WATCHDOG_INTERVAL)
 
             watchdog_task = asyncio.create_task(_watchdog_heartbeat())
+
+            # Second uvicorn: recon_report MCP namespace on port recon_report_port
+            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(config)
+            recon_server = uvicorn.Server(recon_uv_config)
+            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            await recon_report_state.start_reaper()
+            logger.info(
+                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                display_host,
+                config.server.recon_report_port,
+            )
+
             _sd_notify('READY=1')
-            await server.serve()
+            await asyncio.gather(server.serve(), recon_server.serve())
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
+        if recon_report_state is not None:
+            with contextlib.suppress(BaseException):
+                await recon_report_state.stop_reaper()
+        if recon_server is not None:
+            recon_server.should_exit = True
+            with contextlib.suppress(BaseException):
+                await recon_server.shutdown()
         if watchdog_task is not None:
             watchdog_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1128,6 +1149,44 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
     tool_manager.call_tool = _safe_call_tool
     tool_manager._fused_memory_safe_wrapped = True
+
+
+def _build_recon_report_components(
+    config: FusedMemoryConfig,
+) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
+    """Construct the recon_report state, FastMCP server, and uvicorn.Config.
+
+    Extracted from run_server() so it can be unit-tested without starting
+    any sockets.  Only run_server() starts the reaper and calls uvicorn.Server.serve().
+
+    Returns:
+        (ReconReportState, FastMCP, uvicorn.Config)
+    """
+    import uvicorn
+
+    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+    ttl = config.reconciliation.recon_report_state_ttl_seconds
+    state = ReconReportState(ttl_seconds=ttl)
+
+    mcp = create_recon_report_server(state)
+    _install_safe_tool_wrapper(mcp)
+
+    mcp.settings.host = config.server.host
+    mcp.settings.port = config.server.recon_report_port
+    mcp.settings.stateless_http = config.server.stateless_http
+    mcp.settings.json_response = config.server.json_response
+
+    starlette_app = mcp.streamable_http_app()
+    shielded_app = _ASGIExceptionShield(starlette_app)
+
+    uv_config = uvicorn.Config(
+        shielded_app,
+        host=config.server.host,
+        port=config.server.recon_report_port,
+        log_level='info',
+    )
+    return state, mcp, uv_config
 
 
 def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None:
