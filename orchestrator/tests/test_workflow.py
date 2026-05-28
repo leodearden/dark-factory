@@ -26,7 +26,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
@@ -317,7 +317,6 @@ class TestVerifyDebugfixLoopForceWorkspace:
         wf.plan['files'] = ['orchestrator/x.py']
         # Skip the pre-verify rebase step to keep the loop tight.
         wf.config.rebase_before_verify = False
-        wf._inter_iteration_rebase = AsyncMock()  # type: ignore[method-assign]
         return wf
 
     async def test_train_member_passes_force_workspace_true(
@@ -387,6 +386,14 @@ class TestEnterMergeDeferred:
             f'Expected WorkflowOutcome.MERGE_DEFERRED; got {result!r}'
         )
         wf.scheduler.set_task_status.assert_awaited_once_with(wf.task_id, 'merge-deferred')
+        assert wf.state == WorkflowState.MERGE_DEFERRED, (
+            f'Expected wf.state==MERGE_DEFERRED (worktree preserved); got {wf.state!r}'
+        )
+        # Requeue counter must be cleared: the task is workspace-green; any
+        # counter accumulated from prior failed attempts is no longer relevant
+        # (harness MERGE_DEFERRED falls through with requeued=False and won't
+        # call clear_requeue_count itself).
+        wf.scheduler.clear_requeue_count.assert_called_once_with(wf.task_id)
 
 
 def _make_run_wf(

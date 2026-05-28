@@ -4181,3 +4181,40 @@ class TestRunScopedVerificationForceWorkspace:
         assert '__workspace_cmd__' not in joined, (
             f'Workspace command should NOT run when force_workspace=False: {calls!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_true_does_not_derive_task_files(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """force_workspace=True must skip _derive_task_files_from_git entirely.
+
+        The guard at ``if task_files is None and not force_workspace`` was
+        added precisely so force_workspace=True callers never await the git
+        derivation.  A regression that removed ``not force_workspace`` from the
+        guard would still pass the two preceding tests (they pre-populate
+        task_files) but would break this one.
+        """
+        from orchestrator.verify import _derive_task_files_from_git  # noqa: F401
+
+        derive_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr('orchestrator.verify._derive_task_files_from_git', derive_mock)
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__workspace_cmd__',
+        )
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                tmp_path, config, [],
+                task_files=None,
+                force_workspace=True,
+            )
+
+        derive_mock.assert_not_awaited()

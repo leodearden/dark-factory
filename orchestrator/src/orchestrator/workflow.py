@@ -466,6 +466,12 @@ class TaskWorkflow:
         """
         self._enter_phase(WorkflowState.MERGE_DEFERRED)
         await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
+        # Clear any requeue counter accumulated from prior failed attempts: the
+        # task is workspace-green now, so those attempts are no longer relevant.
+        # The harness's _handle_outcome_post only special-cases REQUEUED/DONE;
+        # MERGE_DEFERRED falls through with requeued=False, leaving a stranded
+        # counter if we don't clear it here.
+        self.scheduler.clear_requeue_count(self.task_id)
         logger.info(
             'Task %s: train member workspace-green — parking in merge-deferred '
             '(group-merge worker owns done transition)',
