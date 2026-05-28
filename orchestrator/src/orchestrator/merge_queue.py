@@ -813,6 +813,7 @@ async def _do_train_merge(
         task_files=req.task_files,
         max_retries=0,
         is_merge_verify=True,
+        role='merge',
     )
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
