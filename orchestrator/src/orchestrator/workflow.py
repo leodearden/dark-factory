@@ -1223,6 +1223,12 @@ class TaskWorkflow:
                                 verify = await run_scoped_verification(
                                     self.worktree, self.config, self._module_configs,
                                     task_files=self._task_files,
+                                    # role='task' is explicit for γ's explicit-is-correct
+                                    # invariant (mirrors merge_queue.py role='merge').
+                                    # 'task' is already the default so this is documentary;
+                                    # no call-site spy exists for this path — the
+                                    # _verify_debugfix_loop spy in
+                                    # test_workflow_verify_retry.py covers the primary site.
                                     role='task',
                                 )
                                 if not verify.passed:

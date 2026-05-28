@@ -4452,7 +4452,7 @@ class TestRoleThreading:
     the env kwarg to assert DF_VERIFY_ROLE reaches the subprocess runner.
     """
 
-    def _make_config(self, warm=1800.0, cold: float | None = 5400.0):
+    def _make_config(self, warm=1800.0, cold: float | None = 5400.0, verify_env: dict | None = None):
         return OrchestratorConfig(
             verify_command_timeout_secs=warm,
             verify_cold_command_timeout_secs=cold,
@@ -4460,6 +4460,7 @@ class TestRoleThreading:
             test_command='echo test',
             lint_command='echo lint',
             type_check_command='echo type',
+            verify_env=verify_env or {},
         )
 
     def _make_env_capture_mock(self):
@@ -4523,14 +4524,23 @@ class TestRoleThreading:
 
     @pytest.mark.asyncio
     async def test_run_scoped_verification_global_propagates_role_task(self, tmp_path: Path):
-        """run_scoped_verification(role='task') in global mode propagates DF_VERIFY_ROLE='task'.
+        """run_scoped_verification(role='task') overrides a sentinel config value.
 
-        PRD-named code-level signal: verify_env['DF_VERIFY_ROLE'] == 'task' for the
-        per-task path, consumed by δ.  Cross-layer contract guard for
-        run_scoped_verification → run_verification → _resolve_verify_env → _run_cmd.
+        Uses verify_env={'DF_VERIFY_ROLE': 'sentinel'} as a non-default baseline so
+        the assertion can only pass if _resolve_verify_env is reached and the role
+        kwarg is applied (overriding the sentinel).
+
+        Note: this test cannot distinguish explicit role='task' threading from the
+        'task' default (both produce 'task'), so it is NOT a strict threading guard
+        for the kwarg-forwarding chain.  The call-site spy in
+        test_workflow_verify_retry.py::TestPerTaskVerifyRole is the true threading
+        guard.  This test verifies the override semantics of _resolve_verify_env and
+        serves as the PRD-named code-level signal (DF_VERIFY_ROLE=='task') consumed
+        by δ.
         """
         (tmp_path / '.task').mkdir()
-        config = self._make_config()
+        # Sentinel baseline: role='task' kwarg must override this static config value.
+        config = self._make_config(verify_env={'DF_VERIFY_ROLE': 'sentinel'})
         fake_cmd, captured = self._make_env_capture_mock()
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
@@ -4540,5 +4550,5 @@ class TestRoleThreading:
         assert captured, '_run_cmd was never called'
         assert all(env is not None for env in captured), f'env was None: {captured}'
         assert all(env['DF_VERIFY_ROLE'] == 'task' for env in captured), (
-            f'Expected DF_VERIFY_ROLE=task in global mode; got: {captured}'
+            f'Expected DF_VERIFY_ROLE=task (role kwarg must override sentinel); got: {captured}'
         )
