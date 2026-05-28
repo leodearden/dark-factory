@@ -2745,10 +2745,21 @@ class SpeculativeMergeWorker:
 
         # ── Speculation-race retry ─────────────────────────────────────────────
         # When the first attempt fails with the load-bearing git porcelain phrase
-        # ``not something we can merge`` (detected by _is_speculation_race), main
-        # may have advanced between our get_main_sha() read and merge_to_main's
-        # own get_main_sha() read, leaving the merge worktree built against a
-        # stale base.  Retry exactly once against a freshly-read main HEAD.
+        # ``not something we can merge`` (detected by _is_speculation_race) AND
+        # the merge ran against a stale base (pre_merge_sha != actual_main), main
+        # advanced between our get_main_sha() read and merge_to_main's own read,
+        # so the worktree was built against a commit no longer on main.  Retry
+        # exactly once against a freshly-read main HEAD to clear the stale-base
+        # environment.
+        #
+        # Design note: git emits this phrase when the merge argument (the branch
+        # ref) cannot be resolved to a commit — e.g. a stale ref cache after
+        # rapid concurrent pushes.  The pre_merge_sha != actual_main gate pins
+        # the retry to cases where the base genuinely drifted; if the branch ref
+        # was deleted or force-pushed between the two calls, the retry will fail
+        # identically.  The full stderr is attached to the warning log below for
+        # post-hoc diagnosis.
+        #
         # merge_to_main self-cleans its worktree on non-conflict failure, so
         # merge_result.merge_worktree is None here — no pre-retry cleanup needed.
         if (
@@ -2762,7 +2773,7 @@ class SpeculativeMergeWorker:
             logger.warning(
                 'Task %s: speculation-race detected (first_base=%s, stderr=%r) '
                 '— retrying against main %s',
-                req.task_id, (merge_result.pre_merge_sha or actual_main)[:8],
+                req.task_id, merge_result.pre_merge_sha[:8],
                 merge_result.details[:120], retry_main[:8],
             )
             retry_result = await self._git_ops.merge_to_main(

@@ -7233,3 +7233,144 @@ class TestSpeculationRaceRetry:
         diag2 = item2.immediate_outcome.failure_diagnostic
         assert diag2 is not None
         assert 'first_attempt_base_sha' not in diag2
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_returns_conflict(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry: 1st fails with speculation-race; 2nd returns a true conflict.
+
+        Verifies:
+        - merge_to_main called exactly twice
+        - immediate_outcome.status == 'conflict'
+        - conflict_details carries the retry stderr
+        - retry merge_worktree is cleaned up
+        - _emit_merge_attempt is called with outcome='conflict'
+        """
+        branch = 'race-retry-conflict'
+        worktree = await _make_branch_with_file(
+            git_ops, branch, 'conflict_file.py', 'value = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-conflict', branch, worktree, config)
+
+        fake_retry_wt = Path('/tmp/fake-race-retry-wt')
+        retry_stderr = 'CONFLICT (content): Merge conflict in conflict_file.py'
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: real merge conflict with a retained worktree
+            return MergeResult(
+                success=False, conflicts=True,
+                details=retry_stderr,
+                pre_merge_sha='a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+                merge_worktree=fake_retry_wt,
+            )
+
+        cleanup_calls: list[Path] = []
+
+        async def fake_cleanup(wt: Path) -> None:
+            cleanup_calls.append(wt)
+
+        emit_calls: list[dict] = []
+
+        def fake_emit(event_store: Any, task_id: str, outcome: str, **kwargs: Any) -> None:
+            emit_calls.append({'task_id': task_id, 'outcome': outcome})
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+        monkeypatch.setattr(git_ops, 'cleanup_merge_worktree', fake_cleanup)
+        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_attempt', fake_emit)
+
+        item = await worker._remerge(req, None)
+
+        # Exactly 2 calls — no 3rd retry
+        assert call_count == 2, f'Expected 2 calls, got {call_count}'
+
+        # Conflict immediate_outcome
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'conflict', (
+            f'Expected conflict, got {item.immediate_outcome.status!r}'
+        )
+        assert item.immediate_outcome.conflict_details == retry_stderr, (
+            f'conflict_details mismatch: {item.immediate_outcome.conflict_details!r}'
+        )
+
+        # Retry merge_worktree must be cleaned up
+        assert fake_retry_wt in cleanup_calls, (
+            f'Expected cleanup_merge_worktree({fake_retry_wt}); got: {cleanup_calls}'
+        )
+
+        # _emit_merge_attempt must have been called with outcome='conflict'
+        conflict_emits = [e for e in emit_calls if e['outcome'] == 'conflict']
+        assert conflict_emits, (
+            f'Expected a conflict merge_attempt emission; got emit_calls={emit_calls!r}'
+        )
+        assert conflict_emits[0]['task_id'] == req.task_id
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_success_skip_verify(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry with pre_rebased=True: retry success sets skip_verify=True.
+
+        When req.pre_rebased is True and the retry merge sets pre_merge_sha to
+        the freshly-read retry_main (because merge_to_main uses the explicit
+        base_sha we pass), skip_verify must be True on the returned item.
+        """
+        branch = 'race-retry-skip-verify'
+        worktree = await _make_branch_with_file(
+            git_ops, branch, 'skip_verify.py', 's = 99\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # pre_rebased=True is the trigger for skip_verify
+        req = _make_request('race-skip', branch, worktree, config, pre_rebased=True)
+
+        real_merge_to_main = git_ops.merge_to_main
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: delegate to real merge so pre_merge_sha == base_sha == retry_main
+            return await real_merge_to_main(wt, br, base_sha=base_sha)
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+
+        item = await worker._remerge(req, None)
+
+        assert call_count == 2, f'Expected 2 calls, got {call_count}'
+        assert item.immediate_outcome is None, (
+            f'Expected flowing item; got immediate_outcome={item.immediate_outcome}'
+        )
+        assert item.merge_result is not None
+        assert item.merge_result.success
+
+        # pre_rebased=True + retry used explicit base_sha=retry_main, so the
+        # real merge_to_main sets pre_merge_sha == retry_main → skip_verify=True
+        assert item.skip_verify is True, (
+            f'Expected skip_verify=True (pre_rebased=True, '
+            f'pre_merge_sha={item.merge_result.pre_merge_sha!r}); '
+            f'got skip_verify={item.skip_verify}'
+        )
