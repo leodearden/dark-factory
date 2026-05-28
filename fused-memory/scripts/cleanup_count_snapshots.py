@@ -166,3 +166,49 @@ def scan_entities_for_snapshots(
         ))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Pure core: audit memory payload
+# ---------------------------------------------------------------------------
+
+def build_audit_memory_payload(
+    match: EdgeMatch,
+    entity_uuid: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Build the kwargs dict for memory.add_memory for one invalidated edge.
+
+    Parameters
+    ----------
+    match:
+        The EdgeMatch whose edge is being invalidated.
+    entity_uuid:
+        The primary endpoint entity uuid (canonical representative when the
+        edge had multiple endpoints).
+    now_iso:
+        ISO-8601 timestamp string for the ``invalidated_at`` metadata field.
+
+    Returns
+    -------
+    Dict with keys: content, category, agent_id, project_id, metadata.
+    """
+    content = (
+        f'Count-snapshot cleanup: invalidated edge {match.edge_uuid} '
+        f'on entity {entity_uuid} (project={match.project_id}); '
+        f'original fact: {match.fact_excerpt}'
+    )
+    return {
+        'content': content,
+        'category': 'observations_and_summaries',
+        'agent_id': 'cleanup-count-snapshots',
+        'project_id': match.project_id,
+        'metadata': {
+            'kind': 'count_snapshot_cleanup_audit',
+            'edge_uuid': match.edge_uuid,
+            'entity_uuid': entity_uuid,
+            'project_id': match.project_id,
+            'fact_text_original': match.fact_excerpt[:500],
+            'invalidated_at': now_iso,
+        },
+    }
