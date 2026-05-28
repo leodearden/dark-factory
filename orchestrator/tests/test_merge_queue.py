@@ -26,7 +26,6 @@ from orchestrator.merge_queue import (
     DropGuardResult,
     GroupMergeRequest,
     InFlightMergeRegistry,
-    MergeDispatchResult,
     MergeOutcome,
     MergeRequest,
     MergeWorker,

@@ -3360,8 +3360,8 @@ class TestFindInflightMergeWorktree:
     """
 
     async def _make_branch_with_commit(
-        self, git_ops: GitOps, branch: str, filename: str = None
-    ) -> object:
+        self, git_ops: GitOps, branch: str, filename: str | None = None
+    ) -> WorktreeInfo:
         """Create a branch worktree, add a file, and commit."""
         name = filename or f'{branch}.py'
         wt_info = await git_ops.create_worktree(branch)
@@ -3424,8 +3424,8 @@ class TestFindInflightMergeWorktree:
     ):
         """Ordinary task worktrees (not _merge-*) are never returned."""
         branch = 'ordinary-task'
-        wt_info = await self._make_branch_with_commit(git_ops, branch)
-        # wt_info.path is a task worktree, NOT a _merge-* worktree
+        await self._make_branch_with_commit(git_ops, branch)
+        # the created worktree is a task worktree, NOT a _merge-* worktree
         found = await git_ops.find_inflight_merge_worktree(branch)
         assert found is None, (
             f'find_inflight_merge_worktree must ignore task worktrees, got {found}'

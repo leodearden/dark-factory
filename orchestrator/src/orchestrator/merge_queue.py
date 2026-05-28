@@ -936,7 +936,7 @@ async def coalesce_or_enqueue_merge_request(
     req: MergeRequest,
     event_store: EventStore | None,
     registry: InFlightMergeRegistry,
-    git_ops: object | None = None,
+    git_ops: GitOps | None = None,
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
 ) -> MergeDispatchResult:
