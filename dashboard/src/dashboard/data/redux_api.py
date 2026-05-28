@@ -650,17 +650,22 @@ def shape_escalations(
     }
 
     # Build roots list for reconciliation resolution (worktree-prefix + task-map probe).
-    # Each element is (Path(root_str), list_of_tasks) matching resolve_owning_project contract.
+    # Use Path.resolve(strict=False) so root paths are canonicalised — resolve_owning_project
+    # canonicalises the worktree with the same call, and is_relative_to compares path
+    # components, so unresolved symlinked segments would silently break the prefix match.
+    # Passing list(task_list) avoids the O(n) deep-copy; resolve_owning_project only reads
+    # task['id'] and does not mutate the list.
     roots_for_resolution: list[tuple[Path, list[dict[str, Any]]]] = [
-        (Path(root_str), [dict(t) for t in task_list])
+        (Path(root_str).resolve(strict=False), list(task_list))
         for root_str, task_list in task_maps.items()
     ]
 
-    # Build a reverse mapping: root basename → root_str, for task lookup after resolution.
-    # Multiple roots with the same basename are ambiguous; first-seen wins (same as resolution).
+    # Build a reverse mapping: resolved root basename → root_str (unresolved, as used in
+    # tasks_by_root_id keys), for task lookup after owning-project resolution.
+    # Multiple roots with the same resolved basename are ambiguous; first-seen wins.
     basename_to_root_str: dict[str, str] = {}
     for root_str in task_maps:
-        name = Path(root_str).name
+        name = Path(root_str).resolve(strict=False).name
         if name not in basename_to_root_str:
             basename_to_root_str[name] = root_str
 

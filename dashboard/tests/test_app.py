@@ -332,3 +332,109 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
+
+
+def test_load_task_cards_ttl_expiry(client, tmp_path):
+    """_load_task_cards: after TTL expires, fetch_tasks is called again."""
+    import dashboard.app as app_module
+    from dashboard.app import _task_cards_cache_clear
+
+    proj_a = tmp_path / 'projA'
+    one_orch_queues = {
+        'subsections': [
+            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
+             'escalations': [], 'summary': _EMPTY_SUMMARY},
+            {'id': 'reconciliation', 'label': 'fused-memory', 'kind': 'reconciliation',
+             'escalations': [], 'summary': _EMPTY_SUMMARY},
+        ],
+        'summary': _EMPTY_SUMMARY,
+    }
+    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
+                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
+
+    _task_cards_cache_clear()
+    original_ttl = app_module._TASK_CARDS_TTL_SECONDS
+    mock_ft = AsyncMock(return_value=task_list)
+    try:
+        with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
+             patch('dashboard.app.fetch_tasks', new=mock_ft):
+            # First request: cache miss — fetch_tasks called once, result cached.
+            client.get('/api/v2/dashboard/escalations')
+            assert mock_ft.call_count == 1
+
+            # Zero out TTL so the cached entry is immediately treated as expired.
+            app_module._TASK_CARDS_TTL_SECONDS = 0.0
+
+            # Second request: TTL expired — fetch_tasks called again.
+            resp = client.get('/api/v2/dashboard/escalations')
+    finally:
+        app_module._TASK_CARDS_TTL_SECONDS = original_ttl
+
+    assert resp.status_code == 200
+    assert mock_ft.call_count == 2, (
+        f'expected 2 fetch_tasks calls after TTL expiry, got {mock_ft.call_count}'
+    )
+
+
+def test_escalations_endpoint_multi_root_gather(client, tmp_path):
+    """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
+    from dashboard.app import _task_cards_cache_clear
+
+    _task_cards_cache_clear()
+
+    proj_a = tmp_path / 'projA'
+    proj_b = tmp_path / 'projB'
+
+    task_a = {'id': 11, 'title': 'task-A', 'description': '', 'details': '',
+              'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}
+    task_b = {'id': 22, 'title': 'task-B', 'description': '', 'details': '',
+              'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}}
+
+    queues = {
+        'subsections': [
+            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
+             'escalations': [{'id': 'esc-a1', 'task_id': 11, 'level': 0,
+                              'status': 'pending', 'summary': 'a-issue'}],
+             'summary': _EMPTY_SUMMARY},
+            {'id': str(proj_b), 'label': 'projB', 'kind': 'orchestrator',
+             'escalations': [{'id': 'esc-b1', 'task_id': 22, 'level': 1,
+                              'status': 'pending', 'summary': 'b-issue'}],
+             'summary': _EMPTY_SUMMARY},
+        ],
+        'summary': _EMPTY_SUMMARY,
+    }
+
+    async def fetch_side_effect(_client, _config, root_id):
+        if 'projA' in root_id:
+            return [task_a]
+        if 'projB' in root_id:
+            return [task_b]
+        return []
+
+    with patch('dashboard.app.build_escalation_queues', return_value=queues), \
+         patch('dashboard.app.fetch_tasks', side_effect=fetch_side_effect):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    subs = body['ESCALATIONS']['subsections']
+    assert len(subs) == 2
+
+    sub_a = next(s for s in subs if s['label'] == 'projA')
+    sub_b = next(s for s in subs if s['label'] == 'projB')
+
+    # projA subsection gets task-A (id=11), not task-B.
+    assert len(sub_a['escalations']) == 1
+    row_a = sub_a['escalations'][0]
+    assert row_a['project'] == 'projA'
+    assert row_a['task']['id'] == 11
+    assert row_a['task']['title'] == 'task-A'
+    assert row_a['task_unresolved'] is False
+
+    # projB subsection gets task-B (id=22), not task-A.
+    assert len(sub_b['escalations']) == 1
+    row_b = sub_b['escalations'][0]
+    assert row_b['project'] == 'projB'
+    assert row_b['task']['id'] == 22
+    assert row_b['task']['title'] == 'task-B'
+    assert row_b['task_unresolved'] is False
