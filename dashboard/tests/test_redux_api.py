@@ -477,3 +477,23 @@ class TestShapeEscalations:
         assert set(esc.keys()) == {'subsections', 'summary'}
         assert esc['subsections'] == []
         assert esc['summary'] == _EMPTY_SUMMARY
+
+    def test_shape_escalations_preserves_subsection_metadata(self):
+        """Orchestrator subsection metadata passes through unchanged."""
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        subsections = body['ESCALATIONS']['subsections']
+        assert len(subsections) == 1
+        out = subsections[0]
+        assert out['id'] == '/p/projA'
+        assert out['label'] == 'projA'
+        assert out['kind'] == 'orchestrator'
+        assert out['summary'] == _EMPTY_SUMMARY
+        assert out['escalations'] == []
