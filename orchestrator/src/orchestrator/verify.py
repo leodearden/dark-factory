@@ -77,6 +77,46 @@ def _is_conftest(path: str) -> bool:
     return path.rsplit('/', 1)[-1] == 'conftest.py'
 
 
+# Matches a class that inherits from Protocol or TypedDict (as a base class).
+# Deliberately a cheap content grep rather than an AST parse: structural files
+# almost always use the canonical ``class Foo(Protocol):`` /
+# ``class Bar(TypedDict):`` form, and the cost of a rare false positive (an
+# extra package-wide pyright run) is far cheaper than missing a cross-file
+# invariance break caused by scoping pyright to only the changed file.
+_PROTOCOL_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bProtocol\b')
+_TYPEDDICT_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bTypedDict\b')
+
+
+def _is_structural_python_file(path: str, content: str) -> bool:
+    """Return True when *path* defines a Protocol or TypedDict subclass.
+
+    A deliberately cheap content grep (not an AST parse): matches
+    ``class Foo(Protocol):`` and ``class Bar(TypedDict):`` patterns including
+    multi-base forms such as ``class Foo(Base, Protocol):``.
+
+    Cross-file invariant trap: pyright scoped to a single file cannot verify
+    that all implementors of a Protocol still conform after the Protocol's
+    definition widens.  Returning True causes ``scope_module_config`` to fall
+    back to the full package-wide type-check command so pyright sees the
+    complete picture.
+
+    Scope notes:
+    - ``.pyi`` stub files are explicitly excluded (``path.endswith('.py')``
+      check).  Stub-defined Protocols create the same cross-file invariant
+      trap, but ``.pyi`` stubs are filtered from ``scoped`` before this
+      helper is reached (see ``scope_module_config``'s ``endswith('.py')``
+      filter), so they would never be passed here in normal operation.
+    - Type-argument usage such as ``class Foo(Dict[str, Protocol]):`` is a
+      known false positive: the regex matches ``Protocol`` inside the base
+      list even when it is not a direct base.  The cost is an extra
+      package-wide pyright run — acceptable given the alternative is silently
+      missing a real invariance break.
+    """
+    if not path.endswith('.py'):
+        return False
+    return bool(_PROTOCOL_RE.search(content) or _TYPEDDICT_RE.search(content))
+
+
 def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
     """Remove ``--directory <module_prefix>`` from a ``uv run`` command.
 
@@ -835,13 +875,26 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
-def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig | None:
+def scope_module_config(
+    mc: ModuleConfig,
+    task_files: list[str],
+    worktree: Path | None = None,
+) -> ModuleConfig | None:
     """Narrow *mc*'s commands to the specific *task_files* it covers.
 
     Filters *task_files* to ``.py`` files matching ``mc.prefix + '/'`` and
     keeps full worktree-relative paths.  The ``--directory`` flag is stripped
     from scoped commands so that tools resolve paths from the worktree root,
     where the full paths are valid.
+
+    When *worktree* is provided, any scoped ``.py`` file that defines a
+    ``Protocol`` or ``TypedDict`` subclass causes *mc.type_check_command* to
+    be used verbatim (unscoped).  File-scoped pyright cannot verify cross-file
+    invariants such as Protocol conformance; the package-wide form is the only
+    safe option.  The ``--directory`` flag is preserved (NOT stripped) in the
+    unscoped case — it is required for ``uv run`` to resolve ``src/``/``tests/``
+    correctly when running from the worktree root.  This mirrors the existing
+    ``has_conftest`` branch that sets ``test_cmd = mc.test_command`` verbatim.
 
     Returns ``None`` when no ``.py`` files from *task_files* fall under the
     prefix — the caller should skip that subproject entirely rather than run
@@ -868,12 +921,40 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     # conftest files are handled by the has_conftest branch above.
     test_files = [f for f in scoped if _is_test_file(f)]
 
+    # Detect structural files (Protocol/TypedDict definitions) when we have a
+    # worktree to read from.  File-scoped pyright misses cross-file invariance
+    # breaks; the package-wide command is the only safe scope.
+    # Guard: skip the I/O loop entirely when there is no type-check command to
+    # widen — has_structural can only affect type_cmd, so reading files is
+    # wasted work when mc.type_check_command is None/empty.
+    has_structural = False
+    structural_trigger: str | None = None
+    if worktree is not None and mc.type_check_command:
+        for f in scoped:
+            full = worktree / f
+            if full.is_file():
+                try:
+                    content = full.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    continue
+                if _is_structural_python_file(f, content):
+                    has_structural = True
+                    structural_trigger = f
+                    break
+
     # Build scoped commands with worktree-relative paths, then strip
     # --directory so tools resolve paths from the worktree root
     lint_cmd = _strip_directory_flag(
         _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
-    type_cmd = _strip_directory_flag(
-        _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
+    if has_structural:
+        # Verbatim unscoped type check — mirrors the has_conftest test_cmd branch.
+        # --directory is intentionally preserved so uv resolves src/ and tests/
+        # relative to the module subdirectory (NOT the worktree root).
+        type_cmd = mc.type_check_command
+        logger.info('pyright unscoped: structural file %s in diff', structural_trigger)
+    else:
+        type_cmd = _strip_directory_flag(
+            _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
     if has_conftest:
         # Full unscoped suite: conftest changes affect everything it shadows.
         test_cmd = mc.test_command
@@ -1777,7 +1858,7 @@ async def run_scoped_verification(
                 # scope_module_config returns None when no files touch the subproject;
                 # those subprojects are skipped rather than running their full suite.
                 per_module = [
-                    (mc.prefix, scope_module_config(mc, existing_files))
+                    (mc.prefix, scope_module_config(mc, existing_files, worktree=worktree))
                     for mc in module_configs
                 ]
                 skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
