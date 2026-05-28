@@ -5519,8 +5519,8 @@ class TestDepsSatisfiedTrainAware:
         )
         assert any(
             'intra-train dep satisfied' in record.message
-            and '1' in record.message
-            and 'T1' in record.message
+            and 'dep=1' in record.message
+            and 'train_id=T1' in record.message
             for record in caplog.records
         ), (
             f'Expected "intra-train dep satisfied" log with dep=1 and train_id=T1. '
@@ -5651,6 +5651,37 @@ class TestDepsSatisfiedTrainAware:
         result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
         assert result is False, (
             'stale-snapshot: β must be blocked when dep is absent from tasks_by_id'
+        )
+
+    def test_dep_without_train_metadata_blocks_train_member(self, scheduler: Scheduler):
+        """dep in tasks_by_id but has no metadata.train → intra-train allowance must not fire.
+
+        β is a train member (train_id='T1').  α (merge-deferred) is present in
+        tasks_by_id but carries no metadata.train at all.  dep_train_id resolves
+        to None (which != 'T1'), so the allowance must NOT fire and
+        _deps_satisfied must return False.
+
+        Regression guard: a mistaken default of 'satisfied when dep_train_id is
+        None' would slip past the other missing-dep tests.
+        """
+        alpha_task = {
+            'id': '1',
+            'status': 'merge-deferred',
+            'dependencies': [],
+            'metadata': {},  # no 'train' key at all
+        }
+        beta_task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {'train': {'id': 'T1', 'order': 1}},
+        }
+        status_map = {'1': 'merge-deferred', '2': 'pending'}
+        tasks_by_id = {'1': alpha_task, '2': beta_task}
+
+        result = scheduler._deps_satisfied(beta_task, status_map, tasks_by_id)
+        assert result is False, (
+            'dep without train metadata must block train member '
+            '(dep_train_id=None cannot match train_id=T1)'
         )
 
 

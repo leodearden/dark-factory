@@ -1441,9 +1441,11 @@ class Scheduler:
         deps = task.get('dependencies', [])
         task_id = str(task.get('id', '?'))
         # Resolve this task's train id once (None if not a train member).
+        # Coerce empty string to None so that '' does not accidentally match
+        # another task whose id is also '' (ill-formed but defensively handled).
         task_train = (task.get('metadata') or {}).get('train')
         task_train_id: str | None = (
-            task_train.get('id') if isinstance(task_train, dict) else None
+            task_train.get('id') or None if isinstance(task_train, dict) else None
         )
         for d in deps:
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
@@ -1459,8 +1461,9 @@ class Scheduler:
                 dep_task = tasks_by_id.get(dep_id)
                 if dep_task is not None:
                     dep_train = (dep_task.get('metadata') or {}).get('train')
+                    # Coerce empty string to None (see task_train_id note above).
                     dep_train_id: str | None = (
-                        dep_train.get('id') if isinstance(dep_train, dict) else None
+                        dep_train.get('id') or None if isinstance(dep_train, dict) else None
                     )
                     if dep_train_id == task_train_id:
                         logger.debug(
