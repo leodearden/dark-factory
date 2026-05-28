@@ -443,6 +443,7 @@ def shape_merge_queue(
                 'values': list(spark.get('values') or []),
             },
             'halt': dict(halts.get(label) or {'offline': True}),
+            'train_events': [dict(e) for e in (data.get('train_events') or [])],
         }
     return {'MERGE_QUEUE': out}
 
