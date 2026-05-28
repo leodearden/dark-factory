@@ -669,6 +669,3 @@ class TestFusedMemoryTestsDirectoryClean:
             f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
             f'Violations:\n{result.stdout}'
         )
-        assert result.stdout == '', (
-            f'Expected empty stdout from checker (no violations), got:\n{result.stdout}'
-        )

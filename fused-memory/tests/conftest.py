@@ -72,6 +72,10 @@ def standard_mock_config() -> MagicMock:
 
         def test_something(self, standard_mock_config):
             standard_mock_config.embedder.dimensions = 768
+
+    Note: spec_set only constrains top-level attributes; nested attribute typos
+    (e.g. cfg.embedder.dimensionz) are still silently accepted because cfg.embedder
+    resolves to an unconstrained child MagicMock.
     """
     cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     cfg.embedder.dimensions = 1536
