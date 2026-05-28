@@ -5122,6 +5122,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
         from escalation.models import Escalation
 
+        # PRD § 9.8 — inject per-train context for park-prefix derail escalations.
+        # Non-train tasks get train_state=None (the Escalation field default).
+        # This is the single L1 chokepoint (3 callers inside _mark_blocked at
+        # ~4861/~4980/~5007), so it covers every park-prefix derail path.
+        train_state = await self._build_train_state()
+
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
@@ -5134,6 +5140,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=None,
             workflow_state=self.state.value,
             level=1,
+            train_state=train_state,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
