@@ -586,3 +586,34 @@ class TestShapeEscalations:
         assert row['project'] == 'projA'
         assert row['task'] == task
         assert row['task_unresolved'] is False
+
+    def test_shape_escalations_reconciliation_resolves_via_task_map_probe(self, tmp_path):
+        """Reconciliation row without worktree resolves via task-id probe."""
+        task = {
+            'id': 42, 'title': 'probe-task', 'description': '',
+            'details': '', 'status': 'pending', 'priority': 'low',
+            'dependencies': [], 'metadata': {},
+        }
+        projB_root = tmp_path / 'projB'
+        projB_root.mkdir()
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-probe', 'task_id': '42',
+                    # no 'worktree' field
+                    'level': 0, 'status': 'pending',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {str(projB_root): [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        row = rows[0]
+        assert row['project'] == 'projB'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
