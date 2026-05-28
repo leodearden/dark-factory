@@ -612,6 +612,17 @@ class OrchestratorConfig(BaseSettings):
     # call it a loop in the merge phase (the steward resolution between
     # them is the mediation we already gave it a chance to perform).
     max_consecutive_merge_thrash: int = Field(default=2, ge=1)
+    # Verify-loop signature-repetition cap — after N consecutive verify
+    # failures whose (category, normalised cause_hint) tuple is identical the
+    # loop escalates to L1 (WorkflowOutcome.BLOCKED) instead of burning the
+    # remaining max_verify_attempts budget on futile debug/retry cycles.
+    # Normalisation strips file:line numeric tails, ANSI colour escapes,
+    # collapses whitespace, and lowercases so superficial textual variation
+    # (line numbers shifting, colour codes) does not defeat the equality check.
+    # Default 3 mirrors max_consecutive_infra_resumes — empirically, three
+    # identical failures with no variation in error text means the debugger
+    # is not making progress and human review is the right next step.
+    max_failure_signature_repeat: int = Field(default=3, ge=1)
     merge_verify_min_free_disk_bytes: int = Field(
         default=10 * 1024**3,
         description=(

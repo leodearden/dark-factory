@@ -37,6 +37,13 @@ max_consecutive_infra_resumes: 3
 # orchestrator escalates to L1 instead of resubmitting.
 max_consecutive_merge_thrash: 2
 
+# Verify-loop signature-repetition cap.  After N consecutive verify failures
+# with the same (category, normalised cause_hint) tuple the loop escalates to
+# L1 instead of retrying.  Normalisation strips file:line tails, ANSI codes,
+# collapses whitespace, and lowercases — so shifting line numbers don't defeat
+# the equality check.  Default 3 mirrors max_consecutive_infra_resumes.
+max_failure_signature_repeat: 3
+
 # Per-task retry cap — max WorkflowOutcome.REQUEUED iterations before L1
 # escalation.  Backstop against tight steward→REQUEUED loops (e.g. architect
 # returns empty output every time, steward classes it as transient).
