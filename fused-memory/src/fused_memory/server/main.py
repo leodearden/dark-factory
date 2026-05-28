@@ -443,6 +443,13 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
+    # populate recon_report_state before the harness is constructed, threading the
+    # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
+    # recon-report server. The try/finally block below reads this name; removing the
+    # duplicate init at the old site avoids overwriting a value set here.
+    recon_report_state: Any = None
+    _pre_recon_uv_config: Any = None
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -581,11 +588,27 @@ async def run_server():
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
 
+        # PRD γ (task 1546): For http transport, pre-build the recon_report
+        # components here — before ReconciliationHarness is constructed — so
+        # the SAME ReconReportState object is threaded into the harness (for
+        # direct in-process start_report/get_assembled_report calls) AND used
+        # by the uvicorn recon-report server (for MCP tool access by stage
+        # subprocesses). For non-http transports, recon_report_state remains
+        # None (no MCP server needed) and stages operate without citation wiring.
+        if config.server.transport == 'http':
+            recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
+                config,
+                memory_service=memory_service,
+                task_interceptor=task_interceptor,
+                known_projects=_known_projects_map,
+            )
+
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
             memory_service, taskmaster, recon_journal, event_buffer, config,
             backlog_policy=backlog_policy,
             known_projects=_known_projects_map,
+            recon_report_state=recon_report_state,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -713,7 +736,7 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     watchdog_task: asyncio.Task[None] | None = None
-    recon_report_state: Any = None
+    # recon_report_state already initialized above (PRD γ, task 1546 step-12)
     server: Any | None = None  # primary uvicorn.Server
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
@@ -752,13 +775,19 @@ async def run_server():
             # callback can reference both servers — stopping only the primary would
             # leave asyncio.gather(server.serve(), recon_server.serve()) unresolved
             # and hang run_server() until SIGKILL.
-            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(
-                config,
-                memory_service=memory_service,
-                task_interceptor=task_interceptor,
-                known_projects=_known_projects_map,
-            )
-            recon_server = uvicorn.Server(recon_uv_config)
+            #
+            # PRD γ (task 1546): For reconciliation-enabled runs, recon_report_state
+            # and _pre_recon_uv_config were built above (before harness construction)
+            # so the harness and the uvicorn server share the SAME ReconReportState
+            # object. For reconciliation-disabled runs, build them now.
+            if recon_report_state is None:
+                recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
+                    config,
+                    memory_service=memory_service,
+                    task_interceptor=task_interceptor,
+                    known_projects=_known_projects_map,
+                )
+            recon_server = uvicorn.Server(_pre_recon_uv_config)
             recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
             # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
