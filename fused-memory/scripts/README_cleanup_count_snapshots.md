@@ -106,9 +106,24 @@ Each invalidated edge should have a corresponding memory with
 `metadata.kind == 'count_snapshot_cleanup_audit'` and the original fact text
 in `metadata.fact_text_original`.
 
-To rollback: use the `edge_uuid` from the audit memory metadata and call
-`memory.update_edge(edge_uuid=..., project_id=..., invalid_at=None)` to
-re-validate the edge, then `memory.refresh_entity_summary` to rebuild summaries.
+The audit memory's `metadata.fact_text_original` and `metadata.edge_uuid`
+are your recovery **evidence** — an auditable record of what was invalidated
+and when.  Two workable recovery paths exist:
+
+1. **Re-add the original fact** via `memory.add_memory(...)` or
+   `memory.add_episode(...)` with the original fact text.  This creates a
+   **new** edge — it does NOT re-validate the original invalidated edge.
+
+2. **Direct Cypher write** against FalkorDB/Neo4j to clear `invalid_at` on
+   the original edge by UUID (e.g. `MATCH ()-[r {uuid: $uuid}]-() REMOVE
+   r.invalid_at`).  This truly restores the original edge, but **bypasses the
+   journaled MemoryService write path** — use only when the audited record is
+   insufficient.
+
+> **Note**: `memory.update_edge(edge_uuid=..., invalid_at=None)` does **not**
+> work — `MemoryService.update_edge` raises `ValueError` when both `fact` and
+> `invalid_at` are `None`, and no code path clears `invalid_at` back to `None`
+> through the normal service layer.
 
 ---
 
@@ -148,5 +163,6 @@ python scripts/cleanup_count_snapshots.py \
 - **Deduplicated writes** — each edge is invalidated exactly once even if it
   appears under multiple entity endpoints (the Graphiti double-attribution
   pattern).
-- **Rollback recoverable** — audit memories in Mem0 carry the original
-  `fact_text_original` and `edge_uuid` for re-validation if needed.
+- **Rollback evidence preserved** — audit memories in Mem0 carry the original
+  `fact_text_original` and `edge_uuid` so operators have a complete audit
+  trail.  See Step 4 for the available recovery paths.
