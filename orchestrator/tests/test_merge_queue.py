@@ -5910,3 +5910,59 @@ class TestGroupMergeRequestMainAdvancedClean:
         called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}
         assert len(called_shas) == 1
         assert next(iter(called_shas)) == outcome.merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestVerifyGate (MergeWorker) — step-11 RED / step-12 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestVerifyGate:
+    """PRD scenario 5 red gate: verify failure → no advance, no callbacks."""
+
+    async def test_red_verify_blocks_advance_and_callbacks(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Post-merge verify fails → blocked, advance_main not called, callbacks silent."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Record main SHA before the attempt
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_before = main_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Patch verify to FAIL
+        mock_verify_fail = AsyncMock(return_value=MagicMock(
+            passed=False,
+            summary='Tests failed: 3 errors',
+            failure_report=MagicMock(return_value='Tests failed: 3 errors'),
+        ))
+        # Spy on advance_main to assert it's never called
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify_fail),
+            patch.object(git_ops, 'advance_main', wraps=git_ops.advance_main) as spy_advance,
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert 'Post-merge verification failed' in outcome.reason, (
+            f'expected verify-gate reason, got: {outcome.reason!r}'
+        )
+
+        # advance_main must NOT have been called
+        spy_advance.assert_not_called()
+
+        # Main must be unchanged
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_before, 'main must not advance on red verify'
+
+        # No member callbacks
+        req.mark_member_done.assert_not_called()
