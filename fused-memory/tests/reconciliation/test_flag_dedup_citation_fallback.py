@@ -63,3 +63,54 @@ class TestComputeFlagSignatureFallback:
         }
         result = compute_flag_signature(flag)
         assert result == ('99', 'orphaned')
+
+    def test_multi_task_fallback_deterministic_sorted(self):
+        """Multi-task findings produce the same signature regardless of citation order.
+
+        Reviewer finding dedup_correctness: the prior implementation used only
+        cited_tasks[0].task_id, so two findings about the same set of tasks in
+        different order would produce different signatures and fail to dedup.
+        The fix uses sorted(all task_ids), comma-joined.
+        """
+        flag_abc = {
+            'flag_type': 'stale',
+            'cited_tasks': [
+                {'task_id': 'c', 'project_id': 'p', 'title': 'C'},
+                {'task_id': 'a', 'project_id': 'p', 'title': 'A'},
+                {'task_id': 'b', 'project_id': 'p', 'title': 'B'},
+            ],
+        }
+        flag_bca = {
+            'flag_type': 'stale',
+            'cited_tasks': [
+                {'task_id': 'b', 'project_id': 'p', 'title': 'B'},
+                {'task_id': 'c', 'project_id': 'p', 'title': 'C'},
+                {'task_id': 'a', 'project_id': 'p', 'title': 'A'},
+            ],
+        }
+        sig_abc = compute_flag_signature(flag_abc)
+        sig_bca = compute_flag_signature(flag_bca)
+        assert sig_abc == sig_bca, (
+            f'Same task set in different order must produce the same signature: '
+            f'{sig_abc!r} != {sig_bca!r}'
+        )
+        # Sorted ids are a,b,c → comma-joined → "a,b,c"
+        assert sig_abc == ('a,b,c', 'stale'), f'Unexpected: {sig_abc!r}'
+
+    def test_multi_task_fallback_distinct_sets_differ(self):
+        """Two findings with different cited_tasks sets produce different signatures."""
+        flag1 = {
+            'flag_type': 'stale',
+            'cited_tasks': [
+                {'task_id': '1', 'project_id': 'p', 'title': 'T1'},
+                {'task_id': '2', 'project_id': 'p', 'title': 'T2'},
+            ],
+        }
+        flag2 = {
+            'flag_type': 'stale',
+            'cited_tasks': [
+                {'task_id': '1', 'project_id': 'p', 'title': 'T1'},
+                {'task_id': '3', 'project_id': 'p', 'title': 'T3'},
+            ],
+        }
+        assert compute_flag_signature(flag1) != compute_flag_signature(flag2)

@@ -145,19 +145,38 @@ class BaseStage:
         # PRD γ: signal the recon_report state machine that this stage is starting.
         # The CLI agent will call recon_report.add_finding / cite_* / complete via MCP;
         # the harness then reads back the assembled report after the CLI returns.
-        if self._recon_report_state is not None:
-            self._recon_report_state.start_report(
-                run_id=run_id,
-                stage=self.stage_id.value,
-                project_id=self.project_id,
-            )
+        #
+        # _active_rrs is a run-local alias for self._recon_report_state so that a
+        # start_report failure can degrade to None for this run only, without
+        # mutating the shared state object (which must survive across runs).
+        _active_rrs = self._recon_report_state
+        if _active_rrs is not None:
+            try:
+                _active_rrs.start_report(
+                    run_id=run_id,
+                    stage=self.stage_id.value,
+                    project_id=self.project_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # start_report is on the critical path — a transient error
+                # (e.g. duplicate run_id from a crashed prior run, TTL-reaper race)
+                # must not abort the whole reconciliation cycle.  Degrade: disable
+                # recon_report for this run so the stage proceeds with the
+                # empty-report fallback path (reviewer finding error_handling).
+                logger.warning(
+                    'Stage %s: start_report raised %r for run_id=%s; '
+                    'degrading to empty-report fallback (recon_report disabled '
+                    'for this run)',
+                    self.stage_id.value, exc, run_id,
+                )
+                _active_rrs = None
 
         started = datetime.now(UTC)
 
         # When recon_report_state is active, drop the output_schema requirement —
         # the assembled in-process state is the source of truth, not the LLM's JSON.
         effective_output_schema = (
-            None if self._recon_report_state is not None
+            None if _active_rrs is not None
             else self.get_report_schema()
         )
 
@@ -177,9 +196,9 @@ class BaseStage:
 
         # PRD γ: read assembled report from in-process state (overrides stage_result.report).
         # Falls back to stage_result.report when recon_report_state is not configured
-        # (back-compat path for non-recon stages).
-        if self._recon_report_state is not None:
-            assembled = self._recon_report_state.get_assembled_report(
+        # (back-compat path for non-recon stages) or when start_report degraded to None.
+        if _active_rrs is not None:
+            assembled = _active_rrs.get_assembled_report(
                 run_id, self.stage_id.value
             )
             if assembled is not None:
@@ -193,6 +212,18 @@ class BaseStage:
                     self.stage_id.value, run_id,
                 )
                 stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
+
+        # Schema consistency (reviewer finding schema_consistency): warn when a
+        # flagged item lacks both dedup keys — compute_flag_signature will return
+        # None for these findings, silently bypassing cross-run recurrence tracking.
+        for _item in stage_result.report.get('flagged_items', []):
+            if not _item.get('task_id') and not _item.get('cited_tasks'):
+                logger.warning(
+                    'Stage %s run_id=%s: finding lacks task_id and cited_tasks — '
+                    'dedup signature cannot be computed (finding: %.80s)',
+                    self.stage_id.value, run_id,
+                    _item.get('description', '<no description>'),
+                )
 
         report_data = stage_result.report
         stage_report = StageReport(

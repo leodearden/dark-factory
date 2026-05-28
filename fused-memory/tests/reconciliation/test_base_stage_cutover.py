@@ -335,3 +335,66 @@ class TestBuildMcpConfigReconReport:
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
+
+
+class TestStartReportErrorHandling:
+    """BaseStage.run must degrade gracefully when start_report raises (reviewer finding
+    error_handling).  A transient start_report failure must not abort the stage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_report_raises_degrades_to_empty_report(self):
+        """When start_report raises, the stage produces an empty StageReport (no exception)."""
+
+        class _BrokenState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                raise RuntimeError('duplicate run_id from crashed prior run')
+
+        state = _BrokenState(assembled_report={'summary': 'should not appear', 'flagged_items': [{'description': 'x', 'severity': 'minor', 'cited_tasks': [{'task_id': '1', 'project_id': 'p', 'title': 't'}]}], 'stats': {}})
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-broken')
+
+        # Degraded: empty items and stats (get_assembled_report was NOT called)
+        assert report.items_flagged == [], (
+            'Degraded stage must produce empty items_flagged, not the assembled report'
+        )
+        assert report.stats == {}
+        # get_assembled_report must NOT have been called (no successful start)
+        get_calls = [c for c in state.calls if c[0] == 'get_assembled_report']
+        assert get_calls == [], (
+            f'get_assembled_report must not be called after start_report failure, '
+            f'but got: {get_calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_report_raises_stage_still_returns_stage_report(self):
+        """Even with start_report failure, run() returns a StageReport (not an exception)."""
+
+        class _BrokenState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                raise ValueError('TTL-reaper race')
+
+        state = _BrokenState(assembled_report=None)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.models.reconciliation import StageReport
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            result = await stage.run([], watermark, [], run_id='run-valuerr')
+
+        assert isinstance(result, StageReport), 'run() must return StageReport on start_report failure'
+        assert result.started_at is not None
+        assert result.completed_at is not None

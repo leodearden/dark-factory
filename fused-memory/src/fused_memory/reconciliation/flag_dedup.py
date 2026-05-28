@@ -841,25 +841,34 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     — only ``None`` (absent key) triggers a ``None`` return.
 
     **cited_tasks fallback (PRD γ §9.3):** when the top-level ``task_id`` key
-    is absent (``None``), the function attempts to read ``cited_tasks[0]['task_id']``
-    as a best-effort fallback.  The fallback only applies when ``cited_tasks``
-    is a non-empty list whose first element has a non-``None`` ``task_id``.
-    This preserves deduplication for findings that carry citations but omit the
-    top-level convenience field.
+    is absent (``None``), the function derives a deterministic signature from the
+    *sorted set* of all ``task_id`` values in ``cited_tasks``, comma-joined.
+    This ensures multi-task findings produce the same signature regardless of
+    citation order, and prevents two findings that share only the first cited
+    task from colliding (reviewer finding dedup_correctness).  Callers that need
+    precise single-task dedup should always set the top-level ``task_id``
+    explicitly — the fallback is a best-effort heuristic for findings that omit
+    it.
 
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
     task_id = flag.get('task_id')
 
-    # Best-effort fallback: derive task_id from the first cited task when the
-    # top-level field is absent.  flag_type is still required at the top level.
+    # Best-effort fallback: derive task_id from cited_tasks when the top-level
+    # field is absent.  flag_type is still required at the top level.
+    # Uses sorted(all task_ids) — not just the first — so multi-task findings
+    # dedup deterministically regardless of citation order.
     if task_id is None:
         cited_tasks = flag.get('cited_tasks')
         if cited_tasks and isinstance(cited_tasks, list):
-            first = cited_tasks[0]
-            if isinstance(first, dict):
-                task_id = first.get('task_id')
+            task_ids = sorted(
+                str(c['task_id'])
+                for c in cited_tasks
+                if isinstance(c, dict) and c.get('task_id') is not None
+            )
+            if task_ids:
+                task_id = ','.join(task_ids)
 
     flag_type = flag.get('flag_type')
     if task_id is None or flag_type is None:

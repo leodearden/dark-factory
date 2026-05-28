@@ -108,11 +108,20 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
         },
         'task_id': {
             'type': ['string', 'null'],
-            'description': 'Task ID associated with this finding, if any',
+            'description': (
+                'Task ID associated with this finding. '
+                'Dedup contract: either set task_id + flag_type here, OR include '
+                'at least one cited_tasks entry — otherwise compute_flag_signature '
+                'returns None and this finding will not deduplicate across runs.'
+            ),
         },
         'flag_type': {
             'type': ['string', 'null'],
-            'description': 'Machine-readable flag type for deduplication',
+            'description': (
+                'Machine-readable flag type for deduplication. '
+                'Required alongside task_id (or cited_tasks fallback) for '
+                'cross-run recurrence tracking to work correctly.'
+            ),
         },
         'category': {
             'type': 'string',
@@ -356,4 +365,9 @@ def _extract_report(result: AgentResult) -> dict:
     # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
     # fallback path (empty assembled dict) triggers cleanly rather than masking
     # a missing report with a fake 'No output' summary.
+    # Behavior-change note (reviewer finding behavior_change): prior code returned
+    # {'summary': 'No output from agent'} here.  All callers use report.get('summary')
+    # (never report['summary']), so {} is safe.  Non-recon callers that depend on a
+    # non-empty summary string should pass output_schema=STAGE_REPORT_SCHEMA so the
+    # LLM-emitted JSON path fires before this fallback is reached.
     return {}

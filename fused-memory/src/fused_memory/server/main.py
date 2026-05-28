@@ -641,6 +641,22 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
         )
+        # Startup-order invariant (reviewer finding race_condition):
+        # run_loop() is started as a background task here, BEFORE the recon-report
+        # uvicorn server begins accepting connections (~200 lines below in the http
+        # branch).  The race window is covered in practice by the harness loop's own
+        # startup sequence — usage_gate check, judge.initialize(), and
+        # _start_escalation_server() all complete before the first stage subprocess
+        # is launched — but the ordering is fragile.
+        #
+        # Invariant to preserve in future refactors:
+        #   recon_server.serve() MUST be awaited (via asyncio.gather) BEFORE any
+        #   stage subprocess whose prompt includes `mcp__recon-report__*` calls can
+        #   fire.  If you move the harness task creation BELOW the gather() call, the
+        #   race disappears entirely.  If you move the uvicorn startup ABOVE the task
+        #   creation, the race also disappears.  Do NOT insert long-running init work
+        #   between `asyncio.create_task(run_loop())` and the gather() that starts
+        #   recon_server.serve() without re-evaluating this invariant.
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
 

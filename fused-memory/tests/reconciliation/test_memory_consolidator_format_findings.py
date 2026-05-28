@@ -102,3 +102,58 @@ class TestFormatFindingsWithCitations:
         output = _format_findings([finding])
         assert 'Simple finding' in output
         assert 'affected_ids' not in output
+
+    def test_task_title_included_in_output(self):
+        """cited_tasks title appears in the rendered output (reviewer incomplete_rendering)."""
+        finding = {
+            'description': 'x',
+            'severity': 'minor',
+            'category': 'other',
+            'suggested_action': 'y',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '99', 'title': 'My Task Title'},
+            ],
+        }
+        output = _format_findings([finding])
+        assert 'My Task Title' in output, (
+            f'Task title must appear in _format_findings output, got:\n{output}'
+        )
+
+    def test_fact_text_snapshot_truncated_at_120(self):
+        """fact_text_snapshot longer than 120 chars is truncated with ellipsis."""
+        long_snapshot = 'X' * 130
+        finding = {
+            'description': 'x',
+            'severity': 'minor',
+            'category': 'other',
+            'suggested_action': 'y',
+            'cited_edges': [
+                {'edge_uuid': 'edge-trunc-test', 'fact_text_snapshot': long_snapshot},
+            ],
+        }
+        output = _format_findings([finding])
+        assert 'edge-trunc-test' in output
+        # Truncated snapshot should appear (first 120 chars + '...')
+        assert 'X' * 120 + '...' in output
+        # Full 130-char snapshot must NOT appear verbatim
+        assert long_snapshot not in output
+
+    def test_citation_cap_at_five(self):
+        """Citation lists with more than 5 entries show '... +N more' suffix."""
+        finding = {
+            'description': 'x',
+            'severity': 'minor',
+            'category': 'other',
+            'suggested_action': 'y',
+            'cited_entities': [
+                {'entity_uuid': f'uuid-{n}', 'canonical_name': f'Entity{n}'}
+                for n in range(8)
+            ],
+        }
+        output = _format_findings([finding])
+        # 5 shown, 3 extra
+        assert '+3 more' in output
+        # Only first 5 entities rendered
+        assert 'Entity0' in output
+        assert 'Entity4' in output
+        assert 'Entity5' not in output

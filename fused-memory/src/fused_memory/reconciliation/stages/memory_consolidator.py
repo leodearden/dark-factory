@@ -457,7 +457,17 @@ def _format_findings(findings: list[dict]) -> str:
     category, suggested_action) followed by the four typed citation lists
     (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
     Empty citation lists are omitted from output.
+
+    Rendering limits (reviewer finding incomplete_rendering):
+    - Each citation list is capped at 5 entries (``... +N more`` appended).
+    - ``fact_text_snapshot`` is truncated at 120 characters to avoid inflating
+      payload size when feeding findings into the next reconciliation context.
+    - cited_tasks includes the task title so downstream consumers can read
+      findings without re-fetching tasks.
     """
+    _CITE_CAP = 5
+    _SNAPSHOT_CAP = 120
+
     if not findings:
         return 'No findings.'
     lines = []
@@ -472,36 +482,55 @@ def _format_findings(findings: list[dict]) -> str:
             f'   Suggested action: {action}',
         ]
 
-        cited_entities = f.get('cited_entities', [])
+        cited_entities = f.get('cited_entities') or []
         if cited_entities:
+            shown = cited_entities[:_CITE_CAP]
             entity_strs = ', '.join(
                 f"{e.get('canonical_name', '?')} ({e.get('entity_uuid', '?')})"
-                for e in cited_entities
+                for e in shown
             )
+            extra = len(cited_entities) - len(shown)
+            if extra:
+                entity_strs += f', ... +{extra} more'
             parts.append(f'   Cited entities: {entity_strs}')
 
-        cited_edges = f.get('cited_edges', [])
+        cited_edges = f.get('cited_edges') or []
         if cited_edges:
-            edge_strs = ', '.join(
-                f"{e.get('edge_uuid', '?')}: {e.get('fact_text_snapshot', '?')}"
-                for e in cited_edges
-            )
+            shown = cited_edges[:_CITE_CAP]
+            edge_parts = []
+            for e in shown:
+                snapshot = e.get('fact_text_snapshot', '?')
+                if len(snapshot) > _SNAPSHOT_CAP:
+                    snapshot = snapshot[:_SNAPSHOT_CAP] + '...'
+                edge_parts.append(f"{e.get('edge_uuid', '?')}: {snapshot}")
+            edge_strs = ', '.join(edge_parts)
+            extra = len(cited_edges) - len(shown)
+            if extra:
+                edge_strs += f', ... +{extra} more'
             parts.append(f'   Cited edges: {edge_strs}')
 
-        cited_tasks = f.get('cited_tasks', [])
+        cited_tasks = f.get('cited_tasks') or []
         if cited_tasks:
+            shown = cited_tasks[:_CITE_CAP]
             task_strs = ', '.join(
-                f"{t.get('project_id', '?')}/{t.get('task_id', '?')}"
-                for t in cited_tasks
+                f"{t.get('project_id', '?')}/{t.get('task_id', '?')} ({t.get('title', '?')})"
+                for t in shown
             )
+            extra = len(cited_tasks) - len(shown)
+            if extra:
+                task_strs += f', ... +{extra} more'
             parts.append(f'   Cited tasks: {task_strs}')
 
-        cited_memories = f.get('cited_memories', [])
+        cited_memories = f.get('cited_memories') or []
         if cited_memories:
+            shown = cited_memories[:_CITE_CAP]
             memory_strs = ', '.join(
                 f"{m.get('memory_id', '?')} ({m.get('store', '?')})"
-                for m in cited_memories
+                for m in shown
             )
+            extra = len(cited_memories) - len(shown)
+            if extra:
+                memory_strs += f', ... +{extra} more'
             parts.append(f'   Cited memories: {memory_strs}')
 
         lines.append('\n'.join(parts))
