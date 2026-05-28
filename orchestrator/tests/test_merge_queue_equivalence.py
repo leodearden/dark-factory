@@ -75,14 +75,16 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
-# Stand-in type_check_command that exits 0 on a clean tree and non-zero on
-# a tree carrying a `.BROKEN_UNION` marker file.  This exercises real
-# worktree creation + verbatim unscoped command execution without needing
-# a real pyright binary or a real Protocol break.
+# Stand-in type_check_command that exits 0 on a clean tree and exits 1 with
+# a deterministic 'synthetic type error' message written to stderr when the
+# `.BROKEN_UNION` marker file is present.  Tests can assert that specific
+# string appears in result.detail rather than relying on a non-empty
+# failure_report() header.
 _TYPE_CMD_CONDITIONAL = (
     'python3 -c "'
     "import sys, pathlib; "
-    "sys.exit(1 if pathlib.Path('.BROKEN_UNION').exists() else 0)"
+    "(sys.stderr.write('synthetic type error\\n'), sys.exit(1)) "
+    "if pathlib.Path('.BROKEN_UNION').exists() else sys.exit(0)"
     '"'
 )
 
@@ -198,8 +200,9 @@ class TestCheckPostMergePyrightBehavioral:
             )
             assert result.broken is True
             assert 'subpkg' in result.failing_subprojects
-            # detail carries command output (exit code or stderr surrogate)
-            assert result.detail != ''
+            # detail carries the deterministic sentinel written to stderr by
+            # the stand-in command; asserts capture of real subprocess output.
+            assert 'synthetic type error' in result.detail
         finally:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
@@ -372,7 +375,7 @@ def _make_merge_request(
     config: OrchestratorConfig,
     module_configs: list[ModuleConfig] | None = None,
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,

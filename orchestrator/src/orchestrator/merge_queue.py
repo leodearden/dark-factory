@@ -599,6 +599,14 @@ async def _check_post_merge_pyright(
 
     The merge has already landed via ``update-ref`` before this runs; we NEVER
     block a landed merge on a flaky hang or transient infra error.
+
+    .. note::
+        **Pre-condition**: This check has no baseline. If a subproject's
+        unscoped ``type_check_command`` is already failing on main *before*
+        the merge, every subsequent merge will be blocked for that subproject.
+        Opting into ``type_check_command`` requires the unscoped check to pass
+        on main as a standing pre-condition.  Fix the pre-existing failure
+        forward to unblock the queue.
     """
     # Quick-exit: if no module defines a type_check_command there is nothing to check.
     active = [mc for mc in module_configs if mc.type_check_command is not None]
@@ -607,22 +615,28 @@ async def _check_post_merge_pyright(
 
     merge_wt: Path | None = None
     try:
+        # NOTE: _create_merge_worktree is a private GitOps method.  This helper
+        # is its only cross-module caller; promoting it to public (drop the
+        # leading underscore) is tracked as a follow-up task.
         merge_wt, _ = await git_ops._create_merge_worktree(advanced_sha)
 
-        failing_subprojects: list[str] = []
-        detail_parts: list[str] = []
-
-        for mc in active:
+        async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
             # Run only the type-check command verbatim (unscoped).
             # Null out test/lint so run_verification skips them (None => skip).
-            type_only_mc = dataclasses.replace(
-                mc, test_command=None, lint_command=None,
-            )
-            verify = await run_verification(
+            type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
+            return mc, await run_verification(
                 merge_wt, config, type_only_mc,
                 max_retries=0, is_merge_verify=True, role='merge',
             )
 
+        # Run all subproject type-checks concurrently to minimise wall-clock
+        # impact on the merge queue's push_main delay.
+        pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
+
+        failing_subprojects: list[str] = []
+        detail_parts: list[str] = []
+
+        for mc, verify in pairs:
             if verify.timed_out:
                 logger.warning(
                     'post-merge-pyright: type-check for %r timed out on %s; '
@@ -633,14 +647,12 @@ async def _check_post_merge_pyright(
 
             if not verify.passed:
                 failing_subprojects.append(mc.prefix)
-                # Collect bounded detail from the first failure.
-                raw = verify.failure_report() or verify.type_output or ''
-                if isinstance(raw, str) and raw:
-                    remaining = _POST_MERGE_PYRIGHT_MAX_DETAIL - sum(
-                        len(d) for d in detail_parts
-                    )
-                    if remaining > 0:
-                        detail_parts.append(raw[:remaining])
+                # Collect bounded detail from the FIRST failing subproject only
+                # (matches PostMergePyrightResult.detail docstring).
+                if not detail_parts:
+                    raw = verify.failure_report() or verify.type_output or ''
+                    if isinstance(raw, str) and raw:
+                        detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
 
         detail = '\n'.join(detail_parts)
         return PostMergePyrightResult(
@@ -2679,6 +2691,12 @@ class SpeculativeMergeWorker:
                         ))
                     return True
 
+                # Cleanup merge_wt BEFORE the pyright check: the pyright helper
+                # creates its own detached worktree at advanced_sha, so keeping
+                # merge_wt alive here would briefly double the worktree count
+                # — doubling disk pressure in ENOSPC scenarios.  Mirrors the
+                # MergeWorker ordering at _do_merge line ~1455.
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
                 pyright_result = await _check_post_merge_pyright(
                     advanced_sha, self._git_ops, req.config, req.module_configs,
                     task_id=req.task_id,
@@ -2696,7 +2714,6 @@ class SpeculativeMergeWorker:
                         'post_merge_pyright_broken',
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'blocked',
@@ -2711,7 +2728,6 @@ class SpeculativeMergeWorker:
 
                 logger.info(f'Task {req.task_id}: merged to main successfully')
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
                 push_status = await self._git_ops.push_main()
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
