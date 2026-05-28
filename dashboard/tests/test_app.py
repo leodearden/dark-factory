@@ -438,3 +438,39 @@ def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     assert row_b['task']['id'] == 22
     assert row_b['task']['title'] == 'task-B'
     assert row_b['task_unresolved'] is False
+
+
+# ---------------------------------------------------------------------------
+# /api/load — host load card endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_load_endpoint_returns_known_metric_shape(client) -> None:
+    """/api/load returns all 9 known metrics with the expected per-metric shape.
+
+    The test client creates a temp project_root where load-samples.db does not
+    exist, so every metric must degrade to the all-placeholders shape (current=None,
+    sparkline=[]).  This exercises the missing-DB degradation path end-to-end.
+    """
+    from dashboard.data.load import KNOWN_METRICS
+
+    resp = client.get('/api/load')
+    assert resp.status_code == 200
+
+    body = resp.json()
+    assert isinstance(body, dict)
+    assert set(body.keys()) == set(KNOWN_METRICS)
+
+    # Every key must carry exactly these four sub-keys
+    expected_sub_keys = {'current', 'sparkline', 'window_mean', 'window_max'}
+    for metric in KNOWN_METRICS:
+        assert set(body[metric].keys()) == expected_sub_keys, (
+            f'{metric} has unexpected keys: {set(body[metric].keys())}'
+        )
+
+    # Spot-check one metric for the placeholder values (DB absent → all None/[])
+    oq = body['occt_queue_depth']
+    assert oq['current'] is None
+    assert oq['sparkline'] == []
+    assert oq['window_mean'] is None
+    assert oq['window_max'] is None
