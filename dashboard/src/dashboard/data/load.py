@@ -146,10 +146,12 @@ async def get_load_metrics(
 
         rows = await conn.execute_fetchall(_QUERY_SQL, KNOWN_METRICS)
 
-        # Group rows by metric (already ordered by metric, ts ASC from SQL)
+        # Group rows by metric (already ordered by metric, ts ASC from SQL).
+        # Rows are always aiosqlite.Row objects — DbPool.get sets
+        # conn.row_factory = aiosqlite.Row before returning the connection.
         groups: dict[str, list[Any]] = {m: [] for m in KNOWN_METRICS}
         for row in rows:
-            metric = row['metric'] if hasattr(row, '__getitem__') else row[0]
+            metric = row['metric']
             if metric in groups:
                 groups[metric].append(row)
 
@@ -158,24 +160,15 @@ async def get_load_metrics(
                 continue  # keep placeholder
             # Rows are already in ascending ts order (SQL: ORDER BY metric, ts ASC)
             latest = metric_rows[-1]
-            # Support both aiosqlite.Row (subscript by name) and plain tuples
-            if hasattr(latest, 'keys'):
-                sparkline = [float(r['value']) for r in metric_rows]
-                current = float(latest['value'])
-                window_mean = latest['window_mean']
-                window_max = latest['window_max']
-            else:
-                # (metric, value, window_mean, window_max, ts)
-                sparkline = [float(r[1]) for r in metric_rows]
-                current = float(latest[1])
-                window_mean = latest[2]
-                window_max = latest[3]
-
+            sparkline = [float(r['value']) for r in metric_rows]
+            current = float(latest['value'])
+            wm = latest['window_mean']
+            wx = latest['window_max']
             result[metric] = {
                 'current': current,
                 'sparkline': sparkline,
-                'window_mean': window_mean,
-                'window_max': window_max,
+                'window_mean': float(wm) if wm is not None else None,
+                'window_max': float(wx) if wx is not None else None,
             }
 
         return result

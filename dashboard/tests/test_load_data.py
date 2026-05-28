@@ -11,6 +11,8 @@ import pytest
 from dashboard.data.load import (
     KNOWN_METRICS,
     LOAD_SAMPLES_SCHEMA,
+    PROCESS_METRICS,
+    PSI_METRICS,
     get_load_metrics,
 )
 
@@ -187,3 +189,49 @@ def test_load_samples_db_property_points_to_canonical_path(tmp_path: Path) -> No
     config = DashboardConfig(project_root=tmp_path)
     # tmp_path is already resolved; __post_init__ resolves project_root too
     assert config.load_samples_db == config.project_root / 'data' / 'load-samples.db'
+
+
+# ---------------------------------------------------------------------------
+# Tests: schema and metric drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_load_schema_and_metrics_match_sampler() -> None:
+    """LOAD_SAMPLES_SCHEMA and KNOWN_METRICS stay aligned with the sampler package.
+
+    Skips gracefully when the sampler package is not importable (dashboard-only
+    CI environments that do not install sampler as a dependency).
+    """
+    sampler_store = pytest.importorskip('sampler.store')
+    sampler_metrics_mod = pytest.importorskip('sampler.metrics')
+
+    # --- Schema alignment ---
+    assert LOAD_SAMPLES_SCHEMA == sampler_store._SCHEMA, (
+        "LOAD_SAMPLES_SCHEMA in data/load.py has drifted from "
+        "sampler.store._SCHEMA — update the constant to stay aligned."
+    )
+
+    # --- PSI metric names ---
+    # collect_psi only needs a callable reader; no filesystem or kernel access.
+    stub_psi_text = 'some avg10=0.0\nfull avg10=0.0'
+    sampler_psi_keys = frozenset(
+        sampler_metrics_mod.collect_psi(read=lambda _name: stub_psi_text).keys()
+    )
+    assert sampler_psi_keys == PSI_METRICS, (
+        f'PSI metric mismatch — sampler emits {sorted(sampler_psi_keys)}, '
+        f'dashboard PSI_METRICS has {sorted(PSI_METRICS)}'
+    )
+
+    # --- Process metric names ---
+    # collect_process_metrics imports psutil at call time; skip if unavailable.
+    pytest.importorskip('psutil', reason='psutil required for process-metric name check')
+    process_keys = frozenset(
+        sampler_metrics_mod.collect_process_metrics(
+            proc_iter=lambda *_a, **_kw: [],
+            fd9_exists=lambda _pid: False,
+        ).keys()
+    )
+    assert process_keys == PROCESS_METRICS, (
+        f'Process metric mismatch — sampler emits {sorted(process_keys)}, '
+        f'dashboard PROCESS_METRICS has {sorted(PROCESS_METRICS)}'
+    )
