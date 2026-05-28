@@ -6463,7 +6463,9 @@ class TestMergeFailureDiagnostic:
         worker_task = asyncio.create_task(worker.run())
 
         server = create_server(esc_queue, merge_queue=merge_q, orch_config=config)
+        from fastmcp.tools.function_tool import FunctionTool
         tool = await server.get_tool('merge_request')
+        assert isinstance(tool, FunctionTool)
 
         # Ghost branch: use a real worktree (non-main HEAD) but branch ref doesn't exist
         wt_ghost = await _make_branch_with_file(git_ops, 'e2e-phantom', 'phantom.py', 'x = 1\n')
