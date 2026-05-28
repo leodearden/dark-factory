@@ -575,6 +575,7 @@ class TaskWorkflow:
             # Pass the live task title so create_worktree can quarantine a
             # reused worktree whose stored identity belongs to a different
             # (recycled-id) task — defense-in-depth behind Fix C's flag.
+            train_meta = (self.task.get('metadata') or {}).get('train')
             worktree_info = await self.git_ops.create_worktree(
                 branch_name,
                 expected_title=(
@@ -582,6 +583,7 @@ class TaskWorkflow:
                     if self.config.worktree_identity_guard_enabled
                     else None
                 ),
+                train=train_meta if isinstance(train_meta, dict) else None,
             )
             self.worktree = worktree_info.path
             base_commit = worktree_info.base_commit
