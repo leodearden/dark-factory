@@ -19,6 +19,7 @@ from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     TRAIN_INCOMPLETE_REASON_PREFIX,
+    TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
@@ -6054,3 +6055,92 @@ class TestGroupMergeRequestSpeculativeWorker:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestPartialMemberFlipFailure (MergeWorker) — step-15 RED / step-16 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestPartialMemberFlipFailure:
+    """Guards atomicity invariant when a per-member mark_member_done callback raises
+    AFTER main has advanced.  The worker must NOT produce a split-brain 'blocked'
+    outcome and must attempt all callbacks even when one fails."""
+
+    async def test_partial_flip_failure_after_advance(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """When one mark_member_done callback raises, worker continues all flips,
+        returns 'done' with TRAIN_PARTIAL_FLIP_REASON_PREFIX reason, and main HAS advanced."""
+        req = await _make_stacked_train(git_ops, config)
+
+        # Override mark_member_done: 1st OK, 2nd raises, 3rd OK
+        req.mark_member_done = AsyncMock(side_effect=[  # type: ignore[reportFunctionMemberAccess]
+            None,                                    # trn-a: success
+            RuntimeError('scheduler network blip'),  # trn-b: fails
+            None,                                    # trn-c: success
+        ])
+
+        # Count merge commits before
+        _, before_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_before = int(before_log.strip())
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        # (a) _do_merge returns normally — no exception propagated
+        assert outcome is not None
+
+        # (b) main HAS advanced: one new merge commit, all 3 member files present
+        _, after_log, _ = await _run(
+            ['git', 'rev-list', '--merges', '--count', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_commits_after = int(after_log.strip())
+        assert merge_commits_after == merge_commits_before + 1, (
+            'expected exactly 1 new merge commit on main even when a callback fails'
+        )
+
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # (c) mark_member_done called 3 times (NOT aborted after second failure)
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls (loop must not abort on failure), '
+            f'got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
+        )
+        # All with the same advanced_sha
+        called_shas = {call.args[1] for call in req.mark_member_done.call_args_list}  # type: ignore[reportFunctionMemberAccess]
+        assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
+
+        # (d) outcome.status is 'done' (not 'blocked') — main landed
+        assert outcome.status == 'done', (
+            f'expected done (main advanced), got: {outcome!r}'
+        )
+        assert outcome.merge_sha is not None
+        assert outcome.merge_sha == next(iter(called_shas))
+
+        # (e) reason starts with TRAIN_PARTIAL_FLIP_REASON_PREFIX and names
+        #     the failed count and offending member
+        assert outcome.reason is not None, 'partial-flip outcome must carry a reason'
+        assert outcome.reason.startswith(TRAIN_PARTIAL_FLIP_REASON_PREFIX), (
+            f'expected TRAIN_PARTIAL_FLIP prefix, got: {outcome.reason!r}'
+        )
+        assert '1' in outcome.reason, (
+            f'expected failed-count (1) in reason, got: {outcome.reason!r}'
+        )
+        assert 'trn-b' in outcome.reason, (
+            f'expected offending member task_id (trn-b) in reason, got: {outcome.reason!r}'
+        )
