@@ -5,10 +5,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -127,8 +126,8 @@ class TestReconStateLifecycle:
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
             new=AsyncMock(return_value=fake_result),
-        ) as mock_cli:
-            report = await stage.run([], watermark, [], run_id='run-001')
+        ):
+            await stage.run([], watermark, [], run_id='run-001')
 
         # start_report must be called before the CLI (first in log)
         assert call_log[0] == 'start_report', 'start_report must be called before CLI'

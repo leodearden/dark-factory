@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 
 

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
 from fused_memory.reconciliation.cli_stage_runner import (
     FINDING_ITEM_SCHEMA,
@@ -129,10 +128,7 @@ class TestOutputSchemaNonePassthrough:
         RED: Currently, None is replaced by STAGE_REPORT_SCHEMA before invoke.
         """
         from fused_memory.config.schema import ReconciliationConfig
-        from fused_memory.reconciliation.cli_stage_runner import (
-            StageResult,
-            run_stage_via_cli,
-        )
+        from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
 
         captured_kwargs: dict = {}
 
@@ -178,7 +174,7 @@ class TestOutputSchemaNonePassthrough:
         from shared.cli_invoke import AgentResult
 
         result = AgentResult(
-            output=None,
+            output='',
             structured_output=None,
             turns=0,
             cost_usd=0.0,
