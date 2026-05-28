@@ -776,7 +776,6 @@ class TestCapRetryWedgeGuard:
             active_account_name='acct',
         )
         ok = make_result(success=True, cost_usd=0.5)
-        ok._make_result_turns = 3  # not used by guard, just for clarity
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=ok) as mock_inv_a,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
