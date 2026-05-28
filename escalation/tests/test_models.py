@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation, TrainState
 
 
 class TestBornAtL2Severities:
@@ -213,3 +213,110 @@ class TestL2Fields:
         assert restored.members == [], f"Expected members=[], got {restored.members!r}"
         assert restored.root_cause == '', f"Expected root_cause='', got {restored.root_cause!r}"
         assert restored.options == [], f"Expected options=[], got {restored.options!r}"
+
+
+class TestEscalationTrainState:
+    """Escalation dataclass has a train_state field (PRD § 9.8 park-prefix derail context)."""
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-103-0001',
+            task_id='103',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='train member blocked',
+        )
+
+    # --- (a) default is None ---
+
+    def test_train_state_default_is_none(self):
+        """Escalation constructed without train_state has train_state=None."""
+        esc = self._make_base_esc()
+        assert esc.train_state is None
+
+    # --- (b) round-trip ---
+
+    def test_train_state_round_trip_via_to_dict_from_dict(self):
+        """train_state dict is preserved through to_dict() / from_dict()."""
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
+        esc = Escalation(
+            id='esc-task-103-0001',
+            task_id='103',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='train member blocked',
+            level=1,
+            train_state=ts,
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.train_state == ts
+
+    def test_train_state_round_trip_via_to_json_from_json(self):
+        """train_state dict is preserved through to_json() / from_json()."""
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101', '102'], 'failing_member': '103'}
+        esc = Escalation(
+            id='esc-task-103-0001',
+            task_id='103',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='train member blocked',
+            level=1,
+            train_state=ts,
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.train_state == ts
+
+    def test_train_state_appears_in_to_json_output(self):
+        """train_state is serialised (not silently dropped) when set."""
+        ts: TrainState = {'id': 'T1', 'order': 2, 'parked_members': ['101'], 'failing_member': '103'}
+        esc = Escalation(
+            id='esc-task-103-0001',
+            task_id='103',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='train member blocked',
+            train_state=ts,
+        )
+        d = json.loads(esc.to_json())
+        assert 'train_state' in d
+        assert d['train_state'] == ts
+
+    # --- (c) legacy JSON backward compat ---
+
+    def test_from_dict_legacy_json_omits_train_state(self):
+        """from_json() on JSON without train_state key returns train_state=None (backward compat)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without train_state',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            # NOTE: train_state is intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.train_state is None, (
+            f"Expected train_state=None for legacy JSON, got {restored.train_state!r}"
+        )

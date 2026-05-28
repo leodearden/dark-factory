@@ -75,7 +75,7 @@ class _StewardReescalated(Exception):
         self.escalations = escalations
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
+    from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
     from orchestrator.usage_gate import UsageGate
@@ -116,6 +116,10 @@ class _SchedulerLike(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
+    async def get_tasks(self) -> list[dict]: ...
+    async def get_statuses(
+        self, ids: list[str] | None = ...,
+    ) -> tuple[dict[str, str], Exception | None]: ...
 
 
 class _McpLike(Protocol):
@@ -2236,6 +2240,19 @@ class TaskWorkflow:
 
         metadata = self.task.get('metadata') or {}
 
+        # PRD § 9.8 — train members bypass this counter entirely.
+        # The loop-guard (γ₂/task 1523) owns train verify-phase thrash;
+        # the train-merge worker owns the merge phase.  The counter adds
+        # no value for train members and risks false-trips on legitimate
+        # merge-deferred → merge-deferred re-stamps from sibling activity.
+        if isinstance(metadata.get('train'), dict):
+            logger.debug(
+                'Task %s: train member — bypassing infra-resume thrash counter '
+                '(loop-guard owns train thrash)',
+                self.task_id,
+            )
+            return None
+
         # Determine the category of the most recent resolved L0 (the one
         # the steward just handled).  If no escalation queue is wired up
         # (e.g. eval mode), we cannot classify — fall through.
@@ -2343,6 +2360,18 @@ class TaskWorkflow:
         through to the resubmit.
         """
         metadata = self.task.get('metadata') or {}
+
+        # PRD § 9.8 — train members bypass this counter entirely.
+        # The train-merge worker owns the merge phase for train members;
+        # the counter adds no value and risks false-trips on legitimate
+        # merge-deferred → merge-deferred re-stamps.
+        if isinstance(metadata.get('train'), dict):
+            logger.debug(
+                'Task %s: train member — bypassing merge-outcome thrash counter '
+                '(train-merge worker owns merge phase)',
+                self.task_id,
+            )
+            return None
 
         try:
             counter = int(metadata.get('consecutive_merge_thrash') or 0)
@@ -5022,6 +5051,65 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         tip = (self._merge_sha or '')[:12] or f'{branch}@HEAD'
         return f'\n\n[durable refs] branch={branch} base={base} tip={tip}'
 
+    async def _build_train_state(self) -> TrainState | None:
+        """Build per-train context for L1 escalation payloads (PRD § 9.8).
+
+        Returns None when this task carries no valid metadata.train (non-train
+        task or malformed metadata).  When valid, returns::
+
+            {'id': str, 'order': int,
+             'parked_members': list[str],  # siblings at merge-deferred, excl. self
+             'failing_member': str}        # this task's id
+
+        Fast path: if metadata.train.members is a list, call get_statuses on
+        those ids and filter.  Fallback: scan get_tasks() for tasks whose
+        metadata.train.id matches; status is read directly from the task dicts
+        (avoiding a redundant get_statuses round-trip — get_tasks already embeds
+        per-task status in each dict).
+
+        Reuses the TrainMembership cast/isinstance convention from task 1522
+        (git_ops.py:54-62); cast and TrainMembership are already imported.
+        """
+        metadata = self.task.get('metadata') or {}
+        train_meta = metadata.get('train')
+        if not isinstance(train_meta, dict):
+            return None
+        train = cast(TrainMembership, train_meta)
+
+        train_id = train.get('id')
+        train_order = train.get('order')
+        if train_id is None or train_order is None:
+            return None
+
+        # Discover candidate sibling task ids and their statuses.
+        members_cache = train.get('members')
+        if isinstance(members_cache, list):
+            # Fast path — use the cached members list; fetch statuses from the server.
+            candidates: list[str] = [str(m) for m in members_cache]
+            statuses, _ = await self.scheduler.get_statuses(candidates)
+        else:
+            # Fallback scan — discover siblings via get_tasks().
+            # Status is already embedded in each task dict; avoid a second round-trip.
+            tasks = await self.scheduler.get_tasks()
+            statuses: dict[str, str] = {str(t['id']): str(t.get('status', 'unknown')) for t in tasks}
+            candidates = [
+                str(t['id'])
+                for t in tasks
+                if isinstance((t.get('metadata') or {}).get('train'), dict)
+                and cast(TrainMembership, (t.get('metadata') or {}).get('train')).get('id') == train_id
+            ]
+
+        parked_members = [
+            c for c in candidates
+            if c != self.task_id and statuses.get(c) == 'merge-deferred'
+        ]
+        return cast('TrainState', {
+            'id': train_id,
+            'order': train_order,
+            'parked_members': parked_members,
+            'failing_member': self.task_id,
+        })
+
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
     ) -> None:
@@ -5042,6 +5130,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
         from escalation.models import Escalation
 
+        # PRD § 9.8 — inject per-train context for park-prefix derail escalations.
+        # Non-train tasks get train_state=None (the Escalation field default).
+        # This is the single L1 chokepoint (3 callers inside _mark_blocked at
+        # ~4861/~4980/~5007), so it covers every park-prefix derail path.
+        train_state = await self._build_train_state()
+
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
@@ -5054,6 +5148,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=None,
             workflow_state=self.state.value,
             level=1,
+            train_state=train_state,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:

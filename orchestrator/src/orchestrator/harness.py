@@ -64,6 +64,15 @@ logger = logging.getLogger(__name__)
 # branch-resolution races should clear well before this threshold fires.
 MAX_RECONCILE_FAILURES: int = 5
 
+# Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
+# Intentionally EXCLUDES:
+#   'done' / 'cancelled'   — terminal-by-decision; nothing to recover
+#   'deferred'             — human-deferred; leave for manual resolution
+#   'merge-deferred'       — train-parked (PRD § 9.8); worktree must survive
+# The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
+# the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
+_RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -1490,14 +1499,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
         # blocked tasks (manual `git merge` while task was blocked) get
-        # marked done by the next sweep cycle.  'cancelled' and 'deferred'
-        # are intentionally excluded — terminal-by-decision and
-        # human-deferred respectively.
-        sweep_statuses = {'in-progress', 'blocked'}
+        # marked done by the next sweep cycle.  See _RECONCILE_SWEEP_STATUSES
+        # for the full list of intentionally excluded statuses.
         now = time.monotonic()
 
         for tid, status in statuses.items():
-            if status not in sweep_statuses:
+            if status not in _RECONCILE_SWEEP_STATUSES:
                 continue
             if mid_run and (
                 tid in self.scheduler._dispatched
@@ -1566,7 +1573,25 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Raises ``SetTaskStatusRejected`` if the persistence layer refuses the
         recovery write — caller handles failure counting + escalation.
+
+        Early-return guards (return None without touching the worktree):
+          - open L1 escalation veto (~line 1598): human handoff in progress
+          - merge-deferred guard (below): task is train-parked (PRD § 9.8);
+            the worktree must survive intact for the train-merge worker.
+            Mirrors the open-L1 veto pattern — explicit early-return as
+            belt-and-suspenders on top of the _RECONCILE_SWEEP_STATUSES filter.
         """
+        # PRD § 9.8 — train-parked tasks must never be reverted or have their
+        # worktree cleaned up; the train-merge worker owns their lifecycle.
+        # This guard fires BEFORE any branch compute / get_task / cleanup call.
+        if status == 'merge-deferred':
+            logger.info(
+                'Reconcile: task %s is merge-deferred (train-parked); '
+                'leaving worktree intact',
+                tid,
+            )
+            return None
+
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
 
         # Fetch task metadata once for both fast-paths (is_ancestor + find_merge_marker).
