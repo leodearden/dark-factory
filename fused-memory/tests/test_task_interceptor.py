@@ -152,6 +152,86 @@ async def test_set_task_status_cancelled_triggers(interceptor, reconciler):
     assert result['reconciliation']['status'] == 'async'
 
 
+# ------------------------------------------------------------------
+# merge-deferred invariant regression guards (task 1519,
+# PRD orchestrator-atomic-train-merge §9.2)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_merge_deferred_does_not_trigger_reconciliation(
+    interceptor, taskmaster, reconciler, event_buffer
+):
+    """Transitioning to merge-deferred must NOT fire targeted reconciliation.
+
+    merge-deferred is a non-terminal holding state; targeted reconciliation
+    only fires for STATUS_TRIGGERS = {done, blocked, cancelled, deferred}.
+    merge-deferred is deliberately excluded from that set so the reconciler
+    is not invoked spuriously on every atomic-train hold.
+    Regression guard: will FAIL if merge-deferred is ever added to STATUS_TRIGGERS.
+    """
+    result = await interceptor.set_task_status('1', 'merge-deferred', '/project')
+    # Let the event loop tick so any accidentally-scheduled background tasks run.
+    await asyncio.sleep(0)
+    assert 'reconciliation' not in result, (
+        f"Expected no reconciliation key for merge-deferred, got result={result}"
+    )
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_merge_deferred_is_non_terminal(interceptor, taskmaster):
+    """Transitions OUT of merge-deferred must succeed without reopen_reason.
+
+    merge-deferred is NOT in TERMINAL_STATUSES = {done, cancelled}; the
+    terminal-exit gate must not fire on transitions: merge-deferred → in-progress
+    and merge-deferred → blocked.
+    Regression guard: will FAIL if merge-deferred is ever added to TERMINAL_STATUSES.
+    """
+    # Simulate a task that is currently in merge-deferred holding state.
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'merge-deferred', 'title': 'Test Task'}
+    )
+
+    # merge-deferred → in-progress (sibling-driven re-dispatch), no reopen_reason.
+    result_in_progress = await interceptor.set_task_status('1', 'in-progress', '/project')
+    assert 'error' not in result_in_progress, (
+        f"Expected success for merge-deferred→in-progress, got: {result_in_progress}"
+    )
+    # The underlying taskmaster.set_task_status should have been invoked (gate did NOT fire).
+    taskmaster.set_task_status.assert_called()
+
+    taskmaster.set_task_status.reset_mock()
+
+    # merge-deferred → blocked (derail), no reopen_reason.
+    result_blocked = await interceptor.set_task_status('1', 'blocked', '/project')
+    assert 'error' not in result_blocked, (
+        f"Expected success for merge-deferred→blocked, got: {result_blocked}"
+    )
+    taskmaster.set_task_status.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_returns_merge_deferred_verbatim(interceptor, taskmaster):
+    """get_statuses must return 'merge-deferred' verbatim in the status mapping.
+
+    The holding state is a first-class status; callers (orchestrator, dashboard)
+    must receive the exact string so they can distinguish it from other statuses.
+    """
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {'id': '42', 'status': 'merge-deferred', 'title': 'Atomic-train member'}
+            ]
+        }
+    )
+    mapping = await interceptor.get_statuses('/project')
+    assert '42' in mapping, f"Expected task '42' in mapping, got keys: {list(mapping.keys())}"
+    assert mapping['42'] == 'merge-deferred', (
+        f"Expected mapping['42'] == 'merge-deferred', got: {mapping['42']!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
     """Pure reads don't emit events."""
