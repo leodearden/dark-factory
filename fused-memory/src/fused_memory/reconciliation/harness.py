@@ -150,11 +150,16 @@ class ReconciliationHarness:
         config: FusedMemoryConfig,
         backlog_policy: BacklogPolicy | None = None,
         known_projects: dict[str, str] | None = None,
+        recon_report_state=None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
+        # PRD γ recon_report threading: capture port and state before config is
+        # narrowed to config.reconciliation so stages can reach the full config values.
+        self._recon_report_state = recon_report_state
+        self._recon_report_port: int = config.server.recon_report_port
         _raw_root = config.taskmaster.project_root if config.taskmaster else ''
         if _raw_root:
             _raw_root = os.path.expanduser(_raw_root)
@@ -183,20 +188,27 @@ class ReconciliationHarness:
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
 
-        # Build stages
+        # Build stages — thread recon_report_port and recon_report_state so BaseStage.run
+        # can call start_report / get_assembled_report directly (PRD γ, task 1546).
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         stage3 = IntegrityCheck(
             StageId.integrity_check, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         self.stages = [stage1, stage2, stage3]
@@ -352,14 +364,20 @@ class ReconciliationHarness:
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stage3 = IntegrityCheck(
             StageId.integrity_check, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stages = [stage1, stage2, stage3]
         self._propagate_escalation_queue(stages)
