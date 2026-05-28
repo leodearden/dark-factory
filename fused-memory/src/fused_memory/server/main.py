@@ -752,7 +752,12 @@ async def run_server():
             # callback can reference both servers — stopping only the primary would
             # leave asyncio.gather(server.serve(), recon_server.serve()) unresolved
             # and hang run_server() until SIGKILL.
-            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(config)
+            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(
+                config,
+                memory_service=memory_service,
+                task_interceptor=task_interceptor,
+                known_projects=_known_projects_map,
+            )
             recon_server = uvicorn.Server(recon_uv_config)
             recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
@@ -1198,11 +1203,17 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
 def _build_recon_report_components(
     config: FusedMemoryConfig,
+    memory_service: Any = None,
+    task_interceptor: Any = None,
+    known_projects: dict[str, str] | None = None,
 ) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
     """Construct the recon_report state, FastMCP server, and uvicorn.Config.
 
     Extracted from run_server() so it can be unit-tested without starting
     any sockets.  Only run_server() starts the reaper and calls uvicorn.Server.serve().
+
+    Optional service args (task β): when provided they are injected into the
+    returned ReconReportState so cite_* tools can validate citations at call time.
 
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
@@ -1212,7 +1223,13 @@ def _build_recon_report_components(
     from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
-    state = ReconReportState(ttl_seconds=ttl)
+    state = ReconReportState(
+        ttl_seconds=ttl,
+        memory_service=memory_service,
+        task_interceptor=task_interceptor,
+    )
+    if known_projects is not None:
+        state.known_projects = known_projects
 
     mcp = create_recon_report_server(state)
     _install_safe_tool_wrapper(mcp)

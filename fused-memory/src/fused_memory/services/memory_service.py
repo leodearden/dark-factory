@@ -1073,6 +1073,49 @@ class MemoryService:
         return {'nodes': node_data, 'edges': edge_data}
 
     # ------------------------------------------------------------------
+    # Read: get_edge (thin wrapper for cite_edge — task β)
+    # ------------------------------------------------------------------
+
+    async def get_edge(self, edge_uuid: str, project_id: str) -> dict:
+        """Fetch a single edge by UUID from Graphiti.
+
+        Returns {uuid, name, fact} on success.  Raises EdgeNotFoundError on miss.
+        group_id is mapped from project_id to match the Graphiti storage convention.
+        """
+        name, fact = await self.graphiti.get_edge_text(edge_uuid, group_id=project_id)
+        return {'uuid': edge_uuid, 'name': name, 'fact': fact}
+
+    # ------------------------------------------------------------------
+    # Read: get_memory (thin dispatcher for cite_memory — task β)
+    # ------------------------------------------------------------------
+
+    async def get_memory(self, memory_id: str, store: str, project_id: str) -> dict:
+        """Fetch a memory by id from either Graphiti or Mem0.
+
+        Returns a minimal metadata fingerprint dict:
+          {category, agent_id, created_at} for mem0;
+          {name, fact_snippet} for graphiti.
+        Raises EdgeNotFoundError (graphiti) or ValueError (mem0 not found).
+        """
+        if store == 'graphiti':
+            name, fact = await self.graphiti.get_edge_text(memory_id, group_id=project_id)
+            return {'name': name, 'fact_snippet': fact[:120]}
+
+        # mem0 path
+        from fused_memory.models.scope import Scope
+
+        scope = Scope(project_id=project_id)
+        rec = await self.mem0.get(memory_id, scope)
+        if rec is None:
+            raise ValueError(f'mem0 memory not found: {memory_id}')
+        metadata = rec.get('metadata') or {}
+        return {
+            'category': rec.get('category'),
+            'agent_id': metadata.get('agent_id'),
+            'created_at': rec.get('created_at'),
+        }
+
+    # ------------------------------------------------------------------
     # Read: get_episodes
     # ------------------------------------------------------------------
 

@@ -16,7 +16,7 @@ import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -618,13 +618,20 @@ RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
-Tools: start_report, add_finding, set_stat, inc_stat, complete.
+Tools: start_report, add_finding, set_stat, inc_stat, complete,
+       cite_entity, cite_edge, cite_task, cite_memory.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
 2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type).
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
+
+Citation tools (call after add_finding, before or after complete):
+5. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
+6. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
+7. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
+8. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
 """
 
 
@@ -705,5 +712,66 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         summary appends a warning but does NOT overwrite the original.
         """
         return state.complete(run_id=run_id, summary=summary)
+
+    @mcp.tool()
+    async def cite_entity(run_id: str, finding_id: str, name: str) -> dict:
+        """Resolve a Graphiti entity by name and attach it to a finding.
+
+        PRD §9.2 (task β) — cite_entity(run_id, finding_id, name).
+        Returns {entity_uuid, canonical_name} or a structured error dict.
+        entity_not_found when the name resolves to no nodes.
+        """
+        return await state.cite_entity(run_id=run_id, finding_id=finding_id, name=name)
+
+    @mcp.tool()
+    async def cite_edge(run_id: str, finding_id: str, edge_uuid: str) -> dict:
+        """Validate an edge UUID shape and attach the edge fact to a finding.
+
+        PRD §9.2 (task β) — cite_edge(run_id, finding_id, edge_uuid).
+        Returns {edge_uuid, fact_text_snapshot} or a structured error dict.
+        invalid_uuid_shape when edge_uuid doesn't match the canonical UUID regex.
+        edge_not_found when the UUID is valid but not in the graph.
+        """
+        return await state.cite_edge(
+            run_id=run_id, finding_id=finding_id, edge_uuid=edge_uuid
+        )
+
+    @mcp.tool()
+    async def cite_task(
+        run_id: str, finding_id: str, project_id: str, task_id: str
+    ) -> dict:
+        """Look up a task and attach it to a finding.
+
+        PRD §9.2 (task β) — cite_task(run_id, finding_id, project_id, task_id).
+        Both project_id and task_id are required; omitting either raises a
+        validation error (PRD D4 / P4 boundary guard).
+        Returns {project_id, task_id, title} or a structured error dict.
+        unknown_project when project_id is not in the known_projects registry.
+        task_not_found when the task does not exist in the project.
+        """
+        return await state.cite_task(
+            run_id=run_id,
+            finding_id=finding_id,
+            project_id=project_id,
+            task_id=task_id,
+        )
+
+    @mcp.tool()
+    async def cite_memory(
+        run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: Literal['graphiti', 'mem0'],
+    ) -> dict:
+        """Validate a memory UUID shape and attach the memory fingerprint to a finding.
+
+        PRD §9.2 (task β) — cite_memory(run_id, finding_id, memory_id, store).
+        Returns {memory_id, metadata_fingerprint} or a structured error dict.
+        invalid_uuid_shape when memory_id doesn't match the canonical UUID regex.
+        memory_not_found when the UUID is valid but the memory doesn't exist.
+        """
+        return await state.cite_memory(
+            run_id=run_id, finding_id=finding_id, memory_id=memory_id, store=store
+        )
 
     return mcp
