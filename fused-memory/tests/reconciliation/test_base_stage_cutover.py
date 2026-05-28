@@ -398,3 +398,41 @@ class TestStartReportErrorHandling:
         assert isinstance(result, StageReport), 'run() must return StageReport on start_report failure'
         assert result.started_at is not None
         assert result.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_start_report_raises_short_circuits_without_invoking_cli(self):
+        """Degraded path must short-circuit — run_stage_via_cli is NOT called.
+
+        The recon_report-mode prompts instruct the agent NOT to produce a
+        structured JSON response.  Falling back to a JSON-schema CLI invocation
+        in the degraded path would either time out or fail schema validation,
+        burning a full agent budget on every recon_report outage.  Verify the
+        short-circuit by asserting the CLI runner was never called and the
+        returned StageReport reports zero llm_calls / tokens_used.
+        """
+
+        class _BrokenState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                raise RuntimeError('start_report exploded')
+
+        state = _BrokenState(assembled_report=None)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        cli_mock = AsyncMock(return_value=StageResult(report={}, success=True))
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=cli_mock,
+        ):
+            result = await stage.run([], watermark, [], run_id='run-shortcircuit')
+
+        assert cli_mock.await_count == 0, (
+            'run_stage_via_cli must NOT be invoked when start_report fails — '
+            f'short-circuit broken, was awaited {cli_mock.await_count} time(s)'
+        )
+        assert result.items_flagged == []
+        assert result.stats == {}
+        assert result.llm_calls == 0
+        assert result.tokens_used == 0

@@ -150,6 +150,7 @@ class BaseStage:
         # start_report failure can degrade to None for this run only, without
         # mutating the shared state object (which must survive across runs).
         _active_rrs = self._recon_report_state
+        start_report_failed = False
         if _active_rrs is not None:
             try:
                 _active_rrs.start_report(
@@ -160,18 +161,33 @@ class BaseStage:
             except Exception as exc:  # noqa: BLE001
                 # start_report is on the critical path — a transient error
                 # (e.g. duplicate run_id from a crashed prior run, TTL-reaper race)
-                # must not abort the whole reconciliation cycle.  Degrade: disable
-                # recon_report for this run so the stage proceeds with the
-                # empty-report fallback path (reviewer finding error_handling).
+                # must not abort the whole reconciliation cycle.  Short-circuit:
+                # the stage prompt has been switched to recon_report mode and
+                # tells the agent NOT to produce a structured JSON response, so
+                # invoking the CLI now would either time out or fail schema
+                # validation, costing a full agent budget per stage on every
+                # recon_report outage.  Return an empty StageReport instead.
                 logger.warning(
                     'Stage %s: start_report raised %r for run_id=%s; '
-                    'degrading to empty-report fallback (recon_report disabled '
-                    'for this run)',
+                    'short-circuiting to empty StageReport (no LLM invocation)',
                     self.stage_id.value, exc, run_id,
                 )
                 _active_rrs = None
+                start_report_failed = True
 
         started = datetime.now(UTC)
+
+        if start_report_failed:
+            completed = datetime.now(UTC)
+            return StageReport(
+                stage=self.stage_id,
+                started_at=started,
+                completed_at=completed,
+                items_flagged=[],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
 
         # When recon_report_state is active, drop the output_schema requirement —
         # the assembled in-process state is the source of truth, not the LLM's JSON.
