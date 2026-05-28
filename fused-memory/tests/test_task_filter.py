@@ -2381,3 +2381,107 @@ class TestFilterTaskTreeMaxTaskId:
         assert result.max_task_id == 0, (
             f'List input: expected max_task_id==0, got {result.max_task_id}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: format_filtered_task_tree header includes 'highest task id' (RED)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatHeaderHighestTaskId:
+    """RED tests for 'highest task id' token in format_filtered_task_tree header (step-3).
+
+    The header must render an authoritative 'highest task id: N' token derived
+    from tree.max_task_id, even when max_task_id does NOT appear in any rendered
+    active task line (e.g. because it belongs to a capped or done task).
+    """
+
+    def test_header_includes_highest_task_id_token(self):
+        """format_filtered_task_tree header includes 'highest task id: N' from tree.max_task_id.
+
+        Build a tree where max_task_id=4044 but only small-id active tasks are
+        present (id=1..3), so 4044 never appears as a rendered task line.
+        Assert the header contains 'highest task id: 4044'.
+        """
+        active = [_make_task(i, 'pending') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=100,
+            cancelled_count=10,
+            other_count=0,
+            total_count=113,
+            max_task_id=4044,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 4044' in output, (
+            f'Header must contain "highest task id: 4044" (from tree.max_task_id=4044). '
+            f'Got:\n{output!r}'
+        )
+
+    def test_header_highest_task_id_equals_max_task_id_not_max_rendered(self):
+        """Rendered highest task id equals tree.max_task_id, not the max id among rendered lines.
+
+        Set max_task_id=4044 but the ONLY rendered active task has id=10.
+        The header must show 'highest task id: 4044', not 'highest task id: 10'.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(10, 'pending')],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+            max_task_id=4044,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 4044' in output, (
+            f'Expected "highest task id: 4044" (from max_task_id), not the rendered max id. '
+            f'Got:\n{output!r}'
+        )
+        assert 'highest task id: 10' not in output, (
+            f'Header must not show the rendered max id (10) as highest task id. '
+            f'Got:\n{output!r}'
+        )
+
+    def test_header_highest_task_id_zero_when_max_task_id_zero(self):
+        """When tree.max_task_id=0 (empty input), header shows 'highest task id: 0'."""
+        tree = FilteredTaskTree(
+            active_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=0,
+            max_task_id=0,
+        )
+        output = format_filtered_task_tree(tree)
+
+        assert 'highest task id: 0' in output, (
+            f'Expected "highest task id: 0" for empty tree. Got:\n{output!r}'
+        )
+
+    def test_existing_header_count_fields_still_present(self):
+        """Existing count fields (active shown, done, cancelled, total) are preserved alongside highest task id."""
+        active = [_make_task(i, 'pending') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=7,
+            cancelled_count=2,
+            other_count=1,
+            total_count=13,
+            max_task_id=500,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Existing fields must still be present
+        assert '3 active shown' in output, (
+            f'Expected "3 active shown" in header. Got:\n{output!r}'
+        )
+        assert '7 done' in output, f'Expected "7 done" in header. Got:\n{output!r}'
+        assert '2 cancelled' in output, f'Expected "2 cancelled" in header. Got:\n{output!r}'
+        assert '13 total' in output, f'Expected "13 total" in header. Got:\n{output!r}'
+
+        # New field must also be present
+        assert 'highest task id: 500' in output, (
+            f'Expected "highest task id: 500" in header. Got:\n{output!r}'
+        )
