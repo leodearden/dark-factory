@@ -2,8 +2,21 @@
 const { Sparkline, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, HistBar, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed } = window.DF_SHELL;
 const D = window.DF_DATA;
+const { useState, useEffect } = React;
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
+
+function HostLoadCard() {
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <span className="title">Host load</span>
+      </div>
+      <div className="panel-body">
+      </div>
+    </div>
+  );
+}
 
 function OverviewTab({ paused }) {
   const schedModules = (D.SCHEDULER && D.SCHEDULER.modules) || [];
@@ -221,6 +234,11 @@ function OverviewTab({ paused }) {
             <LiveFeed paused={paused} />
           </div>
         </div>
+      </div>
+
+      {/* Row 4: Host load card */}
+      <div className="col-span-12">
+        <HostLoadCard />
       </div>
     </div>
   );
