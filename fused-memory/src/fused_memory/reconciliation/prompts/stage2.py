@@ -40,6 +40,25 @@ Interpreting the status:
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
+## Splitting Tasks (do NOT create subtasks)
+`mcp__fused-memory__add_subtask` is **not available** in this stage. The orchestrator \
+scheduler is top-level-only: it iterates `tasks` without descending into `t['subtasks']`, \
+so any subtask you create would be permanently invisible to dispatch and silently orphaned.
+
+When a task needs to be decomposed into parallel or sequential work items, use the \
+**flatten recipe** instead (canonical recipe in procedural memory `fca61c20`):
+
+1. For each child task, call `submit_task(project_root=..., title=..., description=..., \
+   planning_mode=True, metadata={{'decomposed_from': {{'parent_id': <parent_id>, \
+   'parent_title': <parent_title>}}, 'human_decomposed': True}})` → saves a draft, \
+   returns `{{'task_id': ..., 'status': 'draft'}}`.
+2. Optionally wire ordering: `add_dependency(id=<child_id>, depends_on=<other_child_id>, \
+   project_root=...)`.
+3. Atomically promote all drafts to pending: \
+   `commit_planning(project_root=..., task_ids='id1,id2,...', target_status='pending')`.
+
+Each resulting task is a top-level task and will be picked up by the dispatcher normally.
+
 ## Your Reconciliation Tasks
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
 memories, search for related context, then write appropriate memories capturing what was accomplished.
