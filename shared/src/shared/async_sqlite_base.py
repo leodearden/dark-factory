@@ -3,6 +3,7 @@
 Provides:
 - apply_wal_pragmas(conn, busy_timeout_ms): standalone utility to configure WAL + busy_timeout
 - apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
+- connect_daemon(database, **kwargs): open a connection with worker thread marked daemon
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -16,7 +17,7 @@ from typing import NamedTuple, Self
 
 import aiosqlite
 
-__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'CheckpointResult', 'AsyncSqliteBase']
+__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult', 'AsyncSqliteBase']
 
 
 class CheckpointResult(NamedTuple):
@@ -85,6 +86,41 @@ async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_time
     await conn.execute('PRAGMA journal_size_limit=67108864')
 
 
+async def connect_daemon(database: str | Path, **kwargs) -> aiosqlite.Connection:
+    """Open an aiosqlite connection with its background worker thread marked daemon.
+
+    The worker thread is marked daemon *before* the thread starts (i.e. before
+    ``await``), so a connection that is never closed (e.g. graceful-shutdown
+    cleanup aborted by a second SIGTERM, MCP stdio clean-EOF, SIGABRT) cannot
+    block interpreter exit in ``threading._shutdown()``.  WAL mode makes this
+    safe: committed data is durable; only in-flight uncommitted transactions
+    are lost, which is already the contract of forced shutdown.
+
+    This is the single source of truth for the daemon-marking mechanism shared by
+    ``AsyncSqliteBase.open()`` and all hand-rolled connect sites across the
+    fused-memory stores that do not subclass ``AsyncSqliteBase``.
+
+    Args:
+        database: Path to the database file (a :class:`str`, :class:`~pathlib.Path`,
+            or the special ``':memory:'`` string) passed straight through to
+            ``aiosqlite.connect()``.  Both ``str`` and ``Path`` are accepted because
+            ``sqlite3.connect`` — which aiosqlite delegates to — accepts any
+            :class:`os.PathLike`, and callers may hold either type.
+        **kwargs: Any extra keyword arguments (e.g. ``timeout=30``,
+            ``isolation_level=None``) forwarded verbatim to ``aiosqlite.connect()``.
+
+    Returns:
+        An open, daemon-thread-backed :class:`aiosqlite.Connection`.
+    """
+    conn_awaitable = aiosqlite.connect(database, **kwargs)
+    # Mark the worker thread as daemon before the thread starts.
+    # AttributeError: aiosqlite renamed ._thread (graceful degradation).
+    # RuntimeError: thread already started (shouldn't happen, but safe).
+    with contextlib.suppress(AttributeError, RuntimeError):
+        conn_awaitable._thread.daemon = True
+    return await conn_awaitable
+
+
 class AsyncSqliteBase(abc.ABC):
     """Abstract base class for async SQLite stores with WAL-mode persistent connections.
 
@@ -132,16 +168,7 @@ class AsyncSqliteBase(abc.ABC):
             if self._conn is not None:
                 raise RuntimeError(f'{type(self).__name__} already opened')
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn_awaitable = aiosqlite.connect(str(self.db_path))
-            # Mark the worker thread as daemon before it starts, so a
-            # leaked connection (e.g. graceful-shutdown cleanup aborted
-            # by a second SIGTERM) can never block interpreter exit in
-            # threading._shutdown(). WAL mode makes this safe: committed
-            # data is durable; only in-flight uncommitted transactions
-            # are lost, which is already the contract of forced shutdown.
-            with contextlib.suppress(AttributeError, RuntimeError):
-                conn_awaitable._thread.daemon = True
-            conn = await conn_awaitable
+            conn = await connect_daemon(str(self.db_path))
             try:
                 await apply_full_durability_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
                 await conn.executescript(self._schema)

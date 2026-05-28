@@ -18,8 +18,13 @@ from pathlib import Path
 
 import pytest
 from shared.async_sqlite_base import CheckpointResult
+from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
-from fused_memory.server.tools import _checkpoint_overrides_db, _open_overrides_db
+from fused_memory.server.tools import (
+    _checkpoint_overrides_db,
+    _connect_overrides_db,
+    _open_overrides_db,
+)
 
 # ---------------------------------------------------------------------------
 # TestOpenOverridesDbPragmas
@@ -184,3 +189,43 @@ class TestCheckpointOverridesDb:
         assert isinstance(result2, CheckpointResult)
         assert result1.busy == 0
         assert result2.busy == 0
+
+
+# ---------------------------------------------------------------------------
+# TestOverridesDbConnectIsDaemon
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOverridesDbConnectIsDaemon:
+    """_open_overrides_db and _connect_overrides_db return daemon-backed connections.
+
+    Mirrors TestWorkerThreadIsDaemon (shared/tests/test_async_sqlite_base.py).
+    Both helpers must route through connect_daemon so the aiosqlite worker thread
+    is daemon-marked and cannot block interpreter exit if the connection is never
+    closed.
+    """
+
+    @pytest.mark.parametrize('autocommit', [False, True], ids=['autocommit=False', 'autocommit=True'])
+    async def test_open_overrides_db_is_daemon(self, tmp_path: Path, autocommit: bool) -> None:
+        """_open_overrides_db returns a connection whose worker thread is daemon."""
+        project_root = str(tmp_path / 'proj')
+        db = await _open_overrides_db(project_root, autocommit=autocommit)
+        try:
+            assert_connection_thread_is_daemon(db, label=f'_open_overrides_db(autocommit={autocommit})')
+        finally:
+            await db.close()
+
+    @pytest.mark.parametrize('autocommit', [False, True], ids=['autocommit=False', 'autocommit=True'])
+    async def test_connect_overrides_db_is_daemon(self, tmp_path: Path, autocommit: bool) -> None:
+        """_connect_overrides_db returns a connection whose worker thread is daemon."""
+        project_root = str(tmp_path / 'proj')
+        # Ensure schema exists first (connect variant skips DDL)
+        init_db = await _open_overrides_db(project_root)
+        await init_db.close()
+
+        db = await _connect_overrides_db(project_root, autocommit=autocommit)
+        try:
+            assert_connection_thread_is_daemon(db, label=f'_connect_overrides_db(autocommit={autocommit})')
+        finally:
+            await db.close()

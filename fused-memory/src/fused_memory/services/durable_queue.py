@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ class DurableWriteQueue:
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'write_queue.db'
-        self._db = await aiosqlite.connect(str(db_path))
+        self._db = await connect_daemon(str(db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.execute(_CREATE_TABLE)

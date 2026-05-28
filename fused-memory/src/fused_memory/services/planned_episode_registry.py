@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 if TYPE_CHECKING:
     pass
@@ -67,7 +67,7 @@ class PlannedEpisodeRegistry:
             return
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'planned_episodes.db'
-        self._db = await aiosqlite.connect(str(db_path))
+        self._db = await connect_daemon(str(db_path))
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         await self._db.execute(_CREATE_TABLE)
         await self._db.execute(_CREATE_INDEX)

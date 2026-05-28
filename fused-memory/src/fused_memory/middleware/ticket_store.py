@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 # Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
 _CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -90,7 +90,7 @@ class TicketStore:
     async def initialize(self) -> None:
         """Open the SQLite connection and create the schema (idempotent)."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self._db_path))
+        self._db = await connect_daemon(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
         # Tables first, then in-place migrate, then indexes — the

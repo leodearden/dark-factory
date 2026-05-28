@@ -14,6 +14,7 @@ from shared.async_sqlite_base import (
     AsyncSqliteBase,
     CheckpointResult,
     apply_full_durability_pragmas,
+    connect_daemon,
 )
 
 # ---------------------------------------------------------------------------
@@ -654,6 +655,27 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
 # ---------------------------------------------------------------------------
 
 
+def _assert_daemon_thread(conn: aiosqlite.Connection, label: str = '') -> None:
+    """Assert that an aiosqlite connection's worker thread is alive and daemon-marked.
+
+    Centralises the ``._thread`` access pattern so that a future aiosqlite
+    rename is caught in one place rather than in every daemon-related test
+    method.  The fused-memory counterpart lives in
+    ``fused-memory/tests/test_daemon_connect_consolidation.py``.
+
+    Args:
+        conn: An open :class:`aiosqlite.Connection` to inspect.
+        label: Optional label prepended to assertion failure messages.
+    """
+    prefix = f'{label}: ' if label else ''
+    thread = conn._thread
+    assert thread.is_alive(), f'{prefix}worker thread should be alive while connection is open'
+    assert thread.daemon is True, (
+        f'{prefix}aiosqlite worker thread must be daemon so a leaked '
+        'connection cannot block interpreter shutdown'
+    )
+
+
 @pytest.mark.asyncio
 class TestWorkerThreadIsDaemon:
     """AsyncSqliteBase.open() marks aiosqlite's worker thread as daemon.
@@ -672,15 +694,51 @@ class TestWorkerThreadIsDaemon:
             assert store._conn is not None
             # aiosqlite Connection stores its worker as ._thread (private).
             # If aiosqlite ever renames this, the guard in open() silently
-            # degrades — this test fails loudly so we notice.
-            thread = store._conn._thread
-            assert thread.is_alive()
-            assert thread.daemon is True, (
-                'aiosqlite worker thread must be daemon so a leaked '
-                'connection cannot block interpreter shutdown'
-            )
+            # degrades — _assert_daemon_thread fails loudly so we notice.
+            _assert_daemon_thread(store._conn, label='AsyncSqliteBase.open()')
         finally:
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# connect_daemon: module-level helper for daemon-marked connections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConnectDaemon:
+    """connect_daemon() opens an aiosqlite connection with its worker thread marked daemon.
+
+    Mirrors TestWorkerThreadIsDaemon for AsyncSqliteBase.open(), but tests the
+    standalone ``connect_daemon`` helper directly.  This helper is the single
+    source-of-truth for the marking mechanism so that hand-rolled connect sites
+    across fused-memory stores can share the same guard without subclassing.
+    """
+
+    async def test_thread_is_daemon(self, tmp_path: Path):
+        """connect_daemon returns a live connection whose worker thread is daemon."""
+        conn = await connect_daemon(str(tmp_path / 'x.db'))
+        try:
+            _assert_daemon_thread(conn, label='connect_daemon')
+        finally:
+            await conn.close()
+
+    async def test_kwargs_passthrough(self, tmp_path: Path):
+        """connect_daemon passes extra kwargs to aiosqlite.connect and marks daemon.
+
+        timeout=30, isolation_level=None are the kwargs used by the override-db
+        helpers in server/tools.py.  This test ensures they flow through and that
+        the resulting connection is both usable and daemon-marked.
+        """
+        conn = await connect_daemon(str(tmp_path / 'y.db'), timeout=30, isolation_level=None)
+        try:
+            _assert_daemon_thread(conn, label='connect_daemon(kwargs)')
+            # Connection must be usable with the supplied kwargs
+            async with conn.execute('SELECT 1') as cur:
+                row = await cur.fetchone()
+            assert row is not None and row[0] == 1
+        finally:
+            await conn.close()
 
 
 # ---------------------------------------------------------------------------
