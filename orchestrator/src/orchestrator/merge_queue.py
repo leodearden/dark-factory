@@ -879,6 +879,133 @@ async def enqueue_merge_request(
 
 
 @dataclass
+class MergeDispatchResult:
+    """Structured return value from :func:`coalesce_or_enqueue_merge_request`.
+
+    Attributes:
+        dispatched: True when the request was enqueued (new work item added).
+        in_flight: True when a merge for *branch* was already in-flight and
+            the caller was coalesced rather than enqueued.
+        branch: The bare branch name (e.g. ``"591"``).
+        inflight_task_id: task_id of the existing in-flight merger, or None
+            when dispatched=True.
+        eta_seconds: Best-effort ETA (coarse heuristic, NOT a bound), or None
+            when dispatched=True or eta is unavailable.
+        source: ``'registry'`` (in-memory) or ``'worktree'`` (disk scan),
+            indicating which source detected the in-flight merger.  None when
+            dispatched=True.
+    """
+
+    dispatched: bool
+    in_flight: bool
+    branch: str
+    inflight_task_id: str | None = None
+    eta_seconds: int | None = None
+    source: str | None = None
+
+
+def _emit_merge_coalesced(
+    event_store: EventStore | None,
+    req: MergeRequest,
+    source: str,
+    eta: int | None,
+) -> None:
+    """Emit a merge_coalesced event.  No-op when *event_store* is None.
+
+    Mirrors the ``_emit_merge_queued`` helper so the coalesced path emits
+    an identical-shape record but with ``merge_coalesced`` as the event type.
+    """
+    if event_store is None:
+        return
+    data: dict = {
+        'branch': req.branch,
+        'source': source,
+    }
+    if eta is not None:
+        data['eta_seconds'] = eta
+    event_store.emit(
+        EventType.merge_coalesced,
+        task_id=req.task_id,
+        phase='merge',
+        data=data,
+    )
+
+
+async def coalesce_or_enqueue_merge_request(
+    queue: asyncio.Queue,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    registry: InFlightMergeRegistry,
+    git_ops: object | None = None,
+    *,
+    liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+) -> MergeDispatchResult:
+    """De-dup gate for the merge_request MCP chokepoint.
+
+    Consults two sources of truth to detect an already-in-flight merge for
+    *req.branch*:
+
+    1. **In-memory registry fast-path** — O(1) dict lookup, covers within-
+       process dispatch races (``merge_request`` /unblock spam).
+    2. **On-disk worktree scan** (when *git_ops* is not None) — detects the
+       workflow's in-flight merger whose ``_merge-*`` worktree exists on disk
+       even after a process restart.  Alive worktrees (mtime ≤ liveness_secs)
+       are coalesced; stale/abandoned worktrees are reaped via
+       ``cleanup_merge_worktree`` and a fresh merge is dispatched (step-10).
+
+    Returns a :class:`MergeDispatchResult` with ``dispatched=True`` if the
+    request was enqueued, or ``in_flight=True`` if it was coalesced.
+
+    On coalesce a ``merge_coalesced`` event is emitted so observers can track
+    the de-dup rate without polling the queue depth.
+
+    **NOT** used by workflow.py's single-task or train paths — those call
+    :func:`enqueue_merge_request` directly.  This function is the
+    ``merge_request`` MCP tool's entry point only.
+    """
+    branch = req.branch
+
+    # ── 1. Registry fast-path ──────────────────────────────────────────
+    if registry.is_inflight(branch):
+        eta = registry.eta_seconds(branch)
+        entry = registry.entry(branch)
+        _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+        return MergeDispatchResult(
+            dispatched=False,
+            in_flight=True,
+            branch=branch,
+            inflight_task_id=entry.task_id if entry else None,
+            eta_seconds=eta,
+            source='registry',
+        )
+
+    # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
+    # (disk-scan / reap logic added in steps 8 and 10)
+
+    # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
+    if registry.acquire(branch, req.task_id, req.result):
+        await enqueue_merge_request(queue, req, event_store)
+        return MergeDispatchResult(
+            dispatched=True,
+            in_flight=False,
+            branch=branch,
+        )
+
+    # Concurrent dispatch won the race during the (currently no-op) scan await
+    eta = registry.eta_seconds(branch)
+    entry = registry.entry(branch)
+    _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+    return MergeDispatchResult(
+        dispatched=False,
+        in_flight=True,
+        branch=branch,
+        inflight_task_id=entry.task_id if entry else None,
+        eta_seconds=eta,
+        source='registry',
+    )
+
+
+@dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
 
