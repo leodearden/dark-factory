@@ -475,3 +475,136 @@ async def apply_cleanup(
         'applied_edges': applied_edges,
         'failed_refreshes': failed_refreshes,
     }
+
+
+async def run(
+    args: argparse.Namespace,
+    *,
+    memory: Any,
+    known_projects_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Main async logic: scan, report, and optionally apply.
+
+    Parameters
+    ----------
+    args:
+        Parsed argparse.Namespace (apply, project_id, limit_per_project,
+        yes_i_am_sure).
+    memory:
+        Live or mock MemoryService instance.
+    known_projects_map:
+        Optional override for the project registry (used in tests to inject
+        a fixture map without reading env vars / filesystem).
+
+    Returns
+    -------
+    The audit report dict.
+    """
+    generated_at = datetime.now(UTC).isoformat()
+
+    if known_projects_map is None:
+        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
+        cfg = _FMC()
+        known_projects_map = build_known_projects_map(cfg.taskmaster.project_root)
+
+    try:
+        project_ids = select_projects(known_projects_map, getattr(args, 'project_id', None))
+    except ValueError as exc:
+        return {'error': str(exc), 'aborted': True, 'dry_run': not args.apply}
+
+    # Enumerate entities per project for the limit cap check
+    per_project_counts: dict[str, int] = {}
+    scan_results_by_project: dict[str, list[EntityScanResult]] = {}
+
+    for pid in project_ids:
+        entities = await memory.graphiti.list_entity_nodes(group_id=pid)
+        per_project_counts[pid] = len(entities)
+        edges_by_entity = await memory.graphiti.get_all_valid_edges(group_id=pid)
+        scan_results_by_project[pid] = scan_entities_for_snapshots(pid, entities, edges_by_entity)
+
+    # Safety cap
+    exceeding, abort = check_limit_cap(
+        per_project_counts,
+        args.limit_per_project,
+        args.yes_i_am_sure,
+    )
+    if abort:
+        return {
+            'aborted': True,
+            'dry_run': not args.apply,
+            'exceeding_projects': exceeding,
+            'limit_per_project': args.limit_per_project,
+            'generated_at': generated_at,
+        }
+
+    # Apply or dry-run
+    applied_edges: set[str] = set()
+    failed_refreshes: list[dict[str, Any]] = []
+
+    if args.apply:
+        all_results = [r for results in scan_results_by_project.values() for r in results]
+        now = datetime.now(UTC)
+        apply_result = await apply_cleanup(memory, all_results, now)
+        applied_edges = apply_result['applied_edges']
+        failed_refreshes = apply_result['failed_refreshes']
+
+    report = build_audit_report(
+        scan_results_by_project=scan_results_by_project,
+        applied_edges=applied_edges,
+        failed_refreshes=failed_refreshes,
+        dry_run=not args.apply,
+        limit_per_project=args.limit_per_project,
+        generated_at=generated_at,
+    )
+
+    print(json.dumps(report, indent=2, default=str))
+    print(format_summary_table(report))
+
+    return report
+
+
+def main() -> int:
+    """CLI entry point."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit invalidations (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', default=None,
+        help='Restrict sweep to a single project_id',
+    )
+    parser.add_argument(
+        '--limit-per-project', dest='limit_per_project', type=int, default=1000,
+        help='Abort if any project has more than this many entities (safety cap)',
+    )
+    parser.add_argument(
+        '--yes-i-am-sure', dest='yes_i_am_sure', action='store_true',
+        help='Override the per-project entity count safety cap',
+    )
+    args = parser.parse_args()
+
+    async def _run_live() -> int:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        await memory.initialize()
+        try:
+            await run(args, memory=memory)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+        return 0
+
+    return asyncio.run(_run_live())
+
+
+if __name__ == '__main__':
+    sys.exit(main())
