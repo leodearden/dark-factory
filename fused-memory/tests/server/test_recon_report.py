@@ -484,3 +484,82 @@ class TestCreateReconReportServer:
         report = state.get_assembled_report('r1', 'memory_consolidator')
         assert report['summary'] == 'done'
         assert len(report['flagged_items']) == 1
+
+
+# ---------------------------------------------------------------------------
+# step-17: _build_recon_report_components helper in main.py — RED until step-18
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportBoot:
+    """Verify _build_recon_report_components returns correct types and config."""
+
+    def _make_config(self, recon_port=8003, ttl=300):
+        """Build a minimal FusedMemoryConfig sufficient for the helper."""
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+            ServerConfig,
+        )
+
+        return FusedMemoryConfig(
+            server=ServerConfig(recon_report_port=recon_port, host='127.0.0.1'),
+            reconciliation=ReconciliationConfig(recon_report_state_ttl_seconds=ttl),
+        )
+
+    def test_returns_three_tuple(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        result = _build_recon_report_components(config)
+        assert len(result) == 3
+
+    def test_state_type_and_ttl(self):
+        from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_report import ReconReportState
+
+        config = self._make_config(ttl=600)
+        state, _, _ = _build_recon_report_components(config)
+        assert isinstance(state, ReconReportState)
+        assert state._ttl_seconds == 600
+
+    def test_mcp_name_is_recon_report(self):
+        from mcp.server.fastmcp import FastMCP
+
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        _, mcp, _ = _build_recon_report_components(config)
+        assert isinstance(mcp, FastMCP)
+        assert mcp.name == 'Recon Report'
+
+    def test_uvicorn_config_port(self):
+        import uvicorn
+
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config(recon_port=8099)
+        _, _, uv_cfg = _build_recon_report_components(config)
+        assert isinstance(uv_cfg, uvicorn.Config)
+        assert uv_cfg.port == 8099
+
+    def test_uvicorn_config_host(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        _, _, uv_cfg = _build_recon_report_components(config)
+        assert uv_cfg.host == '127.0.0.1'
+
+    def test_asgi_shield_applied(self):
+        from fused_memory.server.main import _ASGIExceptionShield, _build_recon_report_components
+
+        config = self._make_config()
+        _, _, uv_cfg = _build_recon_report_components(config)
+        assert isinstance(uv_cfg.app, _ASGIExceptionShield)
+
+    def test_safe_tool_wrapper_applied(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        _, mcp, _ = _build_recon_report_components(config)
+        assert getattr(mcp._tool_manager, '_fused_memory_safe_wrapped', False)
