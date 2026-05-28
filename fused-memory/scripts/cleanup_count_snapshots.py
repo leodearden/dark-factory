@@ -332,3 +332,63 @@ def format_summary_table(report: dict[str, Any]) -> str:
     dry_tag = ' [DRY RUN]' if report.get('dry_run') else ''
     rows.insert(0, f"Count-snapshot cleanup report — {report.get('generated_at', '')}{dry_tag}")
     return '\n'.join(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: project selection + safety cap
+# ---------------------------------------------------------------------------
+
+def select_projects(
+    known_map: dict[str, str],
+    project_id_filter: str | None,
+) -> list[str]:
+    """Return the sorted list of project_ids to process.
+
+    Parameters
+    ----------
+    known_map:
+        ``{project_id: project_root}`` from ``build_known_projects_map``.
+    project_id_filter:
+        When given, restrict to this single project_id.  Raises ValueError
+        with the list of known ids if the filter is not recognised.
+
+    Returns
+    -------
+    Sorted list of project_ids.
+    """
+    if project_id_filter is None:
+        return sorted(known_map.keys())
+    if project_id_filter not in known_map:
+        known_ids = sorted(known_map.keys())
+        raise ValueError(
+            f'Unknown project_id {project_id_filter!r}. '
+            f'Known project ids: {known_ids}'
+        )
+    return [project_id_filter]
+
+
+def check_limit_cap(
+    per_project_entity_counts: dict[str, int],
+    limit: int,
+    yes_i_am_sure: bool,
+) -> tuple[list[str], bool]:
+    """Check whether any project exceeds the per-project entity safety cap.
+
+    Parameters
+    ----------
+    per_project_entity_counts:
+        ``{project_id: entity_count}``
+    limit:
+        Maximum allowed entity count before aborting.
+    yes_i_am_sure:
+        When True, override the abort even if projects exceed the limit.
+
+    Returns
+    -------
+    ``(exceeding_projects, abort)`` where ``exceeding_projects`` lists
+    project_ids whose count > limit and ``abort`` is True when any project
+    exceeds AND ``yes_i_am_sure`` is False.
+    """
+    exceeding = [pid for pid, count in per_project_entity_counts.items() if count > limit]
+    abort = bool(exceeding) and not yes_i_am_sure
+    return exceeding, abort
