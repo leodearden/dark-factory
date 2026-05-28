@@ -77,6 +77,19 @@ class FakeScheduler:
     async def get_task(self, task_id: str) -> dict | None:
         return self.task_data.get(task_id)
 
+    async def get_tasks(self) -> list[dict]:
+        """Return all tracked task data as a list."""
+        return list(self.task_data.values())
+
+    async def get_statuses(
+        self, ids: list[str] | None = None,
+    ) -> tuple[dict[str, str], Exception | None]:
+        """Return latest status per id, filtered by ids if provided."""
+        latest = {tid: hist[-1] for tid, hist in self.statuses.items() if hist}
+        if ids is not None:
+            latest = {tid: latest[tid] for tid in ids if tid in latest}
+        return latest, None
+
     async def update_task(
         self, task_id: str, metadata: str | dict, *, append: bool = False,
     ) -> bool:
@@ -89,14 +102,6 @@ class FakeScheduler:
 
     def release(self, task_id: str) -> None:
         pass
-
-    async def get_tasks(self) -> list[dict]:
-        return []
-
-    async def get_statuses(
-        self, ids: list[str] | None = None,
-    ) -> tuple[dict[str, str], Exception | None]:
-        return ({}, None)
 
     async def tasks_by_train(self, train_id: str, /) -> list[dict]:
         return []
