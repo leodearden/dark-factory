@@ -4324,3 +4324,106 @@ class TestWriteAndConfirmMarker:
         assert 'failed to write marker' in warning_msgs[0]
 
 
+# ---------------------------------------------------------------------------
+# Step 7: confirm_task_absent fail-closed classifier (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmTaskAbsent:
+    """RED tests for confirm_task_absent(get_task_result) (step-7).
+
+    confirm_task_absent is fail-closed: returns True ONLY when the result
+    positively confirms the task does not exist (not-found error dict).
+    Any present, inconclusive, or non-dict result returns False.
+    """
+
+    def test_true_for_not_found_error_dict(self):
+        """Returns True when get_task returns the canonical not-found error dict.
+
+        The sqlite backend raises TaskmasterError('TASKMASTER_TOOL_ERROR',
+        'No tasks found for ID(s): N') on missing tasks; the server surfaces it
+        as {'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): N',
+            'error_type': 'TaskmasterError'}.
+        """
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3438',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(not_found) is True, (
+            'confirm_task_absent must return True for canonical not-found error dict'
+        )
+
+    def test_true_for_not_found_lowercase_variant(self):
+        """Returns True for case-insensitive variant of not-found message."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        not_found = {
+            'error': 'TASKMASTER_TOOL_ERROR: no tasks found for id(s): 42',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(not_found) is True, (
+            'confirm_task_absent must return True for case-insensitive not-found message'
+        )
+
+    def test_false_for_present_task_dict(self):
+        """Returns False when get_task returns a valid task record (task is present)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        task_record = {
+            'id': '3438',
+            'title': 'Some real task',
+            'status': 'in-progress',
+            'dependencies': [],
+        }
+        assert confirm_task_absent(task_record) is False, (
+            'confirm_task_absent must return False when task record is present'
+        )
+
+    def test_false_for_generic_error_dict(self):
+        """Returns False for a generic/inconclusive error dict (e.g. timeout, backend error)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        timeout_error = {
+            'error': 'Connection timeout reaching Taskmaster backend',
+            'error_type': 'TimeoutError',
+        }
+        assert confirm_task_absent(timeout_error) is False, (
+            'confirm_task_absent must return False for inconclusive errors (fail-closed)'
+        )
+
+        backend_error = {
+            'error': 'TASKMASTER_UNAVAILABLE: backend not reachable',
+            'error_type': 'TaskmasterError',
+        }
+        assert confirm_task_absent(backend_error) is False, (
+            'confirm_task_absent must return False for TASKMASTER_UNAVAILABLE (inconclusive)'
+        )
+
+    def test_false_for_none(self):
+        """Returns False for None input (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        assert confirm_task_absent(None) is False, (
+            'confirm_task_absent must return False for None (fail-closed)'
+        )
+
+    def test_false_for_empty_dict(self):
+        """Returns False for empty dict (fail-closed)."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        assert confirm_task_absent({}) is False, (
+            'confirm_task_absent must return False for empty dict (fail-closed)'
+        )
+
+    def test_false_for_non_dict_inputs(self):
+        """Returns False for non-dict inputs (str, int, list) — fail-closed."""
+        from fused_memory.reconciliation.flag_dedup import confirm_task_absent
+
+        for bad in ['no tasks found for id(s)', 42, [], True]:
+            assert confirm_task_absent(bad) is False, (
+                f'confirm_task_absent must return False for non-dict {bad!r} (fail-closed)'
+            )
+
+
