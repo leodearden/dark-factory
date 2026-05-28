@@ -448,7 +448,7 @@ class TaskWorkflow:
         ``is not None`` check.
         """
         train = (self.task.get('metadata') or {}).get('train')
-        return train if isinstance(train, dict) else None
+        return cast(TrainMembership, train) if isinstance(train, dict) else None
 
     async def _enter_merge_deferred(self) -> WorkflowOutcome:
         """Park this train member in the merge-deferred holding state (γ₁, PRD §9.5).

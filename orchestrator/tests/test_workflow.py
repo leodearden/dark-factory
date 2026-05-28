@@ -15,6 +15,7 @@ truth for pass/fail.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -471,8 +472,8 @@ class TestRunMergeDeferredGuard:
         assert outcome == WorkflowOutcome.MERGE_DEFERRED, (
             f'Expected MERGE_DEFERRED for train member; got {outcome!r}'
         )
-        wf._enter_merge_deferred.assert_awaited_once()
-        wf._submit_to_merge_queue.assert_not_called()
+        cast(AsyncMock, wf._enter_merge_deferred).assert_awaited_once()
+        cast(AsyncMock, wf._submit_to_merge_queue).assert_not_called()
 
     async def test_non_train_task_proceeds_to_merge(
         self, tmp_path: Path, monkeypatch,
@@ -495,5 +496,5 @@ class TestRunMergeDeferredGuard:
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE for non-train task merge path; got {outcome!r}'
         )
-        wf._enter_merge_deferred.assert_not_called()
-        wf._submit_to_merge_queue.assert_awaited_once()
+        cast(AsyncMock, wf._enter_merge_deferred).assert_not_called()
+        cast(AsyncMock, wf._submit_to_merge_queue).assert_awaited_once()
