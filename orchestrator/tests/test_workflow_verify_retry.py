@@ -54,6 +54,10 @@ def config(git_repo: Path) -> OrchestratorConfig:
         # not the global cap.
         max_verify_attempts=5,
         max_opaque_timeout_attempts=2,
+        # Raise the signature-repetition cap well above max_verify_attempts so
+        # the opaque-timeout fast-fail tests are not affected by the new
+        # signature guard — these tests are solely about the opaque-timeout cap.
+        max_failure_signature_repeat=100,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',

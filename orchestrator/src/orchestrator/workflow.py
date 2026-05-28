@@ -369,6 +369,11 @@ class TaskWorkflow:
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Per-run history of (category, normalised cause_hint) tuples for the
+        # signature-repetition guard.  Ephemeral — intentionally not persisted
+        # in task metadata because the verify loop is wholly within one
+        # workflow run (unlike _check_infra_resume_thrash which crosses runs).
+        self._failure_signature_history: list[tuple[str, str]] = []
         # Block-reason surfacing for the harness-level retry cap.  Populated
         # when _mark_blocked takes the REQUEUED return path; the harness reads
         # these after workflow.run() returns to decide whether to increment
@@ -3105,6 +3110,26 @@ class TaskWorkflow:
                     self.task_id, verify_attempt,
                     self.config.max_opaque_timeout_attempts,
                     (result.cause_hint or '')[:120],
+                )
+                return WorkflowOutcome.BLOCKED
+            # Signature-repetition guard: escalate to L1 after N consecutive
+            # verify failures with the same (category, normalised cause_hint)
+            # tuple.  Placement is AFTER the opaque-timeout cap (the more
+            # specific signal) and BEFORE the global max_verify_attempts cap.
+            # Uses the last-N-equal window so an early "blip" of a different
+            # category does not prevent the guard from firing once the loop
+            # settles into a repeat pattern.
+            _sig = (result.category or '', _normalize_cause_hint(result.cause_hint))
+            self._failure_signature_history.append(_sig)
+            _N = self.config.max_failure_signature_repeat
+            if (
+                len(self._failure_signature_history) >= _N
+                and all(s == _sig for s in self._failure_signature_history[-_N:])
+            ):
+                logger.warning(
+                    'Task %s: %d consecutive identical verify failures '
+                    '(sig=%r) — escalating to L1',
+                    self.task_id, _N, _sig,
                 )
                 return WorkflowOutcome.BLOCKED
             if verify_attempt >= self.config.max_verify_attempts:

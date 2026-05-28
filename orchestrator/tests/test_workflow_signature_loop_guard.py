@@ -196,17 +196,12 @@ def _test_failure(
 class TestSignatureRepeatLoopGuard:
     """Integration tests driving _verify_debugfix_loop with mocked VerifyResults."""
 
-    def test_failure_signature_history_initialises_empty(
+    async def test_failure_signature_history_initialises_empty(
         self, config, git_ops, task_assignment,
     ):
         """_failure_signature_history must exist as an empty list on a fresh workflow."""
-        import asyncio as _asyncio
-
-        async def _get_wt():
-            info = await git_ops.create_worktree(task_assignment.task_id)
-            return info.path
-
-        wt = _asyncio.run(_get_wt())
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
         workflow, _ = _make_workflow(config, git_ops, task_assignment, wt)
         assert hasattr(workflow, '_failure_signature_history')
         assert workflow._failure_signature_history == []
