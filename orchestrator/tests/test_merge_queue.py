@@ -35,6 +35,7 @@ from orchestrator.merge_queue import (
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _ensure_verify_disk_space,
+    _is_speculation_race,
     _verify_hit_enospc,
     coalesce_or_enqueue_merge_request,
 )
@@ -6934,3 +6935,463 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
         assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
         # Registry now holds the new request
         assert registry.is_inflight(branch) is True
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationRaceRetry
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculationRaceRetry:
+    """Speculation-race retry: re-merge against actual main when base drifted."""
+
+    def test_is_speculation_race_exact_match(self):
+        """_is_speculation_race matches exactly on git porcelain phrase."""
+        # Exact phrase — load-bearing git porcelain output
+        assert _is_speculation_race('not something we can merge') is True
+        assert _is_speculation_race(
+            "merge: task/feature-foo - not something we can merge"
+        ) is True
+        assert _is_speculation_race(
+            "fatal: 'task/bar' - not something we can merge\nerror: merge failed"
+        ) is True
+
+        # Paraphrases must NOT match
+        assert _is_speculation_race('cannot merge') is False
+        assert _is_speculation_race('not something to merge') is False
+        assert _is_speculation_race('refusing to merge unrelated histories') is False
+        assert _is_speculation_race('fatal: refusing to merge unrelated histories') is False
+        assert _is_speculation_race('not a merge') is False
+
+        # Empty and unrelated fatals
+        assert _is_speculation_race('') is False
+        assert _is_speculation_race('fatal: no such branch') is False
+        assert _is_speculation_race('error: CONFLICT (content)') is False
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_succeeds(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Race-retry: 1st merge_to_main fails with stale-base speculation-race
+        stderr; 2nd call (against fresh main) succeeds and the branch lands on main.
+
+        Verifies:
+        - merge_to_main called exactly twice
+        - 2nd call's base_sha == actual main at test time
+        - returned item has no immediate_outcome (flowing, not blocked)
+        - _verify_and_advance returns True and resolves outcome.status == 'done'
+        - caplog contains 'merge_retry_after_speculation_race'
+        """
+        branch = 'race-retry-ok'
+        worktree = await _make_branch_with_file(git_ops, branch, 'race_ok.py', 'x = 1\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-retry', branch, worktree, config)
+
+        real_merge_to_main = git_ops.merge_to_main
+        call_count = 0
+        call_base_shas: list[str | None] = []
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            call_base_shas.append(base_sha)
+            if call_count == 1:
+                return MergeResult(
+                    success=False,
+                    conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: delegate to the real merge_to_main
+            return await real_merge_to_main(wt, br, base_sha=base_sha)
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+        actual_main = await git_ops.get_main_sha()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ), caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            item = await worker._remerge(req, None)
+
+        # merge_to_main must have been called exactly twice
+        assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
+
+        # 2nd call's base_sha must be the actual main SHA (freshly read inside _remerge)
+        assert call_base_shas[1] == actual_main, (
+            f'2nd merge_to_main base_sha {call_base_shas[1]!r} != actual main {actual_main!r}'
+        )
+
+        # item must be flowing (no immediate_outcome), merge succeeded
+        assert item.immediate_outcome is None, (
+            f'Expected flowing item but got immediate_outcome={item.immediate_outcome}'
+        )
+        assert item.merge_result is not None
+        assert item.merge_result.success
+
+        # _verify_and_advance must land the branch on main
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'Expected done, got {outcome.status}: {outcome}'
+
+        # The branch's file must now appear on main
+        rc, file_content, _ = await _run(
+            ['git', 'show', 'main:race_ok.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'race_ok.py not found on main after retry merge'
+        assert 'x = 1' in file_content
+
+        # Structured log note must appear
+        assert 'merge_retry_after_speculation_race' in caplog.text, (
+            'Expected "merge_retry_after_speculation_race" in caplog'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_also_fails(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry: both attempts fail (no-conflict) → dual-attempt diagnostics.
+
+        1st call: speculation-race failure (stale base '0'*40 != actual main).
+        2nd call: a different non-conflict failure (refusing to merge unrelated histories).
+
+        Verifies:
+        - merge_to_main called exactly twice (no 3rd retry)
+        - returned item has immediate_outcome.status == 'blocked'
+        - reason contains BOTH stderr strings and BOTH base SHAs
+        - failure_diagnostic carries μ 4 keys for the final (retry) attempt
+          PLUS first_attempt_base_sha / first_attempt_git_stderr for the first
+        - item.failure_diagnostic == item.immediate_outcome.failure_diagnostic
+        """
+        branch = 'race-retry-fail'
+        worktree = await _make_branch_with_file(git_ops, branch, 'race_fail.py', 'y = 2\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-fail', branch, worktree, config)
+
+        actual_main = await git_ops.get_main_sha()
+        first_base = '0' * 40
+        retry_base = actual_main  # retry re-reads get_main_sha() → actual_main
+        first_stderr = f'merge: task/{branch} - not something we can merge'
+        retry_stderr = 'fatal: refusing to merge unrelated histories'
+
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=first_stderr,
+                    pre_merge_sha=first_base,
+                )
+            # 2nd call: different non-conflict failure; pre_merge_sha = retry_base
+            return MergeResult(
+                success=False, conflicts=False,
+                details=retry_stderr,
+                pre_merge_sha=retry_base,
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+
+        item = await worker._remerge(req, None)
+
+        # Exactly 2 calls — no 3rd retry
+        assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
+
+        # Must be a blocked immediate_outcome
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'blocked', (
+            f'Expected blocked, got {item.immediate_outcome.status}'
+        )
+
+        reason = item.immediate_outcome.reason
+        # reason must surface BOTH stderr strings
+        assert first_stderr in reason or 'not something we can merge' in reason, (
+            f'1st stderr missing from reason: {reason!r}'
+        )
+        assert retry_stderr in reason, f'retry stderr missing from reason: {reason!r}'
+        # reason must surface BOTH base SHAs
+        assert first_base in reason or first_base[:8] in reason, (
+            f'first_base missing from reason: {reason!r}'
+        )
+        assert retry_base in reason or retry_base[:8] in reason, (
+            f'retry_base missing from reason: {reason!r}'
+        )
+
+        # failure_diagnostic must carry μ 4 keys for retry attempt
+        diag = item.immediate_outcome.failure_diagnostic
+        assert diag is not None, 'failure_diagnostic must not be None'
+        assert 'base_sha' in diag
+        assert 'base_label' in diag
+        assert 'branch_ref_in_worktree' in diag
+        assert 'git_stderr' in diag
+
+        # First-attempt keys must be present
+        assert 'first_attempt_base_sha' in diag, (
+            f'first_attempt_base_sha missing from failure_diagnostic: {diag!r}'
+        )
+        assert 'first_attempt_git_stderr' in diag, (
+            f'first_attempt_git_stderr missing from failure_diagnostic: {diag!r}'
+        )
+        assert diag['first_attempt_base_sha'] == first_base
+        assert diag['first_attempt_git_stderr'] == first_stderr
+
+        # item.failure_diagnostic must mirror outcome.failure_diagnostic
+        assert item.failure_diagnostic == diag
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_base_is_actual_main(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """No retry when base_sha == actual main (genuine main-HEAD failure, not a race).
+
+        When merge_result.pre_merge_sha == actual_main (the merge ran against
+        the real current main), the load-bearing stderr alone must NOT trigger a
+        retry. Only exactly ONE merge_to_main call must be made, and the returned
+        item must be a single-diagnostic blocked outcome (no first_attempt_* keys).
+
+        Also asserts that a non-load-bearing failure with a stale base also
+        yields exactly one call.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        actual_main = await git_ops.get_main_sha()
+        branch = 'no-retry-main'
+        worktree = await _make_branch_with_file(git_ops, branch, 'no_retry.py', 'z = 3\n')
+        req = _make_request('no-retry', branch, worktree, config)
+
+        # Case 1: load-bearing stderr but pre_merge_sha == actual main (not a race)
+        call_count = 0
+
+        async def fake_base_is_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            return MergeResult(
+                success=False, conflicts=False,
+                details=f'merge: task/{br} - not something we can merge',
+                pre_merge_sha=actual_main,  # base == actual main → not a race
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_base_is_main)
+        item = await worker._remerge(req, None)
+
+        assert call_count == 1, (
+            f'Expected exactly 1 call (base==main, not a race), got {call_count}'
+        )
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'blocked'
+        # Must NOT have first_attempt_* keys (single-attempt diagnostic)
+        diag = item.immediate_outcome.failure_diagnostic
+        assert diag is not None
+        assert 'first_attempt_base_sha' not in diag, (
+            f'Unexpected first_attempt_base_sha in diag for non-race failure: {diag!r}'
+        )
+
+        # Case 2: non-load-bearing stderr with stale base → no retry either
+        call_count = 0
+        branch2 = 'no-retry-stale-ok'
+        worktree2 = await _make_branch_with_file(git_ops, branch2, 'no_retry2.py', 'w = 4\n')
+        req2 = _make_request('no-retry-2', branch2, worktree2, config)
+
+        async def fake_non_loadbearing(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            return MergeResult(
+                success=False, conflicts=False,
+                details='fatal: refusing to merge unrelated histories',
+                pre_merge_sha='0' * 40,  # stale base, but NOT the race phrase
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_non_loadbearing)
+        item2 = await worker._remerge(req2, None)
+
+        assert call_count == 1, (
+            f'Expected 1 call (non-race stderr), got {call_count}'
+        )
+        assert item2.immediate_outcome is not None
+        assert item2.immediate_outcome.status == 'blocked'
+        diag2 = item2.immediate_outcome.failure_diagnostic
+        assert diag2 is not None
+        assert 'first_attempt_base_sha' not in diag2
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_returns_conflict(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry: 1st fails with speculation-race; 2nd returns a true conflict.
+
+        Verifies:
+        - merge_to_main called exactly twice
+        - immediate_outcome.status == 'conflict'
+        - conflict_details carries the retry stderr
+        - retry merge_worktree is cleaned up
+        - _emit_merge_attempt is called with outcome='conflict'
+        """
+        branch = 'race-retry-conflict'
+        worktree = await _make_branch_with_file(
+            git_ops, branch, 'conflict_file.py', 'value = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-conflict', branch, worktree, config)
+
+        fake_retry_wt = Path('/tmp/fake-race-retry-wt')
+        retry_stderr = 'CONFLICT (content): Merge conflict in conflict_file.py'
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: real merge conflict with a retained worktree
+            return MergeResult(
+                success=False, conflicts=True,
+                details=retry_stderr,
+                pre_merge_sha='a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+                merge_worktree=fake_retry_wt,
+            )
+
+        cleanup_calls: list[Path] = []
+
+        async def fake_cleanup(wt: Path) -> None:
+            cleanup_calls.append(wt)
+
+        emit_calls: list[dict] = []
+
+        def fake_emit(event_store: Any, task_id: str, outcome: str, **kwargs: Any) -> None:
+            emit_calls.append({'task_id': task_id, 'outcome': outcome})
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+        monkeypatch.setattr(git_ops, 'cleanup_merge_worktree', fake_cleanup)
+        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_attempt', fake_emit)
+
+        item = await worker._remerge(req, None)
+
+        # Exactly 2 calls — no 3rd retry
+        assert call_count == 2, f'Expected 2 calls, got {call_count}'
+
+        # Conflict immediate_outcome
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'conflict', (
+            f'Expected conflict, got {item.immediate_outcome.status!r}'
+        )
+        assert item.immediate_outcome.conflict_details == retry_stderr, (
+            f'conflict_details mismatch: {item.immediate_outcome.conflict_details!r}'
+        )
+
+        # Retry merge_worktree must be cleaned up
+        assert fake_retry_wt in cleanup_calls, (
+            f'Expected cleanup_merge_worktree({fake_retry_wt}); got: {cleanup_calls}'
+        )
+
+        # _emit_merge_attempt must have been called with outcome='conflict'
+        conflict_emits = [e for e in emit_calls if e['outcome'] == 'conflict']
+        assert conflict_emits, (
+            f'Expected a conflict merge_attempt emission; got emit_calls={emit_calls!r}'
+        )
+        assert conflict_emits[0]['task_id'] == req.task_id
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_success_skip_verify(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry with pre_rebased=True: retry success MUST force verification (skip_verify=False).
+
+        The speculation-race gate fires only when merge_result.pre_merge_sha != actual_main,
+        meaning main demonstrably advanced between _remerge's get_main_sha() read and
+        merge_to_main's own read.  req.pre_rebased=True reflects a rebase onto the OLD main,
+        NOT retry_main; the retry merges the branch against the newer retry_main, integrating
+        main commits the branch never incorporated.  The documented skip_verify invariant
+        ('pre_rebased AND main unchanged', merge_queue.py SpeculativeItem.skip_verify comment)
+        therefore does NOT hold, and skipping verification would let semantically-unverified
+        main commits land on the protected branch.  skip_verify must be False unconditionally
+        on this path regardless of req.pre_rebased.
+
+        Behavioural check: _verify_and_advance(item) must invoke run_scoped_verification
+        (i.e., must NOT skip the verify step).
+        """
+        branch = 'race-retry-skip-verify'
+        worktree = await _make_branch_with_file(
+            git_ops, branch, 'skip_verify.py', 's = 99\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # pre_rebased=True is the would-be trigger for skip_verify; must NOT skip here
+        req = _make_request('race-skip', branch, worktree, config, pre_rebased=True)
+
+        real_merge_to_main = git_ops.merge_to_main
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=f'merge: task/{br} - not something we can merge',
+                    pre_merge_sha='0' * 40,
+                )
+            # 2nd call: delegate to real merge so a real worktree/commit is produced
+            return await real_merge_to_main(wt, br, base_sha=base_sha)
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+
+        item = await worker._remerge(req, None)
+
+        assert call_count == 2, f'Expected 2 calls, got {call_count}'
+        assert item.immediate_outcome is None, (
+            f'Expected flowing item; got immediate_outcome={item.immediate_outcome}'
+        )
+        assert item.merge_result is not None
+        assert item.merge_result.success
+
+        # SAFETY CONTRACT: main advanced since the pre-rebase, so verification must run.
+        # skip_verify MUST be False regardless of req.pre_rebased.
+        assert item.skip_verify is False, (
+            f'Expected skip_verify=False (main advanced: race gate fired), '
+            f'but got skip_verify={item.skip_verify}. '
+            f'Skipping verification after a speculation-race retry is unsafe.'
+        )
+
+        # Behavioural check: _verify_and_advance must invoke run_scoped_verification
+        # (not skip it) because skip_verify=False.
+        mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        assert mock_verify.called, (
+            'run_scoped_verification must be invoked on a race-retry success '
+            '(skip_verify=False); verification was skipped.'
+        )

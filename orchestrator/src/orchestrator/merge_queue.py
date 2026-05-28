@@ -186,6 +186,26 @@ def _verify_hit_enospc(verify: VerifyResult) -> bool:
     return any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
+_SPECULATION_RACE_MARKER = 'not something we can merge'
+"""LOAD-BEARING exact substring match on git porcelain output.
+
+Do NOT paraphrase this string. Git emits it verbatim when a ref cannot be
+resolved to a mergeable object (e.g. the branch was force-pushed away between
+the speculative merge build and the re-merge attempt). The exact phrase is what
+distinguishes a speculation-race failure from other git non-conflict errors.
+"""
+
+
+def _is_speculation_race(stderr: str) -> bool:
+    """True when *stderr* from a failed merge contains the speculation-race signature.
+
+    Uses a load-bearing exact substring match against ``_SPECULATION_RACE_MARKER``
+    (the git porcelain phrase ``not something we can merge``).  Mirrors the
+    ``_verify_hit_enospc`` / ``_ENOSPC_MARKERS`` pattern.
+    """
+    return _SPECULATION_RACE_MARKER in stderr
+
+
 async def _ensure_verify_disk_space(
     git_ops: GitOps,
     merge_wt: Path,
@@ -2722,6 +2742,127 @@ class SpeculativeMergeWorker:
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
         )
+
+        # ── Speculation-race retry ─────────────────────────────────────────────
+        # When the first attempt fails with the load-bearing git porcelain phrase
+        # ``not something we can merge`` (detected by _is_speculation_race) AND
+        # the merge ran against a stale base (pre_merge_sha != actual_main), main
+        # advanced between our get_main_sha() read and merge_to_main's own read,
+        # so the worktree was built against a commit no longer on main.  Retry
+        # exactly once against a freshly-read main HEAD to clear the stale-base
+        # environment.
+        #
+        # Design note: git emits this phrase when the merge argument (the branch
+        # ref) cannot be resolved to a commit — e.g. a stale ref cache after
+        # rapid concurrent pushes.  The pre_merge_sha != actual_main gate pins
+        # the retry to cases where the base genuinely drifted; if the branch ref
+        # was deleted or force-pushed between the two calls, the retry will fail
+        # identically.  The full stderr is attached to the warning log below for
+        # post-hoc diagnosis.
+        #
+        # merge_to_main self-cleans its worktree on non-conflict failure, so
+        # merge_result.merge_worktree is None here — no pre-retry cleanup needed.
+        if (
+            not merge_result.success
+            and not merge_result.conflicts
+            and _is_speculation_race(merge_result.details)
+            and merge_result.pre_merge_sha is not None
+            and merge_result.pre_merge_sha != actual_main
+        ):
+            retry_main = await self._git_ops.get_main_sha()
+            logger.warning(
+                'Task %s: speculation-race detected (first_base=%s, stderr=%r) '
+                '— retrying against main %s',
+                req.task_id, merge_result.pre_merge_sha[:8],
+                merge_result.details[:120], retry_main[:8],
+            )
+            retry_result = await self._git_ops.merge_to_main(
+                req.worktree, req.branch, base_sha=retry_main,
+            )
+            if retry_result.success:
+                logger.info(
+                    'Task %s: merge_retry_after_speculation_race succeeded '
+                    '(retry_base=%s)',
+                    req.task_id, retry_main[:8],
+                )
+                # skip_verify is UNCONDITIONALLY False on the race-retry path.
+                #
+                # merge_to_main pins pre_merge_sha to the explicit base_sha=retry_main,
+                # so the old expression (req.pre_rebased and pre_merge_sha==retry_main)
+                # was a tautology that degenerated to skip_verify=req.pre_rebased.
+                # However, this branch is reached ONLY after the gate confirmed main
+                # advanced (merge_result.pre_merge_sha != actual_main): the branch was
+                # pre-rebased onto the OLD main while the retry merges it against the
+                # newer retry_main, integrating main commits the branch never
+                # incorporated.  The documented skip_verify invariant
+                # ('pre_rebased AND main unchanged', SpeculativeItem.skip_verify) does
+                # NOT hold; skipping verification would let semantically-unverified
+                # main commits land on the protected branch.  Always verify.
+                return SpeculativeItem(
+                    request=req, merge_result=retry_result,
+                    merge_wt=retry_result.merge_worktree,
+                    base_sha=retry_main, speculative=False, skip_verify=False,
+                    started_monotonic=started_monotonic,
+                )
+            if retry_result.conflicts:
+                _emit_merge_attempt(
+                    self._event_store, req.task_id, 'conflict',
+                    duration_ms=_elapsed_ms(started_monotonic),
+                )
+                if retry_result.merge_worktree:
+                    await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
+                return SpeculativeItem(
+                    request=req, merge_result=None, merge_wt=None,
+                    base_sha=retry_main, speculative=False, skip_verify=False,
+                    immediate_outcome=MergeOutcome(
+                        'conflict', conflict_details=retry_result.details,
+                    ),
+                    started_monotonic=started_monotonic,
+                )
+            # Retry non-conflict failure — build μ diagnostics for BOTH attempts
+            # and surface them together in reason and failure_diagnostic.
+            if retry_result.merge_worktree:
+                await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
+            first_diag = await self._build_merge_failure_diagnostic(
+                req,
+                base_sha=merge_result.pre_merge_sha or actual_main,
+                base_label='main_head',
+                git_stderr=merge_result.details,
+            )
+            retry_diag = await self._build_merge_failure_diagnostic(
+                req,
+                base_sha=retry_result.pre_merge_sha or retry_main,
+                base_label='main_head',
+                git_stderr=retry_result.details,
+            )
+            first_rendered = self._render_failure_diagnostic(first_diag)
+            retry_rendered = self._render_failure_diagnostic(retry_diag)
+            # Combined failure_diagnostic: retry (final) attempt's μ 4 keys
+            # plus first-attempt extras under prefixed keys.
+            combined_diag: dict[str, str] = {
+                **retry_diag,
+                'first_attempt_base_sha': first_diag['base_sha'],
+                'first_attempt_git_stderr': first_diag['git_stderr'],
+            }
+            combined_reason = (
+                f'Attempt 1: {merge_result.details}\n{first_rendered}\n'
+                f'Attempt 2 (retry against main {retry_main[:8]}): '
+                f'{retry_result.details}\n{retry_rendered}'
+            )
+            retry_outcome = MergeOutcome(
+                'blocked',
+                reason=combined_reason,
+                failure_diagnostic=combined_diag,
+            )
+            return SpeculativeItem(
+                request=req, merge_result=None, merge_wt=None,
+                base_sha=retry_main, speculative=False, skip_verify=False,
+                immediate_outcome=retry_outcome,
+                failure_diagnostic=combined_diag,
+                started_monotonic=started_monotonic,
+            )
+        # ── END speculation-race retry ─────────────────────────────────────────
+
         if merge_result.conflicts:
             _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(started_monotonic))
             if merge_result.merge_worktree:
