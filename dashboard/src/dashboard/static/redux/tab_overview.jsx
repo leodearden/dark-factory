@@ -32,6 +32,21 @@ function formatLoadValue(key, type, v) {
 function HostLoadCard() {
   const [load, setLoad] = useState(null);
 
+  useEffect(() => {
+    let alive = true;
+    async function fetchLoad() {
+      try {
+        const resp = await fetch('/api/load', { credentials: 'same-origin' });
+        if (!resp.ok) return;
+        const body = await resp.json();
+        if (alive) setLoad(body);
+      } catch (_) { /* keep prior values on network blip */ }
+    }
+    fetchLoad();
+    const id = setInterval(fetchLoad, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
   return (
     <div className="panel">
       <div className="panel-head">
