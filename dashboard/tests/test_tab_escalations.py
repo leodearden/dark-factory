@@ -172,3 +172,54 @@ def _assert_script_loads_before(
         f'BEFORE {after_label} (position {after_pos}). '
         f'{consumer_note}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-1 test: data.js registers the escalations endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
+    """data.js must register /api/v2/dashboard/escalations mapped to ['ESCALATIONS'].
+
+    The entry must be present in the static (unwindowed) section of endpointsFor,
+    and the empty-defaults block must initialise ESCALATIONS with the shape
+    expected by redux_api.shape_escalations: {subsections, summary:{by_level,by_status}}.
+    """
+    assert '/api/v2/dashboard/escalations' in data_js_body, (
+        "data.js does not contain the literal URL '/api/v2/dashboard/escalations' — "
+        'add it to the unwindowed entries in endpointsFor.'
+    )
+    assert "'ESCALATIONS'" in data_js_body or '"ESCALATIONS"' in data_js_body, (
+        "data.js does not reference 'ESCALATIONS' — add it as the mapped key "
+        "for '/api/v2/dashboard/escalations' in endpointsFor."
+    )
+    seed_block = _extract_df_data_block(data_js_body, 'ESCALATIONS')
+    assert seed_block, (
+        'data.js does not contain an `ESCALATIONS: { ... }` seed block — '
+        'add the initializer to the window.DF_DATA assignment so applyKey has '
+        'something to replace on each poll.'
+    )
+    # Scoped checks: assert top-level keys are present inside the ESCALATIONS block.
+    assert re.search(r'\bsubsections\s*:', seed_block), (
+        "ESCALATIONS seed missing key 'subsections:' — "
+        'add it to the window.DF_DATA ESCALATIONS initializer in data.js.'
+    )
+    assert re.search(r'\bsummary\s*:', seed_block), (
+        "ESCALATIONS seed missing key 'summary:' — "
+        'add it to the window.DF_DATA ESCALATIONS initializer in data.js.'
+    )
+    # summary sub-block: check by_level and by_status are nested under summary.
+    summary_block = _extract_df_data_block(seed_block, 'summary')
+    assert summary_block, (
+        'ESCALATIONS seed summary block not found via _extract_df_data_block — '
+        'ensure summary is an object, not a scalar.'
+    )
+    assert re.search(r'\bby_level\s*:', summary_block), (
+        "ESCALATIONS.summary seed missing key 'by_level:' — "
+        'add it nested under summary in the ESCALATIONS seed block.'
+    )
+    assert re.search(r'\bby_status\s*:', summary_block), (
+        "ESCALATIONS.summary seed missing key 'by_status:' — "
+        'add it nested under summary in the ESCALATIONS seed block.'
+    )
