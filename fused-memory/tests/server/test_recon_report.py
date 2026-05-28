@@ -254,3 +254,51 @@ class TestReconReportCompleteIdempotence:
         # Warning recorded
         assert len(report['summary_warnings']) == 1
         assert 'summary B' in report['summary_warnings'][0]
+
+
+# ---------------------------------------------------------------------------
+# step-9: Unknown run_id returns structured error — RED until step-10
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportRunIdMismatch:
+    """All mutation tools return run_id_unknown for an unregistered run_id."""
+
+    _ERR = {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+
+    def test_add_finding_unknown_run_id(self):
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='ghost',
+            severity='low',
+            category='cat',
+            description='d',
+            suggested_action='a',
+        )
+        assert result['error'] == 'run_id_unknown'
+        assert result['error_type'] == 'ReconReportRunUnknown'
+
+    def test_set_stat_unknown_run_id(self):
+        state = self._make_state()
+        result = state.set_stat('ghost', 'k', 1)
+        assert result['error'] == 'run_id_unknown'
+
+    def test_inc_stat_unknown_run_id(self):
+        state = self._make_state()
+        result = state.inc_stat('ghost', 'k', 1)
+        assert result['error'] == 'run_id_unknown'
+
+    def test_complete_unknown_run_id(self):
+        state = self._make_state()
+        result = state.complete('ghost', 'summary')
+        assert result['error'] == 'run_id_unknown'
+
+    def test_get_assembled_report_unknown_returns_none(self):
+        state = self._make_state()
+        assert state.get_assembled_report('ghost', 'some_stage') is None
