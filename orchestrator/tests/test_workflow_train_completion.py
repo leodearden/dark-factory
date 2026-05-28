@@ -211,3 +211,124 @@ async def test_tip_fires_group_merge_happy_path():
     assert returned == statuses_dict, (
         f'status_check must return plain dict, got {returned!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: Invariant (no-fire) tests — RED against step-4's unconditional impl
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_partial_train_does_not_fire():
+    """Test A — partial train: tip present but sibling '102' is not merge-deferred.
+
+    _maybe_enqueue_group_merge must return None and the asyncio.Queue must
+    remain EMPTY (no GroupMergeRequest enqueued).
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'in-progress', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+        tasks_by_train_return=members,
+    )
+    # Should not be called, but stub defensively
+    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
+
+    result = await f.wf._maybe_enqueue_group_merge()
+
+    assert result is None, (
+        f'Expected None (partial train must not fire), got {result!r}'
+    )
+    assert f.merge_queue.empty(), (
+        'Queue must be empty — GroupMergeRequest must not be enqueued for incomplete train'
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_status_trusted_over_lagging_get_tasks():
+    """Test B — self's just-written status is trusted even if get_tasks still shows old value.
+
+    Scenario: self is tip (103, order 2); '101' and '102' are merge-deferred;
+    '103' is listed as 'in-progress' in the get_tasks result (simulating a
+    lag).  The trigger must trust self's status as 'merge-deferred' (just
+    written) and still FIRE (return non-None) when all others are deferred.
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        # NOTE: stale status for self — trigger must override with 'merge-deferred'
+        {'id': '103', 'status': 'in-progress', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+        tasks_by_train_return=members,
+    )
+    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done', merge_sha='abc'))  # type: ignore[method-assign]
+
+    result = await f.wf._maybe_enqueue_group_merge()
+
+    assert result == WorkflowOutcome.DONE, (
+        f'Expected DONE — self status must be trusted as merge-deferred; got {result!r}'
+    )
+    assert not f.merge_queue.empty(), (
+        'GroupMergeRequest must be enqueued when all members are effectively deferred'
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_tip_member_does_not_fire():
+    """Test C — non-tip member (order 0) must not enqueue the GroupMergeRequest.
+
+    Even when all 3 members are merge-deferred, only the tip (highest order)
+    should fire.  Task '101' (order 0) must return None with empty queue.
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    # Build workflow for the ROOT member (101, order 0) — NOT the tip
+    f = _make(
+        task_id='101',
+        metadata={'train': {'id': 'T1', 'order': 0}},
+        tasks_by_train_return=members,
+    )
+    f.wf._await_cancellable = AsyncMock(return_value=MergeOutcome('done'))  # type: ignore[method-assign]
+
+    result = await f.wf._maybe_enqueue_group_merge()
+
+    assert result is None, (
+        f'Expected None — non-tip must not fire GroupMergeRequest; got {result!r}'
+    )
+    assert f.merge_queue.empty(), (
+        'Queue must be empty — only the tip should enqueue a GroupMergeRequest'
+    )
+
+
+@pytest.mark.asyncio
+async def test_enter_merge_deferred_returns_merge_deferred_when_trigger_parks():
+    """Test D — _enter_merge_deferred returns MERGE_DEFERRED when trigger returns None.
+
+    Patch _maybe_enqueue_group_merge to AsyncMock→None; assert that
+    _enter_merge_deferred sets status=merge-deferred and returns MERGE_DEFERRED.
+    """
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+    )
+    f.wf._maybe_enqueue_group_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    outcome = await f.wf._enter_merge_deferred()
+
+    # status written
+    f.scheduler.set_task_status.assert_awaited_once_with('103', 'merge-deferred')
+    # requeue count cleared
+    f.scheduler.clear_requeue_count.assert_called_once_with('103')
+    # outcome
+    assert outcome == WorkflowOutcome.MERGE_DEFERRED, (
+        f'Expected MERGE_DEFERRED when trigger parks, got {outcome!r}'
+    )
