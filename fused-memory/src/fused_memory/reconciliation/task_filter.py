@@ -19,9 +19,41 @@ keeps holding-state members visible in reconciliation prompts until done.
 from __future__ import annotations
 
 import heapq
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+# --------------------------------------------------------------------------- #
+# Count-snapshot detection
+# --------------------------------------------------------------------------- #
+
+# Matches lines containing >=2 occurrences of `\d+ <status>` on a single line.
+# Non-DOTALL so the two tokens cannot span a newline.
+COUNT_SNAPSHOT_RE: re.Pattern[str] = re.compile(
+    r'\b\d+\s+(?:done|cancell?ed|pending|in[-_ ]?progress|blocked|deferred|review|total|merge[-_ ]?deferred)\b'
+    r'.*?'
+    r'\b\d+\s+(?:done|cancell?ed|pending|in[-_ ]?progress|blocked|deferred|review|total|merge[-_ ]?deferred)\b',
+    re.IGNORECASE,
+)
+
+
+def is_count_snapshot(text: str) -> bool:
+    """Return True when text contains a count-snapshot pattern (>=2 digit+status tokens)."""
+    return bool(COUNT_SNAPSHOT_RE.search(text))
+
+
+def strip_snapshot_lines(text: str) -> tuple[str, int]:
+    """Remove count-snapshot lines from text.
+
+    Splits on newline, drops lines where is_count_snapshot is True, rejoins,
+    and returns (filtered_text, num_dropped).
+    """
+    lines = text.split('\n')
+    kept = [line for line in lines if not COUNT_SNAPSHOT_RE.search(line)]
+    dropped = len(lines) - len(kept)
+    return '\n'.join(kept), dropped
+
 
 # --------------------------------------------------------------------------- #
 # Status constants

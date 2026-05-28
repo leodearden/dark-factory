@@ -2620,3 +2620,139 @@ class TestDetectCensusInconsistency:
         assert result == [], (
             f'Expected [] for empty referenced_ids, got {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# COUNT_SNAPSHOT_RE / is_count_snapshot / strip_snapshot_lines  (task 1547)
+# ---------------------------------------------------------------------------
+
+
+class TestCountSnapshotPrimitives:
+    """Tests for COUNT_SNAPSHOT_RE, is_count_snapshot, and strip_snapshot_lines.
+
+    These primitives detect and strip lines that contain count-snapshot text
+    (e.g. '1505 done / 148 cancelled tasks') from reconciliation payloads.
+    """
+
+    # ------------------------------------------------------------------ #
+    # is_count_snapshot — positive fixtures
+    # ------------------------------------------------------------------ #
+
+    def test_positive_full_status_snapshot(self):
+        """Full status snapshot (pending / in-progress / blocked / deferred / done / cancelled)
+        must be detected as a count-snapshot.
+        """
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+        text = (
+            'As of 2026-05-28, project reify has 2 pending / 2 in-progress / '
+            '0 blocked / 1 deferred / 1505 done / 148 cancelled tasks'
+        )
+        assert is_count_snapshot(text) is True, (
+            f'Expected is_count_snapshot to return True for full-status snapshot, got False.\n'
+            f'text={text!r}'
+        )
+
+    def test_positive_partial_snapshot_done_cancelled_total(self):
+        """Partial snapshot (done, cancelled, total) must be detected."""
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+        text = '...3355 done, 290 cancelled, 3358 total...'
+        assert is_count_snapshot(text) is True, (
+            f'Expected is_count_snapshot to return True for partial snapshot, got False.\n'
+            f'text={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # is_count_snapshot — negative fixtures
+    # ------------------------------------------------------------------ #
+
+    def test_negative_single_done_mention(self):
+        """Single incidental 'done' mention must NOT be detected as a snapshot."""
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+        text = 'Task 42 done via commit abc'
+        assert is_count_snapshot(text) is False, (
+            f'Expected is_count_snapshot to return False for single done mention, got True.\n'
+            f'text={text!r}'
+        )
+
+    def test_negative_legitimate_temporal_fact(self):
+        """Legitimate temporal fact mentioning done in passing must NOT be detected."""
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+        text = 'Decision: mark the rollout done once QA signs off'
+        assert is_count_snapshot(text) is False, (
+            f'Expected is_count_snapshot to return False for legitimate temporal fact, got True.\n'
+            f'text={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # COUNT_SNAPSHOT_RE — basic contract
+    # ------------------------------------------------------------------ #
+
+    def test_count_snapshot_re_is_compiled_pattern(self):
+        """COUNT_SNAPSHOT_RE must be a compiled regex pattern."""
+        import re
+
+        from fused_memory.reconciliation.task_filter import COUNT_SNAPSHOT_RE
+
+        assert hasattr(COUNT_SNAPSHOT_RE, 'search'), (
+            'COUNT_SNAPSHOT_RE must be a compiled regex with a .search method'
+        )
+        assert hasattr(COUNT_SNAPSHOT_RE, 'flags'), (
+            'COUNT_SNAPSHOT_RE must have a .flags attribute (compiled pattern)'
+        )
+        assert COUNT_SNAPSHOT_RE.flags & re.IGNORECASE, (
+            'COUNT_SNAPSHOT_RE must be compiled with re.IGNORECASE'
+        )
+
+    # ------------------------------------------------------------------ #
+    # strip_snapshot_lines — removes only the snapshot line
+    # ------------------------------------------------------------------ #
+
+    def test_strip_removes_snapshot_line_preserves_benign(self):
+        """strip_snapshot_lines drops the snapshot line and keeps benign lines verbatim."""
+        from fused_memory.reconciliation.task_filter import strip_snapshot_lines
+
+        block = (
+            'Entity summary line A\n'
+            'As of 2026-05-28, project reify has 1505 done / 148 cancelled tasks\n'
+            'Entity summary line B'
+        )
+        result_text, count = strip_snapshot_lines(block)
+
+        assert '1505 done' not in result_text, (
+            f'Snapshot line must be stripped; got result_text={result_text!r}'
+        )
+        assert 'Entity summary line A' in result_text, (
+            f'"Entity summary line A" must be preserved; got result_text={result_text!r}'
+        )
+        assert 'Entity summary line B' in result_text, (
+            f'"Entity summary line B" must be preserved; got result_text={result_text!r}'
+        )
+        # Verify order is preserved
+        pos_a = result_text.index('Entity summary line A')
+        pos_b = result_text.index('Entity summary line B')
+        assert pos_a < pos_b, (
+            f'"Entity summary line A" must appear before "Entity summary line B" in result; '
+            f'got result_text={result_text!r}'
+        )
+        assert count == 1, (
+            f'Expected count=1 (one snapshot line stripped), got count={count}'
+        )
+
+    def test_strip_returns_unchanged_text_and_zero_when_no_snapshot(self):
+        """strip_snapshot_lines returns (unchanged_text, 0) when no snapshot lines are present."""
+        from fused_memory.reconciliation.task_filter import strip_snapshot_lines
+
+        block = 'Benign line one\nBenign line two\nNo snapshots here'
+        result_text, count = strip_snapshot_lines(block)
+
+        assert result_text == block, (
+            f'Text must be unchanged when no snapshot lines present; '
+            f'got result_text={result_text!r}'
+        )
+        assert count == 0, (
+            f'Expected count=0 when no snapshot lines stripped, got count={count}'
+        )
