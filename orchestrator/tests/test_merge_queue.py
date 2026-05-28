@@ -7495,7 +7495,7 @@ class TestTrainLifecycleEvents:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         """Happy-path 3-member train → train_started then train_merged emitted."""
-        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.event_store import EventStore
 
         req = await _make_stacked_train(git_ops, config)
         db_path = tmp_path / 'train_events.db'
