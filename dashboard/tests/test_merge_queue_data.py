@@ -2261,3 +2261,117 @@ class TestActiveQueuedMerges:
         result = await active_queued_merges(None, ttl_minutes=30, now=now)
         assert result == []
 
+
+# ---------------------------------------------------------------------------
+# TestRecentTrainEvents
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecentTrainEvents:
+    """Tests for recent_train_events() in dashboard.data.merge_queue."""
+
+    async def test_returns_only_train_events_newest_first(self, tmp_path) -> None:
+        """Returns only train_* rows, newest first, excludes unrelated events."""
+        from dashboard.data.merge_queue import recent_train_events
+
+        now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        train_types = ['train_started', 'train_member_deferred', 'train_merged', 'train_derailed']
+        events = []
+        for i, etype in enumerate(train_types):
+            events.append(dict(
+                event_type=etype,
+                timestamp=now - timedelta(hours=1, minutes=10 - i),
+                task_id=f'task-{i}',
+                run_id=f'run-{i}',
+                data={'train_id': f'train-{i}', 'extra': i},
+            ))
+        # Unrelated event — must be excluded
+        events.append(dict(
+            event_type='merge_attempt',
+            timestamp=now - timedelta(hours=1),
+            task_id='task-unrelated',
+            run_id='run-unrelated',
+            data={'outcome': 'done'},
+        ))
+
+        db_path = _make_db(tmp_path, 'train_events.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_train_events(db, now=now)
+
+        assert len(result) == 4, f'Expected 4 train_* rows, got {len(result)}: {result}'
+        actual_types = [r['event_type'] for r in result]
+        # Newest first: train_derailed (i=3, -1h+7min) > ... > train_started (i=0, -1h+10min)
+        assert actual_types[0] == 'train_derailed', f'Newest first: got {actual_types}'
+        assert set(actual_types) == set(train_types)
+        # Check required keys
+        for r in result:
+            assert 'task_id' in r
+            assert 'run_id' in r
+            assert 'event_type' in r
+            assert 'timestamp' in r
+            assert isinstance(r['data'], dict), f'data must be a dict, got {type(r["data"])}'
+            assert 'train_id' in r['data']
+
+    async def test_none_db_returns_empty_list(self) -> None:
+        """Passing db=None returns [] without raising."""
+        from dashboard.data.merge_queue import recent_train_events
+
+        result = await recent_train_events(None)
+        assert result == []
+
+    async def test_hours_window_excludes_old_events(self, tmp_path) -> None:
+        """Events older than hours window are excluded."""
+        from dashboard.data.merge_queue import recent_train_events
+
+        now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        events = [
+            dict(
+                event_type='train_started',
+                timestamp=now - timedelta(hours=2),  # within default 168h
+                task_id='task-recent',
+                run_id='run-recent',
+                data={'train_id': 'train-recent'},
+            ),
+            dict(
+                event_type='train_merged',
+                timestamp=now - timedelta(hours=200),  # OUTSIDE 168h default
+                task_id='task-old',
+                run_id='run-old',
+                data={'train_id': 'train-old'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'train_window.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_train_events(db, hours=168, now=now)
+
+        assert len(result) == 1, f'Expected 1 recent event, got {len(result)}'
+        assert result[0]['task_id'] == 'task-recent'
+
+    async def test_limit_arg(self, tmp_path) -> None:
+        """limit argument restricts number of results returned."""
+        from dashboard.data.merge_queue import recent_train_events
+
+        now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        events = [
+            dict(
+                event_type='train_started',
+                timestamp=now - timedelta(hours=1, minutes=i + 1),
+                task_id=f'task-{i}',
+                run_id=f'run-{i}',
+                data={'train_id': f'train-{i}'},
+            )
+            for i in range(10)
+        ]
+        db_path = _make_db(tmp_path, 'train_limit.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_train_events(db, limit=3, now=now)
+
+        assert len(result) == 3, f'Expected 3 results (limit=3), got {len(result)}'
+
