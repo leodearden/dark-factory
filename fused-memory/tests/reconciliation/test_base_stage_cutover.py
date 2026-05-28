@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
 
-def _make_stage(recon_report_port: int = 8003) -> MemoryConsolidator:
+def _make_stage(
+    recon_report_port: int = 8003,
+    recon_report_state=None,
+) -> MemoryConsolidator:
     """Build a MemoryConsolidator stub with minimal mock deps and a given recon_report_port."""
     config = ReconciliationConfig()
     memory_mock = AsyncMock()
@@ -28,12 +31,123 @@ def _make_stage(recon_report_port: int = 8003) -> MemoryConsolidator:
         AsyncMock(),  # journal
         config,
         recon_report_port=recon_report_port,
+        recon_report_state=recon_report_state,
     )
     stage.project_id = 'test_project'
     stage.project_root = '/tmp/test'
     stage.episode_limit = 5
     stage.memory_limit = 10
     return stage
+
+
+class _FakeReconState:
+    """Recording fake for ReconReportState — logs calls for assertion."""
+
+    def __init__(self, assembled_report: dict | None = None):
+        self.calls: list[tuple] = []
+        self._assembled = assembled_report
+
+    def start_report(self, run_id: str, stage: str, project_id: str) -> dict:
+        self.calls.append(('start_report', run_id, stage, project_id))
+        return {'run_id': run_id, 'stage': stage}
+
+    def get_assembled_report(self, run_id: str, stage: str) -> dict | None:
+        self.calls.append(('get_assembled_report', run_id, stage))
+        return self._assembled
+
+
+class TestReconStateLifecycle:
+    """BaseStage.run must call start_report before the CLI and get_assembled_report after."""
+
+    @pytest.mark.asyncio
+    async def test_start_report_called_before_cli(self):
+        """start_report is called once with (run_id, stage_id.value, project_id)."""
+        call_log: list[str] = []
+
+        assembled = {
+            'summary': 'ok',
+            'stats': {'items_reviewed': 5},
+            'flagged_items': [],
+            'summary_warnings': [],
+        }
+
+        class _RecordingState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                call_log.append('start_report')
+                return super().start_report(run_id, stage, project_id)
+
+            def get_assembled_report(self, run_id, stage):
+                call_log.append('get_assembled_report')
+                return super().get_assembled_report(run_id, stage)
+
+        state = _RecordingState(assembled_report=assembled)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        fake_result = StageResult(report={}, success=True)
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=fake_result),
+        ) as mock_cli:
+            report = await stage.run([], watermark, [], run_id='run-001')
+
+        # start_report must be called before the CLI (first in log)
+        assert call_log[0] == 'start_report', 'start_report must be called before CLI'
+        assert call_log[1] == 'get_assembled_report', 'get_assembled_report called after CLI'
+
+    @pytest.mark.asyncio
+    async def test_start_report_args(self):
+        """start_report receives the correct run_id, stage_id.value, and project_id."""
+        assembled = {'summary': '', 'stats': {}, 'flagged_items': [], 'summary_warnings': []}
+        state = _FakeReconState(assembled_report=assembled)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            await stage.run([], watermark, [], run_id='run-abc')
+
+        start_call = next(c for c in state.calls if c[0] == 'start_report')
+        assert start_call[1] == 'run-abc'  # run_id
+        assert start_call[2] == StageId.memory_consolidator.value  # stage
+        assert start_call[3] == 'test_project'  # project_id
+
+    @pytest.mark.asyncio
+    async def test_assembled_report_overrides_stage_result(self):
+        """StageReport.items_flagged and stats come from assembled report, not stage_result."""
+        assembled = {
+            'summary': 'test summary',
+            'stats': {'items_reviewed': 42},
+            'flagged_items': [{'description': 'test finding', 'severity': 'minor'}],
+            'summary_warnings': [],
+        }
+        state = _FakeReconState(assembled_report=assembled)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        # stage_result.report has different content — should be ignored
+        dummy_result = StageResult(
+            report={'flagged_items': [], 'stats': {}, 'summary': 'ignored'},
+            success=True,
+        )
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=dummy_result),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-xyz')
+
+        assert report.items_flagged == assembled['flagged_items']
+        assert report.stats == assembled['stats']
 
 
 class TestBuildMcpConfigReconReport:
