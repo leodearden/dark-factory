@@ -18,13 +18,13 @@ from pathlib import Path
 
 import pytest
 from shared.async_sqlite_base import CheckpointResult
+from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 from fused_memory.server.tools import (
     _checkpoint_overrides_db,
     _connect_overrides_db,
     _open_overrides_db,
 )
-from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 # ---------------------------------------------------------------------------
 # TestOpenOverridesDbPragmas
