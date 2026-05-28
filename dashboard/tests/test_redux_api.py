@@ -551,3 +551,38 @@ class TestShapeEscalations:
         # original esc fields preserved
         assert row['id'] == 'esc-99'
         assert row['summary'] == 'gone'
+
+    def test_shape_escalations_reconciliation_resolves_via_worktree(self, tmp_path):
+        """Reconciliation row: worktree under projA root → project='projA', task resolved."""
+        task = {
+            'id': 7, 'title': 'recon-task-7', 'description': 'x',
+            'details': '', 'status': 'pending', 'priority': 'medium',
+            'dependencies': [], 'metadata': {},
+        }
+        projA_root = tmp_path / 'projA'
+        projA_root.mkdir()
+        worktree_path = str(projA_root / '.worktrees' / '7')
+        subsection = {
+            'id': 'reconciliation',
+            'label': 'fused-memory',
+            'kind': 'reconciliation',
+            'escalations': [
+                {
+                    'id': 'esc-r1',
+                    'task_id': '7',
+                    'worktree': worktree_path,
+                    'level': 1,
+                    'status': 'pending',
+                },
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        task_maps = {str(projA_root): [task]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] == 'projA'
+        assert row['task'] == task
+        assert row['task_unresolved'] is False
