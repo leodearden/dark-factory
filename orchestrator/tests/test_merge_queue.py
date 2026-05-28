@@ -5576,6 +5576,12 @@ class TestGroupMergeRequestDataclass:
 # ---------------------------------------------------------------------------
 
 
+async def _setup_repo_with_config(repo: Path) -> None:
+    """Set git identity in a repo (required for commits)."""
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+
+
 async def _make_stacked_train(
     git_ops: GitOps,
     config: OrchestratorConfig,
@@ -5716,3 +5722,63 @@ class TestGroupMergeRequestHappyPath:
         assert len(called_shas) == 1, f'all callbacks must share one SHA, got: {called_shas}'
         called_sha = next(iter(called_shas))
         assert called_sha == outcome.merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestGroupMergeRequestTrainIncomplete (MergeWorker) — step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGroupMergeRequestTrainIncomplete:
+    """PRD spec §9.6 step 1: non-merge-deferred member → immediate block."""
+
+    async def test_incomplete_member_blocks_before_git(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """One member not merge-deferred → blocked with TRAIN_INCOMPLETE prefix; no git work."""
+        req = await _make_stacked_train(git_ops, config)
+        # Override status_check to return one non-deferred member
+        req.status_check = AsyncMock(return_value={
+            'trn-a': 'merge-deferred',
+            'trn-b': 'in-progress',  # not deferred
+            'trn-c': 'merge-deferred',
+        })
+
+        # Capture main SHA before calling _do_merge
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        main_before = main_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Spy on merge_to_main: should NOT be called
+        with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX), (
+            f'expected TRAIN_INCOMPLETE prefix, got: {outcome.reason!r}'
+        )
+        # Naming the offending member in the reason
+        assert 'trn-b' in outcome.reason, (
+            f'expected offending member in reason, got: {outcome.reason!r}'
+        )
+        assert 'in-progress' in outcome.reason, (
+            f'expected offending status in reason, got: {outcome.reason!r}'
+        )
+
+        # Main unchanged (no new commits)
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == main_before, 'main must not advance on incomplete train'
+
+        # No git merge work done
+        spy_merge.assert_not_called()
+
+        # No member callbacks
+        req.mark_member_done.assert_not_called()
