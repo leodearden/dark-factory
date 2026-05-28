@@ -531,12 +531,15 @@ def create_server(
         await enqueue_merge_request(merge_queue, merge_req, event_store)
 
         outcome = await future
-        return {
+        result: dict[str, Any] = {
             'status': outcome.status,
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
             'push_status': outcome.push_status,
         }
+        if outcome.failure_diagnostic is not None:
+            result['failure_diagnostic'] = outcome.failure_diagnostic
+        return result
 
     @mcp.tool()
     async def release_workflow(

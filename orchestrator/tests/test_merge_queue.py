@@ -6321,3 +6321,180 @@ class TestGroupMergeRequestTrainVerifyRole:
         assert captured_kwargs[0].get('role') == 'merge', (
             f"train-merge verify must pass role='merge'; got {captured_kwargs[0]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeFailureDiagnostic — task 1539
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeFailureDiagnostic:
+    """Merge-failure diagnostic enrichment: base SHA, label, ref-resolution, git stderr."""
+
+    async def test_remerge_ghost_branch_sets_failure_diagnostic(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_remerge on a non-existent branch populates failure_diagnostic on the outcome.
+
+        The 'task/ghost' ref does not exist → git fatal + branch_ref_in_worktree=<unresolved>.
+        This is the smoking-gun for the 2026-05-28 'not something we can merge' incident.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('ghost', 'ghost', git_ops.project_root, config)
+        item = await worker._remerge(req, None)
+
+        outcome = item.immediate_outcome
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+        # failure_diagnostic must be populated with all four keys
+        assert outcome.failure_diagnostic is not None, (
+            'failure_diagnostic must be set on blocked outcome from _remerge'
+        )
+        diag = outcome.failure_diagnostic
+        assert len(diag['base_sha']) == 40, f'base_sha must be 40-char hex: {diag["base_sha"]!r}'
+        assert all(c in '0123456789abcdef' for c in diag['base_sha'])
+        assert diag['base_label'] == 'main_head'
+        assert diag['branch_ref_in_worktree'] == '<unresolved>'
+        assert isinstance(diag['git_stderr'], str) and diag['git_stderr'], (
+            'git_stderr must be a non-empty string'
+        )
+
+        # item.failure_diagnostic must mirror outcome.failure_diagnostic
+        assert item.failure_diagnostic == diag
+
+        # rendered labels must appear in reason for backward compat
+        assert 'base_sha=' in outcome.reason
+        assert 'base_label=main_head' in outcome.reason
+        assert 'branch_ref_in_worktree=<unresolved>' in outcome.reason
+
+    async def test_merger_loop_ghost_branch_sets_failure_diagnostic(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Non-existent branch through the Merger loop (direct merge_request path) sets failure_diagnostic.
+
+        The direct merge_request path flows through _merger_loop, not _remerge.
+        Uses a real worktree (non-main HEAD) so the already-merged check passes,
+        but the branch ref 'task/ghost-m' does not exist → merge fails.
+        """
+        # Create a real branch so the worktree HEAD is NOT an ancestor of main
+        # (which would short-circuit to already_merged before the merge attempt).
+        # The request branch name 'ghost-m' has no refs/heads/task/ghost-m ref.
+        wt = await _make_branch_with_file(git_ops, 'phantom-1', 'ph1.py', 'x = 1\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('ghost-m', 'ghost-m', wt, config)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert outcome.failure_diagnostic is not None, (
+            'failure_diagnostic must be set on blocked outcome from Merger loop'
+        )
+        diag = outcome.failure_diagnostic
+        assert len(diag['base_sha']) == 40
+        assert all(c in '0123456789abcdef' for c in diag['base_sha'])
+        assert diag['base_label'] == 'main_head'
+        assert diag['branch_ref_in_worktree'] == '<unresolved>'
+        assert isinstance(diag['git_stderr'], str) and diag['git_stderr']
+        assert 'base_sha=' in outcome.reason
+        assert 'base_label=main_head' in outcome.reason
+        assert 'branch_ref_in_worktree=<unresolved>' in outcome.reason
+
+        await worker.stop()
+        await worker_task
+
+    async def test_merger_loop_speculative_ghost_sets_base_label_speculative(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """N+1 ghost branch speculatively merged gets failure_diagnostic['base_label']=='speculative'."""
+        wt_n = await _make_branch_with_file(
+            git_ops, 'spec-diag-n', 'diag_n.py', 'n = 1\n',
+        )
+        # N+1: real worktree (non-main HEAD) but ref 'task/ghost-spec' does not exist
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'phantom-n1', 'ph_n1.py', 'n1 = 2\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('spec-diag-n', 'spec-diag-n', wt_n, config)
+            req_n1 = _make_request('ghost-spec', 'ghost-spec', wt_n1, config)
+
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N should succeed: {outcome_n}'
+        assert outcome_n1.status == 'blocked', f'N+1 ghost should be blocked: {outcome_n1}'
+        assert outcome_n1.failure_diagnostic is not None
+        # N+1 was speculatively merged against N's merge commit → base_label='speculative'
+        assert outcome_n1.failure_diagnostic['base_label'] == 'speculative', (
+            f"expected 'speculative', got {outcome_n1.failure_diagnostic['base_label']!r}"
+        )
+        assert outcome_n1.failure_diagnostic['branch_ref_in_worktree'] == '<unresolved>'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_escalation_server_merge_request_failure_diagnostic(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """merge_request tool response includes failure_diagnostic on non-conflict failure.
+
+        Successful merges must NOT include failure_diagnostic (byte-identical response shape).
+        """
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        merge_q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, merge_q)
+        worker_task = asyncio.create_task(worker.run())
+
+        server = create_server(esc_queue, merge_queue=merge_q, orch_config=config)
+        from fastmcp.tools.function_tool import FunctionTool
+        tool = await server.get_tool('merge_request')
+        assert isinstance(tool, FunctionTool)
+
+        # Ghost branch: use a real worktree (non-main HEAD) but branch ref doesn't exist
+        wt_ghost = await _make_branch_with_file(git_ops, 'e2e-phantom', 'phantom.py', 'x = 1\n')
+
+        # Ghost branch → failure_diagnostic must appear in response
+        resp = await asyncio.wait_for(
+            tool.fn(task_id='ghost-e2e', branch='ghost-e2e', worktree=str(wt_ghost)),
+            timeout=30,
+        )
+        assert resp['status'] == 'blocked'
+        assert 'failure_diagnostic' in resp, (
+            f"'failure_diagnostic' missing from blocked response: {resp}"
+        )
+        diag = resp['failure_diagnostic']
+        assert diag['base_label'] == 'main_head'
+        assert diag['branch_ref_in_worktree'] == '<unresolved>'
+        assert len(diag['base_sha']) == 40
+
+        # Valid branch → NO failure_diagnostic in successful response
+        wt = await _make_branch_with_file(git_ops, 'e2e-valid', 'e2e.py', 'x = 1\n')
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            resp_ok = await asyncio.wait_for(
+                tool.fn(task_id='e2e-valid', branch='e2e-valid', worktree=str(wt)),
+                timeout=30,
+            )
+        assert resp_ok['status'] == 'done', f'expected done: {resp_ok}'
+        assert 'failure_diagnostic' not in resp_ok, (
+            f"'failure_diagnostic' must not appear in successful merge response: {resp_ok}"
+        )
+
+        await worker.stop()
+        await worker_task
