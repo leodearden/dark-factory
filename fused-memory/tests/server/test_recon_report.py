@@ -563,3 +563,57 @@ class TestReconReportBoot:
         config = self._make_config()
         _, mcp, _ = _build_recon_report_components(config)
         assert getattr(mcp._tool_manager, '_fused_memory_safe_wrapped', False)
+
+
+# ---------------------------------------------------------------------------
+# step-19: Reaper interface exposed but NOT started by _build_recon_report_components
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportReaperWiredAtBoot:
+    """Verify the reaper interface contract and that the factory stays test-friendly."""
+
+    def _make_config(self):
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+            ServerConfig,
+        )
+
+        return FusedMemoryConfig(
+            server=ServerConfig(recon_report_port=8003, host='127.0.0.1'),
+            reconciliation=ReconciliationConfig(recon_report_state_ttl_seconds=300),
+        )
+
+    def test_state_exposes_start_reaper_callable(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        state, _, _ = _build_recon_report_components(config)
+        assert callable(state.start_reaper)
+
+    def test_state_exposes_stop_reaper_callable(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        state, _, _ = _build_recon_report_components(config)
+        assert callable(state.stop_reaper)
+
+    def test_state_exposes_tick_callable(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        state, _, _ = _build_recon_report_components(config)
+        assert callable(state.tick)
+
+    def test_reaper_not_started_by_factory(self):
+        """_build_recon_report_components must NOT start the reaper task.
+
+        Starting the reaper is run_server()'s responsibility; the factory
+        must remain safe to call in unit tests (no asyncio.Task created).
+        """
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config()
+        state, _, _ = _build_recon_report_components(config)
+        assert state._reaper_task is None
