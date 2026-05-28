@@ -19,6 +19,21 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from typing import TypedDict
+
+class TrainState(TypedDict):
+    """Per-train context embedded in L1/L2 escalations for park-prefix derail triage.
+
+    Shape mirrors the dict returned by TaskWorkflow._build_train_state (PRD § 9.8).
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict / asdict()
+    paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    id: str               # train identifier
+    order: int            # this task's position in the train (0-based)
+    parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
+    failing_member: str   # this task's id (the one that triggered BLOCKED)
+
 
 # Severities that cause an escalation to be created directly at L2,
 # bypassing the auto-watcher and routing straight to a human.
@@ -61,10 +76,9 @@ class Escalation:
     root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
     # PRD § 9.8 — per-train context for park-prefix derail L2 escalations.
-    # Shape: {id: str, order: int, parked_members: list[str], failing_member: str}.
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
-    train_state: dict | None = None
+    train_state: TrainState | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

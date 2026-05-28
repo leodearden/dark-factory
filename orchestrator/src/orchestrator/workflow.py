@@ -5063,7 +5063,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Fast path: if metadata.train.members is a list, call get_statuses on
         those ids and filter.  Fallback: scan get_tasks() for tasks whose
-        metadata.train.id matches, then call get_statuses on the discovered ids.
+        metadata.train.id matches; status is read directly from the task dicts
+        (avoiding a redundant get_statuses round-trip — get_tasks already embeds
+        per-task status in each dict).
 
         Reuses the TrainMembership cast/isinstance convention from task 1522
         (git_ops.py:54-62); cast and TrainMembership are already imported.
@@ -5079,14 +5081,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if train_id is None or train_order is None:
             return None
 
-        # Discover candidate sibling task ids.
+        # Discover candidate sibling task ids and their statuses.
         members_cache = train.get('members')
         if isinstance(members_cache, list):
-            # Fast path — use the cached members list.
+            # Fast path — use the cached members list; fetch statuses from the server.
             candidates: list[str] = [str(m) for m in members_cache]
+            statuses, _ = await self.scheduler.get_statuses(candidates)
         else:
             # Fallback scan — discover siblings via get_tasks().
+            # Status is already embedded in each task dict; avoid a second round-trip.
             tasks = await self.scheduler.get_tasks()
+            statuses: dict[str, str] = {str(t['id']): str(t.get('status', 'unknown')) for t in tasks}
             candidates = [
                 str(t['id'])
                 for t in tasks
@@ -5094,7 +5099,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 and cast(TrainMembership, (t.get('metadata') or {}).get('train')).get('id') == train_id
             ]
 
-        statuses, _ = await self.scheduler.get_statuses(candidates)
         parked_members = [
             c for c in candidates
             if c != self.task_id and statuses.get(c) == 'merge-deferred'

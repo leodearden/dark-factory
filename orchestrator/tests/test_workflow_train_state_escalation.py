@@ -186,27 +186,25 @@ async def test_falls_back_to_get_tasks_scan_when_members_absent():
 
     metadata.train = {'id': 'T1', 'order': 2}  (no members)
 
-    get_tasks() returns tasks including siblings with matching train.id.
-    get_statuses() returns statuses for the discovered sibling ids.
+    get_tasks() returns tasks including siblings with matching train.id.  Each
+    task dict carries a 'status' field; the fallback path reads status directly
+    from those dicts — it must NOT issue a second get_statuses() round-trip.
 
     Expected result: parked_members contains only the merge-deferred siblings
     excluding self ('103').
     """
     sibling_tasks = [
-        {'id': '101', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
-        {'id': '102', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
-        {'id': '103', 'metadata': {'train': {'id': 'T1', 'order': 2}}},  # self
-        {'id': '200', 'metadata': {'train': {'id': 'T2', 'order': 0}}},  # different train
-        {'id': '201', 'metadata': {}},  # no train at all
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'done', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'blocked', 'metadata': {'train': {'id': 'T1', 'order': 2}}},  # self
+        {'id': '200', 'status': 'in-progress', 'metadata': {'train': {'id': 'T2', 'order': 0}}},  # different train
+        {'id': '201', 'status': 'in-progress', 'metadata': {}},  # no train at all
     ]
     f = _make(
         task_id='103',
         metadata={'train': {'id': 'T1', 'order': 2}},  # no 'members'
         get_tasks_return=sibling_tasks,
-        get_statuses_return=(
-            {'101': 'merge-deferred', '102': 'done', '103': 'blocked'},
-            None,
-        ),
+        # No get_statuses_return — fallback reads status directly from task dicts
     )
 
     result = await f.wf._build_train_state()
@@ -219,6 +217,31 @@ async def test_falls_back_to_get_tasks_scan_when_members_absent():
     assert result['parked_members'] == ['101']
     # Fallback path: get_tasks must have been called
     f.scheduler.get_tasks.assert_awaited_once()
+    # Fallback path: status comes from task dicts — get_statuses must NOT be called
+    f.scheduler.get_statuses.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_returns_train_state_for_order_zero():
+    """order=0 is a valid train order; the `is None` check must not treat it as absent.
+
+    Regression guard: a truthiness check (``if not train_order``) would silently
+    return None for order=0, dropping train_state for the first member of a train.
+    This test pins the ``is None`` semantics so a future refactor cannot regress it.
+    """
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 0, 'members': ['101', '102', '103']}},
+        get_statuses_return=(
+            {'101': 'merge-deferred', '102': 'merge-deferred', '103': 'blocked'},
+            None,
+        ),
+    )
+
+    result = await f.wf._build_train_state()
+
+    assert result is not None, '_build_train_state must not return None for order=0'
+    assert result['order'] == 0
 
 
 # ---------------------------------------------------------------------------
