@@ -333,3 +333,25 @@ def test_app_jsx_wires_escalations_tab(app_jsx_body: str) -> None:
         "app.jsx toolbarConfig does not have an 'esc:' entry — add "
         "`esc: { showWindow: false, showAgents: false, search: false }` to toolbarConfig."
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7 test: shell.jsx registers escalations glyph and rail entry
+# ---------------------------------------------------------------------------
+
+
+def test_shell_jsx_registers_escalations_glyph_and_rail_entry(shell_jsx_body: str) -> None:
+    """shell.jsx must include a Rail item with id 'esc' and a Glyph case 'esc'.
+
+    Asserts only the routing-relevant id and glyph-key wiring.  Cosmetic
+    fields (label, SVG path data) are intentionally omitted — they can be
+    renamed without breaking the routing.
+    """
+    assert "id: 'esc'" in shell_jsx_body, (
+        "shell.jsx Rail items array does not contain an entry with `id: 'esc'` "
+        '— add the escalations item to the Rail items array.'
+    )
+    assert "case 'esc':" in shell_jsx_body, (
+        "shell.jsx Glyph switch does not have a `case 'esc':` branch — "
+        'add an esc case returning a simple stroke SVG.'
+    )
