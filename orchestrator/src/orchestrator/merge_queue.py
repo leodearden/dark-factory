@@ -762,6 +762,26 @@ def _emit_merge_attempt(
         )
 
 
+def _emit_train_event(
+    event_store: EventStore | None,
+    event_type: EventType,
+    *,
+    task_id: str,
+    train_id: str,
+    member_task_ids: list[str] | None = None,
+    data: dict | None = None,
+) -> None:
+    """Emit a train lifecycle event.  No-op when *event_store* is None."""
+    if event_store is None:
+        return
+    payload: dict = {'train_id': train_id}
+    if member_task_ids is not None:
+        payload['member_task_ids'] = member_task_ids
+    if data:
+        payload.update(data)
+    event_store.emit(event_type, task_id=task_id, phase='merge', data=payload)
+
+
 INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
 """Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
 to be considered actively in-flight rather than abandoned.
