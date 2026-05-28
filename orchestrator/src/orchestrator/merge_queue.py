@@ -111,6 +111,16 @@ left clean.  The downstream classifier surfaces this to the enqueuer so the
 tip task can be re-rebased in its own worktree before the train is
 re-submitted."""
 
+TRAIN_PARTIAL_FLIP_REASON_PREFIX = 'Train partially flipped'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when a train lands
+(main advances successfully) but one or more ``mark_member_done`` callbacks
+raise after the advance.  The outcome status STAYS ``'done'`` — the git state
+is correct — but this prefix signals downstream reconciliation / the steward
+that some member tasks still need their status flipped.  Downstream classifiers
+pattern-match this prefix to distinguish a fully-clean landing
+(``reason=None``) from a partial-flip that requires manual / automated
+cleanup."""
+
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
 """Substrings (matched case-insensitively) that mark a disk-full failure.
@@ -799,9 +809,32 @@ async def _do_train_merge(
         return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
 
     # (g) Flip all members done — ONLY after advance succeeds.
+    # Each callback is wrapped in try/except so a single scheduler blip does
+    # NOT abort the remaining flips (split-brain prevention) and does NOT
+    # surface as a 'blocked' outcome that contradicts the landed git state.
     advanced_sha = git_ops._last_advanced_sha or merge_commit
+    failed: list[tuple[str, str]] = []
     for member_id in req.member_task_ids:
-        await req.mark_member_done(member_id, advanced_sha)
+        try:
+            await req.mark_member_done(member_id, advanced_sha)
+        except Exception as exc:
+            failed.append((member_id, repr(exc)))
+            logger.exception(
+                'Train %s: mark_member_done failed for member %s after main '
+                'advanced to %s',
+                req.train_id, member_id, advanced_sha,
+            )
+
+    if failed:
+        reason = (
+            f'{TRAIN_PARTIAL_FLIP_REASON_PREFIX}: train landed at '
+            f'{advanced_sha[:12]} but {len(failed)}/{len(req.member_task_ids)} '
+            f'member(s) failed to flip — manual cleanup required: '
+            + '; '.join(f'{mid}: {err}' for mid, err in failed)
+        )
+        logger.warning('Train %s: %s', req.train_id, reason)
+        _emit_merge_attempt(event_store, req.task_id, 'train_partial_flip', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
     logger.info(
         'Train %s: landed at %s; %d members marked done',
