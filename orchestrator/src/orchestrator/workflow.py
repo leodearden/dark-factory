@@ -982,6 +982,16 @@ class TaskWorkflow:
 
                 # MERGE (skip for eval mode — no merge into main)
                 if not self._worktree_external:
+                    # Train members hold at merge-deferred instead of merging;
+                    # the group-merge worker (δ₁) owns the eventual done
+                    # transition once all siblings are workspace-green (PRD §9.5,
+                    # γ₁).  The full execute→verify→review pipeline still ran
+                    # above (PRD acceptance criterion 5).  Non-train path is
+                    # byte-identical — this guard only fires when metadata.train
+                    # is a dict.
+                    if self._train is not None:
+                        return await self._enter_merge_deferred()
+
                     self._enter_phase(WorkflowState.MERGE)
 
                     # Defense-in-depth: any blocking L0 escalation created
