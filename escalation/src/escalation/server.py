@@ -43,6 +43,7 @@ def create_server(
     harness: Any = None,
     dedupe_config: DedupeConfig | None = None,
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
+    merge_inflight_registry: Any = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -63,9 +64,26 @@ def create_server(
     already in a terminal state (``'done'`` or ``'cancelled'``).  When omitted
     (the default), the auto-resolve chokepoint is disabled and all escalations
     are submitted normally.
+
+    *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
+    for testing.  When *merge_queue* is not None and no registry is supplied, a
+    fresh registry is created lazily inside this function so it is shared across
+    all ``merge_request`` calls for the lifetime of the server.  When
+    *merge_queue* is None (escalation standalone — orchestrator not wired) the
+    registry is never imported, preserving the standalone import path.
     """
     mcp = FastMCP('escalation')
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+
+    # --- Per-branch in-flight de-dup registry for merge_request ---
+    # Lazily imported so escalation's standalone typecheck env (which does not
+    # have orchestrator on its path) never triggers the import.  The import only
+    # fires when merge_queue is wired, i.e. we are running inside the orchestrator
+    # process where orchestrator is always importable.
+    _registry = merge_inflight_registry
+    if merge_queue is not None and _registry is None:
+        from orchestrator.merge_queue import InFlightMergeRegistry  # type: ignore[reportMissingImports]
+        _registry = InFlightMergeRegistry()
 
     # --- Shared submit/dedupe helper ---
 
@@ -510,7 +528,7 @@ def create_server(
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
-            enqueue_merge_request,
+            coalesce_or_enqueue_merge_request,
         )
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
@@ -528,7 +546,34 @@ def create_server(
             config=orch_config,
             result=future,
         )
-        await enqueue_merge_request(merge_queue, merge_req, event_store)
+
+        # De-dup gate: consults the in-memory registry (and optionally the on-disk
+        # _merge-* worktree scan via harness.git_ops) before enqueuing.  On coalesce
+        # returns immediately with in_flight=True — no future await, no duplicate
+        # enqueue.  On dispatch acquires the registry slot and awaits the future
+        # exactly as the original enqueue_merge_request path.
+        git_ops_for_scan = harness.git_ops if harness is not None else None
+        dispatch = await coalesce_or_enqueue_merge_request(
+            merge_queue,
+            merge_req,
+            event_store,
+            _registry,
+            git_ops=git_ops_for_scan,
+        )
+
+        if dispatch.in_flight:
+            # Branch already being merged — return in_flight immediately so the
+            # caller can poll rather than block.  ETA is a best-effort heuristic.
+            return {
+                'status': 'in_flight',
+                'branch': branch,
+                'inflight_task_id': dispatch.inflight_task_id,
+                'eta_seconds': dispatch.eta_seconds,
+                'reason': (
+                    f'A merge for branch {branch!r} is already in flight '
+                    f'(source={dispatch.source!r}). Poll for completion.'
+                ),
+            }
 
         outcome = await future
         result: dict[str, Any] = {
