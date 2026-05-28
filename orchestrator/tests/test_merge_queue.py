@@ -7056,3 +7056,101 @@ class TestSpeculationRaceRetry:
         assert 'merge_retry_after_speculation_race' in caplog.text, (
             'Expected "merge_retry_after_speculation_race" in caplog'
         )
+
+    @pytest.mark.asyncio
+    async def test_remerge_retry_also_fails(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Race-retry: both attempts fail (no-conflict) → dual-attempt diagnostics.
+
+        1st call: speculation-race failure (stale base '0'*40 != actual main).
+        2nd call: a different non-conflict failure (refusing to merge unrelated histories).
+
+        Verifies:
+        - merge_to_main called exactly twice (no 3rd retry)
+        - returned item has immediate_outcome.status == 'blocked'
+        - reason contains BOTH stderr strings and BOTH base SHAs
+        - failure_diagnostic carries μ 4 keys for the final (retry) attempt
+          PLUS first_attempt_base_sha / first_attempt_git_stderr for the first
+        - item.failure_diagnostic == item.immediate_outcome.failure_diagnostic
+        """
+        branch = 'race-retry-fail'
+        worktree = await _make_branch_with_file(git_ops, branch, 'race_fail.py', 'y = 2\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('race-fail', branch, worktree, config)
+
+        actual_main = await git_ops.get_main_sha()
+        first_base = '0' * 40
+        retry_base = actual_main  # retry re-reads get_main_sha() → actual_main
+        first_stderr = f'merge: task/{branch} - not something we can merge'
+        retry_stderr = 'fatal: refusing to merge unrelated histories'
+
+        call_count = 0
+
+        async def fake_merge_to_main(wt: Any, br: str, base_sha: str | None = None) -> MergeResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MergeResult(
+                    success=False, conflicts=False,
+                    details=first_stderr,
+                    pre_merge_sha=first_base,
+                )
+            # 2nd call: different non-conflict failure; pre_merge_sha = retry_base
+            return MergeResult(
+                success=False, conflicts=False,
+                details=retry_stderr,
+                pre_merge_sha=retry_base,
+            )
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
+
+        item = await worker._remerge(req, None)
+
+        # Exactly 2 calls — no 3rd retry
+        assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
+
+        # Must be a blocked immediate_outcome
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'blocked', (
+            f'Expected blocked, got {item.immediate_outcome.status}'
+        )
+
+        reason = item.immediate_outcome.reason
+        # reason must surface BOTH stderr strings
+        assert first_stderr in reason or 'not something we can merge' in reason, (
+            f'1st stderr missing from reason: {reason!r}'
+        )
+        assert retry_stderr in reason, f'retry stderr missing from reason: {reason!r}'
+        # reason must surface BOTH base SHAs
+        assert first_base in reason or first_base[:8] in reason, (
+            f'first_base missing from reason: {reason!r}'
+        )
+        assert retry_base in reason or retry_base[:8] in reason, (
+            f'retry_base missing from reason: {reason!r}'
+        )
+
+        # failure_diagnostic must carry μ 4 keys for retry attempt
+        diag = item.immediate_outcome.failure_diagnostic
+        assert diag is not None, 'failure_diagnostic must not be None'
+        assert 'base_sha' in diag
+        assert 'base_label' in diag
+        assert 'branch_ref_in_worktree' in diag
+        assert 'git_stderr' in diag
+
+        # First-attempt keys must be present
+        assert 'first_attempt_base_sha' in diag, (
+            f'first_attempt_base_sha missing from failure_diagnostic: {diag!r}'
+        )
+        assert 'first_attempt_git_stderr' in diag, (
+            f'first_attempt_git_stderr missing from failure_diagnostic: {diag!r}'
+        )
+        assert diag['first_attempt_base_sha'] == first_base
+        assert diag['first_attempt_git_stderr'] == first_stderr
+
+        # item.failure_diagnostic must mirror outcome.failure_diagnostic
+        assert item.failure_diagnostic == diag
