@@ -520,6 +520,7 @@ class TaskWorkflow:
         to park the workflow as ``MERGE_DEFERRED``.
         """
         from orchestrator.merge_queue import (
+            TRAIN_INCOMPLETE_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
             enqueue_merge_request,
@@ -546,6 +547,12 @@ class TaskWorkflow:
             return None
 
         # Guard: self must be the tip (highest order → members[-1] after ascending sort).
+        # Correctness depends on dispatch gating: β₁'s intra-train allowance lets
+        # order=k start only once order=k-1 is merge-deferred, which guarantees the
+        # tip (highest order) enters merge-deferred LAST.  The δ₁ group-merge worker
+        # acts as a backstop: if this trigger does not fire (e.g. the tip re-enters
+        # merge-deferred before a sibling propagates), the worker's own status pre-check
+        # will reject the request and return TRAIN_INCOMPLETE, parking the train for retry.
         tip = members[-1]
         if str(tip.get('id')) != self.task_id:
             return None
@@ -562,15 +569,27 @@ class TaskWorkflow:
         branch_name = self.task_id  # matches _submit_to_merge_queue convention
 
         async def _status_check(ids: list[str]) -> dict[str, str]:
-            statuses, _ = await self.scheduler.get_statuses(ids)
-            return statuses  # type: ignore[return-value]
+            statuses, err = await self.scheduler.get_statuses(ids)
+            if err is not None:
+                # Log the transient MCP/read error so the silent discard is
+                # visible.  We return the (possibly empty/partial) dict rather
+                # than raising so the worker's existing train_incomplete pre-check
+                # fires and routes back to the MERGE_DEFERRED park (see outcome
+                # mapping below) instead of surfacing an unclassified 'Merge
+                # worker error' that would escalate to a human.
+                logger.warning(
+                    'Task %s: train %r status_check got error from get_statuses '
+                    '(will return partial %d-entry dict): %s',
+                    self.task_id, train_id, len(statuses or {}), err,
+                )
+            return statuses or {}  # type: ignore[return-value]
 
         async def _mark_member_done(mid: str, sha: str) -> None:
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
 
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id=self.task_id,
             branch=branch_name,
@@ -602,8 +621,20 @@ class TaskWorkflow:
             if result.merge_sha:
                 self._merge_sha = result.merge_sha
             return WorkflowOutcome.DONE
-        # Any non-done status (conflict/blocked/verify-red) → escalate to human
-        # so a failed train is never silently parked forever (scenarios 5/8).
+        # Distinguish transient from genuine failures.
+        # train_incomplete: one or more members haven't propagated their
+        # merge-deferred write yet (or a transient get_statuses error returned
+        # a partial dict).  This is a timing artefact, not a real failure — park
+        # the train and let δ₁ retry when the tip re-enters merge-deferred.
+        if result.reason and result.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX):
+            logger.info(
+                'Task %s: GroupMergeRequest returned train_incomplete for train %r '
+                '— parking (MERGE_DEFERRED) for δ₁ retry. reason: %s',
+                self.task_id, train_id, result.reason,
+            )
+            return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Genuine failure (conflict/verify-red/rebase-conflict) → escalate to human
+        # so a broken train is never silently parked forever (scenarios 5/8).
         return await self._mark_blocked(
             f'Group merge for train {train_id!r} failed: {result.status} — {result.reason}',
             escalate_to_human=True,
