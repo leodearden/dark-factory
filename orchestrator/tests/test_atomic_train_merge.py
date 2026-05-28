@@ -21,20 +21,21 @@ import asyncio
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, TrainMembership, _run
 from orchestrator.merge_queue import (
+    TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
-    TRAIN_REBASE_CONFLICT_REASON_PREFIX,
 )
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
@@ -109,7 +110,7 @@ async def make_stacked_member(
     git_ops: GitOps,
     name: str,
     base_ref: str,
-    edit_fn: Callable[[Path], None],
+    edit_fn: Callable[[Path], Any],
 ) -> tuple[Path, str]:
     """Create branch ``task/<name>`` off *base_ref*, apply *edit_fn*, commit.
 
@@ -331,7 +332,7 @@ class TestScenario1HappyPath:
 
         # --- (ii) all 3 mark_member_done callbacks with ONE shared SHA --------
         assert req.mark_member_done.call_count == 3, (  # type: ignore[union-attr]
-            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"
+            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
         called_shas = {
             call.args[1] for call in req.mark_member_done.call_args_list  # type: ignore[union-attr]
@@ -432,7 +433,7 @@ class TestScenario2WorktreeBase:
 
         # Now create β using train metadata: order=1, predecessor=alpha.
         # create_worktree branches β off α's tip (PRD §9.4).
-        train_meta = {
+        train_meta: TrainMembership = {
             "id": "T-worktree",
             "order": 1,
             "members": ["alpha", "beta"],
@@ -664,7 +665,7 @@ class TestScenario5GroupMergeVerify:
 
         # (iii) All 3 mark_member_done fired.
         assert req.mark_member_done.call_count == 3, (  # type: ignore[union-attr]
-            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"
+            f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
 
     async def test_group_merge_workspace_verify_red(
@@ -751,7 +752,7 @@ class TestScenario5GroupMergeVerify:
         # (iv) No mark_member_done flips.
         assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
             f"mark_member_done must not fire when verify gate is red, "
-            f"got {req.mark_member_done.call_count} call(s)"
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
         )
 
 
@@ -766,7 +767,7 @@ class TestScenario5GroupMergeVerify:
 def _make_verify_failure(
     category: str = "test_failure",
     cause_hint: str = "FAILED tests/test_x.py::test_y",
-) -> "VerifyResult":
+) -> VerifyResult:
     """Return a failing VerifyResult with the given (category, cause_hint)."""
     return VerifyResult(
         passed=False,
@@ -781,15 +782,15 @@ def _make_verify_failure(
 
 
 def _make_train_workflow(
-    config: "OrchestratorConfig",
-    git_ops: "GitOps",
+    config: OrchestratorConfig,
+    git_ops: GitOps,
     task_id: str,
     train_meta: dict,
-    get_statuses_return: "tuple[dict[str, str], Exception | None]",
-    worktree: "Path",
-    merge_queue: "asyncio.Queue | None" = None,
-    tasks_by_train_return: "list[dict] | None" = None,
-) -> "tuple":
+    get_statuses_return: tuple[dict[str, str], Exception | None],
+    worktree: Path,
+    merge_queue: asyncio.Queue | None = None,
+    tasks_by_train_return: list[dict] | None = None,
+) -> tuple:
     """Build a minimally-wired TaskWorkflow for a train member.
 
     Reuses the _make_workflow pattern from test_workflow_signature_loop_guard.py,
@@ -845,11 +846,11 @@ def _make_train_workflow(
 
 
 def _make_plain_workflow(
-    config: "OrchestratorConfig",
-    git_ops: "GitOps",
+    config: OrchestratorConfig,
+    git_ops: GitOps,
     task_id: str,
-    worktree: "Path",
-) -> "tuple":
+    worktree: Path,
+) -> tuple:
     """Build a minimally-wired TaskWorkflow for a plain (non-train) task.
 
     Equivalent to _make_train_workflow but with no train metadata in the task.
@@ -922,7 +923,7 @@ class TestScenario6ParkPrefixDerail:
         """Three-part park-prefix derail assertion."""
         import logging
 
-        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+        from orchestrator.workflow import WorkflowOutcome
 
         # ── Part (i): loop-guard — 3× identical-sig failures → BLOCKED ─────
         # Set up a minimal git repo so create_worktree works.
@@ -1078,7 +1079,7 @@ class TestScenario7TrainResume:
 
     async def test_train_resumes_after_derail_fix(self, tmp_path: Path) -> None:
         """δ₂ trigger fires after derail fix: enqueues GMR, driven merge completes."""
-        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+        from orchestrator.workflow import WorkflowOutcome
 
         # ── Set up a plain git repo (no cargo fixture needed — verify mocked) ─
         repo = tmp_path
@@ -1471,7 +1472,7 @@ class TestScenario8MainAdvances:
         # (iv) No mark_member_done flips.
         assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
             f"mark_member_done must not fire on rebase conflict, "
-            f"got {req.mark_member_done.call_count} call(s)"
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
         )
 
 
@@ -1639,11 +1640,11 @@ class TestScenario10DoneProvGateUnweakened:
 
 def _build_plain_merge_request(
     *,
-    git_ops: "GitOps",
-    config: "OrchestratorConfig",
+    git_ops: GitOps,
+    config: OrchestratorConfig,
     task_id: str,
-    worktree: "Path",
-) -> "MergeRequest":
+    worktree: Path,
+) -> MergeRequest:
     """Build a plain (non-train) MergeRequest for scenario 11.
 
     branch is the unprefixed task_id; merge_to_main prepends branch_prefix internally.
@@ -1791,7 +1792,7 @@ class TestScenario12DegenerateTrainOfOne:
 
         # order=0 → create_worktree branches from main, NOT from a predecessor.
         # This is the degenerate single-member train case.
-        train_meta12 = {"id": "T12", "order": 0, "members": ["alpha12"]}
+        train_meta12: TrainMembership = {"id": "T12", "order": 0, "members": ["alpha12"]}
         wt_info12 = await git_ops12.create_worktree("alpha12", train=train_meta12)
         wt_a12 = wt_info12.path
         await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_a12)
@@ -1856,7 +1857,7 @@ class TestScenario12DegenerateTrainOfOne:
         # the non-train path (PRD §10 row 12).
         assert req12.mark_member_done.call_count == 1, (  # type: ignore[union-attr]
             f"expected mark_member_done called once for the single member, "
-            f"got {req12.mark_member_done.call_count}"
+            f"got {req12.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
         called_task_id12, called_sha12 = req12.mark_member_done.call_args[0]  # type: ignore[union-attr]
         assert called_task_id12 == "alpha12", (
