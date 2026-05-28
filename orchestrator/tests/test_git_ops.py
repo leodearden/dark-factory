@@ -3247,3 +3247,49 @@ class TestCreateWorktreeTrain:
         # No stale worktree directory left on disk
         worktree_path = git_ops.worktree_base / 'beta'
         assert not worktree_path.exists()
+
+    async def test_three_member_chain(self, git_ops: GitOps):
+        """PRD § 4: transitive stacking — γ contains both α and β commits."""
+        from orchestrator.git_ops import TrainMembership
+
+        # α: create worktree, commit one file
+        alpha_info = await git_ops.create_worktree('chain-alpha')
+        (alpha_info.path / 'alpha.py').write_text('a = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # β: stacks on α
+        beta_info = await git_ops.create_worktree(
+            'chain-beta',
+            train=TrainMembership(
+                id='T1', order=1, members=['chain-alpha', 'chain-beta', 'chain-gamma']
+            ),
+        )
+        (beta_info.path / 'beta.py').write_text('b = 2\n')
+        beta_tip = await git_ops.commit(beta_info.path, 'beta commit')
+        assert beta_tip is not None
+
+        # γ: stacks on β
+        gamma_info = await git_ops.create_worktree(
+            'chain-gamma',
+            train=TrainMembership(
+                id='T1', order=2, members=['chain-alpha', 'chain-beta', 'chain-gamma']
+            ),
+        )
+
+        # (1) γ's base_commit == β's tip (NOT α's, NOT main)
+        assert gamma_info.base_commit == beta_tip
+
+        # (2) git log task/chain-gamma..task/chain-beta is empty
+        _, log_bg, _ = await _run(
+            ['git', 'log', 'task/chain-gamma..task/chain-beta', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_bg.strip() == ''
+
+        # (3) git log task/chain-gamma..task/chain-alpha is also empty (transitive)
+        _, log_ag, _ = await _run(
+            ['git', 'log', 'task/chain-gamma..task/chain-alpha', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_ag.strip() == ''
