@@ -627,3 +627,59 @@ class TestReconReportReaperWiredAtBoot:
         config = self._make_config()
         state, _, _ = _build_recon_report_components(config)
         assert state._reaper_task is None
+
+
+# ---------------------------------------------------------------------------
+# step-21: Shutdown callback stops both servers — RED until step-22
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportShutdownCallback:
+    """Regression guard: SIGTERM/SIGINT must stop both primary AND recon_server.
+
+    Prior to step-22, _install_operator_stop_handler received
+    ``lambda: setattr(server, 'should_exit', True)``, which flipped only the
+    primary server's should_exit. asyncio.gather(server.serve(),
+    recon_server.serve()) therefore never resolved, the finally-block teardown
+    was never reached, and run_server() hung until SIGKILL.
+    """
+
+    class _FakeServer:
+        """Minimal fake uvicorn.Server exposing should_exit."""
+
+        def __init__(self) -> None:
+            self.should_exit = False
+
+    def test_callback_stops_both_servers(self):
+        from fused_memory.server.main import _make_operator_stop_callback
+
+        primary = self._FakeServer()
+        recon = self._FakeServer()
+
+        cb = _make_operator_stop_callback(primary, recon)
+
+        # Before invocation — both still running
+        assert primary.should_exit is False
+        assert recon.should_exit is False
+
+        cb()
+
+        # After invocation — BOTH must have been stopped
+        assert primary.should_exit is True
+        assert recon.should_exit is True
+
+    def test_callback_with_single_server(self):
+        """Verify the variadic signature works with just one server too."""
+        from fused_memory.server.main import _make_operator_stop_callback
+
+        srv = self._FakeServer()
+        cb = _make_operator_stop_callback(srv)
+        cb()
+        assert srv.should_exit is True
+
+    def test_callback_with_no_servers(self):
+        """Verify graceful no-op when called with zero servers."""
+        from fused_memory.server.main import _make_operator_stop_callback
+
+        cb = _make_operator_stop_callback()
+        cb()  # Must not raise
