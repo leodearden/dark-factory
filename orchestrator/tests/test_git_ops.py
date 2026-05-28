@@ -3135,3 +3135,24 @@ class TestTrainPredecessor:
         )
         assert result2.task_id == 'b'
         assert result2.branch == 'task/b'
+
+    async def test_raises_when_invariants_violated(self, git_ops: GitOps):
+        from orchestrator.git_ops import TrainMembership
+
+        # (a) order=0: caller should not invoke for degenerate trains
+        with pytest.raises(ValueError, match='order=0'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=0, members=['a']))
+
+        # (b) members missing entirely
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=1))
+
+        # (c) members=None
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=1, members=None))
+
+        # (d) members too short for the requested order
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(
+                TrainMembership(id='T1', order=2, members=['a'])
+            )
