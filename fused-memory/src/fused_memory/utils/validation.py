@@ -9,8 +9,17 @@ Two styles:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag for warn-once behaviour when no registry is configured.
+# Task 1143 (read-side) raises UnknownProjectError for unknown project_ids.
+# Task 1549 (write-side) uses this flag to warn once that the write-boundary
+# registry check is disabled, so operators know writes are ungated.
+_empty_registry_warned: bool = False
 
 # Single shared pattern enforces symmetric allowlist across all identifier types.
 # Accepted: ASCII letters, digits, hyphens, underscores.
@@ -158,4 +167,60 @@ def require_run_id(run_id: str) -> None:
 def require_int_ids(ids: object, *, name: str = 'ids') -> None:
     """Raise InputValidationError if ids is not a list of plain (non-bool) integers."""
     if err := validate_int_ids(ids, name=name):
+        raise InputValidationError(err['error'])
+
+
+def validate_known_project_id(
+    project_id: str,
+    known_projects: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Return an error dict if project_id is not in the known_projects registry, else None.
+
+    Write-side complement of read-side strictness (task 1143); see task 1549.
+
+    When ``known_projects`` is falsy (empty or None), the check is skipped
+    (permissive mode) — this preserves test/local-dev ergonomics where
+    DASHBOARD_KNOWN_PROJECT_ROOTS is unset.  A single WARNING is logged the
+    first time this permissive path is taken (warn-once per process, using the
+    module-level ``_empty_registry_warned`` flag).
+
+    The literal string 'DASHBOARD_KNOWN_PROJECT_ROOTS' is hardcoded in the
+    rejection message (not imported from fused_memory.models.scope) to keep
+    utils/validation.py a leaf module, matching the precedent set by
+    harness.py:304 which hardcodes the same literal in its misconfiguration
+    message.
+    """
+    global _empty_registry_warned
+    if not known_projects:
+        if not _empty_registry_warned:
+            _empty_registry_warned = True
+            logger.warning(
+                'validate_known_project_id called with no known_projects registry — '
+                'write-boundary registry check is disabled. '
+                'Set DASHBOARD_KNOWN_PROJECT_ROOTS to enable it (task 1143 / task 1549).'
+            )
+        return None
+    if project_id not in known_projects:
+        return {
+            'error': (
+                f'project_id {_safe_repr(project_id)} is not a known project '
+                f'(known: {sorted(known_projects)}). '
+                f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to register it. '
+                f'Write-side complement of read-side strictness (task 1143); see task 1549.'
+            ),
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
+def require_known_project_id(
+    project_id: str,
+    known_projects: dict[str, str] | None,
+) -> None:
+    """Raise InputValidationError if project_id is not in the known_projects registry.
+
+    Write-side complement of read-side strictness (task 1143); see task 1549.
+    When known_projects is falsy, the check is permissive (no exception raised).
+    """
+    if err := validate_known_project_id(project_id, known_projects):
         raise InputValidationError(err['error'])
