@@ -28,6 +28,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
+    POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
 )
@@ -281,4 +282,61 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     # _submit_to_merge_queue returns via _mark_blocked before reaching the
     # steward-path capture that sets _last_merge_block_reason — the sentinel
     # must be unchanged.
+    assert wf._last_merge_block_reason == 'sentinel'
+
+
+@pytest.mark.asyncio
+async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thrash(
+    tmp_path: Path, monkeypatch,
+):
+    """post_merge_pyright_broken reason routes to L1 without entering thrash counter.
+
+    Mirrors test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash:
+    the new short-circuit branch in _submit_to_merge_queue must:
+      (a) return BLOCKED
+      (b) call _mark_blocked with escalate_to_human=True (L1, steward bypassed)
+      (c) call _write_merge_failure_review with kind='post_merge_pyright_broken'
+      (d) NOT touch _last_merge_block_reason (returns before the steward-path capture)
+    """
+    from unittest.mock import MagicMock
+
+    f = _make()
+    wf = f.wf
+    wf.worktree = tmp_path / 'wt'
+    wf.worktree.mkdir(parents=True, exist_ok=True)
+    wf.merge_queue = MagicMock()
+    wf.plan = {'files': []}
+    wf._module_configs = []
+    wf._last_merge_block_reason = 'sentinel'
+
+    write_failure_spy = MagicMock()
+    wf._write_merge_failure_review = write_failure_spy  # type: ignore[method-assign]
+
+    broken_reason = (
+        f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: post-merge unscoped '
+        'type-check failed for subpkg on abc123456789. error: src/foo.py:10: ...'
+    )
+
+    async def fake_enqueue(queue, req: MergeRequest, event_store):
+        req.result.set_result(MergeOutcome('blocked', reason=broken_reason))
+
+    monkeypatch.setattr(
+        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
+    )
+
+    outcome = await wf._submit_to_merge_queue('99', pre_rebased=False)
+
+    # (a) outcome is BLOCKED
+    assert outcome == WorkflowOutcome.BLOCKED
+    # (b) _mark_blocked awaited with escalate_to_human=True
+    f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
+    # (c) _write_merge_failure_review called with kind='post_merge_pyright_broken'
+    write_failure_spy.assert_called_once()
+    call_args = write_failure_spy.call_args
+    assert call_args[0][0] == 'post_merge_pyright_broken', (
+        f'Expected kind=post_merge_pyright_broken, got {call_args[0][0]!r}'
+    )
+    # (d) short-circuit fires before steward-path sets _last_merge_block_reason
     assert wf._last_merge_block_reason == 'sentinel'

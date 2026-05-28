@@ -3865,6 +3865,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
@@ -3880,6 +3881,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX):
             self._write_merge_failure_review(
                 'post_merge_equivalence_failed', result.reason,
+            )
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+            )
+        # Post-merge unscoped type-check short-circuit: a union break caught
+        # after the merge landed is also a human-judgement fix-forward case;
+        # same L1-not-steward routing so the steward cannot mask the signal.
+        if result.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
+            self._write_merge_failure_review(
+                'post_merge_pyright_broken', result.reason,
             )
             return await self._mark_blocked(
                 result.reason,

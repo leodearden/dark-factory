@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import logging
 import shutil
 import time
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -120,6 +121,46 @@ that some member tasks still need their status flipped.  Downstream classifiers
 pattern-match this prefix to distinguish a fully-clean landing
 (``reason=None``) from a partial-flip that requires manual / automated
 cleanup."""
+
+
+POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
+unscoped pyright check detects a cross-PR union break.  After
+``advance_main`` succeeds, a full package-wide type-check is run against the
+advanced main SHA for each subproject that declares a ``type_check_command``
+in its ``ModuleConfig``.  Unlike per-PR scoped verify, this catches the case
+where PR A widens a Protocol and PR B (verified against pre-A main) adds a
+conformer satisfying the OLD Protocol — after both land the union has a
+conformer missing the new method; each PR verified clean, but only the
+post-merge whole-package check sees it.
+
+This is a SIGNAL, not a gate: the merge has already landed (``update-ref``
+ran), so we do NOT revert.  We skip ``push_main`` (same as the equivalence
+check), emit an L1 blocked outcome, and route to human / auto-watcher for a
+fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX``:
+a landed merge must never be blocked by a flaky hang or infra error, so the
+check fails open on timeouts and worktree-create exceptions."""
+
+
+@dataclass
+class PostMergePyrightResult:
+    """Structured return value from :func:`_check_post_merge_pyright`.
+
+    Attributes:
+        failing_subprojects: Prefixes of subprojects whose unscoped
+            type-check command exited non-zero (genuine type failure, not
+            a timeout or infra error).  Empty list means clean.
+        detail: Bounded human-readable detail from the first failing
+            subproject's output, for inclusion in the escalation reason.
+    """
+
+    failing_subprojects: list[str] = field(default_factory=list)
+    detail: str = ''
+
+    @property
+    def broken(self) -> bool:
+        """True when at least one subproject's type-check genuinely failed."""
+        return bool(self.failing_subprojects)
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
@@ -521,6 +562,115 @@ async def _check_post_merge_equivalence(
         return []
 
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+# Maximum number of characters to include in the detail field of a
+# ``PostMergePyrightResult`` — keeps the blocked reason string in the
+# escalation payload under reasonable size limits.
+_POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
+
+
+async def _check_post_merge_pyright(
+    advanced_sha: str,
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run an unscoped, package-wide type-check against the post-merge main SHA.
+
+    Second post-merge "equivalence" signal: after ``advance_main`` succeeds,
+    runs each subproject's ``type_check_command`` VERBATIM (unscoped —
+    ``scope_module_config``/``_scope_command`` are NOT called) in a fresh
+    detached worktree at ``advanced_sha``.
+
+    Returns a :class:`PostMergePyrightResult` whose ``broken`` property is
+    ``True`` when at least one subproject's type-check reports a genuine
+    failure (``not passed AND not timed_out``).
+
+    Early returns:
+    - Empty or no-type-check-command module_configs → clean (no-op).
+
+    Fail-open:
+    - Timeouts (``verify.timed_out``) → skip, log WARNING, treat as clean.
+    - Any exception creating the worktree or during verify → log WARNING,
+      treat as clean.
+
+    The merge has already landed via ``update-ref`` before this runs; we NEVER
+    block a landed merge on a flaky hang or transient infra error.
+
+    .. note::
+        **Pre-condition**: This check has no baseline. If a subproject's
+        unscoped ``type_check_command`` is already failing on main *before*
+        the merge, every subsequent merge will be blocked for that subproject.
+        Opting into ``type_check_command`` requires the unscoped check to pass
+        on main as a standing pre-condition.  Fix the pre-existing failure
+        forward to unblock the queue.
+    """
+    # Quick-exit: if no module defines a type_check_command there is nothing to check.
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    merge_wt: Path | None = None
+    try:
+        # NOTE: _create_merge_worktree is a private GitOps method.  This helper
+        # is its only cross-module caller; promoting it to public (drop the
+        # leading underscore) is tracked as a follow-up task.
+        merge_wt, _ = await git_ops._create_merge_worktree(advanced_sha)
+
+        async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
+            # Run only the type-check command verbatim (unscoped).
+            # Null out test/lint so run_verification skips them (None => skip).
+            type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
+            return mc, await run_verification(
+                merge_wt, config, type_only_mc,
+                max_retries=0, is_merge_verify=True, role='merge',
+            )
+
+        # Run all subproject type-checks concurrently to minimise wall-clock
+        # impact on the merge queue's push_main delay.
+        pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
+
+        failing_subprojects: list[str] = []
+        detail_parts: list[str] = []
+
+        for mc, verify in pairs:
+            if verify.timed_out:
+                logger.warning(
+                    'post-merge-pyright: type-check for %r timed out on %s; '
+                    'failing open. task_id=%s',
+                    mc.prefix, advanced_sha[:12], task_id or '<unknown>',
+                )
+                continue  # fail open on timeout
+
+            if not verify.passed:
+                failing_subprojects.append(mc.prefix)
+                # Collect bounded detail from the FIRST failing subproject only
+                # (matches PostMergePyrightResult.detail docstring).
+                if not detail_parts:
+                    raw = verify.failure_report() or verify.type_output or ''
+                    if isinstance(raw, str) and raw:
+                        detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
+
+        detail = '\n'.join(detail_parts)
+        return PostMergePyrightResult(
+            failing_subprojects=failing_subprojects,
+            detail=detail,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            'post-merge-pyright: infra error checking %s — failing open. '
+            'task_id=%s error=%s',
+            advanced_sha[:12], task_id or '<unknown>', exc,
+        )
+        return PostMergePyrightResult()
+
+    finally:
+        if merge_wt is not None:
+            await git_ops.cleanup_merge_worktree(merge_wt)
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
@@ -1360,6 +1510,39 @@ class MergeWorker:
                         f'Conflict resolution likely dropped or rewrote '
                         f'work; review {advanced_sha[:12]} against the '
                         f'task branch tip.'
+                    ),
+                )
+
+            # Decision-3 post-merge unscoped type-check: catch cross-PR union
+            # breaks that per-PR scoped verify cannot detect (PR A widens a
+            # Protocol; PR B, verified against pre-A main, adds a conformer
+            # satisfying the OLD Protocol; only the post-merge whole-package
+            # check catches the missing method after both land).
+            # No-op when module_configs is empty (preserves existing tests).
+            # Merge has already landed; we never revert — skip push instead.
+            pyright_result = await _check_post_merge_pyright(
+                advanced_sha, self._git_ops, req.config, req.module_configs,
+                task_id=req.task_id,
+            )
+            if pyright_result.broken:
+                logger.warning(
+                    'Task %s: post-merge unscoped type-check failed for %s on %s',
+                    req.task_id,
+                    ', '.join(pyright_result.failing_subprojects),
+                    advanced_sha[:12],
+                )
+                _emit_merge_attempt(
+                    self._event_store, req.task_id,
+                    'post_merge_pyright_broken',
+                    duration_ms=_elapsed_ms(t0),
+                )
+                return MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                        f'post-merge unscoped type-check failed for '
+                        f'{", ".join(pyright_result.failing_subprojects)} '
+                        f'on {advanced_sha[:12]}. {pyright_result.detail}'
                     ),
                 )
 
@@ -2508,9 +2691,43 @@ class SpeculativeMergeWorker:
                         ))
                     return True
 
+                # Cleanup merge_wt BEFORE the pyright check: the pyright helper
+                # creates its own detached worktree at advanced_sha, so keeping
+                # merge_wt alive here would briefly double the worktree count
+                # — doubling disk pressure in ENOSPC scenarios.  Mirrors the
+                # MergeWorker ordering at _do_merge line ~1455.
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                pyright_result = await _check_post_merge_pyright(
+                    advanced_sha, self._git_ops, req.config, req.module_configs,
+                    task_id=req.task_id,
+                )
+                if pyright_result.broken:
+                    logger.warning(
+                        'Task %s (speculative): post-merge unscoped type-check '
+                        'failed for %s on %s',
+                        req.task_id,
+                        ', '.join(pyright_result.failing_subprojects),
+                        advanced_sha[:12],
+                    )
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id,
+                        'post_merge_pyright_broken',
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'blocked',
+                            reason=(
+                                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                                f'post-merge unscoped type-check failed for '
+                                f'{", ".join(pyright_result.failing_subprojects)} '
+                                f'on {advanced_sha[:12]}. {pyright_result.detail}'
+                            ),
+                        ))
+                    return True
+
                 logger.info(f'Task {req.task_id}: merged to main successfully')
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
                 push_status = await self._git_ops.push_main()
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
