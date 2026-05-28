@@ -186,6 +186,46 @@ class TestReconStateLifecycle:
         assert report.stats == assembled['stats']
 
 
+class TestReconStateFallbackToEmpty:
+    """When get_assembled_report returns None, BaseStage.run produces an empty StageReport."""
+
+    @pytest.mark.asyncio
+    async def test_none_assembled_produces_empty_stage_report(self):
+        """get_assembled_report returning None → items_flagged=[], stats={}, no exception."""
+        state = _FakeReconState(assembled_report=None)  # Simulates agent crash
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-none')
+
+        assert report.items_flagged == [], 'items_flagged must be empty on None assembled'
+        assert report.stats == {}, 'stats must be empty on None assembled'
+
+    @pytest.mark.asyncio
+    async def test_timestamps_still_set_on_none_assembled(self):
+        """started_at and completed_at are populated even on None assembled."""
+        state = _FakeReconState(assembled_report=None)
+        stage = _make_stage(recon_report_state=state)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-ts')
+
+        assert report.started_at is not None
+        assert report.completed_at is not None
+
+
 class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
