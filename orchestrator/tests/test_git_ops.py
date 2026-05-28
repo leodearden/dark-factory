@@ -3114,3 +3114,233 @@ class TestOrphanWorktreeHelpers:
         info = await git_ops.create_worktree('exists-wt')
         # Query a branch with no task/ ref → rev-list fails → fail-safe True.
         assert await git_ops.worktree_has_unsaved_work(info.path, 'no-such-branch') is True
+
+
+@pytest.mark.asyncio
+class TestTrainPredecessor:
+    async def test_returns_predecessor_for_order_gt_zero(self, git_ops: GitOps):
+        from orchestrator.git_ops import TrainMembership, TrainPredecessor
+
+        # order=1, members=['a', 'b'] → predecessor is members[0] = 'a'
+        result = await git_ops._train_predecessor(
+            TrainMembership(id='T1', order=1, members=['a', 'b'])
+        )
+        assert isinstance(result, TrainPredecessor)
+        assert result.task_id == 'a'
+        assert result.branch == 'task/a'
+
+        # order=2, members=['a', 'b', 'c'] → predecessor is members[1] = 'b'
+        result2 = await git_ops._train_predecessor(
+            TrainMembership(id='T1', order=2, members=['a', 'b', 'c'])
+        )
+        assert result2.task_id == 'b'
+        assert result2.branch == 'task/b'
+
+    async def test_raises_when_invariants_violated(self, git_ops: GitOps):
+        from orchestrator.git_ops import TrainMembership
+
+        # (a) order=0: caller should not invoke for degenerate trains
+        with pytest.raises(ValueError, match='order=0'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=0, members=['a']))
+
+        # (b) members missing entirely
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=1))
+
+        # (c) members=None
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(TrainMembership(id='T1', order=1, members=None))
+
+        # (d) members too short for the requested order
+        with pytest.raises(ValueError, match='members'):
+            await git_ops._train_predecessor(
+                TrainMembership(id='T1', order=2, members=['a'])
+            )
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeTrain:
+    async def test_train_none_regression(self, git_ops: GitOps):
+        """train=None must produce byte-identical behaviour to the old default."""
+        # Capture main SHA before creating the worktree
+        _, main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root
+        )
+        main_sha = main_sha.strip()
+
+        info = await git_ops.create_worktree('feature-notrain', train=None)
+
+        assert info.base_commit == main_sha
+        assert info.stale_commits is None  # no remote in git_repo fixture
+
+    async def test_train_order_zero_degenerate(self, git_ops: GitOps):
+        """order=0 is degenerate — must branch from main, same as train=None."""
+        from orchestrator.git_ops import TrainMembership
+
+        _, main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root
+        )
+        main_sha = main_sha.strip()
+
+        info = await git_ops.create_worktree(
+            'feature-order0',
+            train=TrainMembership(id='T1', order=0, members=['feature-z']),
+        )
+
+        assert info.base_commit == main_sha
+
+    async def test_train_order_gt_zero_branches_from_predecessor_tip(
+        self, git_ops: GitOps
+    ):
+        """PRD § 10 scenario-2: β branches from α's tip, not from main."""
+        from orchestrator.git_ops import TrainMembership
+
+        # Create α worktree and commit one file in it
+        alpha_info = await git_ops.create_worktree('alpha')
+        (alpha_info.path / 'alpha.py').write_text('x = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # Create β with train metadata pointing to α as predecessor
+        beta_info = await git_ops.create_worktree(
+            'beta',
+            train=TrainMembership(id='T1', order=1, members=['alpha', 'beta']),
+        )
+
+        # (1) WorktreeInfo.base_commit == α's branch tip SHA
+        assert beta_info.base_commit == alpha_tip
+
+        # (2) stale_commits is None for train-based worktrees
+        assert beta_info.stale_commits is None
+
+        # (3) git merge-base task/beta task/alpha == α's tip (β forks from α)
+        _, mb, _ = await _run(
+            ['git', 'merge-base', 'task/beta', 'task/alpha'],
+            cwd=git_ops.project_root,
+        )
+        assert mb.strip() == alpha_tip
+
+        # (4) git log task/beta..task/alpha is empty (β already has all of α's commits)
+        _, log_out, _ = await _run(
+            ['git', 'log', 'task/beta..task/alpha', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_out.strip() == ''
+
+    async def test_missing_predecessor_branch_raises(self, git_ops: GitOps):
+        """RuntimeError when the predecessor branch doesn't exist; no stale dir left."""
+        from orchestrator.git_ops import TrainMembership
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.create_worktree(
+                'beta',
+                train=TrainMembership(
+                    id='T1', order=1, members=['nonexistent-task', 'beta']
+                ),
+            )
+
+        msg = str(exc_info.value)
+        assert 'task/nonexistent-task' in msg
+        assert 'T1' in msg
+        assert 'beta' in msg
+
+        # No stale worktree directory left on disk
+        worktree_path = git_ops.worktree_base / 'beta'
+        assert not worktree_path.exists()
+
+    async def test_three_member_chain(self, git_ops: GitOps):
+        """PRD § 4: transitive stacking — γ contains both α and β commits."""
+        from orchestrator.git_ops import TrainMembership
+
+        # α: create worktree, commit one file
+        alpha_info = await git_ops.create_worktree('chain-alpha')
+        (alpha_info.path / 'alpha.py').write_text('a = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # β: stacks on α
+        beta_info = await git_ops.create_worktree(
+            'chain-beta',
+            train=TrainMembership(
+                id='T1', order=1, members=['chain-alpha', 'chain-beta', 'chain-gamma']
+            ),
+        )
+        (beta_info.path / 'beta.py').write_text('b = 2\n')
+        beta_tip = await git_ops.commit(beta_info.path, 'beta commit')
+        assert beta_tip is not None
+
+        # γ: stacks on β
+        gamma_info = await git_ops.create_worktree(
+            'chain-gamma',
+            train=TrainMembership(
+                id='T1', order=2, members=['chain-alpha', 'chain-beta', 'chain-gamma']
+            ),
+        )
+
+        # (1) γ's base_commit == β's tip (NOT α's, NOT main)
+        assert gamma_info.base_commit == beta_tip
+
+        # (2) git log task/chain-gamma..task/chain-beta is empty
+        _, log_bg, _ = await _run(
+            ['git', 'log', 'task/chain-gamma..task/chain-beta', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_bg.strip() == ''
+
+        # (3) git log task/chain-gamma..task/chain-alpha is also empty (transitive)
+        _, log_ag, _ = await _run(
+            ['git', 'log', 'task/chain-gamma..task/chain-alpha', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_ag.strip() == ''
+
+    @pytest.mark.xfail(
+        reason=(
+            'TODO(train, γ₁/γ₂ follow-up): reuse-existing-worktree path rebases onto '
+            'main instead of the predecessor tip; a requeued stacked train member '
+            'silently loses its stacking.  See git_ops.py TODO(train, β₂ follow-up) '
+            'comment.  This xfail pins the gap so it is visible until Phase-3 '
+            'γ₁/γ₂ addresses mid-verify reuse for stacked trains.'
+        ),
+        strict=True,
+    )
+    async def test_reuse_path_rebases_to_predecessor_tip_xfail(
+        self, git_ops: GitOps
+    ):
+        """Requeued stacked train member should rebase onto predecessor tip (not main).
+
+        KNOWN GAP (deferred to γ₁/γ₂): the reuse-existing-worktree path
+        (git_ops.py lines ~643-678) currently rebases onto main unconditionally.
+        A re-dispatched train successor therefore loses its stacking contract
+        and treats main as the base instead of its predecessor's tip.
+
+        This test documents the desired future behaviour:
+          - beta is created stacked on alpha
+          - beta's worktree already exists (simulating a requeue)
+          - calling create_worktree again for beta should (eventually) produce
+            WorktreeInfo.base_commit == alpha_tip, not main's SHA.
+
+        As written it asserts the desired state and is expected to FAIL (xfail)
+        until γ₁/γ₂ is implemented — proving the gap is real.
+        """
+        from orchestrator.git_ops import TrainMembership
+
+        # α: create worktree, commit one file
+        alpha_info = await git_ops.create_worktree('reuse-alpha')
+        (alpha_info.path / 'alpha.py').write_text('a = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # β: stacks on α (fresh create)
+        train = TrainMembership(id='T-reuse', order=1, members=['reuse-alpha', 'reuse-beta'])
+        beta_info = await git_ops.create_worktree('reuse-beta', train=train)
+        (beta_info.path / 'beta.py').write_text('b = 2\n')
+        await git_ops.commit(beta_info.path, 'beta commit')
+
+        # Simulate requeue: call create_worktree again for the same branch.
+        # The reuse path fires because worktree_path already exists.
+        reused_info = await git_ops.create_worktree('reuse-beta', train=train)
+
+        # DESIRED behaviour (γ₁/γ₂): after reuse, base should still be alpha_tip.
+        # CURRENT behaviour: rebases onto main → base_commit == main's SHA (not alpha_tip).
+        assert reused_info.base_commit == alpha_tip  # ← currently fails → xfail

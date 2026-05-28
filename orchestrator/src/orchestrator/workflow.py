@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 from shared.cli_invoke import (
     AllAccountsCappedException,
@@ -41,7 +41,7 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, TrainMembership, _run
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TaskAssignment,
@@ -575,6 +575,7 @@ class TaskWorkflow:
             # Pass the live task title so create_worktree can quarantine a
             # reused worktree whose stored identity belongs to a different
             # (recycled-id) task — defense-in-depth behind Fix C's flag.
+            train_meta = (self.task.get('metadata') or {}).get('train')
             worktree_info = await self.git_ops.create_worktree(
                 branch_name,
                 expected_title=(
@@ -582,6 +583,7 @@ class TaskWorkflow:
                     if self.config.worktree_identity_guard_enabled
                     else None
                 ),
+                train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
             )
             self.worktree = worktree_info.path
             base_commit = worktree_info.base_commit

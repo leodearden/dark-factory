@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from orchestrator.config import GitConfig
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -49,6 +49,24 @@ AdvanceResult = Literal[
 
 
 PushResult = Literal['pushed', 'noop', 'rejected', 'error']
+
+
+class TrainMembership(TypedDict, total=False):
+    """Train metadata passed from task.metadata.train.
+
+    All keys are optional at the type level; _train_predecessor validates
+    presence of required keys at runtime with diagnostic error messages.
+    """
+    id: str
+    order: int
+    members: list[str] | None
+
+
+@dataclass(frozen=True)
+class TrainPredecessor:
+    """Resolved predecessor for a train member with order > 0."""
+    task_id: str
+    branch: str
 
 
 # Default commit-citation pattern for ``find_task_citation_commit``.
@@ -265,7 +283,9 @@ class WorktreeInfo:
     ensure stable diffs even if main advances during task execution.
 
     stale_commits: how far local main was behind the remote at worktree creation
-    time.  None means the fetch was unavailable (no remote configured).  0 means
+    time.  None means either (a) the fetch was unavailable (no remote configured),
+    or (b) the worktree is train-stacked — branched from a sibling's tip rather
+    than from main, so the "behind remote" concept does not apply.  0 means
     already current.  A positive stale_commits value means the remote was ahead by
     N commits.  When local main has diverged (has unpushed commits), the worktree
     is based on local main despite the positive count — check this field together
@@ -461,14 +481,54 @@ class GitOps:
         )
         return remote_ref, behind
 
+    async def _train_predecessor(self, train: TrainMembership) -> TrainPredecessor:
+        """Resolve the predecessor for a train member with order > 0.
+
+        Reads train['members'][order - 1] and derives its branch name using
+        the configured branch_prefix.  Raises ValueError when invariants are
+        violated (order <= 0, members absent/None, members too short).
+        """
+        order = train.get('order', 0)
+        if order <= 0:
+            raise ValueError(
+                f'_train_predecessor called with order={order!r}; '
+                'must only be called when order > 0'
+            )
+        members = train.get('members')
+        if not members or not isinstance(members, list):
+            raise ValueError(
+                f'_train_predecessor: members is {members!r}; '
+                'expected a non-empty list of task ids'
+            )
+        if len(members) < order:
+            raise ValueError(
+                f'_train_predecessor: members has {len(members)} entries but '
+                f'order={order} requires at least {order} entries; members={members!r}'
+            )
+        predecessor_id = str(members[order - 1])
+        return TrainPredecessor(
+            task_id=predecessor_id,
+            branch=f'{self.config.branch_prefix}{predecessor_id}',
+        )
+
     async def create_worktree(
-        self, branch_name: str, *, expected_title: str | None = None,
+        self,
+        branch_name: str,
+        *,
+        expected_title: str | None = None,
+        train: TrainMembership | None = None,
     ) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
         Returns a WorktreeInfo with the worktree path and the base commit SHA
         (main's SHA at creation time) so diffs remain stable even if main
         advances during task execution.
+
+        ``train`` — when supplied and ``train['order'] > 0``, the worktree is
+        branched from the prior train member's branch tip instead of
+        ``origin/main``.  See PRD § 9.4 for the full train-branching spec.
+        ``train=None`` (default) and ``train['order'] == 0`` both fall through
+        to the existing ``_freshen_main()`` path unchanged.
 
         If the worktree/branch already exist (e.g., from a requeued task),
         reuses them instead of failing — UNLESS ``expected_title`` is supplied
@@ -492,13 +552,34 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        # ── Freshen main from remote (best-effort) ────────────────────
-        # If origin/main has advanced since session start, use the remote-
-        # tracking ref as the worktree base so agents start from the freshest
-        # code.  Falls back to local main silently when no remote is configured
-        # (e.g. in test repos).  Never mutates the local main ref — that would
-        # interfere with advance_main's CAS logic.
-        start_ref, stale_commits = await self._freshen_main()
+        # ── Resolve start-ref: train-predecessor tip or freshened main ──
+        # PRD § 9.4: when a train member has order > 0, branch from the prior
+        # member's branch tip so the chain is contiguous.  order=0 (degenerate
+        # train) and train=None both fall through to _freshen_main().
+        if train is not None and train.get('order', 0) > 0:
+            # ── Train path: branch from predecessor's tip ─────────────────
+            # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
+            # as start_ref so the new worktree stacks directly on top.
+            # The missing-branch guard (raise RuntimeError) is in step-12.
+            predecessor = await self._train_predecessor(train)
+            predecessor_sha = await self.resolve_branch_sha(predecessor.branch)
+            if predecessor_sha is None:
+                raise RuntimeError(
+                    f'create_worktree: predecessor branch {predecessor.branch!r} '
+                    f'does not exist (train_id={train.get("id")!r}, '
+                    f'order={train.get("order")}, branch_name={branch_name!r}). '
+                    'The predecessor worktree must be created before the successor.'
+                )
+            start_ref = predecessor_sha
+            stale_commits = None  # "behind remote" does not apply to sibling branches
+        else:
+            # ── Freshen main from remote (best-effort) ────────────────────
+            # If origin/main has advanced since session start, use the remote-
+            # tracking ref as the worktree base so agents start from the freshest
+            # code.  Falls back to local main silently when no remote is configured
+            # (e.g. in test repos).  Never mutates the local main ref — that would
+            # interfere with advance_main's CAS logic.
+            start_ref, stale_commits = await self._freshen_main()
         logger.info(
             'create_worktree: freshening result: ref=%s, stale_commits=%s',
             start_ref, stale_commits,
@@ -510,6 +591,17 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
+            if train is not None and train.get('order', 0) > 0:
+                # start_ref was a SHA just verified by resolve_branch_sha; if
+                # rev-parse fails here it indicates git state corruption, not a
+                # missing remote ref.  Falling back to main would silently violate
+                # the train-stacking invariant, so raise instead.
+                raise RuntimeError(
+                    f'create_worktree: rev-parse of confirmed predecessor SHA '
+                    f'{start_ref!r} failed (rc={rc}); this is unexpected — '
+                    f'the SHA was just resolved by resolve_branch_sha and should '
+                    f'be stable'
+                )
             logger.warning(
                 'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
                 start_ref, rc, self.config.main_branch,
@@ -560,6 +652,9 @@ class GitOps:
                     'chore: save WIP before requeue rebase',
                 )
 
+                # TODO(train, β₂ follow-up): the reuse-existing-worktree path
+                # below still rebases onto main; train γ₁/γ₂ phase will address
+                # mid-verify reuse for stacked trains.
                 # Rebase onto freshened main so the worktree starts from
                 # the latest code — critical for plan revalidation, which
                 # needs the architect to see current file contents.
