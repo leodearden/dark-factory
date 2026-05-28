@@ -4073,3 +4073,111 @@ class TestRunFullVerificationReuse:
             f"Expected 'newmod' to be absent from snapshot run (mid-run staleness lock-in); "
             f"found prefixes: {prefixes!r}.  Pass force_rediscover=True for fresh discovery."
         )
+
+
+class TestRunScopedVerificationForceWorkspace:
+    """run_scoped_verification: force_workspace=True bypasses all scoping.
+
+    Mirrors the is_merge_verify flag-threading pattern (PRD §9.5, γ₁).
+    When force_workspace=True the workspace-global command runs unconditionally,
+    regardless of module_configs or task_files.  Non-train callers always pass
+    force_workspace=False (the default) — byte-identical existing behaviour.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_true_runs_global_command(self, tmp_path: Path):
+        """force_workspace=True bypasses module/fallback scoping and runs the
+        project-wide workspace command (config.test_command).  The per-module
+        sentinel command must NOT appear in the recorded calls.
+        """
+        (tmp_path / 'orchestrator' / 'tests').mkdir(parents=True)
+        (tmp_path / 'orchestrator' / 'tests' / 'test_foo.py').write_text(
+            'def test_x(): pass\n'
+        )
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__workspace_cmd__',
+            lint_command='__ws_lint__',
+            type_check_command='__ws_type__',
+        )
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command='__module_cmd__',
+                lint_command='__module_lint__',
+                type_check_command='__module_type__',
+            ),
+        ]
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['orchestrator/tests/test_foo.py'],
+                force_workspace=True,
+            )
+
+        assert result.passed, f'Expected passed result; got: {result.summary!r}'
+        joined = ' | '.join(calls)
+        assert '__workspace_cmd__' in joined, (
+            f'Workspace command not found in calls: {calls!r}'
+        )
+        assert '__module_cmd__' not in joined, (
+            f'Module command should NOT run when force_workspace=True: {calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_false_runs_module_scoped_command(
+        self, tmp_path: Path,
+    ):
+        """Control: force_workspace=False (default) routes through normal scoping
+        and runs the per-module command, NOT the workspace-global one.  Proves
+        that force_workspace is the sole switch that changes behaviour.
+        """
+        (tmp_path / 'orchestrator' / 'tests').mkdir(parents=True)
+        (tmp_path / 'orchestrator' / 'tests' / 'test_foo.py').write_text(
+            'def test_x(): pass\n'
+        )
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__workspace_cmd__',
+            lint_command='__ws_lint__',
+            type_check_command='__ws_type__',
+        )
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command='__module_cmd__',
+                lint_command='__module_lint__',
+                type_check_command='__module_type__',
+            ),
+        ]
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['orchestrator/tests/test_foo.py'],
+                # force_workspace defaults to False — normal scoping applies
+            )
+
+        assert result.passed, f'Expected passed result; got: {result.summary!r}'
+        joined = ' | '.join(calls)
+        assert '__module_cmd__' in joined, (
+            f'Module command should run for default force_workspace=False: {calls!r}'
+        )
+        assert '__workspace_cmd__' not in joined, (
+            f'Workspace command should NOT run when force_workspace=False: {calls!r}'
+        )
