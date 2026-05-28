@@ -365,3 +365,56 @@ class TestReconReportStateIsolation:
         state.complete('r1', 'done r1')
         r2 = state.get_assembled_report('r2', 's2')
         assert r2['summary'] == ''  # still in-progress
+
+
+# ---------------------------------------------------------------------------
+# step-13: TTL reaper via tick() — RED until step-14
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportReaper:
+    """tick() evicts completed entries past TTL; in-progress entries are immortal."""
+
+    def _make_state(self, ttl=300):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=ttl, clock=lambda: t[0])
+        return state, t
+
+    def test_tick_before_ttl_keeps_entry(self):
+        state, t = self._make_state(ttl=300)
+        state.start_report('r1', 's1', 'p')
+        state.complete('r1', 'done')
+        t[0] = 100.0
+        evicted = state.tick()
+        assert evicted == 0
+        assert state.get_assembled_report('r1', 's1') is not None
+
+    def test_tick_after_ttl_evicts_entry(self):
+        state, t = self._make_state(ttl=300)
+        state.start_report('r1', 's1', 'p')
+        state.complete('r1', 'done')
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 's1') is None
+
+    def test_inprogress_not_evicted_by_ttl(self):
+        state, t = self._make_state(ttl=300)
+        state.start_report('r1', 's1', 'p')
+        # Do NOT call complete — entry remains in-progress
+        t[0] = 1_000_000.0
+        evicted = state.tick()
+        assert evicted == 0
+        assert state.get_assembled_report('r1', 's1') is not None
+
+    def test_tick_returns_count(self):
+        state, t = self._make_state(ttl=300)
+        state.start_report('r1', 's1', 'p')
+        state.start_report('r2', 's2', 'p')
+        state.complete('r1', 'done')
+        state.complete('r2', 'done')
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 2
