@@ -1282,6 +1282,69 @@ class GitOps:
             )
         return removed
 
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
+        """Find an on-disk ``_merge-*`` worktree whose HEAD matches *branch*.
+
+        Enumerates registered worktrees via ``git worktree list --porcelain``,
+        filtering to direct children of ``worktree_base`` whose name starts
+        with ``_merge-`` (same filter as :meth:`prune_stale_merge_worktrees`).
+        For each candidate, reads its HEAD commit subject with
+        ``git log -1 --format=%s`` and compares it by **literal equality** to
+        ``_merge_subject(f'{branch_prefix}{branch}', main_branch)``.
+
+        Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
+        match is found.
+
+        Fail-closed on git errors: a candidate whose ``git log`` fails is
+        skipped (logged at WARNING level) rather than raising — avoids
+        crashing the coalesce dispatch on a partially-written worktree.
+
+        Crash-safety / cross-restart source of truth: even if the in-memory
+        ``InFlightMergeRegistry`` was cleared by a process restart, an
+        in-progress merger's ``_merge-*`` worktree persists on disk and is
+        correctly detected here.
+        """
+        target_subject = _merge_subject(
+            f'{self.config.branch_prefix}{branch}',
+            self.config.main_branch,
+        )
+
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+
+        for line in out.splitlines():
+            if not line.startswith('worktree '):
+                continue
+            wt_path = Path(line[len('worktree '):].strip())
+            try:
+                wt_resolved = wt_path.resolve()
+            except OSError:
+                wt_resolved = wt_path
+            if wt_resolved.parent != self.worktree_base:
+                continue
+            if not wt_resolved.name.startswith('_merge-'):
+                continue
+
+            # Read HEAD commit subject of this candidate
+            rc_log, subject, err_log = await _run(
+                ['git', 'log', '-1', '--format=%s'],
+                cwd=wt_path,
+            )
+            if rc_log != 0:
+                logger.warning(
+                    'find_inflight_merge_worktree: git log failed for %s: %s',
+                    wt_path, err_log.strip(),
+                )
+                continue
+            if subject.strip() == target_subject:
+                return wt_path
+
+        return None
+
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #
     # Once the merge queue (task 292) is stable and we have metrics on
