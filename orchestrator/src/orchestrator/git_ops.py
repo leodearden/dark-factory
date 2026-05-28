@@ -283,7 +283,9 @@ class WorktreeInfo:
     ensure stable diffs even if main advances during task execution.
 
     stale_commits: how far local main was behind the remote at worktree creation
-    time.  None means the fetch was unavailable (no remote configured).  0 means
+    time.  None means either (a) the fetch was unavailable (no remote configured),
+    or (b) the worktree is train-stacked — branched from a sibling's tip rather
+    than from main, so the "behind remote" concept does not apply.  0 means
     already current.  A positive stale_commits value means the remote was ahead by
     N commits.  When local main has diverged (has unpushed commits), the worktree
     is based on local main despite the positive count — check this field together
@@ -554,8 +556,8 @@ class GitOps:
         # PRD § 9.4: when a train member has order > 0, branch from the prior
         # member's branch tip so the chain is contiguous.  order=0 (degenerate
         # train) and train=None both fall through to _freshen_main().
-        # The predecessor-branch path is implemented in steps 9-12.
-        if train is not None and train.get('order', 0) > 0:
+        _from_train = train is not None and train.get('order', 0) > 0
+        if _from_train:
             # ── Train path: branch from predecessor's tip ─────────────────
             # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
             # as start_ref so the new worktree stacks directly on top.
@@ -590,6 +592,17 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
+            if _from_train:
+                # start_ref was a SHA just verified by resolve_branch_sha; if
+                # rev-parse fails here it indicates git state corruption, not a
+                # missing remote ref.  Falling back to main would silently violate
+                # the train-stacking invariant, so raise instead.
+                raise RuntimeError(
+                    f'create_worktree: rev-parse of confirmed predecessor SHA '
+                    f'{start_ref!r} failed (rc={rc}); this is unexpected — '
+                    f'the SHA was just resolved by resolve_branch_sha and should '
+                    f'be stable'
+                )
             logger.warning(
                 'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
                 start_ref, rc, self.config.main_branch,

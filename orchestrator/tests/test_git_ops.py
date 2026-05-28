@@ -3293,3 +3293,54 @@ class TestCreateWorktreeTrain:
             cwd=git_ops.project_root,
         )
         assert log_ag.strip() == ''
+
+    @pytest.mark.xfail(
+        reason=(
+            'TODO(train, γ₁/γ₂ follow-up): reuse-existing-worktree path rebases onto '
+            'main instead of the predecessor tip; a requeued stacked train member '
+            'silently loses its stacking.  See git_ops.py TODO(train, β₂ follow-up) '
+            'comment.  This xfail pins the gap so it is visible until Phase-3 '
+            'γ₁/γ₂ addresses mid-verify reuse for stacked trains.'
+        ),
+        strict=True,
+    )
+    async def test_reuse_path_rebases_to_predecessor_tip_xfail(
+        self, git_ops: GitOps
+    ):
+        """Requeued stacked train member should rebase onto predecessor tip (not main).
+
+        KNOWN GAP (deferred to γ₁/γ₂): the reuse-existing-worktree path
+        (git_ops.py lines ~643-678) currently rebases onto main unconditionally.
+        A re-dispatched train successor therefore loses its stacking contract
+        and treats main as the base instead of its predecessor's tip.
+
+        This test documents the desired future behaviour:
+          - beta is created stacked on alpha
+          - beta's worktree already exists (simulating a requeue)
+          - calling create_worktree again for beta should (eventually) produce
+            WorktreeInfo.base_commit == alpha_tip, not main's SHA.
+
+        As written it asserts the desired state and is expected to FAIL (xfail)
+        until γ₁/γ₂ is implemented — proving the gap is real.
+        """
+        from orchestrator.git_ops import TrainMembership
+
+        # α: create worktree, commit one file
+        alpha_info = await git_ops.create_worktree('reuse-alpha')
+        (alpha_info.path / 'alpha.py').write_text('a = 1\n')
+        alpha_tip = await git_ops.commit(alpha_info.path, 'alpha commit')
+        assert alpha_tip is not None
+
+        # β: stacks on α (fresh create)
+        train = TrainMembership(id='T-reuse', order=1, members=['reuse-alpha', 'reuse-beta'])
+        beta_info = await git_ops.create_worktree('reuse-beta', train=train)
+        (beta_info.path / 'beta.py').write_text('b = 2\n')
+        await git_ops.commit(beta_info.path, 'beta commit')
+
+        # Simulate requeue: call create_worktree again for the same branch.
+        # The reuse path fires because worktree_path already exists.
+        reused_info = await git_ops.create_worktree('reuse-beta', train=train)
+
+        # DESIRED behaviour (γ₁/γ₂): after reuse, base should still be alpha_tip.
+        # CURRENT behaviour: rebases onto main → base_commit == main's SHA (not alpha_tip).
+        assert reused_info.base_commit == alpha_tip  # ← currently fails → xfail
