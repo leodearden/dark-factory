@@ -6,6 +6,7 @@ without sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from datetime import UTC, datetime
@@ -665,3 +666,60 @@ class TestRun:
         # Result should indicate abort
         assert result.get('aborted') is True
         assert result.get('exceeding_projects') == ['dark_factory']
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_id_emits_abort_output(self, capsys):
+        """run() with an unknown --project-id prints a JSON abort payload on
+        stdout and a human-readable message on stderr; no enumeration happens."""
+        memory = self._make_memory(entities=[], edges_by_entity={})
+        args = self._args(apply=False, project_id='unknown-id')
+        known_map = {'dark_factory': '/p'}
+
+        result = await _mod.run(args, memory=memory, known_projects_map=known_map)
+
+        # (i) return-value contract preserved
+        assert result.get('aborted') is True
+        assert 'error' in result
+
+        # (ii) stdout: non-empty, valid JSON, contains aborted + error
+        captured = capsys.readouterr()
+        assert captured.out.strip(), 'stdout should be non-empty on abort'
+        out_data = json.loads(captured.out)
+        assert out_data.get('aborted') is True
+        assert 'error' in out_data
+
+        # (iii) stderr: non-empty, mentions the unknown project_id
+        assert captured.err.strip(), 'stderr should be non-empty on abort'
+        assert 'unknown-id' in captured.err
+
+        # (iv) enumeration did NOT happen (abort before the entity-fetch loop)
+        memory.graphiti.list_entity_nodes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_limit_cap_abort_emits_abort_output(self, capsys):
+        """When entity count exceeds limit, run() prints a JSON abort payload on
+        stdout (with exceeding_projects) and a human-readable hint on stderr."""
+        entities = [
+            {'uuid': f'e{i}', 'name': f'E{i}', 'summary': ''} for i in range(3)
+        ]
+        memory = self._make_memory(entities=entities, edges_by_entity={})
+        args = self._args(apply=True, project_id='dark_factory',
+                          limit_per_project=2, yes_i_am_sure=False)
+        known_map = self._known_map('dark_factory')
+
+        result = await _mod.run(args, memory=memory, known_projects_map=known_map)
+
+        # Return-value contract preserved (existing test still passes)
+        assert result.get('aborted') is True
+        assert result.get('exceeding_projects') == ['dark_factory']
+
+        # stdout: non-empty, valid JSON, aborted + exceeding_projects
+        captured = capsys.readouterr()
+        assert captured.out.strip(), 'stdout should be non-empty on limit-cap abort'
+        out_data = json.loads(captured.out)
+        assert out_data.get('aborted') is True
+        assert out_data.get('exceeding_projects') == ['dark_factory']
+
+        # stderr: non-empty, names the over-cap project
+        assert captured.err.strip(), 'stderr should be non-empty on limit-cap abort'
+        assert 'dark_factory' in captured.err
