@@ -3137,6 +3137,90 @@ class TestEmitMergeAttemptHelper:
 
 
 # ---------------------------------------------------------------------------
+# TestEmitTrainEventHelper — unit tests for module-level _emit_train_event
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTrainEventHelper:
+    def test_emit_train_event_writes_one_row(self, tmp_path: Path) -> None:
+        """Call _emit_train_event — writes exactly one row with correct fields."""
+        import sqlite3
+
+        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        db_path = tmp_path / 'train_eh_a.db'
+        es = EventStore(db_path=db_path, run_id='train-eh-run')
+
+        _emit_train_event(
+            es,
+            EventType.train_started,
+            task_id='trn-a',
+            train_id='train-001',
+            member_task_ids=['trn-a', 'trn-b'],
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, "
+            "       json_extract(data, '$.train_id') as train_id, "
+            "       json_extract(data, '$.member_task_ids') as members "
+            "FROM events WHERE event_type = 'train_started'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        event_type, task_id, phase, train_id, members = rows[0]
+        assert event_type == 'train_started'
+        assert task_id == 'trn-a'
+        assert phase == 'merge'
+        assert train_id == 'train-001'
+
+    def test_emit_train_event_includes_extra_data_keys(self, tmp_path: Path) -> None:
+        """Extra data dict keys appear in the stored JSON."""
+        import json
+        import sqlite3
+
+        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        db_path = tmp_path / 'train_eh_b.db'
+        es = EventStore(db_path=db_path, run_id='train-eh-run')
+
+        _emit_train_event(
+            es,
+            EventType.train_merged,
+            task_id='trn-a',
+            train_id='train-002',
+            member_task_ids=['trn-a', 'trn-b'],
+            data={'merge_commit_sha': 'abc999', 'base_sha': 'base111'},
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT data FROM events WHERE event_type = 'train_merged'").fetchone()
+        conn.close()
+
+        assert row is not None
+        payload = json.loads(row[0])
+        assert payload['train_id'] == 'train-002'
+        assert payload['merge_commit_sha'] == 'abc999'
+        assert payload['base_sha'] == 'base111'
+
+    def test_emit_train_event_noop_when_event_store_is_none(self) -> None:
+        """Call with event_store=None — no exception, nothing written."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        # Should not raise
+        _emit_train_event(
+            None,
+            EventType.train_started,
+            task_id='trn-x',
+            train_id='train-003',
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
 # Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
 # they behave identically with queue depth 1.
