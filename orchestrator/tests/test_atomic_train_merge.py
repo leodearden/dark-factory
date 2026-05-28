@@ -87,9 +87,15 @@ async def seed_workspace_repo(tmp_path: Path) -> Path:
       3. shutil.copytree(_FIXTURE_ROOT → tmp_path, dirs_exist_ok=True)
       4. git add -A && git commit -m "initial workspace"
     """
-    raise NotImplementedError(
-        "seed_workspace_repo scaffold: complete in step-2 (make scenario 1 green)"
-    )
+    repo = tmp_path
+    await _run(["git", "init", "-b", "main"], cwd=repo)
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+    await _run(["git", "config", "user.name", "Test"], cwd=repo)
+    # Copy the cargo workspace fixture tree into the repo root.
+    shutil.copytree(str(_FIXTURE_ROOT), str(repo), dirs_exist_ok=True)
+    await _run(["git", "add", "-A"], cwd=repo)
+    await _run(["git", "commit", "-m", "initial workspace"], cwd=repo)
+    return repo
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +117,24 @@ async def make_stacked_member(
     crate edits (edit_fn receives the worktree root and edits the relevant
     crate src file).
     """
-    raise NotImplementedError(
-        "make_stacked_member scaffold: complete in step-2 (make scenario 1 green)"
+    full_branch = f"{git_ops.config.branch_prefix}{name}"
+    wt_path = git_ops.worktree_base / name
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    await _run(
+        ["git", "worktree", "add", "-b", full_branch, str(wt_path), base_ref],
+        cwd=git_ops.project_root,
     )
+    # Set git identity in the new worktree (required for commits).
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_path)
+    await _run(["git", "config", "user.name", "Test"], cwd=wt_path)
+
+    # Apply the member's deterministic edit.
+    edit_fn(wt_path)
+
+    await git_ops.commit(wt_path, f"Add {name} task output")
+    _, head_sha, _ = await _run(["git", "rev-parse", "HEAD"], cwd=wt_path)
+    return wt_path, head_sha.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +157,29 @@ def build_group_merge_request(
     *tip_name* is the last entry in *member_names*.
     status_check returns ``{name: 'merge-deferred'}`` for all members.
     """
-    raise NotImplementedError(
-        "build_group_merge_request scaffold: complete in step-2 (make scenario 1 green)"
+    status_check = AsyncMock(
+        return_value={name: "merge-deferred" for name in member_names}
+    )
+    mark_member_done = AsyncMock()
+
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+
+    return GroupMergeRequest(
+        task_id=tip_name,
+        branch=tip_name,
+        worktree=tip_worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+        train_id=train_id,
+        member_task_ids=list(member_names),
+        tip_branch=tip_name,
+        tip_task_id=tip_name,
+        status_check=status_check,
+        mark_member_done=mark_member_done,
     )
 
 
@@ -157,8 +199,22 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
       use the shared incremental build cache
     - verify_command_timeout_secs=300  (generous for CI; trivial workspace is fast)
     """
-    raise NotImplementedError(
-        "make_train_config scaffold: complete in step-2 (make scenario 1 green)"
+    return OrchestratorConfig(
+        project_root=repo,
+        test_command="cargo test --workspace --quiet",
+        # Use no-op shell builtins so lint/type_check don't interfere with
+        # the Rust workspace.  'true' always exits 0.
+        lint_command="true",
+        type_check_command="true",
+        verify_env={"CARGO_TARGET_DIR": str(target_dir)},
+        verify_command_timeout_secs=300.0,
+        git=GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        ),
     )
 
 
@@ -213,7 +269,7 @@ class TestScenario1HappyPath:
             lib = wt / "crate_c" / "src" / "lib.rs"
             lib.write_text(lib.read_text() + "\npub fn gamma_task_output() -> u32 { 3 }\n")
 
-        _, main_sha = await _run(
+        _, main_sha, _ = await _run(
             ["git", "rev-parse", "main"], cwd=repo
         )
         main_sha = main_sha.strip()
