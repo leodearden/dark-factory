@@ -16,6 +16,7 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
+    DISALLOW_SUBTASK_CREATE,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
     STAGE2_DISALLOWED,
@@ -124,8 +125,14 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_only_disallows_builtins(self):
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+    def test_stage2_disallows_builtins_plus_subtask_create(self):
+        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE.
+
+        Stage 2 has full memory + task access except for add_subtask, which is
+        blocked because the orchestrator scheduler is top-level-only (see
+        DISALLOW_SUBTASK_CREATE comment in cli_stage_runner.py).
+        """
+        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
