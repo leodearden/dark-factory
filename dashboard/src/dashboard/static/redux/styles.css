@@ -20,6 +20,9 @@
   --warn: oklch(0.80 0.14 80);
   --bad:  oklch(0.68 0.18 25);
   --info: oklch(0.62 0.20 305);
+  --merge-deferred:        oklch(0.74 0.15 60);
+  --merge-deferred-bg:     oklch(0.74 0.15 60 / 0.10);
+  --merge-deferred-border: oklch(0.74 0.15 60 / 0.4);
 
   --radius: 6px;
   --radius-sm: 4px;
@@ -245,6 +248,7 @@ table { border-collapse: collapse; width: 100%; }
 .badge.info  { color: var(--info); border-color: oklch(0.62 0.20 305 / 0.45); background: oklch(0.62 0.20 305 / 0.12); }
 .badge.accent{ color: var(--accent); border-color: oklch(0.72 0.14 230 / 0.4); background: oklch(0.72 0.14 230 / 0.10); }
 .badge.muted { color: var(--fg-2); }
+.badge.merge-deferred { color: var(--merge-deferred); border-color: var(--merge-deferred-border); background: var(--merge-deferred-bg); }
 
 /* Escalation level pills (L0 = info, L1 = warn, L2 = bad) */
 .badge.esc-level-0 { color: var(--info); border-color: oklch(0.62 0.20 305 / 0.45); background: oklch(0.62 0.20 305 / 0.12); }
@@ -459,6 +463,15 @@ table { border-collapse: collapse; width: 100%; }
 }
 .chip-toggle:hover { color: var(--fg-0); border-color: var(--line-strong); background: var(--bg-2); }
 .chip-empty { color: var(--fg-2); font-size: 10px; font-family: var(--mono); opacity: 0.7; }
+.train-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 5px; border-radius: 3px;
+  font-family: var(--mono); font-size: 9px;
+  color: var(--merge-deferred);
+  border: 1px solid var(--merge-deferred-border);
+  background: var(--merge-deferred-bg);
+  margin-left: 4px;
+}
 
 /* ── Tasks tab: dep graph ── */
 .taskgraph { position: relative; padding: 12px; min-height: 200px; }
@@ -478,7 +491,8 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-done.selected       { --sel-color: var(--ok);     background: oklch(0.30 0.08 155 / 0.16); }
 .taskgraph .node.s-blocked.selected    { --sel-color: var(--bad);    background: oklch(0.32 0.10  25 / 0.18); }
 .taskgraph .node.s-pending.selected    { --sel-color: var(--warn);   background: oklch(0.32 0.10  75 / 0.18); }
-.taskgraph .node.s-deferred.selected   { --sel-color: var(--fg-3); }
+.taskgraph .node.s-deferred.selected         { --sel-color: var(--fg-3); }
+.taskgraph .node.s-merge-deferred.selected   { --sel-color: var(--merge-deferred); background: oklch(0.32 0.10 60 / 0.18); }
 .taskgraph .node.in-tree {
   box-shadow: 0 0 0 1px var(--sel-color, var(--accent)) inset;
   border-color: var(--sel-color, var(--accent));
@@ -487,7 +501,8 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-done.in-tree        { --sel-color: var(--ok); }
 .taskgraph .node.s-blocked.in-tree     { --sel-color: var(--bad); }
 .taskgraph .node.s-pending.in-tree     { --sel-color: var(--warn); }
-.taskgraph .node.s-deferred.in-tree    { --sel-color: var(--fg-3); }
+.taskgraph .node.s-deferred.in-tree          { --sel-color: var(--fg-3); }
+.taskgraph .node.s-merge-deferred.in-tree    { --sel-color: var(--merge-deferred); }
 .taskgraph .node .id { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
 .taskgraph .node .ttl { font-size: 11px; color: var(--fg-1); line-height: 1.25; white-space: normal; }
 .taskgraph .node .meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
@@ -497,7 +512,8 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-done       .status-pip { background: var(--ok); }
 .taskgraph .node.s-blocked    .status-pip { background: var(--bad); }
 .taskgraph .node.s-pending    .status-pip { background: var(--warn); }
-.taskgraph .node.s-deferred   .status-pip { background: var(--fg-3); }
+.taskgraph .node.s-deferred        .status-pip { background: var(--fg-3); }
+.taskgraph .node.s-merge-deferred  .status-pip { background: var(--merge-deferred); box-shadow: 0 0 4px oklch(0.74 0.15 60 / 0.5); }
 .taskgraph .node.s-done     { opacity: 0.78; }
 .taskgraph .node.s-deferred { opacity: 0.78; }
 .taskgraph .empty-tier { color: var(--fg-3); font-size: 10px; font-family: var(--mono); padding: 4px; }
