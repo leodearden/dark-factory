@@ -693,6 +693,123 @@ class SpeculativeItem:
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
 
 
+async def _do_train_merge(
+    git_ops: GitOps,
+    req: GroupMergeRequest,
+    event_store: EventStore | None,
+) -> MergeOutcome:
+    """Atomic train-merge pipeline shared by MergeWorker and SpeculativeMergeWorker.
+
+    Implements PRD δ₁ spec §9.6:
+    (a) Status pre-check — all members must be ``merge-deferred``.
+    (b) Tip rebase — ``rebase_onto_main`` rebases the tip onto current main;
+        on conflict it aborts the rebase (worktree left clean) and returns False.
+    (c) Merge — ``merge_to_main`` performs the --no-ff merge of the TIP branch
+        (which, by stacking, already carries all member commits).
+    (d) Workspace verify — ``run_scoped_verification`` with ``is_merge_verify=True``
+        enforces the workspace-wide post-merge green gate (scenario 5).
+    (e) CAS advance — ``advance_main`` atomically updates the main ref.
+    (f) Member callbacks — ``req.mark_member_done`` is called for each member
+        ONLY after advance succeeds (invariant: members flip iff main lands).
+
+    Pre-checks (a)+(b) are added in steps 6 and 8; this initial implementation
+    (step 4) covers the happy path where main is unmoved and all members are
+    already merge-deferred.
+    """
+    t0 = time.monotonic()
+    logger.info(
+        'Train %s: starting atomic merge of %d members via tip branch %s',
+        req.train_id, len(req.member_task_ids), req.branch,
+    )
+
+    # (a) Status pre-check: all members must be 'merge-deferred'.
+    statuses = await req.status_check(req.member_task_ids)
+    incomplete = [
+        (mid, statuses.get(mid, '<missing>'))
+        for mid in req.member_task_ids
+        if statuses.get(mid) != 'merge-deferred'
+    ]
+    if incomplete:
+        first_id, first_status = incomplete[0]
+        reason = (
+            f'{TRAIN_INCOMPLETE_REASON_PREFIX}: member {first_id!r} is '
+            f'{first_status!r} (expected merge-deferred)'
+        )
+        logger.info('Train %s: %s', req.train_id, reason)
+        _emit_merge_attempt(event_store, req.task_id, 'train_incomplete', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('blocked', reason=reason)
+
+    # (b) Rebase tip onto current main so the --no-ff merge is clean.
+    ok = await git_ops.rebase_onto_main(req.worktree)
+    if not ok:
+        reason = (
+            f'{TRAIN_REBASE_CONFLICT_REASON_PREFIX}: tip branch '
+            f'{req.branch!r} conflicts with current main; rebase aborted '
+            f'— resolve in the tip worktree'
+        )
+        logger.info('Train %s: %s', req.train_id, reason)
+        _emit_merge_attempt(event_store, req.task_id, 'train_rebase_conflict', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('blocked', reason=reason)
+
+    # (c) Read current main HEAD AFTER rebase (so CAS expected_main is fresh).
+    main_sha = await git_ops.get_main_sha()
+
+    # (d) --no-ff merge of the tip branch (carries all member commits by stacking).
+    merge_result = await git_ops.merge_to_main(req.worktree, req.branch)
+    if merge_result.conflicts or not merge_result.success:
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        reason = merge_result.details or 'Merge failed'
+        logger.info('Train %s: merge failed: %s', req.train_id, reason)
+        _emit_merge_attempt(event_store, req.task_id, 'conflict' if merge_result.conflicts else 'merge_failed', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('blocked', reason=reason)
+
+    assert merge_result.merge_commit is not None
+    merge_commit = merge_result.merge_commit.strip()
+    merge_wt = merge_result.merge_worktree
+    assert merge_wt is not None
+
+    # (e) Workspace-wide post-merge verify (scenario 5 red gate).
+    verify = await run_scoped_verification(
+        merge_wt, req.config, req.module_configs,
+        task_files=req.task_files,
+        max_retries=0,
+        is_merge_verify=True,
+    )
+    if not verify.passed:
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        reason = f'Post-merge verification failed: {verify.failure_report()}'
+        logger.info('Train %s: verify gate red: %s', req.train_id, reason)
+        _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('blocked', reason=reason)
+
+    # (f) CAS-advance main.
+    adv = await git_ops.advance_main(
+        merge_commit, merge_wt,
+        branch=req.branch,
+        max_attempts=req.config.max_advance_attempts,
+        expected_main=main_sha,
+    )
+    await git_ops.cleanup_merge_worktree(merge_wt)
+
+    if adv != 'advanced':
+        logger.info('Train %s: advance_main returned %r', req.train_id, adv)
+        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0))
+        return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
+
+    # (g) Flip all members done — ONLY after advance succeeds.
+    advanced_sha = git_ops._last_advanced_sha or merge_commit
+    for member_id in req.member_task_ids:
+        await req.mark_member_done(member_id, advanced_sha)
+
+    logger.info(
+        'Train %s: landed at %s; %d members marked done',
+        req.train_id, advanced_sha[:12], len(req.member_task_ids),
+    )
+    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
+    return MergeOutcome('done', merge_sha=advanced_sha)
+
+
 class MergeWorker:
     """Single coroutine that processes merge requests serially.
 
@@ -909,6 +1026,12 @@ class MergeWorker:
             return MergeOutcome('blocked', reason=f'Merge worker error: {exc}')
 
     async def _do_merge(self, req: MergeRequest) -> MergeOutcome | None:
+        # Train dispatch: GroupMergeRequest is handled by the shared
+        # _do_train_merge pipeline which owns rebase + merge + verify + advance
+        # + member callbacks.  The rest of _do_merge is the single-task path.
+        if isinstance(req, GroupMergeRequest):
+            return await _do_train_merge(self._git_ops, req, self._event_store)
+
         t0 = time.monotonic()
 
         # Loop-breaker: refuse to process tasks that have already timed out
