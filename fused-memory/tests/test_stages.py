@@ -1609,6 +1609,63 @@ class TestAutopilotVideoTaskCeilingFreshness:
         )
 
 
+class TestStage2NoTaskIdCeiling:
+    """Task IDs above the old 606 ceiling must NOT block task writes.
+
+    Regression guard for the bug described in task-1517: legitimate
+    autopilot_video tasks 607-610 (created 2026-05-26) caused EVERY Stage 2
+    cycle to abort because the contamination code gate fired on task IDs
+    exceeding the hardcoded AUTOPILOT_VIDEO_TASK_CEILING=606.
+
+    After the fix (step-4), get_disallowed_tools() must always return
+    STAGE2_DISALLOWED regardless of task ID magnitude.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
+        """Task IDs 607-610 (above the old 606 ceiling) must not cause
+        get_disallowed_tools() to append DISALLOW_TASK_WRITES.
+
+        Failure mode (pre-fix): _contamination_detected=True was set during
+        assemble_payload() when excessive_autopilot_video_ids() found IDs > 606,
+        causing get_disallowed_tools() to return STAGE2_DISALLOWED + DISALLOW_TASK_WRITES
+        and aborting every Stage 2 cycle silently.
+        """
+        watermark = Watermark(project_id='autopilot_video')
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps,
+            project_id='autopilot_video',
+            project_root='/home/leo/src/autopilot-video',
+        )
+        # Synthetic tree with task IDs that exceed the old 606 ceiling
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 607, 'title': 'Task 607', 'status': 'pending', 'dependencies': []},
+                {'id': 608, 'title': 'Task 608', 'status': 'in-progress', 'dependencies': []},
+                {'id': 609, 'title': 'Task 609', 'status': 'done', 'dependencies': []},
+                {'id': 610, 'title': 'Task 610', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+
+        await stage.assemble_payload([], watermark, [])
+
+        assert stage.get_disallowed_tools() == STAGE2_DISALLOWED, (
+            f'Expected get_disallowed_tools() == STAGE2_DISALLOWED but got '
+            f'{stage.get_disallowed_tools()!r} — high task IDs must not append '
+            'DISALLOW_TASK_WRITES; the numeric-ID contamination gate has been removed.'
+        )
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
