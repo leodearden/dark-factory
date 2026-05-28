@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from orchestrator.config import GitConfig
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -49,6 +49,24 @@ AdvanceResult = Literal[
 
 
 PushResult = Literal['pushed', 'noop', 'rejected', 'error']
+
+
+class TrainMembership(TypedDict, total=False):
+    """Train metadata passed from task.metadata.train.
+
+    All keys are optional at the type level; _train_predecessor validates
+    presence of required keys at runtime with diagnostic error messages.
+    """
+    id: str
+    order: int
+    members: list[str] | None
+
+
+@dataclass(frozen=True)
+class TrainPredecessor:
+    """Resolved predecessor for a train member with order > 0."""
+    task_id: str
+    branch: str
 
 
 # Default commit-citation pattern for ``find_task_citation_commit``.
@@ -460,6 +478,36 @@ class GitOps:
             self.config.main_branch, behind, remote_ref, remote_ref,
         )
         return remote_ref, behind
+
+    async def _train_predecessor(self, train: TrainMembership) -> TrainPredecessor:
+        """Resolve the predecessor for a train member with order > 0.
+
+        Reads train['members'][order - 1] and derives its branch name using
+        the configured branch_prefix.  Raises ValueError when invariants are
+        violated (order <= 0, members absent/None, members too short).
+        """
+        order = train.get('order', 0)
+        if order <= 0:
+            raise ValueError(
+                f'_train_predecessor called with order={order!r}; '
+                'must only be called when order > 0'
+            )
+        members = train.get('members')
+        if not members or not isinstance(members, list):
+            raise ValueError(
+                f'_train_predecessor: members is {members!r}; '
+                'expected a non-empty list of task ids'
+            )
+        if len(members) < order:
+            raise ValueError(
+                f'_train_predecessor: members has {len(members)} entries but '
+                f'order={order} requires at least {order} entries; members={members!r}'
+            )
+        predecessor_id = str(members[order - 1])
+        return TrainPredecessor(
+            task_id=predecessor_id,
+            branch=f'{self.config.branch_prefix}{predecessor_id}',
+        )
 
     async def create_worktree(
         self, branch_name: str, *, expected_title: str | None = None,

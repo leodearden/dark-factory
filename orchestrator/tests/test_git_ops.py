@@ -3114,3 +3114,24 @@ class TestOrphanWorktreeHelpers:
         info = await git_ops.create_worktree('exists-wt')
         # Query a branch with no task/ ref → rev-list fails → fail-safe True.
         assert await git_ops.worktree_has_unsaved_work(info.path, 'no-such-branch') is True
+
+
+@pytest.mark.asyncio
+class TestTrainPredecessor:
+    async def test_returns_predecessor_for_order_gt_zero(self, git_ops: GitOps):
+        from orchestrator.git_ops import TrainMembership, TrainPredecessor
+
+        # order=1, members=['a', 'b'] → predecessor is members[0] = 'a'
+        result = await git_ops._train_predecessor(
+            TrainMembership(id='T1', order=1, members=['a', 'b'])
+        )
+        assert isinstance(result, TrainPredecessor)
+        assert result.task_id == 'a'
+        assert result.branch == 'task/a'
+
+        # order=2, members=['a', 'b', 'c'] → predecessor is members[1] = 'b'
+        result2 = await git_ops._train_predecessor(
+            TrainMembership(id='T1', order=2, members=['a', 'b', 'c'])
+        )
+        assert result2.task_id == 'b'
+        assert result2.branch == 'task/b'
