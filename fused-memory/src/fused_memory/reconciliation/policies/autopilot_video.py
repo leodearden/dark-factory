@@ -7,17 +7,8 @@ does not embed project-specific magic values.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-
-# Canonical project identifier — single source of truth across stage2 prompt
-# injection and task_knowledge_sync.py's programmatic warning check.
+# Canonical project identifier — single source of truth for stage2 prompt injection.
 AUTOPILOT_VIDEO_PROJECT_ID: str = 'autopilot_video'
-
-# Legacy ceiling constant — retained for backward-compat imports in
-# task_knowledge_sync.py until step-4 removes the code gate entirely.
-# The prompt guardrail (AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL) no longer
-# references this value; it has been replaced by content-based detection.
-AUTOPILOT_VIDEO_TASK_CEILING: int = 606
 
 # Prompt fragment injected by build_stage2_system_prompt() only when
 # project_id == AUTOPILOT_VIDEO_PROJECT_ID.  Content-based: cross-project
@@ -45,26 +36,3 @@ entry to your structured report (with ``summary``, ``target_project_hint``, and 
 reconciliation work for this project.
 
 """
-
-
-def excessive_autopilot_video_ids(tasks: Iterable[dict]) -> list[int]:
-    """Return sorted list of task IDs above AUTOPILOT_VIDEO_TASK_CEILING.
-
-    Legacy helper — retained for backward-compat import in task_knowledge_sync.py
-    until step-4 removes the code gate.  After step-4 this function is deleted.
-
-    Args:
-        tasks: Iterable of task dicts (each with an ``'id'`` field).
-
-    Returns:
-        Sorted list of integer task IDs that exceed the ceiling.  Empty list
-        when the guardrail condition is not met.
-    """
-    # Deferred import avoids a circular dependency at module load time.
-    from fused_memory.reconciliation.task_filter import id_key  # noqa: PLC0415
-
-    return sorted({
-        pid
-        for pid in (id_key(t) for t in tasks)
-        if pid > AUTOPILOT_VIDEO_TASK_CEILING
-    })

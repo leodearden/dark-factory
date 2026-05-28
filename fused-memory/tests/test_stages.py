@@ -1476,6 +1476,7 @@ class TestStage2GuardrailProjectIdGating:
         content-based Contamination Guardrail section with no numeric task-ID
         ceiling, positioned before ## Available Tools."""
         import re
+
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
         prompt = build_stage2_system_prompt(project_id='autopilot_video')
 
@@ -1521,91 +1522,6 @@ class TestStage2GuardrailProjectIdGating:
         assert 'Contamination Guardrail' not in prompt, (
             "Expected 'Contamination Guardrail' to be absent from the dark_factory "
             "prompt — the guardrail must NOT fire for non-autopilot projects."
-        )
-
-
-class TestAutopilotVideoTaskCeilingFreshness:
-    """Consistency check: AUTOPILOT_VIDEO_TASK_CEILING must match the committed fixture.
-
-    This is a *consistency* test, not a live drift detector — it verifies that the
-    constant in policies/autopilot_video.py and the committed fixture
-    tests/fixtures/autopilot_video_max_id.json agree with each other.  It does NOT
-    detect that autopilot_video has outgrown the ceiling in production; that requires
-    updating both values together when autopilot_video's task count grows.
-
-    A secondary test (test_ceiling_constant_not_below_live_max_id) skips on CI and
-    runs only on workstations that have the live autopilot_video repository — it is
-    the actual early-warning detector.
-
-    Workflow when autopilot_video grows past the ceiling:
-    1. Update AUTOPILOT_VIDEO_TASK_CEILING in policies/autopilot_video.py.
-    2. Update tests/fixtures/autopilot_video_max_id.json to {"max_id": <new max>}.
-    3. Re-evaluate whether 'task IDs > ceiling ⟹ cross-project contamination' still holds.
-    4. Run this test to confirm both changes are consistent.
-
-    Mirroring the TestTierConfig / TestProjectIdGuidelineConstants drift-detector pattern.
-    """
-
-    def test_ceiling_constant_consistent_with_fixture(self):
-        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max_id in the committed fixture.
-
-        This is a consistency check between the constant and the fixture — both must
-        be updated together when autopilot_video grows.  The fixture is the committed
-        contract; if this fails, see the class docstring update workflow.
-        """
-        import json
-        from pathlib import Path
-
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
-        )
-
-        fixture_path = Path(__file__).parent / 'fixtures' / 'autopilot_video_max_id.json'
-        fixture_data = json.loads(fixture_path.read_text())
-        fixture_max_id = int(fixture_data['max_id'])
-
-        assert fixture_max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
-            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
-            f'the committed fixture max_id={fixture_max_id}.  '
-            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
-            f'fused_memory/reconciliation/policies/autopilot_video.py to {fixture_max_id} '
-            f'and re-evaluate the contamination guardrail premise before the next cycle.  '
-            f'Also update tests/fixtures/autopilot_video_max_id.json if the live task '
-            f'tree has grown further.'
-        )
-
-    def test_ceiling_constant_not_below_live_max_id(self):
-        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max id in the live tasks.json.
-
-        Secondary assertion (skips gracefully when autopilot_video is not on this
-        machine).  On Leo's workstation this is the actual early-warning detector:
-        it catches the case where autopilot_video has grown but neither the fixture
-        nor the constant has been updated yet.
-        """
-        import json
-
-        import pytest
-
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
-        )
-
-        tasks_path = '/home/leo/src/autopilot-video/.taskmaster/tasks/tasks.json'
-        try:
-            with open(tasks_path) as fh:
-                data = json.load(fh)
-            tasks = data['master']['tasks']
-            max_id = max(int(t['id']) for t in tasks)
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
-            pytest.skip('autopilot_video tasks.json not available in this environment')
-
-        assert max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
-            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
-            f'the observed max task id {max_id} in autopilot_video tasks.json.  '
-            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
-            f'fused_memory/reconciliation/policies/autopilot_video.py to {max_id}, update '
-            f'tests/fixtures/autopilot_video_max_id.json to {{"max_id": {max_id}}}, and '
-            f're-evaluate the contamination guardrail premise before the next cycle.'
         )
 
 
