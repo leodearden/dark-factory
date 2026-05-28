@@ -2785,15 +2785,23 @@ class SpeculativeMergeWorker:
                     '(retry_base=%s)',
                     req.task_id, retry_main[:8],
                 )
-                skip_verify = (
-                    req.pre_rebased
-                    and retry_result.pre_merge_sha is not None
-                    and retry_result.pre_merge_sha == retry_main
-                )
+                # skip_verify is UNCONDITIONALLY False on the race-retry path.
+                #
+                # merge_to_main pins pre_merge_sha to the explicit base_sha=retry_main,
+                # so the old expression (req.pre_rebased and pre_merge_sha==retry_main)
+                # was a tautology that degenerated to skip_verify=req.pre_rebased.
+                # However, this branch is reached ONLY after the gate confirmed main
+                # advanced (merge_result.pre_merge_sha != actual_main): the branch was
+                # pre-rebased onto the OLD main while the retry merges it against the
+                # newer retry_main, integrating main commits the branch never
+                # incorporated.  The documented skip_verify invariant
+                # ('pre_rebased AND main unchanged', SpeculativeItem.skip_verify) does
+                # NOT hold; skipping verification would let semantically-unverified
+                # main commits land on the protected branch.  Always verify.
                 return SpeculativeItem(
                     request=req, merge_result=retry_result,
                     merge_wt=retry_result.merge_worktree,
-                    base_sha=retry_main, speculative=False, skip_verify=skip_verify,
+                    base_sha=retry_main, speculative=False, skip_verify=False,
                     started_monotonic=started_monotonic,
                 )
             if retry_result.conflicts:
