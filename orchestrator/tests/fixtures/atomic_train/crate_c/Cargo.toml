@@ -1,0 +1,7 @@
+[package]
+name = "train-c"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+train-b = { path = "../crate_b" }
