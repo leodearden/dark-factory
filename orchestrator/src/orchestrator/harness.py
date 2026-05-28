@@ -3869,13 +3869,16 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
 
-        Read-first carve-out: non-terminal non-blocked states {deferred, in-progress,
-        pending} (+ None) are skipped with DEBUG — writing 'pending' onto them would
-        clobber a deliberate state that the server gate does NOT protect.
+        Allowlist carve-out: only status=='blocked' or status in TERMINAL_STATUSES
+        reaches the set_task_status attempt block. Every other non-None status
+        (deferred, in-progress, pending, merge-deferred, and any future non-terminal
+        status) is DEBUG-skipped — writing 'pending' onto them would clobber a
+        deliberate state that the server terminal-exit gate does NOT protect.
 
-        For {blocked, done, cancelled} we attempt the flip; blocked succeeds (INFO),
-        done/cancelled are rejected by the terminal-exit gate → SetTaskStatusRejected
-        caught → WARNING (no re-raise, best-effort policy).
+        For {blocked, done, cancelled}:
+          - blocked → set_task_status('pending') succeeds → INFO citing L2 id.
+          - done/cancelled → rejected by the terminal-exit gate → SetTaskStatusRejected
+            caught → WARNING (no re-raise, best-effort policy).
         """
         task_id = escalation.task_id
         status = await self.scheduler.get_status(task_id)
@@ -3887,9 +3890,14 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return
 
-        if status in ('deferred', 'in-progress', 'pending'):
+        # Allowlist: only 'blocked' and terminal statuses (done/cancelled) proceed.
+        # All other non-terminal statuses (deferred, in-progress, pending,
+        # merge-deferred, and any future status) are carved out to prevent clobbering
+        # deliberate state that the server gate does not protect.
+        from orchestrator.task_status import TERMINAL_STATUSES
+        if status not in TERMINAL_STATUSES and status != 'blocked':
             logger.debug(
-                'cascade-unblock: task %s is %s (carve-out preserved); '
+                'cascade-unblock: task %s is %s (non-terminal non-blocked carve-out); '
                 'not flipping (via %s)',
                 task_id, status, escalation.resolved_by,
             )
