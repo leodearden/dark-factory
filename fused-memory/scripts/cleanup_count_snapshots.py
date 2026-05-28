@@ -392,3 +392,86 @@ def check_limit_cap(
     exceeding = [pid for pid, count in per_project_entity_counts.items() if count > limit]
     abort = bool(exceeding) and not yes_i_am_sure
     return exceeding, abort
+
+
+# ---------------------------------------------------------------------------
+# Live shell: apply + run
+# ---------------------------------------------------------------------------
+
+async def apply_cleanup(
+    memory: Any,
+    scan_results: list[EntityScanResult],
+    now: datetime,
+) -> dict[str, Any]:
+    """Invalidate matched edges, write audit memories, refresh entity summaries.
+
+    Parameters
+    ----------
+    memory:
+        A live (or mock) MemoryService instance.
+    scan_results:
+        List of EntityScanResult from scan_entities_for_snapshots.
+    now:
+        Datetime to use as invalid_at (and invalidated_at in audit memory).
+
+    Returns
+    -------
+    ``{applied_edges: set[str], failed_refreshes: list[dict]}``
+    """
+    now_iso = now.isoformat()
+
+    # Dedupe edges across all entity results
+    all_edges: dict[str, EdgeMatch] = {}
+    for r in scan_results:
+        for m in r.edge_matches:
+            if m.edge_uuid not in all_edges:
+                all_edges[m.edge_uuid] = m
+
+    applied_edges: set[str] = set()
+
+    # Invalidate each unique edge + write audit memory
+    for edge_uuid, match in sorted(all_edges.items()):
+        await memory.update_edge(
+            edge_uuid=edge_uuid,
+            project_id=match.project_id,
+            invalid_at=now,
+            _source='cleanup_count_snapshots',
+        )
+        applied_edges.add(edge_uuid)
+
+        # Use the lexicographically-first entity_uuid as canonical representative
+        canonical_entity = sorted(match.entity_uuids)[0]
+        payload = build_audit_memory_payload(match, canonical_entity, now_iso)
+        await memory.add_memory(**payload, _source='cleanup_count_snapshots')
+
+    # Refresh entity summaries for all affected entities (once per entity)
+    affected_entities: dict[str, str] = {}  # entity_uuid -> project_id
+    for r in scan_results:
+        if r.edge_matches:
+            affected_entities[r.entity_uuid] = r.project_id
+        # Also include any extra entity_uuids from edge endpoints
+        for m in r.edge_matches:
+            for euuid in m.entity_uuids:
+                if euuid not in affected_entities:
+                    affected_entities[euuid] = m.project_id
+
+    failed_refreshes: list[dict[str, Any]] = []
+    for entity_uuid, project_id in sorted(affected_entities.items()):
+        try:
+            await memory.refresh_entity_summary(
+                entity_uuid=entity_uuid,
+                project_id=project_id,
+                _source='cleanup_count_snapshots',
+            )
+        except Exception as exc:
+            logger.warning('Failed to refresh entity %s: %s', entity_uuid, exc)
+            failed_refreshes.append({
+                'entity_uuid': entity_uuid,
+                'project_id': project_id,
+                'error': str(exc),
+            })
+
+    return {
+        'applied_edges': applied_edges,
+        'failed_refreshes': failed_refreshes,
+    }
