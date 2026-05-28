@@ -309,6 +309,50 @@ def test_shape_merge_queue_injects_halt_status_per_project():
     assert mq['dark-factory']['halt'] == {'offline': True}
 
 
+def test_shape_merge_queue_includes_train_events():
+    """shape_merge_queue exposes train_events list per project."""
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+            'train_events': [
+                {
+                    'event_type': 'train_started',
+                    'task_id': 'trn-a',
+                    'run_id': 'run-1',
+                    'timestamp': '2026-05-28T12:00:00+00:00',
+                    'data': {'train_id': 't1', 'member_count': 3},
+                }
+            ],
+        },
+    }
+    body = redux_api.shape_merge_queue(raw)
+    section = body['MERGE_QUEUE']['dark-factory']
+    assert 'train_events' in section, f'Missing train_events in section keys: {list(section.keys())}'
+    assert isinstance(section['train_events'], list)
+    assert len(section['train_events']) == 1
+    assert section['train_events'][0]['event_type'] == 'train_started'
+
+    # When 'train_events' key is absent, result should default to []
+    raw_no_train = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+            # no 'train_events' key
+        },
+    }
+    body2 = redux_api.shape_merge_queue(raw_no_train)
+    assert body2['MERGE_QUEUE']['dark-factory']['train_events'] == []
+
+
 # ---------------------------------------------------------------------------
 # shape_costs
 # ---------------------------------------------------------------------------
