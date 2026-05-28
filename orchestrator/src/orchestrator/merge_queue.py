@@ -762,6 +762,26 @@ def _emit_merge_attempt(
         )
 
 
+def _emit_train_event(
+    event_store: EventStore | None,
+    event_type: EventType,
+    *,
+    task_id: str,
+    train_id: str,
+    member_task_ids: list[str] | None = None,
+    data: dict | None = None,
+) -> None:
+    """Emit a train lifecycle event.  No-op when *event_store* is None."""
+    if event_store is None:
+        return
+    payload: dict = {'train_id': train_id}
+    if member_task_ids is not None:
+        payload['member_task_ids'] = member_task_ids
+    if data:
+        payload.update(data)
+    event_store.emit(event_type, task_id=task_id, phase='merge', data=payload)
+
+
 INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
 """Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
 to be considered actively in-flight rather than abandoned.
@@ -1204,6 +1224,28 @@ async def _do_train_merge(
         'member_task_ids': req.member_task_ids,
     }
 
+    # Telemetry: emit train_started once per *attempt*.  Because the workflow
+    # re-parks an incomplete train (MERGE_DEFERRED) for retry, the same
+    # train_id can fire train_started on each scheduler iteration until all
+    # members are ready.  Consumers should treat train_started as
+    # "merge-attempt started" and correlate by (train_id, timestamp) rather
+    # than expecting a single occurrence per train lifecycle.
+    #
+    # base_sha_t0 is a best-effort telemetry read (main at the START of this
+    # attempt); it is NOT the CAS expected_main used for the actual advance
+    # (that is read after rebase at the (c) anchor below).  A transient git
+    # failure here must not abort the core merge path, hence the try/except.
+    try:
+        base_sha_t0: str = await git_ops.get_main_sha()
+    except Exception:
+        base_sha_t0 = ''
+    _emit_train_event(
+        event_store, EventType.train_started,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'member_count': len(req.member_task_ids), 'base_sha': base_sha_t0},
+    )
+
     # (a) Status pre-check: all members must be 'merge-deferred'.
     statuses = await req.status_check(req.member_task_ids)
     incomplete = [
@@ -1212,6 +1254,19 @@ async def _do_train_merge(
         if statuses.get(mid) != 'merge-deferred'
     ]
     if incomplete:
+        # Emit train_member_deferred for each incomplete member (retryable, NOT a derail).
+        for mid, status in incomplete:
+            deferred_reason = f"status is {status!r}, expected merge-deferred"
+            remaining = [m for m in req.member_task_ids if m != mid]
+            _emit_train_event(
+                event_store, EventType.train_member_deferred,
+                task_id=req.task_id, train_id=req.train_id,
+                data={
+                    'deferred_task_id': mid,
+                    'deferred_reason': deferred_reason,
+                    'remaining_members': remaining,
+                },
+            )
         first_id, first_status = incomplete[0]
         reason = (
             f'{TRAIN_INCOMPLETE_REASON_PREFIX}: member {first_id!r} is '
@@ -1230,6 +1285,12 @@ async def _do_train_merge(
             f'— resolve in the tip worktree'
         )
         logger.info('Train %s: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'train_rebase_conflict', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1243,6 +1304,12 @@ async def _do_train_merge(
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
         reason = merge_result.details or 'Merge failed'
         logger.info('Train %s: merge failed: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'conflict' if merge_result.conflicts else 'merge_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1275,6 +1342,12 @@ async def _do_train_merge(
         await git_ops.cleanup_merge_worktree(merge_wt)
         reason = f'Post-merge verification failed: {verify.failure_report()}'
         logger.info('Train %s: verify gate red: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1304,10 +1377,23 @@ async def _do_train_merge(
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': f'Train merge advance failed: {adv}'},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
 
     advanced_sha: str = pre_cleanup_advanced_sha or merge_commit
+
+    _emit_train_event(
+        event_store, EventType.train_merged,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'merge_commit_sha': advanced_sha, 'base_sha': main_sha},
+    )
 
     # (g) Flip all members done — ONLY after advance succeeds.
     # Each callback is wrapped in try/except so a single scheduler blip does

@@ -63,6 +63,9 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
+  // MERGE_QUEUE: {project_label: {depth, outcomes, latency, recent, speculative,
+  //   active, active_spark, halt, train_events: [{event_type, task_id, run_id,
+  //   timestamp, data: {train_id, member_task_ids, ...event-specific keys}}]}}
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },

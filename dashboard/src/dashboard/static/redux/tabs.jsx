@@ -946,6 +946,47 @@ function MergeTab({ projectFilter }) {
                     </table>
                   </div>
                 </div>
+
+                {(d.train_events || []).length > 0 && (
+                  <div className="col-span-12 panel">
+                    <div className="panel-head"><span className="title">Train events</span></div>
+                    <div className="panel-body flush">
+                      <table className="tbl">
+                        <thead><tr><th>Event</th><th>Train</th><th>Task</th><th>Members / Reason</th><th className="num">When</th></tr></thead>
+                        <tbody>
+                          {(d.train_events || []).map((ev, i) => {
+                            const dt = (ev.data || {});
+                            const rawDetail = ev.event_type === 'train_member_deferred'
+                              ? `deferred: ${dt.deferred_reason || '—'}`
+                              : ev.event_type === 'train_derailed'
+                              ? `reason: ${dt.derail_reason || '—'}`
+                              : dt.member_task_ids
+                              ? `members: ${(dt.member_task_ids || []).join(', ')}`
+                              : '—';
+                            // Truncate long strings (e.g. verify failure reports) to keep
+                            // the column width sane; full text is exposed via title attr.
+                            const detail = rawDetail.length > 120
+                              ? rawDetail.slice(0, 120) + '…'
+                              : rawDetail;
+                            const evBadge = ev.event_type === 'train_merged' ? 'ok'
+                              : ev.event_type === 'train_derailed' ? 'bad'
+                              : ev.event_type === 'train_member_deferred' ? 'warn'
+                              : 'info';
+                            return (
+                              <tr key={i}>
+                                <td><span className={`badge ${evBadge}`}>{ev.event_type}</span></td>
+                                <td className="mono">{dt.train_id || '—'}</td>
+                                <td className="mono">{ev.task_id}</td>
+                                <td style={{ color: 'var(--fg-3)', fontSize: 11 }} title={rawDetail}>{detail}</td>
+                                <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(ev.timestamp)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
             </ProjectGroup>
           </div>

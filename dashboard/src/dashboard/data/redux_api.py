@@ -414,7 +414,7 @@ def shape_merge_queue(
     match against ``PROJECTS[].name``.  The shape per-project follows the
     DF_DATA mock: ``depth`` (renamed from ``depth_timeseries``), ``outcomes``,
     ``latency``, ``recent``, ``speculative``, ``active``, ``active_spark``,
-    ``halt``.
+    ``halt``, ``train_events``.
 
     ``active_sparks`` (optional) carries true active-queue depth over time
     keyed by absolute project_root path; surfaced as ``active_spark`` per
@@ -443,6 +443,7 @@ def shape_merge_queue(
                 'values': list(spark.get('values') or []),
             },
             'halt': dict(halts.get(label) or {'offline': True}),
+            'train_events': [dict(e) for e in (data.get('train_events') or [])],
         }
     return {'MERGE_QUEUE': out}
 

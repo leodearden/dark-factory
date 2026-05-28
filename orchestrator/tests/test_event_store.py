@@ -250,3 +250,100 @@ class TestSchedulerPauseEventTypes:
         assert data['reason'] == 'park-stop: 5 tasks blocked'
         assert data['pause_at'] == '2026-05-13T22:00:00+00:00'
         assert data['restored_from_run_id'] == 'prior-run-001'
+
+
+class TestTrainEventTypes:
+    """Assert the four train_* event types exist and can round-trip through EventStore."""
+
+    def test_train_started_value(self) -> None:
+        assert EventType.train_started.value == 'train_started'
+        assert EventType.train_started.name == EventType.train_started.value
+
+    def test_train_member_deferred_value(self) -> None:
+        assert EventType.train_member_deferred.value == 'train_member_deferred'
+        assert EventType.train_member_deferred.name == EventType.train_member_deferred.value
+
+    def test_train_merged_value(self) -> None:
+        assert EventType.train_merged.value == 'train_merged'
+        assert EventType.train_merged.name == EventType.train_merged.value
+
+    def test_train_derailed_value(self) -> None:
+        assert EventType.train_derailed.value == 'train_derailed'
+        assert EventType.train_derailed.name == EventType.train_derailed.value
+
+    def test_all_four_train_events_round_trip(self, tmp_path: Path) -> None:
+        """Emit all four train_* events with documented payloads and verify rows exist."""
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-train-test')
+
+        store.emit(
+            EventType.train_started,
+            task_id='trn-a',
+            phase='merge',
+            data={
+                'train_id': 'train-001',
+                'member_task_ids': ['trn-a', 'trn-b', 'trn-c'],
+                'member_count': 3,
+                'base_sha': 'abc123',
+            },
+        )
+        store.emit(
+            EventType.train_member_deferred,
+            task_id='trn-b',
+            phase='merge',
+            data={
+                'train_id': 'train-001',
+                'deferred_task_id': 'trn-b',
+                'deferred_reason': 'status is planning, expected merge-deferred',
+                'remaining_members': ['trn-a', 'trn-c'],
+            },
+        )
+        store.emit(
+            EventType.train_merged,
+            task_id='trn-a',
+            phase='merge',
+            data={
+                'train_id': 'train-001',
+                'member_task_ids': ['trn-a', 'trn-b', 'trn-c'],
+                'merge_commit_sha': 'def456',
+                'base_sha': 'abc123',
+            },
+        )
+        store.emit(
+            EventType.train_derailed,
+            task_id='trn-a',
+            phase='merge',
+            data={
+                'train_id': 'train-001',
+                'member_task_ids': ['trn-a', 'trn-b', 'trn-c'],
+                'derail_reason': 'verify failed: test suite red',
+            },
+        )
+
+        rows = _query_all(db_path)
+        assert len(rows) == 4
+
+        types = [r['event_type'] for r in rows]
+        assert types == [
+            'train_started',
+            'train_member_deferred',
+            'train_merged',
+            'train_derailed',
+        ]
+
+        started_data = json.loads(rows[0]['data'])
+        assert started_data['train_id'] == 'train-001'
+        assert started_data['member_count'] == 3
+        assert started_data['base_sha'] == 'abc123'
+
+        deferred_data = json.loads(rows[1]['data'])
+        assert deferred_data['deferred_task_id'] == 'trn-b'
+        assert 'planning' in deferred_data['deferred_reason']
+        assert deferred_data['remaining_members'] == ['trn-a', 'trn-c']
+
+        merged_data = json.loads(rows[2]['data'])
+        assert merged_data['merge_commit_sha'] == 'def456'
+        assert merged_data['base_sha'] == 'abc123'
+
+        derailed_data = json.loads(rows[3]['data'])
+        assert 'verify' in derailed_data['derail_reason']

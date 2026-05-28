@@ -3137,6 +3137,90 @@ class TestEmitMergeAttemptHelper:
 
 
 # ---------------------------------------------------------------------------
+# TestEmitTrainEventHelper — unit tests for module-level _emit_train_event
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTrainEventHelper:
+    def test_emit_train_event_writes_one_row(self, tmp_path: Path) -> None:
+        """Call _emit_train_event — writes exactly one row with correct fields."""
+        import sqlite3
+
+        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        db_path = tmp_path / 'train_eh_a.db'
+        es = EventStore(db_path=db_path, run_id='train-eh-run')
+
+        _emit_train_event(
+            es,
+            EventType.train_started,
+            task_id='trn-a',
+            train_id='train-001',
+            member_task_ids=['trn-a', 'trn-b'],
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, "
+            "       json_extract(data, '$.train_id') as train_id, "
+            "       json_extract(data, '$.member_task_ids') as members "
+            "FROM events WHERE event_type = 'train_started'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        event_type, task_id, phase, train_id, members = rows[0]
+        assert event_type == 'train_started'
+        assert task_id == 'trn-a'
+        assert phase == 'merge'
+        assert train_id == 'train-001'
+
+    def test_emit_train_event_includes_extra_data_keys(self, tmp_path: Path) -> None:
+        """Extra data dict keys appear in the stored JSON."""
+        import json
+        import sqlite3
+
+        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        db_path = tmp_path / 'train_eh_b.db'
+        es = EventStore(db_path=db_path, run_id='train-eh-run')
+
+        _emit_train_event(
+            es,
+            EventType.train_merged,
+            task_id='trn-a',
+            train_id='train-002',
+            member_task_ids=['trn-a', 'trn-b'],
+            data={'merge_commit_sha': 'abc999', 'base_sha': 'base111'},
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT data FROM events WHERE event_type = 'train_merged'").fetchone()
+        conn.close()
+
+        assert row is not None
+        payload = json.loads(row[0])
+        assert payload['train_id'] == 'train-002'
+        assert payload['merge_commit_sha'] == 'abc999'
+        assert payload['base_sha'] == 'base111'
+
+    def test_emit_train_event_noop_when_event_store_is_none(self) -> None:
+        """Call with event_store=None — no exception, nothing written."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _emit_train_event
+
+        # Should not raise
+        _emit_train_event(
+            None,
+            EventType.train_started,
+            task_id='trn-x',
+            train_id='train-003',
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
 # Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
 # they behave identically with queue depth 1.
@@ -7394,4 +7478,213 @@ class TestSpeculationRaceRetry:
         assert mock_verify.called, (
             'run_scoped_verification must be invoked on a race-retry success '
             '(skip_verify=False); verification was skipped.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestTrainLifecycleEvents — train_* event emission integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainLifecycleEvents:
+    """Assert train_started, train_merged, train_derailed, and train_member_deferred
+    are emitted by _do_train_merge at the correct points."""
+
+    async def test_happy_path_emits_train_started_and_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Happy-path 3-member train → train_started then train_merged emitted."""
+        from orchestrator.event_store import EventStore
+
+        req = await _make_stacked_train(git_ops, config)
+        db_path = tmp_path / 'train_events.db'
+        event_store = EventStore(db_path=db_path, run_id='train-lifecycle-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_merged') ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert 'train_started' in event_types, f'Missing train_started in {event_types}'
+        assert 'train_merged' in event_types, f'Missing train_merged in {event_types}'
+
+        # train_started must come before train_merged (by id order)
+        started_idx = event_types.index('train_started')
+        merged_idx = event_types.index('train_merged')
+        assert started_idx < merged_idx, 'train_started must precede train_merged'
+
+        # Verify train_started payload
+        import json
+        started_row = rows[started_idx]
+        assert started_row[1] == req.task_id  # task_id
+        assert started_row[2] == 'merge'  # phase
+        started_data = json.loads(started_row[3])
+        assert started_data['train_id'] == req.train_id
+        assert started_data['member_task_ids'] == req.member_task_ids
+        assert started_data['member_count'] == 3
+        assert started_data['base_sha'], 'base_sha must be non-empty'
+
+        # Verify train_merged payload
+        merged_row = rows[merged_idx]
+        merged_data = json.loads(merged_row[3])
+        assert merged_data['train_id'] == req.train_id
+        assert merged_data['merge_commit_sha'], 'merge_commit_sha must be non-empty'
+        assert merged_data['base_sha'], 'base_sha must be non-empty'
+
+    async def test_verify_failed_emits_train_derailed(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Verify failure → train_started then train_derailed, no train_merged."""
+        import json
+
+        from orchestrator.event_store import EventStore
+
+        req = await _make_stacked_train(git_ops, config)
+        db_path = tmp_path / 'train_derailed_verify.db'
+        event_store = EventStore(db_path=db_path, run_id='train-derailed-verify-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        mock_verify_fail = AsyncMock(return_value=MagicMock(
+            passed=False,
+            summary='Tests failed: 3 errors',
+            failure_report=MagicMock(return_value='Tests failed: 3 errors'),
+        ))
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify_fail):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_merged', 'train_derailed') ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert event_types[0] == 'train_started', f'First event must be train_started, got {event_types}'
+        assert 'train_derailed' in event_types, f'Missing train_derailed in {event_types}'
+        assert 'train_merged' not in event_types, f'Unexpected train_merged in {event_types}'
+
+        derailed_idx = event_types.index('train_derailed')
+        derailed_data = json.loads(rows[derailed_idx][1])
+        assert derailed_data['train_id'] == req.train_id
+        assert derailed_data['member_task_ids'] == req.member_task_ids
+        assert 'verif' in derailed_data['derail_reason'].lower(), (
+            f"Expected 'verif' (from 'verify' or 'verification') in derail_reason, "
+            f"got: {derailed_data['derail_reason']!r}"
+        )
+
+    async def test_rebase_conflict_emits_train_derailed(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Rebase conflict → train_started then train_derailed, no train_merged."""
+        import json
+
+        from orchestrator.event_store import EventStore
+
+        req = await _make_stacked_train(git_ops, config)
+        db_path = tmp_path / 'train_derailed_rebase.db'
+        event_store = EventStore(db_path=db_path, run_id='train-derailed-rebase-run')
+
+        # Commit a conflicting change on main so rebase fails
+        conflict_file = git_ops.project_root / 'trn-c.py'
+        conflict_file.write_text('# main version — conflicts with tip\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Conflicting commit on main'], cwd=git_ops.project_root)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        outcome = await worker._do_merge(req)
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_merged', 'train_derailed') ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert event_types[0] == 'train_started', f'First event must be train_started, got {event_types}'
+        assert 'train_derailed' in event_types, f'Missing train_derailed in {event_types}'
+        assert 'train_merged' not in event_types, f'Unexpected train_merged in {event_types}'
+
+        derailed_idx = event_types.index('train_derailed')
+        derailed_data = json.loads(rows[derailed_idx][1])
+        assert derailed_data['train_id'] == req.train_id
+
+    async def test_incomplete_emits_train_member_deferred(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Incomplete member → train_started then train_member_deferred, no train_derailed."""
+        import json
+
+        from orchestrator.event_store import EventStore
+
+        req = await _make_stacked_train(git_ops, config)
+        # Override: trn-a has non-deferred status 'planning'
+        req.status_check = AsyncMock(return_value={
+            'trn-a': 'planning',
+            'trn-b': 'merge-deferred',
+            'trn-c': 'merge-deferred',
+        })
+
+        db_path = tmp_path / 'train_member_deferred.db'
+        event_store = EventStore(db_path=db_path, run_id='train-member-deferred-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        outcome = await worker._do_merge(req)
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked, got: {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX), (
+            f'expected TRAIN_INCOMPLETE prefix, got: {outcome.reason!r}'
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, data FROM events "
+            "WHERE event_type IN ('train_started', 'train_member_deferred', 'train_merged', 'train_derailed') "
+            "ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert event_types[0] == 'train_started', f'First event must be train_started, got {event_types}'
+        assert 'train_member_deferred' in event_types, f'Missing train_member_deferred in {event_types}'
+        assert 'train_merged' not in event_types, f'Unexpected train_merged in {event_types}'
+        assert 'train_derailed' not in event_types, f'Unexpected train_derailed in {event_types}'
+
+        deferred_idx = event_types.index('train_member_deferred')
+        deferred_row = rows[deferred_idx]
+        deferred_data = json.loads(deferred_row[2])
+        assert deferred_data['train_id'] == req.train_id
+        assert deferred_data['deferred_task_id'] == 'trn-a', (
+            f"Expected deferred_task_id='trn-a', got {deferred_data['deferred_task_id']!r}"
+        )
+        assert 'planning' in deferred_data['deferred_reason'], (
+            f"Expected 'planning' in deferred_reason, got: {deferred_data['deferred_reason']!r}"
+        )
+        assert set(deferred_data['remaining_members']) == {'trn-b', 'trn-c'}, (
+            f"Expected remaining_members={{trn-b, trn-c}}, got: {deferred_data['remaining_members']!r}"
         )
