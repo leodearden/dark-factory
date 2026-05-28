@@ -7326,11 +7326,20 @@ class TestSpeculationRaceRetry:
         config: OrchestratorConfig,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """Race-retry with pre_rebased=True: retry success sets skip_verify=True.
+        """Race-retry with pre_rebased=True: retry success MUST force verification (skip_verify=False).
 
-        When req.pre_rebased is True and the retry merge sets pre_merge_sha to
-        the freshly-read retry_main (because merge_to_main uses the explicit
-        base_sha we pass), skip_verify must be True on the returned item.
+        The speculation-race gate fires only when merge_result.pre_merge_sha != actual_main,
+        meaning main demonstrably advanced between _remerge's get_main_sha() read and
+        merge_to_main's own read.  req.pre_rebased=True reflects a rebase onto the OLD main,
+        NOT retry_main; the retry merges the branch against the newer retry_main, integrating
+        main commits the branch never incorporated.  The documented skip_verify invariant
+        ('pre_rebased AND main unchanged', merge_queue.py SpeculativeItem.skip_verify comment)
+        therefore does NOT hold, and skipping verification would let semantically-unverified
+        main commits land on the protected branch.  skip_verify must be False unconditionally
+        on this path regardless of req.pre_rebased.
+
+        Behavioural check: _verify_and_advance(item) must invoke run_scoped_verification
+        (i.e., must NOT skip the verify step).
         """
         branch = 'race-retry-skip-verify'
         worktree = await _make_branch_with_file(
@@ -7338,7 +7347,7 @@ class TestSpeculationRaceRetry:
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        # pre_rebased=True is the trigger for skip_verify
+        # pre_rebased=True is the would-be trigger for skip_verify; must NOT skip here
         req = _make_request('race-skip', branch, worktree, config, pre_rebased=True)
 
         real_merge_to_main = git_ops.merge_to_main
@@ -7353,7 +7362,7 @@ class TestSpeculationRaceRetry:
                     details=f'merge: task/{br} - not something we can merge',
                     pre_merge_sha='0' * 40,
                 )
-            # 2nd call: delegate to real merge so pre_merge_sha == base_sha == retry_main
+            # 2nd call: delegate to real merge so a real worktree/commit is produced
             return await real_merge_to_main(wt, br, base_sha=base_sha)
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
@@ -7367,10 +7376,22 @@ class TestSpeculationRaceRetry:
         assert item.merge_result is not None
         assert item.merge_result.success
 
-        # pre_rebased=True + retry used explicit base_sha=retry_main, so the
-        # real merge_to_main sets pre_merge_sha == retry_main → skip_verify=True
-        assert item.skip_verify is True, (
-            f'Expected skip_verify=True (pre_rebased=True, '
-            f'pre_merge_sha={item.merge_result.pre_merge_sha!r}); '
-            f'got skip_verify={item.skip_verify}'
+        # SAFETY CONTRACT: main advanced since the pre-rebase, so verification must run.
+        # skip_verify MUST be False regardless of req.pre_rebased.
+        assert item.skip_verify is False, (
+            f'Expected skip_verify=False (main advanced: race gate fired), '
+            f'but got skip_verify={item.skip_verify}. '
+            f'Skipping verification after a speculation-race retry is unsafe.'
+        )
+
+        # Behavioural check: _verify_and_advance must invoke run_scoped_verification
+        # (not skip it) because skip_verify=False.
+        mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        assert mock_verify.called, (
+            'run_scoped_verification must be invoked on a race-retry success '
+            '(skip_verify=False); verification was skipped.'
         )
