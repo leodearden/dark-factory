@@ -9,11 +9,11 @@ Three cases mandated by the plan:
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock
 
-from fused_memory.server.main import _require_http_transport_for_reconciliation
+import pytest
 
+from fused_memory.server.main import _require_http_transport_for_reconciliation
 
 # ---------------------------------------------------------------------------
 # Helpers
