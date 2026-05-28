@@ -14,6 +14,7 @@ from shared.async_sqlite_base import (
     AsyncSqliteBase,
     CheckpointResult,
     apply_full_durability_pragmas,
+    connect_daemon,
 )
 
 # ---------------------------------------------------------------------------
@@ -681,6 +682,54 @@ class TestWorkerThreadIsDaemon:
             )
         finally:
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# connect_daemon: module-level helper for daemon-marked connections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConnectDaemon:
+    """connect_daemon() opens an aiosqlite connection with its worker thread marked daemon.
+
+    Mirrors TestWorkerThreadIsDaemon for AsyncSqliteBase.open(), but tests the
+    standalone ``connect_daemon`` helper directly.  This helper is the single
+    source-of-truth for the marking mechanism so that hand-rolled connect sites
+    across fused-memory stores can share the same guard without subclassing.
+    """
+
+    async def test_thread_is_daemon(self, tmp_path: Path):
+        """connect_daemon returns a live connection whose worker thread is daemon."""
+        conn = await connect_daemon(str(tmp_path / 'x.db'))
+        try:
+            thread = conn._thread
+            assert thread.is_alive()
+            assert thread.daemon is True, (
+                'aiosqlite worker thread must be daemon so a leaked '
+                'connection cannot block interpreter shutdown'
+            )
+        finally:
+            await conn.close()
+
+    async def test_kwargs_passthrough(self, tmp_path: Path):
+        """connect_daemon passes extra kwargs to aiosqlite.connect and marks daemon.
+
+        timeout=30, isolation_level=None are the kwargs used by the override-db
+        helpers in server/tools.py.  This test ensures they flow through and that
+        the resulting connection is both usable and daemon-marked.
+        """
+        conn = await connect_daemon(str(tmp_path / 'y.db'), timeout=30, isolation_level=None)
+        try:
+            assert conn._thread.daemon is True, (
+                'worker thread must be daemon even when connect kwargs are supplied'
+            )
+            # Connection must be usable with the supplied kwargs
+            async with conn.execute('SELECT 1') as cur:
+                row = await cur.fetchone()
+            assert row is not None and row[0] == 1
+        finally:
+            await conn.close()
 
 
 # ---------------------------------------------------------------------------
