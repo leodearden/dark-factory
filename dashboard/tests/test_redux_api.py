@@ -525,3 +525,29 @@ class TestShapeEscalations:
         assert row['project'] == 'projA'
         assert row['task'] == task
         assert row['task_unresolved'] is False
+
+    def test_shape_escalations_orchestrator_unresolved_task(self):
+        """Orchestrator row with unknown task_id → task=None, task_unresolved=True."""
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [
+                {'id': 'esc-99', 'task_id': '999', 'level': 1, 'status': 'pending', 'summary': 'gone'},
+            ],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        # task_maps has no task with id=999
+        task_maps = {'/p/projA': [{'id': 1, 'title': 'other', 'description': '', 'details': '',
+                                    'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
+        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
+        rows = body['ESCALATIONS']['subsections'][0]['escalations']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['project'] == 'projA'
+        assert row['task'] is None
+        assert row['task_unresolved'] is True
+        # original esc fields preserved
+        assert row['id'] == 'esc-99'
+        assert row['summary'] == 'gone'
