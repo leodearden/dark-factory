@@ -302,3 +302,66 @@ class TestReconReportRunIdMismatch:
     def test_get_assembled_report_unknown_returns_none(self):
         state = self._make_state()
         assert state.get_assembled_report('ghost', 'some_stage') is None
+
+
+# ---------------------------------------------------------------------------
+# step-11: State isolation between two concurrent runs
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportStateIsolation:
+    """Two runs must never see each other's findings or stats."""
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+
+    def test_findings_are_isolated(self):
+        state = self._make_state()
+        state.start_report('r1', 'stage1', 'p')
+        state.start_report('r2', 'stage2', 'p')
+
+        state.add_finding(run_id='r1', severity='low', category='c',
+                          description='r1-finding', suggested_action='a',
+                          task_id='1', flag_type='f1')
+        state.add_finding(run_id='r2', severity='high', category='c',
+                          description='r2-finding', suggested_action='a',
+                          task_id='2', flag_type='f2')
+
+        r1 = state.get_assembled_report('r1', 'stage1')
+        r2 = state.get_assembled_report('r2', 'stage2')
+        assert len(r1['flagged_items']) == 1
+        assert r1['flagged_items'][0]['description'] == 'r1-finding'
+        assert len(r2['flagged_items']) == 1
+        assert r2['flagged_items'][0]['description'] == 'r2-finding'
+
+    def test_stats_are_isolated(self):
+        state = self._make_state()
+        state.start_report('r1', 's1', 'p')
+        state.start_report('r2', 's2', 'p')
+        state.set_stat('r1', 'scanned', 10)
+        state.set_stat('r2', 'scanned', 99)
+        assert state.get_assembled_report('r1', 's1')['stats'] == {'scanned': 10}
+        assert state.get_assembled_report('r2', 's2')['stats'] == {'scanned': 99}
+
+    def test_finding_ids_are_distinct(self):
+        state = self._make_state()
+        state.start_report('r1', 's1', 'p')
+        state.start_report('r2', 's2', 'p')
+        id1 = state.add_finding(run_id='r1', severity='low', category='c',
+                                 description='d', suggested_action='a',
+                                 task_id='1', flag_type='f')['finding_id']
+        id2 = state.add_finding(run_id='r2', severity='low', category='c',
+                                 description='d', suggested_action='a',
+                                 task_id='1', flag_type='f')['finding_id']
+        assert id1 != id2
+
+    def test_completing_one_does_not_affect_other(self):
+        state = self._make_state()
+        state.start_report('r1', 's1', 'p')
+        state.start_report('r2', 's2', 'p')
+        state.complete('r1', 'done r1')
+        r2 = state.get_assembled_report('r2', 's2')
+        assert r2['summary'] == ''  # still in-progress
