@@ -51,11 +51,13 @@ When a task needs to be decomposed into parallel or sequential work items, use t
 
 1. For each child task, call `submit_task(project_root=..., title=..., description=..., \
    planning_mode=True, metadata={{'decomposed_from': {{'parent_id': <parent_id>, \
-   'parent_title': <parent_title>}}, 'human_decomposed': True}})` → saves a draft, \
-   returns `{{'task_id': ..., 'status': 'draft'}}`.
+   'parent_title': <parent_title>}}, 'human_decomposed': True}})` → creates the task \
+   directly in `deferred` status, returns \
+   `{{'task_id': ..., 'status': 'deferred', 'planning_mode': True}}`. The task stays \
+   parked in `deferred` until step 3's commit_planning promotes it.
 2. Optionally wire ordering: `add_dependency(id=<child_id>, depends_on=<other_child_id>, \
    project_root=...)`.
-3. Atomically promote all drafts to pending: \
+3. Atomically promote all deferred tasks to pending: \
    `commit_planning(project_root=..., task_ids='id1,id2,...', target_status='pending')`.
 
 Each resulting task is a top-level task and will be picked up by the dispatcher normally.
