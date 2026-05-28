@@ -8,6 +8,8 @@ rationale.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from escalation.queue import EscalationQueue
 
 
@@ -86,6 +88,20 @@ class FakeScheduler:
         return {}
 
     def release(self, task_id: str) -> None:
+        pass
+
+    async def get_tasks(self) -> list[dict]:
+        return []
+
+    async def get_statuses(
+        self, ids: list[str] | None = None,
+    ) -> tuple[dict[str, str], Exception | None]:
+        return ({}, None)
+
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]:
+        return []
+
+    def clear_requeue_count(self, task_id: str, /) -> None:
         pass
 
 
@@ -193,3 +209,15 @@ def _make_status_setting_steward(
             pass
 
     return _FakeSteward
+
+
+# ---------------------------------------------------------------------------
+# Protocol-conformance assertion (static-only; never executes at runtime).
+# Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
+# bottom of test_workflow_e2e.py.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
