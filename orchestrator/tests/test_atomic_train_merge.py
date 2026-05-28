@@ -18,6 +18,7 @@ Scaffolding stubs defined here are completed in step-2.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -843,6 +844,63 @@ def _make_train_workflow(
     return wf, scheduler
 
 
+def _make_plain_workflow(
+    config: "OrchestratorConfig",
+    git_ops: "GitOps",
+    task_id: str,
+    worktree: "Path",
+) -> "tuple":
+    """Build a minimally-wired TaskWorkflow for a plain (non-train) task.
+
+    Equivalent to _make_train_workflow but with no train metadata in the task.
+    Returns (workflow, scheduler_mock).
+    """
+    from orchestrator.agents.invoke import AgentResult
+    from orchestrator.artifacts import TaskArtifacts
+    from orchestrator.workflow import TaskWorkflow
+
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {
+        "id": task_id, "title": task_id, "description": "",
+        "status": "in-progress",
+        "metadata": {},  # ← no 'train' key — this is a plain task
+    }
+    assignment.modules = []
+
+    scheduler = MagicMock()
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    scheduler.mark_done = AsyncMock()
+    scheduler.tasks_by_train = AsyncMock(return_value=[])
+    scheduler.update_task = AsyncMock(return_value=True)
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+        merge_queue=None,
+    )
+    wf.worktree = worktree
+    wf.event_store = None
+
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init(task_id, task_id, "desc", base_commit="base-sha")
+    wf.artifacts = artifacts
+    wf.plan = {"task_id": task_id, "steps": []}
+    wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    wf.briefing.build_debugger_prompt = AsyncMock(return_value="debug")  # type: ignore[attr-defined]
+    wf._invoke = AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentResult(success=True, output=""),
+    )
+    wf._get_head_commit = AsyncMock(return_value="head-sha")  # type: ignore[method-assign]
+    wf._inter_iteration_rebase = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    return wf, scheduler
+
+
 @pytest.mark.asyncio
 class TestScenario6ParkPrefixDerail:
     """PRD §10 row 6: park-prefix derail — γ loop-guard fires BLOCKED,
@@ -1415,3 +1473,162 @@ class TestScenario8MainAdvances:
             f"mark_member_done must not fire on rebase conflict, "
             f"got {req.mark_member_done.call_count} call(s)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 9, 10 (loop-guard non-train + done-prov gate unweakened) — step-11 RED / step-12 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScenario9LoopGuardNonTrain:
+    """PRD §10 row 9: loop-guard fires for a plain (non-train) task.
+
+    Regression: the γ₂ loop-guard (workflow.py:3375-3387) must fire for non-train
+    tasks too.  The train-specific derail branch (scenario 6) shares the same
+    max_failure_signature_repeat code path — this test confirms the guard is NOT
+    train-specific and applies equally to all tasks.
+    """
+
+    async def test_loop_guard_non_train(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        caplog,
+    ) -> None:
+        """Plain task: 3× identical-sig failures → BLOCKED (same path as train scenario 6)."""
+        import logging
+
+        from orchestrator.workflow import WorkflowOutcome
+
+        # Set up a minimal git repo (no cargo needed — verify is mocked).
+        repo9 = tmp_path / "repo9"
+        repo9.mkdir()
+        await _run(["git", "init", "-b", "main"], cwd=repo9)
+        await _run(["git", "config", "user.email", "test@test.com"], cwd=repo9)
+        await _run(["git", "config", "user.name", "Test"], cwd=repo9)
+        (repo9 / "README.md").write_text("# repo9\n")
+        await _run(["git", "add", "-A"], cwd=repo9)
+        await _run(["git", "commit", "-m", "initial"], cwd=repo9)
+
+        config9 = OrchestratorConfig(
+            project_root=repo9,
+            max_verify_attempts=5,
+            max_failure_signature_repeat=3,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        git_ops9 = GitOps(config9.git, repo9)
+
+        # Create the plain task's worktree.
+        wt_info9 = await git_ops9.create_worktree("plain9")
+        wt_plain = wt_info9.path
+
+        # Build a PLAIN (non-train) workflow via _make_plain_workflow (step-12 helper).
+        wf9, _ = _make_plain_workflow(config9, git_ops9, "plain9", wt_plain)
+
+        # Inject 3 identical-signature failures: same category + cause_hint
+        # differing only in file:line (normaliser strips the line number).
+        failures9 = [
+            _make_verify_failure("test_failure", "FAILED tests/test_plain.py:10 AssertionError"),
+            _make_verify_failure("test_failure", "FAILED tests/test_plain.py:20 AssertionError"),
+            _make_verify_failure("test_failure", "FAILED tests/test_plain.py:30 AssertionError"),
+        ]
+        verify_mock9 = AsyncMock(side_effect=failures9 * 2)
+        monkeypatch.setattr("orchestrator.workflow.run_scoped_verification", verify_mock9)
+
+        with caplog.at_level(logging.WARNING, logger="orchestrator.workflow"):
+            outcome9 = await wf9._verify_debugfix_loop()
+
+        # Loop-guard must fire after max_failure_signature_repeat (3) identical
+        # signatures — same code path as the train-member derail in scenario 6.
+        assert outcome9 == WorkflowOutcome.BLOCKED, (
+            f"expected BLOCKED after 3 identical-signature failures (plain non-train task), "
+            f"got {outcome9!r}"
+        )
+        assert verify_mock9.await_count == 3, (
+            f"loop-guard must fire at attempt 3 (not wait for max_verify_attempts), "
+            f"got {verify_mock9.await_count} calls"
+        )
+        warning_text = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "consecutive identical verify failures" in warning_text, (
+            f"expected WARNING about consecutive identical failures; got: {warning_text!r}"
+        )
+
+
+@pytest.mark.asyncio
+class TestScenario10DoneProvGateUnweakened:
+    """PRD §10 row 10: done-prov gate is unweakened for non-train tasks.
+
+    Regression: the done_provenance_invalid gate (scheduler.py:1228-1236) must
+    raise ProvenanceValidationRejection for non-train tasks — the train machinery
+    (δ₁) does NOT weaken this gate.
+
+    The gate's underlying invariant: git_ops.is_ancestor (git_ops.py:896-902).
+    fused-memory's done_provenance ancestor check verifies the merge SHA is on
+    main before allowing the done transition.  Train tasks pass the same SHA
+    through mark_member_done → mark_done → set_task_status; the gate applies
+    identically regardless of train membership.
+    """
+
+    async def test_done_provenance_gate_unweakened(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """set_task_status('done', done_provenance={invalid SHA}) raises ProvenanceValidationRejection."""
+        from orchestrator.scheduler import ProvenanceValidationRejection, Scheduler
+
+        # Build a real Scheduler with a minimal OrchestratorConfig.
+        # mcp_session=None → uses mcp_call HTTP path (monkeypatched below).
+        config10 = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch="main",
+                branch_prefix="task/",
+                remote="origin",
+                worktree_dir=".worktrees",
+                push_after_advance=False,
+            ),
+        )
+        sched10 = Scheduler(config10)
+
+        # Stub the MCP transport to return a done_provenance_invalid rejection.
+        # Envelope format mirrors fused-memory's TaskInterceptor.
+        rejection_response = {
+            "result": {
+                "structuredContent": {
+                    "success": False,
+                    "error": "done_provenance_invalid",
+                    "hint": (
+                        'kind="merged" but commit deadbeef is not on main — '
+                        "the train merge machinery (δ₁) does NOT weaken this gate "
+                        "(git_ops.is_ancestor gate at git_ops.py:896-902)"
+                    ),
+                },
+                "isError": False,
+            },
+        }
+        monkeypatch.setattr(
+            "orchestrator.scheduler.mcp_call",
+            AsyncMock(return_value=rejection_response),
+        )
+
+        with pytest.raises(ProvenanceValidationRejection) as excinfo:
+            await sched10.set_task_status(
+                "task42",
+                "done",
+                done_provenance={"kind": "merged", "commit": "deadbeef"},
+            )
+
+        assert excinfo.value.task_id == "task42"
+        assert excinfo.value.error_code == "done_provenance_invalid", (
+            f"expected error_code='done_provenance_invalid', "
+            f"got {excinfo.value.error_code!r}"
+        )
+
