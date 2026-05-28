@@ -41,9 +41,10 @@ returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
 ## Splitting Tasks (do NOT create subtasks)
-`mcp__fused-memory__add_subtask` is **not available** in this stage. The orchestrator \
-scheduler is top-level-only: it iterates `tasks` without descending into `t['subtasks']`, \
-so any subtask you create would be permanently invisible to dispatch and silently orphaned.
+Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
+The orchestrator scheduler is top-level-only: it iterates `tasks` without descending into \
+`t['subtasks']`, so any nested task you create would be permanently invisible to dispatch \
+and silently orphaned.
 
 When a task needs to be decomposed into parallel or sequential work items, use the \
 **flatten recipe** instead (canonical recipe in procedural memory `fca61c20`):
