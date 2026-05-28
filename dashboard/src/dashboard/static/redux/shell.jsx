@@ -101,6 +101,7 @@ const Glyph = ({ kind }) => {
     case 'burn':     return <svg {...props}><path d="M2 11 L5 8 L8 10 L12 4"/><path d="M2 12.5 L12 12.5"/><circle cx="12" cy="4" r="0.6" fill="currentColor"/></svg>;
     case 'sched':    return <svg {...props}><rect x="1.5" y="1.5" width="11" height="11" rx="1"/><path d="M1.5 5h11 M5 1.5v11"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/></svg>;
     case 'curator':  return <svg {...props}><path d="M2 3.5h10 M2 7h10 M2 10.5h6"/><path d="M10 8.5v4 M12 8.5v4"/></svg>;
+    case 'esc':      return <svg {...props}><path d="M7 2 L12 12 H2 Z"/><path d="M7 6v3"/><circle cx="7" cy="10.5" r="0.6" fill="currentColor"/></svg>;
     case 'search':   return <svg {...props}><circle cx="6" cy="6" r="3.5"/><path d="M8.5 8.5 L12 12"/></svg>;
     case 'filter':   return <svg {...props}><path d="M2 3h10 M3.5 7h7 M5 11h4"/></svg>;
     case 'chev':     return <svg {...props}><path d="M4 5l3 3 3-3"/></svg>;
@@ -340,6 +341,7 @@ function Rail({ active, onSelect, counts }) {
     { id: 'merge',     label: 'Merge Queue',  glyph: 'merge',    count: counts.merge },
     { id: 'cost',      label: 'Costs',        glyph: 'cost',     count: '' },
     { id: 'burn',      label: 'Burndown',     glyph: 'burn',     count: '' },
+    { id: 'esc',       label: 'Escalations',  glyph: 'esc',      count: counts.esc ?? '' },
   ];
   return (
     <div className="rail">
