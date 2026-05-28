@@ -6942,7 +6942,6 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 class TestSpeculationRaceRetry:
     """Speculation-race retry: re-merge against actual main when base drifted."""
 

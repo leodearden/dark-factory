@@ -186,6 +186,26 @@ def _verify_hit_enospc(verify: VerifyResult) -> bool:
     return any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
+_SPECULATION_RACE_MARKER = 'not something we can merge'
+"""LOAD-BEARING exact substring match on git porcelain output.
+
+Do NOT paraphrase this string. Git emits it verbatim when a ref cannot be
+resolved to a mergeable object (e.g. the branch was force-pushed away between
+the speculative merge build and the re-merge attempt). The exact phrase is what
+distinguishes a speculation-race failure from other git non-conflict errors.
+"""
+
+
+def _is_speculation_race(stderr: str) -> bool:
+    """True when *stderr* from a failed merge contains the speculation-race signature.
+
+    Uses a load-bearing exact substring match against ``_SPECULATION_RACE_MARKER``
+    (the git porcelain phrase ``not something we can merge``).  Mirrors the
+    ``_verify_hit_enospc`` / ``_ENOSPC_MARKERS`` pattern.
+    """
+    return _SPECULATION_RACE_MARKER in stderr
+
+
 async def _ensure_verify_disk_space(
     git_ops: GitOps,
     merge_wt: Path,
