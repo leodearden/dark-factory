@@ -32,6 +32,7 @@ if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
 from _fm_helpers import pydantic_spec  # noqa: E402
+
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,

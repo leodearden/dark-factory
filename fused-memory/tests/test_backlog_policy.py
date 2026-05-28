@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
-from fused_memory.config.schema import FusedMemoryConfig
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.services.orchestrator_detector import (
