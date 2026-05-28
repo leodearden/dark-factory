@@ -223,3 +223,55 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         "ESCALATIONS.summary seed missing key 'by_status:' — "
         'add it nested under summary in the ESCALATIONS seed block.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3 test: tab_escalations.jsx is served and exports EscalationsTab
+# ---------------------------------------------------------------------------
+
+
+def test_tab_escalations_jsx_served_and_exports_component(_client) -> None:
+    """GET /static/redux/tab_escalations.jsx returns 200 with the expected wiring.
+
+    Asserts:
+    (a) 200 HTTP status.
+    (b) function EscalationsTab( is declared.
+    (c) exports ADDITIVELY via window.DF_TABS.EscalationsTab = (not window.DF_TABS = {).
+    (d) reads window.DF_DATA.ESCALATIONS (or an aliased DF.ESCALATIONS).
+    (e) renders <ProjectGroup.
+    (f) fold state is persisted via useOpenSet( referencing 'df.open.esc'.
+    """
+    resp = _client.get('/static/redux/tab_escalations.jsx')
+    assert resp.status_code == 200, (
+        f'Expected 200 for /static/redux/tab_escalations.jsx, got {resp.status_code}'
+    )
+    body = resp.text
+    assert 'function EscalationsTab(' in body, (
+        'tab_escalations.jsx does not define `function EscalationsTab(` — the component '
+        'must be declared as a named function for the export to work.'
+    )
+    # Additive export — must NOT clobber window.DF_TABS = {...} and must assign EscalationsTab
+    assert 'window.DF_TABS.EscalationsTab' in body, (
+        'tab_escalations.jsx does not set window.DF_TABS.EscalationsTab — add '
+        '`window.DF_TABS.EscalationsTab = EscalationsTab;` at the bottom of the file '
+        'to export additively without clobbering the existing window.DF_TABS object.'
+    )
+    # Reads ESCALATIONS data
+    assert 'ESCALATIONS' in body, (
+        'tab_escalations.jsx does not reference ESCALATIONS — it should read '
+        'window.DF_DATA.ESCALATIONS (or an alias like DF.ESCALATIONS) for its data source.'
+    )
+    # Renders ProjectGroup for subsection folding
+    assert '<ProjectGroup' in body, (
+        'tab_escalations.jsx does not render <ProjectGroup — each subsection must be '
+        'wrapped in a ProjectGroup from window.DF_SHELL for foldable sections.'
+    )
+    # Fold state persisted with the correct key
+    assert "useOpenSet(" in body, (
+        "tab_escalations.jsx does not call useOpenSet( — add the local copy of "
+        "useOpenSet from tabs.jsx and call it with subsection ids and 'df.open.esc'."
+    )
+    assert "'df.open.esc'" in body, (
+        "tab_escalations.jsx does not reference the localStorage key 'df.open.esc' — "
+        "pass it as the storageKey argument to useOpenSet so fold state is persisted."
+    )
