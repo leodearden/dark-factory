@@ -25,17 +25,11 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.cli_stage_runner import (
-    DISALLOW_TASK_WRITES,
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-from fused_memory.reconciliation.policies.autopilot_video import (
-    AUTOPILOT_VIDEO_PROJECT_ID,
-    AUTOPILOT_VIDEO_TASK_CEILING,
-    excessive_autopilot_video_ids,
-)
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -1186,21 +1180,10 @@ class TaskKnowledgeSync(BaseStage):
     # and injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
     _rescued_in_window_markers: int = 0
 
-    # Set to True by assemble_payload() when the autopilot_video contamination
-    # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
-    # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
-    # so the LLM cannot issue task writes even if it ignores the prompt guardrail.
-    _contamination_detected: bool = False
-
     def get_system_prompt(self) -> str:
         return build_stage2_system_prompt(self.project_id)
 
     def get_disallowed_tools(self) -> list[str]:
-        if self._contamination_detected:
-            # Programmatic gate: when contamination is detected, block all task-
-            # mutating tools so a non-compliant LLM cannot breach the guardrail.
-            # This is defence-in-depth behind the prompt-level instruction.
-            return STAGE2_DISALLOWED + DISALLOW_TASK_WRITES
         return STAGE2_DISALLOWED
 
     async def run(
@@ -1569,29 +1552,6 @@ class TaskKnowledgeSync(BaseStage):
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
-
-        # Defence-in-depth: detect contamination early so get_disallowed_tools() can
-        # block task-mutating tools for the remainder of this run.  The prompt-side
-        # guardrail fires on the LLM's honour; the tool-block is the programmatic gate.
-        if self.project_id == AUTOPILOT_VIDEO_PROJECT_ID:
-            all_tasks = itertools.chain(
-                filtered.active_tasks,
-                filtered.done_tasks,
-                filtered.cancelled_tasks,
-            )
-            excessive_ids = excessive_autopilot_video_ids(all_tasks)
-            if excessive_ids:
-                self._contamination_detected = True
-                logger.warning(
-                    'reconciliation.stage2_contamination_guard_fires '
-                    'project_id=%s task_ids_above_ceiling=%s ceiling=%d — '
-                    'verify this is cross-project contamination, not autopilot_video '
-                    'growth past the ceiling constant; task-mutating tools will be '
-                    'blocked for this run via get_disallowed_tools()',
-                    self.project_id,
-                    excessive_ids,
-                    AUTOPILOT_VIDEO_TASK_CEILING,
-                )
 
         # Render "Recently Completed Tasks" section.
         # Invariant: filter_task_tree() always appends to done_tasks when it increments

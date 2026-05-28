@@ -1472,31 +1472,47 @@ class TestStage2GuardrailProjectIdGating:
     """
 
     def test_guardrail_renders_for_autopilot_video_project(self):
-        """build_stage2_system_prompt('autopilot_video') must include the
-        Contamination Guardrail section, ceiling value, before ## Available Tools,
-        and at least one representative forbidden tool name."""
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
-        )
+        """build_stage2_system_prompt('autopilot_video') must include a
+        content-based Contamination Guardrail section with no numeric task-ID
+        ceiling, positioned before ## Available Tools."""
+        import re
+
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
         prompt = build_stage2_system_prompt(project_id='autopilot_video')
+
+        # (a) guardrail heading is present and precedes ## Available Tools
         assert 'Contamination Guardrail' in prompt, (
             "Expected 'Contamination Guardrail' in the autopilot_video prompt — "
             "the guardrail must be injected when project_id == 'autopilot_video'."
-        )
-        assert str(AUTOPILOT_VIDEO_TASK_CEILING) in prompt, (
-            f"Expected the ceiling value {AUTOPILOT_VIDEO_TASK_CEILING!r} to appear "
-            "in the rendered autopilot_video prompt — a typo in the f-string would "
-            "silently omit it."
         )
         assert prompt.index('Contamination Guardrail') < prompt.index('## Available Tools'), (
             "Contamination Guardrail section must appear BEFORE ## Available Tools "
             "in the autopilot_video prompt so the LLM reads the gate before any "
             "tool-use guidance."
         )
-        assert 'set_task_status' in prompt, (
-            "Expected 'set_task_status' to appear in the guardrail block — "
-            "the list of forbidden actions must include at least this representative tool."
+
+        # (b) no numeric task-ID ceiling in the guardrail block
+        guardrail_block = _extract_section(prompt, 'Contamination Guardrail')
+        assert '606' not in guardrail_block, (
+            "The guardrail block must not contain the legacy numeric ceiling '606' — "
+            "high task IDs are normal project growth, not contamination."
+        )
+        assert not re.search(r'exceeds\s+\d+', guardrail_block), (
+            "The guardrail block must not use 'exceeds <number>' phrasing — "
+            "cross-project contamination is content-based, not ID-magnitude-based."
+        )
+        assert 'task ceiling' not in guardrail_block.lower(), (
+            "The guardrail block must not reference a 'task ceiling' — "
+            "the ceiling concept has been removed in favour of content-based detection."
+        )
+
+        # (c) content-based phrasing is present — require specific multi-word phrases
+        # to avoid false-positive matches on incidental single words like 'path'.
+        guardrail_lower = guardrail_block.lower()
+        assert any(phrase in guardrail_lower for phrase in ('file path', 'cross-project routing')), (
+            "Expected specific content-based phrasing ('file path' or 'Cross-Project Routing') "
+            "in the guardrail block — contamination must be judged by cited file paths/modules, "
+            "not task-ID magnitude."
         )
 
     def test_guardrail_omitted_for_other_projects(self):
@@ -1510,88 +1526,75 @@ class TestStage2GuardrailProjectIdGating:
         )
 
 
-class TestAutopilotVideoTaskCeilingFreshness:
-    """Consistency check: AUTOPILOT_VIDEO_TASK_CEILING must match the committed fixture.
+class TestStage2NoTaskIdCeiling:
+    """Task IDs above the old 606 ceiling must NOT block task writes.
 
-    This is a *consistency* test, not a live drift detector — it verifies that the
-    constant in policies/autopilot_video.py and the committed fixture
-    tests/fixtures/autopilot_video_max_id.json agree with each other.  It does NOT
-    detect that autopilot_video has outgrown the ceiling in production; that requires
-    updating both values together when autopilot_video's task count grows.
+    Regression guard for the bug described in task-1517: legitimate
+    autopilot_video tasks 607-610 (created 2026-05-26) caused EVERY Stage 2
+    cycle to abort because the contamination code gate fired on task IDs
+    exceeding the hardcoded AUTOPILOT_VIDEO_TASK_CEILING=606.
 
-    A secondary test (test_ceiling_constant_not_below_live_max_id) skips on CI and
-    runs only on workstations that have the live autopilot_video repository — it is
-    the actual early-warning detector.
-
-    Workflow when autopilot_video grows past the ceiling:
-    1. Update AUTOPILOT_VIDEO_TASK_CEILING in policies/autopilot_video.py.
-    2. Update tests/fixtures/autopilot_video_max_id.json to {"max_id": <new max>}.
-    3. Re-evaluate whether 'task IDs > ceiling ⟹ cross-project contamination' still holds.
-    4. Run this test to confirm both changes are consistent.
-
-    Mirroring the TestTierConfig / TestProjectIdGuidelineConstants drift-detector pattern.
+    After the fix (step-4), get_disallowed_tools() must always return
+    STAGE2_DISALLOWED regardless of task ID magnitude.
     """
 
-    def test_ceiling_constant_consistent_with_fixture(self):
-        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max_id in the committed fixture.
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
 
-        This is a consistency check between the constant and the fixture — both must
-        be updated together when autopilot_video grows.  The fixture is the committed
-        contract; if this fails, see the class docstring update workflow.
+    @pytest.mark.asyncio
+    async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
+        """Task IDs 607-610 (above the old 606 ceiling) must not cause
+        get_disallowed_tools() to append DISALLOW_TASK_WRITES.
+
+        Failure mode (pre-fix): _contamination_detected=True was set during
+        assemble_payload() when excessive_autopilot_video_ids() found IDs > 606,
+        causing get_disallowed_tools() to return STAGE2_DISALLOWED + DISALLOW_TASK_WRITES
+        and aborting every Stage 2 cycle silently.
         """
-        import json
-        from pathlib import Path
+        watermark = Watermark(project_id='autopilot_video')
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps,
+            project_id='autopilot_video',
+            project_root='/home/leo/src/autopilot-video',
+        )
+        # Synthetic tree with task IDs that exceed the old 606 ceiling
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 607, 'title': 'Task 607', 'status': 'pending', 'dependencies': []},
+                {'id': 608, 'title': 'Task 608', 'status': 'in-progress', 'dependencies': []},
+                {'id': 609, 'title': 'Task 609', 'status': 'done', 'dependencies': []},
+                {'id': 610, 'title': 'Task 610', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
 
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # assemble_payload must complete without aborting and include the
+        # high-ID tasks in the rendered output.  Tasks 607 and 608 are
+        # active (pending / in-progress) so they appear in the active task
+        # tree section with the format '- [607] (pending) Task 607 deps=[]'.
+        # If a numeric-ID gate were re-introduced and fired early, these
+        # tasks would be absent from the payload.
+        assert '[607]' in payload, (
+            "Task 607 must appear in the rendered payload — "
+            "assemble_payload must not abort on task IDs above the old 606 ceiling."
+        )
+        assert '[608]' in payload, (
+            "Task 608 must appear in the rendered payload — "
+            "assemble_payload must not short-circuit on high task IDs."
         )
 
-        fixture_path = Path(__file__).parent / 'fixtures' / 'autopilot_video_max_id.json'
-        fixture_data = json.loads(fixture_path.read_text())
-        fixture_max_id = int(fixture_data['max_id'])
-
-        assert fixture_max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
-            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
-            f'the committed fixture max_id={fixture_max_id}.  '
-            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
-            f'fused_memory/reconciliation/policies/autopilot_video.py to {fixture_max_id} '
-            f'and re-evaluate the contamination guardrail premise before the next cycle.  '
-            f'Also update tests/fixtures/autopilot_video_max_id.json if the live task '
-            f'tree has grown further.'
-        )
-
-    def test_ceiling_constant_not_below_live_max_id(self):
-        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max id in the live tasks.json.
-
-        Secondary assertion (skips gracefully when autopilot_video is not on this
-        machine).  On Leo's workstation this is the actual early-warning detector:
-        it catches the case where autopilot_video has grown but neither the fixture
-        nor the constant has been updated yet.
-        """
-        import json
-
-        import pytest
-
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_TASK_CEILING,
-        )
-
-        tasks_path = '/home/leo/src/autopilot-video/.taskmaster/tasks/tasks.json'
-        try:
-            with open(tasks_path) as fh:
-                data = json.load(fh)
-            tasks = data['master']['tasks']
-            max_id = max(int(t['id']) for t in tasks)
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
-            pytest.skip('autopilot_video tasks.json not available in this environment')
-
-        assert max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
-            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
-            f'the observed max task id {max_id} in autopilot_video tasks.json.  '
-            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
-            f'fused_memory/reconciliation/policies/autopilot_video.py to {max_id}, update '
-            f'tests/fixtures/autopilot_video_max_id.json to {{"max_id": {max_id}}}, and '
-            f're-evaluate the contamination guardrail premise before the next cycle.'
+        assert stage.get_disallowed_tools() == STAGE2_DISALLOWED, (
+            f'Expected get_disallowed_tools() == STAGE2_DISALLOWED but got '
+            f'{stage.get_disallowed_tools()!r} — high task IDs must not append '
+            'DISALLOW_TASK_WRITES; the numeric-ID contamination gate has been removed.'
         )
 
 
