@@ -25,7 +25,7 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def pydantic_spec(model: type[BaseModel]) -> type:
     """Return a proxy class exposing ``model``'s fields for ``MagicMock(spec_set=...)``.
 
