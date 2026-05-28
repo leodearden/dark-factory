@@ -215,3 +215,73 @@ def test_escalations_endpoint_returns_escalations_block(client):
     assert 'subsections' in esc
     assert 'summary' in esc
     assert esc['subsections'] == []
+
+
+def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
+    """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
+    from dashboard.app import _task_cards_cache_clear
+    _task_cards_cache_clear()
+
+    proj_a = tmp_path / 'projA'
+    task_dict = {
+        'id': 11, 'title': 'wired', 'description': '', 'details': '',
+        'status': 'pending', 'priority': 'med', 'dependencies': [], 'metadata': {},
+    }
+    sub_summary = {
+        'by_level': {0: 1, 1: 1, 2: 0},
+        'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
+    }
+    queues = {
+        'subsections': [
+            {
+                'id': str(proj_a),
+                'label': 'projA',
+                'kind': 'orchestrator',
+                'escalations': [{'id': 'e1', 'task_id': 11, 'level': 0, 'status': 'pending', 'summary': 'oops'}],
+                'summary': sub_summary,
+            },
+            {
+                'id': 'reconciliation',
+                'label': 'fused-memory',
+                'kind': 'reconciliation',
+                'escalations': [{
+                    'id': 'er1', 'task_id': 11,
+                    'worktree': str(proj_a / '.worktrees' / '11'),
+                    'level': 1, 'status': 'pending',
+                }],
+                'summary': sub_summary,
+            },
+        ],
+        'summary': {
+            'by_level': {0: 1, 1: 1, 2: 0},
+            'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
+        },
+    }
+
+    with patch(
+        'dashboard.app.build_escalation_queues',
+        return_value=queues,
+    ), patch(
+        'dashboard.app.fetch_tasks',
+        new=AsyncMock(return_value=[task_dict]),
+    ):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    subs = body['ESCALATIONS']['subsections']
+    assert len(subs) == 2
+
+    orch_sub = next(s for s in subs if s['kind'] == 'orchestrator')
+    assert len(orch_sub['escalations']) == 1
+    orch_row = orch_sub['escalations'][0]
+    assert orch_row['project'] == 'projA'
+    assert orch_row['task']['title'] == 'wired'
+    assert orch_row['task_unresolved'] is False
+
+    recon_sub = next(s for s in subs if s['kind'] == 'reconciliation')
+    assert len(recon_sub['escalations']) == 1
+    recon_row = recon_sub['escalations'][0]
+    assert recon_row['project'] == 'projA'
+    assert recon_row['task']['title'] == 'wired'
+    assert recon_row['task_unresolved'] is False
