@@ -190,6 +190,7 @@ class WorkflowState(enum.Enum):
     VERIFY = 'verify'
     REVIEW = 'review'
     MERGE = 'merge'
+    MERGE_DEFERRED = 'merge-deferred'
     DONE = 'done'
     BLOCKED = 'blocked'
     ESCALATED = 'escalated'
@@ -202,6 +203,7 @@ class WorkflowOutcome(enum.Enum):
     REQUEUED = 'requeued'
     ESCALATED = 'escalated'
     CANCELLED = 'cancelled'
+    MERGE_DEFERRED = 'merge-deferred'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
@@ -447,6 +449,29 @@ class TaskWorkflow:
         """
         train = (self.task.get('metadata') or {}).get('train')
         return train if isinstance(train, dict) else None
+
+    async def _enter_merge_deferred(self) -> WorkflowOutcome:
+        """Park this train member in the merge-deferred holding state (γ₁, PRD §9.5).
+
+        Called after the full execute→verify→review pipeline succeeds for a
+        train member.  Instead of entering the merge phase, the task transitions
+        to ``status='merge-deferred'`` and waits for the group-merge worker (δ₁)
+        to drive the eventual done transition once all siblings are ready.
+
+        The worktree is NOT cleaned up here — the merge-queue worker's
+        post-merge ``cleanup_worktree`` never runs for merge-deferred tasks,
+        so the worktree is naturally preserved as γ₁'s observable signal.
+
+        Returns ``WorkflowOutcome.MERGE_DEFERRED``.
+        """
+        self._enter_phase(WorkflowState.MERGE_DEFERRED)
+        await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
+        logger.info(
+            'Task %s: train member workspace-green — parking in merge-deferred '
+            '(group-merge worker owns done transition)',
+            self.task_id,
+        )
+        return WorkflowOutcome.MERGE_DEFERRED
 
     async def _finalise_merged_done(self) -> WorkflowOutcome:
         """Common DONE-finalisation for the happy-path merge.
