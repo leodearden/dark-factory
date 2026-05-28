@@ -1241,6 +1241,7 @@ async def run_verification(
     attempt_id: int | None = None,
     task_id: str | None = None,
     archive_root: Path | None = None,
+    role: Literal['merge', 'task'] = 'task',
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -1306,7 +1307,7 @@ async def run_verification(
                 int(timeout), int(warm_timeout),
             )
     concurrent = _resolve_concurrent_verify(config, module_config)
-    verify_env = _resolve_verify_env(config, module_config)
+    verify_env = _resolve_verify_env(config, module_config, role=role)
 
     if verify_env:
         logger.info(
@@ -1701,6 +1702,7 @@ async def run_scoped_verification(
     task_id: str | None = None,
     archive_root: Path | None = None,
     force_workspace: bool = False,
+    role: Literal['merge', 'task'] = 'task',
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -1761,6 +1763,7 @@ async def run_scoped_verification(
                 attempt_id=attempt_id,
                 task_id=task_id,
                 archive_root=archive_root,
+                role=role,
             )
         if module_configs:
             # Apply file-level scoping within each subproject when task_files given
@@ -1807,6 +1810,7 @@ async def run_scoped_verification(
                             max_retries=max_retries,
                             is_merge_verify=is_merge_verify,
                             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                            role=role,
                         )
                         for mc in module_configs
                     ))
@@ -1830,6 +1834,7 @@ async def run_scoped_verification(
                         max_retries=max_retries,
                         is_merge_verify=is_merge_verify,
                         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                        role=role,
                     )
                     for mc in scoped
                 )
@@ -1860,6 +1865,7 @@ async def run_scoped_verification(
                     worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                    role=role,
                 )
 
             # For Rust projects with no module_configs and no Python fallback
@@ -1883,6 +1889,7 @@ async def run_scoped_verification(
                         worktree, config, rewritten, max_retries=max_retries,
                         is_merge_verify=is_merge_verify,
                         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                        role=role,
                     )
 
         logger.info('Verification mode: global (no scope info)')
@@ -1890,6 +1897,7 @@ async def run_scoped_verification(
             worktree, config, max_retries=max_retries,
             is_merge_verify=is_merge_verify,
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+            role=role,
         )
     finally:
         _maybe_prune_archive(archive_root)
