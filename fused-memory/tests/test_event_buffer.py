@@ -1145,3 +1145,68 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     assert row is not None, 'idx_dw_project_claimed should be present after migration'
 
     await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_project_dead_letter_transitions_buffered_only(buf):
+    """mark_project_dead_letter flips only 'buffered' rows for the target project.
+
+    Verifies task 1549 (read-loop quarantine): once called, get_active_projects()
+    naturally stops returning the project_id (it selects WHERE status='buffered'),
+    ending the management-loop respawn storm.
+
+    See: EventBuffer.restore_drained for the mirror UPDATE-by-status pattern.
+    """
+    # Arrange: 2 buffered events for 'know-live', 1 buffered + 1 drained for 'dark_factory'.
+    for _ in range(2):
+        await buf.push(_make_event(project_id='know-live'))
+
+    await buf.push(_make_event(project_id='dark_factory'))
+    # Drain that one 'dark_factory' event so we have a 'drained' row.
+    dark_events = await buf.drain('dark_factory')
+    assert len(dark_events) == 1, 'Expected 1 drained dark_factory event'
+
+    # Push one more 'dark_factory' buffered event (stays buffered).
+    await buf.push(_make_event(project_id='dark_factory'))
+
+    # Act: quarantine all buffered rows for 'know-live'.
+    n = await buf.mark_project_dead_letter('know-live')
+
+    # Assert: exactly 2 rows quarantined.
+    assert n == 2, f'Expected 2 rows quarantined, got {n}'
+
+    # Assert: raw DB status counts.
+    db = buf._require_db()
+    async with db.execute(
+        "SELECT status, COUNT(*) as cnt FROM event_buffer GROUP BY status ORDER BY status"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    counts = {row['status']: row['cnt'] for row in rows}
+
+    assert counts.get('dead_letter') == 2, (
+        f"Expected 2 'dead_letter' rows for know-live; got {counts!r}"
+    )
+    assert counts.get('buffered') == 1, (
+        f"Expected 1 remaining 'buffered' row (dark_factory); got {counts!r}"
+    )
+    assert counts.get('drained') == 1, (
+        f"Expected 1 'drained' row (dark_factory) unchanged; got {counts!r}"
+    )
+
+    # Assert: count_buffered returns 0 for the quarantined project.
+    assert await buf.count_buffered('know-live') == 0, (
+        "count_buffered('know-live') must be 0 after quarantine"
+    )
+
+    # Assert: get_active_projects no longer includes 'know-live'.
+    active = await buf.get_active_projects()
+    assert 'know-live' not in active, (
+        f"'know-live' must not appear in get_active_projects() after quarantine; got {active!r}"
+    )
+    assert 'dark_factory' in active, (
+        f"'dark_factory' must still appear in get_active_projects(); got {active!r}"
+    )
+
+    # Assert: mark_project_dead_letter on a project with no buffered rows returns 0.
+    n2 = await buf.mark_project_dead_letter('know-live')
+    assert n2 == 0, f'Expected 0 for already-quarantined project, got {n2}'
