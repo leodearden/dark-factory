@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -106,7 +107,7 @@ def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
     ids=["merge", "task"],
 )
 def test_role_env_propagates_to_reify_verify_plan(
-    role: str,
+    role: Literal["merge", "task"],
     expected_prefix: str,
     forbid_ionice: bool,
 ) -> None:
