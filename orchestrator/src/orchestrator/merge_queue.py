@@ -19,7 +19,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
@@ -93,6 +93,22 @@ surfacing this.  The workflow routes this prefix to
 ``_mark_blocked(escalate_to_human=True, category='infra_issue')`` — the
 infra_issue category plus the durable ref lets the escalation-watcher
 auto-resolve if the disk has recovered by read-time."""
+
+
+TRAIN_INCOMPLETE_REASON_PREFIX = 'Train merge rejected: not all members are merge-deferred'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when a
+``GroupMergeRequest`` is dispatched but one or more member tasks are not
+in the ``merge-deferred`` status.  Workflow-side classifiers pattern-match
+this prefix to distinguish a pre-condition failure (no git work done, safe
+to retry after the offending member catches up) from a post-merge block."""
+
+TRAIN_REBASE_CONFLICT_REASON_PREFIX = 'Train merge rejected: tip branch rebase conflict'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the tip-branch
+rebase-onto-main step of a ``GroupMergeRequest`` fails with conflicts.
+``rebase_onto_main`` already ran ``git rebase --abort``, so the worktree is
+left clean.  The downstream classifier surfaces this to the enqueuer so the
+tip task can be re-rebased in its own worktree before the train is
+re-submitted."""
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
@@ -611,6 +627,39 @@ class MergeRequest:
     module_configs: list[ModuleConfig]
     config: OrchestratorConfig
     result: asyncio.Future[MergeOutcome] = field(repr=False)
+
+
+@dataclass
+class GroupMergeRequest(MergeRequest):
+    """A request to atomically merge a linear-stacked train of task branches.
+
+    Extends :class:`MergeRequest` with train-specific fields and async
+    callbacks.  The base ``task_id`` / ``branch`` / ``worktree`` are set to
+    the TIP task's values so existing logging, event emission, and CAS
+    bookkeeping all behave normally.
+
+    The callbacks are populated by the enqueuer (δ₂) and capture the
+    scheduler + train_id, keeping the merge worker a pure git engine with no
+    direct scheduler dependency.
+    """
+
+    train_id: str
+    """Unique identifier for this train (e.g. the scheduler's train UUID)."""
+
+    member_task_ids: list[str]
+    """Ordered list of task IDs from root to tip (inclusive)."""
+
+    tip_branch: str
+    """Branch name of the tip task (alias of ``branch``)."""
+
+    tip_task_id: str
+    """Task ID of the tip member (alias of ``task_id``)."""
+
+    status_check: Callable[[list[str]], Awaitable[dict[str, str]]]
+    """Async callback: given *member_task_ids*, return ``{task_id: status}``."""
+
+    mark_member_done: Callable[[str, str], Awaitable[None]]
+    """Async callback: mark a single member task done with the merge SHA."""
 
 
 @dataclass
