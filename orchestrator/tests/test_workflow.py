@@ -386,3 +386,114 @@ class TestEnterMergeDeferred:
             f'Expected WorkflowOutcome.MERGE_DEFERRED; got {result!r}'
         )
         wf.scheduler.set_task_status.assert_awaited_once_with(wf.task_id, 'merge-deferred')
+
+
+def _make_run_wf(
+    tmp_path: Path,
+    *,
+    with_train: bool = False,
+) -> TaskWorkflow:
+    """Build a TaskWorkflow stubbed to reach the post-loop merge block in run().
+
+    Stubs the preamble (setup/plan) and the merge helpers so the tests can
+    assert on the train guard without running git or the real merge pipeline.
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    if with_train:
+        wf.task['metadata'] = {'train': {'id': 'T1', 'order': 0, 'members': ['1523']}}
+
+    # Preamble stubs
+    wf._setup_worktree_and_artifacts = AsyncMock()  # type: ignore[method-assign]
+    wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    wf.config.simple_task_enabled = False
+    # wf.plan is already set by _make_workflow → skips the planner entirely.
+    wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    wf._execute_verify_review_loop = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.DONE,
+    )
+    wf._worktree_external = False
+
+    # Merge-path stubs (train members never reach these; non-train do)
+    wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    wf.git_ops.get_main_sha = AsyncMock(return_value='deadbeef00')
+    wf.git_ops.is_ancestor = AsyncMock(return_value=False)  # not already merged
+    wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+    wf.config.max_merge_retries = 1
+    wf.config.max_pre_merge_retries = 1
+
+    # SUCCESS-block stubs (after _submit_to_merge_queue returns DONE)
+    wf._write_completion_to_memory = AsyncMock()  # type: ignore[method-assign]
+    wf._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
+    wf._await_steward_completion = AsyncMock()  # type: ignore[method-assign]
+    wf._finalise_merged_done = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.DONE,
+    )
+
+    # Train-guard target + merge-queue (only one of these is called per case)
+    wf._enter_merge_deferred = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.MERGE_DEFERRED,
+    )
+    wf._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.DONE,
+    )
+
+    return wf
+
+
+@pytest.mark.asyncio
+class TestRunMergeDeferredGuard:
+    """run() routes train members to merge-deferred instead of the merge phase (γ₁).
+
+    The train guard fires immediately after `if not self._worktree_external:` in
+    the post-loop merge block, before any git calls or merge-queue submission.
+    Non-train tasks must see byte-identical behaviour.
+    """
+
+    async def test_train_member_parks_in_merge_deferred(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A task with metadata.train set must return MERGE_DEFERRED without
+        submitting to the merge queue.  The execute/verify/review pipeline
+        still runs (stubbed via _execute_verify_review_loop).
+        """
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_sha\n', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+        )
+
+        wf = _make_run_wf(tmp_path, with_train=True)
+        outcome = await wf.run()
+
+        assert outcome == WorkflowOutcome.MERGE_DEFERRED, (
+            f'Expected MERGE_DEFERRED for train member; got {outcome!r}'
+        )
+        wf._enter_merge_deferred.assert_awaited_once()
+        wf._submit_to_merge_queue.assert_not_called()
+
+    async def test_non_train_task_proceeds_to_merge(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A task without metadata.train must NOT call _enter_merge_deferred and
+        must proceed to _submit_to_merge_queue — the pre-γ₁ merge path unchanged.
+        """
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_sha\n', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+        )
+
+        wf = _make_run_wf(tmp_path, with_train=False)
+        outcome = await wf.run()
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for non-train task merge path; got {outcome!r}'
+        )
+        wf._enter_merge_deferred.assert_not_called()
+        wf._submit_to_merge_queue.assert_awaited_once()
