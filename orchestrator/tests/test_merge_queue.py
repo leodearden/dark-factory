@@ -7586,8 +7586,9 @@ class TestTrainLifecycleEvents:
         derailed_data = json.loads(rows[derailed_idx][1])
         assert derailed_data['train_id'] == req.train_id
         assert derailed_data['member_task_ids'] == req.member_task_ids
-        assert 'verify' in derailed_data['derail_reason'].lower(), (
-            f"Expected 'verify' in derail_reason, got: {derailed_data['derail_reason']!r}"
+        assert 'verif' in derailed_data['derail_reason'].lower(), (
+            f"Expected 'verif' (from 'verify' or 'verification') in derail_reason, "
+            f"got: {derailed_data['derail_reason']!r}"
         )
 
     async def test_rebase_conflict_emits_train_derailed(

@@ -1259,6 +1259,12 @@ async def _do_train_merge(
             f'— resolve in the tip worktree'
         )
         logger.info('Train %s: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'train_rebase_conflict', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1272,6 +1278,12 @@ async def _do_train_merge(
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
         reason = merge_result.details or 'Merge failed'
         logger.info('Train %s: merge failed: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'conflict' if merge_result.conflicts else 'merge_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1304,6 +1316,12 @@ async def _do_train_merge(
         await git_ops.cleanup_merge_worktree(merge_wt)
         reason = f'Post-merge verification failed: {verify.failure_report()}'
         logger.info('Train %s: verify gate red: %s', req.train_id, reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': reason},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
@@ -1333,6 +1351,12 @@ async def _do_train_merge(
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': f'Train merge advance failed: {adv}'},
+        )
         _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
 
