@@ -5512,8 +5512,10 @@ class TestGroupMergeRequestDataclass:
 
     def _make_instance(self, config: OrchestratorConfig, tmp_path: Path) -> GroupMergeRequest:
         """Build a minimal GroupMergeRequest for introspection."""
-        loop = asyncio.new_event_loop()
-        future: asyncio.Future[MergeOutcome] = loop.create_future()
+        # Use MagicMock instead of a real asyncio.Future to avoid creating (and
+        # leaking) an event loop just to produce a placeholder field value.
+        # These dataclass tests do not exercise async behaviour.
+        future: asyncio.Future[MergeOutcome] = MagicMock(spec=asyncio.Future)
         status_check_mock = AsyncMock(return_value={})
         mark_done_mock = AsyncMock()
         return GroupMergeRequest(
@@ -6053,6 +6055,84 @@ class TestGroupMergeRequestSpeculativeWorker:
             f'got: {spec_rows}'
         )
 
+        # merge_attempt event for the train carries train_id and member_task_ids
+        # so downstream reconciliation can correlate rows with the specific train.
+        conn2 = sqlite3.connect(str(db_path))
+        import json as _json
+        done_rows = conn2.execute(
+            "SELECT data FROM events "
+            "WHERE event_type = 'merge_attempt' AND task_id = ?",
+            (req.task_id,),
+        ).fetchall()
+        conn2.close()
+        assert done_rows, 'expected at least one merge_attempt event for the train'
+        done_payloads = [_json.loads(row[0]) for row in done_rows]
+        # The final 'done' event (or any train event) should carry train_id
+        train_events = [p for p in done_payloads if p.get('outcome') == 'done']
+        assert train_events, f'expected a done merge_attempt event; got: {done_payloads}'
+        assert train_events[-1].get('train_id') == req.train_id, (
+            f'done event missing train_id; payload: {train_events[-1]}'
+        )
+        assert train_events[-1].get('member_task_ids') == req.member_task_ids, (
+            f'done event missing member_task_ids; payload: {train_events[-1]}'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    async def test_regular_then_train_both_land(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A regular MergeRequest followed by a GroupMergeRequest both land cleanly.
+
+        Verifies the ordering contract: regular → train → both on main, no
+        split-brain.  Also documents the pipeline-ordering concern (suggestion 1):
+        the train may dequeue while the regular request's CAS is still pending;
+        advance_main retries absorb the race.
+        """
+        # Build the stacked train (3 members)
+        train_req = await _make_stacked_train(git_ops, config)
+
+        # Build a separate single-task request using git_ops.create_worktree
+        # (which creates branch task/<name>, matching how all other tests work).
+        reg_task_id = 'reg-task'
+        reg_file = 'reg-task.py'
+        reg_wt_info = await git_ops.create_worktree(reg_task_id)
+        reg_wt = reg_wt_info.path
+        (reg_wt / reg_file).write_text('# reg\n')
+        await git_ops.commit(reg_wt, f'add {reg_file}')
+        reg_req = _make_request(reg_task_id, reg_task_id, reg_wt, config)
+
+        db_path = tmp_path / 'events_reg_train.db'
+        event_store = EventStore(db_path=db_path, run_id='test-reg-then-train')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(reg_req)
+            reg_outcome = await asyncio.wait_for(reg_req.result, timeout=60)
+            # Now enqueue the train (after regular has resolved, pipeline is idle)
+            await queue.put(train_req)
+            train_outcome = await asyncio.wait_for(train_req.result, timeout=60)
+
+        assert reg_outcome.status == 'done', f'regular request failed: {reg_outcome!r}'
+        assert train_outcome.status == 'done', f'train request failed: {train_outcome!r}'
+
+        # Both the regular file and all train member files must be on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert reg_file in main_files, f'{reg_file} missing from main'
+        assert 'trn-a.py' in main_files
+        assert 'trn-b.py' in main_files
+        assert 'trn-c.py' in main_files
+
+        # mark_member_done called 3 times for the train
+        assert train_req.mark_member_done.call_count == 3  # type: ignore[reportFunctionMemberAccess]
+
         await worker.stop()
         await worker_task
 
@@ -6138,8 +6218,8 @@ class TestGroupMergeRequestPartialMemberFlipFailure:
         assert outcome.reason.startswith(TRAIN_PARTIAL_FLIP_REASON_PREFIX), (
             f'expected TRAIN_PARTIAL_FLIP prefix, got: {outcome.reason!r}'
         )
-        assert '1' in outcome.reason, (
-            f'expected failed-count (1) in reason, got: {outcome.reason!r}'
+        assert '1/3' in outcome.reason, (
+            f'expected failed-count ratio (1/3) in reason, got: {outcome.reason!r}'
         )
         assert 'trn-b' in outcome.reason, (
             f'expected offending member task_id (trn-b) in reason, got: {outcome.reason!r}'
