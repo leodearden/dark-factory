@@ -47,6 +47,9 @@ class BaseStage:
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
         usage_gate=None,
+        *,
+        recon_report_port: int = 8003,
+        recon_report_state=None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -64,6 +67,9 @@ class BaseStage:
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
+        # PRD γ: recon_report channel threading
+        self._recon_report_port: int = recon_report_port
+        self._recon_report_state = recon_report_state
 
     def get_disallowed_tools(self) -> list[str]:
         """Override in subclass — return MCP tool names this stage may NOT use."""
@@ -215,6 +221,14 @@ class BaseStage:
             'jcodemunch': {
                 'command': 'uvx',
                 'args': ['jcodemunch-mcp'],
+            },
+            # PRD γ: recon_report MCP server — in-process only, not in any
+            # disallow list because mcp__recon-report__* tools only mutate
+            # in-process state (not Graphiti / Mem0 / Taskmaster).
+            # See STAGE3_DISALLOWED comment in cli_stage_runner.py for rationale.
+            'recon-report': {
+                'type': 'http',
+                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',
             },
         }
 
