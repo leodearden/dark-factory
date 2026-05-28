@@ -7,6 +7,7 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
 )
 from fused_memory.reconciliation.prompts import (
+    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
 )
@@ -97,9 +98,12 @@ memory writes. The path-scope guard validates the routing and rejects tasks that
 owned by another project with a structured `DarkFactoryPathScopeViolation` error — its \
 `suggested_project` field tells you where to resubmit.
 - If no project_root in "Known Projects" matches the scope, do NOT file the task in the \
-current project as a workaround. Instead, add a `cross_project_findings` entry to your \
-structured report so the operator can route it manually. Each entry should carry a one-line \
-`summary`, a `target_project_hint` (best-guess project name), and short `evidence` notes.
+current project as a workaround. Instead, emit a finding via recon_report: call \
+`mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
+flag_type='cross_project', actionable=False, \
+description=<one-line summary + target_project_hint>, \
+suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
+No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal.
 - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
 — follow the Authority Model rules for that.
 
@@ -114,7 +118,9 @@ and done tasks for missing knowledge capture.
 cancel, use `set_task_status('cancelled')`; do not route the status change through \
 `update_task` — the server rejects status writes there.
 - {_STAGE2_PROJECT_ID_GUIDELINE}
-- When you have completed your work, produce your final structured report as your response.
+- **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
+(including cross_project_routing findings emitted above): \
+{_RECON_REPORT_TOOL_GUIDANCE}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \

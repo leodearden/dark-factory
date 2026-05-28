@@ -1,6 +1,9 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
-from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts import (
+    _RECON_REPORT_TOOL_GUIDANCE,
+    _STAGE3_PROJECT_ID_GUIDELINE,
+)
 
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
@@ -37,47 +40,24 @@ divergence between stores, or knowledge gaps.
 - Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
 serious (fundamentally contradictory state).
 - {_STAGE3_PROJECT_ID_GUIDELINE}
-- When you have completed your work, produce your final structured report as your response.
 
 ## Finding Classification (REQUIRED)
-Each finding in your report MUST include these fields:
+Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
-- `severity`: One of "minor", "moderate", or "serious".
+- `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
 - `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
 contradictions, task mismatches); `false` if it needs human judgment.
 - `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
 `task_memory_mismatch`, `missing_knowledge`, `cross_store_inconsistency`, `systemic_pattern`, `other`.
-- `affected_ids`: List of memory IDs, entity names, or task IDs involved.
 - `suggested_action`: What the remediation stage should do to fix this finding.
 
-Example finding:
-```json
-{{
-  "description": "Edge 'uses_framework→React' on entity 'project_alpha' last updated 2025-01, but project switched to Vue in 2025-09",
-  "severity": "moderate",
-  "actionable": true,
-  "category": "memory_stale",
-  "affected_ids": ["edge-abc123", "project_alpha"],
-  "suggested_action": "Delete stale edge 'uses_framework→React' and verify Vue edge exists"
-}}
-```
+Instead of an `affected_ids` list, attach typed citations via the recon_report tools \
+(see Report Channel section below).
 
-## Output Format
+## Report Channel — recon_report MCP Tools (PRD γ §9)
+{_RECON_REPORT_TOOL_GUIDANCE}
 
-When you have completed your work, produce your final structured JSON report as your response. \
-Your output MUST conform to the following structure:
-
-- `summary` (string, required): Human-readable summary of what was verified and found.
-- `flagged_items` (array): **All findings go here** — do NOT use a `findings` key. \
-  Each item in `flagged_items` must include:
-  - `description`: What the inconsistency is, with specific IDs and evidence.
-  - `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
-  - `actionable`: `true` or `false`.
-  - `category`: One of the categories listed above.
-  - `affected_ids`: List of memory IDs, entity names, or task IDs.
-  - `suggested_action`: What the remediation stage should do.
-- `stats` (object, optional): Counts and metrics (e.g. items checked, findings by severity).
-
-**Important**: The output key is `flagged_items`, not `findings`. Place every finding \
-inside the `flagged_items` array.
+**NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
+state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \
+They do NOT violate the read-only contract. See PRD §9.1 / §11 task γ.
 """

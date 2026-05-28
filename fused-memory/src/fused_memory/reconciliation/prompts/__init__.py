@@ -52,3 +52,49 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
     stat_keys_phrase="`memories_written`",
     primary_stat_key="`memories_written`",
 )
+
+# ---------------------------------------------------------------------------
+# Shared recon_report tool-usage guidance (PRD γ §9)
+# ---------------------------------------------------------------------------
+# Extracted to prevent prompt drift across Stage 1 / 2 / 3.  Any UUID-format
+# tweak, field-name change, or dedup-anchor update belongs here; it propagates
+# automatically to all stage prompts that interpolate this constant.
+#
+# Stage-specific deltas stay *inline* in each stage module:
+#   Stage 2 — "(including cross_project_routing findings above)" in the intro.
+#   Stage 3 — "## Report Channel" section header + read-only NOTE inserted
+#             between the cite-tool list and the stats line.
+#
+# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3):
+#   When a finding targets a specific task, pass task_id= at the top level of
+#   add_finding() in addition to cite_task().  The dedup engine's cited_tasks
+#   fallback derives a signature from the sorted union of all cited task IDs;
+#   that signature changes whenever citations grow or shrink, defeating
+#   recurrence tracking for evolving multi-task findings.  An explicit top-level
+#   task_id is stable and should always be set when there is a clear primary
+#   subject task.
+_RECON_REPORT_TOOL_GUIDANCE = (
+    'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
+    ' — do NOT call it yourself. For each finding, call `mcp__recon-report__add_finding(...)`'
+    ' and capture the `finding_id` from the response. Then attach typed citations:\n'
+    '- `mcp__recon-report__cite_entity(finding_id=..., name=<canonical entity name>)` —'
+    ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
+    '- `mcp__recon-report__cite_edge(finding_id=..., edge_uuid=<full 36-char UUID>)` —'
+    ' copy the UUID verbatim from the `id` field of a fresh tool result'
+    ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
+    '- `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>,'
+    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**: when the finding'
+    ' has a clear primary subject task, also pass `task_id=<that task_id>` at the top'
+    ' level of `add_finding(...)`. The dedup engine prefers the top-level field; the'
+    ' cited_tasks fallback signature changes as citation sets grow, defeating recurrence'
+    ' tracking.\n'
+    "- `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>,"
+    " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
+    ' `id` field of a fresh tool result.\n'
+    'For stats counters use `mcp__recon-report__set_stat(key=..., value=...)` or'
+    ' `mcp__recon-report__inc_stat(key=..., delta=...)`. When all findings are recorded'
+    ' and all work is done, call'
+    ' `mcp__recon-report__complete(summary=<brief human-readable summary>)` as your'
+    ' terminal action — do NOT produce a structured JSON response; the assembled'
+    ' recon_report state is the authoritative output channel for this stage.'
+)

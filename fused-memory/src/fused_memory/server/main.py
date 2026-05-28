@@ -307,6 +307,34 @@ def configure_uvicorn_logging():
         uv_logger.propagate = False
 
 
+def _require_http_transport_for_reconciliation(config: Any) -> None:
+    """Guard: raise if reconciliation is enabled but transport is not 'http'.
+
+    The recon-report MCP server (PRD §9 / §11 task γ) is only started under
+    the http transport.  Running reconciliation with stdio or sse transport
+    would inject recon-report server URLs into stage MCP configs that point at
+    a non-existent server, silently producing empty StageReports every cycle.
+
+    Call this at the very top of run_server's reconciliation-enabled path —
+    BEFORE ReconciliationHarness is constructed — so the failure is raised
+    before TaskInterceptor is started or any stage is built.
+
+    Raises:
+        ValueError: if config.reconciliation is set and .enabled is True and
+            config.server.transport != 'http'.
+    """
+    if (
+        config.reconciliation
+        and config.reconciliation.enabled
+        and config.server.transport != 'http'
+    ):
+        raise ValueError(
+            f"reconciliation.enabled=True requires server.transport='http' "
+            f"(got '{config.server.transport}'); the recon-report MCP server "
+            "is only started under the http transport."
+        )
+
+
 async def run_server():
     """Parse args, load config, init service, run MCP transport."""
     parser = argparse.ArgumentParser(description='Fused Memory MCP Server')
@@ -443,6 +471,21 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
+    # populate recon_report_state before the harness is constructed, threading the
+    # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
+    # recon-report server. The try/finally block below reads this name; removing the
+    # duplicate init at the old site avoids overwriting a value set here.
+    recon_report_state: Any = None
+    _pre_recon_uv_config: Any = None
+    # Reviewer finding race_condition: set to an asyncio.Event when reconciliation
+    # is enabled; the harness awaits it before launching the first stage subprocess.
+    # Initialised to None here so the finally block and the http-transport branch
+    # can reference it unconditionally.
+    recon_server_ready: asyncio.Event | None = None
+    # PRD γ §11: fail loudly before harness construction if reconciliation is
+    # enabled but the transport cannot host the recon-report MCP server.
+    _require_http_transport_for_reconciliation(config)
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -581,11 +624,39 @@ async def run_server():
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
 
+        # PRD γ (task 1546): Pre-build recon_report components here — before
+        # ReconciliationHarness is constructed — so the SAME ReconReportState
+        # object is threaded into both the harness (for direct in-process
+        # start_report/get_assembled_report calls) and the uvicorn recon-report
+        # server (for MCP tool access by stage subprocesses).
+        #
+        # Two-call invariant: reconciliation enabled → build here so harness and
+        # uvicorn share the same object identity; reconciliation disabled → build
+        # later (in the http transport branch) when uvicorn starts.
+        # `_require_http_transport_for_reconciliation` above already guarantees
+        # transport == 'http' at this point; the redundant inner check is dropped.
+        recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
+            config,
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            known_projects=_known_projects_map,
+        )
+
+        # Reviewer finding race_condition: encode the ordering dependency in code.
+        # The harness's run_loop() awaits this event before launching any stage
+        # subprocess, guaranteeing the recon-report MCP server is accepting
+        # connections before any `mcp__recon-report__*` calls can fire.
+        # The event is set by _watch_recon_server_ready() (spawned below, after the
+        # uvicorn recon_server is built) once recon_server.started flips to True.
+        recon_server_ready = asyncio.Event()  # set by watcher in the http branch below
+
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
             memory_service, taskmaster, recon_journal, event_buffer, config,
             backlog_policy=backlog_policy,
             known_projects=_known_projects_map,
+            recon_report_state=recon_report_state,
+            server_ready_event=recon_server_ready,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -713,7 +784,7 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     watchdog_task: asyncio.Task[None] | None = None
-    recon_report_state: Any = None
+    # recon_report_state already initialized above (PRD γ, task 1546 step-12)
     server: Any | None = None  # primary uvicorn.Server
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
@@ -752,13 +823,19 @@ async def run_server():
             # callback can reference both servers — stopping only the primary would
             # leave asyncio.gather(server.serve(), recon_server.serve()) unresolved
             # and hang run_server() until SIGKILL.
-            recon_report_state, _recon_mcp, recon_uv_config = _build_recon_report_components(
-                config,
-                memory_service=memory_service,
-                task_interceptor=task_interceptor,
-                known_projects=_known_projects_map,
-            )
-            recon_server = uvicorn.Server(recon_uv_config)
+            #
+            # PRD γ (task 1546): For reconciliation-enabled runs, recon_report_state
+            # and _pre_recon_uv_config were built above (before harness construction)
+            # so the harness and the uvicorn server share the SAME ReconReportState
+            # object. For reconciliation-disabled runs, build them now.
+            if recon_report_state is None:
+                recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
+                    config,
+                    memory_service=memory_service,
+                    task_interceptor=task_interceptor,
+                    known_projects=_known_projects_map,
+                )
+            recon_server = uvicorn.Server(_pre_recon_uv_config)
             recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
             # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
@@ -797,6 +874,21 @@ async def run_server():
             # "Task was destroyed but it is pending!" on loop teardown.
             _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
+
+            # Signal the harness once the recon-report server is accepting connections.
+            # Polls uvicorn's server.started flag (set inside serve() after startup()).
+            # This is the complement of the server_ready_event passed to the harness
+            # above — together they enforce that no stage subprocess fires against a
+            # not-yet-listening port (reviewer finding race_condition).
+            if recon_server_ready is not None:
+                async def _watch_recon_server_ready() -> None:
+                    while not recon_server.started:
+                        await asyncio.sleep(0.05)
+                    recon_server_ready.set()
+                    logger.debug('recon-report server ready — harness unblocked')
+
+                asyncio.create_task(_watch_recon_server_ready(), name='recon_server_readiness_watcher')
+
             try:
                 await asyncio.gather(_primary_task, _recon_task)
             except BaseException:

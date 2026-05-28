@@ -1,6 +1,7 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
 from fused_memory.reconciliation.prompts import (
+    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
 )
@@ -63,7 +64,9 @@ triggering Graphiti's edge resolution pipeline which can falsely invalidate acti
 Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
 that don't correspond to any existing edge.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
-- When you have completed your work, produce your final structured report as your response.
+- **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
+(including cross-project scope mismatches flagged to Stage 2): \
+{_RECON_REPORT_TOOL_GUIDANCE}
 
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \

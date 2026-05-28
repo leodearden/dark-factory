@@ -47,6 +47,9 @@ class BaseStage:
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
         usage_gate=None,
+        *,
+        recon_report_port: int = 8003,
+        recon_report_state=None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -64,6 +67,9 @@ class BaseStage:
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
+        # PRD γ: recon_report channel threading
+        self._recon_report_port: int = recon_report_port
+        self._recon_report_state = recon_report_state
 
     def get_disallowed_tools(self) -> list[str]:
         """Override in subclass — return MCP tool names this stage may NOT use."""
@@ -136,7 +142,59 @@ class BaseStage:
         disallowed = self.get_disallowed_tools()
         mcp_config = self._build_mcp_config()
 
+        # PRD γ: signal the recon_report state machine that this stage is starting.
+        # The CLI agent will call recon_report.add_finding / cite_* / complete via MCP;
+        # the harness then reads back the assembled report after the CLI returns.
+        #
+        # _active_rrs is a run-local alias for self._recon_report_state so that a
+        # start_report failure can degrade to None for this run only, without
+        # mutating the shared state object (which must survive across runs).
+        _active_rrs = self._recon_report_state
+        start_report_failed = False
+        if _active_rrs is not None:
+            try:
+                _active_rrs.start_report(
+                    run_id=run_id,
+                    stage=self.stage_id.value,
+                    project_id=self.project_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # start_report is on the critical path — a transient error
+                # (e.g. duplicate run_id from a crashed prior run, TTL-reaper race)
+                # must not abort the whole reconciliation cycle.  Short-circuit:
+                # the stage prompt has been switched to recon_report mode and
+                # tells the agent NOT to produce a structured JSON response, so
+                # invoking the CLI now would either time out or fail schema
+                # validation, costing a full agent budget per stage on every
+                # recon_report outage.  Return an empty StageReport instead.
+                logger.warning(
+                    'Stage %s: start_report raised %r for run_id=%s; '
+                    'short-circuiting to empty StageReport (no LLM invocation)',
+                    self.stage_id.value, exc, run_id,
+                )
+                _active_rrs = None
+                start_report_failed = True
+
         started = datetime.now(UTC)
+
+        if start_report_failed:
+            completed = datetime.now(UTC)
+            return StageReport(
+                stage=self.stage_id,
+                started_at=started,
+                completed_at=completed,
+                items_flagged=[],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        # When recon_report_state is active, drop the output_schema requirement —
+        # the assembled in-process state is the source of truth, not the LLM's JSON.
+        effective_output_schema = (
+            None if _active_rrs is not None
+            else self.get_report_schema()
+        )
 
         stage_result = await run_stage_via_cli(
             system_prompt=self.get_system_prompt(),
@@ -147,10 +205,41 @@ class BaseStage:
             usage_gate=self._usage_gate,
             model=model,
             cwd=Path(self.config.explore_codebase_root),
-            output_schema=self.get_report_schema(),
+            output_schema=effective_output_schema,
         )
 
         completed = datetime.now(UTC)
+
+        # PRD γ: read assembled report from in-process state (overrides stage_result.report).
+        # Falls back to stage_result.report when recon_report_state is not configured
+        # (back-compat path for non-recon stages) or when start_report degraded to None.
+        if _active_rrs is not None:
+            assembled = _active_rrs.get_assembled_report(
+                run_id, self.stage_id.value
+            )
+            if assembled is not None:
+                stage_result.report = assembled
+            else:
+                # Agent crashed / timed out before calling recon_report.complete.
+                # Substitute empty assembled dict — matches today's malformed-JSON outcome.
+                logger.warning(
+                    'Stage %s: get_assembled_report returned None for run_id=%s '
+                    '(agent may have crashed before calling recon_report.complete)',
+                    self.stage_id.value, run_id,
+                )
+                stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
+
+        # Schema consistency (reviewer finding schema_consistency): warn when a
+        # flagged item lacks both dedup keys — compute_flag_signature will return
+        # None for these findings, silently bypassing cross-run recurrence tracking.
+        for _item in stage_result.report.get('flagged_items', []):
+            if not _item.get('task_id') and not _item.get('cited_tasks'):
+                logger.warning(
+                    'Stage %s run_id=%s: finding lacks task_id and cited_tasks — '
+                    'dedup signature cannot be computed (finding: %.80s)',
+                    self.stage_id.value, run_id,
+                    _item.get('description', '<no description>'),
+                )
 
         report_data = stage_result.report
         stage_report = StageReport(
@@ -215,6 +304,14 @@ class BaseStage:
             'jcodemunch': {
                 'command': 'uvx',
                 'args': ['jcodemunch-mcp'],
+            },
+            # PRD γ: recon_report MCP server — in-process only, not in any
+            # disallow list because mcp__recon-report__* tools only mutate
+            # in-process state (not Graphiti / Mem0 / Taskmaster).
+            # See STAGE3_DISALLOWED comment in cli_stage_runner.py for rationale.
+            'recon-report': {
+                'type': 'http',
+                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',
             },
         }
 

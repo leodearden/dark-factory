@@ -59,6 +59,11 @@ DISALLOW_SUBTASK_CREATE = ['mcp__fused-memory__add_subtask']
 STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
 STAGE2_DISALLOWED = DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE  # Full memory + task tools EXCEPT add_subtask (see DISALLOW_SUBTASK_CREATE)
 STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
+# NOTE: `mcp__recon-report__*` tools are intentionally NOT included in DISALLOW_MEMORY_WRITES
+# or DISALLOW_TASK_WRITES and therefore NOT in STAGE3_DISALLOWED.  These tools write only
+# to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster) so they do not violate
+# Stage 3's read-only contract.  Do NOT add them to either disallow list.
+# See PRD §9.1 / §11 task γ for the rationale.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
@@ -82,6 +87,17 @@ STAGE_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 # Structured schema for individual finding items (Stage 3)
+# PRD §9.3: four typed citation lists replace the retired `affected_ids` field.
+# Top-level task_id / flag_type / actionable are preserved for flag_dedup and
+# stats_verifier compatibility.
+#
+# NOTE — ASSEMBLED REPORT SHAPE (suggestion schema_prompt_mismatch):
+# This schema describes the shape of data in the ASSEMBLED report (after the
+# recon_report server has resolved citations).  It is NOT the shape the LLM
+# emits: the stage prompts instruct the agent to call the cite_* MCP tools
+# (e.g. cite_entity(name=...)); the server resolves UUIDs and fingerprints
+# server-side.  Fields marked "server-resolved" below are therefore optional
+# in the LLM output but present in the assembled dict.
 FINDING_ITEM_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'properties': {
@@ -98,6 +114,23 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
             'type': 'boolean',
             'description': 'True if Stage 1/Stage 2 can fix it automatically',
         },
+        'task_id': {
+            'type': ['string', 'null'],
+            'description': (
+                'Task ID associated with this finding. '
+                'Dedup contract: either set task_id + flag_type here, OR include '
+                'at least one cited_tasks entry — otherwise compute_flag_signature '
+                'returns None and this finding will not deduplicate across runs.'
+            ),
+        },
+        'flag_type': {
+            'type': ['string', 'null'],
+            'description': (
+                'Machine-readable flag type for deduplication. '
+                'Required alongside task_id (or cited_tasks fallback) for '
+                'cross-run recurrence tracking to work correctly.'
+            ),
+        },
         'category': {
             'type': 'string',
             'enum': [
@@ -108,18 +141,70 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
                 'missing_knowledge',
                 'cross_store_inconsistency',
                 'systemic_pattern',
+                'cross_project_routing',
                 'other',
             ],
             'description': 'Category of the finding',
         },
-        'affected_ids': {
-            'type': 'array',
-            'items': {'type': 'string'},
-            'description': 'Memory IDs, entity names, or task IDs involved',
-        },
         'suggested_action': {
             'type': 'string',
             'description': 'What the remediation stage should do to fix this finding',
+        },
+        # PRD §9.3 typed citation lists — replace retired `affected_ids`
+        'cited_entities': {
+            'type': 'array',
+            'description': 'Entities cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    # entity_uuid is server-resolved: the agent calls cite_entity(name=...)
+                    # and the server looks up the UUID.  Present in assembled output, but
+                    # the LLM never produces it directly — do NOT add to required.
+                    'entity_uuid': {'type': 'string', 'description': 'UUID of the entity node (server-resolved)'},
+                    'canonical_name': {'type': 'string', 'description': 'Entity canonical name'},
+                },
+                'required': ['canonical_name'],
+            },
+        },
+        'cited_edges': {
+            'type': 'array',
+            'description': 'Graphiti edges cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'edge_uuid': {'type': 'string', 'description': 'UUID of the edge'},
+                    'fact_text_snapshot': {'type': 'string', 'description': 'Snapshot of the edge fact text'},
+                },
+                'required': ['edge_uuid', 'fact_text_snapshot'],
+            },
+        },
+        'cited_tasks': {
+            'type': 'array',
+            'description': 'Tasks cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'project_id': {'type': 'string', 'description': 'Project ID containing the task'},
+                    'task_id': {'type': 'string', 'description': 'Task ID'},
+                    'title': {'type': 'string', 'description': 'Task title'},
+                },
+                'required': ['project_id', 'task_id', 'title'],
+            },
+        },
+        'cited_memories': {
+            'type': 'array',
+            'description': 'Mem0 memory entries cited as evidence for this finding',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'memory_id': {'type': 'string', 'description': 'Memory ID'},
+                    'store': {'type': 'string', 'description': 'Store type (mem0/graphiti)'},
+                    # metadata_fingerprint is server-derived — present in assembled output
+                    # but not emitted by the LLM (agent calls cite_memory(memory_id, store)).
+                    'metadata_fingerprint': {'type': 'string', 'description': 'Fingerprint of memory metadata (server-derived)'},
+                },
+                'required': ['memory_id', 'store'],
+            },
         },
     },
     'required': ['description', 'severity'],
@@ -194,7 +279,7 @@ async def run_stage_via_cli(
             max_budget_usd=5.0,
             disallowed_tools=disallowed_tools,
             mcp_config=mcp_config,
-            output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA,
+            output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
@@ -290,4 +375,12 @@ def _extract_report(result: AgentResult) -> dict:
         # Fallback: wrap raw text as summary
         return {'summary': result.output[:2000]}
 
-    return {'summary': 'No output from agent'}
+    # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
+    # fallback path (empty assembled dict) triggers cleanly rather than masking
+    # a missing report with a fake 'No output' summary.
+    # Behavior-change note (reviewer finding behavior_change): prior code returned
+    # {'summary': 'No output from agent'} here.  All callers use report.get('summary')
+    # (never report['summary']), so {} is safe.  Non-recon callers that depend on a
+    # non-empty summary string should pass output_schema=STAGE_REPORT_SCHEMA so the
+    # LLM-emitted JSON path fires before this fallback is reached.
+    return {}

@@ -30,9 +30,13 @@ When a finding appears to belong to another project:
 - If the target project is listed in the payload's "Known Projects" section, \
 route the task there via that project's ``project_root``; the path-scope guard will \
 validate the routing.
-- If no matching project is in "Known Projects", add a ``cross_project_findings`` \
-entry to your structured report (with ``summary``, ``target_project_hint``, and \
-``evidence``) so the operator can route it manually. Do NOT suppress normal \
-reconciliation work for this project.
+- If no matching project is in "Known Projects", do NOT file the task in the current \
+project as a workaround. Instead, emit a finding via recon_report: call \
+``mcp__recon-report__add_finding(severity='moderate', \
+category='cross_project_routing', flag_type='cross_project', actionable=False, \
+description=<one-line summary + target_project_hint>, \
+suggested_action=<short evidence notes>, task_id=None)`` so the operator can route it \
+manually. No dedicated cross-project tool is needed — the category/flag_type encoding \
+carries the routing signal. Do NOT suppress normal reconciliation work for this project.
 
 """

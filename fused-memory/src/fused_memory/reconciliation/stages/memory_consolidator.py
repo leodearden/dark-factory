@@ -451,6 +451,28 @@ def _format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
 
 
 def _format_findings(findings: list[dict]) -> str:
+    """Render a list of finding dicts as a human-readable string.
+
+    Each finding is formatted with its header fields (description, severity,
+    category, suggested_action) followed by the four typed citation lists
+    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
+    Empty citation lists are omitted from output.
+
+    Rendering limits (reviewer finding incomplete_rendering):
+    - Each citation list is capped at 5 entries (``... +N more`` appended).
+    - ``fact_text_snapshot`` is truncated at 120 characters to avoid inflating
+      payload size when feeding findings into the next reconciliation context.
+    - cited_tasks includes the task title so downstream consumers can read
+      findings without re-fetching tasks.
+    """
+    _CITE_CAP = 5
+    _SNAPSHOT_CAP = 120
+    # Caps for LLM-controlled free-text fields (reviewer finding incomplete_rendering):
+    # without a cap, verbose descriptions from a handful of findings can dominate
+    # the downstream stage payload and swamp per-citation limits.
+    _DESC_CAP = 500
+    _ACTION_CAP = 500
+
     if not findings:
         return 'No findings.'
     lines = []
@@ -459,12 +481,73 @@ def _format_findings(findings: list[dict]) -> str:
         severity = f.get('severity', '?')
         category = f.get('category', '?')
         action = f.get('suggested_action', '?')
-        affected = f.get('affected_ids', [])
-        lines.append(
-            f'{i}. [{severity}/{category}] {desc}\n'
-            f'   Affected: {affected}\n'
-            f'   Suggested action: {action}'
-        )
+
+        if len(desc) > _DESC_CAP:
+            desc = desc[:_DESC_CAP] + '...'
+        if len(action) > _ACTION_CAP:
+            action = action[:_ACTION_CAP] + '...'
+
+        parts = [
+            f'{i}. [{severity}/{category}] {desc}',
+            f'   Suggested action: {action}',
+        ]
+
+        cited_entities = f.get('cited_entities') or []
+        if cited_entities:
+            shown = cited_entities[:_CITE_CAP]
+            entity_strs = ', '.join(
+                f"{e.get('canonical_name', '?')} ({e.get('entity_uuid', '?')})"
+                for e in shown
+            )
+            extra = len(cited_entities) - len(shown)
+            if extra:
+                entity_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_entities truncated (%d dropped)', i, extra)
+            parts.append(f'   Cited entities: {entity_strs}')
+
+        cited_edges = f.get('cited_edges') or []
+        if cited_edges:
+            shown = cited_edges[:_CITE_CAP]
+            edge_parts = []
+            for e in shown:
+                snapshot = e.get('fact_text_snapshot', '?')
+                if len(snapshot) > _SNAPSHOT_CAP:
+                    snapshot = snapshot[:_SNAPSHOT_CAP] + '...'
+                edge_parts.append(f"{e.get('edge_uuid', '?')}: {snapshot}")
+            edge_strs = ', '.join(edge_parts)
+            extra = len(cited_edges) - len(shown)
+            if extra:
+                edge_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_edges truncated (%d dropped)', i, extra)
+            parts.append(f'   Cited edges: {edge_strs}')
+
+        cited_tasks = f.get('cited_tasks') or []
+        if cited_tasks:
+            shown = cited_tasks[:_CITE_CAP]
+            task_strs = ', '.join(
+                f"{t.get('project_id', '?')}/{t.get('task_id', '?')} ({t.get('title', '?')})"
+                for t in shown
+            )
+            extra = len(cited_tasks) - len(shown)
+            if extra:
+                task_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_tasks truncated (%d dropped)', i, extra)
+            parts.append(f'   Cited tasks: {task_strs}')
+
+        cited_memories = f.get('cited_memories') or []
+        if cited_memories:
+            shown = cited_memories[:_CITE_CAP]
+            memory_strs = ', '.join(
+                f"{m.get('memory_id', '?')} ({m.get('store', '?')})"
+                for m in shown
+            )
+            extra = len(cited_memories) - len(shown)
+            if extra:
+                memory_strs += f', ... +{extra} more'
+                logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
+            parts.append(f'   Cited memories: {memory_strs}')
+
+        lines.append('\n'.join(parts))
     return '\n'.join(lines)
 
 

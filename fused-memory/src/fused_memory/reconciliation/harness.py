@@ -103,6 +103,47 @@ logger = logging.getLogger(__name__)
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
+
+def _derive_affected_ids(finding: dict) -> list[str]:
+    """Derive an affected-ids-equivalent list from a finding's typed citations.
+
+    The recon_report cutover (task γ) retired the free-form ``affected_ids``
+    field in favour of typed citation lists — ``cited_entities`` ({entity_uuid,
+    canonical_name}), ``cited_edges`` ({edge_uuid, ...}), ``cited_tasks``
+    ({project_id, task_id, ...}), ``cited_memories`` ({memory_id, ...}).  This
+    helper flattens those typed citations back into a flat list of identity
+    strings so the escalation dedup/recurrence fingerprint
+    (``compute_content_fingerprint``) and the log/detail payloads keep a stable,
+    structured identity component instead of degrading to description-only.
+
+    A legacy ``affected_ids`` field takes precedence when present, so cross-run
+    recurrence counting still works against pre-cutover journal rows that carry
+    the old shape.
+    """
+    legacy = finding.get('affected_ids')
+    if legacy:
+        return [str(a) for a in legacy]
+    ids: list[str] = []
+    for c in finding.get('cited_tasks') or []:
+        tid = c.get('task_id') if isinstance(c, dict) else None
+        if tid:
+            ids.append(str(tid))
+    for c in finding.get('cited_entities') or []:
+        if isinstance(c, dict):
+            val = c.get('canonical_name') or c.get('entity_uuid')
+            if val:
+                ids.append(str(val))
+    for c in finding.get('cited_edges') or []:
+        eid = c.get('edge_uuid') if isinstance(c, dict) else None
+        if eid:
+            ids.append(str(eid))
+    for c in finding.get('cited_memories') or []:
+        mid = c.get('memory_id') if isinstance(c, dict) else None
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
@@ -150,11 +191,21 @@ class ReconciliationHarness:
         config: FusedMemoryConfig,
         backlog_policy: BacklogPolicy | None = None,
         known_projects: dict[str, str] | None = None,
+        recon_report_state=None,
+        server_ready_event: asyncio.Event | None = None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
+        # PRD γ recon_report threading: capture port and state before config is
+        # narrowed to config.reconciliation so stages can reach the full config values.
+        self._recon_report_state = recon_report_state
+        # Reviewer finding race_condition: run_loop() awaits this event before the
+        # first stage subprocess fires, ensuring the recon-report MCP server is
+        # accepting connections.  None when no recon_report server is started.
+        self._server_ready_event = server_ready_event
+        self._recon_report_port: int = config.server.recon_report_port
         _raw_root = config.taskmaster.project_root if config.taskmaster else ''
         if _raw_root:
             _raw_root = os.path.expanduser(_raw_root)
@@ -183,20 +234,27 @@ class ReconciliationHarness:
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
 
-        # Build stages
+        # Build stages — thread recon_report_port and recon_report_state so BaseStage.run
+        # can call start_report / get_assembled_report directly (PRD γ, task 1546).
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         stage3 = IntegrityCheck(
             StageId.integrity_check, memory_service, taskmaster, journal, self.config,
             usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
 
         self.stages = [stage1, stage2, stage3]
@@ -352,14 +410,20 @@ class ReconciliationHarness:
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stage3 = IntegrityCheck(
             StageId.integrity_check, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            recon_report_port=self._recon_report_port,
+            recon_report_state=self._recon_report_state,
         )
         stages = [stage1, stage2, stage3]
         self._propagate_escalation_queue(stages)
@@ -688,7 +752,7 @@ class ReconciliationHarness:
                 fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
                     category,
                     finding.get('category') or '',
-                    [str(a) for a in (finding.get('affected_ids') or [])],
+                    _derive_affected_ids(finding),
                     finding.get('description') or '',
                 )
             else:
@@ -742,6 +806,14 @@ class ReconciliationHarness:
     async def run_loop(self) -> None:
         """Management loop — discover active projects, spawn per-project loops."""
         logger.info('Reconciliation harness background loop started')
+        # Reviewer finding race_condition: wait for the recon-report server to be
+        # accepting connections before the first stage subprocess is launched.  This
+        # encodes the ordering invariant in code rather than relying on comment-only
+        # guarantees.  server_ready_event is None when recon_report is not active.
+        if self._server_ready_event is not None:
+            logger.debug('Harness waiting for recon-report server readiness signal...')
+            await self._server_ready_event.wait()
+            logger.debug('Recon-report server ready — starting reconciliation loop')
         if self.usage_gate:
             await self.usage_gate.check_at_startup()
 
@@ -1218,7 +1290,7 @@ class ReconciliationHarness:
             target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
                 'recon_integrity_issue',
                 finding.get('category') or '',
-                [str(a) for a in (finding.get('affected_ids') or [])],
+                _derive_affected_ids(finding),
                 finding.get('description') or '',
             )
         except Exception:
@@ -1242,7 +1314,7 @@ class ReconciliationHarness:
                         fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
                             'recon_integrity_issue',
                             item.get('category') or '',
-                            [str(a) for a in (item.get('affected_ids') or [])],
+                            _derive_affected_ids(item),
                             item.get('description') or '',
                         )
                     except Exception:
@@ -1284,7 +1356,7 @@ class ReconciliationHarness:
                 'project_id': project_id,
                 'run_id': run_id,
                 'finding_category': finding.get('category', ''),
-                'affected_ids': list(finding.get('affected_ids') or []),
+                'affected_ids': _derive_affected_ids(finding),
                 'description': finding.get('description', ''),
                 'severity': finding.get('severity', ''),
             },
@@ -1506,7 +1578,7 @@ class ReconciliationHarness:
                                 'run_id': run_id,
                                 'parent_run_id': parent_run_id,
                                 'finding_category': finding.get('category', ''),
-                                'affected_ids': list(finding.get('affected_ids') or []),
+                                'affected_ids': _derive_affected_ids(finding),
                                 'description': finding.get('description', ''),
                                 'persistence': persistence,
                                 'threshold': _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
