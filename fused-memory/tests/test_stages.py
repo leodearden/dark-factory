@@ -504,6 +504,11 @@ class TestTaskKnowledgeSyncPayload:
             "assemble_payload() must include a 'summary_nonce: <8-hex>' line "
             f"in the payload — got payload snippet: {payload[-200:]!r}"
         )
+        assert 'FIRST line' in payload, (
+            "assemble_payload() must include the 'FIRST line' instruction so the "
+            "Stage 2 agent is told to prepend the nonce — without this the nonce "
+            "is delivered but the prepend directive is absent (task 1572)."
+        )
 
     @pytest.mark.asyncio
     async def test_successive_assemble_payload_calls_yield_different_nonces(self, mock_deps, watermark):
@@ -9587,16 +9592,3 @@ class TestSummaryNonce:
             f'Expected 8 lowercase hex chars matching ^[0-9a-f]{{8}}$, got {nonce!r}'
         )
 
-    def test_successive_nonces_differ(self):
-        """Two successive generate_summary_nonce() calls return different values.
-
-        High-probability property of a 32-bit CSPRNG (P(collision on 2 draws) ~= 2.3e-10).
-        """
-        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
-
-        first = generate_summary_nonce()
-        second = generate_summary_nonce()
-        assert first != second, (
-            'Two successive generate_summary_nonce() calls returned the same value '
-            f'({first!r}) — expected different tokens from a CSPRNG source.'
-        )
