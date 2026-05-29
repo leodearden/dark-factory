@@ -697,24 +697,27 @@ class Harness:
                 await self._tag_prd_metadata(prd_path, pre_ids)
 
             existing_statuses, err = await self.scheduler.get_statuses()
-            if 'pending' not in existing_statuses.values():
-                if not existing_statuses:
-                    # Distinguish transport failure from genuinely empty tree.
-                    if err is not None:
-                        raise RuntimeError(
-                            f'Failed to reach fused-memory: '
-                            f'{type(err).__name__}: {err}'
-                        ) from err
-                    # Genuinely empty: point operators at the fused-memory
-                    # logs in case tasks should exist but weren't returned.
-                    logger.error(
-                        'get_statuses returned an empty mapping — if tasks '
-                        'should exist, check fused-memory logs for transport '
-                        'errors before assuming the task tree is empty.'
-                    )
-                raise RuntimeError(
-                    'No pending tasks found. Populate the task tree via '
-                    'planning_mode + curator before invoking the orchestrator.'
+            if not existing_statuses:
+                # Distinguish transport failure from genuinely empty tree.
+                if err is not None:
+                    raise RuntimeError(
+                        f'Failed to reach fused-memory: '
+                        f'{type(err).__name__}: {err}'
+                    ) from err
+                # Genuinely empty but reachable — normal under run-until-stopped
+                # lifecycle (orchestrator cold-starts before tasks are filed).
+                logger.info(
+                    'get_statuses returned an empty mapping — task tree is '
+                    'empty but fused-memory is reachable.'
+                )
+            if 'pending' not in existing_statuses.values() and not self._until_idle:
+                # No pending tasks under default lifecycle: log an idle banner
+                # so operators know the service is running but idling.  Under
+                # --until-idle the main loop's drain check exits immediately, so
+                # emitting "entering run-until-stopped idle" would be misleading.
+                logger.info(
+                    'No pending tasks at startup — entering run-until-stopped '
+                    'idle; will pick up tasks as they are filed.'
                 )
 
             # 2b. Tag tasks with code modules for concurrency locking
