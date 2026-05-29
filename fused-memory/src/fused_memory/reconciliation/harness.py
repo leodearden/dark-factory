@@ -1388,6 +1388,59 @@ class ReconciliationHarness:
             },
         )
 
+    def _finding_has_open_escalation(
+        self,
+        finding: dict,
+        pending_fps: set[str] | None = None,
+    ) -> bool:
+        """Return True iff an OPEN pending escalation already covers this finding.
+
+        Uses the same compute_content_fingerprint key as _escalate and
+        _finding_persistence_count (category='recon_integrity_issue', finding
+        category, _derive_affected_ids, description) to guarantee suppression
+        is consistent with what _escalate would fold via submit_or_dedupe.
+
+        pending_fps: pre-fetched set of dedupe_fingerprints for
+        'recon_integrity_issue' pending escalations.  When supplied (built once
+        by _maybe_remediate), the check is an O(1) set membership test — no
+        extra disk scan.  Pass None to fall back to a full get_pending() scan
+        per-finding (direct / unit-test use).
+
+        Fail-open: any exception (or HAS_ESCALATION False / queue None) returns
+        False so that a transient queue-read glitch costs at most one extra
+        remediation pass rather than silently suppressing a needed pass.
+
+        Task 1570 / FIX A.
+        """
+        if not HAS_ESCALATION or self._escalation_queue is None:
+            return False
+        try:
+            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                'recon_integrity_issue',
+                finding.get('category') or '',
+                _derive_affected_ids(finding),
+                finding.get('description') or '',
+            )
+            if pending_fps is not None:
+                return target_fp in pending_fps
+            # Fallback: per-finding scan (no pre-fetched set supplied).
+            for e in self._escalation_queue.get_pending():
+                if (
+                    e.category == 'recon_integrity_issue'
+                    and e.dedupe_fingerprint == target_fp
+                ):
+                    return True
+            return False
+        except Exception as _err:
+            logger.warning(
+                'reconciliation.open_escalation_check_failed',
+                extra={
+                    'finding_category': finding.get('category', ''),
+                    'error': str(_err),
+                },
+            )
+            return False  # fail-open: proceed with remediation
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -1429,12 +1482,65 @@ class ReconciliationHarness:
             if not actionable:
                 return
 
+            # Task 1570 / FIX A: suppress remediation for any actionable finding
+            # that already has an OPEN pending recon_integrity_issue escalation.
+            # Performance: call get_pending() ONCE and build a fingerprint set
+            # (single directory scan per cycle) rather than O(N findings) scans.
+            # Fail-open: on any queue-read error emit a warning, treat pending_fps
+            # as empty (no suppressions), and proceed with full remediation.
+            pending_fps: set[str] = set()
+            if HAS_ESCALATION and self._escalation_queue is not None:
+                try:
+                    pending_fps = {
+                        e.dedupe_fingerprint
+                        for e in self._escalation_queue.get_pending()
+                        if e.category == 'recon_integrity_issue'
+                        and e.dedupe_fingerprint is not None
+                    }
+                except Exception as _fps_err:
+                    logger.warning(
+                        'reconciliation.open_escalation_check_failed',
+                        extra={
+                            'finding_category': '',
+                            'error': str(_fps_err),
+                        },
+                    )
+                    # pending_fps stays empty → no suppressions → remediation
+                    # proceeds normally (fail-open).
+
+            suppressed: list[dict] = []
+            to_remediate: list[dict] = []
+            for finding in actionable:
+                if self._finding_has_open_escalation(finding, pending_fps=pending_fps):
+                    suppressed.append(finding)
+                else:
+                    to_remediate.append(finding)
+
+            for finding in suppressed:
+                logger.info(
+                    'reconciliation.remediation_suppressed_open_escalation',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'affected_ids': _derive_affected_ids(finding),
+                        'description': finding.get('description', ''),
+                    },
+                )
+
+            if not to_remediate:
+                return
+
             logger.info(
-                f'Remediation: {len(actionable)} actionable findings from run {parent_run_id}, '
+                f'Remediation: {len(to_remediate)} actionable findings from run {parent_run_id}, '
                 f'triggering second pass'
+                + (
+                    f' ({len(suppressed)} suppressed — open escalation exists)'
+                    if suppressed else ''
+                )
             )
             await self._run_remediation_pass(
-                project_id, parent_run_id, actionable, tier,
+                project_id, parent_run_id, to_remediate, tier,
                 project_root=project_root,
                 filtered_task_tree=filtered_task_tree,
             )

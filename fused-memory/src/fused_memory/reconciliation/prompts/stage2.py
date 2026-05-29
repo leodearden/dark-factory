@@ -372,6 +372,13 @@ Stale flags require human investigation. Do not attempt to silently resolve them
 re-acting on the same content — escalate (and delete) so an operator can diagnose the \
 root cause without being spammed by repeat alarms.
 
+**Escalation scope**: Use `mcp__escalation__escalate_blocker` sparingly — \
+escalate_blocker is sanctioned ONLY for the Stale Flag Escalation (FIX D) case above. \
+For integrity and task-lifecycle findings (e.g. complete-but-unmerged tasks, lifecycle \
+inconsistencies), report them through the recon_report channel \
+(`mcp__recon-report__add_finding`); the reconciliation harness owns their \
+persistence-gated escalation path.
+
 ## Same-Run Stage 1 human_operator_required Suppression
 If Stage 1 already filed a `human_operator_required` flag for a given `(task_id, \
 flag_type)` pair in this same run, do not re-emit it — Stage 1 already filed it. \

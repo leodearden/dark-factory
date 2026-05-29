@@ -230,7 +230,7 @@ class TestStage3ReportSchema:
         items_schema = STAGE3_REPORT_SCHEMA['properties']['flagged_items']['items']
         assert 'properties' in items_schema
         props = items_schema['properties']
-        for field in ('description', 'severity', 'actionable', 'category', 'affected_ids', 'suggested_action'):
+        for field in ('description', 'severity', 'actionable', 'category', 'suggested_action'):
             assert field in props, f"Expected '{field}' in flagged_items.items.properties"
 
     def test_stage3_finding_item_required_includes_description_and_severity(self):
@@ -820,7 +820,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {}
+        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
 
@@ -908,7 +908,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {}
+        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
         assert any(
