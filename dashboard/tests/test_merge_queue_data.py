@@ -2203,6 +2203,7 @@ class TestActiveQueuedMerges:
         terminal_outcomes = [
             'done', 'already_merged', 'conflict', 'blocked',
             'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
+            'unknown_branch',
         ]
         events = []
         for i, outcome in enumerate(terminal_outcomes):
