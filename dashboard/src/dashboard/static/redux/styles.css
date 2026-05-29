@@ -596,7 +596,7 @@ table { border-collapse: collapse; width: 100%; }
   text-align: left; font-size: 10px; color: var(--fg-3);
   font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase;
   padding: 4px 8px; position: sticky; left: 0;
-  background: var(--bg-0); z-index: 2; min-width: 220px;
+  background: var(--bg-0); z-index: 2; min-width: 360px;
 }
 .sched-skip-hd {
   text-align: center; font-size: 10px; color: var(--fg-3);
@@ -616,14 +616,14 @@ table { border-collapse: collapse; width: 100%; }
 .sched-row-label {
   padding: 5px 8px; font-size: 12px; vertical-align: top;
   position: sticky; left: 0; background: inherit; z-index: 1;
-  border-right: 1px solid var(--line); min-width: 220px; max-width: 280px;
+  border-right: 1px solid var(--line); min-width: 360px; max-width: 520px;
 }
 .sched-row-meta {
   display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 2px;
 }
 .sched-row-title {
   font-size: 11px; color: var(--fg-1);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 480px;
 }
 .sched-badge { font-size: 9px !important; padding: 1px 4px !important; border-radius: 3px; }
 .sched-skip { text-align: center; vertical-align: middle; padding: 4px 4px; }
