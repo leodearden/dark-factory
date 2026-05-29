@@ -221,7 +221,9 @@ function OrchTab({ projectFilter, search }) {
         const counts = {
           active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
           pending:  projTasks.filter(t => t.status === 'pending').length,
-          complete: projTasks.filter(t => t.status === 'done').length,
+          complete: (DF.DONE_COUNTS && DF.DONE_COUNTS[o.project] != null)
+                      ? DF.DONE_COUNTS[o.project]
+                      : projTasks.filter(t => t.status === 'done').length,
         };
 
         const summary = (
@@ -282,7 +284,7 @@ function OrchTab({ projectFilter, search }) {
                             <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.agent || '—'}</td>
                             <td className="num">{t.loops}</td>
                             <td className="num">{t.attempts}</td>
-                            <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? t.completed : isPending ? '—' : `${t.started}m`}</td>
+                            <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : isPending ? '—' : `${t.started}m`}</td>
                             <td><DepsCell task={t} /></td>
                             <td><LocksCell task={t} /></td>
                             <td>
