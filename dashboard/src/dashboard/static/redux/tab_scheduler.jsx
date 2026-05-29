@@ -11,7 +11,7 @@
    Exports: window.DF_SCHEDULER = { SchedulerTab }
 */
 const { useState: stUseState, useCallback: stUseCallback, useEffect: stUseEffect, useRef: stUseRef, useMemo: stUseMemo } = React;
-const { Segmented, timeago, fmtDateTime } = window.DF_SHELL;
+const { Segmented, ProjectChips, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
@@ -280,10 +280,22 @@ function SchedulerTab({ projectFilter = [] }) {
     toastTimers.current.push(timer);
   }, []);
 
-  // Filter rows by projectFilter
-  const visibleRows = projectFilter.length === 0
+  // Derive project list from SCHEDULER data (rows + modules .project field)
+  const chipOptions = stUseMemo(() => {
+    const set = new Set();
+    rows.map(r => r.project).filter(Boolean).forEach(p => set.add(p));
+    modules.map(m => m.project).filter(Boolean).forEach(p => set.add(p));
+    return [...set].sort();
+  }, [rows, modules]);
+
+  // Local chip selection state: null = all (default); [] = nothing; [...] = explicit set
+  const [chipSelected, setChipSelected] = stUseState(null);
+  const effectiveSelected = chipSelected !== null ? chipSelected : chipOptions;
+
+  // Filter rows by chip selection (explicit: row visible iff !r.project or selection includes r.project)
+  const visibleRows = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
     ? rows
-    : rows.filter(r => !r.project || projectFilter.includes(r.project));
+    : rows.filter(r => !r.project || effectiveSelected.includes(r.project));
 
   // Filter modules by projectFilter — mirrors visibleRows above.
   // Keeps a module visible when:
@@ -433,13 +445,20 @@ function SchedulerTab({ projectFilter = [] }) {
         />
       </div>
 
-      {/* Sub-tab switcher */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      {/* Sub-tab switcher + per-project chip filter */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
         <Segmented
           options={[{ value: 'tasks', label: 'Tasks' }, { value: 'modules', label: 'Modules' }]}
           value={subTab}
           onChange={setSubTab}
         />
+        {chipOptions.length > 0 && (
+          <ProjectChips
+            options={chipOptions}
+            selected={effectiveSelected}
+            onChange={setChipSelected}
+          />
+        )}
         <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>
           {visibleRows.length} task{visibleRows.length !== 1 ? 's' : ''} · {visibleModules.length} module{visibleModules.length !== 1 ? 's' : ''}
         </span>
