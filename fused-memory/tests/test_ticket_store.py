@@ -6,9 +6,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
-from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 
 @pytest_asyncio.fixture
