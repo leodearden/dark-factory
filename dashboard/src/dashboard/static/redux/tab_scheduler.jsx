@@ -297,19 +297,17 @@ function SchedulerTab({ projectFilter = [] }) {
     ? rows
     : rows.filter(r => !r.project || effectiveSelected.includes(r.project));
 
-  // Filter modules by projectFilter — mirrors visibleRows above.
-  // Keeps a module visible when:
+  // Filter modules by chip selection — same strict per-project predicate as visibleRows.
+  // A module is visible iff:
   //   • no project tag (legacy/single-project path, !m.project guard mirrors !r.project)
-  //   • the module belongs to a selected project (m.project)
-  //   • the module is currently held by a task in a selected project (m.holder_project)
-  //     — needed so a cross-project lock holder doesn't disappear from the heatmap.
-  const visibleModules = projectFilter.length === 0
+  //   • the module's own project is selected (m.project)
+  // The old holder_project OR-branch is intentionally removed: the data layer sets
+  // holder_project == project whenever a holder exists, making it redundant.
+  // cellStateFor already returns 'not-in-set' for cross-project cells, so no genuine
+  // cross-project conflict is hidden by this strictness.
+  const visibleModules = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
     ? modules
-    : modules.filter(m =>
-        !m.project ||
-        projectFilter.includes(m.project) ||
-        (m.holder_project && projectFilter.includes(m.holder_project))
-      );
+    : modules.filter(m => !m.project || effectiveSelected.includes(m.project));
 
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {
