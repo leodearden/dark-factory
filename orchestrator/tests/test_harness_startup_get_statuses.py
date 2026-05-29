@@ -253,6 +253,10 @@ async def test_startup_until_idle_empty_tree_exits_cleanly(
     # the fixture default returns a MagicMock which compares > 0 as truthy
     # and would spin the loop forever.
     h._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+    # Mock _enforce_cost_ceilings: setting is_paused=False bypasses its
+    # early-return guard and the MagicMock config values cause a TypeError
+    # on the ceiling comparisons.  The cost-ceiling logic is not under test here.
+    h._enforce_cost_ceilings = AsyncMock()
 
     report = await h.run(prd_path=None, until_idle=True)
 
