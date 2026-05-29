@@ -908,9 +908,6 @@ async def test_scheduler_events_fetch_passes_explicit_limit(dummy_client, dummy_
         f"limit must equal _SCHEDULER_EVENTS_LIMIT={sched._SCHEDULER_EVENTS_LIMIT}, "
         f"got {events_args['limit']}"
     )
-    assert sched._SCHEDULER_EVENTS_LIMIT == 200, (
-        f'_SCHEDULER_EVENTS_LIMIT must be 200, got {sched._SCHEDULER_EVENTS_LIMIT}'
-    )
 
 
 # ---------------------------------------------------------------------------

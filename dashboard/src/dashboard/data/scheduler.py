@@ -117,6 +117,12 @@ async def get_scheduler_snapshot(
     ``snapshot_at`` is an ISO-8601 wall-clock string stamped at cache-fill
     time.  The value propagates through ``api_scheduler`` → ``shape_scheduler``
     → the JS envelope so the UI can show a truthful "data as of" timestamp.
+
+    Single-config assumption: the cache is unkeyed (ignores ``client`` and
+    ``config``).  This is correct for the dashboard process, which is always
+    started with a single process-wide :class:`DashboardConfig`.  If the
+    process ever served multiple configs (multi-tenant), callers with a
+    different ``config`` would silently receive another config's snapshot.
     """
     global _scheduler_cache  # must precede first use of the name
 
@@ -134,6 +140,11 @@ async def get_scheduler_snapshot(
             return cached[1], cached[2]
 
         # We are the one caller responsible for filling the cache.
+        # collect_scheduler_state never raises (per-project errors surface as
+        # offline_projects), so we always cache the result — even a degraded
+        # snapshot where some projects are offline.  Caching a partial result
+        # avoids re-running a multi-second fan-out that would just report the
+        # same offline state again; ≤5 s of stale-offline is acceptable.
         six_tuple = await collect_scheduler_state(client, config)
         snapshot_at = datetime.now(UTC).isoformat()
         _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
