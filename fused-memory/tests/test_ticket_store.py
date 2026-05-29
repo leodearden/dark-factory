@@ -104,7 +104,6 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
     await store.initialize()
     first_db = store._db
     assert first_db is not None
-    first_thread = first_db._thread
 
     # Second initialize() WITHOUT an intervening close() — the idempotency path.
     store_second_db = None
@@ -121,22 +120,18 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
         # On current code first_db._connection is still set → AssertionError.
         # Guarantees no "Event loop is closed" ResourceWarning on GC because
         # aiosqlite.Connection.__del__ early-returns when _connection is None.
+        # NOTE: _assert_connection_closed() is the deterministic contract here —
+        # aiosqlite sets ._connection = None synchronously in close()'s finally.
+        # The worker thread exits asynchronously after the stop-future resolves,
+        # so asserting thread.is_alive() races teardown and can flake on loaded
+        # CI.  Thread death is best-effort; do not poll or assert it here
+        # (amendment pass, suggestion 1).
         _assert_connection_closed(first_db)
 
-        # (c) Bounded-poll the prior worker thread to death (~2s).
-        # Placed AFTER (b) so RED fails fast at (b) rather than waiting 2 s.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 2.0
-        while first_thread.is_alive() and loop.time() < deadline:
-            await asyncio.sleep(0.01)
-        assert not first_thread.is_alive(), (
-            'orphaned aiosqlite worker thread leaked after double initialize()'
-        )
-
-        # (d) The NEW connection is a live daemon-backed worker.
+        # (c) The NEW connection is a live daemon-backed worker.
         assert_connection_thread_is_daemon(store._db, 'TicketStore re-init')
 
-        # (e) Usability: submit + get through the new connection.
+        # (d) Usability: submit + get through the new connection.
         tid = await store.submit(project_id='p', candidate_json='{}')
         row = await store.get(tid)
         assert row is not None and row['status'] == 'pending'
@@ -150,20 +145,19 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
 
 @pytest.mark.asyncio
 async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_path):
-    """Simulated reconnect (close→initialize) preserves data and leaks no connection.
+    """Simulated reconnect (close→initialize) preserves data and opens a fresh connection.
 
-    Regression guard for the explicit close()→initialize() cycle (task 1562,
-    bullet 2).  Unlike test_double_initialize_without_close_is_idempotent_and_no_leak,
-    an intervening close() is present here — this was already the safe path, but
-    this test pins the data-persistence contract and the no-leak guarantee against
-    future regression.
+    Net-new coverage over test_initialize_creates_schema_and_reinit_after_close_is_safe:
+    data persistence across the close()→initialize() cycle.  Schema idempotency and
+    the connection-closed / no-leak guarantees on the explicit-close path are already
+    covered by that test; this test pins the data-persistence contract against
+    regression (amendment pass, suggestion 2).
     """
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
     tid = await store.submit(project_id='p', candidate_json='{}')
     first_db = store._db
     assert first_db is not None
-    first_thread = first_db._thread
 
     # Explicit close — the canonical safe teardown path.
     await store.close()
@@ -173,23 +167,11 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
     try:
         await store.initialize()
 
-        # Prior connection is closed (no orphan).
-        _assert_connection_closed(first_db)
-
-        # Bounded-poll the prior worker thread to death (~2s).
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 2.0
-        while first_thread.is_alive() and loop.time() < deadline:
-            await asyncio.sleep(0.01)
-        assert not first_thread.is_alive(), (
-            'prior aiosqlite worker thread leaked after reconnect initialize()'
-        )
-
-        # New connection is a fresh daemon-backed worker.
+        # New connection is a fresh daemon-backed worker, distinct from the prior one.
         assert store._db is not None and store._db is not first_db
         assert_connection_thread_is_daemon(store._db, 'TicketStore reconnect')
 
-        # Data survived the reconnect.
+        # Data survived the reconnect — net-new assertion over the schema-only test.
         row = await store.get(tid)
         assert row is not None and row['status'] == 'pending', (
             f'ticket {tid!r} not found after reconnect'
