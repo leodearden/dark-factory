@@ -930,3 +930,93 @@ class TestReconReportCrossStageDedup:
         assert 'finding_id' in res2, f'Run r2 add_finding failed: {res2}'
 
         assert res1['finding_id'] != res2['finding_id']
+
+
+# ---------------------------------------------------------------------------
+# task-1568: Cross-stage finding citability — RED until step-4 widens
+#            _resolve_finding to scan all (run_id, *) entries
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCrossStageCitability:
+    """A finding_id returned via a cross-stage duplicate_finding must remain
+    citable from the stage that received the duplicate_finding response.
+
+    After Stage 2 gets duplicate_finding(existing_finding_id=A) where A was
+    created in Stage 1, Stage 2 should be able to cite_entity(..., finding_id=A)
+    to attach citations to Stage 1's finding.  Currently _resolve_finding only
+    searches the *active* stage's entry, so cite_entity returns finding_unknown.
+    """
+
+    def _make_state_with_fake_services(self):
+        """Return a ReconReportState wired with a fake memory service."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_FakeMemSvc(),
+        )
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_duplicate_finding_is_citable(self):
+        """cite_entity on a finding from a prior stage must succeed, not return
+        finding_unknown, when the active stage has switched to a later stage.
+        """
+        state, _ = self._make_state_with_fake_services()
+
+        # Stage 1: file finding A
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+
+        # Stage 2: receives duplicate_finding pointing at A
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task is stuck (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # Stage 2 is now active; try to cite onto Stage 1's finding_id
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='SomeEntity',
+        )
+
+        # Must NOT return finding_unknown — the finding is in Stage 1's entry
+        assert cite_result.get('error') != 'finding_unknown', (
+            f'cite_entity returned finding_unknown instead of resolving cross-stage finding: {cite_result}'
+        )
+        assert 'entity_uuid' in cite_result, f'Expected entity_uuid in result, got: {cite_result}'
+
+        # Citation must appear on Stage 1's finding in the assembled report
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        item = s1_report['flagged_items'][0]
+        assert item['finding_id'] == finding_id_a
+        assert len(item['cited_entities']) == 1
+        assert item['cited_entities'][0]['canonical_name'] == 'SomeEntity'
