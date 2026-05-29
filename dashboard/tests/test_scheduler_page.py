@@ -692,6 +692,62 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
 
 
 # ---------------------------------------------------------------------------
+# task-1569 step-1: get_scheduler_snapshot — TTL cache and expiry
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_caches_within_ttl_and_refetches_after_expiry(
+    dummy_client, dummy_config, monkeypatch
+):
+    """get_scheduler_snapshot returns cached result within TTL and re-fetches after expiry.
+
+    Part (a) Within TTL: two calls should invoke the inner collector exactly once;
+    both calls must return identical (six_tuple, snapshot_at), the six_tuple must
+    equal the empty 6-tuple, and snapshot_at must be a non-None ISO-8601 string.
+
+    Part (b) Expiry: after _scheduler_cache_clear() + TTL set to 0.0, two calls
+    should each invoke the inner collector (counter == 2).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    # Part (a): within TTL
+    sched._scheduler_cache_clear()
+    mock_collector = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector):
+        result1 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        result2 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector.call_count == 1, (
+        f'expected 1 call within TTL, got {mock_collector.call_count}'
+    )
+    six_tuple1, snapshot_at1 = result1
+    six_tuple2, snapshot_at2 = result2
+    assert six_tuple1 == empty_6tuple
+    assert six_tuple2 == empty_6tuple
+    assert result1 == result2, 'both calls must return identical results within TTL'
+    assert snapshot_at1 is not None, 'snapshot_at must be non-None'
+    # Verify it is a valid ISO-8601 string
+    from datetime import datetime as _dt
+    _dt.fromisoformat(snapshot_at1)  # raises ValueError if not valid ISO
+
+    # Part (b): expiry — reset cache and TTL
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 0.0)
+    mock_collector2 = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector2):
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector2.call_count == 2, (
+        f'expected 2 calls after TTL=0.0, got {mock_collector2.call_count}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-15: POST /scheduler/override — validation → 400
 # ---------------------------------------------------------------------------
 
