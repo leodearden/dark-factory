@@ -97,8 +97,32 @@ _FAMILY_SHADES: dict[str, list[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Outcome-code → family mapping
-# Covers every code emitted by the orchestrator (merge_queue.py + workflow.py).
+# Outcome-code → family mapping.
+#
+# IMPORTANT: This is a best-effort *superset* spanning multiple orchestrator
+# layers (merge_queue.py, workflow.py, MergeOutcome aliases).  Not every entry
+# below is a live ``merge_attempt`` outcome — several are folded into broader
+# outcomes before they reach ``_emit_merge_attempt``:
+#
+#   not_descendant / contaminated / stash_failed
+#       → folded into 'blocked' at merge_queue.py:2074-2080
+#   done_wip_recovery
+#       → a MergeOutcome status never passed to _emit_merge_attempt
+#   requeued
+#       → emitted as a task_completed outcome (workflow.py:5254), not
+#          merge_attempt
+#   bypass_done / done_provenance
+#       → escalation categories / provenance kinds
+#   plan_blast_radius_lock_conflict
+#       → stored as _last_block_reason, not emitted as a merge_attempt outcome
+#   post_rebase_verify_fail
+#       → recorded as a waste_type, not a merge_attempt outcome
+#
+# Having extra entries is harmless: genuinely-unmapped codes degrade gracefully
+# to the neutral 'unknown' ramp.  Do NOT treat this list as an authoritative
+# enumeration of the live emitted-outcome set; consult the _emit_merge_attempt
+# call sites in orchestrator/src/orchestrator/merge_queue.py and workflow.py
+# for the ground truth.
 # ---------------------------------------------------------------------------
 
 _CODE_FAMILY: dict[str, str] = {

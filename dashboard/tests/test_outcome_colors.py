@@ -111,6 +111,19 @@ def test_classify_outcome_genuinely_new_code():
 # ---------------------------------------------------------------------------
 
 # Full enumerated code set from the orchestrator, grouped by family.
+#
+# MAINTENANCE NOTE: _ALL_ENUMERATED_CODES is a hand-maintained copy of the
+# codes enumerated in outcome_colors._CODE_FAMILY.  It must be kept in sync
+# with the *actual* orchestrator emit sites:
+#
+#   orchestrator/src/orchestrator/merge_queue.py  — _emit_merge_attempt calls
+#   orchestrator/src/orchestrator/workflow.py     — lines 3782-3796 + 5254
+#
+# The limitation of this test is that it is self-referential with respect to
+# _CODE_FAMILY: it can confirm that codes the author already mapped are mapped,
+# but it cannot catch a *genuinely-new* orchestrator outcome code (e.g. a
+# future `wip_halted`) that was never added here.  For that, cross-reference
+# the emit sites above whenever outcome_colors._CODE_FAMILY is updated.
 _ALL_ENUMERATED_CODES: dict[str, list[str]] = {
     'terminal_success': [
         'done', 'already_merged', 'requeued',
