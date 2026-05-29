@@ -229,6 +229,7 @@ function MultiSelect({ label, options, selected, onChange }) {
 function Toolbar({
   window: win, onWindow, windows = ['1h', '24h', '7d', '30d', '90d', 'all'],
   showWindow = true,
+  showProjects = true,
   projects, onProjects,
   agents, onAgents, showAgents = false,
   search, onSearch, searchPlaceholder = 'Search…',
@@ -238,7 +239,7 @@ function Toolbar({
     <div className="toolbar">
       {showWindow && <span className="lbl">Window</span>}
       {showWindow && <ChipGroup options={windows} value={win} onChange={onWindow} />}
-      <MultiSelect label="project" options={SHELL_PROJECTS.map(p => p.name)} selected={projects} onChange={onProjects} />
+      {showProjects && <MultiSelect label="project" options={SHELL_PROJECTS.map(p => p.name)} selected={projects} onChange={onProjects} />}
       {showAgents && <MultiSelect label="agent" options={SHELL_AGENTS} selected={agents} onChange={onAgents} />}
       {onSearch && (
         <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
