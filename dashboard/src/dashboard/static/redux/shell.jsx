@@ -201,7 +201,7 @@ function MultiSelect({ label, options, selected, onChange }) {
           padding: 6, minWidth: 200, boxShadow: '0 12px 30px rgba(0,0,0,0.5)',
         }}>
           <button
-            onClick={() => onChange(allSelected ? [] : options)}
+            onClick={() => onChange(allSelected ? [options[0]] : [])}
             style={{ display: 'block', width: '100%', textAlign: 'left', padding: '4px 8px', fontSize: 11, color: 'var(--accent)', borderRadius: 3 }}>
             {allSelected ? 'select none' : 'select all'}
           </button>
