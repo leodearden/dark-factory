@@ -1,12 +1,14 @@
 """Test/lint/typecheck runner for verification stages."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1100,18 +1102,54 @@ class VerifyResult:
         return '\n\n'.join(sections) if sections else self.summary
 
 
+async def _kill_cgroup_scope(unit: str) -> None:
+    """Force-kill a transient systemd ``--user`` scope unit and reap its cgroup.
+
+    Sends SIGKILL to every process in the scope's cgroup, then stops the unit.
+    Used when a verify command was spawned inside a transient scope (see
+    ``_run_cmd``'s ``use_cgroup_scope`` path): killing the cgroup reaps the
+    ENTIRE subtree (bash → cargo → rustc, and any inner ``timeout`` that
+    setpgid'd cargo into a separate process group), which a plain ``killpg`` on
+    the spawn pgid cannot reach.  Best-effort: every systemctl call is wrapped
+    in ``suppress`` and bounded by a short timeout so a hung manager cannot
+    block the verify path.
+    """
+    for action in (['kill', '--signal=SIGKILL', unit], ['stop', unit]):
+        with contextlib.suppress(Exception):
+            p = await asyncio.create_subprocess_exec(
+                'systemctl', '--user', *action,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(p.wait(), 10)
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
     timeout: float,
     env: dict[str, str] | None = None,
     log_path: 'Path | None' = None,
+    *,
+    use_cgroup_scope: bool = False,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
+
+    When *use_cgroup_scope* is True and ``systemd-run`` is available, the
+    command is launched inside a transient systemd ``--user --scope`` (its own
+    cgroup) so a timeout/cancel can reap the WHOLE subtree by cgroup
+    (``_kill_cgroup_scope``), regardless of process-group escapes — e.g. an
+    inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
+    defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
+    defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
+    Falls back to the plain ``start_new_session`` + ``killpg`` path when the
+    flag is off or ``systemd-run`` is missing, so the default behaviour and the
+    existing test suite are unchanged.
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -1134,16 +1172,36 @@ async def _run_cmd(
 
     proc = None
     pgid: int | None = None
+    scope_unit: str | None = None
+    if use_cgroup_scope and shutil.which('systemd-run') is not None:
+        scope_unit = f'df-verify-{uuid.uuid4().hex[:12]}.scope'
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            executable='/bin/bash',
-            env=subprocess_env,
-            start_new_session=True,
-        )
+        if scope_unit is not None:
+            # Launch inside a transient --user scope (its own cgroup) so a
+            # timeout/cancel can reap the WHOLE subtree by cgroup.  --scope runs
+            # bash as a direct child of systemd-run, inheriting our cwd/env and
+            # forwarding stdio to our pipe; --collect auto-removes the scope when
+            # it exits (no unit leak on the normal-completion path).
+            proc = await asyncio.create_subprocess_exec(
+                'systemd-run', '--user', '--scope', '--quiet', '--collect',
+                f'--unit={scope_unit}',
+                '/bin/bash', '-c', cmd,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=subprocess_env,
+                start_new_session=True,
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                executable='/bin/bash',
+                env=subprocess_env,
+                start_new_session=True,
+            )
         # Capture pgid at spawn; start_new_session guarantees pgid == pid.
         pgid = proc.pid
 
@@ -1174,10 +1232,15 @@ async def _run_cmd(
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, buf.decode(errors='replace'), False
     except TimeoutError:
+        # cgroup kill (primary, reaps process-group escapes) then killpg backstop.
+        if scope_unit is not None:
+            await _kill_cgroup_scope(scope_unit)
         if proc is not None and pgid is not None:
             await terminate_process_group(proc, pgid, grace_secs=5.0)
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
+        if scope_unit is not None:
+            await _kill_cgroup_scope(scope_unit)
         if proc is not None and pgid is not None:
             await terminate_process_group(proc, pgid, grace_secs=5.0)
         raise
@@ -1445,12 +1508,18 @@ async def run_verification(
             return 0, '', False, None, 0.0
         started_at = datetime.now(UTC).isoformat()
         t0 = time.monotonic()
+        # Pass use_cgroup_scope only when enabled so the default-off call
+        # signature stays byte-identical (test doubles stub the legacy kwargs).
+        _scope_kw = (
+            {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
+        )
         rc, out, timed_out_flag = await _run_cmd(
             cmd,
             worktree,
             timeout,
             env=verify_env or None,
             log_path=_stream_log_path(label, current_attempt),
+            **_scope_kw,
         )
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
@@ -1821,6 +1890,24 @@ async def run_scoped_verification(
     """
     scope_cargo_enabled = config.scope_cargo
 
+    # Bound the per-subproject fan-out so a large (or accidentally polluted)
+    # module set can never launch an unbounded number of full builds into one
+    # worktree at once.  Created per call; a no-op when only one module runs.
+    # (Root cause of the 226-way merge-verify storm: a polluted module set
+    # turned the no-match fan-out into 226 concurrent `cargo` pipelines in one
+    # `_merge-*` worktree.)
+    _fanout_sem = asyncio.Semaphore(max(1, config.max_concurrent_module_verifies))
+
+    async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
+        async with _fanout_sem:
+            return await run_verification(
+                worktree, config, mc,
+                max_retries=max_retries,
+                is_merge_verify=is_merge_verify,
+                attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                role=role,
+            )
+
     # When the plan didn't provide a file list, try to derive one from git —
     # but only when we're not bypassing scoping entirely (force_workspace=True
     # goes straight to the global run_verification call without needing a file
@@ -1890,14 +1977,7 @@ async def run_scoped_verification(
                         len(module_configs),
                     )
                     results = await asyncio.gather(*(
-                        run_verification(
-                            worktree, config, mc,
-                            max_retries=max_retries,
-                            is_merge_verify=is_merge_verify,
-                            attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                            role=role,
-                        )
-                        for mc in module_configs
+                        _verify_module(mc) for mc in module_configs
                     ))
                     return _aggregate_results(list(results))
                 # Rewrite cargo --workspace → cargo -p <crate> when all task files
@@ -1913,16 +1993,7 @@ async def run_scoped_verification(
                 scoped = module_configs
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
             results = await asyncio.gather(
-                *(
-                    run_verification(
-                        worktree, config, mc,
-                        max_retries=max_retries,
-                        is_merge_verify=is_merge_verify,
-                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                        role=role,
-                    )
-                    for mc in scoped
-                )
+                *(_verify_module(mc) for mc in scoped)
             )
             return _aggregate_results(list(results))
 

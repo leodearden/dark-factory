@@ -29,6 +29,33 @@ from orchestrator.verify import (
 )
 
 
+class TestKillCgroupScope:
+    """`_kill_cgroup_scope` SIGKILLs the scope cgroup, then stops the unit."""
+
+    @pytest.mark.asyncio
+    async def test_issues_kill_then_stop(self):
+        calls: list[list[str]] = []
+
+        class _FakeProc:
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(list(args))
+            return _FakeProc()
+
+        with patch(
+            'orchestrator.verify.asyncio.create_subprocess_exec',
+            side_effect=fake_exec,
+        ):
+            await verify._kill_cgroup_scope('df-verify-abc.scope')
+
+        assert calls == [
+            ['systemctl', '--user', 'kill', '--signal=SIGKILL', 'df-verify-abc.scope'],
+            ['systemctl', '--user', 'stop', 'df-verify-abc.scope'],
+        ], calls
+
+
 class TestRunCmdBashExecutable:
     """Tests for _run_cmd ensuring /bin/bash is used as the shell executable."""
 
@@ -1144,6 +1171,48 @@ class TestRunScopedVerificationSkipsUntouched:
         )
         assert '__fm_cmd__' in joined, (
             f'fused-memory subproject command should have run; calls: {calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fanout_concurrency_is_bounded(self, tmp_path: Path):
+        """Per-subproject fan-out never exceeds max_concurrent_module_verifies.
+
+        Regression guard for the 226-way merge-verify storm: even when many
+        modules fan out, the semaphore caps how many full verifies run
+        concurrently into one worktree.
+        """
+        (tmp_path / 'conftest.py').write_text('# root\n')  # source, fits no prefix
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_module_verifies=2,
+            concurrent_verify=False,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(6)
+        ]
+
+        state = {'current': 0, 'peak': 0}
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            await asyncio.sleep(0.02)  # hold the slot so overlap is observable
+            state['current'] -= 1
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py'],
+            )
+
+        assert result.passed
+        assert state['peak'] <= 2, (
+            f'fan-out concurrency exceeded the bound: peak={state["peak"]}'
+        )
+        assert state['peak'] >= 2, (
+            f'expected the bound to be saturated with 6 modules; peak={state["peak"]}'
         )
 
     @pytest.mark.asyncio

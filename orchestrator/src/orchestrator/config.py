@@ -420,6 +420,15 @@ _OVERRIDABLE_FIELDS = frozenset({
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
     'node_modules', '__pycache__', 'build', 'target', '.gradle',
+    # Leftover/backup worktree & build dirs and tooling worktrees.  These hold
+    # full project checkouts — each carrying a copy of the root
+    # orchestrator.yaml — which would otherwise be mis-registered as phantom
+    # module configs (see incident: 224 `.worktrees.old/<id>` modules drove a
+    # 226-way merge-verify fan-out into a single worktree).  Belt-and-braces:
+    # the `.git`-boundary prune in the walk below catches these (and any other
+    # nested checkout) generically; the static names keep discovery cheap and
+    # the intent explicit.
+    '.worktrees.old', 'target.old', '.claude',
 })
 
 
@@ -511,7 +520,30 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
                         rel,
                         d,
                     )
-        dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
+        # Prune (a) reserved names and (b) nested checkouts/worktrees.  Any
+        # subdirectory that carries its own ``.git`` entry (a worktree's ``.git``
+        # *file*, a clone/submodule's ``.git`` *dir*) is a separate working tree,
+        # NOT a subproject of THIS project.  Each such checkout contains a copy of
+        # the root orchestrator.yaml; descending into it would mis-register a
+        # phantom module per nested checkout.  This generic guard is naming-
+        # independent — it catches `.worktrees.old/<id>`, `.claude/worktrees/*`,
+        # and any future stray checkout regardless of directory name.  The walk
+        # root (project_root) is never re-examined here, so the main repo's own
+        # ``.git`` cannot prune the root.
+        nested_checkouts = {
+            d for d in dirnames
+            if d not in _DISCOVERY_EXCLUDED_DIRS
+            and (Path(dirpath) / d / '.git').exists()
+        }
+        for d in nested_checkouts:
+            logger.debug(
+                'Module discovery: pruning nested checkout %s (has its own .git)',
+                (Path(dirpath) / d),
+            )
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _DISCOVERY_EXCLUDED_DIRS and d not in nested_checkouts
+        ]
         if 'orchestrator.yaml' not in filenames:
             continue
         yaml_path = Path(dirpath) / 'orchestrator.yaml'
@@ -698,6 +730,29 @@ class OrchestratorConfig(BaseSettings):
     # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
     # Post-merge verify always runs workspace-wide regardless.
     scope_cargo: bool = Field(default=True)
+
+    # ── Merge-verify scoping & fan-out bounds (storm guard) ──────────────
+    # When True, post-merge verify bypasses per-subproject scoping/fan-out and
+    # runs the project-wide command once (the same `force_workspace` path train
+    # members use).  Correct for single-workspace projects (e.g. a cargo
+    # workspace verified with `--scope all`), where scoping at merge time is a
+    # no-op and per-module fan-out across a large module set can launch N full
+    # builds into one merge worktree.  Defaults False to preserve the existing
+    # scoped/fan-out behaviour for multi-subproject projects.
+    merge_verify_workspace: bool = Field(default=False)
+    # Upper bound on concurrent per-subproject ``run_verification`` calls inside
+    # a single ``run_scoped_verification`` fan-out.  Caps the blast radius if the
+    # module set is large (or accidentally polluted) so a fan-out can never spawn
+    # an unbounded number of full builds into one worktree at once.
+    max_concurrent_module_verifies: int = Field(default=4, ge=1)
+    # When True, each verify command is spawned inside a transient systemd
+    # ``--scope`` (its own cgroup) so a timeout/cancel can kill the ENTIRE
+    # subtree by cgroup, regardless of process-group escapes (e.g. an inner GNU
+    # `timeout` that setpgid'd cargo into a separate group, which defeats
+    # killpg).  Defaults False (use start_new_session + killpg) so behaviour and
+    # the existing test suite are unchanged; opt in per project where
+    # `systemd-run --user` is available.
+    verify_use_cgroup_scope: bool = Field(default=False)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
