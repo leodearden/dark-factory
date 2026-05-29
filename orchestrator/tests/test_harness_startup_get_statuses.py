@@ -219,9 +219,8 @@ async def test_startup_noprd_empty_reachable_tree_idles_not_raises(
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
-    with caplog.at_level(logging.INFO):
-        with pytest.raises(RuntimeError, match='stop'):
-            await h.run(prd_path=None)
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match='stop'):
+        await h.run(prd_path=None)
 
     # The idle banner must be emitted.
     assert 'No pending tasks at startup' in caplog.text
