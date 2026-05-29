@@ -354,6 +354,67 @@ def test_shape_merge_queue_includes_train_events():
 
 
 # ---------------------------------------------------------------------------
+# shape_merge_queue — outcomes.colors producer→reader contract (step-7)
+# ---------------------------------------------------------------------------
+
+# The five reify codes in alphabetical order (non-canonical → sorted).
+_REIFY_LABELS = [
+    'cas_retry',
+    'dropped_plan_targets',
+    'plan_files_narrowed',
+    'plan_files_not_touched',
+    'post_merge_equivalence_failed',
+]
+
+
+def test_shape_merge_queue_attaches_outcome_colors():
+    """shape_merge_queue adds outcomes['colors'] parallel to labels."""
+    from dashboard.data.outcome_colors import assign_outcome_colors
+
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': _REIFY_LABELS, 'values': [3, 2, 1, 4, 2]},
+            'latency': {},
+            'recent': [],
+            'speculative': {},
+            'active': [],
+        },
+    }
+    body = redux_api.shape_merge_queue(raw)
+    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+
+    assert 'colors' in outcomes, f"Expected 'colors' key in outcomes; got keys: {list(outcomes)}"
+    colors = outcomes['colors']
+    assert isinstance(colors, list)
+    assert len(colors) == len(_REIFY_LABELS), (
+        f"Expected {len(_REIFY_LABELS)} colors, got {len(colors)}"
+    )
+    assert colors == assign_outcome_colors(_REIFY_LABELS), (
+        "outcomes['colors'] does not match assign_outcome_colors(labels)"
+    )
+
+
+def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
+    """shape_merge_queue with empty outcomes attaches colors == []."""
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {},
+            'active': [],
+        },
+    }
+    body = redux_api.shape_merge_queue(raw)
+    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+    assert outcomes.get('colors') == [], (
+        f"Expected colors == [] for empty outcomes, got {outcomes.get('colors')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # shape_costs
 # ---------------------------------------------------------------------------
 
