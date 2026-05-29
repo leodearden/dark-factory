@@ -82,8 +82,8 @@ def create_server(
     # process where orchestrator is always importable.
     _registry = merge_inflight_registry
     if merge_queue is not None and _registry is None:
-        from orchestrator.merge_queue import (
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
 
