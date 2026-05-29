@@ -95,7 +95,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
-from dashboard.data.scheduler import collect_scheduler_state
+from dashboard.data.scheduler import collect_scheduler_state, get_scheduler_snapshot
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
@@ -977,9 +977,14 @@ async def api_scheduler(request: Request) -> JSONResponse:
     """SCHEDULER — task contention, parks, overrides, and event sparklines."""
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = await collect_scheduler_state(
-        http_client, config
-    )
+    (
+        rows,
+        modules,
+        pin_queue,
+        events_by_task,
+        offline_projects,
+        paused_projects,
+    ), snapshot_at = await get_scheduler_snapshot(http_client, config)
     return JSONResponse(
         redux_api.shape_scheduler(
             rows=rows,
@@ -988,7 +993,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             events_by_task=events_by_task,
             offline_projects=offline_projects,
             paused_projects=paused_projects,
-            snapshot_at=None,
+            snapshot_at=snapshot_at,
         )
     )
 

@@ -663,7 +663,10 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     from unittest.mock import AsyncMock, patch
 
     empty_6tuple = ([], [], [], {}, [], [])
-    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_6tuple)):
+    with patch(
+        'dashboard.app.get_scheduler_snapshot',
+        new=AsyncMock(return_value=(empty_6tuple, None)),
+    ):
         resp = client.get('/api/v2/dashboard/scheduler')
 
     assert resp.status_code == 200
