@@ -1029,7 +1029,13 @@ def test_clear_override_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    # Also suppress the background _metrics_loop task: its initial _run_once()
+    # can fire during await request.json() and call mcp_tool_call, incrementing
+    # call_count before the endpoint even runs its validation logic.
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp,
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()),
+    ):
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/clear-override',
