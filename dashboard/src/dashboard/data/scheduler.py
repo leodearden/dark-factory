@@ -72,6 +72,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SCHEDULER_TTL_SECONDS: float = 5.0
+# Explicit event-history bound passed to the get_scheduler_events MCP tool.
+# The MCP tool defaults to limit=200, but spelling it out here hardens the
+# reader→producer contract so the dashboard stays bounded if the MCP default
+# ever changes (mirrors the producer→reader hardening from task-1188).
+# 200 matches the current effective cap so no sparkline data is lost.
+_SCHEDULER_EVENTS_LIMIT: int = 200
 # Cache entry: (monotonic_ts: float, six_tuple: tuple, snapshot_at: str) | None
 _scheduler_cache: tuple[float, tuple, str] | None = None
 # Single-flight lock: only one cold-cache caller runs the collection;
@@ -435,6 +441,7 @@ async def collect_scheduler_state(
                         'project_root': str(root),
                         'since': since.isoformat(),
                         'event_types': ['task_skipped'],
+                        'limit': _SCHEDULER_EVENTS_LIMIT,
                     },
                 )
                 if isinstance(events_raw, list):
