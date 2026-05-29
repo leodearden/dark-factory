@@ -50,8 +50,9 @@ class TestOrchTabCurrentFocusRemoved:
         Uses a regex to match the removed JSX expression specifically, avoiding
         false failures on related identifiers (e.g. o.current_task_count).
 
-        NOTE: the backend field current_task is LIVE and consumed by
-        tab_overview.jsx (Overview tab). Only the Orchestrators-tab reference
-        in tabs.jsx is removed here.
+        NOTE: the backend field current_task and its last consumer
+        (tab_overview.jsx, Overview tab) were fully removed by task 1571.
+        This guard remains to prevent re-introducing a {o.current_task}
+        consumer in tabs.jsx.
         """
         assert not re.search(r'\{\s*o\.current_task\s*\}', tabs_jsx_body)
