@@ -5981,3 +5981,77 @@ async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
         f'Expected _run_remediation_pass called with only the uncovered finding '
         f'{uncovered_finding!r}, got {passed_findings!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_fail_open_when_queue_raises(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """FAIL-OPEN: if get_pending() raises, all findings still reach remediation.
+
+    When the escalation queue's get_pending() throws (transient I/O error, etc.),
+    the open-escalation check must fail OPEN — no findings are suppressed,
+    remediation proceeds normally, and a
+    'reconciliation.open_escalation_check_failed' warning is emitted.
+
+    Task 1570 / FIX A — covers the exception branch in _maybe_remediate so that
+    a regression turning fail-open into fail-closed would be caught.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Patch get_pending() to raise — simulates a transient queue I/O failure.
+    def raise_on_get_pending():
+        raise OSError('Simulated transient queue read failure')
+
+    esc_queue.get_pending = raise_on_get_pending
+
+    actionable_finding = _make_s3_findings()[0]
+    assert actionable_finding['actionable'] is True
+
+    await event_buffer.push(_make_event('test-project'))
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[actionable_finding])
+
+    # Spy on _run_remediation_pass to confirm it is still called (fail-open).
+    remediation_calls: list[list[dict]] = []
+
+    async def spy_remediate(
+        project_id, parent_run_id, findings_arg, tier,
+        *, project_root, filtered_task_tree=None,
+    ):
+        remediation_calls.append(list(findings_arg))
+
+    harness._run_remediation_pass = spy_remediate  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) Remediation must still run — fail-open means the finding is NOT suppressed.
+    assert len(remediation_calls) == 1, (
+        f'Expected _run_remediation_pass called once (fail-open when get_pending raises); '
+        f'got {len(remediation_calls)} call(s)'
+    )
+    assert remediation_calls[0] == [actionable_finding], (
+        f'Expected remediation called with the full finding list; '
+        f'got {remediation_calls[0]!r}'
+    )
+
+    # (b) A 'reconciliation.open_escalation_check_failed' warning must be emitted.
+    warn_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.open_escalation_check_failed'
+    ]
+    assert len(warn_records) >= 1, (
+        f'Expected a "reconciliation.open_escalation_check_failed" warning log record; '
+        f'got records: {[r.getMessage() for r in caplog.records]}'
+    )
