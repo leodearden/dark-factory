@@ -135,8 +135,9 @@ class TestDismissStaleEscalations:
         harness._tag_prd_metadata = AsyncMock()
         harness._tag_task_modules = AsyncMock()
         harness.scheduler.get_tasks = AsyncMock(return_value=[])
-        # Seed a pending task so the harness clears the post-cutover
-        # 'No pending tasks found' guard and reaches the dry-run stop.
+        # Seed a pending task so run() has work to count and reaches the
+        # dry-run stop (task 1563 removed the 'No pending tasks found' guard;
+        # any tree, even empty, now passes through to dry_run=True return).
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({'1': 'pending'}, None),
         )
@@ -177,6 +178,10 @@ class TestDismissStaleEscalationsFatal:
 
         Specifically: _stop_escalation_server() and mcp.stop() must be called
         even when _dismiss_stale_escalations() raises an OSError.
+
+        With the task-1563 guard removed, an empty task tree ({}, None) no
+        longer raises RuntimeError.  run() now completes cleanly via dry_run=True.
+        The finally block runs regardless.
         """
         prd_path = tmp_path / 'test.prd'
         prd_path.write_text('# Test PRD')
@@ -191,12 +196,17 @@ class TestDismissStaleEscalationsFatal:
             side_effect=OSError('disk full simulated failure')
         )
         harness._stop_escalation_server = AsyncMock()
+        # Mock the startup steps that are now reached (guard removed,
+        # empty tree proceeds through 2b-2e before the dry-run return).
+        harness._tag_prd_metadata = AsyncMock()
+        harness._tag_task_modules = AsyncMock()
+        harness._recover_crashed_tasks = AsyncMock()
+        harness._reconcile_stranded_in_progress = AsyncMock()
 
-        # run() catches the OSError in its dismiss-stale-escalations try/except; the
-        # subsequent get_statuses() check finds no pending tasks (fixture seeds {}) and
-        # raises RuntimeError('No pending tasks found...').
-        with pytest.raises(RuntimeError):
-            await harness.run(prd_path, dry_run=True)
+        # run() catches the OSError in its dismiss-stale-escalations try/except,
+        # then proceeds through the startup steps and exits cleanly via dry_run=True.
+        # A re-raise (not a clean return) would fail this test — that's intentional.
+        await harness.run(prd_path, dry_run=True)
 
         # Finally block must have run
         harness._stop_escalation_server.assert_called_once()
@@ -221,8 +231,9 @@ class TestDismissStaleEscalationsFatal:
         harness._tag_prd_metadata = AsyncMock()
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
-        # Seed a pending task so the harness clears the post-cutover
-        # 'No pending tasks found' guard and reaches the dry-run stop.
+        # Seed a pending task so run() has work to count and reaches the
+        # dry-run stop (task 1563 removed the 'No pending tasks found' guard;
+        # any tree, even empty, now passes through to dry_run=True return).
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({'1': 'pending'}, None),
         )
