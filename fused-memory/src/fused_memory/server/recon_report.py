@@ -430,13 +430,20 @@ class ReconReportState:
     def _resolve_finding(
         self, run_id: str, finding_id: str
     ) -> tuple[_ReportEntry, _Finding] | None:
-        """Return (entry, finding) or None if either run_id or finding_id is unknown."""
-        entry = self._resolve_entry(run_id)
-        if entry is None:
-            return None
-        for f in entry.findings:
-            if f.finding_id == finding_id:
-                return entry, f
+        """Return (entry, finding) or None if either run_id or finding_id is unknown.
+
+        The scan covers ALL stage entries that share this ``run_id``, so a
+        finding_id returned via a cross-stage ``duplicate_finding`` response
+        (where the original finding lives in an earlier stage's entry) remains
+        citable from a later stage.  The lookup is still strictly scoped to
+        ``run_id`` to preserve cross-run isolation.
+        """
+        for (rid, _stage), entry in self._state.items():
+            if rid != run_id:
+                continue
+            for f in entry.findings:
+                if f.finding_id == finding_id:
+                    return entry, f
         return None  # finding_id not in this run
 
     # ------------------------------------------------------------------
