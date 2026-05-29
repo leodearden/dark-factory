@@ -152,12 +152,101 @@ class TestCascadeUnblockUnit:
             "Expected a DEBUG record for in-progress carve-out"
         )
 
-    async def test_criterion_6_steward_resolved_not_flipped(
+    async def test_criterion_6_active_workflow_owns_repend(
         self, harness: Harness, caplog
     ):
-        """[Criterion 6] Direct/steward resolve (resolved_by='steward') → no flip."""
+        """[Criterion 6, reframed] Direct resolve WITH an active workflow → no flip.
+
+        Originally this pinned the ``l2-cascade:`` prefix guard (a
+        steward-resolved L1 did not flip).  Fix #1a now flips an orphaned
+        direct-resolve, so the real invariant is: when a workflow slot is
+        active for the task (``task_id in _escalation_events``), that workflow
+        owns its own re-pend (woken by the synchronous ``event.set()``), and
+        ``_on_escalation_resolved`` must NOT also flip — otherwise it races the
+        workflow.  Registering the active-workflow event must suppress the flip.
+        """
         esc = _make_l1_esc(task_id='9', status='resolved', resolved_by='steward')
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # Active workflow owns the re-pend.
+        harness._escalation_events['9'] = asyncio.Event()
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        # The active workflow was still woken synchronously.
+        assert harness._escalation_events['9'].is_set()
+
+
+@pytest.mark.asyncio
+class TestDirectResolveOrphanUnblock:
+    """Fix #1a — a directly-resolved (non-cascade) orphan L1 with NO active
+    workflow re-pends its blocked task.  This is the precise inverse of the
+    root cause: ``escalation-watcher-auto`` resolved the L1 directly, no
+    workflow owned the re-pend, and the task stayed stranded `blocked` (3576
+    incident, 2026-05-29)."""
+
+    async def test_direct_resolve_no_active_workflow_flips_blocked(
+        self, harness: Harness, caplog
+    ):
+        """Direct resolve (escalation-watcher-auto), level 1, status resolved,
+        NO active workflow, task blocked → flips blocked→pending."""
+        esc = _make_l1_esc(
+            task_id='3576', status='resolved',
+            resolved_by='escalation-watcher-auto',
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # No _escalation_events['3576'] → orphaned, no active workflow.
+
+        with caplog.at_level(logging.INFO):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with('3576', 'pending')  # type: ignore[attr-defined]
+        assert any('escalation-watcher-auto' in r.message for r in caplog.records), (
+            "Expected an INFO/label record citing the direct resolver"
+        )
+
+    async def test_direct_dismiss_no_active_workflow_no_flip(
+        self, harness: Harness
+    ):
+        """Direct DISMISS (status='dismissed') → no flip.
+
+        A dismissed escalation means 'abandon the task' — it must stay blocked.
+        """
+        esc = _make_l1_esc(
+            task_id='3576', status='dismissed',
+            resolved_by='escalation-watcher-auto',
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_direct_resolve_level0_no_flip(self, harness: Harness):
+        """A direct-resolved L0 (level 0) must NOT flip — only L1 is the
+        blocking-handoff tier that re-pend keys off."""
+        esc = _make_l1_esc(
+            task_id='3576', status='resolved',
+            resolved_by='escalation-watcher-auto', level=0,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_direct_resolve_not_blocked_no_flip(self, harness: Harness):
+        """Direct resolve but task already moved off `blocked` (e.g. done) →
+        _cascade_unblock_member's status recheck leaves it alone."""
+        esc = _make_l1_esc(
+            task_id='3576', status='resolved',
+            resolved_by='escalation-watcher-auto',
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='done')
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))

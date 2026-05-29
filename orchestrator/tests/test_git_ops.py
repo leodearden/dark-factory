@@ -221,6 +221,89 @@ class TestWorktreeLifecycle:
         assert worktree_info2.path == worktree_info.path
         assert (worktree_info2.path / 'README.md').exists()
 
+    # ── Fix #3: conservative leftover-branch cleanup ──────────────────────
+    # The blind `git branch -D` at create_worktree could destroy a leftover
+    # branch carrying commits beyond main, or silently fail when the branch is
+    # checked out in a worktree (the 3576 trigger).  The cleanup must prove the
+    # leftover is non-destructive to remove before deleting, and escalate (raise)
+    # otherwise — never destroying WIP or orphan commits.
+
+    async def test_create_worktree_removes_clean_leftover_branch(
+        self, git_ops: GitOps,
+    ):
+        """A leftover 0-commit branch with no holding worktree (the 3576 shape,
+        minus the WIP) is provably non-destructive → removed, worktree created."""
+        full_branch = 'task/lo-clean'
+        # Dangling ref at main HEAD: no commits beyond main, no worktree.
+        rc, _, err = await _run(
+            ['git', 'branch', full_branch, 'main'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+
+        info = await git_ops.create_worktree('lo-clean')
+
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists()
+
+    async def test_create_worktree_refuses_leftover_branch_with_commits(
+        self, git_ops: GitOps,
+    ):
+        """A leftover branch carrying a commit beyond main must NOT be deleted —
+        raise instead, preserving the branch and its orphan commit."""
+        full_branch = 'task/lo-commit'
+        # Build the branch with a real commit beyond main via a throwaway
+        # worktree, then remove the worktree so the branch is a dangling ref.
+        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+        _, commit_sha, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        commit_sha = commit_sha.strip()
+        # Detach the worktree, leaving a dangling branch with one commit.
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('lo-commit')
+
+        # The branch and its commit must be preserved (NOT deleted).
+        rc, sha_after, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        assert rc == 0, 'leftover branch must still exist'
+        assert sha_after.strip() == commit_sha, 'orphan commit must be preserved'
+        assert full_branch in str(excinfo.value)
+
+    async def test_create_worktree_refuses_leftover_branch_in_dirty_worktree(
+        self, git_ops: GitOps,
+    ):
+        """A leftover branch checked out in a DIRTY worktree must NOT be touched
+        — raise with an actionable message; the worktree and its uncommitted
+        edits survive intact (the precise 3576 trigger)."""
+        full_branch = 'task/lo-dirty'
+        holding = git_ops.project_root.parent / 'holding-lo-dirty'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(holding), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        # Uncommitted WIP in the holding worktree.
+        dirty_file = holding / 'uncommitted.py'
+        dirty_file.write_text('work_in_progress = True\n')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('lo-dirty')
+
+        # Actionable error (distinct from the old opaque 'Failed to create
+        # worktree: ... already exists') and nothing destroyed.
+        assert 'refus' in str(excinfo.value).lower()
+        assert dirty_file.exists(), 'uncommitted WIP must survive'
+        assert dirty_file.read_text() == 'work_in_progress = True\n'
+        rc, _, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        assert rc == 0, 'leftover branch must still exist'
+
     async def test_commit_in_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-2')
         (worktree_info.path / 'new_file.py').write_text('print("hello")\n')

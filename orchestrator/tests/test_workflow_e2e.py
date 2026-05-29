@@ -2100,11 +2100,47 @@ class TestDoneIsTerminal:
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'blocked' in scheduler.statuses.get(task_assignment.task_id, [])
         # L0 created for the failure; Fix A also submits an L1 on the
-        # fallthrough path (no steward attached in this test).
+        # fallthrough path (no steward attached in this test).  Fix #2 then
+        # dismisses the orphan L0 on the same fall-through (its consumer — the
+        # steward — is dead), so the L0 survives on disk as 'dismissed', not
+        # 'pending'.  get_by_task(level=0) with status=None returns it either
+        # way, so the count/category assertions below are unaffected.
         l0 = queue.get_by_task(task_assignment.task_id, level=0)
         assert len(l0) == 1
         assert l0[0].category == 'task_failure'
         assert queue.has_open_l1(task_assignment.task_id)
+
+    async def test_fallthrough_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Fix #2: on the fall-through-to-L1 path (steward absent/done, the L0
+        never resolved — the 3576 worktree-creation-failure shape), the
+        orchestrator's own pending L0 is dismissed.  Its only consumer (the
+        steward) is dead and the workflow slot is exiting, so leaving it
+        pending only feeds the orphan-L0 reaper a duplicate-L1 to promote.
+
+        Post-condition: exactly one pending L1 (the human handoff) and ZERO
+        pending L0 — the L0 survives on disk as 'dismissed' (never deleted).
+        """
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path
+        )
+        tid = task_assignment.task_id
+
+        outcome = await workflow._mark_blocked(
+            'Workflow error: failed to create worktree: branch exists',
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Exactly one pending L1 — the human handoff.
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1
+        # No orphan: the workflow's own L0 must not be left pending.
+        assert queue.get_by_task(tid, status='pending', level=0) == []
+        # It is dismissed (preserved on disk for audit), not deleted.
+        dismissed_l0 = queue.get_by_task(tid, status='dismissed', level=0)
+        assert len(dismissed_l0) == 1
+        assert dismissed_l0[0].category == 'task_failure'
 
 
 # ---------------------------------------------------------------------------
