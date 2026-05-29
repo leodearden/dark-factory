@@ -877,11 +877,11 @@ function MergeTab({ projectFilter }) {
                 <div className="col-span-5 panel">
                   <div className="panel-head"><span className="title">Outcomes</span></div>
                   <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <DN data={d.outcomes.labels.map((l, i) => ({ label: l, value: d.outcomes.values[i], color: CP.status[l] || CP.accent }))} size={120} thickness={18} centerValue={d.outcomes.values.reduce((s,v)=>s+v,0)} centerLabel="merges" />
+                    <DN data={d.outcomes.labels.map((l, i) => ({ label: l, value: d.outcomes.values[i], color: (d.outcomes.colors || [])[i] || CP.accent }))} size={120} thickness={18} centerValue={d.outcomes.values.reduce((s,v)=>s+v,0)} centerLabel="merges" />
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flex: 1 }}>
                       {d.outcomes.labels.map((l, i) => (
                         <div key={l} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
-                          <span style={{ width: 8, height: 8, background: CP.status[l] || CP.accent, borderRadius: 2 }}></span>
+                          <span style={{ width: 8, height: 8, background: (d.outcomes.colors || [])[i] || CP.accent, borderRadius: 2 }}></span>
                           <span style={{ color: 'var(--fg-2)' }}>{l}</span>
                           <span className="mono">{d.outcomes.values[i]}</span>
                         </div>

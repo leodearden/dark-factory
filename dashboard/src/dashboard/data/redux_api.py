@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from dashboard.data.escalations import resolve_owning_project
+from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
 
 # ---------------------------------------------------------------------------
@@ -401,6 +402,19 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
+def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Enrich an outcomes dict with a parallel ``colors`` list.
+
+    Given the raw ``outcomes`` mapping (``{labels, values}`` from the
+    aggregator), returns a new dict with those keys preserved and a
+    ``colors`` key added via :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
+    """
+    outcomes = dict(raw or {'labels': [], 'values': []})
+    labels: list[str] = outcomes.get('labels') or []
+    outcomes['colors'] = assign_outcome_colors(labels)
+    return outcomes
+
+
 def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
@@ -433,7 +447,7 @@ def shape_merge_queue(
         label = _project_label(pid)
         out[label] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
-            'outcomes': dict(data.get('outcomes') or {'labels': [], 'values': []}),
+            'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': [dict(r) for r in (data.get('recent') or [])],
             'speculative': dict(data.get('speculative') or {}),
