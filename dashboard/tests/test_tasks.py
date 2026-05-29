@@ -5,10 +5,7 @@ Focus: the field-mapping contract at the MCP→dashboard boundary.
 
 from __future__ import annotations
 
-import pytest
-
 from dashboard.data.tasks import _shape_task
-
 
 # ---------------------------------------------------------------------------
 # updated_at preservation (step-1/step-2)
