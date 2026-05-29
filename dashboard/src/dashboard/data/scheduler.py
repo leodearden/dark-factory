@@ -74,12 +74,23 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_TTL_SECONDS: float = 5.0
 # Cache entry: (monotonic_ts: float, six_tuple: tuple, snapshot_at: str) | None
 _scheduler_cache: tuple[float, tuple, str] | None = None
+# Single-flight lock: only one cold-cache caller runs the collection;
+# waiters re-check the cache after acquiring the lock and return early if
+# another waiter already filled it (double-checked locking pattern).
+_scheduler_refresh_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _scheduler_cache_clear() -> None:
-    """Clear the scheduler snapshot TTL cache (test/admin hook)."""
-    global _scheduler_cache
+    """Clear the scheduler snapshot TTL cache and reset the refresh lock.
+
+    Test/admin hook.  Resetting the Lock creates a fresh instance bound to
+    no event loop, preventing "got Future attached to a different loop" when
+    pytest-asyncio's function-scoped loops reuse the module-level Lock across
+    successive test functions.
+    """
+    global _scheduler_cache, _scheduler_refresh_lock
     _scheduler_cache = None
+    _scheduler_refresh_lock = asyncio.Lock()
 
 
 async def get_scheduler_snapshot(
@@ -93,20 +104,34 @@ async def get_scheduler_snapshot(
     frontend polls every 3 s, a warm cache means every steady-state poll
     returns instantly without re-running the N-project MCP fan-out.
 
+    Single-flight: when the cache is cold, only the first concurrent caller
+    runs the collection; others await the lock and then return from the
+    freshly-filled cache (double-checked locking).
+
     ``snapshot_at`` is an ISO-8601 wall-clock string stamped at cache-fill
     time.  The value propagates through ``api_scheduler`` → ``shape_scheduler``
     → the JS envelope so the UI can show a truthful "data as of" timestamp.
     """
-    global _scheduler_cache
+    global _scheduler_cache  # must precede first use of the name
+
+    # Fast path — no lock needed for a warm cache hit.
     now = time.monotonic()
     cached = _scheduler_cache
     if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
         return cached[1], cached[2]
 
-    six_tuple = await collect_scheduler_state(client, config)
-    snapshot_at = datetime.now(UTC).isoformat()
-    _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
-    return six_tuple, snapshot_at
+    # Slow path — acquire the lock; re-check after acquiring (double-check).
+    async with _scheduler_refresh_lock:
+        now = time.monotonic()
+        cached = _scheduler_cache
+        if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
+            return cached[1], cached[2]
+
+        # We are the one caller responsible for filling the cache.
+        six_tuple = await collect_scheduler_state(client, config)
+        snapshot_at = datetime.now(UTC).isoformat()
+        _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
+        return six_tuple, snapshot_at
 
 
 # ---------------------------------------------------------------------------
