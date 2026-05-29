@@ -92,6 +92,35 @@ def _parse_max_width(block: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# step-7: Toolbar gates project MultiSelect via showProjects prop
+# ---------------------------------------------------------------------------
+
+
+def test_toolbar_gates_project_control(shell_jsx_body):
+    """shell.jsx Toolbar must accept a showProjects prop (default true) and
+    render the project MultiSelect only when showProjects is truthy.
+
+    Asserts:
+    - The Toolbar destructured props include `showProjects`
+    - The project MultiSelect render is guarded by a showProjects conditional
+    """
+    # Toolbar props must include showProjects (with a default of true)
+    assert re.search(
+        r'function\s+Toolbar\s*\([^)]*showProjects',
+        shell_jsx_body,
+    ), (
+        'Toolbar must destructure showProjects from its props'
+    )
+    # The project MultiSelect must be wrapped in a {showProjects && ...} guard
+    assert re.search(
+        r'\{showProjects\s*&&',
+        shell_jsx_body,
+    ), (
+        'Toolbar must guard the project MultiSelect with {showProjects && ...}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-5: shell.jsx exports ProjectChips
 # ---------------------------------------------------------------------------
 
