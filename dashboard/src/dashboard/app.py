@@ -29,7 +29,11 @@ from shared.async_sqlite_base import AsyncSqliteBase
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
-from dashboard.data.active_tasks import collect_active_tasks
+from dashboard.data.active_tasks import (
+    _MAX_DONE_PER_PROJECT,
+    collect_active_tasks,
+    collect_done_counts,
+)
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     aggregate_burndown_projects,
@@ -528,12 +532,17 @@ async def api_tasks(request: Request) -> JSONResponse:
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    active, offline_projects = await collect_active_tasks(http_client, config)
+    (active, offline_projects), done_counts = await asyncio.gather(
+        collect_active_tasks(http_client, config,
+                             max_done_per_project=_MAX_DONE_PER_PROJECT),
+        collect_done_counts(http_client, config),
+    )
     return JSONResponse(
         {
             'ACTIVE_TASKS': active,
             'TASKS_OFFLINE': bool(offline_projects),
             'TASKS_OFFLINE_PROJECTS': offline_projects,
+            'DONE_COUNTS': done_counts,
         }
     )
 
