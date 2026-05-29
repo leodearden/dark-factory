@@ -45,7 +45,11 @@ def test_minutes_since_returns_zero_on_missing_or_bad():
 
 
 def _shape_task(task: dict) -> dict:
-    """Build a row in the dashboard's per-task wire shape."""
+    """Build a row in the dashboard's per-task wire shape.
+
+    Mirrors tasks.py::_shape_task — must include ``updated_at`` so that
+    done-task ordering tests work correctly.
+    """
     return {
         'id': int(task['id']),
         'title': task.get('title') or '',
@@ -55,6 +59,7 @@ def _shape_task(task: dict) -> dict:
         'priority': task.get('priority'),
         'dependencies': list(task.get('dependencies') or []),
         'metadata': task.get('metadata', {}),
+        'updated_at': task.get('updated_at'),
     }
 
 
@@ -277,4 +282,189 @@ async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
     )
     assert by_id['trainyard/T-102']['train'] is None, (
         "task 102 without train metadata should have train=None"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bounded done emission (step-3/step-4)
+# ---------------------------------------------------------------------------
+
+
+def _make_done_project(root, *, project_dir, active_tasks, done_tasks):
+    """Layout a project with active + done tasks carrying updated_at.
+
+    ``active_tasks`` and ``done_tasks`` are raw dicts; done tasks MUST include
+    ``updated_at`` so the ordering / completed-field assertions work.
+    """
+    project_root = root / project_dir
+    project_root.mkdir(parents=True, exist_ok=True)
+    shaped = [_shape_task(t) for t in (active_tasks + done_tasks)]
+    return project_root, shaped
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_bounded_done_appends_done_rows(tmp_path, monkeypatch, dummy_client):
+    """max_done_per_project=2 appends the 2 most-recent done rows, most-recent first."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active one', 'status': 'in-progress', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 50, 'title': 'done oldest', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+            {'id': 51, 'title': 'done middle', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T11:00:00+00:00'},
+            {'id': 52, 'title': 'done newest', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=2)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert len(done_rows) == 2, f'expected 2 done rows, got {len(done_rows)}'
+
+    # Most-recent two: id 52 (12:00) and id 51 (11:00)
+    done_ids = [t['id'] for t in done_rows]
+    assert 'df/T-52' in done_ids
+    assert 'df/T-51' in done_ids
+    assert 'df/T-50' not in done_ids, 'oldest done task should be excluded by N=2 cap'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_bounded_done_completed_field(tmp_path, monkeypatch, dummy_client):
+    """Each done row must have 'completed' == its updated_at ISO string."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[],
+        done_tasks=[
+            {'id': 10, 'title': 'done task', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=5)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert len(done_rows) == 1
+    row = done_rows[0]
+    assert row['completed'] == '2026-05-29T09:00:00+00:00', (
+        f"expected completed == '2026-05-29T09:00:00+00:00', got {row.get('completed')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_active_rows_unchanged_no_completed_key(tmp_path, monkeypatch, dummy_client):
+    """Active rows must NOT have a 'completed' key even when max_done_per_project>0."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active', 'status': 'in-progress', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'done', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=5)
+
+    active_rows = [t for t in active if t['status'] != 'done']
+    assert active_rows, 'expected at least one active row'
+    for row in active_rows:
+        assert 'completed' not in row, (
+            f"active row {row['id']!r} must not have 'completed' key"
+        )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_default_excludes_done_rows(tmp_path, monkeypatch, dummy_client):
+    """Default (no max_done_per_project) must return NO done rows — scheduler back-compat."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active', 'status': 'pending', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 2, 'title': 'done', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    # Call with NO max_done_per_project — default behaviour
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert done_rows == [], (
+        'Default collect_active_tasks must NOT return done rows — '
+        'scheduler.py must not receive done tasks'
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_done_ordering_tie_broken_by_id(tmp_path, monkeypatch, dummy_client):
+    """When updated_at is identical, higher id wins the tie-break."""
+    same_ts = '2026-05-29T10:00:00+00:00'
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[],
+        done_tasks=[
+            {'id': 10, 'title': 'done low id', 'status': 'done', 'dependencies': [],
+             'updated_at': same_ts},
+            {'id': 20, 'title': 'done high id', 'status': 'done', 'dependencies': [],
+             'updated_at': same_ts},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
+                                            max_done_per_project=1)
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    assert len(done_rows) == 1
+    assert done_rows[0]['id'] == 'df/T-20', (
+        'tie-break: higher id (20) should win over lower id (10)'
     )
