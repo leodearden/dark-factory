@@ -47,3 +47,25 @@ __pycache__/
 # tests pass an unpatched MagicMock as config the stringified mock name
 # becomes the path, producing files like "<MagicMock name='...' id='...'>".
 <MagicMock*
+
+# ── Runtime / debug artifacts ────────────────────────────────────────
+# Transient output from verification screenshots, MCP tooling, log runs,
+# and skill/watcher run-products.  None of this belongs in history.
+# (gitignore has no inline comments — annotations are on their own lines.)
+# Root-level debug/verification screenshots:
+/*.png
+# Playwright MCP console logs + screenshots:
+.playwright-mcp/
+# Stray empty marker file:
+.codex
+# Orchestrator / orchestrate run logs:
+/logs/
+# Runtime data (combine_audit.jsonl, etc.) — note /data/ above is root-only:
+orchestrator/data/
+# recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
+recon-watch/close-manifest*.json
+# /review skill phase outputs (review/briefing.yaml stays tracked):
+review/reports/
+
+# ── Node / codex CLI install (ad-hoc, not a project dependency) ──────
+node_modules/
