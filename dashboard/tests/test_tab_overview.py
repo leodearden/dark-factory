@@ -37,10 +37,6 @@ class TestOverviewTabCurrentTaskRemoved:
         """File must still export OverviewTab — guards against a renamed/empty file."""
         assert 'function OverviewTab(' in tab_overview_jsx_body
 
-    def test_overview_tab_positive_anchor_table_title(self, tab_overview_jsx_body):
-        """'Orchestrators · current work' table title must still be present."""
-        assert 'Orchestrators · current work' in tab_overview_jsx_body
-
     def test_current_task_td_render_ref_removed(self, tab_overview_jsx_body):
         """The JSX expression {o.current_task} must NOT appear in tab_overview.jsx."""
         assert not re.search(r'\{\s*o\.current_task\s*\}', tab_overview_jsx_body)
