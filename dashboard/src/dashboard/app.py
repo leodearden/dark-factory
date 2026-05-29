@@ -31,7 +31,6 @@ from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
 from dashboard.data.active_tasks import (
     _MAX_DONE_PER_PROJECT,
-    collect_active_tasks,
     collect_tasks_with_counts,
 )
 from dashboard.data.burndown import (

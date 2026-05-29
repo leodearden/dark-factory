@@ -301,7 +301,7 @@ async def collect_done_counts(
         *(fetch_statuses(client, config, r) for r in roots)
     )
     counts: dict[str, int] = {}
-    for root, result in zip(roots, results):
+    for root, result in zip(roots, results, strict=False):
         # Skip offline markers (dict with 'offline' key).
         if isinstance(result, dict) and result.get('offline'):
             continue
