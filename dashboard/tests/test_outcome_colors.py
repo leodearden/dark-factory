@@ -104,3 +104,68 @@ def test_classify_outcome_unknown_literal():
 def test_classify_outcome_genuinely_new_code():
     """A code not in the map routes to the 'unknown' family."""
     assert classify_outcome('some_brand_new_code_xyz') == 'unknown'
+
+
+# ---------------------------------------------------------------------------
+# Step-5: comprehensive coverage — every enumerated code maps to a real family,
+# and the realistic ordered label set has no adjacent color collisions.
+# ---------------------------------------------------------------------------
+
+# Full enumerated code set from the orchestrator, grouped by family.
+_ALL_ENUMERATED_CODES: dict[str, list[str]] = {
+    'terminal_success': [
+        'done', 'already_merged', 'requeued',
+        'done_wip_recovery', 'bypass_done', 'done_provenance',
+    ],
+    'cas': ['cas_retry', 'cas_exhausted', 'cas_failed'],
+    'plan': [
+        'dropped_plan_targets', 'plan_files_narrowed',
+        'plan_files_not_touched', 'plan_blast_radius_lock_conflict',
+    ],
+    'post_merge': [
+        'post_merge_equivalence_failed', 'post_merge_pyright_broken',
+        'post_rebase_verify_fail',
+    ],
+    'train': ['train_incomplete', 'train_rebase_conflict', 'train_partial_flip'],
+    'terminal_failure': [
+        'blocked', 'conflict', 'merge_failed', 'verify_failed',
+        'advance_failed', 'abandoned_verify_timeouts', 'unknown_branch',
+        'not_descendant', 'contaminated', 'stash_failed',
+    ],
+}
+
+# Canonical codes always emitted first (in this order) by outcome_distribution.
+_CANONICAL_ORDER = ['done', 'conflict', 'blocked', 'already_merged']
+
+
+def _build_realistic_label_list() -> list[str]:
+    """Reproduce outcome_distribution ordering: canonical first, then sorted."""
+    canonical_set = set(_CANONICAL_ORDER)
+    all_codes = [c for codes in _ALL_ENUMERATED_CODES.values() for c in codes]
+    remaining = sorted(c for c in all_codes if c not in canonical_set)
+    return _CANONICAL_ORDER + remaining
+
+
+def test_every_enumerated_code_classifies_to_known_family():
+    """No enumerated outcome code falls through to the 'unknown' fallback."""
+    for family, codes in _ALL_ENUMERATED_CODES.items():
+        for code in codes:
+            got = classify_outcome(code)
+            assert got != 'unknown', (
+                f"Code {code!r} (expected family {family!r}) fell through to 'unknown'"
+            )
+            assert got == family, (
+                f"Code {code!r} classified as {got!r}, expected {family!r}"
+            )
+
+
+def test_realistic_label_set_no_adjacent_color_collision():
+    """The realistic outcome_distribution label ordering has no adjacent color collision."""
+    labels = _build_realistic_label_list()
+    colors = assign_outcome_colors(labels)
+    assert len(colors) == len(labels)
+    for i in range(len(colors) - 1):
+        assert colors[i] != colors[i + 1], (
+            f"Adjacent color collision at positions {i} ({labels[i]!r}) "
+            f"and {i+1} ({labels[i+1]!r}): {colors[i]!r}"
+        )
