@@ -748,6 +748,63 @@ async def test_get_scheduler_snapshot_caches_within_ttl_and_refetches_after_expi
 
 
 # ---------------------------------------------------------------------------
+# task-1569 step-3: get_scheduler_snapshot — single-flight concurrency
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_single_flight_collapses_concurrent_misses(
+    dummy_client, dummy_config, monkeypatch
+):
+    """Concurrent cache misses collapse to a single underlying collection.
+
+    Three tasks call get_scheduler_snapshot simultaneously on a cold cache.
+    Only one should invoke collect_scheduler_state; the other two should
+    await the lock, then return the freshly-filled cache.  All three must
+    receive the same snapshot_at.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import dashboard.data.scheduler as sched
+
+    sched._scheduler_cache_clear()
+    # Disable TTL expiry so the test doesn't race against monotonic time
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 9999.0)
+
+    empty_6tuple = ([], [], [], {}, [], [])
+    counter = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_collector(_client, _config):
+        nonlocal counter
+        counter += 1
+        started.set()
+        await release.wait()
+        return empty_6tuple
+
+    with patch('dashboard.data.scheduler.collect_scheduler_state', side_effect=slow_collector):
+        tasks = [
+            asyncio.create_task(sched.get_scheduler_snapshot(dummy_client, dummy_config))
+            for _ in range(3)
+        ]
+        # Wait for the first coroutine to enter the collector, then let the
+        # other two reach the lock before releasing.
+        await started.wait()
+        await asyncio.sleep(0)  # yield to let the other two tasks queue on the lock
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert counter == 1, (
+        f'expected single underlying collection, got counter={counter}'
+    )
+    snapshot_ats = [r[1] for r in results]
+    assert len(set(snapshot_ats)) == 1, (
+        f'all callers must receive the same snapshot_at, got {snapshot_ats}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-15: POST /scheduler/override — validation → 400
 # ---------------------------------------------------------------------------
 
