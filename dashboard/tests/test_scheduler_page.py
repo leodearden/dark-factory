@@ -663,7 +663,10 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     from unittest.mock import AsyncMock, patch
 
     empty_6tuple = ([], [], [], {}, [], [])
-    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_6tuple)):
+    with patch(
+        'dashboard.app.get_scheduler_snapshot',
+        new=AsyncMock(return_value=(empty_6tuple, None)),
+    ):
         resp = client.get('/api/v2/dashboard/scheduler')
 
     assert resp.status_code == 200
@@ -689,6 +692,222 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert inner['offline_projects'] == []
     assert inner['paused'] is False
     assert inner['paused_projects'] == []
+
+
+# ---------------------------------------------------------------------------
+# task-1569 step-1: get_scheduler_snapshot — TTL cache and expiry
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_caches_within_ttl_and_refetches_after_expiry(
+    dummy_client, dummy_config, monkeypatch
+):
+    """get_scheduler_snapshot returns cached result within TTL and re-fetches after expiry.
+
+    Part (a) Within TTL: two calls should invoke the inner collector exactly once;
+    both calls must return identical (six_tuple, snapshot_at), the six_tuple must
+    equal the empty 6-tuple, and snapshot_at must be a non-None ISO-8601 string.
+
+    Part (b) Expiry: after _scheduler_cache_clear() + TTL set to 0.0, two calls
+    should each invoke the inner collector (counter == 2).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    # Part (a): within TTL
+    sched._scheduler_cache_clear()
+    mock_collector = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector):
+        result1 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        result2 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector.call_count == 1, (
+        f'expected 1 call within TTL, got {mock_collector.call_count}'
+    )
+    six_tuple1, snapshot_at1 = result1
+    six_tuple2, snapshot_at2 = result2
+    assert six_tuple1 == empty_6tuple
+    assert six_tuple2 == empty_6tuple
+    assert result1 == result2, 'both calls must return identical results within TTL'
+    assert snapshot_at1 is not None, 'snapshot_at must be non-None'
+    # Verify it is a valid ISO-8601 string
+    from datetime import datetime as _dt
+    _dt.fromisoformat(snapshot_at1)  # raises ValueError if not valid ISO
+
+    # Part (b): expiry — reset cache and TTL
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 0.0)
+    mock_collector2 = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector2):
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector2.call_count == 2, (
+        f'expected 2 calls after TTL=0.0, got {mock_collector2.call_count}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1569 step-3: get_scheduler_snapshot — single-flight concurrency
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_single_flight_collapses_concurrent_misses(
+    dummy_client, dummy_config, monkeypatch
+):
+    """Concurrent cache misses collapse to a single underlying collection.
+
+    Three tasks call get_scheduler_snapshot simultaneously on a cold cache.
+    Only one should invoke collect_scheduler_state; the other two should
+    await the lock, then return the freshly-filled cache.  All three must
+    receive the same snapshot_at.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import dashboard.data.scheduler as sched
+
+    sched._scheduler_cache_clear()
+    # Disable TTL expiry so the test doesn't race against monotonic time
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 9999.0)
+
+    empty_6tuple = ([], [], [], {}, [], [])
+    counter = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_collector(_client, _config):
+        nonlocal counter
+        counter += 1
+        started.set()
+        await release.wait()
+        return empty_6tuple
+
+    with patch('dashboard.data.scheduler.collect_scheduler_state', side_effect=slow_collector):
+        tasks = [
+            asyncio.create_task(sched.get_scheduler_snapshot(dummy_client, dummy_config))
+            for _ in range(3)
+        ]
+        # Wait for the first coroutine to enter the collector, then let the
+        # other two reach the lock before releasing.
+        await started.wait()
+        await asyncio.sleep(0)  # yield to let the other two tasks queue on the lock
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert counter == 1, (
+        f'expected single underlying collection, got counter={counter}'
+    )
+    snapshot_ats = [r[1] for r in results]
+    assert len(set(snapshot_ats)) == 1, (
+        f'all callers must receive the same snapshot_at, got {snapshot_ats}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1569 step-5: endpoint threads snapshot_at through the envelope
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_endpoint_threads_snapshot_at_through_envelope(client):
+    """GET /scheduler passes the real snapshot_at from get_scheduler_snapshot into the envelope.
+
+    When get_scheduler_snapshot returns a known snapshot_at string, the
+    SCHEDULER.snapshot_at field in the response must equal it.  The envelope
+    must still contain all expected keys with empty-state values.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    known_snapshot_at = '2026-05-29T12:00:00+00:00'
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    with patch(
+        'dashboard.app.get_scheduler_snapshot',
+        new=AsyncMock(return_value=(empty_6tuple, known_snapshot_at)),
+    ):
+        resp = client.get('/api/v2/dashboard/scheduler')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert 'SCHEDULER' in data
+    inner = data['SCHEDULER']
+    assert inner['snapshot_at'] == known_snapshot_at
+    # Verify envelope structure is still intact
+    for key in ('rows', 'modules', 'pin_queue', 'events_by_task', 'offline',
+                'offline_projects', 'paused', 'paused_projects'):
+        assert key in inner, f'missing key {key!r}'
+    assert inner['rows'] == []
+    assert inner['modules'] == []
+    assert inner['offline'] is False
+    assert inner['paused'] is False
+
+
+# ---------------------------------------------------------------------------
+# task-1569 step-7: _one_project passes explicit limit to get_scheduler_events
+# ---------------------------------------------------------------------------
+
+
+async def test_scheduler_events_fetch_passes_explicit_limit(dummy_client, dummy_config):
+    """collect_scheduler_state passes _SCHEDULER_EVENTS_LIMIT as explicit limit.
+
+    Verifies that the get_scheduler_events MCP call includes a 'limit' key equal
+    to sched._SCHEDULER_EVENTS_LIMIT (which must equal 200) so the dashboard's
+    event-history bound is explicit rather than relying on the MCP default.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'meta_files': [],
+        }
+    ]
+
+    recorded_calls: list[tuple[str, dict]] = []
+
+    async def mcp_side_effect(_client, _url, tool_name, args):
+        recorded_calls.append((tool_name, dict(args)))
+        if tool_name == 'get_scheduler_state':
+            return _scheduler_snapshot()
+        elif tool_name == 'get_scheduler_events':
+            return []
+        return None
+
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mcp_side_effect),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        await collect_scheduler_state(dummy_client, dummy_config)
+
+    events_calls = [
+        (name, args) for name, args in recorded_calls
+        if name == 'get_scheduler_events'
+    ]
+    assert events_calls, 'expected at least one get_scheduler_events call'
+    _tool_name, events_args = events_calls[0]
+
+    assert 'limit' in events_args, (
+        f'get_scheduler_events call must include explicit limit; got args={events_args}'
+    )
+    assert events_args['limit'] == sched._SCHEDULER_EVENTS_LIMIT, (
+        f"limit must equal _SCHEDULER_EVENTS_LIMIT={sched._SCHEDULER_EVENTS_LIMIT}, "
+        f"got {events_args['limit']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +1029,13 @@ def test_clear_override_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    # Also suppress the background _metrics_loop task: its initial _run_once()
+    # can fire during await request.json() and call mcp_tool_call, incrementing
+    # call_count before the endpoint even runs its validation logic.
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp,
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()),
+    ):
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/clear-override',

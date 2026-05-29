@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -54,6 +55,100 @@ from dashboard.data.active_tasks import _all_project_roots, _project_label, coll
 from dashboard.data.memory import invalidate_session, mcp_tool_call
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Short-TTL cache for get_scheduler_snapshot
+#
+# The frontend polls /scheduler every 3 s (data.js:143/151) unconditionally,
+# regardless of the active tab.  Without a cache, every poll re-runs the full
+# N-project collection.  A TTL >= the poll interval keeps the cache warm so
+# switching to the Scheduler tab renders instantly from already-populated
+# DF_DATA.SCHEDULER.  The 5 s window allows a few seconds of staleness, which
+# the task explicitly accepts.
+#
+# _scheduler_cache_clear() is a test hook that resets both the cache tuple and
+# the asyncio.Lock so pytest-asyncio's function-scoped event loops don't hit
+# "got Future attached to a different loop" on the second cache test.
+# ---------------------------------------------------------------------------
+
+_SCHEDULER_TTL_SECONDS: float = 5.0
+# Explicit event-history bound passed to the get_scheduler_events MCP tool.
+# The MCP tool defaults to limit=200, but spelling it out here hardens the
+# reader→producer contract so the dashboard stays bounded if the MCP default
+# ever changes (mirrors the producer→reader hardening from task-1188).
+# 200 matches the current effective cap so no sparkline data is lost.
+_SCHEDULER_EVENTS_LIMIT: int = 200
+# Cache entry: (monotonic_ts: float, six_tuple: tuple, snapshot_at: str) | None
+_scheduler_cache: tuple[float, tuple, str] | None = None
+# Single-flight lock: only one cold-cache caller runs the collection;
+# waiters re-check the cache after acquiring the lock and return early if
+# another waiter already filled it (double-checked locking pattern).
+_scheduler_refresh_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _scheduler_cache_clear() -> None:
+    """Clear the scheduler snapshot TTL cache and reset the refresh lock.
+
+    Test/admin hook.  Resetting the Lock creates a fresh instance bound to
+    no event loop, preventing "got Future attached to a different loop" when
+    pytest-asyncio's function-scoped loops reuse the module-level Lock across
+    successive test functions.
+    """
+    global _scheduler_cache, _scheduler_refresh_lock
+    _scheduler_cache = None
+    _scheduler_refresh_lock = asyncio.Lock()
+
+
+async def get_scheduler_snapshot(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> tuple[tuple, str]:
+    """Return cached scheduler snapshot ``(six_tuple, snapshot_at)``.
+
+    Calls :func:`collect_scheduler_state` at most once per
+    ``_SCHEDULER_TTL_SECONDS`` interval (default 5 s).  Because the
+    frontend polls every 3 s, a warm cache means every steady-state poll
+    returns instantly without re-running the N-project MCP fan-out.
+
+    Single-flight: when the cache is cold, only the first concurrent caller
+    runs the collection; others await the lock and then return from the
+    freshly-filled cache (double-checked locking).
+
+    ``snapshot_at`` is an ISO-8601 wall-clock string stamped at cache-fill
+    time.  The value propagates through ``api_scheduler`` → ``shape_scheduler``
+    → the JS envelope so the UI can show a truthful "data as of" timestamp.
+
+    Single-config assumption: the cache is unkeyed (ignores ``client`` and
+    ``config``).  This is correct for the dashboard process, which is always
+    started with a single process-wide :class:`DashboardConfig`.  If the
+    process ever served multiple configs (multi-tenant), callers with a
+    different ``config`` would silently receive another config's snapshot.
+    """
+    global _scheduler_cache  # must precede first use of the name
+
+    # Fast path — no lock needed for a warm cache hit.
+    now = time.monotonic()
+    cached = _scheduler_cache
+    if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
+        return cached[1], cached[2]
+
+    # Slow path — acquire the lock; re-check after acquiring (double-check).
+    async with _scheduler_refresh_lock:
+        now = time.monotonic()
+        cached = _scheduler_cache
+        if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
+            return cached[1], cached[2]
+
+        # We are the one caller responsible for filling the cache.
+        # collect_scheduler_state never raises (per-project errors surface as
+        # offline_projects), so we always cache the result — even a degraded
+        # snapshot where some projects are offline.  Caching a partial result
+        # avoids re-running a multi-second fan-out that would just report the
+        # same offline state again; ≤5 s of stale-offline is acceptable.
+        six_tuple = await collect_scheduler_state(client, config)
+        snapshot_at = datetime.now(UTC).isoformat()
+        _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
+        return six_tuple, snapshot_at
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +452,7 @@ async def collect_scheduler_state(
                         'project_root': str(root),
                         'since': since.isoformat(),
                         'event_types': ['task_skipped'],
+                        'limit': _SCHEDULER_EVENTS_LIMIT,
                     },
                 )
                 if isinstance(events_raw, list):
