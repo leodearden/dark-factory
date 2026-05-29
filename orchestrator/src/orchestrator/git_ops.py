@@ -700,14 +700,22 @@ class GitOps:
                 )
                 shutil.rmtree(worktree_path)
 
-        # If branch exists but worktree doesn't (stale from a previous run), clean up
+        # If the branch ref already exists (stale from a previous run, or — the
+        # 3576 trigger — still checked out in a leftover worktree), clean it up
+        # ONLY when deterministically non-destructive.  The old code ran a blind
+        # `git branch -D` and ignored its rc: when the branch was checked out in
+        # a leftover worktree the delete silently failed, then `git worktree add`
+        # raised the opaque "a branch named ... already exists" (2026-05-29).
+        # Worse, a blind delete of a branch carrying commits beyond main would
+        # have destroyed orphan work.  Hard rule: never delete uncommitted WIP
+        # or orphan commits — prove the cleanup is non-destructive, else raise
+        # (→ blocked + L1, now non-stranding via Harness Fix #1a).
         rc, _, _ = await _run(
             ['git', 'rev-parse', '--verify', full_branch],
             cwd=self.project_root,
         )
         if rc == 0:
-            logger.info(f'Cleaning up stale branch {full_branch} before creating worktree')
-            await _run(['git', 'branch', '-D', full_branch], cwd=self.project_root)
+            await self._cleanup_leftover_branch(full_branch, branch_name)
 
         # Create worktree with new branch from the freshened ref
         rc, out, err = await _run(
@@ -773,6 +781,124 @@ class GitOps:
             path=worktree_path,
             base_commit=post_create_base,
             stale_commits=stale_commits,
+        )
+
+    async def _worktree_holding_branch(self, full_branch: str) -> Path | None:
+        """Path of the registered worktree that has *full_branch* checked out.
+
+        Returns ``None`` when no worktree holds it (a dangling ref) or when
+        ``git worktree list`` errors.  Callers treat ``None`` conservatively —
+        a dangling ref has no working tree to be dirty, so only commits-beyond-
+        main can carry work, and that is checked separately and fail-safe.
+        """
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        target = f'refs/heads/{full_branch}'
+        current: Path | None = None
+        for line in out.splitlines():
+            if line.startswith('worktree '):
+                current = Path(line[len('worktree '):].strip())
+            elif line.startswith('branch ') and line[len('branch '):].strip() == target:
+                return current
+        return None
+
+    async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
+        """Whether *full_branch* carries commits beyond main.
+
+        **Fail-safe ``True``** on any git error or unparseable output — never
+        report a branch as empty (safe to delete) when we cannot prove it.
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--count',
+             f'{self.config.main_branch}..{full_branch}'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return True
+        try:
+            return int(out.strip()) > 0
+        except ValueError:
+            return True
+
+    async def _cleanup_leftover_branch(
+        self, full_branch: str, branch_name: str,
+    ) -> None:
+        """Remove a leftover branch ref ONLY when provably non-destructive.
+
+        Called by ``create_worktree`` when ``full_branch`` already exists.
+        Raises :class:`RuntimeError` (→ the task blocks with an L1, now
+        non-stranding via Harness Fix #1a) rather than deleting anything when
+        the leftover carries commits beyond main, has a dirty working tree, or
+        its state cannot be verified.  Hard rule: never destroy WIP / orphan
+        commits — escalate when not deterministically certain.
+        """
+        holding = await self._worktree_holding_branch(full_branch)
+        if holding is not None and holding.exists():
+            # Branch is checked out in a live tree — full check (commits beyond
+            # main OR dirty working tree, fail-safe True on any error).
+            unsafe = await self.worktree_has_unsaved_work(holding, branch_name)
+        else:
+            # Dangling ref, or a worktree admin entry whose directory is gone
+            # (e.g. rmtree'd above but still tracked by git — the 3576 shape):
+            # no live working tree to be dirty, so only commits-beyond-main
+            # can carry work.
+            unsafe = await self._branch_has_commits_beyond_main(full_branch)
+
+        if unsafe:
+            raise RuntimeError(
+                f'create_worktree: refusing to delete leftover branch '
+                f'{full_branch!r} — it carries commits beyond '
+                f'{self.config.main_branch}, has uncommitted changes, or its '
+                f'state could not be verified (fail-safe). This would destroy '
+                f'work. Inspect it and, once any wanted work is preserved, '
+                f'remove it manually: '
+                f'`git worktree remove --force <path>` (if checked out) then '
+                f'`git branch -D {full_branch}`.'
+            )
+
+        # Provably empty AND clean → safe to remove.  Clear any worktree (and
+        # its admin entry) holding the branch first, else `git branch -D` fails
+        # with "branch is checked out" (the silent-failure that caused 3576).
+        if holding is not None:
+            rc_rm, _, err_rm = await _run(
+                ['git', 'worktree', 'remove', '--force', str(holding)],
+                cwd=self.project_root,
+            )
+            if rc_rm != 0:
+                logger.warning(
+                    'create_worktree: `git worktree remove` for leftover %s '
+                    'failed (rc=%d): %s — pruning admin entries and retrying '
+                    'branch delete', holding, rc_rm, err_rm.strip(),
+                )
+            await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+
+        rc_del, _, err_del = await _run(
+            ['git', 'branch', '-D', full_branch], cwd=self.project_root,
+        )
+        if rc_del != 0:
+            raise RuntimeError(
+                f'create_worktree: failed to delete provably-empty leftover '
+                f'branch {full_branch!r} (rc={rc_del}): {err_del.strip()}. It '
+                f'may still be checked out in a worktree; remove that worktree '
+                f'first (`git worktree list` to find it).'
+            )
+
+        # Re-verify the ref is actually gone before `git worktree add` collides.
+        rc_chk, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', full_branch], cwd=self.project_root,
+        )
+        if rc_chk == 0:
+            raise RuntimeError(
+                f'create_worktree: leftover branch {full_branch!r} still '
+                f'present after `git branch -D`; aborting rather than colliding '
+                f'on `git worktree add`.'
+            )
+        logger.info(
+            'create_worktree: removed provably-empty leftover branch %s '
+            '(no commits beyond main, clean/no working tree)', full_branch,
         )
 
     async def commit(self, worktree: Path, message: str) -> str | None:

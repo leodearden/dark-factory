@@ -5270,6 +5270,34 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # never resolved the L0.  Either way a human should know — submit
         # an L1 (deduped) so the task isn't silently parked.
         await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
+
+        # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
+        # The steward has finished (or never ran) and this workflow slot is
+        # about to exit, so the L0's only consumer is dead.  Leaving it pending
+        # strands an orphan that the orphan-L0 reaper later promotes into a
+        # DUPLICATE L1 (esc-3576-234 in the 2026-05-29 incident) — pure churn,
+        # since _ensure_l1_escalation_for_blocked above already filed the human-
+        # facing L1.  Mirrors the defensive dismissal block at the
+        # skip_escalation path above.  Guarded on escalation_queue because the
+        # fall-through is also reached when no queue is wired.
+        if self.escalation_queue:
+            orphan_l0 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            for esc in orphan_l0:
+                self.escalation_queue.resolve(
+                    esc.id,
+                    'Auto-dismissed: workflow exiting BLOCKED, steward done '
+                    '(L1 filed for human handoff)',
+                    dismiss=True,
+                    resolved_by='auto-dismissed',
+                )
+            if orphan_l0:
+                logger.info(
+                    'Task %s: dismissed %d orphan L0(s) on BLOCKED fall-through '
+                    '(steward consumer dead; L1 already filed)',
+                    self.task_id, len(orphan_l0),
+                )
         return WorkflowOutcome.BLOCKED
 
     def _durable_ref_suffix(self) -> str:

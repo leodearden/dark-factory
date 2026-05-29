@@ -1787,8 +1787,11 @@ class TestTaskFailureEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-        # Check L0 escalation was created (the per-failure one).
-        # An L1 is also submitted on the fallthrough BLOCKED path.
+        # Check L0 escalation was created (the per-failure one).  An L1 is
+        # also submitted on the fallthrough BLOCKED path (Fix A), and Fix #2
+        # then DISMISSES the orphan L0 on that same fall-through — the steward
+        # (its only consumer) is done and the slot is exiting — so the L0
+        # survives on disk as 'dismissed' rather than 'pending'.
         l0 = queue.get_by_task('42', level=0)
         assert len(l0) == 1
         esc = l0[0]
@@ -1796,7 +1799,7 @@ class TestTaskFailureEscalation:
         assert esc.severity == 'blocking'
         assert esc.agent_role == 'orchestrator'
         assert esc.task_id == '42'
-        assert esc.status == 'pending'
+        assert esc.status == 'dismissed'
         # L1 fallthrough escalation must also be present (Fix A).
         assert queue.has_open_l1('42')
 

@@ -1768,6 +1768,77 @@ Output JSON matching the schema. Every task must appear in the output.
         # blocked is a deliberate state and we only flip it to done on
         # observed evidence.
         if status == 'blocked':
+            # Fix #1b — defense-in-depth backstop for the stranded-blocked gap.
+            # A task left 'blocked' with NO open escalation AND no active
+            # workflow is an orphaned recovery: its blocking escalation was
+            # resolved directly with no live workflow to re-pend it (3576,
+            # 2026-05-29).  blocked→pending recovery is owned exclusively by
+            # the active-workflow resume path and the L2-cascade / direct-resolve
+            # event flips (Fix #1a); a 'blocked' row with no escalation at all
+            # has no event left to fire, so it would sit forever.
+            #
+            # We RE-FILE a single L1 — we NEVER change status.  Re-filing (not
+            # re-pending) cannot yank a deliberate release_workflow blocked-park:
+            # a parked /unblock task either still has an open L1 (→ skipped by
+            # the pending-escalation check) or, if a human resolved its L1 and
+            # is mid-merge, the re-filed L1 is harmless noise they dismiss.
+            # Fix #1a then performs the actual re-pend when this L1 is resolved.
+            #
+            # Self-dedupes: once filed, the pending-escalation check below
+            # suppresses re-filing on the next cycle until it is resolved.
+            if (
+                self.config.stranded_blocked_escalate_enabled
+                and self._escalation_queue is not None
+                and tid not in self._escalation_events       # no active workflow
+                and tid not in self._workflow_cancel_at       # not a recent cancel/park
+                and not self._escalation_queue.get_by_task(tid, status='pending')
+            ):
+                from escalation.models import Escalation
+
+                esc = Escalation(
+                    id=self._escalation_queue.make_id(tid),
+                    task_id=tid,
+                    agent_role='harness-stranded-blocked-reaper',
+                    severity='blocking',
+                    category='task_failure',
+                    summary=(
+                        f'Stranded blocked: task {tid} blocked with no open '
+                        f'escalation and no active workflow — likely an orphaned '
+                        f'recovery; needs re-pend or triage.'
+                    )[:200],
+                    detail=(
+                        f'Task {tid} is in status=blocked with no commit on '
+                        f'main (no out-of-band merge), no pending escalation, '
+                        f'and no active workflow slot.  This is the stranded-'
+                        f'blocked-on-direct-resolution shape: a blocking '
+                        f'escalation was resolved directly while no workflow '
+                        f'owned the re-pend, so blocked→pending never fired.\n\n'
+                        f'Resolve this L1 to re-pend the task '
+                        f'(Harness._on_escalation_resolved / Fix #1a flips it '
+                        f'blocked→pending on resolution), or triage/cancel the '
+                        f'task if it should stay parked.'
+                    ),
+                    suggested_action='manual_intervention',
+                    level=1,
+                )
+                self._escalation_queue.submit(esc)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=tid,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': 'task_failure',
+                            'severity': 'blocking',
+                            'level': 1,
+                            'reason': 'stranded-blocked-backstop',
+                        },
+                    )
+                logger.warning(
+                    'Reconcile: task %s stranded blocked with no open '
+                    'escalation/active workflow — re-filed L1 %s (no status '
+                    'change)', tid, esc.id,
+                )
             return None
 
         # An open L1 escalation is the deliberate human-handoff signal (e.g. an
@@ -3972,6 +4043,43 @@ Output JSON matching the schema. Every task must appear in the output.
                 self._cascade_unblock_member(escalation),
                 label=(
                     f'cascade-unblock task {escalation.task_id} '
+                    f'(via {escalation.resolved_by})'
+                ),
+            )
+
+        # Fix #1a — event-driven re-pend on DIRECT resolution of an orphan L1.
+        # The root cause of the 3576 strand (2026-05-29): an L1 resolved
+        # directly (resolved_by='escalation-watcher-auto', not 'l2-cascade:')
+        # while NO workflow owned the task.  The wake event.set() above woke
+        # nothing (no active workflow); the cascade flip above did not match
+        # (no l2-cascade prefix).  So the blocked→pending flip never happened
+        # and the task stayed stranded.  This is the precise inverse: when the
+        # task has no active workflow slot (task_id not in _escalation_events),
+        # WE perform the flip — reusing _cascade_unblock_member, which rechecks
+        # status=='blocked' and TOCTOU-guards via SetTaskStatusRejected.
+        #
+        # Gates:
+        #   - level==1, status=='resolved' (NOT 'dismissed' — a dismissed
+        #     escalation means "abandon the task"; leave it blocked).
+        #   - NOT l2-cascade (the block above already scheduled that flip).
+        #   - task_id NOT in _escalation_events: a live workflow owns its own
+        #     re-pend (woken by event.set()); only flip when orphaned.  This is
+        #     the precise inverse of the root cause and avoids racing the rare
+        #     active-workflow re-pend (idempotent anyway via the blocked recheck).
+        if (
+            escalation.level == 1
+            and escalation.status == 'resolved'
+            and escalation.task_id != self._SCHEDULER_PAUSE_SENTINEL
+            and not (
+                isinstance(escalation.resolved_by, str)
+                and escalation.resolved_by.startswith('l2-cascade:')
+            )
+            and escalation.task_id not in self._escalation_events
+        ):
+            self._schedule_coro_threadsafe(
+                self._cascade_unblock_member(escalation),
+                label=(
+                    f'orphan-unblock task {escalation.task_id} '
                     f'(via {escalation.resolved_by})'
                 ),
             )

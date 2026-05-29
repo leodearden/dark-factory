@@ -253,6 +253,31 @@ class TestDirectResolveOrphanUnblock:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
+    async def test_scheduler_pause_sentinel_excluded(self, harness: Harness):
+        """The synthetic __scheduler__ pause sentinel is NOT a real task — its
+        resolution has dedicated auto-resume handling, so the orphan-unblock
+        path must skip it (no get_status flip, no stray background task)."""
+        esc = _make_l1_esc(
+            task_id=harness._SCHEDULER_PAUSE_SENTINEL, status='resolved',
+            resolved_by='interactive',
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # Not paused → the dedicated auto-resume block is also a no-op, so the
+        # ONLY thing that could schedule a background task is the orphan-unblock
+        # path — which must skip the sentinel.  harness.scheduler is a MagicMock
+        # (fixture); narrow it so the is_paused mock attribute is settable — the
+        # real Scheduler.is_paused is a read-only @property.
+        assert isinstance(harness.scheduler, MagicMock)
+        harness.scheduler.is_paused = False
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert harness._background_tasks == set(), (
+            'orphan-unblock must not schedule any coro for the pause sentinel'
+        )
+
     async def test_merge_deferred_task_not_flipped(
         self, harness: Harness, caplog
     ):
