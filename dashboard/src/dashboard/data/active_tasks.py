@@ -42,6 +42,10 @@ from dashboard.data.tasks import fetch_tasks
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
 
+# Maximum done tasks to include per project when the caller opts in via
+# ``max_done_per_project``.  Kept at module level so app.py can import it.
+_MAX_DONE_PER_PROJECT = 50
+
 
 def _project_label(root: Path) -> str:
     """Display label for a project root path: the directory's basename."""
@@ -94,12 +98,20 @@ async def _shape_one_project(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: Path,
+    *,
+    max_done_per_project: int = 0,
 ) -> tuple[list[dict], bool]:
     """Build (active_tasks, offline) for a single project root.
 
     *offline* is True when the MCP fetch failed for this project; the
     caller surfaces that in the API payload so the React Tasks tab can
     show an offline banner.
+
+    When *max_done_per_project* > 0, the most-recent N done tasks
+    (sorted by ``updated_at`` descending, then ``id`` descending) are
+    appended to the returned list.  Each done row carries a ``completed``
+    field (the ``updated_at`` ISO string or ``''``).  Active rows are
+    unaffected.
     """
     project = _project_label(project_root)
     fetched = await fetch_tasks(client, config, project_root)
@@ -168,12 +180,49 @@ async def _shape_one_project(
             'train': train,
         })
 
+    if max_done_per_project > 0:
+        done_tasks = [t for t in tasks if t.get('status') == 'done']
+        # Sort by updated_at descending; id descending as tie-breaker.
+        done_tasks.sort(
+            key=lambda t: (t.get('updated_at') or '', t.get('id') or 0),
+            reverse=True,
+        )
+        for task in done_tasks[:max_done_per_project]:
+            task_id = task['id']
+            uid = _task_uid(project, task_id)
+            meta_files = list((task.get('metadata') or {}).get('files') or [])
+            train_meta = (task.get('metadata') or {}).get('train')
+            train = (
+                {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
+                if isinstance(train_meta, dict) and train_meta.get('id')
+                else None
+            )
+            wt = worktrees.get(task_id) or {}
+            active.append({
+                'id': uid,
+                'project': project,
+                'title': task.get('title') or '',
+                'description': task.get('description') or '',
+                'details': task.get('details') or '',
+                'status': 'done',
+                'agent': f'claude-task-{task_id}' if wt else None,
+                'started': 0,
+                'loops': int(wt.get('iteration_count') or 0),
+                'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
+                'deps': [],
+                'meta_files': meta_files,
+                'train': train,
+                'completed': task.get('updated_at') or '',
+            })
+
     return active, False
 
 
 async def collect_active_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
+    *,
+    max_done_per_project: int = 0,
 ) -> tuple[list[dict], list[str]]:
     """Collect active tasks across all known projects.
 
@@ -181,13 +230,19 @@ async def collect_active_tasks(
     the list of project labels whose MCP fetch failed.  The handler turns a
     non-empty *offline_projects* into ``offline: True`` on the dashboard payload.
 
+    When *max_done_per_project* > 0, the most-recent N done tasks per project
+    are appended to the returned list (each with a ``completed`` field).
+    Default 0 leaves the return shape unchanged — scheduler.py is unaffected.
+
     Lock state is surfaced via the scheduler endpoint — see
     /api/v2/dashboard/scheduler.
     """
     all_active: list[dict] = []
     offline_projects: list[str] = []
     for root in _all_project_roots(config):
-        active, offline = await _shape_one_project(client, config, root)
+        active, offline = await _shape_one_project(
+            client, config, root, max_done_per_project=max_done_per_project,
+        )
         if offline:
             offline_projects.append(_project_label(root))
         all_active.extend(active)
