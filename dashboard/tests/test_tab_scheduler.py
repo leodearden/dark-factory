@@ -114,16 +114,19 @@ def test_scheduler_module_filter_is_consistent_with_rows(tab_scheduler_jsx_body)
         'tab_scheduler.jsx visibleModules must not contain the holder_project widening '
         'keep-branch (m.holder_project && ...includes(m.holder_project))'
     )
-    # visibleModules must filter on m.project (strict per-project predicate)
+    # visibleModules must use the specific new strict predicate:
+    #   m => !m.project || effectiveSelected.includes(m.project)
+    # The discriminating part is `effectiveSelected.includes(m.project)` —
+    # the old implementation had `m.holder_project && ...includes(m.holder_project)`
+    # which the negative assertion above already excludes. Asserting the literal
+    # new predicate guards against generic `modules.filter(...m.project...)` forms
+    # that would also have passed the old (holder_project-widened) implementation.
     assert re.search(
-        r'visibleModules[^=\n]*=.*filter.*m\.project',
-        tab_scheduler_jsx_body,
-    ) or re.search(
-        r'modules\.filter.*m\.project',
+        r'effectiveSelected\.includes\s*\(\s*m\.project\s*\)',
         tab_scheduler_jsx_body,
     ), (
-        'tab_scheduler.jsx visibleModules must filter on m.project '
-        '(strict per-project chip-selection predicate)'
+        'tab_scheduler.jsx visibleModules must use the strict per-project predicate '
+        'effectiveSelected.includes(m.project), not a holder_project widening branch'
     )
 
 
@@ -269,11 +272,12 @@ def test_multiselect_select_none_clears_to_empty(shell_jsx_body):
     assert '[options[0]]' not in shell_jsx_body, (
         'shell.jsx still contains [options[0]] phantom-single-selection pattern'
     )
-    # The select-none branch must call onChange([]) — regex that captures it
-    # within the allSelected ternary context
-    assert re.search(r'onChange\s*\(\s*allSelected\s*\?.*\[\s*\]', shell_jsx_body), (
+    # The select-none branch must call onChange([]) — specifically the ternary
+    # `onChange(allSelected ? [] :` (not the old `onChange(allSelected ? [options[0]] : [])`
+    # which also ends with `[]` but on the select-all branch, not the select-none branch).
+    assert re.search(r'onChange\s*\(\s*allSelected\s*\?\s*\[\s*\]\s*:', shell_jsx_body), (
         'shell.jsx MultiSelect select-none/select-all toggle must call onChange([]) '
-        'for the allSelected (select-none) branch'
+        'as the select-none branch: onChange(allSelected ? [] : options)'
     )
 
 
