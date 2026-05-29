@@ -1154,6 +1154,41 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
+    def test_stage2_escalate_blocker_sanctioned_only_for_stale_flag(self):
+        """Stage 2 prompt must scope escalate_blocker to the FIX D stale-flag case only.
+
+        Task 1570 / FIX B: the Stage-2 LLM agent was over-generalising
+        escalate_blocker to integrity/task-lifecycle findings, bypassing the
+        harness persistence gate.  The fix adds a positive scoping directive
+        so the agent knows escalate_blocker is sanctioned ONLY for the
+        stale-Mem0-flag (FIX D) case.
+
+        Template: test_stage2_directs_cancellation_via_set_task_status
+        (positive `in` + negative `not in` pattern).
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        # --- POSITIVE: the stale-flag FIX D sanction must remain intact ---
+        assert 'reconciliation_stale_flag' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must retain the 'reconciliation_stale_flag' "
+            "category reference so FIX D escalations remain sanctioned."
+        )
+        assert 'Stale Flag Escalation (FIX D)' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must retain the 'Stale Flag Escalation (FIX D)' "
+            "section header so agents can locate the stale-flag guidance."
+        )
+
+        # --- NEGATIVE / RED discriminator: explicit scoping prohibition ---
+        # Step 4 adds the sentinel phrase 'escalate_blocker is sanctioned ONLY for'.
+        # Before step 4 this assertion FAILS (test is RED on base branch).
+        # After step 4 it PASSES (the directive is present).
+        assert 'escalate_blocker is sanctioned ONLY for' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain an explicit scoping directive "
+            "'escalate_blocker is sanctioned ONLY for' so agents know the tool "
+            "is restricted to the Stale Flag Escalation (FIX D) case and must "
+            "NOT escalate integrity/task-lifecycle findings via escalate_blocker."
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
