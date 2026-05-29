@@ -862,6 +862,19 @@ class OrchestratorConfig(BaseSettings):
     stranded_reconcile_enabled: bool = Field(default=True)
     stranded_reconcile_interval_secs: float = Field(default=900.0)
 
+    # Backstop for the stranded-`blocked` gap: a task left `blocked` with no
+    # open escalation AND no active workflow is an orphaned recovery (its
+    # blocking escalation was resolved directly with no live workflow to
+    # re-pend it — the 3576 incident, 2026-05-29).  The stranded-reconcile
+    # sweep deliberately refuses `blocked`→`pending` (only flips to `done` on
+    # on-main evidence), so such a task falls between every recovery mechanism.
+    # When enabled, the sweep re-files a single L1 (it NEVER changes status —
+    # re-filing can't yank a deliberate `release_workflow` blocked-park) so a
+    # human/auto-watcher re-triages; the event-driven re-pend
+    # (``_on_escalation_resolved``) then performs the actual flip once that L1
+    # is resolved.  Self-dedupes via the pending-escalation check.
+    stranded_blocked_escalate_enabled: bool = Field(default=True)
+
     # Scheduler park-and-stop (AFK hardening, task 1322).
     # When park_stop_parked_threshold tasks transition to 'blocked' within
     # park_stop_parked_window_hours, the scheduler is paused automatically.

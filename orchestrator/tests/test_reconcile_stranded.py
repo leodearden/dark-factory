@@ -1,16 +1,20 @@
 """Tests for Harness._reconcile_stranded_in_progress and the _pid_alive helper."""
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import time as _time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness, _pid_alive
@@ -2409,6 +2413,130 @@ async def test_blocked_without_on_main_evidence_left_alone(harness: Harness):
     changed = await harness._reconcile_stranded_in_progress()
 
     assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Fix #1b: backstop stranded-`blocked` sweep (re-file L1, never re-pend)
+# ---------------------------------------------------------------------------
+
+def _pending(queue: EscalationQueue, tid: str) -> list[Escalation]:
+    return queue.get_by_task(tid, status='pending')
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_refiles_single_l1_without_status_change(
+    harness: Harness, tmp_path: Path,
+):
+    """blocked + no on-main evidence + no open escalation + no active workflow
+    → exactly one L1 re-filed, status UNCHANGED (never re-pended)."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = True
+    # is_ancestor=False, find_merge_marker=None (fixture defaults) → no on-main.
+
+    result = await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert result is None
+    # Status must NOT change — re-file, never re-pend.
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+    pending = _pending(harness._escalation_queue, '601')
+    assert len(pending) == 1, f'expected exactly one re-filed escalation, got {pending}'
+    assert pending[0].level == 1
+    assert pending[0].category == 'task_failure'
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_second_sweep_does_not_duplicate(
+    harness: Harness, tmp_path: Path,
+):
+    """Once the backstop L1 is pending, a subsequent sweep must NOT re-file
+    (the pending-escalation check self-dedupes)."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = True
+
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+    assert len(_pending(harness._escalation_queue, '601')) == 1
+
+    # Second sweep — the L1 from the first pass is still pending.
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert len(_pending(harness._escalation_queue, '601')) == 1, (
+        'second sweep must not file a duplicate L1'
+    )
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_skips_when_escalation_already_open(
+    harness: Harness, tmp_path: Path,
+):
+    """An already-open escalation (any level) suppresses the re-file."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = True
+    harness._escalation_queue.submit(Escalation(
+        id=harness._escalation_queue.make_id('601'),
+        task_id='601', agent_role='steward', severity='blocking',
+        category='design_concern', summary='pre-existing', level=1,
+    ))
+
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    pending = _pending(harness._escalation_queue, '601')
+    assert len(pending) == 1, 'must not add a second escalation'
+    assert pending[0].category == 'design_concern', 'pre-existing one untouched'
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_skips_when_active_workflow(
+    harness: Harness, tmp_path: Path,
+):
+    """An active workflow (task_id in _escalation_events) owns its own re-pend
+    — the backstop must not re-file."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = True
+    harness._escalation_events['601'] = asyncio.Event()
+
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert _pending(harness._escalation_queue, '601') == []
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_skips_when_recently_cancelled(
+    harness: Harness, tmp_path: Path,
+):
+    """A recent release_workflow/cancel park (task_id in _workflow_cancel_at)
+    must not be re-filed — the human is mid-handling."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = True
+    harness._workflow_cancel_at['601'] = _time.monotonic()
+
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert _pending(harness._escalation_queue, '601') == []
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_skips_when_flag_disabled(
+    harness: Harness, tmp_path: Path,
+):
+    """Config flag off → no re-file (clean disable)."""
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness.config.stranded_blocked_escalate_enabled = False
+
+    await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert _pending(harness._escalation_queue, '601') == []
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_skips_when_no_queue(harness: Harness):
+    """No escalation queue wired → no crash, no action."""
+    harness._escalation_queue = None
+    harness.config.stranded_blocked_escalate_enabled = True
+
+    result = await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
+
+    assert result is None
     harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
