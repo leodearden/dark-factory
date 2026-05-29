@@ -92,6 +92,42 @@ def _parse_max_width(block: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# step-13: visibleModules uses same chip-selection predicate as visibleRows
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_module_filter_is_consistent_with_rows(tab_scheduler_jsx_body):
+    """tab_scheduler.jsx visibleModules must use the chip-selection predicate
+    (module visible iff !m.project or selection includes m.project) and must
+    NOT contain the old holder_project widening keep-branch.
+
+    Asserts:
+    - The old `m.holder_project && ...includes(m.holder_project)` widening
+      clause is absent from the modules filter
+    - visibleModules filter uses the same project predicate as visibleRows
+    """
+    # The permissive holder_project OR-branch must be gone
+    assert not re.search(
+        r'm\.holder_project\s*&&\s*[^;]+includes\s*\(\s*m\.holder_project\s*\)',
+        tab_scheduler_jsx_body,
+    ), (
+        'tab_scheduler.jsx visibleModules must not contain the holder_project widening '
+        'keep-branch (m.holder_project && ...includes(m.holder_project))'
+    )
+    # visibleModules must filter on m.project (strict per-project predicate)
+    assert re.search(
+        r'visibleModules[^=\n]*=.*filter.*m\.project',
+        tab_scheduler_jsx_body,
+    ) or re.search(
+        r'modules\.filter.*m\.project',
+        tab_scheduler_jsx_body,
+    ), (
+        'tab_scheduler.jsx visibleModules must filter on m.project '
+        '(strict per-project chip-selection predicate)'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-11: tab_scheduler.jsx renders ProjectChips with data-derived project list
 # ---------------------------------------------------------------------------
 
