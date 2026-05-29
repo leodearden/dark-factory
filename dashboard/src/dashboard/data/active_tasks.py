@@ -38,7 +38,7 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import fetch_statuses, fetch_tasks
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
 
@@ -247,3 +247,28 @@ async def collect_active_tasks(
             offline_projects.append(_project_label(root))
         all_active.extend(active)
     return all_active, offline_projects
+
+
+async def collect_done_counts(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> dict[str, int]:
+    """Return a ``{project_label: done_count}`` map for all reachable projects.
+
+    Uses the compact ``fetch_statuses`` (the same source the burndown collector
+    uses) so the count agrees with the burndown snapshot and is ~95% smaller
+    than a full ``fetch_tasks`` call.
+
+    Projects whose ``fetch_statuses`` returns an offline marker are silently
+    omitted — the caller can fall back to counting loaded done rows from
+    ACTIVE_TASKS.
+    """
+    counts: dict[str, int] = {}
+    for root in _all_project_roots(config):
+        result = await fetch_statuses(client, config, root)
+        # Skip offline markers (dict with 'offline' key).
+        if isinstance(result, dict) and result.get('offline'):
+            continue
+        label = _project_label(root)
+        counts[label] = sum(1 for s in result.values() if s == 'done')
+    return counts
