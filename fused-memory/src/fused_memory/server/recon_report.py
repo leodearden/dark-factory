@@ -227,7 +227,15 @@ class ReconReportState:
         task_id: str | None = None,
         flag_type: str | None = None,
     ) -> dict[str, Any]:
-        """Append a finding to the current report entry, with in-run dedup."""
+        """Append a finding to the current report entry, with in-run dedup.
+
+        In-run dedup (PRD §9.2) is scoped to the ``run_id`` across ALL stages
+        of the same run.  If (task_id, flag_type) was already filed by any
+        earlier stage of this run, ``duplicate_finding`` is returned with the
+        original finding_id — Stage 2 can then attach citations to that finding
+        rather than creating a redundant row.  Cross-run isolation is preserved:
+        findings from a different run_id are never considered.
+        """
         entry = self._resolve_entry(run_id)
         if entry is None:
             return _ERR_RUN_UNKNOWN.copy()
@@ -243,12 +251,18 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
-        # In-run dedup: skip when both are None (informational findings)
+        # In-run dedup: skip when both are None (informational findings).
+        # Scan ALL stages of this run_id so Stage 2 cannot duplicate Stage 1's
+        # findings.  Each stage's _signature_to_finding map remains the per-stage
+        # source of truth; the scan reads across them while filtering strictly on
+        # run_id to preserve cross-run isolation.
         sig = (task_id, flag_type)
         if sig != (None, None):
-            existing_id = entry._signature_to_finding.get(sig)
-            if existing_id is not None:
-                return _duplicate_finding_error(existing_id)
+            for (rid, _stage), other in self._state.items():
+                if rid == run_id:
+                    existing_id = other._signature_to_finding.get(sig)
+                    if existing_id is not None:
+                        return _duplicate_finding_error(existing_id)
 
         finding_id = str(uuid.uuid4())
         finding = _Finding(
@@ -643,7 +657,8 @@ Tools: start_report, add_finding, set_stat, inc_stat, complete,
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
-2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type).
+2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type
+                  across ALL stages of the same run_id).
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 
@@ -690,8 +705,10 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         PRD §9.2 — add_finding(run_id, severity, category, description,
                                 suggested_action, actionable, task_id, flag_type).
         Returns {finding_id} or a structured duplicate/error dict.
-        In-run dedup: if (task_id, flag_type) was already reported (and
-        neither is None), returns {error: duplicate_finding, existing_finding_id}.
+        In-run dedup: if (task_id, flag_type) was already reported by ANY stage
+        of this run_id (and neither is None), returns
+        {error: duplicate_finding, existing_finding_id}.  Attach citations to
+        existing_finding_id instead of creating a redundant row.
         """
         return state.add_finding(
             run_id=run_id,
