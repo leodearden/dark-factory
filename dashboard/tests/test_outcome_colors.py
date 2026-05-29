@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dashboard.data.outcome_colors import assign_outcome_colors, classify_outcome
 
-
 # ---------------------------------------------------------------------------
 # Step-1: reify leaf-signal — five cross-family codes all get distinct colors
 # ---------------------------------------------------------------------------
