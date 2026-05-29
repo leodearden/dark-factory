@@ -805,6 +805,44 @@ async def test_get_scheduler_snapshot_single_flight_collapses_concurrent_misses(
 
 
 # ---------------------------------------------------------------------------
+# task-1569 step-5: endpoint threads snapshot_at through the envelope
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_endpoint_threads_snapshot_at_through_envelope(client):
+    """GET /scheduler passes the real snapshot_at from get_scheduler_snapshot into the envelope.
+
+    When get_scheduler_snapshot returns a known snapshot_at string, the
+    SCHEDULER.snapshot_at field in the response must equal it.  The envelope
+    must still contain all expected keys with empty-state values.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    known_snapshot_at = '2026-05-29T12:00:00+00:00'
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    with patch(
+        'dashboard.app.get_scheduler_snapshot',
+        new=AsyncMock(return_value=(empty_6tuple, known_snapshot_at)),
+    ):
+        resp = client.get('/api/v2/dashboard/scheduler')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert 'SCHEDULER' in data
+    inner = data['SCHEDULER']
+    assert inner['snapshot_at'] == known_snapshot_at
+    # Verify envelope structure is still intact
+    for key in ('rows', 'modules', 'pin_queue', 'events_by_task', 'offline',
+                'offline_projects', 'paused', 'paused_projects'):
+        assert key in inner, f'missing key {key!r}'
+    assert inner['rows'] == []
+    assert inner['modules'] == []
+    assert inner['offline'] is False
+    assert inner['paused'] is False
+
+
+# ---------------------------------------------------------------------------
 # step-15: POST /scheduler/override — validation → 400
 # ---------------------------------------------------------------------------
 
