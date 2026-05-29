@@ -95,7 +95,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
-from dashboard.data.scheduler import collect_scheduler_state, get_scheduler_snapshot
+from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
