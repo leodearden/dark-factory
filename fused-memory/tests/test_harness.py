@@ -5797,3 +5797,187 @@ async def test_project_loop_quarantines_buffered_events_on_unknown_project_error
         f'_sleep(5) must not be called on UnknownProjectError (no retry); '
         f'got {len(cooldown_calls)} call(s): {sleep_mock.await_args_list!r}'
     )
+
+
+# ── Task 1570: open-escalation suppression in _maybe_remediate ────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_suppresses_all_when_open_escalation_exists(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """ALL-SUPPRESSED: a single actionable finding with an already-open pending
+    escalation must NOT trigger a remediation run.
+
+    Task 1570 / FIX A: _maybe_remediate checks each actionable finding against
+    the escalation queue (get_pending + fingerprint match) and skips the
+    _run_remediation_pass call when all findings are covered, emitting a
+    structured suppress log instead.
+
+    RED on base branch: current _maybe_remediate spawns _run_remediation_pass
+    unconditionally for any actionable finding, so the journal will contain a
+    remediation run and no suppress-log record will be present.
+    """
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Use the first actionable finding from the standard fixture set.
+    actionable_finding = _make_s3_findings()[0]
+    assert actionable_finding['actionable'] is True
+
+    # Compute the same fingerprint _escalate / _finding_persistence_count use.
+    target_fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        actionable_finding.get('category') or '',
+        _derive_affected_ids(actionable_finding),
+        actionable_finding.get('description') or '',
+    )
+
+    # Seed the queue with a PENDING escalation whose fingerprint matches.
+    seed_esc = Escalation(
+        id=esc_queue.make_id('recon-test'),
+        task_id='recon-test',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='Pre-existing open escalation for this finding',
+        detail='Seeded by test',
+        dedupe_fingerprint=target_fp,
+    )
+    esc_queue.submit(seed_esc)
+
+    # Verify the seed is visible as pending before the cycle runs.
+    assert any(e.dedupe_fingerprint == target_fp for e in esc_queue.get_pending()), (
+        'Seeded escalation not visible in get_pending() — test setup error'
+    )
+
+    # Push one event so the cycle has something to process.
+    await event_buffer.push(_make_event('test-project'))
+
+    # S1 + S2 return empty; S3 returns the single actionable finding.
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[actionable_finding])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    # (a) Journal must contain ONLY the parent run — no remediation run.
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert remediation_runs == [], (
+        f'Expected no remediation run (finding is covered by open escalation), '
+        f'got {len(remediation_runs)}: {[r.id for r in remediation_runs]}'
+    )
+
+    # (b) A structured suppress-log record must have been emitted.
+    suppress_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_suppressed_open_escalation'
+    ]
+    assert len(suppress_records) >= 1, (
+        f'Expected at least one "reconciliation.remediation_suppressed_open_escalation" '
+        f'log record; got records: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """PARTIAL: two actionable findings, only one with an open escalation.
+
+    _maybe_remediate must call _run_remediation_pass exactly ONCE, passing
+    only the uncovered finding — the covered one is silently suppressed.
+
+    Task 1570 / FIX A — partial suppression path.
+
+    RED on base branch: current _maybe_remediate passes BOTH actionable findings
+    to _run_remediation_pass; it does not filter by open-escalation coverage.
+    """
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Two actionable findings from the standard fixture.
+    findings = _make_s3_findings()
+    covered_finding = findings[0]    # will have an open escalation
+    uncovered_finding = findings[1]  # no pending escalation
+    assert covered_finding['actionable'] is True
+    assert uncovered_finding['actionable'] is True
+
+    # Seed queue only for the COVERED finding.
+    covered_fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        covered_finding.get('category') or '',
+        _derive_affected_ids(covered_finding),
+        covered_finding.get('description') or '',
+    )
+    seed_esc = Escalation(
+        id=esc_queue.make_id('recon-test'),
+        task_id='recon-test',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='Open escalation covering the first finding only',
+        detail='Seeded by test',
+        dedupe_fingerprint=covered_fp,
+    )
+    esc_queue.submit(seed_esc)
+
+    # Push event for the cycle.
+    await event_buffer.push(_make_event('test-project'))
+
+    # S1 + S2 return empty; S3 returns both actionable findings.
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[covered_finding, uncovered_finding])
+
+    # Spy on _run_remediation_pass — stub it out so we can inspect call args.
+    remediation_calls: list[list[dict]] = []
+
+    async def spy_remediate(
+        project_id, parent_run_id, findings_arg, tier,
+        *, project_root, filtered_task_tree=None,
+    ):
+        remediation_calls.append(list(findings_arg))
+
+    harness._run_remediation_pass = spy_remediate  # type: ignore[method-assign]
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # _run_remediation_pass must be called exactly once …
+    assert len(remediation_calls) == 1, (
+        f'Expected _run_remediation_pass called exactly once (partial suppression), '
+        f'got {len(remediation_calls)} call(s)'
+    )
+
+    # … with ONLY the uncovered finding.
+    passed_findings = remediation_calls[0]
+    assert passed_findings == [uncovered_finding], (
+        f'Expected _run_remediation_pass called with only the uncovered finding '
+        f'{uncovered_finding!r}, got {passed_findings!r}'
+    )
