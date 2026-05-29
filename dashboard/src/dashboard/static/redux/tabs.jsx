@@ -241,11 +241,7 @@ function OrchTab({ projectFilter, search }) {
             <ProjectGroup id={String(o.pid)} label={o.project} open={openMap[String(o.pid)]} onToggle={() => toggle(String(o.pid))} summary={summary}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16 }}>
                 <div>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
-                    <div>
-                      <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 2 }}>Current focus</div>
-                      <div style={{ fontSize: 13, color: 'var(--fg-0)' }}>{o.current_task}</div>
-                    </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10, gap: 12, flexWrap: 'wrap' }}>
                     <div className="seg" role="group" aria-label="Task filter">
                       <button className={filter.active   ? 'on' : ''} onClick={() => flipFilter(o.pid, 'active')}>Active · {counts.active}</button>
                       <button className={filter.pending  ? 'on' : ''} onClick={() => flipFilter(o.pid, 'pending')}>Pending · {counts.pending}</button>
@@ -255,7 +251,7 @@ function OrchTab({ projectFilter, search }) {
 
                   <table className="tbl" style={{ marginTop: 4, tableLayout: 'fixed', width: '100%' }}>
                     <colgroup>
-                      <col style={{ width: 80 }} />
+                      <col style={{ width: '18ch' }} />
                       <col />
                       <col style={{ width: 130 }} />
                       <col style={{ width: 60 }} />
