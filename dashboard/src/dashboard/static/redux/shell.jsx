@@ -153,6 +153,24 @@ function ChipGroup({ options, value, onChange }) {
   );
 }
 
+// ── Project chip filter (explicit selection: default all; none=[] show nothing) ──
+function ProjectChips({ options, selected, onChange }) {
+  return (
+    <div className="chips">
+      <button onClick={() => onChange(options)} style={{ fontSize: 10, padding: '2px 6px' }}>all</button>
+      <button onClick={() => onChange([])} style={{ fontSize: 10, padding: '2px 6px' }}>none</button>
+      {options.map(o => (
+        <button key={o} className={selected.includes(o) ? 'on' : ''} onClick={() => {
+          const next = selected.includes(o)
+            ? selected.filter(x => x !== o)
+            : [...selected, o];
+          onChange(next);
+        }}>{o}</button>
+      ))}
+    </div>
+  );
+}
+
 function MultiSelect({ label, options, selected, onChange }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -410,4 +428,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
