@@ -12,6 +12,7 @@ from dashboard.data.active_tasks import (
     _attempts_from_review_summary,
     _minutes_since,
     collect_active_tasks,
+    collect_done_counts,
 )
 
 # ---------------------------------------------------------------------------
@@ -468,3 +469,75 @@ async def test_collect_active_tasks_done_ordering_tie_broken_by_id(tmp_path, mon
     assert done_rows[0]['id'] == 'df/T-20', (
         'tie-break: higher id (20) should win over lower id (10)'
     )
+
+
+# ---------------------------------------------------------------------------
+# collect_done_counts (step-5/step-6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_done_counts_returns_per_project_done_count(tmp_path, monkeypatch, dummy_client):
+    """collect_done_counts counts 'done' entries per project label."""
+    df_root = tmp_path / 'dark-factory'
+    df_root.mkdir()
+    reify_root = tmp_path / 'reify'
+    reify_root.mkdir()
+
+    # dark-factory: 3 done out of mixed statuses
+    df_statuses = {1: 'done', 2: 'done', 3: 'in-progress', 4: 'done', 5: 'pending'}
+    # reify: 1 done
+    reify_statuses = {10: 'done', 11: 'in-progress', 12: 'pending'}
+
+    async def _fake_fetch_statuses(client, config, project_root):
+        resolved = project_root.resolve()
+        if resolved == df_root.resolve():
+            return dict(df_statuses)
+        if resolved == reify_root.resolve():
+            return dict(reify_statuses)
+        return {'offline': True, 'error': 'not found'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
+
+    cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
+    counts = await collect_done_counts(client=dummy_client, config=cfg)
+
+    assert counts == {'dark-factory': 3, 'reify': 1}
+
+
+@pytest.mark.asyncio
+async def test_collect_done_counts_skips_offline_projects(tmp_path, monkeypatch, dummy_client):
+    """collect_done_counts omits projects whose fetch_statuses returns an offline marker."""
+    online_root = tmp_path / 'online-project'
+    online_root.mkdir()
+    offline_root = tmp_path / 'offline-project'
+    offline_root.mkdir()
+
+    async def _fake_fetch_statuses(client, config, project_root):
+        if project_root.resolve() == offline_root.resolve():
+            return {'offline': True, 'error': 'connection refused'}
+        return {1: 'done', 2: 'in-progress'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
+
+    cfg = DashboardConfig(project_root=online_root, known_project_roots=[offline_root])
+    counts = await collect_done_counts(client=dummy_client, config=cfg)
+
+    assert 'offline-project' not in counts
+    assert counts.get('online-project') == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_done_counts_all_done_zero(tmp_path, monkeypatch, dummy_client):
+    """A project with no done tasks returns 0, not a missing key."""
+    root = tmp_path / 'empty-project'
+    root.mkdir()
+
+    async def _fake_fetch_statuses(client, config, project_root):
+        return {1: 'in-progress', 2: 'pending'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
+    cfg = DashboardConfig(project_root=root)
+    counts = await collect_done_counts(client=dummy_client, config=cfg)
+
+    assert counts == {'empty-project': 0}
