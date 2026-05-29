@@ -1336,6 +1336,7 @@ async def _do_train_merge(
         task_files=req.task_files,
         max_retries=0,
         is_merge_verify=True,
+        force_workspace=req.config.merge_verify_workspace,
         role='merge',
     )
     if not verify.passed:
@@ -1784,6 +1785,7 @@ class MergeWorker:
                 task_files=req.task_files,
                 max_retries=0,
                 is_merge_verify=True,
+                force_workspace=req.config.merge_verify_workspace,
                 role='merge',
             )
             # Transient-infra (disk pressure) retry: an ENOSPC failure is
@@ -1811,6 +1813,7 @@ class MergeWorker:
                         task_files=req.task_files,
                         max_retries=0,
                         is_merge_verify=True,
+                        force_workspace=req.config.merge_verify_workspace,
                         role='merge',
                     )
             if not verify.passed:
@@ -3042,6 +3045,7 @@ class SpeculativeMergeWorker:
                     task_files=req.task_files,
                     max_retries=0,
                     is_merge_verify=True,
+                    force_workspace=req.config.merge_verify_workspace,
                     role='merge',
                 )
             except Exception as exc:
@@ -3086,6 +3090,7 @@ class SpeculativeMergeWorker:
                             task_files=req.task_files,
                             max_retries=0,
                             is_merge_verify=True,
+                            force_workspace=req.config.merge_verify_workspace,
                             role='merge',
                         )
                     except Exception as exc:

@@ -411,6 +411,56 @@ class TestModuleConfigDiscovery:
                     f"Excluded dir {excluded!r} leaked into results as key {key!r}"
                 )
 
+    def test_discover_excludes_leftover_worktree_and_backup_dirs(self, tmp_path: Path):
+        """`.worktrees.old`, `target.old`, `.claude` are pruned by static name.
+
+        Regression guard for the 226-way merge-verify storm: a leftover
+        `.worktrees.old/<id>/orchestrator.yaml` (a full task-worktree checkout
+        carrying a copy of the root config) must NOT register as a phantom
+        module.
+        """
+        for leftover in ('.worktrees.old', 'target.old', '.claude'):
+            nested = tmp_path / leftover / '3859'
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / 'orchestrator.yaml').write_text(
+                yaml.dump({'test_command': 'pytest'})
+            )
+        legit = tmp_path / 'legit'
+        legit.mkdir()
+        (legit / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest legit/'}))
+        configs = _discover_module_configs(tmp_path)
+        assert 'legit' in configs
+        assert not any(
+            k.startswith(('.worktrees.old', 'target.old', '.claude'))
+            for k in configs
+        ), f'leftover dir leaked into module configs: {sorted(configs)}'
+
+    def test_discover_prunes_nested_git_checkouts(self, tmp_path: Path):
+        """Any subdir carrying its own `.git` is a separate checkout, not a module.
+
+        Naming-independent guard: a worktree/clone (`.git` file OR dir) that
+        contains an orchestrator.yaml must be skipped, however it is named —
+        catches stray checkouts the static exclude list does not enumerate.
+        """
+        # (a) a worktree-style nested checkout: `.git` is a FILE
+        wt = tmp_path / 'some_stray_worktree'
+        wt.mkdir()
+        (wt / '.git').write_text('gitdir: /elsewhere/.git/worktrees/x\n')
+        (wt / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        # (b) a clone-style nested checkout: `.git` is a DIR
+        clone = tmp_path / 'vendored_clone'
+        clone.mkdir()
+        (clone / '.git').mkdir()
+        (clone / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        # (c) a legitimate monorepo subproject: NO `.git`
+        legit = tmp_path / 'legit'
+        legit.mkdir()
+        (legit / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest legit/'}))
+        configs = _discover_module_configs(tmp_path)
+        assert 'legit' in configs
+        assert 'some_stray_worktree' not in configs
+        assert 'vendored_clone' not in configs
+
     def test_discover_handles_self_referencing_symlink_loop(self, tmp_path: Path):
         """_discover_module_configs completes without infinite recursion when a symlink loop exists.
 
@@ -912,3 +962,27 @@ class TestParkStopConfig:
         assert config.park_stop_enabled is True
         assert config.park_stop_parked_threshold == 15
         assert config.park_stop_parked_window_hours == 1.0
+
+
+class TestMergeVerifyStormGuardFields:
+    """Defaults and overrides for the merge-verify storm-guard knobs."""
+
+    def test_defaults_preserve_existing_behaviour(self):
+        config = OrchestratorConfig()
+        assert config.merge_verify_workspace is False
+        assert config.max_concurrent_module_verifies == 4
+        assert config.verify_use_cgroup_scope is False
+
+    def test_overrides_accepted(self):
+        config = OrchestratorConfig(
+            merge_verify_workspace=True,
+            max_concurrent_module_verifies=8,
+            verify_use_cgroup_scope=True,
+        )
+        assert config.merge_verify_workspace is True
+        assert config.max_concurrent_module_verifies == 8
+        assert config.verify_use_cgroup_scope is True
+
+    def test_max_concurrent_module_verifies_floor(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(max_concurrent_module_verifies=0)
