@@ -9468,3 +9468,39 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             assert other['title'] not in rendered, (
                 f'Legacy branch: neighbor title {other["title"]!r} leaked:\n{rendered!r}'
             )
+
+
+class TestSummaryNonce:
+    """generate_summary_nonce() produces a correctly-formatted per-cycle uniqueness token.
+
+    Task 1572: Python-side CSPRNG nonce to defeat Mem0 cosine-similarity dedup of
+    Stage 2 per-cycle summaries.  Generated outside the LLM to guarantee entropy.
+    Successive ISO timestamps (tasks 1473/1488) embed nearly identically and failed
+    to provide sufficient cosine distance — 8+ confirmed dedup recurrences.
+    """
+
+    def test_nonce_format_is_8_lowercase_hex_chars(self):
+        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$."""
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        nonce = generate_summary_nonce()
+        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
+        assert re.fullmatch(r'[0-9a-f]{8}', nonce), (
+            f'Expected 8 lowercase hex chars matching ^[0-9a-f]{{8}}$, got {nonce!r}'
+        )
+
+    def test_successive_nonces_differ(self):
+        """Two successive generate_summary_nonce() calls return different values.
+
+        High-probability property of a 32-bit CSPRNG (P(collision on 2 draws) ~= 2.3e-10).
+        """
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        first = generate_summary_nonce()
+        second = generate_summary_nonce()
+        assert first != second, (
+            'Two successive generate_summary_nonce() calls returned the same value '
+            f'({first!r}) — expected different tokens from a CSPRNG source.'
+        )
