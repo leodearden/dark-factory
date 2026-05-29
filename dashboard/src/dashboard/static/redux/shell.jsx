@@ -153,7 +153,11 @@ function ChipGroup({ options, value, onChange }) {
   );
 }
 
-// ── Project chip filter (explicit selection: default all; none=[] show nothing) ──
+// ── Project chip filter (explicit selection: default all; []=only untagged entries visible) ──
+// When `selected` is [] the SchedulerTab predicates `!r.project || selected.includes(r.project)`
+// resolve to `!r.project` — so only rows/modules with no project tag are shown, not nothing.
+// "none" is therefore "untagged only"; callers that want a genuine empty view must gate on
+// selected.length === 0 && allProjects.length > 0 themselves.
 function ProjectChips({ options, selected, onChange }) {
   return (
     <div className="chips">
