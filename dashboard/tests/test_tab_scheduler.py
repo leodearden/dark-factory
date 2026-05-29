@@ -92,6 +92,35 @@ def _parse_max_width(block: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# step-9: app.jsx hides global project dropdown on scheduler tab
+# ---------------------------------------------------------------------------
+
+
+def test_app_hides_global_project_dropdown_on_scheduler(app_jsx_body):
+    """app.jsx must set showProjects: false for the scheduler toolbarConfig entry
+    and pass a showProjects value derived from toolbarConfig to <Toolbar>.
+
+    Asserts:
+    - The scheduler entry in toolbarConfig includes `showProjects: false`
+    - The <Toolbar ...> invocation passes showProjects derived from toolbarConfig
+    """
+    # scheduler entry in toolbarConfig must set showProjects: false
+    assert re.search(
+        r'scheduler\s*:\s*\{[^}]*showProjects\s*:\s*false',
+        app_jsx_body,
+    ), (
+        'app.jsx toolbarConfig scheduler entry must include showProjects: false'
+    )
+    # Toolbar invocation must pass showProjects sourced from toolbarConfig
+    assert re.search(
+        r'showProjects\s*=\s*\{',
+        app_jsx_body,
+    ), (
+        'app.jsx <Toolbar> must pass showProjects={...} derived from toolbarConfig'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-7: Toolbar gates project MultiSelect via showProjects prop
 # ---------------------------------------------------------------------------
 
