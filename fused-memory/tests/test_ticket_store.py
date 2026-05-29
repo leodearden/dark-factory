@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
+from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 
 @pytest_asyncio.fixture
@@ -84,6 +85,67 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
     assert store._db is None, 'store._db must be None after close() (task 1560)'
+
+
+@pytest.mark.asyncio
+async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_path):
+    """A second initialize() WITHOUT an intervening close() is safe and leaks no connection.
+
+    Covers the back-to-back init→init path (task 1562).  After the second
+    initialize():
+    - The prior connection is CLOSED (not orphaned).
+    - The new connection is a fresh, daemon-backed worker.
+    - The store is fully usable through the new connection.
+
+    This test is RED on current code because initialize() unconditionally opens a
+    new connection, orphaning the prior one (task 1562).
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    first_db = store._db
+    assert first_db is not None
+    first_thread = first_db._thread
+
+    # Second initialize() WITHOUT an intervening close() — the idempotency path.
+    store_second_db = None
+    try:
+        await store.initialize()
+        store_second_db = store._db
+
+        # (a) A fresh connection was opened.
+        assert store._db is not None and store._db is not first_db, (
+            'store._db should be a new connection after the second initialize()'
+        )
+
+        # (b) RED ASSERTION: the prior connection must be closed, not orphaned.
+        # On current code first_db._connection is still set → AssertionError.
+        # Guarantees no "Event loop is closed" ResourceWarning on GC because
+        # aiosqlite.Connection.__del__ early-returns when _connection is None.
+        _assert_connection_closed(first_db)
+
+        # (c) Bounded-poll the prior worker thread to death (~2s).
+        # Placed AFTER (b) so RED fails fast at (b) rather than waiting 2 s.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while first_thread.is_alive() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert not first_thread.is_alive(), (
+            'orphaned aiosqlite worker thread leaked after double initialize()'
+        )
+
+        # (d) The NEW connection is a live daemon-backed worker.
+        assert_connection_thread_is_daemon(store._db, 'TicketStore re-init')
+
+        # (e) Usability: submit + get through the new connection.
+        tid = await store.submit(project_id='p', candidate_json='{}')
+        row = await store.get(tid)
+        assert row is not None and row['status'] == 'pending'
+
+    finally:
+        await store.close()
+        assert store._db is None, 'store._db must be None after close()'
+        if store_second_db is not None:
+            _assert_connection_closed(store_second_db)
 
 
 @pytest.mark.asyncio
