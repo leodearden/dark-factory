@@ -134,10 +134,11 @@ recon_report.add_finding(
 ) -> {"finding_id": str}             # 36-char UUID assigned server-side
 
     Allocates a new finding row. If (task_id, flag_type) matches a prior
-    finding in this (run_id, stage), returns
+    finding in ANY stage of this run_id, returns
     {"error": "duplicate_finding", "error_type": "ReconReportDuplicateFinding",
      "existing_finding_id": "..."} so the LLM can attach citations to the
-    existing finding instead.
+    existing finding instead.  Dedup spans stage boundaries within a run_id
+    (see §9.5); cross-run isolation is preserved.
 
 recon_report.cite_entity(run_id: str, finding_id: str, name: str)
     -> {"entity_uuid": "<36-char>", "canonical_name": "..."}
@@ -219,7 +220,7 @@ The existing `StageReport.items_flagged: list[dict]` field shape is preserved (e
 
 ### 9.5 In-run dedup semantics
 
-`add_finding` computes a signature from `(task_id, flag_type)`. If a prior finding in this `(run_id, stage)` has the same signature, the call returns an error pointing the LLM at the existing `finding_id` so citations can attach to it instead of creating a duplicate. The post-processor cross-cycle dedup (`flag_dedup.py`) continues to fold same-signature flags **across** runs; the in-run gate handles within-run duplicates that the post-processor would have folded anyway.
+`add_finding` computes a signature from `(task_id, flag_type)`. If a prior finding with the same signature exists in **any stage** of this `run_id`, the call returns an error pointing the LLM at the existing `finding_id` so citations can attach to it instead of creating a duplicate row. The dedup scan covers all `(run_id, *)` stage entries; cross-run isolation is preserved by filtering strictly on `run_id`. The first stage to file a given signature within a cycle wins; subsequent stages of the same run receive `duplicate_finding` and should cite the original finding rather than re-filing. (Implemented as part of task 1568 — previously the dedup was scoped to a single `(run_id, stage)` pair.) The post-processor cross-cycle dedup (`flag_dedup.py`) continues to fold same-signature flags **across** runs; the in-run gate handles within-run duplicates that the post-processor would have folded anyway.
 
 ## 10. § Boundary-test sketch (B+H)
 

@@ -820,3 +820,261 @@ class TestReconReportShutdownCallback:
 
         cb = _make_operator_stop_callback()
         cb()  # Must not raise
+
+
+# ---------------------------------------------------------------------------
+# task-1568: Cross-stage in-run dedup — RED until step-2 extends add_finding
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCrossStageDedup:
+    """Extend the §9.2 in-run dedup so it spans stage boundaries within a run_id.
+
+    Within one reconciliation cycle (shared run_id), Stage 2 must not be able
+    to allocate a second finding row for a (task_id, flag_type) already filed
+    by Stage 1. Cross-run isolation must be preserved: two runs with the same
+    signature must still produce distinct finding_ids.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def _finding(
+        self,
+        state,
+        run_id: str = 'r1',
+        task_id: str | None = '3803',
+        flag_type: str | None = 'task_stuck_pending_merge',
+        **kwargs,
+    ):
+        defaults = dict(
+            run_id=run_id,
+            severity='high',
+            category='stuck_task',
+            description='d',
+            suggested_action='a',
+            actionable=True,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_cross_stage_same_sig_returns_duplicate_error(self):
+        """Stage 2 filing the same (task_id, flag_type) as Stage 1 must return
+        duplicate_finding with existing_finding_id pointing at Stage 1's finding.
+        """
+        state, _ = self._make_state()
+
+        # Stage 1 — memory_consolidator
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        result1 = self._finding(state, run_id='r1')
+        assert 'finding_id' in result1, f'Stage 1 add_finding failed: {result1}'
+        finding_id_a = result1['finding_id']
+
+        # Stage 2 — task_knowledge_sync (same run_id, different stage)
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        result2 = self._finding(state, run_id='r1')
+
+        # Must be detected as a cross-stage duplicate
+        assert result2.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding but got: {result2}'
+        )
+        assert result2['error_type'] == 'ReconReportDuplicateFinding'
+        assert result2['existing_finding_id'] == finding_id_a
+
+        # Stage 2's report must be empty (dup never entered it)
+        s2_report = state.get_assembled_report('r1', 'task_knowledge_sync')
+        assert s2_report is not None
+        assert s2_report['flagged_items'] == []
+
+        # Stage 1's report must still have exactly one finding
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        assert s1_report['flagged_items'][0]['finding_id'] == finding_id_a
+
+    def test_cross_stage_different_sig_both_allocate(self):
+        """Different (task_id, flag_type) signatures across two stages of the same
+        run must both succeed — cross-stage dedup must not over-suppress.
+        """
+        state, _ = self._make_state()
+
+        # Stage 1
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        r1 = self._finding(state, run_id='r1', task_id='42', flag_type='memory_task_mismatch')
+        assert 'finding_id' in r1, f'Stage 1 add_finding failed: {r1}'
+
+        # Stage 2 — different signature
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        r2 = self._finding(state, run_id='r1', task_id='99', flag_type='missing_completion_memory')
+        assert 'finding_id' in r2, f'Stage 2 add_finding failed: {r2}'
+
+        assert r1['finding_id'] != r2['finding_id']
+
+    def test_cross_run_same_sig_not_deduped(self):
+        """Two different run_ids with the same (task_id, flag_type) must each
+        allocate distinct finding_ids — cross-run isolation must be preserved.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = self._finding(state, run_id='r1')
+        assert 'finding_id' in res1, f'Run r1 add_finding failed: {res1}'
+
+        state.start_report(run_id='r2', stage='memory_consolidator', project_id='dark_factory')
+        res2 = self._finding(state, run_id='r2')
+        assert 'finding_id' in res2, f'Run r2 add_finding failed: {res2}'
+
+        assert res1['finding_id'] != res2['finding_id']
+
+
+# ---------------------------------------------------------------------------
+# task-1568: Cross-stage finding citability — RED until step-4 widens
+#            _resolve_finding to scan all (run_id, *) entries
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCrossStageCitability:
+    """A finding_id returned via a cross-stage duplicate_finding must remain
+    citable from the stage that received the duplicate_finding response.
+
+    After Stage 2 gets duplicate_finding(existing_finding_id=A) where A was
+    created in Stage 1, Stage 2 should be able to cite_entity(..., finding_id=A)
+    to attach citations to Stage 1's finding.  Currently _resolve_finding only
+    searches the *active* stage's entry, so cite_entity returns finding_unknown.
+    """
+
+    def _make_state_with_fake_services(self):
+        """Return a ReconReportState wired with a fake memory service."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_FakeMemSvc(),
+        )
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_cross_stage_duplicate_finding_is_citable(self):
+        """cite_entity on a finding from a prior stage must succeed, not return
+        finding_unknown, when the active stage has switched to a later stage.
+        """
+        state, _ = self._make_state_with_fake_services()
+
+        # Stage 1: file finding A
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+
+        # Stage 2: receives duplicate_finding pointing at A
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task is stuck (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # Stage 2 is now active; try to cite onto Stage 1's finding_id
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='SomeEntity',
+        )
+
+        # Must NOT return finding_unknown — the finding is in Stage 1's entry
+        assert cite_result.get('error') != 'finding_unknown', (
+            f'cite_entity returned finding_unknown instead of resolving cross-stage finding: {cite_result}'
+        )
+        assert 'entity_uuid' in cite_result, f'Expected entity_uuid in result, got: {cite_result}'
+
+        # Citation must appear on Stage 1's finding in the assembled report
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        item = s1_report['flagged_items'][0]
+        assert item['finding_id'] == finding_id_a
+        assert len(item['cited_entities']) == 1
+        assert item['cited_entities'][0]['canonical_name'] == 'SomeEntity'
+
+    @pytest.mark.asyncio
+    async def test_cite_after_owning_stage_completed(self):
+        """cite_entity on a cross-stage finding must succeed even if the finding's
+        owning stage has already been completed — cite_* bypasses the completed()
+        guard and now reads across stages via _resolve_finding.
+        """
+        state, _ = self._make_state_with_fake_services()
+
+        # Stage 1: file finding A, then complete the stage
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+        state.complete(run_id='r1', summary='stage 1 done')
+
+        # Stage 2: gets duplicate_finding pointing at A (Stage 1 already completed)
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # Stage 2 cites the cross-stage finding whose owning stage is completed
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='AnotherEntity',
+        )
+
+        # Must NOT return finding_unknown despite Stage 1 being completed
+        assert cite_result.get('error') != 'finding_unknown', (
+            f'cite_entity returned finding_unknown for a completed stage finding: {cite_result}'
+        )
+        assert 'entity_uuid' in cite_result, f'Expected entity_uuid, got: {cite_result}'
+
+        # Citation must appear on Stage 1's finding in the assembled report
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        item = s1_report['flagged_items'][0]
+        assert item['finding_id'] == finding_id_a
+        assert any(c['canonical_name'] == 'AnotherEntity' for c in item['cited_entities'])
