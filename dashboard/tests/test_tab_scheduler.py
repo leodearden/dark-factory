@@ -48,3 +48,70 @@ def app_jsx_body(_client):
 @pytest.fixture(scope='module')
 def index_html_body(_client):
     return _client.get('/static/redux/index.html').text
+
+
+# ---------------------------------------------------------------------------
+# step-1: CSS widens scheduler title column
+# ---------------------------------------------------------------------------
+
+
+def _extract_css_rule_block(css: str, selector: str) -> str:
+    """Return the body of the first matching CSS rule block (braces included).
+
+    Walks forward from the opening ``{`` counting brace depth to find the
+    matching close brace.  Returns the empty string if the selector is not
+    found.  Does not skip ``{``/``}`` inside string literals — acceptable
+    because the CSS here does not embed brace characters in quoted values.
+    """
+    m = re.search(re.escape(selector) + r'\s*\{', css)
+    if m is None:
+        return ''
+    start = m.end() - 1
+    depth = 0
+    for i in range(start, len(css)):
+        c = css[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return css[start:i + 1]
+    return ''
+
+
+def _parse_min_width(block: str) -> int | None:
+    """Return the numeric pixel value of the first min-width declaration."""
+    m = re.search(r'min-width\s*:\s*(\d+)px', block)
+    return int(m.group(1)) if m else None
+
+
+def _parse_max_width(block: str) -> int | None:
+    """Return the numeric pixel value of the first max-width declaration, or None."""
+    m = re.search(r'max-width\s*:\s*(\d+)px', block)
+    return int(m.group(1)) if m else None
+
+
+def test_styles_css_widens_scheduler_title_column(styles_css_body):
+    """styles.css must widen the scheduler title column to readable widths.
+
+    .sched-row-label min-width must be >= 320px (currently 220 — too narrow).
+    .sched-row-title max-width must be >= 300px or absent (currently 240px —
+    truncates titles prematurely).
+    """
+    label_block = _extract_css_rule_block(styles_css_body, '.sched-row-label')
+    assert label_block, '.sched-row-label rule not found in styles.css'
+
+    min_w = _parse_min_width(label_block)
+    assert min_w is not None, 'min-width not found in .sched-row-label'
+    assert min_w >= 320, (
+        f'.sched-row-label min-width is {min_w}px; expected >= 320px for readable titles'
+    )
+
+    title_block = _extract_css_rule_block(styles_css_body, '.sched-row-title')
+    assert title_block, '.sched-row-title rule not found in styles.css'
+
+    max_w = _parse_max_width(title_block)
+    # max-width may be absent (good) or >= 300px
+    assert max_w is None or max_w >= 300, (
+        f'.sched-row-title max-width is {max_w}px; expected >= 300px or absent'
+    )
