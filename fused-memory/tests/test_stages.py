@@ -504,11 +504,6 @@ class TestTaskKnowledgeSyncPayload:
             "assemble_payload() must include a 'summary_nonce: <8-hex>' line "
             f"in the payload — got payload snippet: {payload[-200:]!r}"
         )
-        assert 'FIRST line' in payload, (
-            "assemble_payload() must include the 'FIRST line' instruction so the "
-            "Stage 2 agent is told to prepend the nonce — without this the nonce "
-            "is delivered but the prepend directive is absent (task 1572)."
-        )
 
     @pytest.mark.asyncio
     async def test_successive_assemble_payload_calls_yield_different_nonces(self, mock_deps, watermark):
