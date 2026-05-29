@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +35,7 @@ from orchestrator.merge_queue import (
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
+    _classify_branch_presence,
     _ensure_verify_disk_space,
     _is_speculation_race,
     _verify_hit_enospc,
@@ -837,6 +839,103 @@ class TestCheckPlanTargetsInTree:
 
 
 @pytest.mark.asyncio
+class TestClassifyBranchPresence:
+    """Unit tests for the _classify_branch_presence branch-existence guard."""
+
+    async def test_unknown_branch_no_ref_no_marker(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """No branch ref and no merge marker → unknown_branch, merge_attempt emitted."""
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'ghost-4011', 'ghost-4011', time.monotonic(),
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'unknown_branch'
+        assert 'task/ghost-4011' in outcome.reason
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert rows == [('unknown_branch',)], f'rows={rows}'
+
+    async def test_already_merged_marker_present(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Branch ref deleted but a merge marker remains on main → already_merged.
+
+        Disambiguates a merged-then-cleaned-up branch from one that never
+        existed (unknown_branch).
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Merge a branch into main so a 'Merge task/am-marker into main' marker
+        # exists, then remove the worktree + branch ref so only the marker is left.
+        worktree = (await git_ops.create_worktree('am-marker')).path
+        (worktree / 'm.py').write_text('m = 1\n')
+        await git_ops.commit(worktree, 'Add m')
+        result = await git_ops.merge_to_main(worktree, 'am-marker')
+        assert result.success
+        assert result.merge_commit is not None
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await _run(
+            ['git', 'worktree', 'remove', '--force', str(worktree)],
+            cwd=git_ops.project_root,
+        )
+        await _run(
+            ['git', 'branch', '-D', 'task/am-marker'], cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/am-marker') is None
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'am-marker', 'am-marker', time.monotonic(),
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'already_merged', f'got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert rows == [('already_merged',)], f'rows={rows}'
+
+    async def test_existing_branch_returns_none(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """An existing branch ref → None (proceed), no merge_attempt emitted."""
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        await git_ops.create_worktree('live-branch')  # creates task/live-branch
+        assert await git_ops.resolve_branch_sha('task/live-branch') is not None
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'live-branch', 'live-branch', time.monotonic(),
+        )
+
+        assert outcome is None
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, 'no merge_attempt expected when the branch ref exists'
+
+
+@pytest.mark.asyncio
 class TestMergeWorker:
     async def test_basic_merge_through_queue(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1023,6 +1122,45 @@ class TestMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+    async def test_unknown_branch_emits_terminal_merge_attempt(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A request for a branch with no ref (e.g. a mis-routed merge_request)
+        resolves to 'unknown_branch' with a terminal merge_attempt as the latest
+        event — never a trailing bare merge_dequeued (dashboard phantom)."""
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        # 'ghost-4011' was never created here — no task/ghost-4011 ref exists.
+        req = _make_request(
+            'ghost-4011', 'ghost-4011', tmp_path / 'no-such-wt', config,
+        )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'unknown_branch', f'got {outcome}'
+        assert 'task/ghost-4011' in outcome.reason
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') FROM events "
+            "WHERE task_id = 'ghost-4011' ORDER BY id"
+        ).fetchall()
+        conn.close()
+        assert ('merge_attempt', 'unknown_branch') in rows, f'rows={rows}'
+        assert rows[-1] == ('merge_attempt', 'unknown_branch'), (
+            f'latest event must be terminal, not a bare merge_dequeued: {rows}'
+        )
 
     async def test_conflict_returns_conflict(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1907,6 +2045,42 @@ class TestSpeculativeMergeWorker:
 
         await worker.stop()
         await worker_task
+
+    async def test_unknown_branch_emits_terminal_merge_attempt(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """SpeculativeMergeWorker: a missing branch ref resolves to
+        'unknown_branch' via the immediate-outcome path, leaving a terminal
+        merge_attempt (not a bare merge_dequeued) as the latest event."""
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        # 'ghost-4011' was never created here — no task/ghost-4011 ref exists.
+        req = _make_request(
+            'ghost-4011', 'ghost-4011', tmp_path / 'no-such-wt', config,
+        )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'unknown_branch', f'got {outcome}'
+
+        await worker.stop()
+        await worker_task
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') FROM events "
+            "WHERE task_id = 'ghost-4011' ORDER BY id"
+        ).fetchall()
+        conn.close()
+        assert ('merge_attempt', 'unknown_branch') in rows, f'rows={rows}'
+        assert rows[-1] == ('merge_attempt', 'unknown_branch'), (
+            f'latest event must be terminal, not a bare merge_dequeued: {rows}'
+        )
 
     async def test_verifier_exception_releases_speculation_slot(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -6458,18 +6632,22 @@ class TestMergeFailureDiagnostic:
         assert 'base_label=main_head' in outcome.reason
         assert 'branch_ref_in_worktree=<unresolved>' in outcome.reason
 
-    async def test_merger_loop_ghost_branch_sets_failure_diagnostic(
+    async def test_merger_loop_unknown_branch_intercepted_before_diagnostic(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Non-existent branch through the Merger loop (direct merge_request path) sets failure_diagnostic.
+        """A missing branch ref through the Merger loop is intercepted by the
+        branch-presence guard and returns 'unknown_branch' before the merge —
+        so it never reaches the merge-failure path and carries no
+        failure_diagnostic.
 
-        The direct merge_request path flows through _merger_loop, not _remerge.
-        Uses a real worktree (non-main HEAD) so the already-merged check passes,
-        but the branch ref 'task/ghost-m' does not exist → merge fails.
+        Historical context: this is the 2026-05-28 'not something we can merge'
+        misroute scenario (a request for a branch that never existed here).  It
+        used to surface as blocked + failure_diagnostic[branch_ref_in_worktree=
+        '<unresolved>']; that diagnostic-enrichment path is still covered for
+        the _remerge case by test_remerge_ghost_branch_sets_failure_diagnostic.
         """
-        # Create a real branch so the worktree HEAD is NOT an ancestor of main
-        # (which would short-circuit to already_merged before the merge attempt).
-        # The request branch name 'ghost-m' has no refs/heads/task/ghost-m ref.
+        # Real worktree (non-main HEAD) so the already-merged check would pass,
+        # but the request branch 'ghost-m' has no refs/heads/task/ghost-m ref.
         wt = await _make_branch_with_file(git_ops, 'phantom-1', 'ph1.py', 'x = 1\n')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -6480,27 +6658,23 @@ class TestMergeFailureDiagnostic:
         await queue.put(req)
         outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        assert outcome.status == 'blocked'
-        assert outcome.failure_diagnostic is not None, (
-            'failure_diagnostic must be set on blocked outcome from Merger loop'
+        assert outcome.status == 'unknown_branch', f'got {outcome}'
+        assert 'task/ghost-m' in outcome.reason
+        assert outcome.failure_diagnostic is None, (
+            'guard short-circuits before the merge-failure path — no diagnostic'
         )
-        diag = outcome.failure_diagnostic
-        assert len(diag['base_sha']) == 40
-        assert all(c in '0123456789abcdef' for c in diag['base_sha'])
-        assert diag['base_label'] == 'main_head'
-        assert diag['branch_ref_in_worktree'] == '<unresolved>'
-        assert isinstance(diag['git_stderr'], str) and diag['git_stderr']
-        assert 'base_sha=' in outcome.reason
-        assert 'base_label=main_head' in outcome.reason
-        assert 'branch_ref_in_worktree=<unresolved>' in outcome.reason
 
         await worker.stop()
         await worker_task
 
-    async def test_merger_loop_speculative_ghost_sets_base_label_speculative(
+    async def test_merger_loop_speculative_ghost_returns_unknown_branch(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """N+1 ghost branch speculatively merged gets failure_diagnostic['base_label']=='speculative'."""
+        """A missing-ref N+1 branch in the speculative position is intercepted
+        by the branch-presence guard and returns 'unknown_branch' (N still
+        succeeds).  Previously surfaced as blocked + failure_diagnostic
+        ['base_label']=='speculative' from the speculative merge-failure path.
+        """
         wt_n = await _make_branch_with_file(
             git_ops, 'spec-diag-n', 'diag_n.py', 'n = 1\n',
         )
@@ -6523,23 +6697,20 @@ class TestMergeFailureDiagnostic:
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
 
         assert outcome_n.status == 'done', f'N should succeed: {outcome_n}'
-        assert outcome_n1.status == 'blocked', f'N+1 ghost should be blocked: {outcome_n1}'
-        assert outcome_n1.failure_diagnostic is not None
-        # N+1 was speculatively merged against N's merge commit → base_label='speculative'
-        assert outcome_n1.failure_diagnostic['base_label'] == 'speculative', (
-            f"expected 'speculative', got {outcome_n1.failure_diagnostic['base_label']!r}"
+        assert outcome_n1.status == 'unknown_branch', (
+            f'N+1 ghost should be unknown_branch: {outcome_n1}'
         )
-        assert outcome_n1.failure_diagnostic['branch_ref_in_worktree'] == '<unresolved>'
+        assert outcome_n1.failure_diagnostic is None
 
         await worker.stop()
         await worker_task
 
-    async def test_escalation_server_merge_request_failure_diagnostic(
+    async def test_escalation_server_merge_request_unknown_branch(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        """merge_request tool response includes failure_diagnostic on non-conflict failure.
-
-        Successful merges must NOT include failure_diagnostic (byte-identical response shape).
+        """merge_request returns 'unknown_branch' for a branch with no ref (a
+        misroute), carrying no failure_diagnostic; a valid branch still merges
+        cleanly with no failure_diagnostic (byte-identical success shape).
         """
         from escalation.queue import EscalationQueue
         from escalation.server import create_server
@@ -6554,22 +6725,17 @@ class TestMergeFailureDiagnostic:
         tool = await server.get_tool('merge_request')
         assert isinstance(tool, FunctionTool)
 
-        # Ghost branch: use a real worktree (non-main HEAD) but branch ref doesn't exist
+        # Missing branch ref (real worktree of a different branch) → unknown_branch
         wt_ghost = await _make_branch_with_file(git_ops, 'e2e-phantom', 'phantom.py', 'x = 1\n')
 
-        # Ghost branch → failure_diagnostic must appear in response
         resp = await asyncio.wait_for(
             tool.fn(task_id='ghost-e2e', branch='ghost-e2e', worktree=str(wt_ghost)),
             timeout=30,
         )
-        assert resp['status'] == 'blocked'
-        assert 'failure_diagnostic' in resp, (
-            f"'failure_diagnostic' missing from blocked response: {resp}"
+        assert resp['status'] == 'unknown_branch', f'got {resp}'
+        assert 'failure_diagnostic' not in resp, (
+            f'unknown_branch must not carry a failure_diagnostic: {resp}'
         )
-        diag = resp['failure_diagnostic']
-        assert diag['base_label'] == 'main_head'
-        assert diag['branch_ref_in_worktree'] == '<unresolved>'
-        assert len(diag['base_sha']) == 40
 
         # Valid branch → NO failure_diagnostic in successful response
         wt = await _make_branch_with_file(git_ops, 'e2e-valid', 'e2e.py', 'x = 1\n')

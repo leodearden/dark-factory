@@ -52,6 +52,7 @@ _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 _TERMINAL_MERGE_OUTCOMES: frozenset[str] = frozenset({
     'done', 'already_merged', 'conflict', 'blocked',
     'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
+    'unknown_branch',
 })
 _ACTIVE_EVENT_TYPES: tuple[str, ...] = ('merge_queued', 'merge_dequeued', 'merge_attempt')
 
@@ -563,7 +564,7 @@ async def active_queued_merges(
     'merge_attempt'), picks the latest row per task_id within the TTL window,
     and excludes tasks whose latest event is a terminal merge_attempt outcome
     (done, already_merged, conflict, blocked, dropped_plan_targets,
-    cas_exhausted, abandoned_verify_timeouts).
+    cas_exhausted, abandoned_verify_timeouts, unknown_branch).
 
     Args:
         db:  Async SQLite connection, or None (returns []).

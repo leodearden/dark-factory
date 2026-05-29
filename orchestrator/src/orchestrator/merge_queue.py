@@ -762,6 +762,51 @@ def _emit_merge_attempt(
         )
 
 
+async def _classify_branch_presence(
+    git_ops: GitOps,
+    event_store: EventStore | None,
+    task_id: str,
+    branch: str,
+    t0: float | None,
+) -> MergeOutcome | None:
+    """Terminal outcome when *branch* has no live ref in this repo, else None.
+
+    Classifies a queued *branch* (the bare name, e.g. ``"4011"``) by whether
+    its ``{branch_prefix}{branch}`` ref still exists:
+
+        ref present            -> None  (proceed with normal merge)
+        ref absent + marker    -> already_merged   (merged then cleaned up)
+        ref absent + no marker -> unknown_branch    (never existed; likely a misroute)
+
+    The ``unknown_branch`` case fires when a ``merge_request`` for one repo's
+    branch is mis-routed to another repo's escalation MCP (e.g. a reify
+    ``task/4011`` reaching the dark-factory queue): the branch was never created
+    here, so its ref never existed and no merge marker can be on main.
+
+    A bare ``merge_dequeued`` left as the latest event for a task makes the
+    dashboard render it as ``in_flight`` (a phantom).  Emitting the matching
+    terminal ``merge_attempt`` here means the latest event is terminal, so the
+    dashboard excludes it and the mis-routing caller gets a clear signal.
+    ``unknown_branch`` is a diagnostic terminal outcome, so emitting it is
+    consistent with ``_emit_merge_attempt``'s contract (only infrastructure
+    ``blocked`` outcomes are intentionally suppressed there).
+    """
+    full_branch = f'{git_ops.config.branch_prefix}{branch}'  # bare name -> task/<branch>
+    if await git_ops.resolve_branch_sha(full_branch) is not None:
+        return None  # common case: ref present, one rev-parse
+    if await git_ops.find_merge_marker(full_branch) is not None:
+        _emit_merge_attempt(
+            event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
+        )
+        return MergeOutcome('already_merged')
+    _emit_merge_attempt(
+        event_store, task_id, 'unknown_branch', duration_ms=_elapsed_ms(t0),
+    )
+    return MergeOutcome(
+        'unknown_branch', reason=f'branch {full_branch!r} not found in repo',
+    )
+
+
 def _emit_train_event(
     event_store: EventStore | None,
     event_type: EventType,
@@ -1161,7 +1206,7 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
@@ -1679,6 +1724,17 @@ class MergeWorker:
                 attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
             )
             return self._abandon_outcome(req.task_id, prior_timeouts)
+
+        # 0. Branch-presence guard: a missing branch ref resolves terminally
+        # (unknown_branch on a never-existed ref — typically a mis-routed
+        # merge_request — or already_merged when the ref was cleaned up after
+        # merge).  Runs before the rev-parse HEAD below so a misroute can't be
+        # born as a bare merge_dequeued (phantom in_flight on the dashboard).
+        guard = await _classify_branch_presence(
+            self._git_ops, self._event_store, req.task_id, req.branch, t0,
+        )
+        if guard is not None:
+            return guard
 
         # 1. Already-merged detection (ghost-loop fix)
         _, branch_head, _ = await _run(
@@ -2416,6 +2472,30 @@ class SpeculativeMergeWorker:
                             immediate_outcome=self._abandon_outcome(
                                 req.task_id, prior_timeouts,
                             ),
+                            started_monotonic=t0,
+                        ))
+                        spec_base = None
+                        self._inflight_req = None
+                        continue
+
+                    # ── Step 0.5: branch-presence guard ───────────────────────
+                    # A missing branch ref resolves terminally before the
+                    # rev-parse HEAD below: unknown_branch on a never-existed
+                    # ref (typically a mis-routed merge_request) or
+                    # already_merged when the ref was cleaned up post-merge.
+                    # Riding it through the verifier queue as an immediate
+                    # outcome means the latest event is the terminal
+                    # merge_attempt _classify_branch_presence emitted, not a
+                    # bare merge_dequeued (phantom in_flight on the dashboard).
+                    guard = await _classify_branch_presence(
+                        self._git_ops, self._event_store, req.task_id,
+                        req.branch, t0,
+                    )
+                    if guard is not None:
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=None, merge_wt=None,
+                            base_sha=actual_main, speculative=speculative,
+                            skip_verify=False, immediate_outcome=guard,
                             started_monotonic=t0,
                         ))
                         spec_base = None

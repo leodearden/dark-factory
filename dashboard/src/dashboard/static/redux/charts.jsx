@@ -25,6 +25,7 @@ const PALETTE = {
     in_flight: 'oklch(0.80 0.14 80)',
     conflict: 'oklch(0.80 0.14 80)',
     already_merged: 'oklch(0.62 0.20 305)',
+    unknown_branch: 'oklch(0.58 0.04 250)',
     failed: 'oklch(0.68 0.18 25)',
     success: 'oklch(0.74 0.14 155)',
     partial: 'oklch(0.80 0.14 80)',

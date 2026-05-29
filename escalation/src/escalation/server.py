@@ -520,7 +520,10 @@ def create_server(
         - Normal outcome: ``{status, reason, conflict_details, push_status}``
           (plus optional ``failure_diagnostic`` on failure).
           ``status`` is one of: ``done``, ``conflict``, ``blocked``,
-          ``already_merged``, ``failed``.
+          ``already_merged``, ``unknown_branch``, ``failed``.
+          ``unknown_branch`` means the requested branch has no ref in the
+          target repo — usually a merge_request mis-routed to the wrong
+          repo's escalation MCP; check that the branch belongs here.
         - Already in flight: ``{status='in_flight', branch, inflight_task_id,
           eta_seconds, reason, conflict_details=None, push_status=None}``.
           A merge for *branch* is already running; the caller should poll
