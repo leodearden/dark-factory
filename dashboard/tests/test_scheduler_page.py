@@ -846,6 +846,74 @@ def test_scheduler_endpoint_threads_snapshot_at_through_envelope(client):
 
 
 # ---------------------------------------------------------------------------
+# task-1569 step-7: _one_project passes explicit limit to get_scheduler_events
+# ---------------------------------------------------------------------------
+
+
+async def test_scheduler_events_fetch_passes_explicit_limit(dummy_client, dummy_config):
+    """collect_scheduler_state passes _SCHEDULER_EVENTS_LIMIT as explicit limit.
+
+    Verifies that the get_scheduler_events MCP call includes a 'limit' key equal
+    to sched._SCHEDULER_EVENTS_LIMIT (which must equal 200) so the dashboard's
+    event-history bound is explicit rather than relying on the MCP default.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'meta_files': [],
+        }
+    ]
+
+    recorded_calls: list[tuple[str, dict]] = []
+
+    async def mcp_side_effect(_client, _url, tool_name, args):
+        recorded_calls.append((tool_name, dict(args)))
+        if tool_name == 'get_scheduler_state':
+            return _scheduler_snapshot()
+        elif tool_name == 'get_scheduler_events':
+            return []
+        return None
+
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mcp_side_effect),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        await collect_scheduler_state(dummy_client, dummy_config)
+
+    events_calls = [
+        (name, args) for name, args in recorded_calls
+        if name == 'get_scheduler_events'
+    ]
+    assert events_calls, 'expected at least one get_scheduler_events call'
+    _tool_name, events_args = events_calls[0]
+
+    assert 'limit' in events_args, (
+        f'get_scheduler_events call must include explicit limit; got args={events_args}'
+    )
+    assert events_args['limit'] == sched._SCHEDULER_EVENTS_LIMIT, (
+        f"limit must equal _SCHEDULER_EVENTS_LIMIT={sched._SCHEDULER_EVENTS_LIMIT}, "
+        f"got {events_args['limit']}"
+    )
+    assert sched._SCHEDULER_EVENTS_LIMIT == 200, (
+        f'_SCHEDULER_EVENTS_LIMIT must be 200, got {sched._SCHEDULER_EVENTS_LIMIT}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-15: POST /scheduler/override — validation → 400
 # ---------------------------------------------------------------------------
 
