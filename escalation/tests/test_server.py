@@ -1065,8 +1065,8 @@ class TestMergeRequestDedup:
         return OrchestratorConfig(project_root=tmp_path)
 
     def _make_registry(self):
-        from orchestrator.merge_queue import (
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
         )
         return InFlightMergeRegistry()
 
