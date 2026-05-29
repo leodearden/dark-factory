@@ -149,6 +149,58 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_path):
+    """Simulated reconnect (close→initialize) preserves data and leaks no connection.
+
+    Regression guard for the explicit close()→initialize() cycle (task 1562,
+    bullet 2).  Unlike test_double_initialize_without_close_is_idempotent_and_no_leak,
+    an intervening close() is present here — this was already the safe path, but
+    this test pins the data-persistence contract and the no-leak guarantee against
+    future regression.
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    tid = await store.submit(project_id='p', candidate_json='{}')
+    first_db = store._db
+    assert first_db is not None
+    first_thread = first_db._thread
+
+    # Explicit close — the canonical safe teardown path.
+    await store.close()
+    assert store._db is None
+
+    # Reconnect via initialize().
+    try:
+        await store.initialize()
+
+        # Prior connection is closed (no orphan).
+        _assert_connection_closed(first_db)
+
+        # Bounded-poll the prior worker thread to death (~2s).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while first_thread.is_alive() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert not first_thread.is_alive(), (
+            'prior aiosqlite worker thread leaked after reconnect initialize()'
+        )
+
+        # New connection is a fresh daemon-backed worker.
+        assert store._db is not None and store._db is not first_db
+        assert_connection_thread_is_daemon(store._db, 'TicketStore reconnect')
+
+        # Data survived the reconnect.
+        row = await store.get(tid)
+        assert row is not None and row['status'] == 'pending', (
+            f'ticket {tid!r} not found after reconnect'
+        )
+
+    finally:
+        await store.close()
+        assert store._db is None
+
+
+@pytest.mark.asyncio
 async def test_new_ticket_id_has_tkt_prefix_and_sorts_by_time():
     """_new_ticket_id() returns tkt_-prefixed ids that are lexicographically time-ordered."""
     id1 = _new_ticket_id()
