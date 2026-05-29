@@ -54,6 +54,11 @@ contradictions, task mismatches); `false` if it needs human judgment.
 Instead of an `affected_ids` list, attach typed citations via the recon_report tools \
 (see Report Channel section below).
 
+## Output Format
+The harness assembles all findings into a `flagged_items` array in the final report. \
+Do NOT emit a structured JSON response — use `mcp__recon-report__add_finding` for each \
+finding (see Report Channel below).
+
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {_RECON_REPORT_TOOL_GUIDANCE}
 
