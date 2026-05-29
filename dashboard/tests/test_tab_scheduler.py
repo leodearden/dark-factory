@@ -254,30 +254,46 @@ def test_shell_exports_project_chips(shell_jsx_body):
 
 
 # ---------------------------------------------------------------------------
-# step-3: MultiSelect select-none clears to empty array
+# step-17: MultiSelect select-none keeps real single-project selection
 # ---------------------------------------------------------------------------
 
 
-def test_multiselect_select_none_clears_to_empty(shell_jsx_body):
-    """MultiSelect select-none handler must clear selection to [] (empty array).
+def test_multiselect_select_none_keeps_real_selection(shell_jsx_body):
+    """MultiSelect select-none/select-all toggle must use onChange(allSelected ? [options[0]] : []).
 
-    The current bug: `onChange(allSelected ? [options[0]] : [])` leaves ONE
-    project selected when the user clicks "select none" from an all-selected
-    state.  The fix: the select-none branch should call `onChange([])`.
+    Background: throughout the dashboard [] means "show all" — downstream
+    project filters are `projectFilter.length === 0 || projectFilter.includes(...)`,
+    the global projects state initialises to [] (// [] = all), and MultiSelect's
+    own allSelected is `selected.length === 0 || selected.length === options.length`.
 
-    Assert the phantom-single-selection pattern `[options[0]]` is gone and
-    the select-none/select-all toggle calls `onChange([])` for the none path.
+    Consequence: onChange([]) for the select-none branch is a no-op — clicking
+    "select none" when allSelected is true produces [] which is still allSelected,
+    so the label never flips to "select all" and no filtering occurs.
+
+    The correct behaviour: onChange(allSelected ? [options[0]] : [])
+      - allSelected=true  → click → [options[0]] (one project, allSelected=false, label="select all")
+      - allSelected=false → click → [] (allSelected=true, label="select none")
+
+    Asserts:
+    (a) the no-op select-none regression 'allSelected ? [] :' is absent
+    (b) the reverted real-selection pattern [options[0]] is present
+    (c) the empty-equals-all invariant 'selected.length === 0' is present
+        (this is the allSelected definition that [] triggers)
     """
-    # The broken pattern must NOT be present
-    assert '[options[0]]' not in shell_jsx_body, (
-        'shell.jsx still contains [options[0]] phantom-single-selection pattern'
+    # (a) The no-op select-none regression must be gone
+    assert 'allSelected ? [] :' not in shell_jsx_body, (
+        'shell.jsx MultiSelect select-none branch must not use onChange([]) — '
+        '[] means show-all so onChange([]) is a no-op when allSelected is true'
     )
-    # The select-none branch must call onChange([]) — specifically the ternary
-    # `onChange(allSelected ? [] :` (not the old `onChange(allSelected ? [options[0]] : [])`
-    # which also ends with `[]` but on the select-all branch, not the select-none branch).
-    assert re.search(r'onChange\s*\(\s*allSelected\s*\?\s*\[\s*\]\s*:', shell_jsx_body), (
-        'shell.jsx MultiSelect select-none/select-all toggle must call onChange([]) '
-        'as the select-none branch: onChange(allSelected ? [] : options)'
+    # (b) The reverted real-selection pattern must be restored
+    assert '[options[0]]' in shell_jsx_body, (
+        'shell.jsx MultiSelect must use [options[0]] for the select-none branch '
+        'so clicking select-none produces a real single-project view'
+    )
+    # (c) Pin the empty-equals-all invariant (the allSelected definition)
+    assert 'selected.length === 0' in shell_jsx_body, (
+        'shell.jsx MultiSelect allSelected definition must include selected.length === 0 '
+        '(empty array = show all convention)'
     )
 
 
