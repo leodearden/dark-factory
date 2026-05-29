@@ -243,7 +243,11 @@ function ModulesView({ modules, rows, eventsMap }) {
 }
 
 // ── Main SchedulerTab component ──
-function SchedulerTab({ projectFilter = [] }) {
+// Note: the global `projects` filter is intentionally not consumed here — the
+// Scheduler tab owns its own per-project chip filter (ProjectChips) derived from
+// SCHEDULER rows/modules. The global Toolbar project dropdown is hidden on this
+// tab via app.jsx toolbarConfig.scheduler.showProjects: false.
+function SchedulerTab() {
   const sched = D.SCHEDULER || {};
   const {
     rows = [],

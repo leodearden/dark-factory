@@ -113,7 +113,7 @@ function App() {
       case 'overview': return <OverviewTab paused={tw.pauseLive} />;
       case 'orch':     return <OrchTab projectFilter={projects} search={search} />;
       case 'tasks':     return <TasksTab projectFilter={projects} search={search} />;
-      case 'scheduler': return <SchedulerTab projectFilter={projects} />;
+      case 'scheduler': return <SchedulerTab />;
       case 'curator':  return <CuratorTab projectFilter={projects} />;
       case 'perf':     return <PerfTab projectFilter={projects} />;
       case 'memory':   return <MemoryTab projectFilter={projects} />;
