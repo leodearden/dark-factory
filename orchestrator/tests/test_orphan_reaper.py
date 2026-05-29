@@ -121,7 +121,7 @@ class TestOrphanReaper:
 
         await harness._reap_orphan_worktrees()
 
-        harness.scheduler.get_tasks.assert_not_called()
+        harness.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.prune_worktrees.assert_not_called()  # type: ignore[attr-defined]
 

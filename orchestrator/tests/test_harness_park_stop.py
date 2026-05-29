@@ -12,6 +12,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -755,7 +756,7 @@ class TestHarnessRunForever:
         class _StopIdle(Exception):
             pass
 
-        captured = {'report_at_sleep': None}
+        captured: dict[str, Any] = {'report_at_sleep': None}
 
         async def fake_sleep(_secs, *args, **kwargs):
             # By the time we idle-sleep, the work cycle has reset the report.
