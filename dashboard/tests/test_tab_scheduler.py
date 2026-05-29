@@ -92,6 +92,38 @@ def _parse_max_width(block: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# step-5: shell.jsx exports ProjectChips
+# ---------------------------------------------------------------------------
+
+
+def test_shell_exports_project_chips(shell_jsx_body):
+    """shell.jsx must define ProjectChips and export it via window.DF_SHELL.
+
+    Asserts:
+    - `function ProjectChips(` is defined
+    - `ProjectChips` appears in the `window.DF_SHELL = { ... }` export
+    - the none toggle calls `onChange([])` (empty selection = show nothing)
+    - the all toggle calls `onChange(` with the full options (non-empty array)
+    """
+    # Function must be defined
+    assert re.search(r'function\s+ProjectChips\s*\(', shell_jsx_body), (
+        'shell.jsx must define function ProjectChips(...)'
+    )
+    # Must be in the DF_SHELL export
+    assert re.search(r'window\.DF_SHELL\s*=\s*\{[^}]*ProjectChips', shell_jsx_body), (
+        'ProjectChips must be exported in window.DF_SHELL = { ... }'
+    )
+    # none toggle calls onChange([])
+    assert re.search(r'onChange\s*\(\s*\[\s*\]\s*\)', shell_jsx_body), (
+        'ProjectChips must have a none toggle calling onChange([])'
+    )
+    # all toggle calls onChange(options) or similar non-empty arg
+    assert re.search(r'onChange\s*\(\s*options\s*\)', shell_jsx_body), (
+        'ProjectChips must have an all toggle calling onChange(options)'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-3: MultiSelect select-none clears to empty array
 # ---------------------------------------------------------------------------
 
