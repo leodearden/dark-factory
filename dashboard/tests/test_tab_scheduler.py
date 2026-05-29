@@ -92,6 +92,39 @@ def _parse_max_width(block: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# step-11: tab_scheduler.jsx renders ProjectChips with data-derived project list
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_tab_renders_project_chips(tab_scheduler_jsx_body):
+    """tab_scheduler.jsx must:
+    - Destructure ProjectChips from window.DF_SHELL
+    - Render <ProjectChips in JSX
+    - Derive its options from SCHEDULER data by mapping .project over BOTH
+      rows AND modules (both contribute to the project list).
+    """
+    # Must destructure ProjectChips from window.DF_SHELL
+    assert re.search(
+        r'const\s*\{[^}]*ProjectChips[^}]*\}\s*=\s*window\.DF_SHELL',
+        tab_scheduler_jsx_body,
+    ), (
+        'tab_scheduler.jsx must destructure ProjectChips from window.DF_SHELL'
+    )
+    # Must render <ProjectChips
+    assert re.search(r'<ProjectChips', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must render <ProjectChips'
+    )
+    # Derives project list from rows .project
+    assert re.search(r'rows[^\n]*\.project', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must map .project over rows for the chip options'
+    )
+    # Derives project list from modules .project
+    assert re.search(r'modules[^\n]*\.project', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must map .project over modules for the chip options'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-9: app.jsx hides global project dropdown on scheduler tab
 # ---------------------------------------------------------------------------
 
