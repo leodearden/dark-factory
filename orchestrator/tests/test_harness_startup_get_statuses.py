@@ -246,7 +246,7 @@ async def test_startup_until_idle_empty_tree_exits_cleanly(
     """
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.is_paused = False
+    cast(MagicMock, h.scheduler).is_paused = False
     h.scheduler.acquire_next = AsyncMock(return_value=None)
     # Override return_value so mid-run reconcile returns 0 (no tasks freed);
     # the fixture default returns a MagicMock which compares > 0 as truthy
