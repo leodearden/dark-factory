@@ -192,7 +192,7 @@ function OverviewTab({ paused }) {
         <div className="panel-body flush">
           <table className="tbl">
             <thead>
-              <tr><th>Orch</th><th>Project</th><th>Current task</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th></tr>
+              <tr><th>Orch</th><th>Project</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th></tr>
             </thead>
             <tbody>
               {D.ORCHESTRATORS.map(o => (
@@ -204,9 +204,6 @@ function OverviewTab({ paused }) {
                     </span>
                   </td>
                   <td className="mono" style={{ color: 'var(--fg-1)' }}>{o.project}</td>
-                  <td style={{ color: 'var(--fg-2)', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {o.current_task}
-                  </td>
                   <td className="num">{(() => {
                     const projMods = schedModules.filter(m => m.project === o.project);
                     const heldMods = projMods.filter(m => m.holder);

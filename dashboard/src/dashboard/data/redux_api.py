@@ -29,32 +29,6 @@ def _project_label(value: str | Path) -> str:
     return name or s
 
 
-def _current_task_for_orchestrator(orchestrator: Mapping[str, Any]) -> str:
-    """Pick a representative current task title from an orchestrator's worktrees.
-
-    Prefers a worktree in EXECUTE phase, then PLAN, then any.  Falls back to
-    the en-dash placeholder when no worktrees exist.
-    """
-    worktrees = orchestrator.get('worktrees') or {}
-    if not worktrees:
-        return '—'
-
-    def _entry_title(entry: Mapping[str, Any]) -> str:
-        meta = entry.get('metadata') or {}
-        tid = meta.get('task_id')
-        title = meta.get('title') or ''
-        if tid is not None:
-            return f'{tid}: {title}' if title else f'{tid}'
-        return title or '—'
-
-    for desired in ('EXECUTE', 'PLAN'):
-        for entry in worktrees.values():
-            if entry.get('phase') == desired:
-                return _entry_title(entry)
-    # Fall back to any worktree.
-    return _entry_title(next(iter(worktrees.values())))
-
-
 def shape_orchestrators(
     orchestrators: Iterable[Mapping[str, Any]],
     *,
@@ -87,7 +61,6 @@ def shape_orchestrators(
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
             'summary': dict(o.get('summary') or {}),
-            'current_task': _current_task_for_orchestrator(o),
         })
 
     # PROJECTS: union of active roots + known roots.  ``active`` reflects

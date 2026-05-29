@@ -29,23 +29,7 @@ def test_shape_orchestrators_picks_first_pid_and_basename_project():
     assert orch['project'] == 'dark-factory'
     assert orch['running'] is True
     assert orch['summary']['total'] == 0
-    assert orch['current_task'] == '—'
-
-
-def test_shape_orchestrators_picks_execute_phase_for_current_task():
-    raw = [{
-        'pids': [42],
-        'project_root': '/p',
-        'running': True,
-        'summary': {},
-        'started': 'now',
-        'worktrees': {
-            7: {'phase': 'PLAN', 'metadata': {'task_id': '7', 'title': 'plan-task'}},
-            9: {'phase': 'EXECUTE', 'metadata': {'task_id': '9', 'title': 'doing-this'}},
-        },
-    }]
-    body = redux_api.shape_orchestrators(raw)
-    assert body['ORCHESTRATORS'][0]['current_task'] == '9: doing-this'
+    assert 'current_task' not in orch
 
 
 def test_shape_orchestrators_marks_inactive_known_projects():
