@@ -153,6 +153,28 @@ function ChipGroup({ options, value, onChange }) {
   );
 }
 
+// ── Project chip filter (explicit selection: default all; []=only untagged entries visible) ──
+// When `selected` is [] the SchedulerTab predicates `!r.project || selected.includes(r.project)`
+// resolve to `!r.project` — so only rows/modules with no project tag are shown, not nothing.
+// "none" is therefore "untagged only"; callers that want a genuine empty view must gate on
+// selected.length === 0 && allProjects.length > 0 themselves.
+function ProjectChips({ options, selected, onChange }) {
+  return (
+    <div className="chips">
+      <button onClick={() => onChange(options)} style={{ fontSize: 10, padding: '2px 6px' }}>all</button>
+      <button onClick={() => onChange([])} style={{ fontSize: 10, padding: '2px 6px' }}>none</button>
+      {options.map(o => (
+        <button key={o} className={selected.includes(o) ? 'on' : ''} onClick={() => {
+          const next = selected.includes(o)
+            ? selected.filter(x => x !== o)
+            : [...selected, o];
+          onChange(next);
+        }}>{o}</button>
+      ))}
+    </div>
+  );
+}
+
 function MultiSelect({ label, options, selected, onChange }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -211,6 +233,7 @@ function MultiSelect({ label, options, selected, onChange }) {
 function Toolbar({
   window: win, onWindow, windows = ['1h', '24h', '7d', '30d', '90d', 'all'],
   showWindow = true,
+  showProjects = true,
   projects, onProjects,
   agents, onAgents, showAgents = false,
   search, onSearch, searchPlaceholder = 'Search…',
@@ -220,7 +243,7 @@ function Toolbar({
     <div className="toolbar">
       {showWindow && <span className="lbl">Window</span>}
       {showWindow && <ChipGroup options={windows} value={win} onChange={onWindow} />}
-      <MultiSelect label="project" options={SHELL_PROJECTS.map(p => p.name)} selected={projects} onChange={onProjects} />
+      {showProjects && <MultiSelect label="project" options={SHELL_PROJECTS.map(p => p.name)} selected={projects} onChange={onProjects} />}
       {showAgents && <MultiSelect label="agent" options={SHELL_AGENTS} selected={agents} onChange={onAgents} />}
       {onSearch && (
         <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
@@ -410,4 +433,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };

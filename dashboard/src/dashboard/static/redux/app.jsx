@@ -113,7 +113,7 @@ function App() {
       case 'overview': return <OverviewTab paused={tw.pauseLive} />;
       case 'orch':     return <OrchTab projectFilter={projects} search={search} />;
       case 'tasks':     return <TasksTab projectFilter={projects} search={search} />;
-      case 'scheduler': return <SchedulerTab projectFilter={projects} />;
+      case 'scheduler': return <SchedulerTab />;
       case 'curator':  return <CuratorTab projectFilter={projects} />;
       case 'perf':     return <PerfTab projectFilter={projects} />;
       case 'memory':   return <MemoryTab projectFilter={projects} />;
@@ -140,7 +140,7 @@ function App() {
     overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
     tasks:     { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
-    scheduler: { showWindow: false,                        showAgents: false, search: false },
+    scheduler: { showWindow: false, showProjects: false,    showAgents: false, search: false },
     curator:  { showWindow: false,                        showAgents: false, search: false },
     perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     memory:   { showWindow: false,                        showAgents: true,  search: false },
@@ -167,6 +167,7 @@ function App() {
           window={win} onWindow={setWin}
           showWindow={toolbarConfig.showWindow !== false}
           windows={toolbarConfig.windows}
+          showProjects={toolbarConfig.showProjects !== false}
           projects={projects} onProjects={setProjects}
           agents={agents} onAgents={setAgents}
           showAgents={toolbarConfig.showAgents}
