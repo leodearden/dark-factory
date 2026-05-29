@@ -187,7 +187,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
                   <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
                   {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
                   <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-                    {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed || 'done') : t.status}
+                    {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
                   </span>
                 </div>
                 <div className="ttl">{t.title}</div>
@@ -201,7 +201,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
 }
 
 function fmtAge(t) {
-  if (t.status === 'done')             return t.completed || '—';
+  if (t.status === 'done')             return t.completed ? window.DF_SHELL.timeago(t.completed) : '—';
   if (t.status === 'pending')          return 'unstarted';
   if (t.status === 'merge-deferred')   return 'parked for train';
   return `${t.started}m running`;
@@ -409,7 +409,7 @@ function TasksTab({ projectFilter, search }) {
               total:    projTasks.length,
               active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
               pending:  projTasks.filter(t => t.status === 'pending').length,
-              complete: projTasks.filter(t => t.status === 'done').length,
+              complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null) ? DF_T.DONE_COUNTS[p.id] : projTasks.filter(t => t.status === 'done').length,
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const summary = (
