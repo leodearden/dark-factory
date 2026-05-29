@@ -184,6 +184,11 @@ class ReconReportState:
         self._reaper_interval = reaper_interval
         self._state: dict[tuple[str, str], _ReportEntry] = {}
         self._active: dict[str, str] = {}  # run_id → current stage
+        # Run-level O(1) indices so add_finding / _resolve_finding avoid scanning
+        # all entries across every live run_id.  Populated on the miss path of
+        # add_finding; cleaned up by tick() when entries are evicted.
+        self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
+        self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -252,17 +257,14 @@ class ReconReportState:
             return _ERR_ALREADY_COMPLETED.copy()
 
         # In-run dedup: skip when both are None (informational findings).
-        # Scan ALL stages of this run_id so Stage 2 cannot duplicate Stage 1's
-        # findings.  Each stage's _signature_to_finding map remains the per-stage
-        # source of truth; the scan reads across them while filtering strictly on
-        # run_id to preserve cross-run isolation.
+        # _run_sig_index gives O(1) cross-stage lookup scoped to this run_id,
+        # replacing an O(N) scan over all live entries.  Cross-run isolation is
+        # preserved because the index is keyed by run_id.
         sig = (task_id, flag_type)
         if sig != (None, None):
-            for (rid, _stage), other in self._state.items():
-                if rid == run_id:
-                    existing_id = other._signature_to_finding.get(sig)
-                    if existing_id is not None:
-                        return _duplicate_finding_error(existing_id)
+            existing_id = self._run_sig_index.get(run_id, {}).get(sig)
+            if existing_id is not None:
+                return _duplicate_finding_error(existing_id)
 
         finding_id = str(uuid.uuid4())
         finding = _Finding(
@@ -278,6 +280,8 @@ class ReconReportState:
         entry.findings.append(finding)
         if sig != (None, None):
             entry._signature_to_finding[sig] = finding_id
+            self._run_sig_index.setdefault(run_id, {})[sig] = finding_id
+        self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
 
         return {'finding_id': finding_id}
 
@@ -432,19 +436,19 @@ class ReconReportState:
     ) -> tuple[_ReportEntry, _Finding] | None:
         """Return (entry, finding) or None if either run_id or finding_id is unknown.
 
-        The scan covers ALL stage entries that share this ``run_id``, so a
-        finding_id returned via a cross-stage ``duplicate_finding`` response
-        (where the original finding lives in an earlier stage's entry) remains
-        citable from a later stage.  The lookup is still strictly scoped to
-        ``run_id`` to preserve cross-run isolation.
+        The lookup covers ALL stage entries that share this ``run_id`` via
+        _run_finding_index, so a finding_id returned via a cross-stage
+        ``duplicate_finding`` response (where the original finding lives in an
+        earlier stage's entry) remains citable from a later stage.  The index
+        is keyed by run_id, preserving cross-run isolation.
         """
-        for (rid, _stage), entry in self._state.items():
-            if rid != run_id:
-                continue
-            for f in entry.findings:
-                if f.finding_id == finding_id:
-                    return entry, f
-        return None  # finding_id not in this run
+        entry = self._run_finding_index.get(run_id, {}).get(finding_id)
+        if entry is None:
+            return None
+        for f in entry.findings:
+            if f.finding_id == finding_id:
+                return entry, f
+        return None
 
     # ------------------------------------------------------------------
     # cite_* tools (task β)
@@ -469,12 +473,12 @@ class ReconReportState:
         resolved = self._resolve_finding(run_id, finding_id)
         if resolved is None:
             return _ERR_FINDING_UNKNOWN.copy()
-        _, finding = resolved
+        finding_entry, finding = resolved
 
         if self._memory_service is None:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
-        result = await self._memory_service.get_entity(name, entry.project_id)
+        result = await self._memory_service.get_entity(name, finding_entry.project_id)
         nodes = result.get('nodes', [])
         if not nodes:
             return _ERR_ENTITY_NOT_FOUND.copy()
@@ -504,7 +508,7 @@ class ReconReportState:
         resolved = self._resolve_finding(run_id, finding_id)
         if resolved is None:
             return _ERR_FINDING_UNKNOWN.copy()
-        _, finding = resolved
+        finding_entry, finding = resolved
 
         if not _UUID_RE.match(edge_uuid):
             return _ERR_INVALID_UUID_SHAPE.copy()
@@ -513,7 +517,7 @@ class ReconReportState:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
         try:
-            result = await self._memory_service.get_edge(edge_uuid, entry.project_id)
+            result = await self._memory_service.get_edge(edge_uuid, finding_entry.project_id)
         except EdgeNotFoundError:
             return _ERR_EDGE_NOT_FOUND.copy()
 
@@ -584,7 +588,7 @@ class ReconReportState:
         resolved = self._resolve_finding(run_id, finding_id)
         if resolved is None:
             return _ERR_FINDING_UNKNOWN.copy()
-        _, finding = resolved
+        finding_entry, finding = resolved
 
         if not _UUID_RE.match(memory_id):
             return _ERR_INVALID_UUID_SHAPE.copy()
@@ -594,7 +598,7 @@ class ReconReportState:
 
         try:
             fingerprint = await self._memory_service.get_memory(
-                memory_id, store, entry.project_id
+                memory_id, store, finding_entry.project_id
             )
         except (EdgeNotFoundError, MemoryNotFoundError):
             return _ERR_MEMORY_NOT_FOUND.copy()
@@ -618,10 +622,23 @@ class ReconReportState:
         ]
         for key in to_evict:
             rid, stage = key
+            evicted = self._state[key]
             del self._state[key]
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
                 del self._active[rid]
+            # Clean up run-level indices for evicted findings
+            if rid in self._run_sig_index:
+                for sig, fid in evicted._signature_to_finding.items():
+                    if self._run_sig_index[rid].get(sig) == fid:
+                        del self._run_sig_index[rid][sig]
+                if not self._run_sig_index[rid]:
+                    del self._run_sig_index[rid]
+            if rid in self._run_finding_index:
+                for f in evicted.findings:
+                    self._run_finding_index[rid].pop(f.finding_id, None)
+                if not self._run_finding_index[rid]:
+                    del self._run_finding_index[rid]
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)

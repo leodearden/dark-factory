@@ -1020,3 +1020,61 @@ class TestReconReportCrossStageCitability:
         assert item['finding_id'] == finding_id_a
         assert len(item['cited_entities']) == 1
         assert item['cited_entities'][0]['canonical_name'] == 'SomeEntity'
+
+    @pytest.mark.asyncio
+    async def test_cite_after_owning_stage_completed(self):
+        """cite_entity on a cross-stage finding must succeed even if the finding's
+        owning stage has already been completed — cite_* bypasses the completed()
+        guard and now reads across stages via _resolve_finding.
+        """
+        state, _ = self._make_state_with_fake_services()
+
+        # Stage 1: file finding A, then complete the stage
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+        state.complete(run_id='r1', summary='stage 1 done')
+
+        # Stage 2: gets duplicate_finding pointing at A (Stage 1 already completed)
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # Stage 2 cites the cross-stage finding whose owning stage is completed
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='AnotherEntity',
+        )
+
+        # Must NOT return finding_unknown despite Stage 1 being completed
+        assert cite_result.get('error') != 'finding_unknown', (
+            f'cite_entity returned finding_unknown for a completed stage finding: {cite_result}'
+        )
+        assert 'entity_uuid' in cite_result, f'Expected entity_uuid, got: {cite_result}'
+
+        # Citation must appear on Stage 1's finding in the assembled report
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        item = s1_report['flagged_items'][0]
+        assert item['finding_id'] == finding_id_a
+        assert any(c['canonical_name'] == 'AnotherEntity' for c in item['cited_entities'])
