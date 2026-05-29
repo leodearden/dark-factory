@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -54,6 +55,58 @@ from dashboard.data.active_tasks import _all_project_roots, _project_label, coll
 from dashboard.data.memory import invalidate_session, mcp_tool_call
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Short-TTL cache for get_scheduler_snapshot
+#
+# The frontend polls /scheduler every 3 s (data.js:143/151) unconditionally,
+# regardless of the active tab.  Without a cache, every poll re-runs the full
+# N-project collection.  A TTL >= the poll interval keeps the cache warm so
+# switching to the Scheduler tab renders instantly from already-populated
+# DF_DATA.SCHEDULER.  The 5 s window allows a few seconds of staleness, which
+# the task explicitly accepts.
+#
+# _scheduler_cache_clear() is a test hook that resets both the cache tuple and
+# the asyncio.Lock so pytest-asyncio's function-scoped event loops don't hit
+# "got Future attached to a different loop" on the second cache test.
+# ---------------------------------------------------------------------------
+
+_SCHEDULER_TTL_SECONDS: float = 5.0
+# Cache entry: (monotonic_ts: float, six_tuple: tuple, snapshot_at: str) | None
+_scheduler_cache: tuple[float, tuple, str] | None = None
+
+
+def _scheduler_cache_clear() -> None:
+    """Clear the scheduler snapshot TTL cache (test/admin hook)."""
+    global _scheduler_cache
+    _scheduler_cache = None
+
+
+async def get_scheduler_snapshot(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> tuple[tuple, str]:
+    """Return cached scheduler snapshot ``(six_tuple, snapshot_at)``.
+
+    Calls :func:`collect_scheduler_state` at most once per
+    ``_SCHEDULER_TTL_SECONDS`` interval (default 5 s).  Because the
+    frontend polls every 3 s, a warm cache means every steady-state poll
+    returns instantly without re-running the N-project MCP fan-out.
+
+    ``snapshot_at`` is an ISO-8601 wall-clock string stamped at cache-fill
+    time.  The value propagates through ``api_scheduler`` → ``shape_scheduler``
+    → the JS envelope so the UI can show a truthful "data as of" timestamp.
+    """
+    global _scheduler_cache
+    now = time.monotonic()
+    cached = _scheduler_cache
+    if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
+        return cached[1], cached[2]
+
+    six_tuple = await collect_scheduler_state(client, config)
+    snapshot_at = datetime.now(UTC).isoformat()
+    _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
+    return six_tuple, snapshot_at
 
 
 # ---------------------------------------------------------------------------
