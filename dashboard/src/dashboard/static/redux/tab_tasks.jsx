@@ -405,11 +405,18 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const projTasks = allTasks.filter(t => t.project === p.id);
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
+            const _fallbackDone = projTasks.filter(t => t.status === 'done').length;
             const counts = {
               total:    projTasks.length,
               active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
               pending:  projTasks.filter(t => t.status === 'pending').length,
-              complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null) ? DF_T.DONE_COUNTS[p.id] : projTasks.filter(t => t.status === 'done').length,
+              // DONE_COUNTS carries the authoritative full count from the server.
+              // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
+              // (≤50 per project). If we hit that cap without a server count, show
+              // "50+" so the user knows the displayed number is a lower bound.
+              complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
+                ? DF_T.DONE_COUNTS[p.id]
+                : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const summary = (
