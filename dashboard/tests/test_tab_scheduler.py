@@ -91,6 +91,33 @@ def _parse_max_width(block: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# ---------------------------------------------------------------------------
+# step-3: MultiSelect select-none clears to empty array
+# ---------------------------------------------------------------------------
+
+
+def test_multiselect_select_none_clears_to_empty(shell_jsx_body):
+    """MultiSelect select-none handler must clear selection to [] (empty array).
+
+    The current bug: `onChange(allSelected ? [options[0]] : [])` leaves ONE
+    project selected when the user clicks "select none" from an all-selected
+    state.  The fix: the select-none branch should call `onChange([])`.
+
+    Assert the phantom-single-selection pattern `[options[0]]` is gone and
+    the select-none/select-all toggle calls `onChange([])` for the none path.
+    """
+    # The broken pattern must NOT be present
+    assert '[options[0]]' not in shell_jsx_body, (
+        'shell.jsx still contains [options[0]] phantom-single-selection pattern'
+    )
+    # The select-none branch must call onChange([]) — regex that captures it
+    # within the allSelected ternary context
+    assert re.search(r'onChange\s*\(\s*allSelected\s*\?.*\[\s*\]', shell_jsx_body), (
+        'shell.jsx MultiSelect select-none/select-all toggle must call onChange([]) '
+        'for the allSelected (select-none) branch'
+    )
+
+
 def test_styles_css_widens_scheduler_title_column(styles_css_body):
     """styles.css must widen the scheduler title column to readable widths.
 
