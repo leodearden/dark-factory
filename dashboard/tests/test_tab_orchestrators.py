@@ -6,6 +6,8 @@ Follows the idiom established in test_tab_curator.py / test_index_html.py.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -45,8 +47,11 @@ class TestOrchTabCurrentFocusRemoved:
     def test_current_task_render_ref_removed(self, tabs_jsx_body):
         """The JSX expression {o.current_task} must NOT appear in tabs.jsx.
 
+        Uses a regex to match the removed JSX expression specifically, avoiding
+        false failures on related identifiers (e.g. o.current_task_count).
+
         NOTE: the backend field current_task is LIVE and consumed by
         tab_overview.jsx (Overview tab). Only the Orchestrators-tab reference
         in tabs.jsx is removed here.
         """
-        assert 'o.current_task' not in tabs_jsx_body
+        assert not re.search(r'\{\s*o\.current_task\s*\}', tabs_jsx_body)
