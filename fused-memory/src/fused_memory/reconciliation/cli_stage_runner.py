@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -230,6 +231,28 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
     },
     'required': ['summary'],
 }
+
+
+def generate_summary_nonce() -> str:
+    """Return an 8-char lowercase-hex nonce for per-cycle summary uniqueness.
+
+    Generated from Python's CSPRNG (secrets module) OUTSIDE the LLM so the
+    token carries genuine entropy regardless of the LLM's output distribution.
+    Injected into the Stage 2 payload once per cycle (in assemble_payload) so
+    the Stage 2 agent can prepend it to its per-cycle summary content.
+
+    Rationale (task 1572): ISO 8601 uniqueness_token alone (tasks 1473/1488)
+    produced insufficient cosine-distance separation — consecutive timestamps
+    embed nearly identically in Mem0's embedding space, causing per-cycle
+    summaries to be silently deduplicated (memory_ids=[]) in 8+ confirmed
+    recurrences.  A 32-bit random hex prefix shifts the leading content far
+    enough to defeat the ~0.92 cosine-similarity dedup threshold.
+
+    Returns:
+        8-character lowercase hex string (e.g. 'a3f7c21b'), i.e.
+        secrets.token_hex(4).
+    """
+    return secrets.token_hex(4)
 
 
 @dataclass
