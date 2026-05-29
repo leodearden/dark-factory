@@ -251,7 +251,7 @@ function OrchTab({ projectFilter, search }) {
 
                   <table className="tbl" style={{ marginTop: 4, tableLayout: 'fixed', width: '100%' }}>
                     <colgroup>
-                      <col style={{ width: 80 }} />
+                      <col style={{ width: '18ch' }} />
                       <col />
                       <col style={{ width: 130 }} />
                       <col style={{ width: 60 }} />
