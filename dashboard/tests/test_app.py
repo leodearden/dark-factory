@@ -86,15 +86,34 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.app.collect_active_tasks',
         new=AsyncMock(return_value=([], [])),
+    ), patch(
+        'dashboard.app.collect_done_counts',
+        new=AsyncMock(return_value={}),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS'}
+    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
     assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
+    assert body['DONE_COUNTS'] == {}
+
+
+def test_tasks_endpoint_includes_done_counts(client):
+    """DONE_COUNTS payload carries the per-project done count from collect_done_counts."""
+    with patch(
+        'dashboard.app.collect_active_tasks',
+        new=AsyncMock(return_value=([], [])),
+    ), patch(
+        'dashboard.app.collect_done_counts',
+        new=AsyncMock(return_value={'dark-factory': 7}),
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['DONE_COUNTS'] == {'dark-factory': 7}
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
@@ -102,6 +121,9 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     with patch(
         'dashboard.app.collect_active_tasks',
         new=AsyncMock(return_value=([], ['dark-factory'])),
+    ), patch(
+        'dashboard.app.collect_done_counts',
+        new=AsyncMock(return_value={}),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
