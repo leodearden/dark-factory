@@ -480,6 +480,56 @@ class TestTaskKnowledgeSyncPayload:
         # The project_id should appear in the memory tools instruction (line 98)
         assert 'project_id="reify"' in payload
 
+    @pytest.mark.asyncio
+    async def test_payload_contains_per_cycle_summary_nonce_section(self, mock_deps, watermark):
+        """assemble_payload() must include a '### Per-Cycle Summary Nonce' section
+        with a 'summary_nonce: <8-hex>' line.
+
+        Task 1572: the nonce is generated Python-side (CSPRNG) and injected into
+        the payload so the Stage 2 agent can prepend it to its per-cycle summary,
+        defeating Mem0 cosine-similarity dedup (~0.92 threshold).
+        """
+        import re
+
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Per-Cycle Summary Nonce' in payload, (
+            "assemble_payload() must include a '### Per-Cycle Summary Nonce' section "
+            "so the Stage 2 agent receives the CSPRNG nonce (task 1572)."
+        )
+        assert re.search(r'summary_nonce: [0-9a-f]{8}', payload), (
+            "assemble_payload() must include a 'summary_nonce: <8-hex>' line "
+            f"in the payload — got payload snippet: {payload[-200:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successive_assemble_payload_calls_yield_different_nonces(self, mock_deps, watermark):
+        """Two assemble_payload calls on a freshly-configured stage yield different
+        summary_nonce values.
+
+        High-probability property of a 32-bit CSPRNG (P(collision) ~= 2.3e-10).
+        Task 1572: verifies the nonce is re-generated each call, not cached.
+        """
+        import re
+
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload1 = await stage.assemble_payload([], watermark, [])
+        payload2 = await stage.assemble_payload([], watermark, [])
+
+        match1 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload1)
+        match2 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload2)
+        assert match1, f"No summary_nonce in first payload; got: {payload1[-200:]!r}"
+        assert match2, f"No summary_nonce in second payload; got: {payload2[-200:]!r}"
+        assert match1.group(1) != match2.group(1), (
+            f"Expected different summary_nonce values across successive assemble_payload() calls, "
+            f"but both returned {match1.group(1)!r} — nonce must be regenerated each call."
+        )
+
 
 class TestTaskKnowledgeSyncKnownProjectsSection:
     """Stage 2 surfaces a "Known Projects" section so the LLM can re-route findings."""
