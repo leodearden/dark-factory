@@ -5,17 +5,22 @@ startup sites: the pre_ids snapshot before PRD parse, the pending-task check
 when no PRD is given, and the total_tasks count after reconcile.  Two
 companion tests cover the transport-failure vs genuinely-empty distinction
 introduced by task 1010.
+
+Task 1563 removed the 'No pending tasks found' startup refusal so the
+orchestrator can cold-start and idle on an empty queue under the
+run-until-stopped lifecycle.  The transport-failure raise is preserved.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, HarnessReport
 
 # ---------------------------------------------------------------------------
 # Shared fixture
@@ -79,16 +84,17 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
 ):
     """No-PRD startup uses get_statuses (not get_tasks) for the pending-task check.
 
-    Both mocks are seeded "no tasks" so the no-pending RuntimeError path is
-    exercised: get_statuses returns {} → 'pending' not in values → RuntimeError.
+    An empty but reachable tree ({}, None) no longer raises 'No pending tasks
+    found' — the harness proceeds into the main loop where the fixture's
+    acquire_next sentinel raises RuntimeError('stop').
     """
     h = startup_harness
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
-    # get_statuses seeded empty so the no-pending RuntimeError path fires.
+    # get_statuses seeded empty — guard removed, harness now reaches the loop.
     get_statuses_mock.return_value = ({}, None)
 
-    with pytest.raises(RuntimeError, match='No pending tasks found'):
+    with pytest.raises(RuntimeError, match='stop'):
         await h.run(prd_path=None)
 
     # get_statuses IS the call site for the pending-task check.
@@ -198,17 +204,56 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
 
 
 @pytest.mark.asyncio
-async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
+async def test_startup_noprd_empty_reachable_tree_idles_not_raises(
     startup_harness: Harness,
+    caplog: pytest.LogCaptureFixture,
 ):
-    """No-PRD startup: genuinely empty task tree still raises the original error.
+    """No-PRD startup: reachable but empty task tree does NOT raise 'No pending tasks found'.
 
-    When get_statuses returns ({}, None) (no transport failure), the existing
-    'No PRD given and no pending tasks found' RuntimeError is raised unchanged
-    — regression protection for the legitimately-empty path.
+    When get_statuses returns ({}, None) (no transport failure), the harness
+    logs an INFO idle banner and proceeds into the main loop rather than
+    refusing to start.  The fixture's acquire_next sentinel breaks the loop
+    with RuntimeError('stop') — asserting 'stop' proves execution passed the
+    guard.
     """
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
-    with pytest.raises(RuntimeError, match='No pending tasks found'):
-        await h.run(prd_path=None)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError, match='stop'):
+            await h.run(prd_path=None)
+
+    # The idle banner must be emitted.
+    assert 'No pending tasks at startup' in caplog.text
+    # The old guard message must NOT appear.
+    assert 'No pending tasks found' not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_startup_until_idle_empty_tree_exits_cleanly(
+    startup_harness: Harness,
+):
+    """--until-idle with empty task tree exits cleanly, returning a HarnessReport.
+
+    When get_statuses returns ({}, None) and until_idle=True, the harness
+    proceeds through the removed startup guard, enters the main loop, and
+    exits immediately via the existing 'if self._until_idle: break' drain check
+    rather than raising.  Proves the --until-idle immediate-exit-on-empty
+    contract is preserved by the main loop without new startup-time logic.
+
+    GOTCHA: scheduler.is_paused must be set False — MagicMock().is_paused is
+    truthy by default and would route acquire_next=None into the paused-idle
+    sleep branch, hanging the test forever.
+    """
+    h = startup_harness
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    h.scheduler.is_paused = False
+    h.scheduler.acquire_next = AsyncMock(return_value=None)
+    # Override return_value so mid-run reconcile returns 0 (no tasks freed);
+    # the fixture default returns a MagicMock which compares > 0 as truthy
+    # and would spin the loop forever.
+    h._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+
+    report = await h.run(prd_path=None, until_idle=True)
+
+    assert isinstance(report, HarnessReport)
