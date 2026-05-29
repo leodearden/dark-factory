@@ -1388,6 +1388,46 @@ class ReconciliationHarness:
             },
         )
 
+    def _finding_has_open_escalation(self, finding: dict) -> bool:
+        """Return True iff an OPEN pending escalation already covers this finding.
+
+        Uses the same compute_content_fingerprint key as _escalate and
+        _finding_persistence_count (category='recon_integrity_issue', finding
+        category, _derive_affected_ids, description) to guarantee suppression
+        is consistent with what _escalate would fold via submit_or_dedupe.
+
+        Fail-open: any exception (or HAS_ESCALATION False / queue None) returns
+        False so that a transient queue-read glitch costs at most one extra
+        remediation pass rather than silently suppressing a needed pass.
+
+        Task 1570 / FIX A.
+        """
+        if not HAS_ESCALATION or self._escalation_queue is None:
+            return False
+        try:
+            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
+                'recon_integrity_issue',
+                finding.get('category') or '',
+                _derive_affected_ids(finding),
+                finding.get('description') or '',
+            )
+            for e in self._escalation_queue.get_pending():
+                if (
+                    e.category == 'recon_integrity_issue'
+                    and e.dedupe_fingerprint == target_fp
+                ):
+                    return True
+            return False
+        except Exception as _err:
+            logger.warning(
+                'reconciliation.open_escalation_check_failed',
+                extra={
+                    'finding_category': finding.get('category', ''),
+                    'error': str(_err),
+                },
+            )
+            return False  # fail-open: proceed with remediation
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -1429,12 +1469,45 @@ class ReconciliationHarness:
             if not actionable:
                 return
 
+            # Task 1570 / FIX A: suppress remediation for any actionable finding
+            # that already has an OPEN pending recon_integrity_issue escalation.
+            # A finding is covered when _finding_has_open_escalation returns True
+            # (same fingerprint key as _escalate/_finding_persistence_count).
+            # Fail-open: on any queue-read error the helper returns False and the
+            # finding is treated as uncovered → remediation proceeds as before.
+            suppressed: list[dict] = []
+            to_remediate: list[dict] = []
+            for finding in actionable:
+                if self._finding_has_open_escalation(finding):
+                    suppressed.append(finding)
+                else:
+                    to_remediate.append(finding)
+
+            for finding in suppressed:
+                logger.info(
+                    'reconciliation.remediation_suppressed_open_escalation',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'affected_ids': _derive_affected_ids(finding),
+                        'description': finding.get('description', ''),
+                    },
+                )
+
+            if not to_remediate:
+                return
+
             logger.info(
-                f'Remediation: {len(actionable)} actionable findings from run {parent_run_id}, '
+                f'Remediation: {len(to_remediate)} actionable findings from run {parent_run_id}, '
                 f'triggering second pass'
+                + (
+                    f' ({len(suppressed)} suppressed — open escalation exists)'
+                    if suppressed else ''
+                )
             )
             await self._run_remediation_pass(
-                project_id, parent_run_id, actionable, tier,
+                project_id, parent_run_id, to_remediate, tier,
                 project_root=project_root,
                 filtered_task_tree=filtered_task_tree,
             )
