@@ -1,0 +1,27 @@
+{
+  "skill_name": "factory-init",
+  "notes": "Side-effecting workflow skill. Eval strategy is vibe + dry-run: exercise it against a real throwaway-ish repo (my-solar-challenge) and inspect the generated config + flow, gating the destructive steps (fused-memory restart, session spawning) behind confirmation. Assertions target the deterministic, verifiable parts: project_id derivation, port selection, valid config files.",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "factory-init ../my-solar-challenge so we can develop it with the orchestrator",
+      "expected_output": "Detects dark-factory installed; confirms my-solar-challenge is a git repo; derives project_id=my_solar_challenge (hyphen->underscore) and flags the need for a CLAUDE.md pin; picks escalation port 8104 (8100/8101/8102/8105 claimed, 8103 reserved); writes orchestrator.yaml/.mcp.json/.envrc/.gitignore/CLAUDE.md with Python verify commands and the venv-in-worktree caveat surfaced; validates config via orchestrator status; registers in DASHBOARD_KNOWN_PROJECT_ROOTS (with confirm) and restarts fused-memory; routes to /spawn /review-briefing -> /review -> offer /prd since code exists.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 2,
+      "prompt": "I'm starting a brand new project in ~/src/widget-forge (empty dir). Set it up for dark-factory.",
+      "expected_output": "Preflight passes; offers git init + initial commit since no repo; derives project_id=widget_forge (no hyphen, no pin needed); picks next free escalation port; writes config with placeholder/no-op verify commands appropriate to an empty repo and asks the user about the intended stack; registers + restarts (with confirm); since there's no code, runs a goals discussion then spawns /prd 1-5x serially.",
+      "files": [],
+      "assertions": []
+    },
+    {
+      "id": 3,
+      "prompt": "Set up /tmp/some-repo for the orchestrator (dark-factory's fused-memory service is stopped).",
+      "expected_output": "Preflight detects fused-memory on 8002 is unreachable and STOPS, telling the user dark-factory isn't fully running, that installing/starting it is out of scope for this skill, and does not attempt to start any service or write any config.",
+      "files": [],
+      "assertions": []
+    }
+  ]
+}
