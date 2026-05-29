@@ -88,7 +88,28 @@ class TicketStore:
         self._db: aiosqlite.Connection | None = None
 
     async def initialize(self) -> None:
-        """Open the SQLite connection and create the schema (idempotent)."""
+        """Open the SQLite connection and create the schema.
+
+        Idempotent at both the connection level and the schema level:
+
+        * **Connection-level** — if ``self._db`` is already set (e.g. from a
+          prior ``initialize()`` or a reconnect-via-reinit pattern), the
+          existing connection is closed first via :meth:`close` (which also
+          checkpoints the WAL and nulls ``self._db``) before a fresh one is
+          opened.  This prevents orphaning the aiosqlite worker thread, which
+          would otherwise raise ``"Event loop is closed"`` on GC (tasks 1560,
+          1562).
+
+        * **Schema-level** — ``CREATE TABLE IF NOT EXISTS`` and
+          ``CREATE INDEX IF NOT EXISTS`` make repeated calls safe on an
+          already-initialised database.
+        """
+        if self._db is not None:
+            # Idempotent / reconnect-safe: close (checkpoint WAL + close +
+            # null out) any prior connection before reassigning.  Orphaning it
+            # leaks the aiosqlite worker thread and raises "Event loop is
+            # closed" on GC (tasks 1560, 1562).
+            await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await connect_daemon(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
