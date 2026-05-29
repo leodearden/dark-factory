@@ -94,18 +94,59 @@ def _attempts_from_review_summary(summary: str) -> int:
         return 0
 
 
+def _build_task_row(
+    project: str,
+    task: dict,
+    task_id: int,
+    wt: dict,
+    uid: str,
+) -> dict:
+    """Build the common row fields shared by active and done task rows.
+
+    Returns a dict with all fields that are identical regardless of task
+    status.  Callers add status-specific fields afterwards:
+    active rows add ``started`` (minutes) and ``deps``; done rows add
+    ``started: 0``, ``deps: []``, and ``completed`` (ISO timestamp or '').
+    """
+    meta_files = list((task.get('metadata') or {}).get('files') or [])
+    train_meta = (task.get('metadata') or {}).get('train')
+    train = (
+        {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
+        if isinstance(train_meta, dict) and train_meta.get('id')
+        else None
+    )
+    return {
+        'id': uid,
+        'project': project,
+        'title': task.get('title') or '',
+        'description': task.get('description') or '',
+        'details': task.get('details') or '',
+        'status': task.get('status'),
+        'agent': f'claude-task-{task_id}' if wt else None,
+        'loops': int(wt.get('iteration_count') or 0),
+        'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
+        'meta_files': meta_files,
+        'train': train,
+    }
+
+
 async def _shape_one_project(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: Path,
     *,
     max_done_per_project: int = 0,
-) -> tuple[list[dict], bool]:
-    """Build (active_tasks, offline) for a single project root.
+) -> tuple[list[dict], bool, int]:
+    """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
     *offline* is True when the MCP fetch failed for this project; the
     caller surfaces that in the API payload so the React Tasks tab can
     show an offline banner.
+
+    *done_count* is the total number of ``'done'`` tasks in the fetched
+    list, **before** the *max_done_per_project* cap is applied.  Callers
+    that need the authoritative count for display should use this value
+    rather than counting the (capped) emitted rows.
 
     When *max_done_per_project* > 0, the most-recent N done tasks
     (sorted by ``updated_at`` descending, then ``id`` descending) are
@@ -116,10 +157,14 @@ async def _shape_one_project(
     project = _project_label(project_root)
     fetched = await fetch_tasks(client, config, project_root)
     if isinstance(fetched, dict) and fetched.get('offline'):
-        return [], True
+        return [], True, 0
     tasks = fetched if isinstance(fetched, list) else []
     if not tasks:
-        return [], False
+        return [], False, 0
+
+    # Count ALL done tasks before any cap — this is the authoritative figure
+    # for the DONE_COUNTS payload key.
+    done_count = sum(1 for t in tasks if t.get('status') == 'done')
 
     worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
 
@@ -148,37 +193,12 @@ async def _shape_one_project(
                 'done': dep_task.get('status') == 'done',
             })
 
-        # Footprint the scheduler actually locks on: taskmaster metadata.files.
-        # This is the same source the scheduler derives its module locks from;
-        # lock display is routed through D.SCHEDULER.{rows,modules} on the frontend.
-        meta_files = list((task.get('metadata') or {}).get('files') or [])
-
-        # Projected train shape: {id, order} only — members[] and other internal
-        # fields are intentionally excluded to keep the wire contract narrow.
-        train_meta = (task.get('metadata') or {}).get('train')
-        train = (
-            {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
-            if isinstance(train_meta, dict) and train_meta.get('id')
-            else None
-        )
-
         uid = _task_uid(project, task_id)
-        agent = f'claude-task-{task_id}' if wt else None
-        active.append({
-            'id': uid,
-            'project': project,
-            'title': task.get('title') or '',
-            'description': task.get('description') or '',
-            'details': task.get('details') or '',
-            'status': status,
-            'agent': agent,
-            'started': _minutes_since(meta.get('created_at')),
-            'loops': int(wt.get('iteration_count') or 0),
-            'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
-            'deps': deps,
-            'meta_files': meta_files,
-            'train': train,
-        })
+        row = _build_task_row(project, task, task_id, wt, uid)
+        # active rows: started from worktree creation time; deps from task tree.
+        row['started'] = _minutes_since(meta.get('created_at'))
+        row['deps'] = deps
+        active.append(row)
 
     if max_done_per_project > 0:
         done_tasks = [t for t in tasks if t.get('status') == 'done']
@@ -190,32 +210,50 @@ async def _shape_one_project(
         for task in done_tasks[:max_done_per_project]:
             task_id = task['id']
             uid = _task_uid(project, task_id)
-            meta_files = list((task.get('metadata') or {}).get('files') or [])
-            train_meta = (task.get('metadata') or {}).get('train')
-            train = (
-                {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
-                if isinstance(train_meta, dict) and train_meta.get('id')
-                else None
-            )
             wt = worktrees.get(task_id) or {}
-            active.append({
-                'id': uid,
-                'project': project,
-                'title': task.get('title') or '',
-                'description': task.get('description') or '',
-                'details': task.get('details') or '',
-                'status': 'done',
-                'agent': f'claude-task-{task_id}' if wt else None,
-                'started': 0,
-                'loops': int(wt.get('iteration_count') or 0),
-                'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
-                'deps': [],
-                'meta_files': meta_files,
-                'train': train,
-                'completed': task.get('updated_at') or '',
-            })
+            row = _build_task_row(project, task, task_id, wt, uid)
+            # done rows: no meaningful start time; no deps surfaced.
+            row['started'] = 0
+            row['deps'] = []
+            row['completed'] = task.get('updated_at') or ''
+            active.append(row)
 
-    return active, False
+    return active, False, done_count
+
+
+async def collect_tasks_with_counts(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    *,
+    max_done_per_project: int = 0,
+) -> tuple[list[dict], list[str], dict[str, int]]:
+    """Aggregate active tasks and per-project done counts in a single MCP pass.
+
+    Returns ``(active_tasks, offline_projects, done_counts)`` where:
+
+    - *active_tasks* is the list of active (and optionally bounded done) rows
+    - *offline_projects* lists project labels whose MCP fetch failed
+    - *done_counts* maps project label → total done task count (pre-cap)
+
+    Prefer this over calling ``collect_active_tasks`` and
+    ``collect_done_counts`` concurrently: it halves per-project MCP
+    round-trips and guarantees that DONE_COUNTS matches the same snapshot
+    as the ACTIVE_TASKS rows.
+    """
+    all_active: list[dict] = []
+    offline_projects: list[str] = []
+    done_counts: dict[str, int] = {}
+    for root in _all_project_roots(config):
+        active, offline, done_count = await _shape_one_project(
+            client, config, root, max_done_per_project=max_done_per_project,
+        )
+        label = _project_label(root)
+        if offline:
+            offline_projects.append(label)
+        else:
+            done_counts[label] = done_count
+        all_active.extend(active)
+    return all_active, offline_projects, done_counts
 
 
 async def collect_active_tasks(
@@ -236,17 +274,14 @@ async def collect_active_tasks(
 
     Lock state is surfaced via the scheduler endpoint — see
     /api/v2/dashboard/scheduler.
+
+    Note: callers that also need per-project done counts should use
+    ``collect_tasks_with_counts`` to avoid a second MCP round-trip.
     """
-    all_active: list[dict] = []
-    offline_projects: list[str] = []
-    for root in _all_project_roots(config):
-        active, offline = await _shape_one_project(
-            client, config, root, max_done_per_project=max_done_per_project,
-        )
-        if offline:
-            offline_projects.append(_project_label(root))
-        all_active.extend(active)
-    return all_active, offline_projects
+    active, offline, _ = await collect_tasks_with_counts(
+        client, config, max_done_per_project=max_done_per_project,
+    )
+    return active, offline
 
 
 async def collect_done_counts(
@@ -256,16 +291,17 @@ async def collect_done_counts(
     """Return a ``{project_label: done_count}`` map for all reachable projects.
 
     Uses the compact ``fetch_statuses`` (the same source the burndown collector
-    uses) so the count agrees with the burndown snapshot and is ~95% smaller
-    than a full ``fetch_tasks`` call.
+    uses) so the count agrees with the burndown snapshot.
 
-    Projects whose ``fetch_statuses`` returns an offline marker are silently
-    omitted — the caller can fall back to counting loaded done rows from
-    ACTIVE_TASKS.
+    All projects are fetched concurrently to minimise latency.  Projects whose
+    ``fetch_statuses`` returns an offline marker are silently omitted.
     """
+    roots = _all_project_roots(config)
+    results = await asyncio.gather(
+        *(fetch_statuses(client, config, r) for r in roots)
+    )
     counts: dict[str, int] = {}
-    for root in _all_project_roots(config):
-        result = await fetch_statuses(client, config, root)
+    for root, result in zip(roots, results):
         # Skip offline markers (dict with 'offline' key).
         if isinstance(result, dict) and result.get('offline'):
             continue
