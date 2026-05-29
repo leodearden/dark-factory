@@ -69,7 +69,9 @@ def startup_harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
     # Raise on acquire_next to stop the scheduler loop after startup.
-    h.scheduler.acquire_next = AsyncMock(side_effect=RuntimeError('stop'))
+    # Use a distinctive sentinel so match='__loop_reached_sentinel__' cannot
+    # collide with unrelated RuntimeErrors (e.g. 'stopped'/'stopping').
+    h.scheduler.acquire_next = AsyncMock(side_effect=RuntimeError('__loop_reached_sentinel__'))
 
     return h
 
@@ -94,7 +96,7 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     # get_statuses seeded empty — guard removed, harness now reaches the loop.
     get_statuses_mock.return_value = ({}, None)
 
-    with pytest.raises(RuntimeError, match='stop'):
+    with pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
         await h.run(prd_path=None)
 
     # get_statuses IS the call site for the pending-task check.
@@ -121,7 +123,7 @@ async def test_startup_total_tasks_counted_via_get_statuses(
         None,
     )
 
-    with pytest.raises(RuntimeError, match='stop'):
+    with pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
         await h.run(prd_path=None)
 
     assert h.report.total_tasks == 2
@@ -160,7 +162,7 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
 
     h._tag_prd_metadata = _capture  # type: ignore[assignment]
 
-    with pytest.raises(RuntimeError, match='stop'):
+    with pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
         await h.run(prd_path=prd)
 
     assert captured_pre_ids == {'10', '20'}
@@ -213,19 +215,20 @@ async def test_startup_noprd_empty_reachable_tree_idles_not_raises(
     When get_statuses returns ({}, None) (no transport failure), the harness
     logs an INFO idle banner and proceeds into the main loop rather than
     refusing to start.  The fixture's acquire_next sentinel breaks the loop
-    with RuntimeError('stop') — asserting 'stop' proves execution passed the
-    guard.
+    with RuntimeError('__loop_reached_sentinel__') — asserting the sentinel
+    proves execution passed the guard and entered the main loop.
     """
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
-    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match='stop'):
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
         await h.run(prd_path=None)
 
     # The idle banner must be emitted.
     assert 'No pending tasks at startup' in caplog.text
-    # The old guard message must NOT appear.
-    assert 'No pending tasks found' not in caplog.text
+    # Note: 'No pending tasks found' was a raised RuntimeError (not logged), so a
+    # negative caplog assertion for that string would be vacuous — omitted here.
+    # The meaningful guarantee is the positive banner assertion + raises(match=sentinel).
 
 
 @pytest.mark.asyncio
@@ -260,3 +263,8 @@ async def test_startup_until_idle_empty_tree_exits_cleanly(
     report = await h.run(prd_path=None, until_idle=True)
 
     assert isinstance(report, HarnessReport)
+    # acquire_next must have been awaited exactly once: proves the main loop was
+    # entered (not short-circuited before it) and the until-idle drain branch
+    # — not the paused-idle sleep branch — was the exit path.  If the paused
+    # branch had fired, acquire_next would never have been called.
+    cast(AsyncMock, h.scheduler.acquire_next).assert_awaited_once()
