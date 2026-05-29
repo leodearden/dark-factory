@@ -820,3 +820,113 @@ class TestReconReportShutdownCallback:
 
         cb = _make_operator_stop_callback()
         cb()  # Must not raise
+
+
+# ---------------------------------------------------------------------------
+# task-1568: Cross-stage in-run dedup — RED until step-2 extends add_finding
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportCrossStageDedup:
+    """Extend the §9.2 in-run dedup so it spans stage boundaries within a run_id.
+
+    Within one reconciliation cycle (shared run_id), Stage 2 must not be able
+    to allocate a second finding row for a (task_id, flag_type) already filed
+    by Stage 1. Cross-run isolation must be preserved: two runs with the same
+    signature must still produce distinct finding_ids.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def _finding(
+        self,
+        state,
+        run_id: str = 'r1',
+        task_id: str | None = '3803',
+        flag_type: str | None = 'task_stuck_pending_merge',
+        **kwargs,
+    ):
+        defaults = dict(
+            run_id=run_id,
+            severity='high',
+            category='stuck_task',
+            description='d',
+            suggested_action='a',
+            actionable=True,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_cross_stage_same_sig_returns_duplicate_error(self):
+        """Stage 2 filing the same (task_id, flag_type) as Stage 1 must return
+        duplicate_finding with existing_finding_id pointing at Stage 1's finding.
+        """
+        state, _ = self._make_state()
+
+        # Stage 1 — memory_consolidator
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        result1 = self._finding(state, run_id='r1')
+        assert 'finding_id' in result1, f'Stage 1 add_finding failed: {result1}'
+        finding_id_a = result1['finding_id']
+
+        # Stage 2 — task_knowledge_sync (same run_id, different stage)
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        result2 = self._finding(state, run_id='r1')
+
+        # Must be detected as a cross-stage duplicate
+        assert result2.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding but got: {result2}'
+        )
+        assert result2['error_type'] == 'ReconReportDuplicateFinding'
+        assert result2['existing_finding_id'] == finding_id_a
+
+        # Stage 2's report must be empty (dup never entered it)
+        s2_report = state.get_assembled_report('r1', 'task_knowledge_sync')
+        assert s2_report is not None
+        assert s2_report['flagged_items'] == []
+
+        # Stage 1's report must still have exactly one finding
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert len(s1_report['flagged_items']) == 1
+        assert s1_report['flagged_items'][0]['finding_id'] == finding_id_a
+
+    def test_cross_stage_different_sig_both_allocate(self):
+        """Different (task_id, flag_type) signatures across two stages of the same
+        run must both succeed — cross-stage dedup must not over-suppress.
+        """
+        state, _ = self._make_state()
+
+        # Stage 1
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        r1 = self._finding(state, run_id='r1', task_id='42', flag_type='memory_task_mismatch')
+        assert 'finding_id' in r1, f'Stage 1 add_finding failed: {r1}'
+
+        # Stage 2 — different signature
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        r2 = self._finding(state, run_id='r1', task_id='99', flag_type='missing_completion_memory')
+        assert 'finding_id' in r2, f'Stage 2 add_finding failed: {r2}'
+
+        assert r1['finding_id'] != r2['finding_id']
+
+    def test_cross_run_same_sig_not_deduped(self):
+        """Two different run_ids with the same (task_id, flag_type) must each
+        allocate distinct finding_ids — cross-run isolation must be preserved.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = self._finding(state, run_id='r1')
+        assert 'finding_id' in res1, f'Run r1 add_finding failed: {res1}'
+
+        state.start_report(run_id='r2', stage='memory_consolidator', project_id='dark_factory')
+        res2 = self._finding(state, run_id='r2')
+        assert 'finding_id' in res2, f'Run r2 add_finding failed: {res2}'
+
+        assert res1['finding_id'] != res2['finding_id']
