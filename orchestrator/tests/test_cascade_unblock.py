@@ -345,3 +345,33 @@ class TestCascadeUnblockIntegration:
 
         # Clean up background tasks
         await asyncio.gather(*list(harness._background_tasks))
+
+
+@pytest.mark.asyncio
+class TestCascadeUnblockOffLoop:
+    """The resolve callback may fire OFF the orchestrator loop (sync MCP
+    resolve_issue runs on a FastMCP threadpool worker).  The old bare
+    asyncio.create_task raised 'no running event loop' there, silently
+    dropping the flip (2026-05-29 reify).  _schedule_coro_threadsafe must
+    route it back onto the captured loop instead."""
+
+    async def test_off_loop_resolve_still_flips_blocked_member(
+        self, harness: Harness
+    ):
+        """[Regression] blocked member is flipped even when the callback runs off-loop."""
+        # run() normally captures this; set directly since we skip startup.
+        harness._loop = asyncio.get_running_loop()
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        esc = _make_l1_esc(task_id='3438', resolved_by='l2-cascade:esc-4000-39')
+
+        # Worker thread → no running loop in that thread (the failing condition).
+        await asyncio.to_thread(harness._on_escalation_resolved, esc)
+
+        # The flip is scheduled onto harness._loop; poll until it lands.
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while harness.scheduler.set_task_status.await_count == 0:  # type: ignore[attr-defined]
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.02)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with('3438', 'pending')  # type: ignore[attr-defined]

@@ -708,4 +708,31 @@ def create_server(
             return {'wired': False, 'error': 'escalation server running standalone'}
         return harness.get_merge_halt_status()
 
+    @mcp.tool()
+    async def resume_scheduler(reason: str) -> dict[str, Any]:
+        """Resume a paused orchestrator scheduler in-process (no restart).
+
+        The scheduler park-stops (or cost-ceiling / EWA-trips) by setting an
+        in-memory pause that ALSO persists to runs.db, so the pause survives
+        restarts.  This clears both: dispatch resumes on the next idle tick
+        (~15s), no restart needed.
+
+        Normally you resolve the scheduler-pause L1 instead — that now
+        auto-resumes the scheduler.  Use this tool for the orphan case: the
+        pause has no open escalation (it was dismissed, or filing failed), or
+        you need to force a resume directly.  Idempotent; ``reason`` is
+        required for audit.
+
+        Returns ``{resumed, was_paused, prior_reason, reason}`` (or an
+        ``error`` when the server is running standalone with no harness wired).
+        """
+        if harness is None:
+            return {
+                'resumed': False,
+                'error': 'escalation server running standalone — no harness wired',
+            }
+        if not reason or not reason.strip():
+            return {'resumed': False, 'error': 'reason is required for audit'}
+        return await harness.force_resume_scheduler(reason.strip())
+
     return mcp

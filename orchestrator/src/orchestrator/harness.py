@@ -345,6 +345,12 @@ class Harness:
         # Fire-and-forget async tasks (strong refs prevent GC mid-flight).
         # Mirrors the active-set + add_done_callback(discard) idiom at line ~856.
         self._background_tasks: set[asyncio.Task] = set()
+        # The orchestrator's event loop, captured in run() once we're inside
+        # asyncio.run().  Lets callbacks that may fire OFF the loop (the sync
+        # escalation MCP tool resolve_issue runs on a FastMCP threadpool worker)
+        # schedule coroutines back onto it via run_coroutine_threadsafe — see
+        # _schedule_coro_threadsafe.  None until run() starts.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Idle-while-paused state (task 1322 follow-up).  Throttle timestamp for
         # the "alive but paused" WARNING emitted by the main run loop.
@@ -499,6 +505,13 @@ class Harness:
         """
         self._until_idle = until_idle
         self.report.started_at = datetime.now(UTC).isoformat()
+
+        # Capture the live event loop so off-loop callbacks (e.g. the sync
+        # escalation MCP tool resolve_issue, which FastMCP runs on a threadpool
+        # worker) can schedule coroutines back onto it.  Must be inside
+        # asyncio.run(); Harness is constructed in the sync body of cli.run()
+        # where no loop exists yet.
+        self._loop = asyncio.get_running_loop()
 
         # Install the usage-gate SIGHUP handler now that we're inside
         # asyncio.run(). The gate's __init__ runs before the loop exists
@@ -3825,6 +3838,69 @@ Output JSON matching the schema. Every task must appear in the output.
         if event:
             event.set()
 
+    def _schedule_coro_threadsafe(self, coro, *, label: str) -> None:
+        """Schedule *coro* on the orchestrator event loop from any thread.
+
+        ``_on_escalation_resolved`` can fire on EITHER thread:
+          - in-loop, for callers like the watcher supervisor or unit tests
+            that drive ``queue.resolve()`` from within the running loop; or
+          - off-loop, when the sync escalation MCP tool ``resolve_issue`` runs
+            on a FastMCP threadpool worker — there is no running loop in that
+            thread, so a bare ``asyncio.create_task`` raises ``RuntimeError:
+            no running event loop`` (the 2026-05-29 reify failure: the
+            cascade-unblock flip was dropped AND, had it been wired, the
+            scheduler auto-resume would have been too).
+
+        On-loop: ``create_task`` + register in ``_background_tasks`` so callers
+        awaiting that set still observe the work (preserves the cascade unit
+        tests' ``await asyncio.gather(*_background_tasks)`` drain).
+
+        Off-loop: hand the coroutine to ``self._loop`` via
+        ``run_coroutine_threadsafe``, which is thread-safe and wakes the loop.
+
+        Best-effort: if no loop is reachable (bare-Harness tests that never
+        called ``run()`` and aren't inside a loop), the coroutine is closed and
+        a WARNING logged, so the queue's callback wrapper never sees an
+        exception.
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is not None:
+            t = running.create_task(coro)
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
+            return
+
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.warning(
+                '%s: no orchestrator event loop reachable; dropping', label,
+            )
+            coro.close()
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            logger.warning(
+                '%s: failed to schedule on orchestrator loop', label,
+                exc_info=True,
+            )
+            coro.close()
+            return
+
+        def _log_if_raised(f) -> None:
+            try:
+                exc = f.exception()
+            except Exception:
+                return
+            if exc is not None:
+                logger.warning('%s: scheduled coro raised: %r', label, exc)
+
+        fut.add_done_callback(_log_if_raised)
+
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""
         # Increment for any status transition (resolved or dismissed) — both are
@@ -3850,6 +3926,30 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Merge queue un-halted: halt owner %s resolved', escalation.id,
             )
 
+        # Auto-resume a paused scheduler when its pause L1 resolves.  This is
+        # the documented resume path — the L1's own detail text says "resolve
+        # this escalation / call resume_scheduler()" — but it was never wired,
+        # so resolving the L1 cleared the marker while the scheduler stayed
+        # parked and kept logging "Scheduler paused — idling" (2026-05-29 reify
+        # incident).  Gated on is_paused so a resolution arriving after a manual
+        # resume_scheduler() (or for a stale already-resolved sentinel) is a
+        # no-op.  Scheduled threadsafe because this callback may run off-loop
+        # (sync MCP resolve_issue on a FastMCP worker).  Resume only on
+        # 'resolved' — 'dismissed' means the operator abandoned the pause.
+        if (
+            escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL
+            and escalation.status == 'resolved'
+            and self.scheduler.is_paused
+        ):
+            logger.info(
+                'scheduler-pause escalation %s resolved — auto-resuming '
+                'scheduler dispatch', escalation.id,
+            )
+            self._schedule_coro_threadsafe(
+                self.resume_scheduler(),
+                label=f'auto-resume-scheduler (via {escalation.id})',
+            )
+
         # Auto-flip cascade-resolved L1 member task from blocked→pending.
         # Guarded by level==1 + status=='resolved' + resolved_by startswith 'l2-cascade:'
         # so it only fires for members of a resolved (not dismissed) L2 cluster.
@@ -3861,22 +3961,17 @@ Output JSON matching the schema. Every task must appear in the output.
             and isinstance(escalation.resolved_by, str)
             and escalation.resolved_by.startswith('l2-cascade:')
         ):
-            # asyncio.create_task requires a running event loop. In production
-            # this callback always fires inside the orchestrator loop, so this
-            # is safe. Guard with RuntimeError so an accidental non-loop
-            # invocation (e.g. a sync test helper or future tooling) is
-            # diagnosable rather than swallowed as a generic callback failure
-            # by the queue's try/except wrapper.
-            try:
-                t = asyncio.create_task(self._cascade_unblock_member(escalation))
-                self._background_tasks.add(t)
-                t.add_done_callback(self._background_tasks.discard)
-            except RuntimeError:
-                logger.warning(
-                    'cascade-unblock: no running event loop; cannot schedule '
-                    'flip for task %s (via %s)',
-                    escalation.task_id, escalation.resolved_by,
-                )
+            # Scheduled via _schedule_coro_threadsafe so it works whether this
+            # callback fires on the orchestrator loop (watcher supervisor, unit
+            # tests) or off it (sync MCP resolve_issue on a FastMCP worker —
+            # where a bare asyncio.create_task raised "no running event loop").
+            self._schedule_coro_threadsafe(
+                self._cascade_unblock_member(escalation),
+                label=(
+                    f'cascade-unblock task {escalation.task_id} '
+                    f'(via {escalation.resolved_by})'
+                ),
+            )
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
@@ -3963,6 +4058,38 @@ Output JSON matching the schema. Every task must appear in the output.
             owner, reason,
         )
         return {'unhalted': True, 'prior_owner': owner, 'reason': reason}
+
+    async def force_resume_scheduler(self, reason: str) -> dict[str, Any]:
+        """Operator/watcher escape hatch: resume a paused scheduler in-process.
+
+        Backs the ``resume_scheduler`` escalation MCP tool.  Mirrors
+        ``force_unhalt_merge_queue``: a structured-return, audit-logged wrapper
+        over the existing ``resume_scheduler()`` (which clears the in-memory
+        pause, resets the EWA if the trip was EWA-driven, clears the persisted
+        pause in runs.db, and emits ``scheduler_resumed``).
+
+        Unlike resolving the scheduler-pause L1 (which now auto-resumes via
+        ``_on_escalation_resolved``), this works even when the pause has no open
+        escalation — the orphan case (escalation dismissed, or filing failed).
+
+        Idempotent: reports ``resumed=False`` when nothing was paused, but
+        still calls ``resume_scheduler()`` so a stale runs.db pause row can't
+        resurrect the pause on the next restart.  ``reason`` is required for
+        audit.
+        """
+        was_paused = self.scheduler.is_paused
+        prior_reason = self.scheduler.pause_reason
+        await self.resume_scheduler()
+        logger.warning(
+            'force_resume_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
+            was_paused, prior_reason, reason,
+        )
+        return {
+            'resumed': was_paused,
+            'was_paused': was_paused,
+            'prior_reason': prior_reason,
+            'reason': reason,
+        }
 
     # ------------------------------------------------------------------ #
     # Scheduler park-and-stop pause (task 1322)                           #
