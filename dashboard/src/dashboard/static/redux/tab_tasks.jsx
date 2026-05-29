@@ -187,7 +187,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
                   <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
                   {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
                   <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-                    {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed || 'done') : t.status}
+                    {t.status === 'in-progress' ? `${t.started}m` : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
                   </span>
                 </div>
                 <div className="ttl">{t.title}</div>
@@ -201,7 +201,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
 }
 
 function fmtAge(t) {
-  if (t.status === 'done')             return t.completed || '—';
+  if (t.status === 'done')             return t.completed ? window.DF_SHELL.timeago(t.completed) : '—';
   if (t.status === 'pending')          return 'unstarted';
   if (t.status === 'merge-deferred')   return 'parked for train';
   return `${t.started}m running`;
@@ -405,11 +405,18 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const projTasks = allTasks.filter(t => t.project === p.id);
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
+            const _fallbackDone = projTasks.filter(t => t.status === 'done').length;
             const counts = {
               total:    projTasks.length,
               active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
               pending:  projTasks.filter(t => t.status === 'pending').length,
-              complete: projTasks.filter(t => t.status === 'done').length,
+              // DONE_COUNTS carries the authoritative full count from the server.
+              // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
+              // (≤50 per project). If we hit that cap without a server count, show
+              // "50+" so the user knows the displayed number is a lower bound.
+              complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
+                ? DF_T.DONE_COUNTS[p.id]
+                : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const summary = (
