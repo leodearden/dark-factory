@@ -277,6 +277,33 @@ def test_multiselect_select_none_clears_to_empty(shell_jsx_body):
     )
 
 
+# ---------------------------------------------------------------------------
+# step-15: index.html cache-buster is bumped to >= 19
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_cache_buster_bumped(index_html_body):
+    """Every /static/redux/* asset in index.html must carry a ?v= cache-buster
+    that is equal and >= 19.
+
+    The current value is 18.  Any change to styles.css, shell.jsx,
+    tab_scheduler.jsx, or app.jsx requires bumping the version so browsers
+    reload the changed assets.
+
+    Asserts:
+    - All ?v= values found on /static/redux/* paths are integers >= 19
+    - At least one versioned asset is present (sanity guard)
+    """
+    versions = [
+        int(m.group(1))
+        for m in re.finditer(r'/static/redux/[^\s"\']+\?v=(\d+)', index_html_body)
+    ]
+    assert versions, 'No versioned /static/redux/* assets found in index.html'
+    assert all(v >= 19 for v in versions), (
+        f'All ?v= values must be >= 19; found: {versions}'
+    )
+
+
 def test_styles_css_widens_scheduler_title_column(styles_css_body):
     """styles.css must widen the scheduler title column to readable widths.
 
