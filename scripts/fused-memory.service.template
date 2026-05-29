@@ -44,7 +44,7 @@ Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
 # Multi-project path-scope-guard / project-prefix-registry coverage. Same env var
 # the dashboard reads — keep in sync with dashboard.service.template. Comma-separated
 # (no spaces — systemd treats them as assignment separators).
-Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
+Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live,/home/leo/src/my-solar-challenge
 # F-infra T-8: pre-done hook for Reify project. Calls reify-audit P5 check
 # before any set_task_status(done) transition. {id} is substituted by the
 # upstream hook (pre_done_hook.py) with the actual task id at invocation time.

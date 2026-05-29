@@ -27,6 +27,8 @@ Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/hom
 
 Append `,<TARGET>` to the end of that line. Editing the template (not just the live unit) means the registration survives the next time anyone re-runs `setup-host.sh`. `__REPO_ROOT__` is a placeholder for `<DF>` and is fine to leave as-is — the new entry is a literal absolute path.
 
+**Keep `dashboard.service.template` in sync.** The same `DASHBOARD_KNOWN_PROJECT_ROOTS=` line appears in `<DF>/scripts/dashboard.service.template` (the comment in the fused-memory template says so explicitly). Make the identical append there, or the project won't show on the dashboard. The fused-memory copy is the one that governs reconciliation (the recon-storm hazard); the dashboard copy is cosmetic but should match.
+
 ### 2. Render into the live unit
 
 `setup-host.sh` installs the unit by substituting `__REPO_ROOT__`. Reproduce just that step (don't run the whole `setup-host.sh`, which also does docker/uv work):
