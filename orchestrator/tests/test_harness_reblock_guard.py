@@ -58,7 +58,7 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     harness.briefing = MagicMock()
     harness.mcp = MagicMock()
     harness.usage_gate = MagicMock()
-    harness._merge_queue = None
+    harness._merge_queue = asyncio.Queue()
     harness._merge_worker = None
     harness.event_store = None
     harness.cost_store = None
