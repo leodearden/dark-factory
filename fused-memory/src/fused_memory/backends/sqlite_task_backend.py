@@ -1094,6 +1094,13 @@ class SqliteTaskBackend:
             norm_pid, dep_int = _parse_qualified_dep(depends_on)
             canonical = f'{norm_pid}:{dep_int}'
 
+            # Self-check: reject when both project_id and task_id match this task.
+            if norm_pid == resolve_project_id(project_root) and dep_int == tid:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'add_dependency: task cannot depend on itself',
+                )
+
             async with self._write_lock(project_root), self._txn(project_root) as conn:
                 cursor = await conn.execute(
                     'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
