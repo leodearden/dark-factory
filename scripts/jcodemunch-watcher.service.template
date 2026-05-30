@@ -4,7 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=__UV_PATH__x --python 3.12 --with "jcodemunch-mcp[watch]" \
+# PyPI name `jcodemunch-mcp` was quarantined (admin review #308, ~2026-05-30) →
+# bare `uvx jcodemunch-mcp` 404s. Pinned to the git source until PyPI is restored.
+# v1.108.27 is the latest-stable line (index-schema matches existing on-disk indexes);
+# the v2.x git tags are an OLDER/divergent line (older index schema) despite the
+# higher semver — do NOT pin 2.x. Revert to `--with "jcodemunch-mcp[watch]"` once
+# `uvx jcodemunch-mcp` resolves from PyPI again.
+ExecStart=__UV_PATH__x --python 3.12 --from "jcodemunch-mcp[watch] @ git+https://github.com/jgravelle/jcodemunch-mcp.git@v1.108.27" \
   jcodemunch-mcp watch-claude \
   --repos __REPO_ROOT__
 
