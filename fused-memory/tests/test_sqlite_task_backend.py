@@ -16,6 +16,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _format_task_id,
     _merge_metadata,
     _normalize_legacy_memory_hints_value,
+    _parse_qualified_dep,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -76,6 +77,41 @@ def test_parse_task_id_rejects_malformed(raw):
 def test_format_task_id_round_trips():
     assert _format_task_id(7, None) == '7'
     assert _format_task_id(2, 7) == '7.2'
+
+
+# ── _parse_qualified_dep ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    'raw,expected_pid,expected_id',
+    [
+        ('dark_factory:13', 'dark_factory', 13),
+        ('dark-factory:13', 'dark_factory', 13),   # hyphen normalized
+        (' dark_factory : 13 ', 'dark_factory', 13),  # whitespace stripped
+    ],
+)
+def test_parse_qualified_dep_accepts_valid(raw, expected_pid, expected_id):
+    pid, dep_id = _parse_qualified_dep(raw)
+    assert pid == expected_pid
+    assert dep_id == expected_id
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        ':13',               # empty project_id
+        'dark_factory:',     # empty task_id
+        'dark_factory:abc',  # non-numeric task_id
+        'a:b:c',             # extra colon
+        'dark_factory:5.1',  # dotted/subtask id
+        'dark_factory:0',    # non-positive (zero)
+        'dark_factory:-1',   # non-positive (negative)
+    ],
+)
+def test_parse_qualified_dep_rejects_malformed(raw):
+    with pytest.raises(TaskmasterError) as exc:
+        _parse_qualified_dep(raw)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────
