@@ -139,7 +139,15 @@ fi
 #   - /home/leo/bin/wait-for-port.py        (port-wait helper used by ExecStartPre)
 #   - orchestrator-dark-factory.service     (dark-factory orchestrator, supervised)
 #   - orchestrator-reify.service            (reify orchestrator, supervised)
+#   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, supervised)
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
+#
+# The orchestrator units run `uv run --frozen ...`, so process start never
+# implicitly re-syncs the shared dark-factory/.venv. After any dependency change
+# (or a fresh checkout) run scripts/sync-orchestrator-env.sh once to materialize
+# the runtime venv on the .python-version pin — the watchdog only port-probes and
+# will NOT repair a missing/stale venv (a frozen-start failure that exhausts
+# StartLimitBurst is left stopped for operator attention).
 #
 # The unit files reference /home/leo/bin/wait-for-port.py from ExecStartPre,
 # so the helper lives under ~/bin (stable absolute path across repo moves).
@@ -150,10 +158,11 @@ info "Installing orchestrator units + watchdog"
 mkdir -p "$HOME/bin"
 install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.py"
 
-cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service" "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-reify.service"        "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"     "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"       "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
 
 systemctl --user daemon-reload
 # Watchdog timer always enabled — it's the safety net that revives a
@@ -164,6 +173,9 @@ systemctl --user enable orchestrator-watchdog.timer
 # Disable selectively if a host should not be part of the unattended workload.
 systemctl --user enable orchestrator-reify.service
 systemctl --user enable orchestrator-dark-factory.service
+# autopilot-video joined the unattended workload 2026-05-29 (separate target,
+# selected purely via --config). Enabled by default like the other two.
+systemctl --user enable orchestrator-autopilot-video.service
 ok "orchestrator units + watchdog installed and enabled"
 
 # ---------------------------------------------------------------------------
