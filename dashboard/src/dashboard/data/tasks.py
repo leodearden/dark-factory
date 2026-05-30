@@ -106,6 +106,43 @@ async def fetch_tasks(
     return {'offline': True, 'error': '; '.join(errors)}
 
 
+async def fetch_external_statuses(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    deps: list[str],
+) -> dict[str, str]:
+    """Fetch a ``{dep_id: status}`` map for a list of external dep strings via MCP.
+
+    Calls ``get_external_statuses`` which returns a BARE ``{dep: status}`` map
+    (NOT wrapped in a ``'statuses'`` key, unlike ``get_statuses``).
+
+    Short-circuits to ``{}`` when *deps* is empty (no MCP call issued).
+    Returns ``{}`` on any network/parse failure (fail-safe: leaves entries at
+    the ``'unknown'`` sentinel rather than fabricating statuses or crashing).
+    """
+    if not deps:
+        return {}
+
+    for url in config.fused_memory_urls:
+        try:
+            result = await mcp_tool_call(
+                client, url, 'get_external_statuses', {'deps': deps},
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('fetch_external_statuses failed for %s: %s', url, e)
+            _sessions.pop(url.rstrip('/'), None)
+            continue
+
+        if not isinstance(result, dict):
+            logger.debug('fetch_external_statuses: unexpected result type %s from %s', type(result), url)
+            continue
+
+        return result  # bare {dep: status} map
+
+    return {}
+
+
 async def fetch_statuses(
     client: httpx.AsyncClient,
     config: DashboardConfig,
