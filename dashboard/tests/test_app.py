@@ -123,6 +123,45 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     assert body['TASKS_OFFLINE_PROJECTS'] == ['dark-factory']
 
 
+def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(client):
+    """api_tasks must call collect_tasks_with_counts with resolve_external=True
+    and forward the external_deps field in ACTIVE_TASKS rows unchanged.
+
+    Asserts:
+    (a) collect_tasks_with_counts is called with resolve_external=True
+    (b) ACTIVE_TASKS[0]['external_deps'] contains the resolved dep
+    (c) Top-level key set is unchanged (non-breaking)
+    """
+    mock_row = {
+        'id': 'dark-factory/T-5',
+        'project': 'dark-factory',
+        'title': 'waits on upstream',
+        'status': 'pending',
+        'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
+    }
+    mock = AsyncMock(return_value=([mock_row], [], {}))
+
+    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # (a) resolve_external=True was passed
+    call_kwargs = mock.call_args.kwargs
+    assert call_kwargs.get('resolve_external') is True, (
+        f'expected resolve_external=True in call_args.kwargs, got: {call_kwargs}'
+    )
+
+    # (b) external_deps passes through unmodified
+    assert body['ACTIVE_TASKS'][0]['external_deps'] == [
+        {'id': 'dark_factory:13', 'status': 'done'}
+    ]
+
+    # (c) top-level key set unchanged
+    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+
+
 def test_memory_returns_memory_status(client):
     """memory endpoint composes status + queue stats into a MEMORY_STATUS block."""
     with patch(
