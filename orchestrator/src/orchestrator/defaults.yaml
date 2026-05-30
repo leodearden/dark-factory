@@ -171,15 +171,13 @@ review:
 #
 # Parks are coupled to the owner's live state: they evaporate the moment the
 # owner completes, is cancelled, or has its dependencies un-satisfied — no
-# wall-clock lease needed.  Set scheduler_v2: true to activate the full v2
-# machinery (eager parks on the full module set, cross-tier preemption,
-# owner-state GC sweep).  Default false for burn-in; flip after validation.
+# wall-clock lease needed.  Eager parks cover the full module set at once
+# (cross-tier preemption + owner-state GC sweep are always active).
 #
 # Per-tier skip_threshold: tiers below the threshold park quickly; thresholds
 # >= 1000 effectively disable parking for that tier and auto-enable
 # rate-limited task_skipped emission.
 fairness:
-  scheduler_v2: false
   skip_threshold:
     critical: 0
     high: 1

@@ -2167,29 +2167,7 @@ class TestFairness:
         # And A's park was cleaned up on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
 
-    # ---- skip-threshold park tests (unconditional since scheduler_v2 gate removed) ----
-
-    @pytest.mark.asyncio
-    async def test_scheduler_v2_true_installs_parks(self):
-        """Parks install after the per-tier threshold (unconditional)."""
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        # Use per-tier defaults: high -> threshold=1 (installs after first skip).
-        scheduler = Scheduler(config)
-
-        # Seed compiler/src so A (high priority) is forced to skip.
-        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
-        scheduler._dispatched.add('seed')
-
-        a = self._broad_task()  # high priority
-        b = self._narrow_task('B', 'eval/src', priority='medium')
-        scheduler.get_tasks = AsyncMock(return_value=[a, b])
-
-        # One tick: high threshold=1, so A parks after this single skip.
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == 'B'
-
-        # A's parks should now be installed.
-        assert scheduler.lock_table.has_parks('A')
+    # ---- skip-threshold / unconditional park tests ----
 
     @pytest.mark.asyncio
     async def test_parks_install_unconditionally_without_v2_flag(self):
