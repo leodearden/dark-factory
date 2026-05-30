@@ -13,7 +13,10 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+from fused_memory.reconciliation.cli_stage_runner import (
+    STAGE1_DISALLOWED,
+    build_summary_nonce_section,
+)
 from fused_memory.reconciliation.flag_dedup import dedup_flags, filter_false_absence_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -256,6 +259,9 @@ class MemoryConsolidator(BaseStage):
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
 
+        # 9. Per-cycle summary nonce (task 1574)
+        summary_nonce_section = self._build_summary_nonce_section()
+
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -273,7 +279,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -321,6 +327,9 @@ Review the above data and perform memory consolidation:
         # Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # Per-cycle summary nonce (task 1574)
+        summary_nonce_section = self._build_summary_nonce_section()
+
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -338,7 +347,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -371,6 +380,18 @@ Review the above data and perform memory consolidation:
         if self.filtered_task_tree is None:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+
+    def _build_summary_nonce_section(self) -> str:
+        """Return the Per-Cycle Summary Nonce payload section with a fresh CSPRNG nonce.
+
+        Delegates to the shared cli_stage_runner.build_summary_nonce_section() helper
+        so Stage 1 and Stage 2 produce identical section wording and cannot drift.
+        Generates a new 8-char hex nonce on each call (secrets.token_hex(4)) so that
+        consecutive per-cycle summaries embed distinctly in Mem0's vector space,
+        defeating the ~0.92 cosine-similarity dedup threshold that was silently dropping
+        summaries (confirmed failure: run 899d2dad, summary 1ad1d2f5; task 1574).
+        """
+        return build_summary_nonce_section()
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""

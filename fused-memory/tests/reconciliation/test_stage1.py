@@ -7,6 +7,10 @@ Covers:
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
+- CSPRNG summary_nonce injection in per-cycle payloads (task 1574):
+  both legacy assemble_payload and assembled _format_assembled_payload paths must inject
+  '### Per-Cycle Summary Nonce' with a fresh 8-hex nonce per call
+  (TestStage1PayloadSummaryNonce)
 - A7b: harness._escalate fingerprint stamping and dedup routing
   (TestReconEscalationDedup)
 - Step-11: MemoryConsolidator.run() wiring — deletion guard (filter_false_absence_flags)
@@ -20,6 +24,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,6 +175,95 @@ class TestStage1PayloadOmitsProjectRootWhenUnset:
             '_format_assembled_payload should omit project_root directive when project_root is empty'
         )
         assert 'Use project_root=""' not in result
+
+
+# ---------------------------------------------------------------------------
+# task-1574: CSPRNG summary_nonce injection in Stage 1 per-cycle payloads
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PayloadSummaryNonce:
+    """assemble_payload / _format_assembled_payload inject '### Per-Cycle Summary Nonce'
+    with a fresh 8-hex CSPRNG nonce per call — mirrors Stage 2 (task 1572).
+    """
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_contains_nonce_section(self):
+        """Legacy assemble_payload (time-windowed path) includes '### Per-Cycle Summary Nonce'
+        and a summary_nonce: <8-hex> line.
+
+        RED before step-2 impl: no nonce section injected yet.
+        """
+        stage = _make_consolidator()
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert '### Per-Cycle Summary Nonce' in payload, (
+            "assemble_payload must inject '### Per-Cycle Summary Nonce' section "
+            "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
+        )
+        m = re.search(r'summary_nonce: ([0-9a-f]{8})', payload)
+        assert m is not None, (
+            "assemble_payload must include 'summary_nonce: <8-hex>' in the payload "
+            f"(regex r'summary_nonce: [0-9a-f]{{8}}' found no match); payload excerpt:\n"
+            f"{payload[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_nonce_is_fresh_per_call(self):
+        """Two consecutive assemble_payload calls produce distinct summary_nonce values.
+
+        Proves each call generates a fresh CSPRNG nonce rather than caching one value.
+        RED before step-2 impl: no nonce injected at all.
+        """
+        stage = _make_consolidator()
+        watermark = Watermark(project_id='test_project')
+
+        payload1 = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+        payload2 = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        m1 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload1)
+        m2 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload2)
+        assert m1 is not None and m2 is not None, (
+            "Both assemble_payload calls must emit a summary_nonce; "
+            "one or both were missing."
+        )
+        assert m1.group(1) != m2.group(1), (
+            f"Consecutive assemble_payload calls must produce DISTINCT nonces "
+            f"(got {m1.group(1)!r} both times — nonce is not fresh per call)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_assembled_path_contains_nonce_section(self):
+        """_format_assembled_payload (ContextAssembler path) includes nonce section.
+
+        RED before step-4 impl: _format_assembled_payload does not inject the nonce.
+        """
+        stage = _make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert '### Per-Cycle Summary Nonce' in payload, (
+            "_format_assembled_payload must inject '### Per-Cycle Summary Nonce' section "
+            "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
+        )
+        m = re.search(r'summary_nonce: ([0-9a-f]{8})', payload)
+        assert m is not None, (
+            "_format_assembled_payload must include 'summary_nonce: <8-hex>' in the payload "
+            f"(regex r'summary_nonce: [0-9a-f]{{8}}' found no match); payload excerpt:\n"
+            f"{payload[:500]}"
+        )
 
 
 # ---------------------------------------------------------------------------
