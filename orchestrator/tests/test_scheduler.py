@@ -6278,3 +6278,120 @@ class TestApplyExternalDepPolicyCancelled:
         )
 
         callback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyUnresolved (task 1580 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyUnresolved:
+    """Grace-then-escalate counter for unknown/malformed sentinel statuses.
+
+    Uses max_external_dep_unresolved_cycles=2 so tests don't need 3 real ticks.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_external_dep_unresolved_cycles=2,
+        )
+        return Scheduler(config)
+
+    def _pending_task(self, dep: str = 'dark_factory:5') -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+
+    @pytest.mark.parametrize(
+        'sentinel', ['unknown_task', 'unknown_project', 'malformed']
+    )
+    @pytest.mark.asyncio
+    async def test_sentinel_below_threshold_no_callback(
+        self, scheduler: Scheduler, sentinel: str
+    ):
+        """First tick with a sentinel: counter increments, callback NOT called."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': sentinel}, external_err=None
+        )
+
+        callback.assert_not_called()
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5'), 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_sentinel_at_threshold_fires_callback(self, scheduler: Scheduler):
+        """At threshold (2 ticks of unknown_task), callback IS called once."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+        cache = {'dark_factory:5': 'unknown_task'}
+
+        # Tick 1 — below threshold
+        await scheduler._apply_external_dep_policy([task], cache, external_err=None)
+        callback.assert_not_called()
+
+        # Tick 2 — reaches threshold
+        await scheduler._apply_external_dep_policy([task], cache, external_err=None)
+        callback.assert_called_once()
+
+        # Summary must carry EXTERNAL_DEP_UNRESOLVED prefix
+        kwargs = callback.call_args.kwargs
+        assert 'EXTERNAL_DEP_UNRESOLVED' in kwargs.get('summary', ''), (
+            f'Expected EXTERNAL_DEP_UNRESOLVED in summary; got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_when_dep_resolves_to_real_status(
+        self, scheduler: Scheduler
+    ):
+        """When dep later resolves to a non-sentinel, counter is reset to 0."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — sentinel; counter goes to 1
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5')) == 1
+
+        # Tick 2 — dep resolves to 'pending' (real live status)
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'pending'}, external_err=None
+        )
+        # Counter must be gone (reset)
+        assert ('10', 'dark_factory:5') not in scheduler._external_unresolved_counts, (
+            f'Counter should be reset; got '
+            f'{scheduler._external_unresolved_counts!r}'
+        )
+        # No callback (pending → wait silently)
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_when_dep_reaches_done(
+        self, scheduler: Scheduler
+    ):
+        """When dep resolves to 'done', counter is reset (not just ignored)."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — sentinel
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5')) == 1
+
+        # Tick 2 — dep is done
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'done'}, external_err=None
+        )
+        assert ('10', 'dark_factory:5') not in scheduler._external_unresolved_counts
+        callback.assert_not_called()
