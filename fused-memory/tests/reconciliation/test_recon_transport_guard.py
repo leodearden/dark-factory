@@ -12,7 +12,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from _fm_helpers import pydantic_spec
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.main import _require_http_transport_for_reconciliation
 
 # ---------------------------------------------------------------------------
@@ -21,7 +23,7 @@ from fused_memory.server.main import _require_http_transport_for_reconciliation
 
 def _make_cfg(transport: str, recon_enabled: bool):
     """Minimal fake config sufficient for the guard function."""
-    cfg = MagicMock()
+    cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     cfg.server.transport = transport
     cfg.reconciliation = MagicMock()
     cfg.reconciliation.enabled = recon_enabled
@@ -66,7 +68,7 @@ class TestRequireHttpTransportForReconciliation:
         _require_http_transport_for_reconciliation(cfg)
 
     def test_reconciliation_none_passes(self):
-        cfg = MagicMock()
+        cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         cfg.server.transport = 'stdio'
         cfg.reconciliation = None
         # reconciliation not configured → guard is a no-op
