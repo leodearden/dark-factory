@@ -31,11 +31,10 @@ import json
 from pathlib import Path
 
 import pytest
-
 from escalation.queue import EscalationQueue
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TwoProjectMcpSession
