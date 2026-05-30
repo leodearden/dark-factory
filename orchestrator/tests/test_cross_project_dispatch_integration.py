@@ -68,6 +68,8 @@ class TwoProjectMcpSession:
         self.ext_call_count: int = 0
         self.raise_on_external: bool = False
         self._request_id: int = 0
+        # Payload of the most-recent get_external_statuses call (for assertion).
+        self.last_ext_call_deps: list[str] | None = None
 
     # ── envelope helpers ─────────────────────────────────────────────────────
 
@@ -136,9 +138,11 @@ class TwoProjectMcpSession:
                 'TwoProjectMcpSession: simulated transient resolver error'
             )
 
+        deps: list[str] = arguments.get('deps', [])
+        # Record the deps payload so tests can assert the full batched set.
+        self.last_ext_call_deps = list(deps)
         self.ext_call_count += 1
 
-        deps: list[str] = arguments.get('deps', [])
         statuses: dict[str, str] = {}
 
         for dep in deps:
@@ -148,6 +152,10 @@ class TwoProjectMcpSession:
                 statuses[dep] = 'malformed'
                 continue
 
+            # Split on the FIRST colon only (index, not split).
+            # Multi-colon deps (e.g. 'proj:1:2') yield raw_task='1:2', which
+            # fails int() → 'malformed'. This edge case is intentionally out
+            # of scope for the double; α's own tests cover any divergence.
             colon_idx = dep.index(':')
             raw_project = dep[:colon_idx]
             raw_task = dep[colon_idx + 1:]
@@ -290,19 +298,12 @@ async def _call_get_external_statuses(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestResolverContract:
-    """Pin TwoProjectMcpSession.get_external_statuses to α's documented contract.
+    """Smoke-test: TwoProjectMcpSession.get_external_statuses wires through correctly.
 
-    All tests here call session.call_tool('get_external_statuses', ...) directly.
-    They fail RED because get_external_statuses raises NotImplementedError until S2.
-
-    Contract (mirrored from fused-memory/tests/test_get_external_statuses.py and
-    PRD Contract §get_external_statuses):
-    - Real status passed through verbatim (done / pending / cancelled).
-    - 'nope:1' → 'unknown_project' (unrecognised project_id).
-    - '<known>:999999' → 'unknown_task' (task absent from upstream_statuses).
-    - Malformed dep strings → 'malformed'.
-    - Hyphen-form project id resolves like underscore form; key is verbatim.
-    - A single multi-dep call increments ext_call_count by exactly 1.
+    These are minimal 'double wires through' checks — not an exhaustive copy of
+    α's contract. Exhaustive sentinel, normalization, and edge-case coverage lives
+    in fused-memory/tests/test_get_external_statuses.py (the real α tool). A full
+    parallel copy here would silently drift from production if α's contract changes.
     """
 
     def _make_session(self) -> TwoProjectMcpSession:
@@ -331,65 +332,22 @@ class TestResolverContract:
         assert statuses[f'{_UPSTREAM_PROJECT}:30'] == 'cancelled'
 
     @pytest.mark.asyncio
-    async def test_unknown_project_sentinel(self) -> None:
-        """Project not in known_projects → 'unknown_project' sentinel."""
-        session = self._make_session()
-        statuses = await _call_get_external_statuses(session, ['nope:1'])
-        assert statuses['nope:1'] == 'unknown_project'
+    async def test_sentinel_wiring_and_call_count(self) -> None:
+        """Sentinel routing wires through and ext_call_count increments once per call.
 
-    @pytest.mark.asyncio
-    async def test_unknown_task_sentinel(self) -> None:
-        """Known project but absent task_id → 'unknown_task' sentinel."""
-        session = self._make_session()
-        statuses = await _call_get_external_statuses(
-            session, [f'{_UPSTREAM_PROJECT}:999999']
-        )
-        assert statuses[f'{_UPSTREAM_PROJECT}:999999'] == 'unknown_task'
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('dep', [
-        'garbage',                              # no colon at all
-        f'{_UPSTREAM_PROJECT}:',                # empty task_id
-        ':10',                                  # empty project_id
-        f'{_UPSTREAM_PROJECT}:abc',             # non-numeric task_id
-    ])
-    async def test_malformed_dep_sentinel(self, dep: str) -> None:
-        """Unparseable dep string → 'malformed' sentinel."""
-        session = self._make_session()
-        statuses = await _call_get_external_statuses(session, [dep])
-        assert statuses[dep] == 'malformed', (
-            f'Expected malformed sentinel for {dep!r}; got {statuses!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_hyphen_project_id_normalized(self) -> None:
-        """Hyphen form of project_id resolves identically to underscore form.
-
-        Key in the result must be the verbatim hyphen string.
+        Checks one passthrough (real status) and one sentinel (unknown_project)
+        in a single call to confirm the double routes both branches correctly.
+        Exhaustive sentinel cases (unknown_task, malformed, hyphen-normalization)
+        are covered by fused-memory/tests/test_get_external_statuses.py.
         """
-        hyphen_project = _UPSTREAM_PROJECT.replace('_', '-')
-        session = self._make_session()
-        statuses = await _call_get_external_statuses(
-            session, [f'{hyphen_project}:10']
-        )
-        # Key is verbatim (hyphen form); value is the real status.
-        assert statuses[f'{hyphen_project}:10'] == 'done', (
-            f'Hyphen-form dep should resolve to done; got {statuses!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_single_call_increments_ext_call_count_by_one(self) -> None:
-        """A single multi-dep call increments ext_call_count by exactly 1."""
         session = self._make_session()
         assert session.ext_call_count == 0
-        await _call_get_external_statuses(
+        statuses = await _call_get_external_statuses(
             session,
-            [
-                f'{_UPSTREAM_PROJECT}:10',
-                f'{_UPSTREAM_PROJECT}:20',
-                'nope:1',
-            ],
+            [f'{_UPSTREAM_PROJECT}:10', 'nope:1'],
         )
+        assert statuses[f'{_UPSTREAM_PROJECT}:10'] == 'done'
+        assert statuses['nope:1'] == 'unknown_project'
         assert session.ext_call_count == 1, (
             f'Expected ext_call_count==1 after one call; got {session.ext_call_count}'
         )
@@ -619,14 +577,34 @@ class TestOneExternalCallPerTick:
             ],
         )
 
-        # Reset counter just before the tick being measured.
+        # Reset counter and payload capture just before the tick being measured.
         session.ext_call_count = 0
+        session.last_ext_call_deps = None
 
         await run_tick(harness)
 
         assert session.ext_call_count == 1, (
             f'Invariant 5: expected exactly 1 get_external_statuses call per tick; '
             f'got {session.ext_call_count}'
+        )
+
+        # The single call must have queried ALL five distinct deps — not just the
+        # deps from one task or a partial subset. A regression where production
+        # batches incorrectly (e.g. only collects deps from the first task) would
+        # still emit one call but with an incomplete payload.
+        expected_deps = {
+            f'{_UPSTREAM_PROJECT}:1',
+            f'{_UPSTREAM_PROJECT}:2',
+            f'{_UPSTREAM_PROJECT}:3',
+            f'{_UPSTREAM_PROJECT}:4',
+            'nope:9',
+        }
+        assert session.last_ext_call_deps is not None, (
+            'last_ext_call_deps is None — get_external_statuses was never called'
+        )
+        assert set(session.last_ext_call_deps) == expected_deps, (
+            f'Invariant 5: the single call must cover all 5 distinct deps; '
+            f'got {set(session.last_ext_call_deps)!r}, expected {expected_deps!r}'
         )
 
 
