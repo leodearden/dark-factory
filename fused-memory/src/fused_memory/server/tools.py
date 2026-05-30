@@ -1880,6 +1880,11 @@ def create_mcp_server(
         Registry/DB unavailability raises (transient) — NOT mapped to a sentinel.
         """
         result: dict[str, str] = {}
+        # Collect well-formed, known-project deps grouped by normalised project_id
+        # so we can issue ONE get_statuses call per distinct foreign project.
+        # Maps norm_project_id → list of (verbatim_dep, task_id) tuples.
+        project_batches: dict[str, list[tuple[str, str]]] = {}
+
         for dep in deps:
             # Parse: split on first colon
             project_id, sep, task_id = dep.partition(':')
@@ -1899,15 +1904,24 @@ def create_mcp_server(
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
                 continue
+            project_batches.setdefault(norm_project_id, []).append((dep, task_id))
+
+        # Issue ONE get_statuses call per distinct foreign project (minimises reads).
+        # Intentionally NOT wrapped in try/except — transient errors (DB/registry
+        # unavailability) must propagate as exceptions, not be mapped to a sentinel.
+        # Sentinels = semantic "unresolvable"; exceptions = transient "couldn't answer".
+        for norm_project_id, dep_pairs in project_batches.items():
             project_root = _kp[norm_project_id]
-            # Read status from foreign project
+            task_ids = [tid for _, tid in dep_pairs]
             statuses = await task_interceptor.get_statuses(
-                project_root=project_root, ids=[task_id]
+                project_root=project_root, ids=task_ids
             )
-            if task_id not in statuses:
-                result[dep] = 'unknown_task'
-            else:
-                result[dep] = statuses[task_id]
+            for dep, task_id in dep_pairs:
+                if task_id not in statuses:
+                    result[dep] = 'unknown_task'
+                else:
+                    result[dep] = statuses[task_id]
+
         return result
 
     @mcp.tool()
