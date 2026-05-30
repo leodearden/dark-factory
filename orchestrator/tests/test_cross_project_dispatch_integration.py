@@ -394,3 +394,58 @@ class TestResolverContract:
         assert session.ext_call_count == 1, (
             f'Expected ext_call_count==1 after one call; got {session.ext_call_count}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S3 RED — rows 1+2 headline sequencing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHeadlineSequencing:
+    """Prove that a dependent task dispatches only AFTER its upstream goes 'done'.
+
+    Boundary rows exercised:
+    - Row 1 (done → dispatch): after upstream becomes done, acquire_next returns
+      a TaskAssignment with the dependent task_id.
+    - Row 2 (pending → wait): while upstream is pending, acquire_next returns None
+      AND no escalation is filed (no action taken for a live but not-done upstream).
+
+    Dispatch is observed via acquire_next()'s returned TaskAssignment, never by
+    reading the task storage directly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dependent_dispatched_only_tick_after_upstream_done(
+        self, tmp_path: Path
+    ) -> None:
+        """Dependent task T dispatches only on the tick AFTER upstream N → done.
+
+        Tick A: upstream N='pending' → acquire_next returns None, no escalation.
+        set N='done'.
+        Tick B: acquire_next returns a TaskAssignment with task_id == T.
+        """
+        harness, session = build_harness(tmp_path)
+        upstream_task_id = '5'
+        dep_string = f'{_UPSTREAM_PROJECT}:{upstream_task_id}'
+
+        # Register a pending dependent task T with one external dep.
+        register_pending_dependent_task(session, 'T', external_deps=[dep_string])
+        # Upstream is initially pending.
+        set_upstream_status(session, upstream_task_id, 'pending')
+
+        # Tick A: upstream pending → no dispatch, no escalation (row 2).
+        tick_a_result = await run_tick(harness)
+        assert tick_a_result is None, (
+            f'Tick A: upstream pending → must NOT dispatch; got {tick_a_result!r}'
+        )
+        assert escalations_for(harness, 'T') == [], (
+            'Tick A: pending upstream must not produce any escalation (row 2)'
+        )
+
+        # Transition upstream to done.
+        set_upstream_status(session, upstream_task_id, 'done')
+
+        # Tick B: upstream done → T dispatched (row 1).
+        tick_b_result = await run_tick(harness)
+        assert tick_b_result == 'T', (
+            f'Tick B: upstream done → must dispatch T; got {tick_b_result!r}'
+        )
