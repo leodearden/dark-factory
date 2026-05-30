@@ -1890,11 +1890,16 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
+            # Normalise project_id: lowercase + hyphen→underscore, mirroring
+            # models/scope.py:resolve_project_id so 'dark-factory' == 'dark_factory'.
+            # Registry lookup uses the normalised form; result is keyed by the
+            # original verbatim dep string.
+            norm_project_id = project_id.lower().replace('-', '_')
             # Look up project_root in registry
-            if project_id not in _kp:
+            if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
                 continue
-            project_root = _kp[project_id]
+            project_root = _kp[norm_project_id]
             # Read status from foreign project
             statuses = await task_interceptor.get_statuses(
                 project_root=project_root, ids=[task_id]
