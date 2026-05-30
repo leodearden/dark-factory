@@ -34,6 +34,7 @@ from fused_memory.backends.task_backend_types import (
     ValidateDependenciesResult,
 )
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,48 @@ def _parse_task_id(raw: str | int) -> tuple[int, int | None]:
         raise TaskmasterError(
             'INVALID_TASK_ID', f'non-numeric task id: {raw!r}',
         ) from exc
+
+
+def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
+    """Parse a cross-project dependency string of the form ``"project_id:task_id"``.
+
+    Assumes the caller has already detected that ``':'`` is present.
+    Strips whitespace, normalises ``'-'`` to ``'_'`` in the project_id portion,
+    and rejects any malformed input with a ``TaskmasterError`` whose code is
+    ``TASKMASTER_TOOL_ERROR``.
+
+    Returns:
+        ``(normalized_project_id, dep_int)`` where ``dep_int > 0``.
+
+    Raises:
+        :class:`TaskmasterError` with ``TASKMASTER_TOOL_ERROR`` on any of:
+        empty project_id, empty task_id, extra colons, non-numeric task_id,
+        dotted (subtask) task_id, or non-positive task_id.
+    """
+    _MALFORMED = (
+        'TASKMASTER_TOOL_ERROR',
+        f'add_dependency: malformed cross-project dependency {depends_on!r};'
+        ' expected "project_id:task_id"',
+    )
+    parts = depends_on.split(':')
+    if len(parts) != 2:
+        raise TaskmasterError(*_MALFORMED)
+    raw_pid, raw_tid = parts[0].strip(), parts[1].strip()
+    if not raw_pid:
+        raise TaskmasterError(*_MALFORMED)
+    if not raw_tid:
+        raise TaskmasterError(*_MALFORMED)
+    # Reject dotted subtask ids (e.g. "5.1") and non-numeric ids.
+    if '.' in raw_tid or not raw_tid.lstrip('-').isdigit():
+        raise TaskmasterError(*_MALFORMED)
+    try:
+        dep_int = int(raw_tid)
+    except ValueError:
+        raise TaskmasterError(*_MALFORMED)
+    if dep_int <= 0:
+        raise TaskmasterError(*_MALFORMED)
+    norm_pid = raw_pid.replace('-', '_')
+    return norm_pid, dep_int
 
 
 def _format_task_id(task_id: int, parent_id: int | None) -> str:
