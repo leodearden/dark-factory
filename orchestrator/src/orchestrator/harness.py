@@ -306,6 +306,11 @@ class Harness:
         # (persistence + event + log) defined on the Harness.  Sibling tasks
         # (cost-ceiling 1323, EWA digest 1327) call pause_scheduler() directly.
         self.scheduler._on_park_stop_trip = self.pause_scheduler
+        # Wire the external-dep block callback: when an external dep is cancelled
+        # or persistently unresolvable, Scheduler trips → Harness._block_and_escalate.
+        # Mirrors the _on_park_stop_trip pattern (declared in scheduler.py, installed
+        # here so the harness EscalationQueue and set_task_status are available).
+        self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -2081,6 +2086,63 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.warning('Filed L1 scheduler-pause escalation %s', esc.id)
         except Exception:
             logger.warning('Failed to file scheduler-pause escalation', exc_info=True)
+
+    async def _block_and_escalate_external_dep(
+        self,
+        task_id: str,
+        *,
+        summary: str,
+        detail: str,
+        category: str,
+    ) -> None:
+        """Block a task and file an L1 escalation for a cross-project dep failure.
+
+        Installed on ``self.scheduler._on_external_dep_block`` right after
+        Scheduler construction, mirroring the ``_on_park_stop_trip`` pattern.
+
+        Sets the task to ``blocked`` via ``scheduler.set_task_status`` and
+        submits a level-1 ``Escalation`` to the queue.  Deduped by
+        ``has_open_l1`` so repeated ticks for the same task do not stack
+        duplicate escalations.  No-ops gracefully when no escalation queue is
+        attached (bare-Harness unit tests stay green).
+        """
+        # Set task to blocked regardless of queue state — the queue is only for
+        # human notification; the gate stays closed via the external-dep cache.
+        await self.scheduler.set_task_status(task_id, 'blocked')
+
+        if not self._escalation_queue:
+            logger.warning(
+                'External dep block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+
+        if self._escalation_queue.has_open_l1(task_id):
+            logger.debug(
+                'External dep block for task %s — open L1 already exists, skipping',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Filed L1 external-dep escalation %s for task %s',
+            esc.id,
+            task_id,
+        )
 
     # Synthetic task_id sentinel and root_cause key for watcher-outage L2
     # escalations.  One canonical root_cause keys all watcher-outage L2s
