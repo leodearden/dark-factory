@@ -1231,6 +1231,30 @@ async def test_qualified_and_bare_dep_coexist(backend, project_root):
     assert task['metadata']['external_deps'] == ['dark_factory:13']
 
 
+# ── add_dependency — qualified rejection tests ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_self_raises(backend, project_root):
+    """Qualified dep that points to itself (same project + same id) raises TaskmasterError."""
+    from fused_memory.models.scope import resolve_project_id
+    await backend.add_task(project_root=project_root, title='a')
+    self_dep = f'{resolve_project_id(project_root)}:1'
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1', self_dep, project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'cannot depend on itself' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_nonexistent_dependent_raises(backend, project_root):
+    """Qualified dep where the dependent task (the 'id') does not exist raises TaskmasterError."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('999', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found' in str(exc.value)
+
+
 @pytest.mark.asyncio
 async def test_validate_dependencies_reports_dangling(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
