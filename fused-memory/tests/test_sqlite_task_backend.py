@@ -1210,7 +1210,7 @@ async def test_qualified_dep_lenient_foreign_target_missing(backend, project_roo
     """Qualified dep succeeds even when the foreign target does not exist."""
     await backend.add_task(project_root=project_root, title='a')
     # 'other_project:999' — foreign target never created; should NOT raise.
-    result = await backend.add_dependency(
+    await backend.add_dependency(
         '1', 'other_project:999', project_root=project_root,
     )
     task = await backend.get_task('1', project_root)

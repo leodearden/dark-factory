@@ -179,8 +179,8 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
         raise TaskmasterError(*_MALFORMED)
     try:
         dep_int = int(raw_tid)
-    except ValueError:
-        raise TaskmasterError(*_MALFORMED)
+    except ValueError as err:
+        raise TaskmasterError(*_MALFORMED) from err
     if dep_int <= 0:
         raise TaskmasterError(*_MALFORMED)
     norm_pid = raw_pid.replace('-', '_')
