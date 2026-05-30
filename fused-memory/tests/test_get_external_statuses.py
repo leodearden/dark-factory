@@ -144,3 +144,56 @@ async def test_hyphen_project_id_normalised_and_key_verbatim(mcp_server):
         {'deps': ['dark-factory:13']},
     )
     assert result == {'dark-factory:13': 'done'}
+
+
+# ------------------------------------------------------------------
+# step-11: acceptance test + batching + read-only
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_mixed_deps(mcp_server):
+    """User-observable signal: mixed deps return the correct sentinel/status for each.
+
+    Reproduces the task's acceptance criteria exactly.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': [
+            'dark_factory:13',    # real status
+            'nope:1',             # unknown project
+            'dark_factory:999999',  # unknown task
+            'garbage',            # malformed (no colon)
+            'dark-factory:13',    # hyphen form → same real status
+        ]},
+    )
+    assert result == {
+        'dark_factory:13': 'done',
+        'nope:1': 'unknown_project',
+        'dark_factory:999999': 'unknown_task',
+        'garbage': 'malformed',
+        'dark-factory:13': 'done',
+    }
+
+
+@pytest.mark.asyncio
+async def test_batching_same_project_one_backend_call(mcp_server, ext_task_interceptor):
+    """Two deps targeting the same project issue exactly ONE get_statuses backend call."""
+    await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': ['dark_factory:13', 'dark_factory:14']},
+    )
+    assert ext_task_interceptor.get_statuses.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_read_only_no_mutations(mcp_server, ext_task_interceptor):
+    """The tool must not call any task-mutation or reconciliation methods."""
+    await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': ['dark_factory:13']},
+    )
+    ext_task_interceptor.set_task_status.assert_not_called()
+    ext_task_interceptor.update_task.assert_not_called()
+    ext_task_interceptor.add_dependency.assert_not_called()
+    ext_task_interceptor.trigger_reconciliation.assert_not_called()
