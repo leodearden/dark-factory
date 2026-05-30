@@ -460,7 +460,6 @@ class TestGetStateSnapshotPopulated:
         Assertions mirror the step-13 spec exactly.
         """
         config = OrchestratorConfig(max_per_module=1)
-        config.fairness.scheduler_v2 = True
         store = OverrideStore(tmp_path / 'o.db')
 
         # T1 gets a boost override (medium → high).

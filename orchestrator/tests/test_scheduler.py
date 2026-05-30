@@ -2018,10 +2018,9 @@ class TestFairness:
 
     @pytest.fixture
     def fair_config(self) -> OrchestratorConfig:
-        """OrchestratorConfig tuned for quick fairness testing (v2 enabled)."""
+        """OrchestratorConfig tuned for quick fairness testing."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.skip_threshold = 3
-        config.fairness.scheduler_v2 = True
         return config
 
     @staticmethod
@@ -2172,10 +2171,9 @@ class TestFairness:
 
     @pytest.mark.asyncio
     async def test_scheduler_v2_true_installs_parks(self):
-        """When scheduler_v2=True, parks install after the per-tier threshold."""
+        """Parks install after the per-tier threshold (unconditional)."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         # Use per-tier defaults: high -> threshold=1 (installs after first skip).
-        config.fairness.scheduler_v2 = True
         scheduler = Scheduler(config)
 
         # Seed compiler/src so A (high priority) is forced to skip.
@@ -2195,13 +2193,12 @@ class TestFairness:
 
     @pytest.mark.asyncio
     async def test_parks_install_unconditionally_without_v2_flag(self):
-        """Parks install after the per-tier threshold even with no v2 flag set.
+        """Parks install after the per-tier threshold with default config.
 
-        This is a RED test until the scheduler_v2 gate is removed from
-        _bump_skip_and_maybe_park.  Default high-tier threshold=1, so one skip
-        is enough.
+        Regression guard: no flag is needed.  Default high-tier threshold=1,
+        so one skip is enough.
         """
-        # Default config — NO scheduler_v2 assignment anywhere.
+        # Default config — no flag assignment needed.
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         scheduler = Scheduler(config)
 
@@ -2222,14 +2219,13 @@ class TestFairness:
 
     @pytest.mark.asyncio
     async def test_eager_park_full_module_set(self):
-        """With scheduler_v2=True, parks install on ALL of A's modules at once.
+        """Parks install on ALL of A's modules at once (eager, full coverage).
 
         Even modules not currently held by another task are covered — this
         prevents racing lower-priority tasks from grabbing a free module
         while A waits for a blocked one.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
         # Per-tier defaults: high -> threshold=1.
         scheduler = Scheduler(config)
 
@@ -2268,7 +2264,7 @@ class TestFairness:
         and emits both reservation_installed and reservation_evicted events.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
+
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2315,7 +2311,7 @@ class TestFairness:
     async def test_park_gc_on_terminal_owner(self):
         """A park owned by a terminal task is reaped on the next tick."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
+
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2355,7 +2351,7 @@ class TestFairness:
     async def test_park_gc_on_missing_owner(self):
         """A park whose owner is no longer in the task list is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
+
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2386,7 +2382,7 @@ class TestFairness:
     async def test_park_gc_on_deps_unsatisfied(self):
         """A park whose owner has un-satisfied deps is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
+
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2426,7 +2422,7 @@ class TestFairness:
         owner's park between sweep and dispatch.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.scheduler_v2 = True
+
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -3289,7 +3285,7 @@ class TestPerTierSkipThreshold:
     def _config(self, thresholds: dict[str, int]) -> OrchestratorConfig:
         config = OrchestratorConfig(max_per_module=1)
         config.fairness.skip_threshold = thresholds
-        config.fairness.scheduler_v2 = True
+
         return config
 
     def test_skip_threshold_for_lookup(self):

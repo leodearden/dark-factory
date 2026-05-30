@@ -274,15 +274,16 @@ class FairnessConfig(BaseModel):
     When a broad-footprint task keeps losing the greedy lock race to narrow
     tasks, the scheduler increments a per-task skip counter.  Once the counter
     reaches ``skip_threshold`` for the task's tier, the scheduler installs a
-    reservation ("park") on every module the starved task wants.  Parks are
-    coupled to the owner's live state: they evaporate the moment the owner
-    completes, is cancelled, or has its dependencies un-satisfied — no
-    wall-clock lease needed.
+    reservation ("park") on every module the starved task wants.  Parks use
+    eager, full-module-set coverage: every module the starved task needs is
+    reserved at once, including modules that are currently free, to prevent
+    lower-priority tasks from grabbing them while the owner waits.
 
-    Set ``scheduler_v2: true`` to enable the full v2 machinery (eager parks,
-    cross-tier preemption, owner-state GC).  When False (default) the skip
-    counter still increments and ``task_skipped`` still emits, but
-    ``install_parks`` is never called so anti-starvation is inert.
+    Parks are coupled to the owner's live state via owner-state GC: they
+    evaporate the moment the owner completes, is cancelled, or has its
+    dependencies un-satisfied — no wall-clock lease needed.  Cross-tier
+    preemption ensures a parked high-priority task is not blocked indefinitely
+    by a flood of lower-priority tasks.
     """
 
     skip_threshold: int | dict[str, int] = Field(
@@ -293,14 +294,6 @@ class FairnessConfig(BaseModel):
             'dict[tier -> int] for per-tier thresholds.  Thresholds >= 1000 '
             'effectively disable parking for that tier and auto-enable '
             'rate-limited task_skipped emission.'
-        ),
-    )
-    scheduler_v2: bool = Field(
-        default=False,
-        description=(
-            'Enable the v2 anti-starvation machinery: eager parks on the full '
-            'module set, cross-tier preemption, and owner-state GC sweep.  '
-            'Default False for one burn-in cycle; flip to True after validation.'
         ),
     )
 
