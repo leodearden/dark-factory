@@ -629,3 +629,69 @@ class TestOneExternalCallPerTick:
             f'Invariant 5: expected exactly 1 get_external_statuses call per tick; '
             f'got {session.ext_call_count}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S11 RED — row 11: transient resolver error → fail-safe wait, no counter,
+#           no escalation; retry dispatches on next tick (invariant 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTransientResolverError:
+    """Row 11 / invariant 6: transient get_external_statuses error → fail-safe wait.
+
+    When the resolver raises (session.raise_on_external=True):
+    - T is NOT dispatched (acquire_next returns None).
+    - No escalation is filed (fail-safe wait, not a policy decision).
+    - scheduler._external_unresolved_counts has NO entry for (T, dep) — the grace
+      counter must NOT be incremented on a transient error tick.
+
+    After clearing raise_on_external (Tick B), the upstream is already 'done', so
+    acquire_next must dispatch T immediately (no wasted grace ticks).
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_resolver_error_waits_no_counter_then_retries(
+        self, tmp_path: Path
+    ) -> None:
+        """Transient resolver error: no dispatch, no counter, no escalation; retry dispatches."""
+        harness, session = build_harness(tmp_path)
+        upstream_task_id = '42'
+        dep_string = f'{_UPSTREAM_PROJECT}:{upstream_task_id}'
+
+        register_pending_dependent_task(session, 'T', external_deps=[dep_string])
+        # Upstream is already done — only the transient error blocks dispatch.
+        set_upstream_status(session, upstream_task_id, 'done')
+
+        # Inject transient resolver failure.
+        session.raise_on_external = True
+
+        # Tick A: resolver raises → fail-safe wait.
+        tick_a_result = await run_tick(harness)
+
+        # (a) T must NOT be dispatched.
+        assert tick_a_result is None, (
+            f'Transient error: T must NOT be dispatched on Tick A; got {tick_a_result!r}'
+        )
+
+        # (b) No escalation filed (fail-safe wait, not a policy escalation).
+        assert escalations_for(harness, 'T') == [], (
+            'Transient error: must NOT file any escalation on Tick A'
+        )
+
+        # (c) Grace counter must NOT be incremented on a transient error tick.
+        count_key = ('T', dep_string)
+        assert count_key not in harness.scheduler._external_unresolved_counts, (
+            f'Transient error: _external_unresolved_counts must NOT have an entry '
+            f'for {count_key!r} after a transient error tick; '
+            f'got {harness.scheduler._external_unresolved_counts!r}'
+        )
+
+        # Clear the transient error → resolver will answer on next call.
+        session.raise_on_external = False
+
+        # Tick B: resolver answers, upstream is done → T dispatches immediately.
+        tick_b_result = await run_tick(harness)
+        assert tick_b_result == 'T', (
+            f'After clearing transient error: upstream done → T must dispatch; '
+            f'got {tick_b_result!r}'
+        )
