@@ -51,7 +51,7 @@ timeout_method = "thread"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests", "../shared/src", "../escalation/src"]
+extraPaths = ["src", "tests", "scripts", "../shared/src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 

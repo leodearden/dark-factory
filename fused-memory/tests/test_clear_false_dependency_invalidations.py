@@ -5,7 +5,7 @@ Step 11: RED tests (fail until step-12 creates the script).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,8 +25,8 @@ class TestClearFalseDependencyInvalidations:
 
     def test_module_exposes_target_edge_uuids(self):
         """Module-level TARGET_EDGE_UUIDS must list exactly the 6 full UUIDs."""
-        import sys
         import os
+        import sys
         scripts_dir = os.path.join(
             os.path.dirname(__file__), '..', 'scripts'
         )
@@ -45,8 +45,8 @@ class TestClearFalseDependencyInvalidations:
     @pytest.mark.asyncio
     async def test_repair_apply_calls_update_edge_for_each_uuid(self):
         """repair(apply=True) calls mock_memory.update_edge once per target edge."""
-        import sys
         import os
+        import sys
         scripts_dir = os.path.join(
             os.path.dirname(__file__), '..', 'scripts'
         )
@@ -59,7 +59,7 @@ class TestClearFalseDependencyInvalidations:
                 return_value={'status': 'updated', 'verified': True}
             )
 
-            report = await repair(mock_memory, project_id='know_live', apply=True)
+            await repair(mock_memory, project_id='know_live', apply=True)
 
             assert mock_memory.update_edge.await_count == 6, (
                 f'Expected 6 update_edge calls, got {mock_memory.update_edge.await_count}'
@@ -73,7 +73,7 @@ class TestClearFalseDependencyInvalidations:
                 f'Expected all 6 UUIDs to be cleared; got {called_uuids}'
             )
             # Check clear_invalid_at=True on every call
-            for args, kwargs in mock_memory.update_edge.call_args_list:
+            for _args, kwargs in mock_memory.update_edge.call_args_list:
                 assert kwargs.get('clear_invalid_at') is True, (
                     f'Expected clear_invalid_at=True on all calls; got {kwargs}'
                 )
@@ -86,8 +86,8 @@ class TestClearFalseDependencyInvalidations:
     @pytest.mark.asyncio
     async def test_repair_dry_run_makes_no_calls(self):
         """repair(apply=False) makes ZERO update_edge calls and reports dry_run=True."""
-        import sys
         import os
+        import sys
         scripts_dir = os.path.join(
             os.path.dirname(__file__), '..', 'scripts'
         )
