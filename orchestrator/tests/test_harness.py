@@ -10,7 +10,7 @@ Asserts that:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.models import Escalation
@@ -18,7 +18,6 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,6 +63,7 @@ class TestHarnessExternalDepBlockWiring:
         # Patch scheduler.set_task_status to avoid real MCP calls.
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
+        assert harness.scheduler._on_external_dep_block is not None
         await harness.scheduler._on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
@@ -80,6 +80,7 @@ class TestHarnessExternalDepBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
+        assert harness.scheduler._on_external_dep_block is not None
         await harness.scheduler._on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
@@ -105,6 +106,8 @@ class TestHarnessExternalDepBlockWiring:
         harness = _make_harness(tmp_path)
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        assert harness.scheduler._on_external_dep_block is not None
 
         # First call — no open L1 yet → submits
         mock_queue.has_open_l1.return_value = False
@@ -137,6 +140,7 @@ class TestHarnessExternalDepBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
         # Must not raise even without a queue.
+        assert harness.scheduler._on_external_dep_block is not None
         await harness.scheduler._on_external_dep_block(
             '99',
             summary='EXTERNAL_DEP_UNRESOLVED: ...',
