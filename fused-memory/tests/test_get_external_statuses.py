@@ -126,3 +126,21 @@ async def test_malformed_dep_returns_sentinel(mcp_server, ext_task_interceptor, 
     assert result == {dep: 'malformed'}
     # No backend read should be made for malformed deps
     ext_task_interceptor.get_statuses.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# step-09: project_id normalisation (hyphen → underscore)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hyphen_project_id_normalised_and_key_verbatim(mcp_server):
+    """'dark-factory:13' (hyphen form) resolves identically to 'dark_factory:13'.
+
+    The result key must be the original hyphen string verbatim.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': ['dark-factory:13']},
+    )
+    assert result == {'dark-factory:13': 'done'}
