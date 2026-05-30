@@ -370,18 +370,25 @@ class GraphitiBackend:
     async def update_edge(
         self, edge_uuid: str, fact: str | None = None, *, group_id: str,
         invalid_at: datetime | None = None,
+        clear_invalid_at: bool = False,
     ) -> dict[str, Any]:
         """Update an existing edge's fact text and/or invalidate it.
 
-        At least one of ``fact`` or ``invalid_at`` must be provided. When
-        ``fact`` is set, the edge's fact text is replaced and its embedding is
-        regenerated. When ``invalid_at`` is set, the edge is marked superseded
-        as of that timestamp (no re-embedding needed). Both may be combined.
+        At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
+        be provided. When ``fact`` is set, the edge's fact text is replaced and
+        its embedding is regenerated. When ``invalid_at`` is set, the edge is
+        marked superseded as of that timestamp (no re-embedding needed). Both
+        may be combined.
+
+        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
+        reset to ``None``, restoring it to an active (non-superseded) state.
+        This takes precedence over ``invalid_at`` if both are supplied.
+        Compatible with ``fact`` (update text and un-supersede in one call).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
         """
-        if fact is None and invalid_at is None:
+        if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact or invalid_at to be set')
         driver = self._driver_for(group_id)
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
@@ -391,6 +398,8 @@ class GraphitiBackend:
             await edge.generate_embedding(embedder)
         if invalid_at is not None:
             edge.invalid_at = invalid_at
+        if clear_invalid_at:
+            edge.invalid_at = None
         await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
 
         # Deterministically refresh both endpoint entity summaries so they
