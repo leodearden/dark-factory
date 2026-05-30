@@ -66,6 +66,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 | **G4** | Cross-PRD seams have a named owner; reciprocal "the other owns it" patterns resolved | **prompt** |
 | **G5** | High-stakes / architecturally-complex PRDs use approach **B + H** (contracts + two-way boundary tests) rather than bare B | **prompt with heuristic** |
 | **G6** | Every signal asserting a number/exactness/end-to-end capability has its premise validated — achievable, true, and producible from the task's own dependency set | **block** |
+| **Manifest** | Per-leaf capability→evidence bindings committed beside the PRD (mechanizes G3+G6: anti-orphan/wired, anti-inversion, field-population, grammar-fixture, numeric-floor); any FAIL binding blocks queueing | **block** (decompose) |
 | **META** | The "yes" question above | **block** at PRD save |
 
 - `block` — the phase cannot complete until the gap is resolved.
@@ -81,6 +82,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 **Decompose mode:**
 - A batch of tasks filed via `submit_task` with `planning_mode=True` (always). Each carries metadata fields `user_observable_signal`, `consumer_ref`, and a substrate-confirmed flag (e.g. `grammar_confirmed`).
 - All declared dependencies (intra-batch and out-of-batch, including cross-PRD) wired via `add_dependency` while the batch is still `deferred`.
+- A committed **capability manifest** beside the PRD binding each leaf signal's asserted capabilities to evidence (mechanizing G3+G6); any FAIL binding blocks the batch until resolved.
 - The whole batch flipped `deferred` → `pending` together in a single bulk `set_task_status` call — never one-at-a-time.
 - The orchestrator does **not** currently read the `user_observable_signal` / `consumer_ref` / substrate-confirmed metadata fields; they are substrate for a future tracking-infra session. Surface this in the hand-back.
 

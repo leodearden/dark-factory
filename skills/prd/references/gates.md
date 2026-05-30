@@ -73,6 +73,8 @@ If a leaf task's only "signal" is "a unit test passes against synthetic input", 
 1. **[overlay] If the overlay defines a substrate verifier**, run it. The canonical example is a *grammar gate* for a language/DSL project: extract each novel syntax fragment to a fixture and parse it (`tree-sitter parse --quiet`), exit 0 = pass. Other verifiers: "does this route exist in the router?", "does this column exist in the schema?", "does this flag parse?". The overlay specifies the command and pass/fail semantics and may ship a reference file (e.g. `references/grammar-gate.md`).
 2. **If no verifier is defined**, do it manually: for each assumed capability, find concrete evidence it exists today (a definition, a test, a doc). If you can't, it's unverified.
 
+**Wired, not merely declared (anti-orphan, the 2962 / C-10 shape).** For a capability a signal *invokes at runtime* — a fn the eval path must call, a field a sampler must read, a dispatch arm, an IPC channel — "a definition exists" is **not** sufficient evidence. Require evidence it is **wired into the consuming entry path on main**: referenced from the production dispatch table / engine walk / runtime entry, not only from a `tests/` module or an otherwise-unreferenced declaration. A *declared-but-test-only-or-unwired* symbol FAILS G3 exactly as an absent one does — it's the same stall (the implementer finds the symbol but no path reaches it). **[overlay]** names the project's production entry paths and the grep that proves wiring.
+
 Every unverified capability must be resolved before save/queue. Two valid resolutions:
 - **(a)** Rewrite the PRD to use a capability that does exist; re-verify the rewrite.
 - **(b)** Queue the substrate work as an explicit prerequisite task in the decomposition, make every dependent task `depends_on` it, and name it in `Pre-conditions for activating`.
@@ -138,11 +140,13 @@ Thresholds are **[overlay]**-tunable. When any condition holds, prompt: "This PR
 
 **Application.** For every observable / leaf signal, classify its assertion and apply the matching check. Most signals — "emits diagnostic `E_*`", "compile test", "endpoint returns 200" — assert no quantitative premise and pass trivially.
 
-1. **Numeric bound / threshold** ("within X%", "≤ ε", "≥ N", "to M digits"). Cite an *achievability basis*: an existing validated test/reference that already hits that accuracy on a comparable problem, OR a back-of-envelope error estimate for the method at the planned resolution, OR a reference computation. If none exists, the bound is a **guess** — set it to a defensible value, or mark it provisional and file a calibration task. **Reject bare guessed thresholds.** A fixture comment claiming "Tuned" is not a basis.
+1. **Numeric bound / threshold** ("within X%", "≤ ε", "≥ N", "to M digits"). Cite an *achievability basis*: an existing validated test/reference that already hits that accuracy on a comparable problem, OR a back-of-envelope error estimate for the method at the planned resolution, OR a reference computation. If none exists, the bound is a **guess** — set it to a defensible value, or mark it provisional and file a calibration task. **Reject bare guessed thresholds.** A fixture comment claiming "Tuned" is not a basis. **Floor check:** when the bound is an *absolute accuracy* on a numerical method, state the method's **analytical error floor** at the planned resolution and assert `bound > floor`; a bound at or below the floor is unachievable by construction (the buckling 5%-vs-9–10%-bending-lock and Duhamel 1e-9-vs-O((ΩΔt)²) cases). If `bound ≤ floor`, relax the bound to the honest floor or re-cast it as a convergence-*rate* assertion.
 
 2. **Closed-form exactness / reproduction** ("exact within 1e-12", "reproduces P(t) exactly", "round-trips losslessly"). State the **mathematical identity** that makes it true, then confirm the asserted **configuration** satisfies it. Exactness is almost always configuration-dependent (boundary condition, element order, end conditions, basis degree) — name the configuration that earns it.
 
 3. **End-to-end capability** ("produces a Mesh", "evaluates to `Value::X`", "the union renders"). Trace every capability the signal requires to the task's **dependency set**: each must be delivered by this task or one of its **prerequisites** — never by a task that **depends on** this one. If a required capability is owned by a downstream task, the signal belongs on that downstream leaf (the C-as-integration-gate pattern from G2), not here.
+
+   **Field-population sub-check (the result-field twin).** When the signal *samples or reduces a field off a result value* (`result.stress`, `mode.shape`, `elastic.displacement`), the required capability is not "the field is declared on the type" but "the producer **populates** it with a real, sampleable value". Require evidence the producer writes a **non-sentinel** value (not a placeholder / `Undef` / `None` / trivial default) into that field on the **production** path — a declared-but-never-populated field FAILS even though the type checks and the signal reads as plausible. **[overlay]** names the project's empty-value sentinel. (This is the FEA/modal hot zone: `ElasticResult.{stress,displacement}` and `ModalResult.shape` declared but left `Undef`, so every downstream sampler inherits a false premise.)
 
 Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scientific projects and rarely for CRUD/web/tooling projects. **[overlay]** sets the project's domain flag and supplies domain-specific premise hazards (e.g. FEA element locking, spline end-conditions). Branch 3 is **universal** — it's a dependency-correctness check that applies to every project.
 
@@ -150,6 +154,28 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 - **(a)** Move the signal to the task that can actually produce it (fixes misattribution).
 - **(b)** Weaken the assertion to what's achievable now, file a follow-up for the stronger property.
 - **(c)** Change the asserted configuration so the claim becomes true.
+
+---
+
+## Capability Manifest — mechanizing G3 + G6 per leaf
+
+**Level:** **block** (decompose; drafted in author mode alongside the per-task signals).
+
+**What it catches.** The systemic gap that G3/G6 *as narrative gates* leave open: the author **asserts** they checked the substrate, but the real check lands at **dispatch** — one agent spin-up + escalation + human triage **per task** instead of once at authoring. Every "architect rejects RED-test premise / dependency_capability" escalation is this gap firing. The manifest converts G3/G6 from "the author promises" to "the toolchain proves," paying the substrate check **once**, here.
+
+**Application.** For each **leaf** task's user-observable / RED signal, mechanically enumerate the capabilities it asserts — every symbol, fn, field, syntax fragment, numeric bound it relies on — and **bind each to evidence**:
+
+| Check | PASS evidence | FAIL (blocks queue) |
+|---|---|---|
+| Capability→producer (anti-orphan, shape 1) | `grep:<file>:<line>` shows it **wired into the consuming entry path** on main, OR `producer:task-<N>` in the **transitive dependency closure** whose deliverable *is* this capability | `declared-only` · `test-only` · `producer-absent` |
+| DAG-direction (anti-inversion, shape 2) | the producer task is **upstream** of this leaf | `producer-downstream` (the owner *depends on* this leaf) |
+| Field-population (the result-field twin) | `grep` shows the producer writes a **non-sentinel sampleable** value into the field on the production path | `declared-only` (field present, producer leaves it the empty sentinel) |
+| Grammar reality (anti-mismatch, shape 4) | `grammar-fixture:<path>` parses with **0 ERROR nodes**, OR a named grammar-producer task is upstream | `fixture-ERROR` |
+| Numeric floor (anti-floor, shape 3) | `floor:<bound> > <method-floor>`, floor stated | `bound≤floor` |
+
+Any capability resolving to a FAIL value **blocks** queueing until resolved by one of the G3/G6 resolutions: rewrite to an existing capability, queue the prerequisite **upstream** + wire the dep, move the signal to the producing leaf, or relax the bound.
+
+**Output contract.** Emit the manifest as a committed artifact **beside the PRD** — one block per leaf: `task-label → [(capability → evidence)…]`. Committing it lets a downstream verifier (and the dispatch-time architect) **diff intent against substrate** instead of re-deriving the check. **[overlay]** names the manifest-path convention and the project's evidence commands (grep targets, the empty-value sentinel, the grammar-fixture command, the floor references).
 
 ---
 
@@ -180,7 +206,7 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 3. **G4 third.** Identify cross-PRD seams; resolve ownership before writing the relationship table.
 4. **G5 fourth.** Decide B vs B+H; if H, draft contract + boundary-test sketch now (they shape the decomposition).
 5. **G2 in the decomposition plan** — name an observable signal per task even though the hard check is at decompose time.
-6. **G6 alongside the G2 draft** — validate each drafted leaf signal's substantive premise.
+6. **G6 alongside the G2 draft** — validate each drafted leaf signal's substantive premise; draft the **capability-manifest** bindings here so decompose only re-checks them.
 7. **META last.** Final sanity check before save.
 
 ## Gate-application order (decompose mode)
@@ -188,5 +214,6 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 1. **G1, G3, G4 re-check** against the saved PRD (fast; mostly drift detection).
 2. **G2 walk** — enumerate every task, classify leaf/intermediate, attach `user_observable_signal` / `consumer_ref`.
 3. **G6 re-check** — validate each leaf signal's premise. Escalate before filing if one can't be substantiated (cheaper than an implementer discovering it against a RED test).
-4. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
-5. File the batch (see `decompose-mode.md`).
+4. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**; any FAIL binding blocks the batch until resolved.
+5. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
+6. File the batch (see `decompose-mode.md`).

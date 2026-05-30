@@ -35,6 +35,12 @@ Enumerate every task in the PRD's decomposition plan. For each:
 
 If any leaf task lacks a user-observable signal, **stop** and surface to the user. If any intermediate task has no named downstream consumer, surface it — typically the decomposition is missing an integration-gate task.
 
+### Step 2.5 — Capability manifest (mechanize G3 + G6; commit beside the PRD)
+
+Before filing, build the **capability manifest** (`gates.md` → *Capability Manifest — mechanizing G3 + G6 per leaf*). For each **leaf** task, enumerate the capabilities its signal asserts and bind each to evidence — `grep:file:line wired` / `producer:task-N upstream` / `grammar-fixture:path parses` / `floor:bound>X`. Any binding that resolves to `declared-only | test-only | producer-downstream | producer-absent | fixture-ERROR | bound≤floor` **blocks the batch** — resolve it (rewrite to an existing capability, queue the prerequisite upstream + wire the dep, move the signal to the producing leaf, or relax the bound) **before** Step 3.
+
+Commit the manifest beside the PRD (the overlay names the path; generic default `<prd-path-without-ext>.capability-manifest.md`). This is the artifact a dispatch-time architect or downstream verifier diffs against substrate — the point is to pay the substrate check **once, here**, not once per task at dispatch. The empty-value sentinel, the production-entry-path grep targets, and the floor references are **[overlay]**-supplied; in generic mode, bind by hand against the codebase.
+
 ### Step 3 — File tasks (ALWAYS planning_mode=True; synchronous, curator-bypassing)
 
 PRD-decomposition batches are the canonical use case for `planning_mode=True`. **Every task in the batch is filed with `planning_mode=True`, no exceptions.** This lands them as `deferred` so the scheduler picks nothing up before the wiring is complete and the batch is flipped together in Step 5.
@@ -120,6 +126,7 @@ Confirm every batch task shows up as `pending`, with the expected dependencies a
 State:
 - Number of tasks filed.
 - Number of intra-batch and out-of-batch dependencies wired.
+- The committed **capability-manifest** path, and any bindings that had to be resolved (re-scoped / re-homed / bound relaxed) to clear the gate.
 - Any tasks that came back `combined` (and into what).
 - A note that the orchestrator does **not** currently read `user_observable_signal` / `consumer_ref` / the substrate-confirmed flag — this metadata is substrate for a future tracking-infra session.
 
