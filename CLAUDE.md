@@ -60,6 +60,47 @@ Use `project_root: "/home/leo/src/dark-factory"` for all task operations.
 
 Status transitions (`done`, `blocked`, `cancelled`, `deferred`) trigger targeted reconciliation automatically.
 
+### Cross-project task dependencies
+
+A task can declare a dependency on a task in **another** project using the qualified `"project_id:task_id"` form (e.g. `"dark_factory:42"`). When `add_dependency` receives a `depends_on` value that contains `:`, it routes the dep to `metadata.external_deps` (a list of canonical `"project_id:task_id"` strings) instead of the integer `dependencies` table — no schema migration required.
+
+```python
+# Qualified form → appended to metadata.external_deps
+mcp__fused-memory__add_dependency(
+    id="<dependent_task_id>",
+    depends_on="dark_factory:42",   # project_id:task_id
+    project_root="<project_root>",
+)
+# Bare integer → existing integer dependencies table (unchanged)
+mcp__fused-memory__add_dependency(id="<id>", depends_on=13, project_root="<project_root>")
+```
+
+The foreign target is **not** verified at write time; existence is resolved at gate time.
+
+**Resolution: `get_external_statuses`**
+
+The scheduler resolves `metadata.external_deps` at each dispatch tick via the read-only fused-memory tool `get_external_statuses(deps: list[str]) -> dict[str, str]`. It takes a list of `"project_id:task_id"` strings, looks each up in the shared fused-memory registry, and returns a status per dep. Unresolvable deps return explicit sentinels:
+
+| Sentinel | Meaning |
+|---|---|
+| `"unknown_project"` | `project_id` not in the registry |
+| `"unknown_task"` | Project known; no top-level task with that id |
+| `"malformed"` | Not parseable as `project_id:task_id` |
+
+**Dispatch-time policy**
+
+The gate lives in the **dependent's** scheduler only — it does not affect the upstream project's orchestrator. External deps are checked at dispatch time; they are not re-evaluated after a task has been dispatched.
+
+| Resolved status | Scheduler action |
+|---|---|
+| `done` | Satisfied — counts toward dispatch |
+| `cancelled` | Not satisfied → `_mark_blocked(escalate_to_human=True)` immediately |
+| `unknown_project` / `unknown_task` / `malformed` | Not satisfied; grace period then escalate after repeated unresolved cycles |
+| Any other live status (`pending`, `in-progress`, …) | Not satisfied; keep waiting |
+| Resolver error (transient timeout / server hiccup) | Not satisfied this tick — fail-safe wait, no grace counter increment |
+
+A task is dispatched only when **all** local deps **and** all `metadata.external_deps` are `done`.
+
 ## Session Lifecycle
 
 ### Starting a session

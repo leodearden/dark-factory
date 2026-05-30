@@ -92,6 +92,18 @@ mcp__fused-memory__add_dependency(
 
 Wire intra-batch (Greek-letter prereqs → the IDs from `submit_task`) and out-of-batch (PRD-declared prereqs → existing task IDs elsewhere). If the decomposition specified `metadata.unblocks` reverse-deps, set those via `update_task`.
 
+**Cross-project dependencies** — when a task depends on a task in a *different* project, pass a qualified `"project_id:task_id"` string as `depends_on`:
+
+```python
+mcp__fused-memory__add_dependency(
+    id="<dependent_task_id>",
+    depends_on="dark_factory:42",   # qualified form
+    project_root="<dependent_project_root>",
+)
+```
+
+A qualified `depends_on` (containing `:`) is routed to `metadata.external_deps` on the dependent task rather than the integer `dependencies` table. The foreign target is not verified at write time. At dispatch time the dependent's scheduler resolves each entry via `get_external_statuses` and gates dispatch until every external dep is `done`. A `cancelled` upstream immediately escalates to a human; a persistently-unresolvable dep (`unknown_project`, `unknown_task`, `malformed`) escalates after a grace period. See the Task Routing section of `CLAUDE.md` for the full dispatch policy.
+
 Do **not** flip anything to `pending` until every edge is in. A partially-wired batch with some tasks already `pending` lets the scheduler grab a leaf whose real prereq hasn't been wired yet.
 
 ### Step 5 — Flip the whole batch deferred → pending in one call
