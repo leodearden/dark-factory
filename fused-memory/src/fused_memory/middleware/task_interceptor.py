@@ -3220,6 +3220,21 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        """Add a dependency for a task.
+
+        ``depends_on`` is forwarded verbatim to the backend.
+
+        - **Qualified form** (``"project_id:task_id"``, contains ``':'``): routed by the
+          backend to the dependent task's ``metadata.external_deps`` list via an
+          append-safe merge.  ``'-'`` in the project_id is normalised to ``'_'``.
+          The foreign target is not verified at write time (lenient).
+        - **Bare integer form**: recorded in the integer ``dependencies`` table,
+          unchanged from the original behavior.
+
+        The interceptor does not inspect or transform ``depends_on``; routing is
+        handled entirely by the backend.  The journal and ``task_modified`` event
+        are emitted regardless of which branch the backend takes.
+        """
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -3254,6 +3269,21 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        """Remove a dependency from a task.
+
+        ``depends_on`` is forwarded verbatim to the backend.
+
+        - **Qualified form** (``"project_id:task_id"``, contains ``':'``): the
+          backend removes the canonical entry from the dependent task's
+          ``metadata.external_deps`` list.  Idempotent — no error if the entry
+          is absent.
+        - **Bare integer form**: issues an unconditional ``DELETE`` from the
+          integer ``dependencies`` table, unchanged from the original behavior.
+
+        The interceptor does not inspect or transform ``depends_on``; routing is
+        handled entirely by the backend.  The journal and ``task_modified`` event
+        are emitted regardless of which branch the backend takes.
+        """
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
