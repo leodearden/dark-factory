@@ -650,3 +650,162 @@ async def test_collect_active_tasks_external_deps_empty_when_absent(
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
     assert len(active) == 1
     assert active[0]['external_deps'] == []
+
+
+# ---------------------------------------------------------------------------
+# collect_tasks_with_counts resolve_external (step-5 / step-6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_overwrites_status(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """With resolve_external=True, statuses from fetch_external_statuses overwrite 'unknown'.
+
+    'dark_factory:13' resolves to 'done'; 'reify:8' is absent from the map
+    and keeps the honest 'unknown' sentinel (no fabricated status).
+    """
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='xdeps',
+        tasks=[
+            {
+                'id': 5,
+                'title': 'waits on upstream',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['dark_factory:13', 'reify:8']},
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_ext_statuses(client, config, deps):
+        # Returns only 'dark_factory:13'; 'reify:8' is absent (simulates partial map).
+        return {'dark_factory:13': 'done'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _fake_ext_statuses)
+
+    cfg = DashboardConfig(project_root=root)
+    active, _, _ = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg, resolve_external=True,
+    )
+    assert len(active) == 1
+    row = active[0]
+    assert row['external_deps'] == [
+        {'id': 'dark_factory:13', 'status': 'done'},      # resolved
+        {'id': 'reify:8', 'status': 'unknown'},            # absent from map → stays 'unknown'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_false_skips_mcp(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """With resolve_external=False (default), fetch_external_statuses is NOT called."""
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='xdeps',
+        tasks=[
+            {
+                'id': 5,
+                'title': 'waits on upstream',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['dark_factory:13']},
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError('fetch_external_statuses must NOT be called when resolve_external=False')
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
+
+    cfg = DashboardConfig(project_root=root)
+    # Default resolve_external=False — must NOT call fetch_external_statuses.
+    active, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    # Rows keep 'unknown' sentinel (unresolved).
+    assert active[0]['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_single_batched_call(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """resolve_external=True issues exactly ONE batched fetch_external_statuses call
+    covering the deduped union of ALL rows' external dep ids.
+    """
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='multi',
+        tasks=[
+            {
+                'id': 1, 'title': 'A', 'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['proj:10', 'proj:20']},
+            },
+            {
+                'id': 2, 'title': 'B', 'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['proj:20', 'proj:30']},  # 'proj:20' deduped
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    calls = []
+
+    async def _record_call(client, config, deps):
+        calls.append(sorted(deps))
+        return {}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
+
+    cfg = DashboardConfig(project_root=root)
+    await collect_tasks_with_counts(client=dummy_client, config=cfg, resolve_external=True)
+
+    assert len(calls) == 1, f'expected 1 batched call, got {len(calls)}: {calls}'
+    # Deduped union: proj:10, proj:20, proj:30
+    assert calls[0] == ['proj:10', 'proj:20', 'proj:30']
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_deps(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """resolve_external=True skips the fetch call when no rows have external deps."""
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='nodeps',
+        tasks=[
+            {'id': 1, 'title': 'plain', 'status': 'pending',
+             'dependencies': [], 'metadata': {}},
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError('fetch_external_statuses must NOT be called when union is empty')
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
+
+    cfg = DashboardConfig(project_root=root)
+    active, _, _ = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg, resolve_external=True,
+    )
+    assert active[0]['external_deps'] == []
