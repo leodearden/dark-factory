@@ -2915,3 +2915,81 @@ class TestGetStatusScoping:
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
 
+
+# ---------------------------------------------------------------------------
+# Step 1: TRACK B.1 backend clear_invalid_at RED tests
+# ---------------------------------------------------------------------------
+
+class TestGraphitiBackendUpdateEdgeClearInvalidAt:
+    """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
+
+    def _make_backend_and_edge(self, mock_config):
+        """Set up a GraphitiBackend with mock driver/client and a mock edge."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+        mock_driver = MagicMock()
+        mock_cloned_driver = MagicMock()
+        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
+        backend._driver = mock_driver
+        backend.client = MagicMock()
+
+        mock_edge = AsyncMock()
+        mock_edge.source_node_uuid = 'src-uuid'
+        mock_edge.target_node_uuid = 'tgt-uuid'
+        mock_edge.uuid = 'e-1'
+        mock_edge.fact = 'original fact'
+        mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_edge.save = AsyncMock()
+        mock_edge.generate_embedding = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        return backend, mock_edge
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_alone_sets_none(self, mock_config):
+        """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+            assert mock_edge.invalid_at is None, (
+                'clear_invalid_at=True must set edge.invalid_at to None'
+            )
+            mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config):
+        """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
+            assert mock_edge.fact == 'new fact', (
+                'fact must be updated when fact is provided'
+            )
+            assert mock_edge.invalid_at is None, (
+                'invalid_at must be cleared when clear_invalid_at=True'
+            )
+            mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config):
+        """When both invalid_at and clear_invalid_at=True are given, clear wins."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        ts = datetime(2026, 6, 1, tzinfo=UTC)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge(
+                'e-1', group_id='proj', invalid_at=ts, clear_invalid_at=True
+            )
+            assert mock_edge.invalid_at is None, (
+                'clear_invalid_at=True must take precedence: invalid_at ends up None'
+            )
+            mock_edge.save.assert_awaited_once()
+
