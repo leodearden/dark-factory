@@ -88,6 +88,8 @@ def test_format_task_id_round_trips():
         ('dark_factory:13', 'dark_factory', 13),
         ('dark-factory:13', 'dark_factory', 13),   # hyphen normalized
         (' dark_factory : 13 ', 'dark_factory', 13),  # whitespace stripped
+        ('DARK_FACTORY:13', 'dark_factory', 13),    # uppercase lowercased
+        ('Dark-Factory:13', 'dark_factory', 13),    # mixed case + hyphen both normalized
     ],
 )
 def test_parse_qualified_dep_accepts_valid(raw, expected_pid, expected_id):
@@ -1255,6 +1257,30 @@ async def test_qualified_dep_nonexistent_dependent_raises(backend, project_root)
     assert 'No tasks found' in str(exc.value)
 
 
+@pytest.mark.asyncio
+async def test_qualified_dep_self_raises_mixed_case(backend, project_root):
+    """Self-loop detection is case-insensitive: DARK_FACTORY:1 still rejected for task 1."""
+    from fused_memory.models.scope import resolve_project_id
+    await backend.add_task(project_root=project_root, title='a')
+    # Upper-cased project_id canonicalizes to same as resolve_project_id output.
+    self_dep = f'{resolve_project_id(project_root).upper()}:1'
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1', self_dep, project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'cannot depend on itself' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_qualified_add_dep_subtask_dependent_raises(backend, project_root):
+    """Qualified add_dependency with a dotted (subtask) task_id raises TaskmasterError."""
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1.1', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'subtask dependencies are not supported' in str(exc.value)
+
+
 # ── remove_dependency — qualified (cross-project) tests ────────────
 
 
@@ -1315,6 +1341,17 @@ async def test_qualified_remove_dep_integer_table_unaffected(backend, project_ro
     task = await backend.get_task('2', project_root)
     assert task['dependencies'] == [1]
     assert task['metadata'].get('external_deps', []) == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_subtask_dependent_raises(backend, project_root):
+    """Qualified remove_dependency with a dotted (subtask) task_id raises TaskmasterError."""
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.remove_dependency('1.1', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'subtask dependencies are not supported' in str(exc.value)
 
 
 @pytest.mark.asyncio

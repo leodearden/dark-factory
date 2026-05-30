@@ -183,7 +183,7 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
         raise TaskmasterError(*_MALFORMED) from err
     if dep_int <= 0:
         raise TaskmasterError(*_MALFORMED)
-    norm_pid = raw_pid.replace('-', '_')
+    norm_pid = raw_pid.lower().replace('-', '_')
     return norm_pid, dep_int
 
 
@@ -1193,7 +1193,12 @@ class SqliteTaskBackend:
         if ':' in str(depends_on):
             norm_pid, dep_int = _parse_qualified_dep(depends_on)
             canonical = f'{norm_pid}:{dep_int}'
-            tid, _ = _parse_task_id(task_id)
+            tid, parent_id = _parse_task_id(task_id)
+            if parent_id is not None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'remove_dependency: subtask dependencies are not supported',
+                )
 
             async with self._write_lock(project_root), self._txn(project_root) as conn:
                 cursor = await conn.execute(
