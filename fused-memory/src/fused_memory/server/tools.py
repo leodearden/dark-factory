@@ -994,6 +994,7 @@ def create_mcp_server(
         project_id: str,
         fact: str | None = None,
         invalid_at: str | None = None,
+        clear_invalid_at: bool = False,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1001,7 +1002,8 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Update an existing Graphiti edge's fact text and/or invalidate it.
 
-        At least one of ``fact`` or ``invalid_at`` must be provided.
+        At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
+        be provided.
 
         - ``fact``: new fact text. Bypasses the LLM extraction and edge
           resolution pipeline — the embedding is regenerated and both endpoint
@@ -1012,6 +1014,11 @@ def create_mcp_server(
           as of that moment. Used by Stage-2 reconciliation to retire
           contradicted facts (e.g. a 'shipped via X' edge where X isn't in
           the task's recorded commit diff) without destroying the audit trail.
+        - ``clear_invalid_at``: when True, resets the edge's ``invalid_at``
+          field to ``None``, restoring it to active (non-superseded) status.
+          Useful to undo a false invalidation. Compatible with ``fact``
+          (update text and un-supersede in one call). Mutually exclusive
+          with ``invalid_at`` (cannot set and clear simultaneously).
 
         All other edge properties (valid_at, endpoints, episodes) are preserved.
 
@@ -1021,6 +1028,8 @@ def create_mcp_server(
             fact: New fact text for the edge (optional)
             invalid_at: ISO 8601 timestamp to mark the edge as superseded
                 (optional; e.g. "2026-04-19T12:34:56+00:00")
+            clear_invalid_at: When True, clear invalid_at (un-supersede the edge).
+                Mutually exclusive with invalid_at. Compatible with fact.
             agent_id: Which agent is updating (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1051,7 +1060,13 @@ def create_mcp_server(
                 }
             if parsed_invalid_at.tzinfo is None:
                 parsed_invalid_at = parsed_invalid_at.replace(tzinfo=UTC)
-        if normalised_fact is None and parsed_invalid_at is None:
+        if clear_invalid_at and parsed_invalid_at is not None:
+            return {
+                'error': 'clear_invalid_at and invalid_at are mutually exclusive: '
+                         'cannot set and clear invalid_at in the same call',
+                'error_type': 'ValidationError',
+            }
+        if normalised_fact is None and parsed_invalid_at is None and not clear_invalid_at:
             return {
                 'error': 'update_edge requires fact or invalid_at',
                 'error_type': 'ValidationError',
@@ -1067,6 +1082,7 @@ def create_mcp_server(
                 causation_id=causation_id,
                 _source=source,
                 invalid_at=parsed_invalid_at,
+                clear_invalid_at=clear_invalid_at,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
