@@ -1849,6 +1849,9 @@ class Scheduler:
         tid: str,
         status_map: dict[str, str],
         tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -1868,6 +1871,13 @@ class Scheduler:
         (the default), the allowance is disabled — behaviour is identical to
         today.  Both ``acquire_next`` call sites pass the per-tick snapshot.
 
+        *external_status_cache* and *external_resolver_failed* are forwarded
+        to :meth:`_deps_satisfied` for the cross-project external dep gate.
+        When both default (``None``/``False``), the external gate is skipped —
+        behaviour is byte-identical to the pre-external-dep implementation.
+        The ``_park_gc`` call site does NOT pass these params (preserving
+        park-GC semantics, scope containment per design decision 4).
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -1881,7 +1891,11 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if not self._deps_satisfied(task, status_map, tasks_by_id):
+        if not self._deps_satisfied(
+            task, status_map, tasks_by_id,
+            external_status_cache=external_status_cache,
+            external_resolver_failed=external_resolver_failed,
+        ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -2366,6 +2380,33 @@ class Scheduler:
         # the lazy per-call delete inside _eligible_for_dispatch.
         self._gc_expired_cooldowns()
 
+        # Cross-project external dep gate (invariant 5 — one batched call per tick).
+        # Collect the union of metadata.external_deps across all pending tasks; if
+        # non-empty issue ONE get_external_statuses call.  Zero deps → zero calls.
+        # The per-tick cache is then forwarded to _eligible_for_dispatch at both
+        # call sites below; _apply_external_dep_policy runs the side-effecting pass
+        # (counter increments, escalation callbacks) exactly once per tick.
+        # The _park_gc call site above does NOT receive the cache, preserving park-GC
+        # semantics (design decision 4: scope containment).
+        _pending_tasks_with_ext: list[dict] = [
+            t for t in tasks
+            if t.get('status') == 'pending'
+            and (t.get('metadata') or {}).get('external_deps')
+        ]
+        _ext_dep_union: list[str] = list({
+            dep
+            for t in _pending_tasks_with_ext
+            for dep in ((t.get('metadata') or {}).get('external_deps') or [])
+        })
+        if _ext_dep_union:
+            external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
+        else:
+            external_cache, external_err = {}, None
+        await self._apply_external_dep_policy(
+            _pending_tasks_with_ext, external_cache, external_err
+        )
+        _external_resolver_failed = external_err is not None
+
         # Load priority-override snapshot for this tick.
         current_overrides: dict[str, OverrideRow] = (
             self._override_store.get_overrides(self._project_root)
@@ -2524,7 +2565,11 @@ class Scheduler:
             tid_str = str(t.get('id', ''))
             if not tid_str:
                 continue
-            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map, tasks_by_id)
+            eligible, signal_label = self._eligible_for_dispatch(
+                t, tid_str, status_map, tasks_by_id,
+                external_status_cache=external_cache,
+                external_resolver_failed=_external_resolver_failed,
+            )
             if not eligible:
                 continue
             # signal_label is stashed and reused at the dispatch arm site so
@@ -2562,7 +2607,9 @@ class Scheduler:
                 # loop to keep both paths in sync.  A future gate addition only
                 # needs to be added to _eligible_for_dispatch.
                 eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map, tasks_by_id
+                    pin_task, pin_tid, status_map, tasks_by_id,
+                    external_status_cache=external_cache,
+                    external_resolver_failed=_external_resolver_failed,
                 )
                 if not eligible:
                     continue
