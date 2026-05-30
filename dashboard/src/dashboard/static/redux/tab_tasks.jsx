@@ -302,11 +302,14 @@ function TaskDetail({ task, allTasks }) {
       {(() => {
         const extDeps = task.external_deps || [];
         if (!extDeps.length) return null;
+        // Any status that begins with 'unknown' (covers future unknown_* sentinels)
+        // or equals the 'malformed' sentinel renders as dep-unknown (muted / warning).
+        const isUnknown = s => s.startsWith('unknown') || s === 'malformed';
         return (<>
           <div className="section-lbl">External dependencies ({extDeps.length})</div>
           <div className="chips multiline">
             {extDeps.map(d => {
-              const cls = d.status === 'done' ? 'dep-done' : d.status === 'unknown' || d.status === 'unknown_project' || d.status === 'unknown_task' || d.status === 'malformed' ? 'dep-unknown' : 'dep-pending';
+              const cls = d.status === 'done' ? 'dep-done' : isUnknown(d.status) ? 'dep-unknown' : 'dep-pending';
               return (
                 <span key={d.id} className={`chip ${cls}`} title={d.status}>{d.id} · {d.status}</span>
               );

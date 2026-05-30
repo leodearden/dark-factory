@@ -809,3 +809,66 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
         client=dummy_client, config=cfg, resolve_external=True,
     )
     assert active[0]['external_deps'] == []
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """resolve_external=True must NOT include done rows' external dep ids in the batched call.
+
+    Done tasks' external deps are no longer actionable. Their ids must not bloat the MCP
+    request, and their rows must keep the 'unknown' sentinel (not get re-stamped).
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='xdeps',
+        active_tasks=[
+            {
+                'id': 5,
+                'title': 'active waiter',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['proj:10']},
+            },
+        ],
+        done_tasks=[
+            {
+                'id': 6,
+                'title': 'done with external dep',
+                'status': 'done',
+                'dependencies': [],
+                'updated_at': '2026-05-29T10:00:00+00:00',
+                'metadata': {'external_deps': ['proj:99']},  # must NOT enter the batched call
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    calls: list[list[str]] = []
+
+    async def _record_call(client, config, deps):
+        calls.append(sorted(deps))
+        return {'proj:10': 'done'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
+
+    cfg = DashboardConfig(project_root=root)
+    active, _, _ = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg,
+        max_done_per_project=5, resolve_external=True,
+    )
+
+    # Only the active row's dep id should be in the batched call — NOT 'proj:99'.
+    assert calls == [['proj:10']], (
+        f'done row dep "proj:99" must not appear in the batched call; got {calls}'
+    )
+
+    by_id = {r['id']: r for r in active}
+    # Active row's dep was resolved.
+    assert by_id['xdeps/T-5']['external_deps'] == [{'id': 'proj:10', 'status': 'done'}]
+    # Done row's dep kept 'unknown' (was not re-stamped).
+    assert by_id['xdeps/T-6']['external_deps'] == [{'id': 'proj:99', 'status': 'unknown'}]

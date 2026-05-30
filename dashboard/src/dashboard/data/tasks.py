@@ -138,6 +138,12 @@ async def fetch_external_statuses(
             logger.debug('fetch_external_statuses: unexpected result type %s from %s', type(result), url)
             continue
 
+        if 'error' in result or not result:
+            # Structured error dict or empty result (e.g. parse failure) — try next URL.
+            # The fail-safe {} is returned below if all URLs exhaust.
+            logger.debug('fetch_external_statuses: soft failure from %s: %s', url, result)
+            continue
+
         return result  # bare {dep: status} map
 
     return {}

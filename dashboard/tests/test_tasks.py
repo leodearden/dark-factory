@@ -157,3 +157,56 @@ async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_co
             result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
 
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_failover_on_error_dict(two_url_config):
+    """fetch_external_statuses continues to the next URL when the first returns an error dict.
+
+    Multi-server failover must not be silently lost when mcp_tool_call returns a
+    structured error (e.g. {'error': '...'}). The second URL succeeds and its map
+    is returned.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    good_map = {'dark_factory:13': 'done'}
+    calls: list[str] = []
+
+    async def _two_urls(client, url, tool, args):
+        calls.append(url)
+        if url == two_url_config.fused_memory_urls[0]:
+            return {'error': 'server overloaded'}
+        return good_map
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_two_urls):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, two_url_config, ['dark_factory:13'])
+
+    assert result == good_map, 'should fall through to second URL on error dict'
+    assert len(calls) == 2, 'both URLs should have been tried'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_failover_on_empty_dict(two_url_config):
+    """fetch_external_statuses continues to the next URL when the first returns an empty dict.
+
+    An empty {} result (e.g. from a parse failure) is a soft failure and should
+    trigger multi-server failover rather than returning an empty map prematurely.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    good_map = {'dark_factory:13': 'in-progress'}
+    calls: list[str] = []
+
+    async def _two_urls(client, url, tool, args):
+        calls.append(url)
+        if url == two_url_config.fused_memory_urls[0]:
+            return {}  # empty — soft failure
+        return good_map
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_two_urls):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, two_url_config, ['dark_factory:13'])
+
+    assert result == good_map, 'should fall through to second URL on empty dict'
+    assert len(calls) == 2, 'both URLs should have been tried'

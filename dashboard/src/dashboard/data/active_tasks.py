@@ -272,9 +272,14 @@ async def collect_tasks_with_counts(
         all_active.extend(active)
 
     if resolve_external:
-        # Gather the deduped union of all external dep ids.
+        # Gather the deduped union of external dep ids for ACTIVE (non-done) rows only.
+        # Done rows' external deps are no longer actionable; skipping them avoids
+        # needless MCP load and prevents 'External dependencies' chips appearing on
+        # completed tasks in the dashboard (where they would be noise, not signal).
         dep_ids: set[str] = set()
         for row in all_active:
+            if 'completed' in row:
+                continue  # skip bounded done rows
             for entry in row.get('external_deps') or []:
                 dep_ids.add(entry['id'])
         if dep_ids:
@@ -282,6 +287,8 @@ async def collect_tasks_with_counts(
                 client, config, sorted(dep_ids),
             )
             for row in all_active:
+                if 'completed' in row:
+                    continue  # skip bounded done rows
                 for entry in row.get('external_deps') or []:
                     entry['status'] = status_map.get(entry['id'], 'unknown')
 
