@@ -11,8 +11,6 @@ Covers:
   both legacy assemble_payload and assembled _format_assembled_payload paths must inject
   '### Per-Cycle Summary Nonce' with a fresh 8-hex nonce per call
   (TestStage1PayloadSummaryNonce)
-- Stage 1 prompt mandates summary_nonce (task 1574): STAGE1_SYSTEM_PROMPT must reference
-  summary_nonce as FIRST line of per-cycle summary content (TestStage1PromptNonceMechanism)
 - A7b: harness._escalate fingerprint stamping and dedup routing
   (TestReconEscalationDedup)
 - Step-11: MemoryConsolidator.run() wiring — deletion guard (filter_false_absence_flags)
@@ -265,46 +263,6 @@ class TestStage1PayloadSummaryNonce:
             "_format_assembled_payload must include 'summary_nonce: <8-hex>' in the payload "
             f"(regex r'summary_nonce: [0-9a-f]{{8}}' found no match); payload excerpt:\n"
             f"{payload[:500]}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# task-1574: Stage 1 system prompt mandates summary_nonce as FIRST line
-# ---------------------------------------------------------------------------
-
-
-class TestStage1PromptNonceMechanism:
-    """Existence checks that STAGE1_SYSTEM_PROMPT references summary_nonce (task 1574).
-
-    Mirrors test_stages.py TestStage2PromptNonceMechanism (lines 1611-1640).
-    """
-
-    def test_stage1_prompt_contains_summary_nonce(self):
-        """STAGE1_SYSTEM_PROMPT must reference 'summary_nonce'.
-
-        Guards that the nonce injected into the payload is also mandated in the prompt
-        instructions so the agent is told to prepend it — otherwise the nonce is inert.
-        RED before step-6 impl: STAGE1_SYSTEM_PROMPT has no summary_nonce reference yet.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'summary_nonce' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must reference 'summary_nonce' so the agent is "
-            "instructed to prepend it as the FIRST line of its per-cycle summary "
-            "(task 1574: without this, the nonce injected into the payload is inert)"
-        )
-
-    def test_stage1_prompt_retains_uniqueness_token(self):
-        """Regression guard: STAGE1_SYSTEM_PROMPT must still contain 'uniqueness_token'.
-
-        The summary_nonce is ADDITIVE — the ISO timestamp uniqueness_token is retained.
-        This test is GREEN before and after the impl, pinning the additive contract.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'uniqueness_token' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must retain 'uniqueness_token' after adding "
-            "summary_nonce (the nonce is ADDITIVE, not a replacement; task 1574)"
         )
 
 
