@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -197,3 +198,25 @@ async def test_read_only_no_mutations(mcp_server, ext_task_interceptor):
     ext_task_interceptor.update_task.assert_not_called()
     ext_task_interceptor.add_dependency.assert_not_called()
     ext_task_interceptor.trigger_reconciliation.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# step-13: transient error propagates — NOT mapped to a sentinel
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transient_backend_error_raises_not_sentinel(mcp_server, ext_task_interceptor):
+    """A transient backend error (RuntimeError) must propagate as ToolError.
+
+    It must NOT be caught and returned as 'unknown_project'/'unknown_task'/'malformed'.
+    This guards the load-bearing distinction between transient failure (raise →
+    scheduler fail-safe wait) and semantic unresolvability (sentinel → grace-then-escalate).
+    """
+    ext_task_interceptor.get_statuses = AsyncMock(side_effect=RuntimeError('db down'))
+
+    with pytest.raises(ToolError):
+        await mcp_server._tool_manager.call_tool(
+            'get_external_statuses',
+            {'deps': ['dark_factory:13']},
+        )
