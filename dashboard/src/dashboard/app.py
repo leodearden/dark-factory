@@ -534,7 +534,9 @@ async def api_tasks(request: Request) -> JSONResponse:
     # Single-pass: fetch_tasks once per project, derive both active rows and
     # done counts from the same snapshot — no second fetch_statuses round-trip.
     active, offline_projects, done_counts = await collect_tasks_with_counts(
-        http_client, config, max_done_per_project=_MAX_DONE_PER_PROJECT,
+        http_client, config,
+        max_done_per_project=_MAX_DONE_PER_PROJECT,
+        resolve_external=True,
     )
     return JSONResponse(
         {
