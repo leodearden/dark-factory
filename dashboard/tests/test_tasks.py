@@ -1,9 +1,15 @@
-"""Unit tests for dashboard.data.tasks._shape_task.
+"""Unit tests for dashboard.data.tasks._shape_task and fetch_external_statuses.
 
-Focus: the field-mapping contract at the MCP→dashboard boundary.
+Focus: the field-mapping contract at the MCP→dashboard boundary and the
+fetch_external_statuses short-circuit + fail-safe semantics.
 """
 
 from __future__ import annotations
+
+from unittest.mock import patch
+
+import httpx
+import pytest
 
 from dashboard.data.tasks import _shape_task
 
@@ -76,3 +82,131 @@ def test_shape_task_returns_none_on_missing_id():
 
 def test_shape_task_returns_none_on_non_numeric_id():
     assert _shape_task({'id': 'abc', 'title': 'bad id', 'status': 'pending'}) is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_external_statuses (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_empty_deps_short_circuits(dummy_config):
+    """fetch_external_statuses(deps=[]) returns {} immediately without any MCP call."""
+    from dashboard.data.tasks import fetch_external_statuses
+
+    called = []
+
+    async def _fail_if_called(*args, **kwargs):
+        called.append(args)
+        raise AssertionError('mcp_tool_call must not be called when deps=[]')
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_fail_if_called):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, [])
+
+    assert result == {}
+    assert called == [], 'mcp_tool_call must not be invoked for empty deps'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_returns_bare_status_map(dummy_config):
+    """fetch_external_statuses returns the BARE {dep: status} map on success."""
+    from dashboard.data.tasks import fetch_external_statuses
+
+    bare_map = {'dark_factory:13': 'done', 'reify:8': 'unknown_task'}
+
+    async def _fake_mcp(client, url, tool, args):
+        assert tool == 'get_external_statuses'
+        assert args == {'deps': ['dark_factory:13', 'reify:8']}
+        return bare_map
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_fake_mcp):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(
+                client, dummy_config, ['dark_factory:13', 'reify:8']
+            )
+
+    assert result == {'dark_factory:13': 'done', 'reify:8': 'unknown_task'}
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_returns_empty_on_connect_error(dummy_config):
+    """fetch_external_statuses returns {} (fail-safe) on ConnectError."""
+    from dashboard.data.tasks import fetch_external_statuses
+
+    async def _raise_connect(*args, **kwargs):
+        raise httpx.ConnectError('refused')
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_raise_connect):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_config):
+    """fetch_external_statuses returns {} if MCP returns a non-dict (guards shape drift)."""
+    from dashboard.data.tasks import fetch_external_statuses
+
+    async def _bad_result(*args, **kwargs):
+        return ['not', 'a', 'dict']
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_bad_result):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_failover_on_error_dict(two_url_config):
+    """fetch_external_statuses continues to the next URL when the first returns an error dict.
+
+    Multi-server failover must not be silently lost when mcp_tool_call returns a
+    structured error (e.g. {'error': '...'}). The second URL succeeds and its map
+    is returned.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    good_map = {'dark_factory:13': 'done'}
+    calls: list[str] = []
+
+    async def _two_urls(client, url, tool, args):
+        calls.append(url)
+        if url == two_url_config.fused_memory_urls[0]:
+            return {'error': 'server overloaded'}
+        return good_map
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_two_urls):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, two_url_config, ['dark_factory:13'])
+
+    assert result == good_map, 'should fall through to second URL on error dict'
+    assert len(calls) == 2, 'both URLs should have been tried'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_failover_on_empty_dict(two_url_config):
+    """fetch_external_statuses continues to the next URL when the first returns an empty dict.
+
+    An empty {} result (e.g. from a parse failure) is a soft failure and should
+    trigger multi-server failover rather than returning an empty map prematurely.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    good_map = {'dark_factory:13': 'in-progress'}
+    calls: list[str] = []
+
+    async def _two_urls(client, url, tool, args):
+        calls.append(url)
+        if url == two_url_config.fused_memory_urls[0]:
+            return {}  # empty — soft failure
+        return good_map
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_two_urls):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, two_url_config, ['dark_factory:13'])
+
+    assert result == good_map, 'should fall through to second URL on empty dict'
+    assert len(calls) == 2, 'both URLs should have been tried'
