@@ -2221,6 +2221,33 @@ class TestFairness:
         assert scheduler.lock_table.has_parks('A')
 
     @pytest.mark.asyncio
+    async def test_parks_install_unconditionally_without_v2_flag(self):
+        """Parks install after the per-tier threshold even with no v2 flag set.
+
+        This is a RED test until the scheduler_v2 gate is removed from
+        _bump_skip_and_maybe_park.  Default high-tier threshold=1, so one skip
+        is enough.
+        """
+        # Default config — NO scheduler_v2 assignment anywhere.
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        scheduler = Scheduler(config)
+
+        # Seed compiler/src so A (high priority) is forced to skip.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()  # high priority
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # One tick: high threshold=1, so A should park after this single skip.
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'B'
+
+        # Parks must be installed unconditionally — no flag required.
+        assert scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
     async def test_eager_park_full_module_set(self):
         """With scheduler_v2=True, parks install on ALL of A's modules at once.
 
