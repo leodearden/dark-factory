@@ -136,3 +136,31 @@ This project is a dark-factory orchestrator target.
   descriptive `agent_id`.
 - Config: `orchestrator.yaml` (+ `.mcp.json`, `.envrc`) at the repo root.
 ```
+
+---
+
+## .jcodemunch.jsonc
+
+Per-project config for the jcodemunch code indexer (the AST-based retrieval the orchestrator's agents use). A JSONC file (comments allowed) at the repo root. Model on the existing projects (`dark-factory/.jcodemunch.jsonc` for a Python repo; `reify/.jcodemunch.jsonc` for a multi-language one).
+
+```jsonc
+{
+  // <PROJECT_ID>: <one-line description of the repo + primary package path>
+  "languages": ["python"],          // detect from the repo: python / rust / typescript / tsx / ...
+  "max_folder_files": 5000,
+  "extra_ignore_patterns": [
+    // Project-specific heavy/noise dirs ON TOP of the global ~/.code-index/config.jsonc.
+    // The global list knows ".venv/" but NOT a bare "venv/" — add it here if the
+    // project uses one, or the indexer crawls thousands of installed library files.
+    "venv/",
+    "results/",
+    "data/"
+  ],
+  "disabled_tools": ["search_columns"],
+  "staleness_days": 3
+}
+```
+
+Tailor `languages` and `extra_ignore_patterns` to the repo. The global ignore list (`~/.code-index/config.jsonc`) already covers `.venv/`, `node_modules/`, `target/`, `__pycache__/`, the `*_cache` dirs, `.worktrees/`, `.taskmaster/`, and the common lockfiles — so only add what's *specific* to this project (its data/output dirs, a non-dotfile `venv/`, generated parser sources, etc.).
+
+After writing it, register the repo with the watcher (Stage 6b): append the absolute path to the `--repos` line in `~/.config/systemd/user/jcodemunch-watcher.service`, `daemon-reload`, and `systemctl --user restart jcodemunch-watcher`.

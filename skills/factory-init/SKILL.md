@@ -17,8 +17,8 @@ Hold this end-state in mind; every stage moves toward it:
 2. The target is a git repo (the orchestrator branches task worktrees from `main` — no repo, no worktrees).
 3. A canonical `project_id` is chosen — lowercase, **no hyphens** — and pinned where the directory name would otherwise disagree with it.
 4. A unique escalation port is chosen and recorded.
-5. The target repo contains `orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, and (where needed) a `CLAUDE.md` project_id pin.
-6. The project root is registered in `DASHBOARD_KNOWN_PROJECT_ROOTS` and fused-memory has been restarted and verified — **before any task is queued**.
+5. The target repo contains `orchestrator.yaml`, `.mcp.json`, `.envrc`, a `.gitignore` covering orchestrator scratch dirs, a `.jcodemunch.jsonc` indexer config, and (where needed) a `CLAUDE.md` project_id pin.
+6. The project root is registered in `DASHBOARD_KNOWN_PROJECT_ROOTS` (reconciliation, restarted + verified — **before any task is queued**) and added to the `jcodemunch-watcher` `--repos` list (re-indexed).
 7. The right next step is launched: existing code → `/spawn /review-briefing` then `/spawn /review` then *offer* `/spawn /prd`; greenfield → a goals discussion, then `/spawn /prd` run 1–5× serially to queue the first task batch.
 
 ## Operating principles
@@ -71,6 +71,7 @@ Exact templates, the verify-command cookbook, and merge-don't-clobber guidance l
 - **`.envrc`** — `export ORCH_CONFIG_PATH="<absolute path to orchestrator.yaml>"`. direnv may not be installed (don't auto-install — offer it); without direnv this file is inert and the orchestrator needs `--config` explicitly.
 - **`.gitignore`** — ensure `.worktrees/`, `.task/`, `.taskmaster/`, and `data/escalations/` are ignored. `.task/` is critical: if it ever lands on `main` it contaminates every future worktree. Merge into any existing `.gitignore` rather than overwriting.
 - **`CLAUDE.md`** — if a project_id pin is needed (hyphenated dir), add it plus the dark-factory routing conventions (route all task ops through fused-memory MCP with `project_root=<target>`; write-tag with `project_id=<id>`). Merge into an existing `CLAUDE.md`, never clobber it.
+- **`.jcodemunch.jsonc`** — the per-project code-indexer config (languages, ignore patterns) so the orchestrator's agents get structured code retrieval over this repo. Detect the language(s) from the repo. **Crucial:** add the project's own heavy dirs to `extra_ignore_patterns` — especially a non-dotfile virtualenv like `venv/`, which the *global* ignore list (`~/.code-index/config.jsonc`, which only knows `.venv/`) won't catch, so the indexer would otherwise crawl thousands of installed library files.
 - `mkdir -p <target>/data/escalations`.
 
 **Validate before registering.** From the dark-factory repo, run a status check against the new config:
@@ -81,14 +82,28 @@ cd <dark-factory> && uv run --project orchestrator orchestrator status --config 
 
 Expect "No tasks found." (or an empty tree) — *not* a config error. This confirms the YAML parses and satisfies the loader before you touch the shared service.
 
-## Stage 6 — Register with reconciliation (DESTRUCTIVE — confirm first)
+## Stage 6 — Register with dark-factory's shared services
+
+Two registrations. The reconciliation one is destructive (restarts a shared service) and load-bearing for correctness; the jcodemunch one is cheap and safe.
+
+### 6a. Reconciliation (DESTRUCTIVE — confirm first)
 
 Full procedure and rationale in **`references/recon-registration.md`**. The shape:
 
-1. Append the target's absolute path to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in `<dark-factory>/scripts/fused-memory.service.template` — the source of truth that survives future re-renders.
-2. Render it into the live unit the same way `setup-host.sh` does (`sed 's|__REPO_ROOT__|<dark-factory>|g'` → `~/.config/systemd/user/fused-memory.service`), then `systemctl --user daemon-reload`.
+1. Append the target's absolute path to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in `<dark-factory>/scripts/fused-memory.service.template` — the source of truth — and **keep `dashboard.service.template` in sync** (the same var lives there too).
+2. Apply it to the live unit `~/.config/systemd/user/fused-memory.service` with a **surgical one-line edit** (append `,<target>`), then `systemctl --user daemon-reload`. Do *not* re-render from the template unless you substitute *both* `__REPO_ROOT__` and `__UV_PATH__` — a partial render leaves `ExecStart` broken.
 3. **Confirm with the user, then `systemctl --user restart fused-memory`.** ⚠️ This severs *this* session's fused-memory MCP tools — they do not reconnect. That's acceptable: nothing after this point needs MCP in this session, and the sessions you spawn in Stage 7 get fresh connections to the restarted server.
-4. Verify: a python-urllib probe to `8002/health` returns healthy, and `journalctl --user -u fused-memory` shows the new project recognised. Registration detection is heuristic, so *confirm in the log* rather than assuming.
+4. Verify: a python-urllib probe to `8002/health` returns healthy, and `journalctl --user -u fused-memory` shows the new project in the `project_prefix_registry` line. Detection is heuristic (it may not claim ambiguous prefixes like `src/`), so *confirm in the log* rather than assuming.
+
+### 6b. jcodemunch code indexer (safe)
+
+So the orchestrator's agents get structured code retrieval over the new repo. There's one global `jcodemunch-watcher.service` that watches a **multi-repo `--repos` list**; the live unit (not the single-repo template) is the source of truth for that list.
+
+1. Append ` <target>` to the `--repos` line in `~/.config/systemd/user/jcodemunch-watcher.service` (space-separated), then `systemctl --user daemon-reload`.
+2. `systemctl --user restart jcodemunch-watcher`. Unlike 6a this is cheap and non-disruptive — it just re-indexes and does **not** sever any MCP (the user-scope jcodemunch retrieval MCP is a separate process from the watcher). No confirmation needed beyond the user already wanting jcodemunch.
+3. Verify the project is being indexed: `journalctl --user -u jcodemunch-watcher --since '1 min ago'` mentions `<target>`.
+
+(The global `~/.code-index/config.jsonc` and the user-scope jcodemunch MCP already exist from the dark-factory install — verify, don't recreate.)
 
 ## Stage 7 — Route by code presence
 
