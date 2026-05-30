@@ -208,3 +208,133 @@ def escalations_for(harness: Harness, task_id: str) -> list:
     if q is None:
         return []
     return q.get_by_task(task_id, status='pending')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: extract statuses from call_tool envelope
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _call_get_external_statuses(
+    session: TwoProjectMcpSession, deps: list[str]
+) -> dict:
+    """Call session.call_tool('get_external_statuses', ...) and extract statuses.
+
+    Parses the JSON-RPC text-content envelope, returns the inner 'statuses' dict.
+    Raises NotImplementedError when the branch is not yet implemented (S1 RED phase).
+    """
+    result = await session.call_tool(
+        'get_external_statuses', {'deps': deps}
+    )
+    text = result['result']['content'][0]['text']
+    payload = json.loads(text)
+    return payload['statuses']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S1 RED — TwoProjectMcpSession resolver CONTRACT (fidelity to α)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResolverContract:
+    """Pin TwoProjectMcpSession.get_external_statuses to α's documented contract.
+
+    All tests here call session.call_tool('get_external_statuses', ...) directly.
+    They fail RED because get_external_statuses raises NotImplementedError until S2.
+
+    Contract (mirrored from fused-memory/tests/test_get_external_statuses.py and
+    PRD Contract §get_external_statuses):
+    - Real status passed through verbatim (done / pending / cancelled).
+    - 'nope:1' → 'unknown_project' (unrecognised project_id).
+    - '<known>:999999' → 'unknown_task' (task absent from upstream_statuses).
+    - Malformed dep strings → 'malformed'.
+    - Hyphen-form project id resolves like underscore form; key is verbatim.
+    - A single multi-dep call increments ext_call_count by exactly 1.
+    """
+
+    def _make_session(self) -> TwoProjectMcpSession:
+        session = TwoProjectMcpSession(known_projects={_UPSTREAM_PROJECT})
+        session.upstream_statuses = {
+            '10': 'done',
+            '20': 'pending',
+            '30': 'cancelled',
+        }
+        return session
+
+    @pytest.mark.asyncio
+    async def test_real_statuses_passed_through(self) -> None:
+        """Known project + known task → real status keyed by verbatim dep string."""
+        session = self._make_session()
+        statuses = await _call_get_external_statuses(
+            session,
+            [
+                f'{_UPSTREAM_PROJECT}:10',
+                f'{_UPSTREAM_PROJECT}:20',
+                f'{_UPSTREAM_PROJECT}:30',
+            ],
+        )
+        assert statuses[f'{_UPSTREAM_PROJECT}:10'] == 'done'
+        assert statuses[f'{_UPSTREAM_PROJECT}:20'] == 'pending'
+        assert statuses[f'{_UPSTREAM_PROJECT}:30'] == 'cancelled'
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_sentinel(self) -> None:
+        """Project not in known_projects → 'unknown_project' sentinel."""
+        session = self._make_session()
+        statuses = await _call_get_external_statuses(session, ['nope:1'])
+        assert statuses['nope:1'] == 'unknown_project'
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_sentinel(self) -> None:
+        """Known project but absent task_id → 'unknown_task' sentinel."""
+        session = self._make_session()
+        statuses = await _call_get_external_statuses(
+            session, [f'{_UPSTREAM_PROJECT}:999999']
+        )
+        assert statuses[f'{_UPSTREAM_PROJECT}:999999'] == 'unknown_task'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('dep', [
+        'garbage',                              # no colon at all
+        f'{_UPSTREAM_PROJECT}:',                # empty task_id
+        ':10',                                  # empty project_id
+        f'{_UPSTREAM_PROJECT}:abc',             # non-numeric task_id
+    ])
+    async def test_malformed_dep_sentinel(self, dep: str) -> None:
+        """Unparseable dep string → 'malformed' sentinel."""
+        session = self._make_session()
+        statuses = await _call_get_external_statuses(session, [dep])
+        assert statuses[dep] == 'malformed', (
+            f'Expected malformed sentinel for {dep!r}; got {statuses!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_hyphen_project_id_normalized(self) -> None:
+        """Hyphen form of project_id resolves identically to underscore form.
+
+        Key in the result must be the verbatim hyphen string.
+        """
+        hyphen_project = _UPSTREAM_PROJECT.replace('_', '-')
+        session = self._make_session()
+        statuses = await _call_get_external_statuses(
+            session, [f'{hyphen_project}:10']
+        )
+        # Key is verbatim (hyphen form); value is the real status.
+        assert statuses[f'{hyphen_project}:10'] == 'done', (
+            f'Hyphen-form dep should resolve to done; got {statuses!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_call_increments_ext_call_count_by_one(self) -> None:
+        """A single multi-dep call increments ext_call_count by exactly 1."""
+        session = self._make_session()
+        assert session.ext_call_count == 0
+        await _call_get_external_statuses(
+            session,
+            [
+                f'{_UPSTREAM_PROJECT}:10',
+                f'{_UPSTREAM_PROJECT}:20',
+                'nope:1',
+            ],
+        )
+        assert session.ext_call_count == 1, (
+            f'Expected ext_call_count==1 after one call; got {session.ext_call_count}'
+        )
