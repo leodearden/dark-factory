@@ -1861,6 +1861,38 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_external_statuses(deps: list[str]) -> dict[str, str]:
+        """Return cross-project task statuses keyed by the verbatim dep string.
+
+        Each dep is a ``"<project_id>:<task_id>"`` string.  For each dep the
+        tool normalises the project_id, looks it up in the known-projects
+        registry, reads the foreign project's top-level task status via
+        ``task_interceptor.get_statuses``, and returns the result keyed by the
+        **original** verbatim dep string.
+
+        Possible values per key:
+        - A real task status (e.g. ``"done"``, ``"pending"``)
+        - ``"unknown_project"`` — project_id not in the registry
+        - ``"unknown_task"``    — project known, but no top-level task with that id
+        - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
+
+        Read-only: no reconciliation, no event emission, no task mutation.
+        Registry/DB unavailability raises (transient) — NOT mapped to a sentinel.
+        """
+        result: dict[str, str] = {}
+        for dep in deps:
+            # Parse: split on first colon
+            project_id, sep, task_id = dep.partition(':')
+            # Look up project_root in registry
+            project_root = _kp.get(project_id)
+            # Read status from foreign project
+            statuses = await task_interceptor.get_statuses(
+                project_root=project_root, ids=[task_id]
+            )
+            result[dep] = statuses[task_id]
+        return result
+
+    @mcp.tool()
     async def get_task(
         id: str,
         project_root: str,
