@@ -1175,8 +1175,53 @@ class SqliteTaskBackend:
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult:
+        """Remove a dependency from a task.
+
+        ``depends_on`` accepts two forms:
+
+        * **Bare integer** (e.g. ``"3"``): deletes from the integer dependencies
+          table. Idempotent — no error if the dependency is absent.
+        * **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical entry
+          from ``metadata.external_deps`` via an atomic read-modify-write inside
+          the backend's ``_txn``. Idempotent — no error if the row or dep is absent.
+          ``'-'`` in the project_id portion is normalised to ``'_'``.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
+
+        # ── Qualified (cross-project) path ─────────────────────────────────
+        if ':' in str(depends_on):
+            norm_pid, dep_int = _parse_qualified_dep(depends_on)
+            canonical = f'{norm_pid}:{dep_int}'
+            tid, _ = _parse_task_id(task_id)
+
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    try:
+                        meta = json.loads(row['metadata'] or '{}')
+                    except (TypeError, ValueError):
+                        meta = {}
+                    existing = meta.get('external_deps', [])
+                    if canonical in existing:
+                        updated = [e for e in existing if e != canonical]
+                        meta['external_deps'] = updated
+                        await conn.execute(
+                            'UPDATE tasks SET metadata = ?, updated_at = ? '
+                            'WHERE tag = ? AND id = ? AND parent_id = ?',
+                            (json.dumps(meta), _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                        )
+            return {
+                'id': str(tid),
+                'dependency_id': canonical,
+                'message': f'Removed external dependency: {tid} no longer depends on {canonical}',
+            }
+
+        # ── Bare-integer (same-project) path ───────────────────────────────
         tid, _ = _parse_task_id(task_id)
         dep_tid, _ = _parse_task_id(depends_on)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
