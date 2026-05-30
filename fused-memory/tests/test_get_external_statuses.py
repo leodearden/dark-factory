@@ -102,3 +102,27 @@ async def test_known_project_unknown_task_returns_sentinel(mcp_server):
         {'deps': ['dark_factory:999999']},
     )
     assert result == {'dark_factory:999999': 'unknown_task'}
+
+
+# ------------------------------------------------------------------
+# step-07: malformed sentinel
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dep', [
+    'garbage',             # no colon at all
+    'dark_factory:',       # empty task_id
+    ':13',                 # empty project_id
+    'dark_factory:abc',    # non-numeric task_id
+    'dark_factory:15.2',   # dotted subtask form — out of scope
+])
+async def test_malformed_dep_returns_sentinel(mcp_server, ext_task_interceptor, dep):
+    """Deps that cannot be parsed as <project_id>:<int> return 'malformed', no backend call."""
+    result = await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': [dep]},
+    )
+    assert result == {dep: 'malformed'}
+    # No backend read should be made for malformed deps
+    ext_task_interceptor.get_statuses.assert_not_called()
