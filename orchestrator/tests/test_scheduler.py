@@ -3877,9 +3877,14 @@ class TestGetStatuses:
 class TestSchedulerV2Config:
     """Schema assertions for the v2 scheduler config changes."""
 
-    def test_scheduler_v2_default_false(self):
-        """FairnessConfig.scheduler_v2 defaults to False."""
-        assert FairnessConfig().scheduler_v2 is False
+    def test_scheduler_v2_field_removed(self):
+        """scheduler_v2 must no longer exist on FairnessConfig.
+
+        Regression guard mirroring test_lease_fields_removed_from_fairness_config.
+        """
+        assert not hasattr(FairnessConfig(), 'scheduler_v2'), (
+            'scheduler_v2 field must be removed from FairnessConfig'
+        )
 
     def test_skip_threshold_is_per_tier_dict(self):
         """Default skip_threshold is a per-tier dict with the v2 values."""
