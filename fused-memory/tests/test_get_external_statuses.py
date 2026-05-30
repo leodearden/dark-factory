@@ -20,10 +20,12 @@ def _make_get_statuses_side_effect(db: dict):
     matching entries (unknown ids silently omitted), exactly mirroring
     task_interceptor.get_statuses behaviour.
     """
+
     async def _side_effect(project_root, ids=None, tag=None):
         if ids is None:
             return dict(db)
         return {k: v for k, v in db.items() if k in ids}
+
     return _side_effect
 
 
@@ -31,12 +33,17 @@ def _make_get_statuses_side_effect(db: dict):
 def passthrough_main_checkout(monkeypatch):
     """Stub resolve_main_checkout to pass its argument through unchanged.
 
-    These tests use synthetic project_root values like ``/df`` that are not
-    real git working trees; the real resolver would reject them.  End-to-end
-    resolver behaviour is exercised in test_main_checkout_resolver.py.
+    This fixture is load-bearing: ``get_external_statuses`` now pipes each
+    registered project_root through ``_normalize_project_root`` (which calls
+    ``resolve_main_checkout``) to redirect any worktree path to the main
+    checkout, mirroring all other read tools.  Without this stub the real
+    resolver would reject synthetic roots like ``/df`` and ``/proj_a`` because
+    they are not real git working trees.  End-to-end resolver behaviour is
+    exercised in test_main_checkout_resolver.py.
     """
     monkeypatch.setattr(
-        'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        'fused_memory.server.tools.resolve_main_checkout',
+        lambda p: str(p),
     )
 
 
@@ -110,13 +117,16 @@ async def test_known_project_unknown_task_returns_sentinel(mcp_server):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('dep', [
-    'garbage',             # no colon at all
-    'dark_factory:',       # empty task_id
-    ':13',                 # empty project_id
-    'dark_factory:abc',    # non-numeric task_id
-    'dark_factory:15.2',   # dotted subtask form — out of scope
-])
+@pytest.mark.parametrize(
+    'dep',
+    [
+        'garbage',  # no colon at all
+        'dark_factory:',  # empty task_id
+        ':13',  # empty project_id
+        'dark_factory:abc',  # non-numeric task_id
+        'dark_factory:15.2',  # dotted subtask form — out of scope
+    ],
+)
 async def test_malformed_dep_returns_sentinel(mcp_server, ext_task_interceptor, dep):
     """Deps that cannot be parsed as <project_id>:<int> return 'malformed', no backend call."""
     result = await mcp_server._tool_manager.call_tool(
@@ -159,13 +169,15 @@ async def test_acceptance_mixed_deps(mcp_server):
     """
     result = await mcp_server._tool_manager.call_tool(
         'get_external_statuses',
-        {'deps': [
-            'dark_factory:13',    # real status
-            'nope:1',             # unknown project
-            'dark_factory:999999',  # unknown task
-            'garbage',            # malformed (no colon)
-            'dark-factory:13',    # hyphen form → same real status
-        ]},
+        {
+            'deps': [
+                'dark_factory:13',  # real status
+                'nope:1',  # unknown project
+                'dark_factory:999999',  # unknown task
+                'garbage',  # malformed (no colon)
+                'dark-factory:13',  # hyphen form → same real status
+            ]
+        },
     )
     assert result == {
         'dark_factory:13': 'done',
@@ -219,3 +231,63 @@ async def test_transient_backend_error_raises_not_sentinel(mcp_server, ext_task_
             'get_external_statuses',
             {'deps': ['dark_factory:13']},
         )
+
+
+# ------------------------------------------------------------------
+# Amendment: additional edge-case coverage (suggestion 4)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_deps_returns_empty_dict(mcp_server, ext_task_interceptor):
+    """Empty deps list returns {} with zero backend calls."""
+    result = await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': []},
+    )
+    assert result == {}
+    ext_task_interceptor.get_statuses.assert_not_called()
+
+
+@pytest.fixture
+def two_project_interceptor():
+    """Task interceptor with a two-project foreign DB (proj_a and proj_b)."""
+    ti = AsyncMock()
+    db_a = {'1': 'done'}
+    db_b = {'2': 'pending'}
+
+    async def side_effect(project_root, ids=None, tag=None):
+        db = db_a if project_root == '/proj_a' else db_b
+        if ids is None:
+            return dict(db)
+        return {k: v for k, v in db.items() if k in ids}
+
+    ti.get_statuses = AsyncMock(side_effect=side_effect)
+    return ti
+
+
+@pytest.fixture
+def mcp_server_two_projects(two_project_interceptor):
+    """MCP server with two known projects for cross-project batching tests."""
+    return create_mcp_server(
+        AsyncMock(),
+        task_interceptor=two_project_interceptor,
+        known_projects={'proj_a': '/proj_a', 'proj_b': '/proj_b'},
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_projects_two_backend_calls(
+    mcp_server_two_projects, two_project_interceptor
+):
+    """Deps from two distinct known projects issue exactly one get_statuses call each.
+
+    This exercises the cross-project branch of the per-project batching loop
+    and verifies the call_count==2 invariant (one call per distinct project).
+    """
+    result = await mcp_server_two_projects._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': ['proj_a:1', 'proj_b:2']},
+    )
+    assert result == {'proj_a:1': 'done', 'proj_b:2': 'pending'}
+    assert two_project_interceptor.get_statuses.call_count == 2

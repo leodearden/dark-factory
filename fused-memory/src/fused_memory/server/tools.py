@@ -83,6 +83,7 @@ _PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish
 # orchestrator/src/orchestrator/overrides.py:258.
 _VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
 
+
 async def _open_overrides_db(
     project_root: str,
     *,
@@ -1063,7 +1064,7 @@ def create_mcp_server(
         if clear_invalid_at and parsed_invalid_at is not None:
             return {
                 'error': 'clear_invalid_at and invalid_at are mutually exclusive: '
-                         'cannot set and clear invalid_at in the same call',
+                'cannot set and clear invalid_at in the same call',
                 'error_type': 'ValidationError',
             }
         if normalised_fact is None and parsed_invalid_at is None and not clear_invalid_at:
@@ -1912,16 +1913,28 @@ def create_mcp_server(
         # Sentinels = semantic "unresolvable"; exceptions = transient "couldn't answer".
         for norm_project_id, dep_pairs in project_batches.items():
             project_root = _kp[norm_project_id]
+            # Redirect worktree roots to the main checkout, mirroring all other
+            # read tools (see _normalize_project_root docstring).  Registry roots
+            # from build_known_projects_map are expected to be canonical
+            # main-checkout paths, but this guard prevents a silent divergence if
+            # a registered root were ever a worktree path.
+            # Resolution failure raises (transient) — consistent with this tool's
+            # "no sentinel for transient failures" contract.
+            _norm = _normalize_project_root(project_root)
+            if isinstance(_norm, dict):
+                raise RuntimeError(
+                    f'Cannot resolve registered root for {norm_project_id!r}: {_norm}'
+                )
+            project_root = _norm
             task_ids = [tid for _, tid in dep_pairs]
-            statuses = await task_interceptor.get_statuses(
-                project_root=project_root, ids=task_ids
-            )
+            statuses = await task_interceptor.get_statuses(project_root=project_root, ids=task_ids)
             for dep, task_id in dep_pairs:
                 if task_id not in statuses:
                     result[dep] = 'unknown_task'
                 else:
                     result[dep] = statuses[task_id]
 
+        await _log_read('get_external_statuses', result_summary={'count': len(result)})
         return result
 
     @mcp.tool()
@@ -1988,9 +2001,9 @@ def create_mcp_server(
                 edges from metadata.modules. Schema::
 
                   {
-                    "kind":   "merged" | "found_on_main",  # required
-                    "commit": "<sha-or-ref>",              # required for both kinds
-                    "note":   "<free text>",               # required if kind="found_on_main"
+                      'kind': 'merged' | 'found_on_main',  # required
+                      'commit': '<sha-or-ref>',  # required for both kinds
+                      'note': '<free text>',  # required if kind="found_on_main"
                   }
 
                 ``kind="merged"``: the work landed on main via a merge commit.
