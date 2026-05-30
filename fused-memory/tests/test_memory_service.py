@@ -873,6 +873,7 @@ class TestUpdateEdge:
         await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='proj')
         service.graphiti.update_edge.assert_called_once_with(
             'e-1', 'new fact', group_id='proj', invalid_at=None,
+            clear_invalid_at=False,
         )
 
     @pytest.mark.asyncio
@@ -887,6 +888,7 @@ class TestUpdateEdge:
         )
         service.graphiti.update_edge.assert_called_once_with(
             'e-1', None, group_id='proj', invalid_at=ts,
+            clear_invalid_at=False,
         )
 
     @pytest.mark.asyncio

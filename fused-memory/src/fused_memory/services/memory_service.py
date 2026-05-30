@@ -1240,13 +1240,15 @@ class MemoryService:
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
         invalid_at: datetime | None = None,
+        clear_invalid_at: bool = False,
     ) -> dict:
         """Update an existing Graphiti edge's fact text and/or invalidate it.
 
-        At least one of ``fact`` or ``invalid_at`` must be supplied. Setting
-        ``invalid_at`` to a timestamp marks the edge as superseded as of that
-        moment (used by reconciliation to retire contradicted facts without
-        destroying their audit trail).
+        At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
+        be supplied. Setting ``invalid_at`` marks the edge as superseded as of
+        that moment (used by reconciliation to retire contradicted facts without
+        destroying their audit trail). Setting ``clear_invalid_at=True`` resets
+        ``invalid_at`` to ``None``, restoring the edge to active status.
 
         **Guard-2 verification (TOCTOU note):** when *fact* is supplied, a
         ``get_edge_text`` readback is performed after the save to confirm
@@ -1259,7 +1261,7 @@ class MemoryService:
         practice.  Undercounting ``edges_updated`` (the conservative outcome) is
         safer than overcounting, so the behaviour is intentional.
         """
-        if fact is None and invalid_at is None:
+        if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact or invalid_at to be set')
         write_op_id = str(uuid_mod.uuid4())
 
@@ -1273,6 +1275,8 @@ class MemoryService:
             params['fact'] = fact[:200]
         if invalid_at is not None:
             params['invalid_at'] = invalid_at.isoformat()
+        if clear_invalid_at:
+            params['clear_invalid_at'] = True
 
         result_data = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -1282,6 +1286,7 @@ class MemoryService:
             payload=params,
             coro=self.graphiti.update_edge(
                 edge_uuid, fact, group_id=project_id, invalid_at=invalid_at,
+                clear_invalid_at=clear_invalid_at,
             ),
         )
         result = {'status': 'updated', 'store': 'graphiti', **result_data}
