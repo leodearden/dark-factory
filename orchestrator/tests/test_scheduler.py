@@ -5857,3 +5857,143 @@ class TestTasksByTrain:
         assert str(result[0].get('id')) == '501', (
             f'Expected 501 first (order=0), got {result[0].get("id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestGetExternalStatuses (task 1580 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatuses:
+    """``Scheduler.get_external_statuses`` returns a ``(statuses, error)`` tuple.
+
+    Mirrors the TestGetStatuses shape but for the cross-project resolver:
+    - exactly ONE dispatch_tool('get_external_statuses', {'deps': [...]}) call
+    - no project_root argument (the tool is cross-project by design)
+    - returns ({}, exc) on exception rather than propagating
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_returns_parsed_mapping(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_external_statuses parses the MCP response and returns (dict, None)."""
+        import json
+
+        response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps(
+                            {
+                                'statuses': {
+                                    'dark_factory:5': 'done',
+                                    'other_proj:99': 'pending',
+                                }
+                            }
+                        ),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+        result, err = await scheduler.get_external_statuses(
+            ['dark_factory:5', 'other_proj:99']
+        )
+        assert err is None
+        assert result == {'dark_factory:5': 'done', 'other_proj:99': 'pending'}
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_passes_deps_argument_no_project_root(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Exactly ONE dispatch_tool call with {'deps': [...]} — no project_root."""
+        import json
+
+        mcp_mock = AsyncMock(
+            return_value={
+                'result': {
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                        }
+                    ]
+                }
+            }
+        )
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        _result, _err = await scheduler.get_external_statuses(['dark_factory:5'])
+
+        mcp_mock.assert_called_once()
+        # The tool name must be 'get_external_statuses' (positional arg 1 of mcp_call)
+        call_args = mcp_mock.call_args[0]
+        assert call_args[1] == 'get_external_statuses', (
+            f"Expected tool name 'get_external_statuses'; got {call_args[1]!r}"
+        )
+        arguments = call_args[2]['arguments']
+        assert arguments.get('deps') == ['dark_factory:5'], (
+            f"Expected deps=['dark_factory:5']; got {arguments!r}"
+        )
+        assert 'project_root' not in arguments, (
+            f'project_root must not be present in arguments; got {arguments!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_exception_returns_empty_dict(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """OSError from mcp_call returns ({}, OSError) tuple."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'Connection refused')),
+        )
+        result, err = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result == {}
+        assert isinstance(err, OSError)
+        assert err.errno == 2
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_exception_then_success_no_state_leak(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Failing call returns ({}, exc); subsequent success returns (dict, None).
+
+        Error state lives on the stack — no cross-call leakage via shared attribute.
+        """
+        import json
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'Connection refused')),
+        )
+        result_fail, err_fail = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result_fail == {}
+        assert isinstance(err_fail, OSError)
+
+        success_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=success_response),
+        )
+        result_ok, err_ok = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result_ok == {'dark_factory:5': 'done'}
+        assert err_ok is None
