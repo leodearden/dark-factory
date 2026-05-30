@@ -2917,6 +2917,75 @@ class TestGetStatusScoping:
 
 
 # ---------------------------------------------------------------------------
+# Step 3: TRACK B.1 service clear_invalid_at RED tests
+# ---------------------------------------------------------------------------
+
+class TestUpdateEdgeClearInvalidAt:
+    """Service update_edge must forward clear_invalid_at through to the backend."""
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_forwards_to_backend(self, service):
+        """service.update_edge(clear_invalid_at=True) calls backend with clear_invalid_at=True."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        await service.update_edge(edge_uuid='e-1', project_id='proj', clear_invalid_at=True)
+        service.graphiti.update_edge.assert_called_once_with(
+            'e-1', None, group_id='proj', invalid_at=None, clear_invalid_at=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_result_is_verified_true(self, service):
+        """Clear-only update sets verified=True without calling get_edge_text."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('edge', 'fact'))
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is True, (
+            'clear-only update must be verified=True without a readback'
+        )
+        service.graphiti.get_edge_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_alone_does_not_raise(self, service):
+        """Guard must allow clear_invalid_at=True even when fact and invalid_at are None."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'f', 'refreshed_nodes': []}
+        )
+        # Should NOT raise ValueError
+        await service.update_edge(edge_uuid='e-1', project_id='proj', clear_invalid_at=True)
+
+    @pytest.mark.asyncio
+    async def test_all_none_still_raises(self, service):
+        """ValueError must still be raised when all three (fact/invalid_at/clear_invalid_at) are falsy."""
+        with pytest.raises(ValueError, match='fact or invalid_at'):
+            await service.update_edge(
+                edge_uuid='e-1', project_id='proj',
+                fact=None, invalid_at=None, clear_invalid_at=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_journal_params_include_clear_invalid_at(self, service):
+        """Journal params dict must include clear_invalid_at when True."""
+        logged_params = {}
+
+        async def fake_journaled_call(**kwargs):
+            logged_params.update(kwargs.get('payload', {}))
+            return {'uuid': 'e-1', 'fact': 'f', 'refreshed_nodes': []}
+
+        service._journaled_backend_call = fake_journaled_call
+        await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert logged_params.get('clear_invalid_at') is True, (
+            f'clear_invalid_at must appear in journal params; got {logged_params}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step 1: TRACK B.1 backend clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
 
