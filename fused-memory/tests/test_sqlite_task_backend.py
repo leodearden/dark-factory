@@ -1255,6 +1255,68 @@ async def test_qualified_dep_nonexistent_dependent_raises(backend, project_root)
     assert 'No tasks found' in str(exc.value)
 
 
+# ── remove_dependency — qualified (cross-project) tests ────────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_removes_one_leaves_other(backend, project_root):
+    """remove_dependency with a qualified dep removes only that entry."""
+    import json as _json
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+    # Also set a sibling key to verify it survives.
+    sibling_meta = _json.dumps({'extra': 'keep'})
+    await backend.update_task('1', project_root, metadata=sibling_meta, append=True)
+
+    await backend.remove_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['reify:7']
+    assert task['metadata']['extra'] == 'keep'
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_hyphen_normalized(backend, project_root):
+    """Hyphen form 'dark-factory:13' removes the canonical 'dark_factory:13'."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    await backend.remove_dependency('1', 'dark-factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata'].get('external_deps', []) == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_idempotent_absent(backend, project_root):
+    """Removing an absent qualified dep is a no-op (no error)."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+
+    # 'nope:1' was never added — should not raise.
+    await backend.remove_dependency('1', 'nope:1', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['reify:7']
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_integer_table_unaffected(backend, project_root):
+    """Qualified remove_dependency does not touch the integer dependencies table."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    await backend.remove_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('2', project_root)
+    assert task['dependencies'] == [1]
+    assert task['metadata'].get('external_deps', []) == []
+
+
 @pytest.mark.asyncio
 async def test_validate_dependencies_reports_dangling(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
