@@ -1150,6 +1150,12 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
     # must NOT leak to a target, which has to stay free to sync its own deps.
     'UV_FROZEN',
     'UV_NO_SYNC',
+    # `uv run` (our ExecStart) sets UV_RUN_RECURSION_DEPTH in our env to guard
+    # against runaway nested invocations.  A target's verify is a logically
+    # independent uv invocation tree, so it must start that counter fresh rather
+    # than inherit our depth — otherwise a uv-based target (dark-factory /
+    # autopilot-video) would `uv run` "pre-loaded" at our depth.
+    'UV_RUN_RECURSION_DEPTH',
     'CONDA_PREFIX',
     'CONDA_DEFAULT_ENV',
     'PYTHONHOME',
