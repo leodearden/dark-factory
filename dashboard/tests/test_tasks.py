@@ -6,7 +6,7 @@ fetch_external_statuses short-circuit + fail-safe semantics.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
