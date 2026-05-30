@@ -6395,3 +6395,105 @@ class TestApplyExternalDepPolicyUnresolved:
         )
         assert ('10', 'dark_factory:5') not in scheduler._external_unresolved_counts
         callback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyTransientErr (task 1580 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyTransientErr:
+    """Invariant 6: transient resolver error → silent wait, no counter, no escalation.
+
+    When external_err is not None (the MCP resolver raised), _apply_external_dep_policy
+    must be a no-op: no counter increment, no callback invocation.  The boolean gate
+    (_deps_satisfied with external_resolver_failed=True) must also block dispatch.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def _pending_task(self) -> dict:
+        return {
+            'id': '20',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:99']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_transient_err_no_callback(self, scheduler: Scheduler):
+        """external_err set → _on_external_dep_block never called."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'unknown_task'},   # cache has a sentinel but err is set
+            external_err=RuntimeError('db unavailable'),
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_transient_err_no_counter_increment(self, scheduler: Scheduler):
+        """external_err set → _external_unresolved_counts stays empty (no increment)."""
+        scheduler._on_external_dep_block = AsyncMock()
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'malformed'},
+            external_err=RuntimeError('registry timeout'),
+        )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Expected empty counter dict; got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_transient_err_does_not_reset_prior_counter(
+        self, scheduler: Scheduler
+    ):
+        """A transient error must not reset a counter built up in prior ticks."""
+        scheduler._on_external_dep_block = AsyncMock()
+        task = self._pending_task()
+
+        # Tick 1 — sentinel, no err → counter = 1
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:99': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('20', 'dark_factory:99')) == 1
+
+        # Tick 2 — transient err → counter must stay at 1 (no reset, no increment)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'unknown_task'},
+            external_err=RuntimeError('blip'),
+        )
+        assert scheduler._external_unresolved_counts.get(('20', 'dark_factory:99')) == 1, (
+            f'Counter must be untouched on transient err; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    def test_deps_satisfied_external_resolver_failed_blocks(
+        self, scheduler: Scheduler
+    ):
+        """external_resolver_failed=True → _deps_satisfied returns False (gate closed)."""
+        task = {
+            'id': '20',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:99']},
+        }
+        # Even with a 'done' entry in the cache, resolver_failed overrides
+        result = scheduler._deps_satisfied(
+            task,
+            {},
+            external_status_cache={'dark_factory:99': 'done'},
+            external_resolver_failed=True,
+        )
+        assert result is False, (
+            'external_resolver_failed=True must block dispatch regardless of cache'
+        )
