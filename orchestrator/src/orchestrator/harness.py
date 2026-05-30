@@ -2108,7 +2108,19 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         # Set task to blocked regardless of queue state — the queue is only for
         # human notification; the gate stays closed via the external-dep cache.
-        await self.scheduler.set_task_status(task_id, 'blocked')
+        # Wrapped in try/except so a transient set_task_status failure (e.g.
+        # fused-memory temporarily unavailable) does not prevent the L1 escalation
+        # from being filed; the human must still be notified even if the status
+        # write failed so they can intervene and set it manually.
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'External dep block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id,
+                exc_info=True,
+            )
 
         if not self._escalation_queue:
             logger.warning(
@@ -2118,8 +2130,12 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         if self._escalation_queue.has_open_l1(task_id):
-            logger.debug(
-                'External dep block for task %s — open L1 already exists, skipping',
+            # Log at WARNING: the pre-existing L1 may be for an unrelated cause
+            # (e.g. an infra escalation), so the external-dep block reason could
+            # be masked.  The warning makes the suppression observable.
+            logger.warning(
+                'External dep block for task %s — open L1 already exists, suppressing '
+                'duplicate; pre-existing L1 may be for an unrelated cause',
                 task_id,
             )
             return

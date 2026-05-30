@@ -1455,6 +1455,15 @@ class Scheduler:
         - ``external_err is not None`` → short-circuit; no counter increment,
           no escalation (fail-safe wait — resolver will retry next tick).
 
+        **Recovery note**: once ``_on_external_dep_block`` sets a task to
+        ``blocked``, the task leaves ``pending`` and this policy no longer
+        evaluates it.  Recovery requires manual unblock (set the task back to
+        ``pending`` after confirming the upstream dep is resolvable).  This is
+        intentional for ``cancelled`` deps (permanently terminal) and
+        conservative-but-safe for sentinel deps (transient resolution lag may
+        require manual intervention).  The ``EXTERNAL_DEP_UNRESOLVED``
+        escalation detail text prompts the human accordingly.
+
         This method must NOT be called from ``_deps_satisfied`` or
         ``_eligible_for_dispatch``.  Those are pure predicates called per-candidate;
         side effects here would N-fire per tick.
@@ -1522,7 +1531,10 @@ class Scheduler:
                             f'{status!r} for {count} consecutive ticks '
                             f'(threshold={threshold}).  The dep string may be '
                             f'malformed, or the referenced project/task may not '
-                            f'exist.  Task {task_id} is gated until resolved.'
+                            f'exist.  Task {task_id} is gated until resolved.  '
+                            f'Once the dep is resolvable or done, manually set '
+                            f'task {task_id} back to pending to reopen it — '
+                            f'blocked tasks are not re-evaluated automatically.'
                         )
                         if self._on_external_dep_block is not None:
                             await self._on_external_dep_block(
@@ -2361,17 +2373,31 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at, _skip_count, and _module_cache entries for tasks
-        # now in a terminal status so a future legitimate re-dispatch (e.g.
-        # cancelled -> pending re-architect, or a freshly-created task reusing the
-        # id) starts from a clean slate.  Resurrection-safe: a re-queued task
-        # re-derives modules and re-accumulates its skip count fresh.
+        # Drop _last_dispatch_at, _skip_count, _module_cache, and sub-threshold
+        # _external_unresolved_counts entries for tasks now in a terminal status
+        # so a future legitimate re-dispatch (e.g. cancelled -> pending
+        # re-architect, or a freshly-created task reusing the id) starts from a
+        # clean slate.  Resurrection-safe: a re-queued task re-derives modules
+        # and re-accumulates its skip count fresh.
         # Mirrors the _pending_anchor clearing in _update_age_anchors.
+        _terminal_ids: set[str] = set()
         for tid_str, status in status_map.items():
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
+                _terminal_ids.add(tid_str)
+        # _external_unresolved_counts is keyed by (task_id, dep); sweep
+        # separately to avoid mutating while iterating.  A sub-threshold counter
+        # entry would otherwise leak permanently if the task terminates before
+        # crossing the escalation threshold (e.g. manually cancelled while count=1).
+        if _terminal_ids and self._external_unresolved_counts:
+            _stale_ext_keys = [
+                k for k in self._external_unresolved_counts
+                if k[0] in _terminal_ids
+            ]
+            for k in _stale_ext_keys:
+                del self._external_unresolved_counts[k]
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
@@ -2402,9 +2428,19 @@ class Scheduler:
             external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
         else:
             external_cache, external_err = {}, None
-        await self._apply_external_dep_policy(
-            _pending_tasks_with_ext, external_cache, external_err
-        )
+        try:
+            await self._apply_external_dep_policy(
+                _pending_tasks_with_ext, external_cache, external_err
+            )
+        except Exception:
+            # A failure in the policy pass (e.g. set_task_status raising inside
+            # the _on_external_dep_block callback) must not abort the whole tick.
+            # Degrade to a fail-safe wait: the gate stays closed via
+            # _external_resolver_failed below, and the policy retries next tick.
+            logger.warning(
+                'External dep policy pass raised — degrading to fail-safe wait this tick',
+                exc_info=True,
+            )
         _external_resolver_failed = external_err is not None
 
         # Load priority-override snapshot for this tick.
