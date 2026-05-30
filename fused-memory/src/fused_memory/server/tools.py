@@ -1892,7 +1892,10 @@ def create_mcp_server(
             statuses = await task_interceptor.get_statuses(
                 project_root=project_root, ids=[task_id]
             )
-            result[dep] = statuses[task_id]
+            if task_id not in statuses:
+                result[dep] = 'unknown_task'
+            else:
+                result[dep] = statuses[task_id]
         return result
 
     @mcp.tool()
