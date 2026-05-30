@@ -571,3 +571,61 @@ class TestUnknownDepGraceThenEscalate:
         assert 'EXTERNAL_DEP_UNRESOLVED' in esc.summary, (
             f'Expected EXTERNAL_DEP_UNRESOLVED prefix; got {esc.summary!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S9 RED — row 9: one get_external_statuses call per tick (invariant 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOneExternalCallPerTick:
+    """Invariant 5: exactly one get_external_statuses call per tick regardless of fan-out.
+
+    Three pending dependent tasks whose external_deps collectively reference
+    five DISTINCT foreign deps (mix of done/pending/unknown across one or more
+    known upstream projects). A single acquire_next tick must issue exactly ONE
+    batched get_external_statuses call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_external_call_per_tick_regardless_of_fanout(
+        self, tmp_path: Path
+    ) -> None:
+        """One get_external_statuses call covers all five distinct deps in one tick."""
+        harness, session = build_harness(tmp_path)
+
+        # Set up upstream statuses: 3 real, 1 pending, 1 unknown (absent).
+        set_upstream_status(session, '1', 'done')
+        set_upstream_status(session, '2', 'done')
+        set_upstream_status(session, '3', 'pending')
+
+        # Three tasks whose deps collectively span five distinct strings.
+        register_pending_dependent_task(
+            session, 'T1',
+            external_deps=[
+                f'{_UPSTREAM_PROJECT}:1',   # done
+                f'{_UPSTREAM_PROJECT}:2',   # done
+            ],
+        )
+        register_pending_dependent_task(
+            session, 'T2',
+            external_deps=[
+                f'{_UPSTREAM_PROJECT}:3',   # pending
+                f'{_UPSTREAM_PROJECT}:4',   # unknown_task
+            ],
+        )
+        register_pending_dependent_task(
+            session, 'T3',
+            external_deps=[
+                'nope:9',                   # unknown_project
+            ],
+        )
+
+        # Reset counter just before the tick being measured.
+        session.ext_call_count = 0
+
+        await run_tick(harness)
+
+        assert session.ext_call_count == 1, (
+            f'Invariant 5: expected exactly 1 get_external_statuses call per tick; '
+            f'got {session.ext_call_count}'
+        )
