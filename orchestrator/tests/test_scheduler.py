@@ -6497,3 +6497,164 @@ class TestApplyExternalDepPolicyTransientErr:
         assert result is False, (
             'external_resolver_failed=True must block dispatch regardless of cache'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextExternalDepGate (task 1580 — step-11 RED / step-12 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextExternalDepGate:
+    """acquire_next wires the external-dep gate: one batched call, correct dispatch decisions.
+
+    Invariants under test:
+    - 5: exactly ONE get_external_statuses call per tick (union of all pending deps);
+         ZERO calls when no pending task has external deps.
+    - 1: external dep 'done' + local deps done → task IS dispatched.
+    - boundary row 2: external dep 'pending' → not dispatched, no escalation.
+    - boundary row 3: external dep 'cancelled' → not dispatched, callback fires.
+    - boundary row 8: local deps done + external dep 'pending' → not dispatched.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=2)
+        return Scheduler(config)
+
+    def _task(self, tid: str, ext_deps: list[str] | None = None) -> dict:
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'files': ['backend'],
+                **({'external_deps': ext_deps} if ext_deps else {}),
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_external_deps_zero_calls(self, scheduler: Scheduler):
+        """Invariant 5: zero pending tasks with external_deps → zero get_external_statuses calls."""
+        scheduler.get_tasks = AsyncMock(return_value=[self._task('1')])
+        scheduler.get_external_statuses = AsyncMock(return_value=({}, None))
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '1'
+
+        scheduler.get_external_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_batched_call_covering_all_pending_deps(
+        self, scheduler: Scheduler
+    ):
+        """Invariant 5: all external deps across pending tasks batched into ONE call."""
+        task_a = self._task('1', ext_deps=['proj:10'])
+        task_b = self._task('2', ext_deps=['proj:20'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'proj:10': 'done', 'proj:20': 'done'}, None)
+        )
+        scheduler._apply_external_dep_policy = AsyncMock()
+
+        await scheduler.acquire_next()
+
+        # Exactly ONE call with the union of deps (order-independent)
+        scheduler.get_external_statuses.assert_called_once()
+        call_args = scheduler.get_external_statuses.call_args
+        passed_deps = set(call_args.args[0] if call_args.args else call_args.kwargs.get('deps', []))
+        assert passed_deps == {'proj:10', 'proj:20'}, (
+            f'Expected union of all pending task external_deps; got {passed_deps!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_dep_done_task_dispatched(self, scheduler: Scheduler):
+        """Invariant 1: external dep 'done' (and no local deps) → task IS dispatched."""
+        task = self._task('3', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'done'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '3', (
+            f'External dep done → should dispatch; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_dep_pending_not_dispatched_no_callback(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 2: external dep 'pending' → not dispatched, no escalation."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = self._task('4', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'pending'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'External dep pending → must NOT dispatch; got {result!r}'
+        )
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_external_dep_cancelled_not_dispatched_callback_fires(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 3: external dep 'cancelled' → not dispatched, block callback fires."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = self._task('5', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'cancelled'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'External dep cancelled → must NOT dispatch; got {result!r}'
+        )
+        callback.assert_called_once()
+        kwargs = callback.call_args.kwargs
+        assert 'EXTERNAL_DEP_CANCELLED' in kwargs.get('summary', ''), (
+            f'Expected EXTERNAL_DEP_CANCELLED in summary; got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_local_deps_done_external_dep_pending_not_dispatched(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 8: all local deps done but external dep 'pending' → not dispatched."""
+        dep_task = {
+            'id': '10',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task = {
+            'id': '11',
+            'title': 'Task 11',
+            'status': 'pending',
+            'dependencies': ['10'],
+            'metadata': {
+                'files': ['backend'],
+                'external_deps': ['dark_factory:99'],
+            },
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[dep_task, task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:99': 'in-progress'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'Local deps done but external dep in-progress → must NOT dispatch; got {result!r}'
+        )
