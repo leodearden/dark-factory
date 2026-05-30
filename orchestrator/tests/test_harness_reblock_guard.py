@@ -1,17 +1,18 @@
-"""Tests for the rapid-re-block guard: slot-setup failure arms requeue cooldown.
+"""Tests for the rapid-re-block guard: unhandled slot exception arms requeue cooldown.
 
 Regression test for the issue (reify #2928) where a task with all deps satisfied
 was rapid-re-blocked 3 consecutive times in one session, each time with no
 block_reason.  The loop was:
   1. Reconciliation resets task to pending.
-  2. Orchestrator dispatches task → worktree-create race raises inside workflow.run().
+  2. Orchestrator dispatches task → unhandled exception raises inside workflow.run().
   3. except Exception handler in _run_slot returns BLOCKED without arming cooldown.
   4. scheduler.release(requeued=False) → task immediately eligible for re-dispatch.
   5. Back to step 2.
 
-The fix adds a local slot_setup_failed flag set in the except Exception handler
-and ORs it into the requeued argument of the final scheduler.release call,
-arming the existing 30 s requeue_cooldown_secs grace window.
+The fix adds a local arm_requeue_cooldown flag set in the except Exception handler
+(for any unhandled workflow-slot exception, not just slot setup) and ORs it into
+the requeued argument of the final scheduler.release call, arming the existing
+30 s requeue_cooldown_secs grace window.
 """
 from __future__ import annotations
 
@@ -67,13 +68,13 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
 
 
 class _RaisingWorkflow:
-    """Stub whose run() raises RuntimeError — worktree-create-race surrogate."""
+    """Stub whose run() raises RuntimeError — unhandled-workflow-slot-exception surrogate."""
 
     def __init__(self, **kwargs):
         pass
 
     async def run(self):
-        raise RuntimeError('worktree-create race surrogate')
+        raise RuntimeError('unhandled workflow-slot exception surrogate')
 
 
 class _CancelledWorkflow:
@@ -95,11 +96,11 @@ class TestSlotSetupFailureReblockGuard:
     async def test_slot_setup_failure_blocks_immediate_redispatch(
         self, config: OrchestratorConfig, monkeypatch
     ):
-        """A slot-setup failure (RuntimeError from workflow.run) must arm the
-        requeue cooldown so the task cannot be immediately re-dispatched.
+        """Any unhandled workflow-slot exception must arm the requeue cooldown so
+        the task cannot be immediately re-dispatched.
 
         RED on the base branch (no cooldown armed → task immediately re-dispatchable).
-        GREEN after the fix (slot_setup_failed flag ORed into scheduler.release).
+        GREEN after the fix (arm_requeue_cooldown flag ORed into scheduler.release).
         """
         clock = [1000.0]
         scheduler = Scheduler(config, time_source=lambda: clock[0])
@@ -116,7 +117,7 @@ class TestSlotSetupFailureReblockGuard:
 
         result = await harness._run_slot(assignment, sem)
 
-        # _run_slot returns a synthetic BLOCKED report on slot-setup failure.
+        # _run_slot returns a synthetic BLOCKED report on unhandled slot exception.
         assert result is not None
         assert result.outcome == WorkflowOutcome.BLOCKED
 

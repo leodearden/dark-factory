@@ -2328,11 +2328,11 @@ Output JSON matching the schema. Every task must appear in the output.
     ) -> TaskReport | None:
         """Run a single workflow slot."""
         report = None
-        # Set to True in the except Exception handler (slot-setup failure, e.g.
-        # worktree-create race) so the existing requeue cooldown is armed via
-        # scheduler.release, preventing the rapid re-block loop where reconciliation
-        # immediately re-dispatches the task before it can make progress.
-        slot_setup_failed = False
+        # Set to True in the except Exception handler (any unhandled workflow-slot
+        # exception) so the existing requeue cooldown is armed via scheduler.release,
+        # preventing the rapid re-block loop where reconciliation immediately
+        # re-dispatches the task before it can make progress.
+        arm_requeue_cooldown = False
         try:
             logger.info(
                 f'Starting workflow for task {assignment.task_id}: '
@@ -2483,7 +2483,7 @@ Output JSON matching the schema. Every task must appear in the output.
             )
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
-            slot_setup_failed = True  # arm rapid-re-block guard in finally
+            arm_requeue_cooldown = True  # any unhandled slot exception → arm cooldown in finally
             return TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
@@ -2515,10 +2515,10 @@ Output JSON matching the schema. Every task must appear in the output.
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
                     )
-            # slot_setup_failed=True (worktree-create race etc.) arms the existing
-            # requeue_cooldown_secs grace window so a freshly-unblocked task is not
-            # immediately re-dispatched and re-blocked in a tight loop.
-            self.scheduler.release(assignment.task_id, requeued=requeued or slot_setup_failed)
+            # arm_requeue_cooldown=True (any unhandled workflow-slot exception) arms
+            # the existing requeue_cooldown_secs grace window so a freshly-unblocked
+            # task is not immediately re-dispatched and re-blocked in a tight loop.
+            self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
             sem.release()
 
     async def _maybe_auto_eval(
