@@ -873,6 +873,7 @@ class TestUpdateEdge:
         await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='proj')
         service.graphiti.update_edge.assert_called_once_with(
             'e-1', 'new fact', group_id='proj', invalid_at=None,
+            clear_invalid_at=False,
         )
 
     @pytest.mark.asyncio
@@ -887,11 +888,12 @@ class TestUpdateEdge:
         )
         service.graphiti.update_edge.assert_called_once_with(
             'e-1', None, group_id='proj', invalid_at=ts,
+            clear_invalid_at=False,
         )
 
     @pytest.mark.asyncio
     async def test_update_edge_requires_fact_or_invalid_at(self, service):
-        with pytest.raises(ValueError, match='fact or invalid_at'):
+        with pytest.raises(ValueError, match='fact, invalid_at, or clear_invalid_at'):
             await service.update_edge(edge_uuid='e-1', project_id='proj')
 
     @pytest.mark.asyncio
@@ -2106,6 +2108,49 @@ class TestExecuteGraphitiWriteWithDedup:
         assert result is None
         service.graphiti.bulk_remove_edges.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_restore_hook_for_invalidated_dep_edges(self, service):
+        """_execute_graphiti_write invokes the restore hook when add_episode returns
+        an invalidated dependency edge — guards against the hook being accidentally removed.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+        dep_edge = MockEdge(
+            fact='Task 562 depends on Task 557',
+            uuid='dep-edge-1',
+            source_node_uuid='s1',
+            target_node_uuid='t1',
+        )
+        dep_edge.invalid_at = ts  # falsely superseded
+
+        mock_result = MockAddEpisodeResult(edges=[dep_edge])
+        mock_result.entity_edges = []
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'dep-edge-1', 'fact': 'Task 562 depends on Task 557',
+                          'refreshed_nodes': []}
+        )
+
+        payload = {
+            'name': 'ep_restore',
+            'content': 'Task 562 depends on Task 557',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        # The restore hook must have cleared the false invalidation
+        service.graphiti.update_edge.assert_called_once_with(
+            'dep-edge-1', group_id='test', clear_invalid_at=True
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
@@ -2914,4 +2959,249 @@ class TestGetStatusScoping:
         assert result['queue'] == fixed_stats, (
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 9: TRACK B.2 restore hook RED tests
+# ---------------------------------------------------------------------------
+
+class TestRestoreSupersededDependencyEdges:
+    """_restore_superseded_dependency_edges must clear false dependency invalidations."""
+
+    def _make_mock_edge(self, *, uuid, fact, invalid_at=None):
+        edge = MagicMock()
+        edge.uuid = uuid
+        edge.fact = fact
+        edge.invalid_at = invalid_at
+        return edge
+
+    @pytest.mark.asyncio
+    async def test_restores_only_invalidated_dependency_edges(self, service):
+        """Only edges that are (a) invalidated AND (b) dependency facts are restored."""
+        from datetime import UTC, datetime
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        edge_a = self._make_mock_edge(
+            uuid='a', fact='Task 562 depends on Task 557', invalid_at=ts,
+        )
+        edge_b = self._make_mock_edge(
+            uuid='b', fact='Task 562 reached status done', invalid_at=ts,
+        )
+        edge_c = self._make_mock_edge(
+            uuid='c', fact='Task 563 depends on Task 558', invalid_at=None,
+        )
+
+        result = MagicMock()
+        result.edges = [edge_a, edge_b, edge_c]
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'a', 'fact': 'Task 562 depends on Task 557', 'refreshed_nodes': []}
+        )
+
+        count = await service._restore_superseded_dependency_edges(result, group_id='proj')
+        assert count == 1, f'Expected 1 restored edge, got {count}'
+        service.graphiti.update_edge.assert_called_once_with(
+            'a', group_id='proj', clear_invalid_at=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_none_result(self, service):
+        """Returns 0 and makes no calls when result is None."""
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_superseded_dependency_edges(None, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_empty_edges(self, service):
+        """Returns 0 and makes no calls when result.edges is empty."""
+        result = MagicMock()
+        result.edges = []
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_superseded_dependency_edges(result, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 7: TRACK B.2 _is_dependency_fact helper RED tests
+# ---------------------------------------------------------------------------
+
+class TestIsDependencyFact:
+    """Module-level _is_dependency_fact helper matches 'depends on' regardless of case/spacing."""
+
+    def test_canonical_dependency_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 depends on Task 557') is True
+
+    def test_depends_on_case_insensitive(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('X  Depends On  Y') is True
+
+    def test_lowercase_depends_on(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('module a depends on module b') is True
+
+    def test_non_dependency_status_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 reached status done') is False
+
+    def test_non_dependency_owns_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 owns module X') is False
+
+    def test_empty_string(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact(None) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Step 3: TRACK B.1 service clear_invalid_at RED tests
+# ---------------------------------------------------------------------------
+
+class TestUpdateEdgeClearInvalidAt:
+    """Service update_edge must forward clear_invalid_at through to the backend."""
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_forwards_to_backend(self, service):
+        """service.update_edge(clear_invalid_at=True) calls backend with clear_invalid_at=True."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        await service.update_edge(edge_uuid='e-1', project_id='proj', clear_invalid_at=True)
+        service.graphiti.update_edge.assert_called_once_with(
+            'e-1', None, group_id='proj', invalid_at=None, clear_invalid_at=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_result_is_verified_true(self, service):
+        """Clear-only update sets verified=True without calling get_edge_text."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('edge', 'fact'))
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is True, (
+            'clear-only update must be verified=True without a readback'
+        )
+        service.graphiti.get_edge_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_alone_does_not_raise(self, service):
+        """Guard must allow clear_invalid_at=True even when fact and invalid_at are None."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'f', 'refreshed_nodes': []}
+        )
+        # Should NOT raise ValueError
+        await service.update_edge(edge_uuid='e-1', project_id='proj', clear_invalid_at=True)
+
+    @pytest.mark.asyncio
+    async def test_all_none_still_raises(self, service):
+        """ValueError must still be raised when all three (fact/invalid_at/clear_invalid_at) are falsy."""
+        with pytest.raises(ValueError, match='fact, invalid_at, or clear_invalid_at'):
+            await service.update_edge(
+                edge_uuid='e-1', project_id='proj',
+                fact=None, invalid_at=None, clear_invalid_at=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_journal_params_include_clear_invalid_at(self, service):
+        """Journal params dict must include clear_invalid_at when True."""
+        logged_params = {}
+
+        async def fake_journaled_call(**kwargs):
+            logged_params.update(kwargs.get('payload', {}))
+            return {'uuid': 'e-1', 'fact': 'f', 'refreshed_nodes': []}
+
+        service._journaled_backend_call = fake_journaled_call
+        await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert logged_params.get('clear_invalid_at') is True, (
+            f'clear_invalid_at must appear in journal params; got {logged_params}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 1: TRACK B.1 backend clear_invalid_at RED tests
+# ---------------------------------------------------------------------------
+
+class TestGraphitiBackendUpdateEdgeClearInvalidAt:
+    """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
+
+    def _make_backend_and_edge(self, mock_config):
+        """Set up a GraphitiBackend with mock driver/client and a mock edge."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+        mock_driver = MagicMock()
+        mock_cloned_driver = MagicMock()
+        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
+        backend._driver = mock_driver
+        backend.client = MagicMock()
+
+        mock_edge = AsyncMock()
+        mock_edge.source_node_uuid = 'src-uuid'
+        mock_edge.target_node_uuid = 'tgt-uuid'
+        mock_edge.uuid = 'e-1'
+        mock_edge.fact = 'original fact'
+        mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_edge.save = AsyncMock()
+        mock_edge.generate_embedding = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        return backend, mock_edge
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_alone_sets_none(self, mock_config):
+        """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+            assert mock_edge.invalid_at is None, (
+                'clear_invalid_at=True must set edge.invalid_at to None'
+            )
+            mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config):
+        """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
+            assert mock_edge.fact == 'new fact', (
+                'fact must be updated when fact is provided'
+            )
+            assert mock_edge.invalid_at is None, (
+                'invalid_at must be cleared when clear_invalid_at=True'
+            )
+            mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config):
+        """When both invalid_at and clear_invalid_at=True are given, clear wins."""
+        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        ts = datetime(2026, 6, 1, tzinfo=UTC)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge(
+                'e-1', group_id='proj', invalid_at=ts, clear_invalid_at=True
+            )
+            assert mock_edge.invalid_at is None, (
+                'clear_invalid_at=True must take precedence: invalid_at ends up None'
+            )
+            mock_edge.save.assert_awaited_once()
 

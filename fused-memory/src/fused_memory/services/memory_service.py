@@ -47,6 +47,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
+# Used by _restore_superseded_dependency_edges to identify edges that should
+# never be superseded by LLM edge-resolution.
+_DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
+
+
+def _is_dependency_fact(fact: str | None) -> bool:
+    """Return True when *fact* expresses a dependency relationship.
+
+    Uses the canonical ``depends on`` phrasing (case-insensitive, word-boundary
+    anchored) that matches the project's relational verb in classifier.py.
+    """
+    return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
+
 
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
@@ -278,6 +292,81 @@ class MemoryService:
         logger.info('Deduplicating %d edge(s) after add_episode', len(duplicates))
         return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
+    async def _restore_superseded_dependency_edges(
+        self, result: Any, *, group_id: str
+    ) -> int:
+        """Undo false dependency-edge invalidations caused by LLM edge-resolution.
+
+        Graphiti's upstream ``add_episode`` LLM pipeline can falsely supersede
+        existing "X depends on Y" edges when a new dependency fact is added for
+        a hub entity (dependencies are additive, so supersession is wrong for
+        them). This method scans the edges returned in *result* — exactly the
+        edges this episode touched — and clears ``invalid_at`` for any that are
+        both (a) invalidated AND (b) express a dependency fact.
+
+        Modelled on ``_dedup_episode_edges``; handles None / empty result the
+        same way. Legitimate dependency removals flow through
+        ``remove_dependency`` (a different code path) and are unaffected.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with an ``edges`` attribute).
+                    Handles ``None`` and objects with empty/missing edges
+                    gracefully.
+
+        Returns:
+            Number of dependency edges whose invalidation was reversed (0 when
+            nothing to do).
+        """
+        if result is None:
+            return 0
+
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return 0
+
+        restored = 0
+        failed = 0
+        for edge in edges:
+            if getattr(edge, 'invalid_at', None) is None:
+                continue
+            fact = getattr(edge, 'fact', '') or ''
+            if not _is_dependency_fact(fact):
+                continue
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            try:
+                await self.graphiti.update_edge(
+                    edge_uuid, group_id=group_id, clear_invalid_at=True
+                )
+                restored += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write.  Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to restore dependency edge %s; will retry on next episode',
+                    edge_uuid,
+                )
+                failed += 1
+
+        if restored > 0:
+            logger.info(
+                'Restored %d falsely-superseded dependency edge(s) after add_episode',
+                restored,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to restore %d dependency edge(s) after add_episode',
+                failed,
+            )
+        return restored
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -322,6 +411,8 @@ class MemoryService:
         )
         # Post-write dedup: remove duplicate edges created within this episode
         await self._dedup_episode_edges(result, group_id=payload['group_id'])
+        # Post-write restore: undo false dependency-edge supersessions
+        await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
@@ -1240,13 +1331,15 @@ class MemoryService:
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
         invalid_at: datetime | None = None,
+        clear_invalid_at: bool = False,
     ) -> dict:
         """Update an existing Graphiti edge's fact text and/or invalidate it.
 
-        At least one of ``fact`` or ``invalid_at`` must be supplied. Setting
-        ``invalid_at`` to a timestamp marks the edge as superseded as of that
-        moment (used by reconciliation to retire contradicted facts without
-        destroying their audit trail).
+        At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
+        be supplied. Setting ``invalid_at`` marks the edge as superseded as of
+        that moment (used by reconciliation to retire contradicted facts without
+        destroying their audit trail). Setting ``clear_invalid_at=True`` resets
+        ``invalid_at`` to ``None``, restoring the edge to active status.
 
         **Guard-2 verification (TOCTOU note):** when *fact* is supplied, a
         ``get_edge_text`` readback is performed after the save to confirm
@@ -1259,8 +1352,8 @@ class MemoryService:
         practice.  Undercounting ``edges_updated`` (the conservative outcome) is
         safer than overcounting, so the behaviour is intentional.
         """
-        if fact is None and invalid_at is None:
-            raise ValueError('update_edge requires fact or invalid_at to be set')
+        if fact is None and invalid_at is None and not clear_invalid_at:
+            raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
         write_op_id = str(uuid_mod.uuid4())
 
         params: dict[str, Any] = {'edge_uuid': edge_uuid}
@@ -1273,6 +1366,8 @@ class MemoryService:
             params['fact'] = fact[:200]
         if invalid_at is not None:
             params['invalid_at'] = invalid_at.isoformat()
+        if clear_invalid_at:
+            params['clear_invalid_at'] = True
 
         result_data = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -1282,6 +1377,7 @@ class MemoryService:
             payload=params,
             coro=self.graphiti.update_edge(
                 edge_uuid, fact, group_id=project_id, invalid_at=invalid_at,
+                clear_invalid_at=clear_invalid_at,
             ),
         )
         result = {'status': 'updated', 'store': 'graphiti', **result_data}
