@@ -2242,7 +2242,6 @@ class TestFairness:
         and emits both reservation_installed and reservation_evicted events.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2289,7 +2288,6 @@ class TestFairness:
     async def test_park_gc_on_terminal_owner(self):
         """A park owned by a terminal task is reaped on the next tick."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2329,7 +2327,6 @@ class TestFairness:
     async def test_park_gc_on_missing_owner(self):
         """A park whose owner is no longer in the task list is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2360,7 +2357,6 @@ class TestFairness:
     async def test_park_gc_on_deps_unsatisfied(self):
         """A park whose owner has un-satisfied deps is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -2400,7 +2396,6 @@ class TestFairness:
         owner's park between sweep and dispatch.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
@@ -3263,7 +3258,6 @@ class TestPerTierSkipThreshold:
     def _config(self, thresholds: dict[str, int]) -> OrchestratorConfig:
         config = OrchestratorConfig(max_per_module=1)
         config.fairness.skip_threshold = thresholds
-
         return config
 
     def test_skip_threshold_for_lookup(self):
@@ -3848,8 +3842,8 @@ class TestGetStatuses:
         )
 
 
-class TestSchedulerV2Config:
-    """Schema assertions for the v2 scheduler config changes."""
+class TestFairnessConfigSchema:
+    """Schema assertions for FairnessConfig and the scheduler's fairness config."""
 
     def test_scheduler_v2_field_removed(self):
         """scheduler_v2 must no longer exist on FairnessConfig.
@@ -3861,7 +3855,7 @@ class TestSchedulerV2Config:
         )
 
     def test_skip_threshold_is_per_tier_dict(self):
-        """Default skip_threshold is a per-tier dict with the v2 values."""
+        """Default skip_threshold is a per-tier dict."""
         cfg = OrchestratorConfig()
         assert cfg.fairness.skip_threshold == {
             'critical': 0,
