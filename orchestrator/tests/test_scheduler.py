@@ -6164,3 +6164,117 @@ class TestDepsSatisfiedExternalGate:
             scheduler._deps_satisfied(task, status_map, external_status_cache=cache)
             is False
         )
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyCancelled (task 1580 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyCancelled:
+    """_apply_external_dep_policy must fire _on_external_dep_block for cancelled deps.
+
+    PRD invariant 2 / design decision 1: cancelled is STRICT — immediate
+    escalation, no grace period, no counter increment.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dep_fires_callback_once(self, scheduler: Scheduler):
+        """_on_external_dep_block called exactly once when dep is 'cancelled'."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'cancelled'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_called_once()
+        call_kwargs = callback.call_args
+        # First positional arg or 'task_id' kwarg must be '10'
+        args = call_kwargs.args if call_kwargs.args else ()
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == '10', (
+            f'Expected task_id="10"; got {task_id_arg!r}'
+        )
+        # Summary must carry EXTERNAL_DEP_CANCELLED prefix
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'EXTERNAL_DEP_CANCELLED' in str(summary_arg), (
+            f'Expected EXTERNAL_DEP_CANCELLED in summary; got {summary_arg!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dep_does_not_touch_unresolved_counter(
+        self, scheduler: Scheduler
+    ):
+        """Cancelled dep must NOT increment _external_unresolved_counts."""
+        scheduler._on_external_dep_block = AsyncMock()
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'cancelled'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Unresolved counter must remain empty for cancelled; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_done_dep_no_callback(self, scheduler: Scheduler):
+        """Done external dep must NOT invoke callback (satisfied — no action)."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'done'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_dep_no_callback(self, scheduler: Scheduler):
+        """A live (pending/in-progress) dep must wait silently — no callback."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'in-progress'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_not_called()
