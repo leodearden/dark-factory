@@ -1884,7 +1884,10 @@ def create_mcp_server(
             # Parse: split on first colon
             project_id, sep, task_id = dep.partition(':')
             # Look up project_root in registry
-            project_root = _kp.get(project_id)
+            if project_id not in _kp:
+                result[dep] = 'unknown_project'
+                continue
+            project_root = _kp[project_id]
             # Read status from foreign project
             statuses = await task_interceptor.get_statuses(
                 project_root=project_root, ids=[task_id]
