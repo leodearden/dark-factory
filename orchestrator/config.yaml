@@ -43,11 +43,6 @@ escalation:
 max_turns:
   architect: 120
 
-# Scheduler v2 — eager parks, cross-tier preemption, owner-state GC sweep.
-# Burn-in cycle complete; flipping on to exercise the new anti-starvation path.
-fairness:
-  scheduler_v2: true
-
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
 # real spend governor, the orch-level dollar guard just trips during normal
