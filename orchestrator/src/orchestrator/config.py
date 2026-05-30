@@ -637,6 +637,14 @@ class OrchestratorConfig(BaseSettings):
     # call it a loop in the merge phase (the steward resolution between
     # them is the mediation we already gave it a chance to perform).
     max_consecutive_merge_thrash: int = Field(default=2, ge=1)
+    # Cross-project external-dep grace threshold — after N consecutive ticks
+    # where an external dep resolves to an unresolvable sentinel
+    # (unknown_project / unknown_task / malformed), escalate to L1.  Default 3
+    # mirrors max_consecutive_infra_resumes — matches the nearest existing
+    # thrash guard per PRD open question 1.  A named field (rather than reusing
+    # max_consecutive_infra_resumes directly) lets tests set a low threshold
+    # without affecting the infra-resume gate.
+    max_external_dep_unresolved_cycles: int = Field(default=3, ge=1)
     # Verify-loop signature-repetition cap — after N consecutive verify
     # failures whose (category, normalised cause_hint) tuple is identical the
     # loop escalates to L1 (WorkflowOutcome.BLOCKED) instead of burning the
