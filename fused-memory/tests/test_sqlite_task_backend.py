@@ -1144,6 +1144,92 @@ async def test_add_dependency_self_loop_raises(backend, project_root):
         await backend.add_dependency('1', '1', project_root=project_root)
 
 
+# ── add_dependency — qualified (cross-project) happy path ──────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_stored_in_external_deps(backend, project_root):
+    """add_dependency with a qualified dep stores it in metadata.external_deps."""
+    await backend.add_task(project_root=project_root, title='a')
+    result = await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    assert result['id'] == '1'
+    assert result['dependency_id'] == 'dark_factory:13'
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+    assert task['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_idempotent_no_duplicate(backend, project_root):
+    """Adding the same qualified dep twice does not produce duplicates."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_accumulates_multiple(backend, project_root):
+    """Two distinct qualified deps accumulate in external_deps."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13', 'reify:7']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_hyphen_normalized(backend, project_root):
+    """'dark-factory:13' stores canonical 'dark_factory:13'."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark-factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_preserves_sibling_metadata(backend, project_root):
+    """Qualified add_dependency preserves other metadata keys (e.g. memory_hints)."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.update_task('1', project_root, metadata={'sibling_key': 'preserved'})
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+    assert task['metadata']['sibling_key'] == 'preserved'
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_lenient_foreign_target_missing(backend, project_root):
+    """Qualified dep succeeds even when the foreign target does not exist."""
+    await backend.add_task(project_root=project_root, title='a')
+    # 'other_project:999' — foreign target never created; should NOT raise.
+    result = await backend.add_dependency(
+        '1', 'other_project:999', project_root=project_root,
+    )
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['other_project:999']
+
+
+@pytest.mark.asyncio
+async def test_qualified_and_bare_dep_coexist(backend, project_root):
+    """A task can have both an integer dep (dependencies table) and a qualified dep."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('2', project_root)
+    assert task['dependencies'] == [1]
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
 @pytest.mark.asyncio
 async def test_validate_dependencies_reports_dangling(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
