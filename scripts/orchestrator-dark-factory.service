@@ -27,7 +27,7 @@ WorkingDirectory=/home/leo/src/dark-factory
 # Gate startup on fused-memory's MCP port (8002) being live. Pairs with Wants=
 # above: waits cleanly instead of crash-looping while fused-memory comes up.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002
-ExecStart=/home/leo/.local/bin/uv run --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml
+ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml
 
 # PATH replicated from the working manual process so verify subprocesses find
 # cargo / node / npm / sccache. (A systemd user service otherwise gets a

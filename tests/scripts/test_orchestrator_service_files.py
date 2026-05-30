@@ -18,6 +18,7 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
 REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
+AUTOPILOT_SERVICE = REPO_ROOT / "scripts" / "orchestrator-autopilot-video.service"
 WATCHDOG_SERVICE = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
 WATCHDOG_TIMER = REPO_ROOT / "scripts" / "orchestrator-watchdog.timer"
 
@@ -67,9 +68,15 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the df config"
+    ), "ExecStart must invoke the orchestrator with the df config, frozen"
+    # --frozen: process start must NEVER implicitly re-sync the shared
+    # dark-factory/.venv (the 2026-05-29 ghost-venv fix — a frozen start fails
+    # fast instead of bootstrapping/mutating the runtime interpreter).
+    assert "uv run --frozen" in content, (
+        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
+    )
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -129,9 +136,14 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the reify config"
+    ), "ExecStart must invoke the orchestrator with the reify config, frozen"
+    # --frozen: see the df structure test — unit start must never re-sync the
+    # shared dark-factory/.venv that the reify orchestrator also runs under.
+    assert "uv run --frozen" in content, (
+        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
+    )
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -187,6 +199,78 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         "(only Description and --config path should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
+
+
+# ---------------------------------------------------------------------------
+# orchestrator-autopilot-video.service
+# ---------------------------------------------------------------------------
+
+
+def test_autopilot_video_service_exists_and_structure() -> None:
+    """scripts/orchestrator-autopilot-video.service must exist with the right shape.
+
+    Until the 2026-05-29 venv-isolation fix this unit was live in
+    ~/.config/systemd/user/ but had NO source template in scripts/ — so
+    setup-host.sh would never reinstall it and it could not pick up --frozen.
+    This test guards the now-tracked template going forward.
+    """
+    assert AUTOPILOT_SERVICE.exists(), (
+        "scripts/orchestrator-autopilot-video.service must exist as a tracked "
+        "template (it was previously installed but untracked)"
+    )
+    content = AUTOPILOT_SERVICE.read_text(encoding="utf-8")
+
+    # --- sections ---
+    assert "[Unit]" in content
+    assert "[Service]" in content
+    assert "[Install]" in content
+
+    # --- [Unit] ---
+    assert "Description=Autopilot Video Orchestrator" in content
+    after_line = next(
+        (ln for ln in content.splitlines() if ln.startswith("After=")), None
+    )
+    assert after_line is not None, "After= line not found"
+    assert "network.target" in after_line
+    assert "fused-memory.service" in after_line
+    assert "Wants=fused-memory.service" in content
+    assert "Requires=fused-memory.service" not in content
+
+    # --- [Service] ---
+    assert "Type=simple" in content
+    # CWD must be dark-factory like the other two (uv --project resolves the
+    # orchestrator/ subdir relative to cwd); the target is selected via --config.
+    assert "WorkingDirectory=/home/leo/src/dark-factory" in content
+    assert (
+        "ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:8002"
+        in content
+    )
+    assert (
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/orchestrator-config.yaml"
+        in content
+    ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
+    assert "uv run --frozen" in content
+    assert "Restart=on-failure" in content
+    assert "StartLimitIntervalSec=600" in content
+    assert "StartLimitBurst=10" in content
+    assert "TimeoutStopSec=90" in content
+    assert "TimeoutStartSec=300" in content
+    assert "StandardOutput=journal" in content
+    assert "StandardError=journal" in content
+
+    # --- [Install] ---
+    assert "WantedBy=default.target" in content
+
+
+def test_autopilot_video_start_limit_directives_under_unit_section() -> None:
+    """StartLimit directives must be under [Unit], not [Service] (systemd >=230)."""
+    sections = _parse_sections(AUTOPILOT_SERVICE.read_text(encoding="utf-8"))
+    unit_text = "\n".join(sections.get("Unit", []))
+    service_text = "\n".join(sections.get("Service", []))
+    assert "StartLimitIntervalSec=600" in unit_text
+    assert "StartLimitBurst=10" in unit_text
+    assert "StartLimitIntervalSec" not in service_text
+    assert "StartLimitBurst" not in service_text
 
 
 # ---------------------------------------------------------------------------

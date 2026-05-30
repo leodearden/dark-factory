@@ -1125,6 +1125,80 @@ async def _kill_cgroup_scope(unit: str) -> None:
                 await asyncio.wait_for(p.wait(), 10)
 
 
+# Environment variables that activate a *specific* Python virtualenv / uv
+# project.  The orchestrator runs under `uv run --project orchestrator`, which
+# activates dark-factory/.venv and exports these into our process env.  If they
+# leak into a TARGET project's verify/build/test subprocess, the target's `uv`
+# resolves THIS venv instead of its own and a target `uv sync` writes the
+# target's deps into the orchestrator's runtime interpreter — the 2026-05-29
+# ghost-venv incident (autopilot-video's torch/insightface stack got synced into
+# dark-factory/.venv, flipping it 3.13->3.12 and deleting the live interpreter's
+# stdlib out from under the running orchestrator, which then hit FileNotFoundError
+# every scheduler cycle and stopped dispatching).
+#
+# Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
+# of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
+# FIFO, ...); an allowlist would silently break Rust verify the first time a new
+# var is needed.  We remove ONLY the python-env-selection vars that cause the
+# leak and pass everything else through untouched.
+_VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
+    'VIRTUAL_ENV',
+    'UV_PROJECT_ENVIRONMENT',
+    'UV_PROJECT',
+    'UV_ACTIVE',
+    # Fix 3 may run the orchestrator unit with --frozen; UV_FROZEN / UV_NO_SYNC
+    # must NOT leak to a target, which has to stay free to sync its own deps.
+    'UV_FROZEN',
+    'UV_NO_SYNC',
+    'CONDA_PREFIX',
+    'CONDA_DEFAULT_ENV',
+    'PYTHONHOME',
+})
+
+
+def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
+    """Drop the active venv's ``bin`` directory from a PATH string.
+
+    ``uv run`` prepends ``$VIRTUAL_ENV/bin`` to PATH in the orchestrator
+    process, so removing ``VIRTUAL_ENV`` alone is insufficient: the venv's bin
+    dir is still first on PATH and a target's bare ``python`` / ``uv`` / ``pip``
+    would still resolve into the orchestrator venv.  Remove exactly that one
+    component (matched as ``<venv>/bin`` via normpath); every other PATH entry
+    (cargo, sccache, system bins) keeps its order.  Returns *path* unchanged
+    when *path* or *venv* is falsy.
+    """
+    if not path or not venv:
+        return path
+    venv_bin = os.path.normpath(os.path.join(venv, 'bin'))
+    kept = [
+        p for p in path.split(os.pathsep)
+        if p and os.path.normpath(p) != venv_bin
+    ]
+    return os.pathsep.join(kept)
+
+
+def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
+    """Build the subprocess env for a TARGET project's verify/build/test spawn.
+
+    Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
+    vars (``_VENV_ISOLATION_KEYS``) and minus the venv ``bin`` dir on PATH, so
+    the target's toolchain resolves the target's OWN .venv.  Then injects
+    ``PYTHONUNBUFFERED=1`` (the partial-log invariant — see ``_run_cmd``) and
+    finally overlays *extra* (the caller's ``_resolve_verify_env`` result:
+    ``DF_VERIFY_ROLE`` plus reify's ``RUSTC_WRAPPER`` / ``CARGO_*`` / jobserver
+    vars) LAST, so target-supplied vars always win.
+    """
+    venv = os.environ.get('VIRTUAL_ENV')
+    env = {k: v for k, v in os.environ.items() if k not in _VENV_ISOLATION_KEYS}
+    stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
+    if stripped_path is not None:
+        env['PATH'] = stripped_path
+    env['PYTHONUNBUFFERED'] = '1'
+    if extra:
+        env.update(extra)
+    return env
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -1166,9 +1240,13 @@ async def _run_cmd(
     # progress dots stay in stdio buffers and never reach our streaming loop,
     # so a hanging subprocess produces an opaque ``Command timed out after …``
     # cause hint with no actionable signal.
-    subprocess_env: dict[str, str] = {**os.environ, 'PYTHONUNBUFFERED': '1'}
-    if env:
-        subprocess_env.update(env)
+    # Build the target subprocess env via the venv-isolation scrub so the
+    # TARGET's `uv` resolves the TARGET's .venv, never dark-factory/.venv (the
+    # 2026-05-29 ghost-venv coupling).  The scrub strips the orchestrator's
+    # venv/uv activation vars + the venv bin dir from PATH, sets
+    # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
+    # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
+    subprocess_env: dict[str, str] = _target_subprocess_env(env)
 
     proc = None
     pgid: int | None = None
