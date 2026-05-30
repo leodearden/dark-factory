@@ -10,9 +10,11 @@ import pytest
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     _attempts_from_review_summary,
+    _build_task_row,
     _minutes_since,
     collect_active_tasks,
     collect_done_counts,
+    collect_tasks_with_counts,
 )
 
 # ---------------------------------------------------------------------------
@@ -541,3 +543,110 @@ async def test_collect_done_counts_all_done_zero(tmp_path, monkeypatch, dummy_cl
     counts = await collect_done_counts(client=dummy_client, config=cfg)
 
     assert counts == {'empty-project': 0}
+
+
+# ---------------------------------------------------------------------------
+# external_deps field on task rows (step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+def test_build_task_row_external_deps_from_metadata():
+    """_build_task_row carries external_deps as [{'id','status':'unknown'}] per entry."""
+    task = {
+        'id': 42,
+        'title': 'cross-project waiter',
+        'description': '',
+        'details': '',
+        'status': 'pending',
+        'metadata': {'external_deps': ['dark_factory:13', 'reify:8']},
+    }
+    row = _build_task_row('myproject', task, 42, {}, 'myproject/T-42')
+    assert row['external_deps'] == [
+        {'id': 'dark_factory:13', 'status': 'unknown'},
+        {'id': 'reify:8', 'status': 'unknown'},
+    ]
+
+
+def test_build_task_row_external_deps_empty_when_absent():
+    """_build_task_row yields external_deps=[] when metadata.external_deps is absent."""
+    task = {'id': 1, 'title': 'no ext', 'status': 'pending', 'metadata': {}}
+    row = _build_task_row('myproject', task, 1, {}, 'myproject/T-1')
+    assert row['external_deps'] == []
+
+
+def test_build_task_row_external_deps_empty_when_non_list():
+    """_build_task_row yields external_deps=[] when metadata.external_deps is not a list."""
+    for bad_value in [None, 'foo:1', 123, {'a': 'b'}]:
+        task = {'id': 1, 'title': 'bad', 'status': 'pending',
+                'metadata': {'external_deps': bad_value}}
+        row = _build_task_row('p', task, 1, {}, 'p/T-1')
+        assert row['external_deps'] == [], (
+            f'expected [] for external_deps={bad_value!r}'
+        )
+
+
+def test_build_task_row_external_deps_ignores_non_str_and_empty():
+    """_build_task_row ignores empty strings and non-str items in external_deps."""
+    task = {'id': 1, 'title': 'x', 'status': 'pending',
+            'metadata': {'external_deps': ['', 'dark_factory:13', '', None, 42]}}
+    row = _build_task_row('p', task, 1, {}, 'p/T-1')
+    assert row['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """A task carrying metadata.external_deps surfaces external_deps with 'unknown' sentinels."""
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='xdeps',
+        tasks=[
+            {
+                'id': 5,
+                'title': 'waits on upstream',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['dark_factory:13', 'reify:8']},
+            },
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    assert row['external_deps'] == [
+        {'id': 'dark_factory:13', 'status': 'unknown'},
+        {'id': 'reify:8', 'status': 'unknown'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_external_deps_empty_when_absent(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Tasks without external_deps carry external_deps=[] (no KeyError)."""
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='nodeps',
+        tasks=[
+            {'id': 1, 'title': 'plain task', 'status': 'pending',
+             'dependencies': [], 'metadata': {}},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    assert active[0]['external_deps'] == []
