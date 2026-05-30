@@ -108,12 +108,20 @@ def _build_task_row(
     active rows add ``started`` (minutes) and ``deps``; done rows add
     ``started: 0``, ``deps: []``, and ``completed`` (ISO timestamp or '').
     """
-    meta_files = list((task.get('metadata') or {}).get('files') or [])
-    train_meta = (task.get('metadata') or {}).get('train')
+    metadata = task.get('metadata') or {}
+    meta_files = list(metadata.get('files') or [])
+    train_meta = metadata.get('train')
     train = (
         {'id': train_meta['id'], 'order': train_meta.get('order', 0)}
         if isinstance(train_meta, dict) and train_meta.get('id')
         else None
+    )
+    raw_ext = metadata.get('external_deps')
+    external_deps = (
+        [{'id': dep, 'status': 'unknown'}
+         for dep in raw_ext
+         if isinstance(dep, str) and dep]
+        if isinstance(raw_ext, list) else []
     )
     return {
         'id': uid,
@@ -127,6 +135,7 @@ def _build_task_row(
         'attempts': _attempts_from_review_summary(wt.get('review_summary') or ''),
         'meta_files': meta_files,
         'train': train,
+        'external_deps': external_deps,
     }
 
 
