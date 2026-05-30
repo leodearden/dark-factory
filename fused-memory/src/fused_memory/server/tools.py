@@ -2590,9 +2590,28 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Add a dependency between tasks.
 
+        ``depends_on`` accepts two forms:
+
+        - **Bare integer** (e.g. ``"5"``): records the dependency in the integer
+          ``dependencies`` table — the original behavior.
+        - **Qualified** (e.g. ``"dark_factory:13"``): records the dependency in
+          the dependent task's ``metadata.external_deps`` list via an append-safe
+          merge.  ``'-'`` in the project_id is normalised to ``'_'``.  The
+          foreign target is **not** verified at write time (lenient); it may be
+          filed later or live in another project.
+
+        The qualified form is **not** a ``tkt_``-prefixed ticket id and is
+        therefore not rejected by the ticket-id guard.
+
+        Self-loops (same project + same task id) and malformed qualified strings
+        raise ``TaskmasterError`` and surface as
+        ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
+
         Args:
             id: Task ID that will depend on another
-            depends_on: Task ID that becomes a dependency
+            depends_on: Task ID that becomes a dependency.  Either a bare integer
+                string (``"5"``) or a qualified cross-project reference
+                (``"project_id:task_id"``).
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
@@ -2624,11 +2643,22 @@ def create_mcp_server(
         project_root: str,
         tag: str | None = None,
     ) -> dict[str, Any]:
-        """Remove a dependency between tasks.
+        """Remove a dependency from a task.
+
+        ``depends_on`` accepts two forms:
+
+        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
+          from the integer ``dependencies`` table — the original behavior.
+        - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
+          entry from the dependent task's ``metadata.external_deps`` list.
+          ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —
+          no error if the entry is absent.
 
         Args:
             id: Task ID to remove dependency from
-            depends_on: Dependency task ID to remove
+            depends_on: Dependency to remove.  Either a bare integer string
+                (``"5"``) or a qualified cross-project reference
+                (``"project_id:task_id"``).
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """

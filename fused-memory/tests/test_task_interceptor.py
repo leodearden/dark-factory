@@ -6351,3 +6351,51 @@ async def test_single_completion_reconcile_gets_correct_task_before(
         )
 
 
+
+# ── Qualified dep seam tests ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_interceptor_add_dependency_forwards_qualified_verbatim(
+    interceptor, taskmaster, event_buffer,
+):
+    """Qualified depends_on string is forwarded verbatim to tm.add_dependency
+    and a task_modified event is emitted.
+    """
+    taskmaster.add_dependency = AsyncMock(
+        return_value={'id': '1', 'dependency_id': 'dark_factory:13', 'message': 'ok'},
+    )
+    await interceptor.add_dependency('1', 'dark_factory:13', '/project')
+
+    taskmaster.add_dependency.assert_awaited_once()
+    _, kwargs = taskmaster.add_dependency.call_args
+    assert kwargs.get('depends_on') == 'dark_factory:13' or (
+        len(taskmaster.add_dependency.call_args.args) >= 2
+        and taskmaster.add_dependency.call_args.args[1] == 'dark_factory:13'
+    )
+
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_interceptor_remove_dependency_forwards_qualified_verbatim(
+    interceptor, taskmaster, event_buffer,
+):
+    """Qualified depends_on string is forwarded verbatim to tm.remove_dependency
+    and a task_modified event is emitted.
+    """
+    taskmaster.remove_dependency = AsyncMock(
+        return_value={'id': '1', 'dependency_id': 'dark_factory:13', 'message': 'ok'},
+    )
+    await interceptor.remove_dependency('1', 'dark_factory:13', '/project')
+
+    taskmaster.remove_dependency.assert_awaited_once()
+    _, kwargs = taskmaster.remove_dependency.call_args
+    assert kwargs.get('depends_on') == 'dark_factory:13' or (
+        len(taskmaster.remove_dependency.call_args.args) >= 2
+        and taskmaster.remove_dependency.call_args.args[1] == 'dark_factory:13'
+    )
+
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 1

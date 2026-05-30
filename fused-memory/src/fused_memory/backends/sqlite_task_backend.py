@@ -34,6 +34,7 @@ from fused_memory.backends.task_backend_types import (
     ValidateDependenciesResult,
 )
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,48 @@ def _parse_task_id(raw: str | int) -> tuple[int, int | None]:
         raise TaskmasterError(
             'INVALID_TASK_ID', f'non-numeric task id: {raw!r}',
         ) from exc
+
+
+def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
+    """Parse a cross-project dependency string of the form ``"project_id:task_id"``.
+
+    Assumes the caller has already detected that ``':'`` is present.
+    Strips whitespace, normalises ``'-'`` to ``'_'`` in the project_id portion,
+    and rejects any malformed input with a ``TaskmasterError`` whose code is
+    ``TASKMASTER_TOOL_ERROR``.
+
+    Returns:
+        ``(normalized_project_id, dep_int)`` where ``dep_int > 0``.
+
+    Raises:
+        :class:`TaskmasterError` with ``TASKMASTER_TOOL_ERROR`` on any of:
+        empty project_id, empty task_id, extra colons, non-numeric task_id,
+        dotted (subtask) task_id, or non-positive task_id.
+    """
+    _MALFORMED = (
+        'TASKMASTER_TOOL_ERROR',
+        f'add_dependency: malformed cross-project dependency {depends_on!r};'
+        ' expected "project_id:task_id"',
+    )
+    parts = depends_on.split(':')
+    if len(parts) != 2:
+        raise TaskmasterError(*_MALFORMED)
+    raw_pid, raw_tid = parts[0].strip(), parts[1].strip()
+    if not raw_pid:
+        raise TaskmasterError(*_MALFORMED)
+    if not raw_tid:
+        raise TaskmasterError(*_MALFORMED)
+    # Reject dotted subtask ids (e.g. "5.1") and non-numeric ids.
+    if '.' in raw_tid or not raw_tid.lstrip('-').isdigit():
+        raise TaskmasterError(*_MALFORMED)
+    try:
+        dep_int = int(raw_tid)
+    except ValueError as err:
+        raise TaskmasterError(*_MALFORMED) from err
+    if dep_int <= 0:
+        raise TaskmasterError(*_MALFORMED)
+    norm_pid = raw_pid.lower().replace('-', '_')
+    return norm_pid, dep_int
 
 
 def _format_task_id(task_id: int, parent_id: int | None) -> str:
@@ -1024,8 +1067,68 @@ class SqliteTaskBackend:
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult:
+        """Add a dependency to a task.
+
+        ``depends_on`` accepts two forms:
+
+        * **Bare integer** (e.g. ``"3"``): the traditional integer-table path.
+          Both the dependent task and the target must exist in this project.
+        * **Qualified** (e.g. ``"dark_factory:13"``): cross-project dependency
+          stored in the dependent task's ``metadata.external_deps`` list.
+          The foreign target is **not** verified at write time (lenient write —
+          the target may be filed later or live in another project).
+          ``'-'`` in the project_id portion is normalised to ``'_'`` before
+          storing.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
+
+        # ── Qualified (cross-project) path ─────────────────────────────────
+        if ':' in str(depends_on):
+            tid, parent_id = _parse_task_id(task_id)
+            if parent_id is not None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'add_dependency: subtask dependencies are not supported',
+                )
+            norm_pid, dep_int = _parse_qualified_dep(depends_on)
+            canonical = f'{norm_pid}:{dep_int}'
+
+            # Self-check: reject when both project_id and task_id match this task.
+            if norm_pid == resolve_project_id(project_root) and dep_int == tid:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'add_dependency: task cannot depend on itself',
+                )
+
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise TaskmasterError(
+                        'TASKMASTER_TOOL_ERROR',
+                        f'No tasks found for ID(s): {tid}',
+                    )
+                new_meta = _merge_metadata(
+                    row['metadata'],
+                    json.dumps({'external_deps': [canonical]}),
+                    append=True,
+                )
+                await conn.execute(
+                    'UPDATE tasks SET metadata = ?, updated_at = ? '
+                    'WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (new_meta, _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+            return {
+                'id': str(tid),
+                'dependency_id': canonical,
+                'message': f'Added external dependency: {tid} now depends on {canonical}',
+            }
+
+        # ── Bare-integer (same-project) path ───────────────────────────────
         tid, parent_id = _parse_task_id(task_id)
         dep_tid, dep_parent_id = _parse_task_id(depends_on)
         if parent_id is not None or dep_parent_id is not None:
@@ -1072,8 +1175,58 @@ class SqliteTaskBackend:
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult:
+        """Remove a dependency from a task.
+
+        ``depends_on`` accepts two forms:
+
+        * **Bare integer** (e.g. ``"3"``): deletes from the integer dependencies
+          table. Idempotent — no error if the dependency is absent.
+        * **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical entry
+          from ``metadata.external_deps`` via an atomic read-modify-write inside
+          the backend's ``_txn``. Idempotent — no error if the row or dep is absent.
+          ``'-'`` in the project_id portion is normalised to ``'_'``.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
+
+        # ── Qualified (cross-project) path ─────────────────────────────────
+        if ':' in str(depends_on):
+            norm_pid, dep_int = _parse_qualified_dep(depends_on)
+            canonical = f'{norm_pid}:{dep_int}'
+            tid, parent_id = _parse_task_id(task_id)
+            if parent_id is not None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'remove_dependency: subtask dependencies are not supported',
+                )
+
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    try:
+                        meta = json.loads(row['metadata'] or '{}')
+                    except (TypeError, ValueError):
+                        meta = {}
+                    existing = meta.get('external_deps', [])
+                    if canonical in existing:
+                        updated = [e for e in existing if e != canonical]
+                        meta['external_deps'] = updated
+                        await conn.execute(
+                            'UPDATE tasks SET metadata = ?, updated_at = ? '
+                            'WHERE tag = ? AND id = ? AND parent_id = ?',
+                            (json.dumps(meta), _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                        )
+            return {
+                'id': str(tid),
+                'dependency_id': canonical,
+                'message': f'Removed external dependency: {tid} no longer depends on {canonical}',
+            }
+
+        # ── Bare-integer (same-project) path ───────────────────────────────
         tid, _ = _parse_task_id(task_id)
         dep_tid, _ = _parse_task_id(depends_on)
         async with self._write_lock(project_root), self._txn(project_root) as conn:

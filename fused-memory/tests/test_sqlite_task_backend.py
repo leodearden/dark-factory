@@ -16,6 +16,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _format_task_id,
     _merge_metadata,
     _normalize_legacy_memory_hints_value,
+    _parse_qualified_dep,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -76,6 +77,43 @@ def test_parse_task_id_rejects_malformed(raw):
 def test_format_task_id_round_trips():
     assert _format_task_id(7, None) == '7'
     assert _format_task_id(2, 7) == '7.2'
+
+
+# ── _parse_qualified_dep ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    'raw,expected_pid,expected_id',
+    [
+        ('dark_factory:13', 'dark_factory', 13),
+        ('dark-factory:13', 'dark_factory', 13),   # hyphen normalized
+        (' dark_factory : 13 ', 'dark_factory', 13),  # whitespace stripped
+        ('DARK_FACTORY:13', 'dark_factory', 13),    # uppercase lowercased
+        ('Dark-Factory:13', 'dark_factory', 13),    # mixed case + hyphen both normalized
+    ],
+)
+def test_parse_qualified_dep_accepts_valid(raw, expected_pid, expected_id):
+    pid, dep_id = _parse_qualified_dep(raw)
+    assert pid == expected_pid
+    assert dep_id == expected_id
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        ':13',               # empty project_id
+        'dark_factory:',     # empty task_id
+        'dark_factory:abc',  # non-numeric task_id
+        'a:b:c',             # extra colon
+        'dark_factory:5.1',  # dotted/subtask id
+        'dark_factory:0',    # non-positive (zero)
+        'dark_factory:-1',   # non-positive (negative)
+    ],
+)
+def test_parse_qualified_dep_rejects_malformed(raw):
+    with pytest.raises(TaskmasterError) as exc:
+        _parse_qualified_dep(raw)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────
@@ -1106,6 +1144,214 @@ async def test_add_dependency_self_loop_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
     with pytest.raises(TaskmasterError):
         await backend.add_dependency('1', '1', project_root=project_root)
+
+
+# ── add_dependency — qualified (cross-project) happy path ──────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_stored_in_external_deps(backend, project_root):
+    """add_dependency with a qualified dep stores it in metadata.external_deps."""
+    await backend.add_task(project_root=project_root, title='a')
+    result = await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    assert result['id'] == '1'
+    assert result['dependency_id'] == 'dark_factory:13'
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+    assert task['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_idempotent_no_duplicate(backend, project_root):
+    """Adding the same qualified dep twice does not produce duplicates."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_accumulates_multiple(backend, project_root):
+    """Two distinct qualified deps accumulate in external_deps."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13', 'reify:7']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_hyphen_normalized(backend, project_root):
+    """'dark-factory:13' stores canonical 'dark_factory:13'."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark-factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_preserves_sibling_metadata(backend, project_root):
+    """Qualified add_dependency preserves other metadata keys (e.g. memory_hints)."""
+    import json as _json
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.update_task('1', project_root, metadata=_json.dumps({'sibling_key': 'preserved'}))
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+    assert task['metadata']['sibling_key'] == 'preserved'
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_lenient_foreign_target_missing(backend, project_root):
+    """Qualified dep succeeds even when the foreign target does not exist."""
+    await backend.add_task(project_root=project_root, title='a')
+    # 'other_project:999' — foreign target never created; should NOT raise.
+    await backend.add_dependency(
+        '1', 'other_project:999', project_root=project_root,
+    )
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['other_project:999']
+
+
+@pytest.mark.asyncio
+async def test_qualified_and_bare_dep_coexist(backend, project_root):
+    """A task can have both an integer dep (dependencies table) and a qualified dep."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('2', project_root)
+    assert task['dependencies'] == [1]
+    assert task['metadata']['external_deps'] == ['dark_factory:13']
+
+
+# ── add_dependency — qualified rejection tests ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_self_raises(backend, project_root):
+    """Qualified dep that points to itself (same project + same id) raises TaskmasterError."""
+    from fused_memory.models.scope import resolve_project_id
+    await backend.add_task(project_root=project_root, title='a')
+    self_dep = f'{resolve_project_id(project_root)}:1'
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1', self_dep, project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'cannot depend on itself' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_nonexistent_dependent_raises(backend, project_root):
+    """Qualified dep where the dependent task (the 'id') does not exist raises TaskmasterError."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('999', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_qualified_dep_self_raises_mixed_case(backend, project_root):
+    """Self-loop detection is case-insensitive: DARK_FACTORY:1 still rejected for task 1."""
+    from fused_memory.models.scope import resolve_project_id
+    await backend.add_task(project_root=project_root, title='a')
+    # Upper-cased project_id canonicalizes to same as resolve_project_id output.
+    self_dep = f'{resolve_project_id(project_root).upper()}:1'
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1', self_dep, project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'cannot depend on itself' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_qualified_add_dep_subtask_dependent_raises(backend, project_root):
+    """Qualified add_dependency with a dotted (subtask) task_id raises TaskmasterError."""
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1.1', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'subtask dependencies are not supported' in str(exc.value)
+
+
+# ── remove_dependency — qualified (cross-project) tests ────────────
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_removes_one_leaves_other(backend, project_root):
+    """remove_dependency with a qualified dep removes only that entry."""
+    import json as _json
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+    # Also set a sibling key to verify it survives.
+    sibling_meta = _json.dumps({'extra': 'keep'})
+    await backend.update_task('1', project_root, metadata=sibling_meta, append=True)
+
+    await backend.remove_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['reify:7']
+    assert task['metadata']['extra'] == 'keep'
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_hyphen_normalized(backend, project_root):
+    """Hyphen form 'dark-factory:13' removes the canonical 'dark_factory:13'."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
+
+    await backend.remove_dependency('1', 'dark-factory:13', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata'].get('external_deps', []) == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_idempotent_absent(backend, project_root):
+    """Removing an absent qualified dep is a no-op (no error)."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_dependency('1', 'reify:7', project_root=project_root)
+
+    # 'nope:1' was never added — should not raise.
+    await backend.remove_dependency('1', 'nope:1', project_root=project_root)
+
+    task = await backend.get_task('1', project_root)
+    assert task['metadata']['external_deps'] == ['reify:7']
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_integer_table_unaffected(backend, project_root):
+    """Qualified remove_dependency does not touch the integer dependencies table."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    await backend.remove_dependency('2', 'dark_factory:13', project_root=project_root)
+
+    task = await backend.get_task('2', project_root)
+    assert task['dependencies'] == [1]
+    assert task['metadata'].get('external_deps', []) == []
+
+
+@pytest.mark.asyncio
+async def test_qualified_remove_dep_subtask_dependent_raises(backend, project_root):
+    """Qualified remove_dependency with a dotted (subtask) task_id raises TaskmasterError."""
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.remove_dependency('1.1', 'dark_factory:13', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'subtask dependencies are not supported' in str(exc.value)
 
 
 @pytest.mark.asyncio
