@@ -38,7 +38,7 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
-from dashboard.data.tasks import fetch_statuses, fetch_tasks
+from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
 
@@ -235,6 +235,7 @@ async def collect_tasks_with_counts(
     config: DashboardConfig,
     *,
     max_done_per_project: int = 0,
+    resolve_external: bool = False,
 ) -> tuple[list[dict], list[str], dict[str, int]]:
     """Aggregate active tasks and per-project done counts in a single MCP pass.
 
@@ -243,6 +244,13 @@ async def collect_tasks_with_counts(
     - *active_tasks* is the list of active (and optionally bounded done) rows
     - *offline_projects* lists project labels whose MCP fetch failed
     - *done_counts* maps project label → total done task count (pre-cap)
+
+    When *resolve_external* is ``True``, gathers the deduped union of every
+    row's ``external_deps`` ids, issues **one** batched
+    ``fetch_external_statuses`` call (skipped when the union is empty), and
+    overwrites each entry's status.  Deps absent from the map keep the honest
+    ``'unknown'`` sentinel.  Defaults to ``False`` so the scheduler-page path
+    (``collect_active_tasks``) issues no extra MCP round-trip.
 
     Prefer this over calling ``collect_active_tasks`` and
     ``collect_done_counts`` concurrently: it halves per-project MCP
@@ -262,6 +270,21 @@ async def collect_tasks_with_counts(
         else:
             done_counts[label] = done_count
         all_active.extend(active)
+
+    if resolve_external:
+        # Gather the deduped union of all external dep ids.
+        dep_ids: set[str] = set()
+        for row in all_active:
+            for entry in row.get('external_deps') or []:
+                dep_ids.add(entry['id'])
+        if dep_ids:
+            status_map = await fetch_external_statuses(
+                client, config, sorted(dep_ids),
+            )
+            for row in all_active:
+                for entry in row.get('external_deps') or []:
+                    entry['status'] = status_map.get(entry['id'], 'unknown')
+
     return all_active, offline_projects, done_counts
 
 
