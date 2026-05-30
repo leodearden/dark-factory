@@ -83,6 +83,7 @@ _PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish
 # orchestrator/src/orchestrator/overrides.py:258.
 _VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
 
+
 async def _open_overrides_db(
     project_root: str,
     *,
@@ -1063,7 +1064,7 @@ def create_mcp_server(
         if clear_invalid_at and parsed_invalid_at is not None:
             return {
                 'error': 'clear_invalid_at and invalid_at are mutually exclusive: '
-                         'cannot set and clear invalid_at in the same call',
+                'cannot set and clear invalid_at in the same call',
                 'error_type': 'ValidationError',
             }
         if normalised_fact is None and parsed_invalid_at is None and not clear_invalid_at:
@@ -1861,6 +1862,82 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_external_statuses(deps: list[str]) -> dict[str, str]:
+        """Return cross-project task statuses keyed by the verbatim dep string.
+
+        Each dep is a ``"<project_id>:<task_id>"`` string.  For each dep the
+        tool normalises the project_id, looks it up in the known-projects
+        registry, reads the foreign project's top-level task status via
+        ``task_interceptor.get_statuses``, and returns the result keyed by the
+        **original** verbatim dep string.
+
+        Possible values per key:
+        - A real task status (e.g. ``"done"``, ``"pending"``)
+        - ``"unknown_project"`` — project_id not in the registry
+        - ``"unknown_task"``    — project known, but no top-level task with that id
+        - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
+
+        Read-only: no reconciliation, no event emission, no task mutation.
+        Registry/DB unavailability raises (transient) — NOT mapped to a sentinel.
+        """
+        result: dict[str, str] = {}
+        # Collect well-formed, known-project deps grouped by normalised project_id
+        # so we can issue ONE get_statuses call per distinct foreign project.
+        # Maps norm_project_id → list of (verbatim_dep, task_id) tuples.
+        project_batches: dict[str, list[tuple[str, str]]] = {}
+
+        for dep in deps:
+            # Parse: split on first colon
+            project_id, sep, task_id = dep.partition(':')
+            # Validate: malformed if no colon, empty project_id, empty task_id,
+            # or task_id not a plain non-negative integer (rejects dotted subtask
+            # forms like "15.2", signs, non-numerics — mirrors add_dependency's
+            # subtask rejection).
+            if not sep or not project_id or not task_id or not task_id.isdigit():
+                result[dep] = 'malformed'
+                continue
+            # Normalise project_id: lowercase + hyphen→underscore, mirroring
+            # models/scope.py:resolve_project_id so 'dark-factory' == 'dark_factory'.
+            # Registry lookup uses the normalised form; result is keyed by the
+            # original verbatim dep string.
+            norm_project_id = project_id.lower().replace('-', '_')
+            # Look up project_root in registry
+            if norm_project_id not in _kp:
+                result[dep] = 'unknown_project'
+                continue
+            project_batches.setdefault(norm_project_id, []).append((dep, task_id))
+
+        # Issue ONE get_statuses call per distinct foreign project (minimises reads).
+        # Intentionally NOT wrapped in try/except — transient errors (DB/registry
+        # unavailability) must propagate as exceptions, not be mapped to a sentinel.
+        # Sentinels = semantic "unresolvable"; exceptions = transient "couldn't answer".
+        for norm_project_id, dep_pairs in project_batches.items():
+            project_root = _kp[norm_project_id]
+            # Redirect worktree roots to the main checkout, mirroring all other
+            # read tools (see _normalize_project_root docstring).  Registry roots
+            # from build_known_projects_map are expected to be canonical
+            # main-checkout paths, but this guard prevents a silent divergence if
+            # a registered root were ever a worktree path.
+            # Resolution failure raises (transient) — consistent with this tool's
+            # "no sentinel for transient failures" contract.
+            _norm = _normalize_project_root(project_root)
+            if isinstance(_norm, dict):
+                raise RuntimeError(
+                    f'Cannot resolve registered root for {norm_project_id!r}: {_norm}'
+                )
+            project_root = _norm
+            task_ids = [tid for _, tid in dep_pairs]
+            statuses = await task_interceptor.get_statuses(project_root=project_root, ids=task_ids)
+            for dep, task_id in dep_pairs:
+                if task_id not in statuses:
+                    result[dep] = 'unknown_task'
+                else:
+                    result[dep] = statuses[task_id]
+
+        await _log_read('get_external_statuses', result_summary={'count': len(result)})
+        return result
+
+    @mcp.tool()
     async def get_task(
         id: str,
         project_root: str,
@@ -1924,9 +2001,9 @@ def create_mcp_server(
                 edges from metadata.modules. Schema::
 
                   {
-                    "kind":   "merged" | "found_on_main",  # required
-                    "commit": "<sha-or-ref>",              # required for both kinds
-                    "note":   "<free text>",               # required if kind="found_on_main"
+                      'kind': 'merged' | 'found_on_main',  # required
+                      'commit': '<sha-or-ref>',  # required for both kinds
+                      'note': '<free text>',  # required if kind="found_on_main"
                   }
 
                 ``kind="merged"``: the work landed on main via a merge commit.
