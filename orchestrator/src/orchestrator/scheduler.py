@@ -1480,6 +1480,9 @@ class Scheduler:
         task: dict,
         status_map: dict[str, str],
         tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
     ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
@@ -1504,6 +1507,19 @@ class Scheduler:
 
         The allowance also requires the dep record to be present in *tasks_by_id*.
         A missing dep (stale snapshot) is treated conservatively as blocking.
+
+        **Cross-project external dep gate:** when *external_status_cache* is not
+        ``None``, after all local deps are satisfied the method checks
+        ``task.metadata.external_deps``.  An external dep is satisfied iff its
+        status in the cache is exactly ``'done'``.  Any other value (live status,
+        sentinel, missing from cache) is NOT satisfied.  When
+        *external_resolver_failed* is ``True``, all external deps are treated as
+        not satisfied regardless of the cache (fail-safe wait).
+
+        Defaulting both new parameters to ``None``/``False`` makes the legacy
+        3-arg call from ``_park_gc`` and all existing tests byte-identical.
+        Side effects (escalation, counter increments) MUST NOT live here — this
+        method is a pure predicate called from multiple sites.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -1557,6 +1573,32 @@ class Scheduler:
                 dep_status,
             )
             return False
+
+        # External-dep gate (cross-project).  Only active when the cache is
+        # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
+        if external_status_cache is not None:
+            external_deps: list = (
+                (task.get('metadata') or {}).get('external_deps') or []
+            )
+            for ext_dep in external_deps:
+                if external_resolver_failed:
+                    logger.debug(
+                        'Task %s blocked: external dep %r not checked '
+                        '(resolver failed — fail-safe wait)',
+                        task_id,
+                        ext_dep,
+                    )
+                    return False
+                ext_status = external_status_cache.get(ext_dep)
+                if ext_status != 'done':
+                    logger.debug(
+                        'Task %s blocked: external dep %r has status %r, '
+                        'need done',
+                        task_id,
+                        ext_dep,
+                        ext_status,
+                    )
+                    return False
         return True
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
