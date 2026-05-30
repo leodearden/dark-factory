@@ -112,15 +112,71 @@ class TwoProjectMcpSession:
             return self._envelope(json.dumps({'id': task_id, 'status': status}))
 
         if name == 'get_external_statuses':
-            raise NotImplementedError(
-                'TwoProjectMcpSession.get_external_statuses not yet implemented '
-                '— will be implemented in step S2 to make S1 GREEN'
-            )
+            return await self._get_external_statuses(arguments)
 
         raise NotImplementedError(
             f'TwoProjectMcpSession: unknown tool {name!r} — '
             'add a branch in call_tool if this tool is needed by the test'
         )
+
+    async def _get_external_statuses(self, arguments: dict) -> dict:
+        """Implement α's get_external_statuses contract (PRD Contract §get_external_statuses).
+
+        Resolution matrix (mirrored from fused-memory/tests/test_get_external_statuses.py):
+        - dep not parseable as '<project_id>:<int>' → 'malformed'
+        - project_id (after hyphen→underscore normalization) not in known_projects
+          → 'unknown_project'
+        - project_id known but task_id absent from upstream_statuses → 'unknown_task'
+        - otherwise → upstream_statuses[task_id]
+
+        Increments ext_call_count exactly once per call (invariant 5).
+        Raises RuntimeError when raise_on_external=True (transient-error simulation).
+        """
+        if self.raise_on_external:
+            raise RuntimeError(
+                'TwoProjectMcpSession: simulated transient resolver error'
+            )
+
+        self.ext_call_count += 1
+
+        deps: list[str] = arguments.get('deps', [])
+        statuses: dict[str, str] = {}
+
+        for dep in deps:
+            # Parse '<project_id>:<task_id>' — must have exactly one colon,
+            # non-empty sides, and an integer task_id.
+            if ':' not in dep:
+                statuses[dep] = 'malformed'
+                continue
+
+            colon_idx = dep.index(':')
+            raw_project = dep[:colon_idx]
+            raw_task = dep[colon_idx + 1:]
+
+            # Validate both sides are non-empty and task_id is a plain integer.
+            if not raw_project or not raw_task:
+                statuses[dep] = 'malformed'
+                continue
+            try:
+                int(raw_task)   # must be a plain integer (no dots, no letters)
+            except ValueError:
+                statuses[dep] = 'malformed'
+                continue
+
+            # Normalize project_id: hyphen → underscore for registry lookup.
+            normalized_project = raw_project.replace('-', '_')
+            if normalized_project not in self.known_projects:
+                statuses[dep] = 'unknown_project'
+                continue
+
+            # Look up task in the upstream (foreign) status store.
+            task_status = self.upstream_statuses.get(raw_task)
+            if task_status is None:
+                statuses[dep] = 'unknown_task'
+            else:
+                statuses[dep] = task_status
+
+        return self._envelope(json.dumps({'statuses': statuses}))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
