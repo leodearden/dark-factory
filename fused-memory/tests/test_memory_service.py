@@ -2919,6 +2919,42 @@ class TestGetStatusScoping:
 
 
 # ---------------------------------------------------------------------------
+# Step 7: TRACK B.2 _is_dependency_fact helper RED tests
+# ---------------------------------------------------------------------------
+
+class TestIsDependencyFact:
+    """Module-level _is_dependency_fact helper matches 'depends on' regardless of case/spacing."""
+
+    def test_canonical_dependency_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 depends on Task 557') is True
+
+    def test_depends_on_case_insensitive(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('X  Depends On  Y') is True
+
+    def test_lowercase_depends_on(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('module a depends on module b') is True
+
+    def test_non_dependency_status_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 reached status done') is False
+
+    def test_non_dependency_owns_fact(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('Task 562 owns module X') is False
+
+    def test_empty_string(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact('') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import _is_dependency_fact
+        assert _is_dependency_fact(None) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
 
