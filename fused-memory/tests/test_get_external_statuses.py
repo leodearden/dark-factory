@@ -87,3 +87,18 @@ async def test_unknown_project_returns_sentinel(mcp_server):
         {'deps': ['nope:1']},
     )
     assert result == {'nope:1': 'unknown_project'}
+
+
+# ------------------------------------------------------------------
+# step-05: unknown_task sentinel
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_known_project_unknown_task_returns_sentinel(mcp_server):
+    """A known project but a task_id absent from the foreign DB returns 'unknown_task'."""
+    result = await mcp_server._tool_manager.call_tool(
+        'get_external_statuses',
+        {'deps': ['dark_factory:999999']},
+    )
+    assert result == {'dark_factory:999999': 'unknown_task'}
