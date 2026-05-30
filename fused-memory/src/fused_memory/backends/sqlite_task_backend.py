@@ -1067,8 +1067,61 @@ class SqliteTaskBackend:
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult:
+        """Add a dependency to a task.
+
+        ``depends_on`` accepts two forms:
+
+        * **Bare integer** (e.g. ``"3"``): the traditional integer-table path.
+          Both the dependent task and the target must exist in this project.
+        * **Qualified** (e.g. ``"dark_factory:13"``): cross-project dependency
+          stored in the dependent task's ``metadata.external_deps`` list.
+          The foreign target is **not** verified at write time (lenient write —
+          the target may be filed later or live in another project).
+          ``'-'`` in the project_id portion is normalised to ``'_'`` before
+          storing.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
+
+        # ── Qualified (cross-project) path ─────────────────────────────────
+        if ':' in str(depends_on):
+            tid, parent_id = _parse_task_id(task_id)
+            if parent_id is not None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'add_dependency: subtask dependencies are not supported',
+                )
+            norm_pid, dep_int = _parse_qualified_dep(depends_on)
+            canonical = f'{norm_pid}:{dep_int}'
+
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                cursor = await conn.execute(
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise TaskmasterError(
+                        'TASKMASTER_TOOL_ERROR',
+                        f'No tasks found for ID(s): {tid}',
+                    )
+                new_meta = _merge_metadata(
+                    row['metadata'],
+                    json.dumps({'external_deps': [canonical]}),
+                    append=True,
+                )
+                await conn.execute(
+                    'UPDATE tasks SET metadata = ?, updated_at = ? '
+                    'WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (new_meta, _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                )
+            return {
+                'id': str(tid),
+                'dependency_id': canonical,
+                'message': f'Added external dependency: {tid} now depends on {canonical}',
+            }
+
+        # ── Bare-integer (same-project) path ───────────────────────────────
         tid, parent_id = _parse_task_id(task_id)
         dep_tid, dep_parent_id = _parse_task_id(depends_on)
         if parent_id is not None or dep_parent_id is not None:

@@ -1195,8 +1195,9 @@ async def test_qualified_dep_hyphen_normalized(backend, project_root):
 @pytest.mark.asyncio
 async def test_qualified_dep_preserves_sibling_metadata(backend, project_root):
     """Qualified add_dependency preserves other metadata keys (e.g. memory_hints)."""
+    import json as _json
     await backend.add_task(project_root=project_root, title='a')
-    await backend.update_task('1', project_root, metadata={'sibling_key': 'preserved'})
+    await backend.update_task('1', project_root, metadata=_json.dumps({'sibling_key': 'preserved'}))
     await backend.add_dependency('1', 'dark_factory:13', project_root=project_root)
 
     task = await backend.get_task('1', project_root)
