@@ -324,6 +324,9 @@ Review the above data and perform memory consolidation:
         # Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # Per-cycle summary nonce (task 1574)
+        summary_nonce_section = self._build_summary_nonce_section()
+
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -341,7 +344,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
