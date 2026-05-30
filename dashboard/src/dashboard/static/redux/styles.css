@@ -439,6 +439,7 @@ table { border-collapse: collapse; width: 100%; }
 }
 .chip.dep-done { color: var(--fg-2); border-color: var(--line); background: transparent; opacity: 0.75; text-decoration: line-through; text-decoration-color: var(--fg-3); }
 .chip.dep-pending { color: var(--warn); border-color: oklch(0.78 0.15 75 / 0.45); background: oklch(0.78 0.15 75 / 0.10); }
+.chip.dep-unknown { color: var(--fg-3); border-color: var(--line); background: transparent; opacity: 0.7; font-style: italic; }
 .chip.lock-free { color: var(--fg-2); border-color: var(--line); background: transparent; opacity: 0.78; }
 .chip.lock-mine { color: var(--ok); border-color: oklch(0.74 0.15 155 / 0.45); background: oklch(0.74 0.15 155 / 0.10); }
 .chip.lock-taken { color: var(--bad); border-color: oklch(0.65 0.20 25 / 0.55); background: oklch(0.65 0.20 25 / 0.12); font-weight: 600; }

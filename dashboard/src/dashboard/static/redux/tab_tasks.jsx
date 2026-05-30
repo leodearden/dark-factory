@@ -300,6 +300,22 @@ function TaskDetail({ task, allTasks }) {
           </div>}
 
       {(() => {
+        const extDeps = task.external_deps || [];
+        if (!extDeps.length) return null;
+        return (<>
+          <div className="section-lbl">External dependencies ({extDeps.length})</div>
+          <div className="chips multiline">
+            {extDeps.map(d => {
+              const cls = d.status === 'done' ? 'dep-done' : d.status === 'unknown' || d.status === 'unknown_project' || d.status === 'unknown_task' || d.status === 'malformed' ? 'dep-unknown' : 'dep-pending';
+              return (
+                <span key={d.id} className={`chip ${cls}`} title={d.status}>{d.id} · {d.status}</span>
+              );
+            })}
+          </div>
+        </>);
+      })()}
+
+      {(() => {
         const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
         const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
           ? buildSchedLockInfo(task, DF_T.SCHEDULER)
