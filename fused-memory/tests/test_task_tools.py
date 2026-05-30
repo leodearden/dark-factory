@@ -992,3 +992,86 @@ def test_commit_planning_registered(mcp_server_with_tasks):
     """commit_planning shows up in the MCP server's tool list."""
     tool_names = [t.name for t in mcp_server_with_tasks._tool_manager.list_tools()]
     assert 'commit_planning' in tool_names
+
+
+# ---------------------------------------------------------------------------
+# add_dependency / remove_dependency qualified depends_on wire tests (step-11)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_qualified_not_ticket_rejected_and_forwarded(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A qualified depends_on ("project_id:task_id") is not tkt_-rejected and
+    is forwarded verbatim to task_interceptor.add_dependency.
+
+    Guards that _reject_if_ticket_id only catches the 'tkt_' prefix — a
+    colon-separated qualified id is NOT tkt_-shaped and must pass through
+    unchanged.
+    """
+    task_interceptor.add_dependency = AsyncMock(
+        return_value={'id': '1', 'dependency_id': 'dark_factory:13', 'message': 'ok'},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'add_dependency',
+        {'id': '1', 'depends_on': 'dark_factory:13', 'project_root': '/project'},
+    )
+    # Must NOT be a ValidationError ticket rejection.
+    assert result.get('error_type') != 'ValidationError', (
+        f'Qualified depends_on was incorrectly ticket-rejected: {result}'
+    )
+    task_interceptor.add_dependency.assert_awaited_once()
+    _, kwargs = task_interceptor.add_dependency.call_args
+    assert kwargs['depends_on'] == 'dark_factory:13'
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_self_loop_taskmaster_error_wire_shape(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When the backend raises TaskmasterError for self-loop, the tool returns
+    {'error': 'TASKMASTER_TOOL_ERROR: add_dependency: task cannot depend on itself',
+     'error_type': 'TaskmasterError'}.
+
+    Confirms the specific error wire shape from the observable signal (plan
+    §OBSERVABLE SIGNAL).
+    """
+    from fused_memory.backends.task_backend_errors import TaskmasterError
+
+    task_interceptor.add_dependency = AsyncMock(
+        side_effect=TaskmasterError(
+            'TASKMASTER_TOOL_ERROR',
+            'add_dependency: task cannot depend on itself',
+        )
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'add_dependency',
+        {'id': '1', 'depends_on': 'my_project:1', 'project_root': '/project'},
+    )
+    assert result['error_type'] == 'TaskmasterError'
+    assert 'TASKMASTER_TOOL_ERROR' in result['error']
+    assert 'task cannot depend on itself' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_remove_dependency_qualified_not_ticket_rejected_and_forwarded(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A qualified depends_on is not tkt_-rejected and is forwarded verbatim to
+    task_interceptor.remove_dependency.
+    """
+    task_interceptor.remove_dependency = AsyncMock(
+        return_value={'id': '1', 'dependency_id': 'dark_factory:13', 'message': 'ok'},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'remove_dependency',
+        {'id': '1', 'depends_on': 'dark_factory:13', 'project_root': '/project'},
+    )
+    # Must NOT be a ValidationError ticket rejection.
+    assert result.get('error_type') != 'ValidationError', (
+        f'Qualified depends_on was incorrectly ticket-rejected: {result}'
+    )
+    task_interceptor.remove_dependency.assert_awaited_once()
+    _, kwargs = task_interceptor.remove_dependency.call_args
+    assert kwargs['depends_on'] == 'dark_factory:13'
