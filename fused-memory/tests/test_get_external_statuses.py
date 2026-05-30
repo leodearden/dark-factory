@@ -9,7 +9,6 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from fused_memory.server.tools import create_mcp_server
 
-
 # Foreign DB data: {task_id: status}
 _FOREIGN_DB = {'13': 'done', '14': 'pending', '20': 'cancelled'}
 
