@@ -5857,3 +5857,804 @@ class TestTasksByTrain:
         assert str(result[0].get('id')) == '501', (
             f'Expected 501 first (order=0), got {result[0].get("id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestGetExternalStatuses (task 1580 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatuses:
+    """``Scheduler.get_external_statuses`` returns a ``(statuses, error)`` tuple.
+
+    Mirrors the TestGetStatuses shape but for the cross-project resolver:
+    - exactly ONE dispatch_tool('get_external_statuses', {'deps': [...]}) call
+    - no project_root argument (the tool is cross-project by design)
+    - returns ({}, exc) on exception rather than propagating
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_returns_parsed_mapping(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_external_statuses parses the MCP response and returns (dict, None)."""
+        import json
+
+        response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps(
+                            {
+                                'statuses': {
+                                    'dark_factory:5': 'done',
+                                    'other_proj:99': 'pending',
+                                }
+                            }
+                        ),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+        result, err = await scheduler.get_external_statuses(
+            ['dark_factory:5', 'other_proj:99']
+        )
+        assert err is None
+        assert result == {'dark_factory:5': 'done', 'other_proj:99': 'pending'}
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_passes_deps_argument_no_project_root(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Exactly ONE dispatch_tool call with {'deps': [...]} — no project_root."""
+        import json
+
+        mcp_mock = AsyncMock(
+            return_value={
+                'result': {
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                        }
+                    ]
+                }
+            }
+        )
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        _result, _err = await scheduler.get_external_statuses(['dark_factory:5'])
+
+        mcp_mock.assert_called_once()
+        # mcp_call signature: (url, 'tools/call', {'name': ..., 'arguments': ...})
+        call_payload = mcp_mock.call_args[0][2]  # third positional arg
+        assert call_payload.get('name') == 'get_external_statuses', (
+            f"Expected name='get_external_statuses'; got {call_payload.get('name')!r}"
+        )
+        arguments = call_payload['arguments']
+        assert arguments.get('deps') == ['dark_factory:5'], (
+            f"Expected deps=['dark_factory:5']; got {arguments!r}"
+        )
+        assert 'project_root' not in arguments, (
+            f'project_root must not be present in arguments; got {arguments!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_exception_returns_empty_dict(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """OSError from mcp_call returns ({}, OSError) tuple."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'Connection refused')),
+        )
+        result, err = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result == {}
+        assert isinstance(err, OSError)
+        assert err.errno == 2
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_exception_then_success_no_state_leak(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Failing call returns ({}, exc); subsequent success returns (dict, None).
+
+        Error state lives on the stack — no cross-call leakage via shared attribute.
+        """
+        import json
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'Connection refused')),
+        )
+        result_fail, err_fail = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result_fail == {}
+        assert isinstance(err_fail, OSError)
+
+        success_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=success_response),
+        )
+        result_ok, err_ok = await scheduler.get_external_statuses(['dark_factory:5'])
+        assert result_ok == {'dark_factory:5': 'done'}
+        assert err_ok is None
+
+
+# ---------------------------------------------------------------------------
+# TestDepsSatisfiedExternalGate (task 1580 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestDepsSatisfiedExternalGate:
+    """Unit tests for the external-dep boolean gate added to _deps_satisfied.
+
+    The gate is PURE (no side effects, no escalation calls).  It is opt-in:
+    passing external_status_cache=None / external_resolver_failed=False (the
+    defaults) reproduces byte-identical legacy behaviour — existing tests in
+    TestDepsSatisfied remain valid without modification.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def _task_with_external_dep(self, dep: str = 'dark_factory:5') -> dict:
+        """Build a minimal pending task with one external dep."""
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+
+    # --- done → satisfied ---------------------------------------------------
+
+    def test_external_dep_done_satisfied(self, scheduler: Scheduler):
+        """External dep with status 'done' → _deps_satisfied returns True."""
+        task = self._task_with_external_dep()
+        status_map: dict[str, str] = {}
+        cache = {'dark_factory:5': 'done'}
+        assert scheduler._deps_satisfied(task, status_map, external_status_cache=cache) is True
+
+    # --- live / non-done statuses → not satisfied ---------------------------
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked'])
+    def test_external_dep_live_status_not_satisfied(
+        self, scheduler: Scheduler, status: str
+    ):
+        """External dep with a live non-done status → _deps_satisfied returns False."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': status}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- cancelled → not satisfied (strict, PRD decision 1) ----------------
+
+    def test_external_dep_cancelled_not_satisfied(self, scheduler: Scheduler):
+        """External dep with status 'cancelled' → False (strict, PRD decision 1)."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': 'cancelled'}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- sentinel statuses → not satisfied ----------------------------------
+
+    @pytest.mark.parametrize(
+        'sentinel', ['unknown_project', 'unknown_task', 'malformed']
+    )
+    def test_external_dep_sentinel_not_satisfied(
+        self, scheduler: Scheduler, sentinel: str
+    ):
+        """External dep resolving to a sentinel → _deps_satisfied returns False."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': sentinel}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- dep missing from cache → not satisfied -----------------------------
+
+    def test_external_dep_missing_from_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """A dep absent from the cache → _deps_satisfied returns False (conservative)."""
+        task = self._task_with_external_dep()
+        # Cache exists but does not include 'dark_factory:5'
+        cache: dict[str, str] = {}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- resolver_failed=True → not satisfied regardless of cache -----------
+
+    def test_external_resolver_failed_not_satisfied(self, scheduler: Scheduler):
+        """external_resolver_failed=True → False regardless of cache contents."""
+        task = self._task_with_external_dep()
+        # Cache says done — but resolver failed so we must not satisfy
+        cache = {'dark_factory:5': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, {}, external_status_cache=cache, external_resolver_failed=True
+            )
+            is False
+        )
+
+    def test_external_resolver_failed_no_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """external_resolver_failed=True with empty cache → False."""
+        task = self._task_with_external_dep()
+        assert (
+            scheduler._deps_satisfied(
+                task, {}, external_status_cache={}, external_resolver_failed=True
+            )
+            is False
+        )
+
+    # --- backward compatibility: no external_deps → legacy behaviour --------
+
+    def test_no_external_deps_legacy_local_dep_done(self, scheduler: Scheduler):
+        """Task with no external_deps and legacy params → legacy semantics unchanged."""
+        task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {},
+        }
+        status_map = {'1': 'done'}
+        # Omitting external_status_cache / external_resolver_failed — defaults
+        assert scheduler._deps_satisfied(task, status_map) is True
+
+    def test_no_external_deps_legacy_local_dep_pending(self, scheduler: Scheduler):
+        """Task with no external_deps: local dep pending → still False (legacy)."""
+        task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {},
+        }
+        status_map = {'1': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is False
+
+    # --- mixed: local-done + external-pending → not satisfied ---------------
+
+    def test_local_done_external_pending_not_satisfied(self, scheduler: Scheduler):
+        """Local deps done but external dep 'pending' → overall not satisfied."""
+        task = {
+            'id': '10',
+            'dependencies': [{'id': '9'}],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        status_map = {'9': 'done'}
+        cache = {'dark_factory:5': 'pending'}
+        assert (
+            scheduler._deps_satisfied(task, status_map, external_status_cache=cache)
+            is False
+        )
+
+    def test_external_done_local_pending_not_satisfied(self, scheduler: Scheduler):
+        """External dep done but local dep pending → overall not satisfied."""
+        task = {
+            'id': '10',
+            'dependencies': [{'id': '9'}],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        status_map = {'9': 'pending'}
+        cache = {'dark_factory:5': 'done'}
+        assert (
+            scheduler._deps_satisfied(task, status_map, external_status_cache=cache)
+            is False
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyCancelled (task 1580 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyCancelled:
+    """_apply_external_dep_policy must fire _on_external_dep_block for cancelled deps.
+
+    PRD invariant 2 / design decision 1: cancelled is STRICT — immediate
+    escalation, no grace period, no counter increment.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dep_fires_callback_once(self, scheduler: Scheduler):
+        """_on_external_dep_block called exactly once when dep is 'cancelled'."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'cancelled'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_called_once()
+        call_kwargs = callback.call_args
+        # First positional arg or 'task_id' kwarg must be '10'
+        args = call_kwargs.args if call_kwargs.args else ()
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == '10', (
+            f'Expected task_id="10"; got {task_id_arg!r}'
+        )
+        # Summary must carry EXTERNAL_DEP_CANCELLED prefix
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'EXTERNAL_DEP_CANCELLED' in str(summary_arg), (
+            f'Expected EXTERNAL_DEP_CANCELLED in summary; got {summary_arg!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dep_does_not_touch_unresolved_counter(
+        self, scheduler: Scheduler
+    ):
+        """Cancelled dep must NOT increment _external_unresolved_counts."""
+        scheduler._on_external_dep_block = AsyncMock()
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'cancelled'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Unresolved counter must remain empty for cancelled; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_done_dep_no_callback(self, scheduler: Scheduler):
+        """Done external dep must NOT invoke callback (satisfied — no action)."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'done'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_dep_no_callback(self, scheduler: Scheduler):
+        """A live (pending/in-progress) dep must wait silently — no callback."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        external_cache = {'dark_factory:5': 'in-progress'}
+
+        await scheduler._apply_external_dep_policy(
+            [task], external_cache, external_err=None
+        )
+
+        callback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyUnresolved (task 1580 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyUnresolved:
+    """Grace-then-escalate counter for unknown/malformed sentinel statuses.
+
+    Uses max_external_dep_unresolved_cycles=2 so tests don't need 3 real ticks.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_external_dep_unresolved_cycles=2,
+        )
+        return Scheduler(config)
+
+    def _pending_task(self, dep: str = 'dark_factory:5') -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+
+    @pytest.mark.parametrize(
+        'sentinel', ['unknown_task', 'unknown_project', 'malformed']
+    )
+    @pytest.mark.asyncio
+    async def test_sentinel_below_threshold_no_callback(
+        self, scheduler: Scheduler, sentinel: str
+    ):
+        """First tick with a sentinel: counter increments, callback NOT called."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': sentinel}, external_err=None
+        )
+
+        callback.assert_not_called()
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5'), 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_sentinel_at_threshold_fires_callback(self, scheduler: Scheduler):
+        """At threshold (2 ticks of unknown_task), callback IS called once."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+        cache = {'dark_factory:5': 'unknown_task'}
+
+        # Tick 1 — below threshold
+        await scheduler._apply_external_dep_policy([task], cache, external_err=None)
+        callback.assert_not_called()
+
+        # Tick 2 — reaches threshold
+        await scheduler._apply_external_dep_policy([task], cache, external_err=None)
+        callback.assert_called_once()
+
+        # Summary must carry EXTERNAL_DEP_UNRESOLVED prefix
+        kwargs = callback.call_args.kwargs
+        assert 'EXTERNAL_DEP_UNRESOLVED' in kwargs.get('summary', ''), (
+            f'Expected EXTERNAL_DEP_UNRESOLVED in summary; got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_when_dep_resolves_to_real_status(
+        self, scheduler: Scheduler
+    ):
+        """When dep later resolves to a non-sentinel, counter is reset to 0."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — sentinel; counter goes to 1
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5')) == 1
+
+        # Tick 2 — dep resolves to 'pending' (real live status)
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'pending'}, external_err=None
+        )
+        # Counter must be gone (reset)
+        assert ('10', 'dark_factory:5') not in scheduler._external_unresolved_counts, (
+            f'Counter should be reset; got '
+            f'{scheduler._external_unresolved_counts!r}'
+        )
+        # No callback (pending → wait silently)
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_when_dep_reaches_done(
+        self, scheduler: Scheduler
+    ):
+        """When dep resolves to 'done', counter is reset (not just ignored)."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — sentinel
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('10', 'dark_factory:5')) == 1
+
+        # Tick 2 — dep is done
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:5': 'done'}, external_err=None
+        )
+        assert ('10', 'dark_factory:5') not in scheduler._external_unresolved_counts
+        callback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExternalDepPolicyTransientErr (task 1580 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestApplyExternalDepPolicyTransientErr:
+    """Invariant 6: transient resolver error → silent wait, no counter, no escalation.
+
+    When external_err is not None (the MCP resolver raised), _apply_external_dep_policy
+    must be a no-op: no counter increment, no callback invocation.  The boolean gate
+    (_deps_satisfied with external_resolver_failed=True) must also block dispatch.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def _pending_task(self) -> dict:
+        return {
+            'id': '20',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:99']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_transient_err_no_callback(self, scheduler: Scheduler):
+        """external_err set → _on_external_dep_block never called."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'unknown_task'},   # cache has a sentinel but err is set
+            external_err=RuntimeError('db unavailable'),
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_transient_err_no_counter_increment(self, scheduler: Scheduler):
+        """external_err set → _external_unresolved_counts stays empty (no increment)."""
+        scheduler._on_external_dep_block = AsyncMock()
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'malformed'},
+            external_err=RuntimeError('registry timeout'),
+        )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Expected empty counter dict; got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_transient_err_does_not_reset_prior_counter(
+        self, scheduler: Scheduler
+    ):
+        """A transient error must not reset a counter built up in prior ticks."""
+        scheduler._on_external_dep_block = AsyncMock()
+        task = self._pending_task()
+
+        # Tick 1 — sentinel, no err → counter = 1
+        await scheduler._apply_external_dep_policy(
+            [task], {'dark_factory:99': 'unknown_task'}, external_err=None
+        )
+        assert scheduler._external_unresolved_counts.get(('20', 'dark_factory:99')) == 1
+
+        # Tick 2 — transient err → counter must stay at 1 (no reset, no increment)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:99': 'unknown_task'},
+            external_err=RuntimeError('blip'),
+        )
+        assert scheduler._external_unresolved_counts.get(('20', 'dark_factory:99')) == 1, (
+            f'Counter must be untouched on transient err; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    def test_deps_satisfied_external_resolver_failed_blocks(
+        self, scheduler: Scheduler
+    ):
+        """external_resolver_failed=True → _deps_satisfied returns False (gate closed)."""
+        task = {
+            'id': '20',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:99']},
+        }
+        # Even with a 'done' entry in the cache, resolver_failed overrides
+        result = scheduler._deps_satisfied(
+            task,
+            {},
+            external_status_cache={'dark_factory:99': 'done'},
+            external_resolver_failed=True,
+        )
+        assert result is False, (
+            'external_resolver_failed=True must block dispatch regardless of cache'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextExternalDepGate (task 1580 — step-11 RED / step-12 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextExternalDepGate:
+    """acquire_next wires the external-dep gate: one batched call, correct dispatch decisions.
+
+    Invariants under test:
+    - 5: exactly ONE get_external_statuses call per tick (union of all pending deps);
+         ZERO calls when no pending task has external deps.
+    - 1: external dep 'done' + local deps done → task IS dispatched.
+    - boundary row 2: external dep 'pending' → not dispatched, no escalation.
+    - boundary row 3: external dep 'cancelled' → not dispatched, callback fires.
+    - boundary row 8: local deps done + external dep 'pending' → not dispatched.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=2)
+        return Scheduler(config)
+
+    def _task(self, tid: str, ext_deps: list[str] | None = None) -> dict:
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'files': ['backend'],
+                **({'external_deps': ext_deps} if ext_deps else {}),
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_external_deps_zero_calls(self, scheduler: Scheduler):
+        """Invariant 5: zero pending tasks with external_deps → zero get_external_statuses calls."""
+        scheduler.get_tasks = AsyncMock(return_value=[self._task('1')])
+        scheduler.get_external_statuses = AsyncMock(return_value=({}, None))
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '1'
+
+        scheduler.get_external_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_batched_call_covering_all_pending_deps(
+        self, scheduler: Scheduler
+    ):
+        """Invariant 5: all external deps across pending tasks batched into ONE call."""
+        task_a = self._task('1', ext_deps=['proj:10'])
+        task_b = self._task('2', ext_deps=['proj:20'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'proj:10': 'done', 'proj:20': 'done'}, None)
+        )
+        scheduler._apply_external_dep_policy = AsyncMock()
+
+        await scheduler.acquire_next()
+
+        # Exactly ONE call with the union of deps (order-independent)
+        scheduler.get_external_statuses.assert_called_once()
+        call_args = scheduler.get_external_statuses.call_args
+        passed_deps = set(call_args.args[0] if call_args.args else call_args.kwargs.get('deps', []))
+        assert passed_deps == {'proj:10', 'proj:20'}, (
+            f'Expected union of all pending task external_deps; got {passed_deps!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_dep_done_task_dispatched(self, scheduler: Scheduler):
+        """Invariant 1: external dep 'done' (and no local deps) → task IS dispatched."""
+        task = self._task('3', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'done'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '3', (
+            f'External dep done → should dispatch; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_dep_pending_not_dispatched_no_callback(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 2: external dep 'pending' → not dispatched, no escalation."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = self._task('4', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'pending'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'External dep pending → must NOT dispatch; got {result!r}'
+        )
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_external_dep_cancelled_not_dispatched_callback_fires(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 3: external dep 'cancelled' → not dispatched, block callback fires."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task = self._task('5', ext_deps=['dark_factory:5'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:5': 'cancelled'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'External dep cancelled → must NOT dispatch; got {result!r}'
+        )
+        callback.assert_called_once()
+        kwargs = callback.call_args.kwargs
+        assert 'EXTERNAL_DEP_CANCELLED' in kwargs.get('summary', ''), (
+            f'Expected EXTERNAL_DEP_CANCELLED in summary; got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_local_deps_done_external_dep_pending_not_dispatched(
+        self, scheduler: Scheduler
+    ):
+        """Boundary row 8: all local deps done but external dep 'pending' → not dispatched."""
+        dep_task = {
+            'id': '10',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task = {
+            'id': '11',
+            'title': 'Task 11',
+            'status': 'pending',
+            'dependencies': ['10'],
+            'metadata': {
+                'files': ['backend'],
+                'external_deps': ['dark_factory:99'],
+            },
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[dep_task, task])
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'dark_factory:99': 'in-progress'}, None)
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            f'Local deps done but external dep in-progress → must NOT dispatch; got {result!r}'
+        )

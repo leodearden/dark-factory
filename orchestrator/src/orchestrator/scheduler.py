@@ -755,6 +755,16 @@ class Scheduler:
         self._blocked_task_ids_in_window: set[str] = set()
         # Callback installed by the Harness so trip → persistence + event.
         self._on_park_stop_trip: Callable[[str], Any] | None = None
+        # --- Cross-project external-dep escalation (task 1580) ---
+        # Callback installed by the Harness: (task_id, *, summary, detail,
+        # category) → block the task + submit L1.  Default None so bare-Harness
+        # unit tests (and park_gc) are unaffected.
+        self._on_external_dep_block: Callable[..., Any] | None = None
+        # Per-(task_id, dep_string) count of consecutive ticks where the dep
+        # resolved to a sentinel (unknown_project/unknown_task/malformed).
+        # Process-local — a scheduler restart is an acceptable implicit reset,
+        # matching _requeue_counts/_skip_count idioms above.
+        self._external_unresolved_counts: dict[tuple[str, str], int] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1384,6 +1394,180 @@ class Scheduler:
             return {}, e
         return {}, None
 
+    async def get_external_statuses(
+        self, deps: list[str]
+    ) -> tuple[dict[str, str], Exception | None]:
+        """Return a ``(statuses, error)`` tuple for a list of cross-project deps.
+
+        Issues a single ``get_external_statuses`` MCP call (no ``project_root``
+        — the tool is cross-project by design).  The dep strings are passed
+        verbatim; the returned dict is keyed by those same dep strings.
+
+        Sentinels returned by the tool (``unknown_project``, ``unknown_task``,
+        ``malformed``) are surfaced as-is — the caller decides policy.
+
+        Returns:
+            ``({dep: status}, None)`` on success.
+            ``({}, exception)`` on any failure — transient raises are swallowed
+            into the error slot (fail-safe; caller should skip policy effects).
+        """
+        try:
+            arguments: dict = {'deps': list(deps)}
+            result = await self.dispatch_tool(
+                'get_external_statuses', arguments, timeout=15
+            )
+            statuses = self._parse_tool_text_result(result, 'statuses')
+            if isinstance(statuses, dict):
+                return statuses, None
+        except Exception as e:
+            logger.exception(
+                'Failed to fetch external dep statuses: %s: %s',
+                type(e).__name__,
+                e,
+            )
+            return {}, e
+        return {}, None
+
+    _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
+        {'unknown_project', 'unknown_task', 'malformed'}
+    )
+
+    async def _apply_external_dep_policy(
+        self,
+        pending_tasks: list[dict],
+        external_cache: dict[str, str],
+        external_err: Exception | None,
+    ) -> None:
+        """Side-effecting pass over pending tasks' external deps.
+
+        Run ONCE per tick from ``acquire_next``.  Per-task per-dep:
+
+        - ``done`` → satisfied; no action.
+        - ``cancelled`` → invoke ``_on_external_dep_block`` immediately with
+          ``EXTERNAL_DEP_CANCELLED`` prefix (invariant 2 — strict escalation).
+        - ``unknown_project`` / ``unknown_task`` / ``malformed`` → increment the
+          per-(task, dep) unresolved counter; escalate at threshold with
+          ``EXTERNAL_DEP_UNRESOLVED`` prefix; counter resets when the dep
+          resolves to a real (non-sentinel) status.
+        - Other live status (``pending``, ``in-progress``, …) → wait silently;
+          reset the sentinel counter for that (task, dep) pair (the dep is now
+          resolvable even if not done).
+        - ``external_err is not None`` → short-circuit; no counter increment,
+          no escalation (fail-safe wait — resolver will retry next tick).
+
+        **Recovery note**: once ``_on_external_dep_block`` sets a task to
+        ``blocked``, the task leaves ``pending`` and this policy no longer
+        evaluates it.  Recovery requires manual unblock (set the task back to
+        ``pending`` after confirming the upstream dep is resolvable).  This is
+        intentional for ``cancelled`` deps (permanently terminal) and
+        conservative-but-safe for sentinel deps (transient resolution lag may
+        require manual intervention).  The ``EXTERNAL_DEP_UNRESOLVED``
+        escalation detail text prompts the human accordingly.
+
+        This method must NOT be called from ``_deps_satisfied`` or
+        ``_eligible_for_dispatch``.  Those are pure predicates called per-candidate;
+        side effects here would N-fire per tick.
+        """
+        if external_err is not None:
+            return  # transient resolver failure — fail-safe wait
+
+        threshold = self.config.max_external_dep_unresolved_cycles
+
+        for task in pending_tasks:
+            task_id = str(task.get('id', '?'))
+            external_deps: list = (
+                (task.get('metadata') or {}).get('external_deps') or []
+            )
+            for dep in external_deps:
+                status = external_cache.get(dep)
+
+                if status == 'done':
+                    # Satisfied — reset any accumulated sentinel counter.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
+
+                elif status == 'cancelled':
+                    # Strict immediate escalation — no counter increment.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
+                    summary = (
+                        f'EXTERNAL_DEP_CANCELLED: task {task_id} blocked — '
+                        f'external dep {dep!r} is cancelled'
+                    )
+                    detail = (
+                        f'Cross-project dep {dep!r} reached terminal status '
+                        f'cancelled.  Task {task_id} cannot proceed; it should '
+                        f'be re-architected or cancelled itself.'
+                    )
+                    if self._on_external_dep_block is not None:
+                        await self._on_external_dep_block(
+                            task_id,
+                            summary=summary,
+                            detail=detail,
+                            category='dependency_discovered',
+                        )
+                    else:
+                        logger.warning(
+                            'External dep %r cancelled for task %s — '
+                            'no _on_external_dep_block callback installed',
+                            dep,
+                            task_id,
+                        )
+
+                elif status in self._EXTERNAL_SENTINEL_STATUSES:
+                    # Unknown/malformed — grace-then-escalate counter.
+                    count = (
+                        self._external_unresolved_counts.get((task_id, dep), 0) + 1
+                    )
+                    self._external_unresolved_counts[(task_id, dep)] = count
+                    if count >= threshold:
+                        # Pop so the next crossing (if it persists) fires again.
+                        self._external_unresolved_counts.pop((task_id, dep), None)
+                        summary = (
+                            f'EXTERNAL_DEP_UNRESOLVED: task {task_id} — '
+                            f'dep {dep!r} unresolvable for {count} ticks '
+                            f'(status={status!r})'
+                        )
+                        detail = (
+                            f'Cross-project dep {dep!r} has returned sentinel '
+                            f'{status!r} for {count} consecutive ticks '
+                            f'(threshold={threshold}).  The dep string may be '
+                            f'malformed, or the referenced project/task may not '
+                            f'exist.  Task {task_id} is gated until resolved.  '
+                            f'Once the dep is resolvable or done, manually set '
+                            f'task {task_id} back to pending to reopen it — '
+                            f'blocked tasks are not re-evaluated automatically.'
+                        )
+                        if self._on_external_dep_block is not None:
+                            await self._on_external_dep_block(
+                                task_id,
+                                summary=summary,
+                                detail=detail,
+                                category='dependency_discovered',
+                            )
+                        else:
+                            logger.warning(
+                                'External dep %r unresolved x%d for task %s — '
+                                'no _on_external_dep_block callback installed',
+                                dep,
+                                count,
+                                task_id,
+                            )
+                    else:
+                        logger.debug(
+                            'Task %s: external dep %r status=%r (%d/%d ticks) — '
+                            'waiting silently',
+                            task_id,
+                            dep,
+                            status,
+                            count,
+                            threshold,
+                        )
+
+                else:
+                    # Any other live status (pending, in-progress, blocked, …):
+                    # wait silently and reset the sentinel counter so transient
+                    # blips don't accumulate.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
+
     async def update_task(
         self,
         task_id: str,
@@ -1446,6 +1630,9 @@ class Scheduler:
         task: dict,
         status_map: dict[str, str],
         tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
     ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
@@ -1470,6 +1657,19 @@ class Scheduler:
 
         The allowance also requires the dep record to be present in *tasks_by_id*.
         A missing dep (stale snapshot) is treated conservatively as blocking.
+
+        **Cross-project external dep gate:** when *external_status_cache* is not
+        ``None``, after all local deps are satisfied the method checks
+        ``task.metadata.external_deps``.  An external dep is satisfied iff its
+        status in the cache is exactly ``'done'``.  Any other value (live status,
+        sentinel, missing from cache) is NOT satisfied.  When
+        *external_resolver_failed* is ``True``, all external deps are treated as
+        not satisfied regardless of the cache (fail-safe wait).
+
+        Defaulting both new parameters to ``None``/``False`` makes the legacy
+        3-arg call from ``_park_gc`` and all existing tests byte-identical.
+        Side effects (escalation, counter increments) MUST NOT live here — this
+        method is a pure predicate called from multiple sites.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -1523,6 +1723,32 @@ class Scheduler:
                 dep_status,
             )
             return False
+
+        # External-dep gate (cross-project).  Only active when the cache is
+        # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
+        if external_status_cache is not None:
+            external_deps: list = (
+                (task.get('metadata') or {}).get('external_deps') or []
+            )
+            for ext_dep in external_deps:
+                if external_resolver_failed:
+                    logger.debug(
+                        'Task %s blocked: external dep %r not checked '
+                        '(resolver failed — fail-safe wait)',
+                        task_id,
+                        ext_dep,
+                    )
+                    return False
+                ext_status = external_status_cache.get(ext_dep)
+                if ext_status != 'done':
+                    logger.debug(
+                        'Task %s blocked: external dep %r has status %r, '
+                        'need done',
+                        task_id,
+                        ext_dep,
+                        ext_status,
+                    )
+                    return False
         return True
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
@@ -1635,6 +1861,9 @@ class Scheduler:
         tid: str,
         status_map: dict[str, str],
         tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -1654,6 +1883,13 @@ class Scheduler:
         (the default), the allowance is disabled — behaviour is identical to
         today.  Both ``acquire_next`` call sites pass the per-tick snapshot.
 
+        *external_status_cache* and *external_resolver_failed* are forwarded
+        to :meth:`_deps_satisfied` for the cross-project external dep gate.
+        When both default (``None``/``False``), the external gate is skipped —
+        behaviour is byte-identical to the pre-external-dep implementation.
+        The ``_park_gc`` call site does NOT pass these params (preserving
+        park-GC semantics, scope containment per design decision 4).
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -1667,7 +1903,11 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if not self._deps_satisfied(task, status_map, tasks_by_id):
+        if not self._deps_satisfied(
+            task, status_map, tasks_by_id,
+            external_status_cache=external_status_cache,
+            external_resolver_failed=external_resolver_failed,
+        ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -2133,17 +2373,31 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at, _skip_count, and _module_cache entries for tasks
-        # now in a terminal status so a future legitimate re-dispatch (e.g.
-        # cancelled -> pending re-architect, or a freshly-created task reusing the
-        # id) starts from a clean slate.  Resurrection-safe: a re-queued task
-        # re-derives modules and re-accumulates its skip count fresh.
+        # Drop _last_dispatch_at, _skip_count, _module_cache, and sub-threshold
+        # _external_unresolved_counts entries for tasks now in a terminal status
+        # so a future legitimate re-dispatch (e.g. cancelled -> pending
+        # re-architect, or a freshly-created task reusing the id) starts from a
+        # clean slate.  Resurrection-safe: a re-queued task re-derives modules
+        # and re-accumulates its skip count fresh.
         # Mirrors the _pending_anchor clearing in _update_age_anchors.
+        _terminal_ids: set[str] = set()
         for tid_str, status in status_map.items():
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
+                _terminal_ids.add(tid_str)
+        # _external_unresolved_counts is keyed by (task_id, dep); sweep
+        # separately to avoid mutating while iterating.  A sub-threshold counter
+        # entry would otherwise leak permanently if the task terminates before
+        # crossing the escalation threshold (e.g. manually cancelled while count=1).
+        if _terminal_ids and self._external_unresolved_counts:
+            _stale_ext_keys = [
+                k for k in self._external_unresolved_counts
+                if k[0] in _terminal_ids
+            ]
+            for k in _stale_ext_keys:
+                del self._external_unresolved_counts[k]
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
@@ -2151,6 +2405,43 @@ class Scheduler:
         # observe post-GC state, matching the contract previously provided by
         # the lazy per-call delete inside _eligible_for_dispatch.
         self._gc_expired_cooldowns()
+
+        # Cross-project external dep gate (invariant 5 — one batched call per tick).
+        # Collect the union of metadata.external_deps across all pending tasks; if
+        # non-empty issue ONE get_external_statuses call.  Zero deps → zero calls.
+        # The per-tick cache is then forwarded to _eligible_for_dispatch at both
+        # call sites below; _apply_external_dep_policy runs the side-effecting pass
+        # (counter increments, escalation callbacks) exactly once per tick.
+        # The _park_gc call site above does NOT receive the cache, preserving park-GC
+        # semantics (design decision 4: scope containment).
+        _pending_tasks_with_ext: list[dict] = [
+            t for t in tasks
+            if t.get('status') == 'pending'
+            and (t.get('metadata') or {}).get('external_deps')
+        ]
+        _ext_dep_union: list[str] = list({
+            dep
+            for t in _pending_tasks_with_ext
+            for dep in ((t.get('metadata') or {}).get('external_deps') or [])
+        })
+        if _ext_dep_union:
+            external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
+        else:
+            external_cache, external_err = {}, None
+        try:
+            await self._apply_external_dep_policy(
+                _pending_tasks_with_ext, external_cache, external_err
+            )
+        except Exception:
+            # A failure in the policy pass (e.g. set_task_status raising inside
+            # the _on_external_dep_block callback) must not abort the whole tick.
+            # Degrade to a fail-safe wait: the gate stays closed via
+            # _external_resolver_failed below, and the policy retries next tick.
+            logger.warning(
+                'External dep policy pass raised — degrading to fail-safe wait this tick',
+                exc_info=True,
+            )
+        _external_resolver_failed = external_err is not None
 
         # Load priority-override snapshot for this tick.
         current_overrides: dict[str, OverrideRow] = (
@@ -2310,7 +2601,11 @@ class Scheduler:
             tid_str = str(t.get('id', ''))
             if not tid_str:
                 continue
-            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map, tasks_by_id)
+            eligible, signal_label = self._eligible_for_dispatch(
+                t, tid_str, status_map, tasks_by_id,
+                external_status_cache=external_cache,
+                external_resolver_failed=_external_resolver_failed,
+            )
             if not eligible:
                 continue
             # signal_label is stashed and reused at the dispatch arm site so
@@ -2348,7 +2643,9 @@ class Scheduler:
                 # loop to keep both paths in sync.  A future gate addition only
                 # needs to be added to _eligible_for_dispatch.
                 eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map, tasks_by_id
+                    pin_task, pin_tid, status_map, tasks_by_id,
+                    external_status_cache=external_cache,
+                    external_resolver_failed=_external_resolver_failed,
                 )
                 if not eligible:
                     continue
