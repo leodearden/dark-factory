@@ -47,6 +47,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
+# Used by _restore_superseded_dependency_edges to identify edges that should
+# never be superseded by LLM edge-resolution.
+_DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
+
+
+def _is_dependency_fact(fact: str | None) -> bool:
+    """Return True when *fact* expresses a dependency relationship.
+
+    Uses the canonical ``depends on`` phrasing (case-insensitive, word-boundary
+    anchored) that matches the project's relational verb in classifier.py.
+    """
+    return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
+
 
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
