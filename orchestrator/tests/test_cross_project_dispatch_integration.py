@@ -507,3 +507,67 @@ class TestCancelledUpstreamEscalation:
         assert t_status == 'blocked', (
             f"Expected T.status=='blocked' after cancelled-dep policy; got {t_status!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S7 RED — rows 4+5: unknown_project / unknown_task → grace-then-escalate
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnknownDepGraceThenEscalate:
+    """Rows 4+5: sentinel deps escalate at the threshold, NOT before.
+
+    Parametrized over:
+    - 'unknown_project': dep references a project not in known_projects.
+    - 'unknown_task': dep references a known project but an absent task_id.
+
+    For ticks 1..threshold-1: acquire_next returns None AND no escalation is filed.
+    On tick == threshold: exactly one pending L1 with 'EXTERNAL_DEP_UNRESOLVED' prefix.
+    T is never dispatched.
+
+    The threshold is read from harness.config.max_external_dep_unresolved_cycles
+    (production default = 3, set in config.py:647) — not hard-coded.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('scenario,dep_string', [
+        ('unknown_project', 'nope:1'),
+        ('unknown_task',    f'{_UPSTREAM_PROJECT}:999999'),
+    ])
+    async def test_unknown_dep_grace_then_escalate(
+        self, tmp_path: Path, scenario: str, dep_string: str
+    ) -> None:
+        """Grace ticks elapse silently; escalation fires on tick == threshold."""
+        harness, session = build_harness(tmp_path)
+        threshold = harness.config.max_external_dep_unresolved_cycles
+
+        register_pending_dependent_task(session, 'T', external_deps=[dep_string])
+        # (No upstream_statuses entry — dep resolves to the sentinel.)
+
+        # Ticks 1..threshold-1: no dispatch, no escalation (grace period).
+        for tick in range(1, threshold):
+            tick_result = await run_tick(harness)
+            escs = escalations_for(harness, 'T')
+            assert tick_result is None, (
+                f'Scenario={scenario!r} tick {tick}: must NOT dispatch; got {tick_result!r}'
+            )
+            assert escs == [], (
+                f'Scenario={scenario!r} tick {tick}: must NOT escalate before threshold '
+                f'({tick}/{threshold - 1}); got {escs!r}'
+            )
+
+        # Tick == threshold: escalation fires.
+        tick_result = await run_tick(harness)
+        escs = escalations_for(harness, 'T')
+        assert tick_result is None, (
+            f'Scenario={scenario!r} tick {threshold}: T must NOT be dispatched; '
+            f'got {tick_result!r}'
+        )
+        assert len(escs) == 1, (
+            f'Scenario={scenario!r} tick {threshold}: expected 1 L1; '
+            f'got {len(escs)}: {escs!r}'
+        )
+        esc = escs[0]
+        assert esc.level == 1, f'Expected level==1; got {esc.level}'
+        assert 'EXTERNAL_DEP_UNRESOLVED' in esc.summary, (
+            f'Expected EXTERNAL_DEP_UNRESOLVED prefix; got {esc.summary!r}'
+        )
