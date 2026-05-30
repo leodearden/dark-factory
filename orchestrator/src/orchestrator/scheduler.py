@@ -755,6 +755,16 @@ class Scheduler:
         self._blocked_task_ids_in_window: set[str] = set()
         # Callback installed by the Harness so trip → persistence + event.
         self._on_park_stop_trip: Callable[[str], Any] | None = None
+        # --- Cross-project external-dep escalation (task 1580) ---
+        # Callback installed by the Harness: (task_id, *, summary, detail,
+        # category) → block the task + submit L1.  Default None so bare-Harness
+        # unit tests (and park_gc) are unaffected.
+        self._on_external_dep_block: Callable[..., Any] | None = None
+        # Per-(task_id, dep_string) count of consecutive ticks where the dep
+        # resolved to a sentinel (unknown_project/unknown_task/malformed).
+        # Process-local — a scheduler restart is an acceptable implicit reset,
+        # matching _requeue_counts/_skip_count idioms above.
+        self._external_unresolved_counts: dict[tuple[str, str], int] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1417,6 +1427,134 @@ class Scheduler:
             )
             return {}, e
         return {}, None
+
+    _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
+        {'unknown_project', 'unknown_task', 'malformed'}
+    )
+
+    async def _apply_external_dep_policy(
+        self,
+        pending_tasks: list[dict],
+        external_cache: dict[str, str],
+        external_err: Exception | None,
+    ) -> None:
+        """Side-effecting pass over pending tasks' external deps.
+
+        Run ONCE per tick from ``acquire_next``.  Per-task per-dep:
+
+        - ``done`` → satisfied; no action.
+        - ``cancelled`` → invoke ``_on_external_dep_block`` immediately with
+          ``EXTERNAL_DEP_CANCELLED`` prefix (invariant 2 — strict escalation).
+        - ``unknown_project`` / ``unknown_task`` / ``malformed`` → increment the
+          per-(task, dep) unresolved counter; escalate at threshold with
+          ``EXTERNAL_DEP_UNRESOLVED`` prefix; counter resets when the dep
+          resolves to a real (non-sentinel) status.
+        - Other live status (``pending``, ``in-progress``, …) → wait silently;
+          reset the sentinel counter for that (task, dep) pair (the dep is now
+          resolvable even if not done).
+        - ``external_err is not None`` → short-circuit; no counter increment,
+          no escalation (fail-safe wait — resolver will retry next tick).
+
+        This method must NOT be called from ``_deps_satisfied`` or
+        ``_eligible_for_dispatch``.  Those are pure predicates called per-candidate;
+        side effects here would N-fire per tick.
+        """
+        if external_err is not None:
+            return  # transient resolver failure — fail-safe wait
+
+        threshold = self.config.max_external_dep_unresolved_cycles
+
+        for task in pending_tasks:
+            task_id = str(task.get('id', '?'))
+            external_deps: list = (
+                (task.get('metadata') or {}).get('external_deps') or []
+            )
+            for dep in external_deps:
+                status = external_cache.get(dep)
+
+                if status == 'done':
+                    # Satisfied — reset any accumulated sentinel counter.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
+
+                elif status == 'cancelled':
+                    # Strict immediate escalation — no counter increment.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
+                    summary = (
+                        f'EXTERNAL_DEP_CANCELLED: task {task_id} blocked — '
+                        f'external dep {dep!r} is cancelled'
+                    )
+                    detail = (
+                        f'Cross-project dep {dep!r} reached terminal status '
+                        f'cancelled.  Task {task_id} cannot proceed; it should '
+                        f'be re-architected or cancelled itself.'
+                    )
+                    if self._on_external_dep_block is not None:
+                        await self._on_external_dep_block(
+                            task_id,
+                            summary=summary,
+                            detail=detail,
+                            category='dependency_discovered',
+                        )
+                    else:
+                        logger.warning(
+                            'External dep %r cancelled for task %s — '
+                            'no _on_external_dep_block callback installed',
+                            dep,
+                            task_id,
+                        )
+
+                elif status in self._EXTERNAL_SENTINEL_STATUSES:
+                    # Unknown/malformed — grace-then-escalate counter.
+                    count = (
+                        self._external_unresolved_counts.get((task_id, dep), 0) + 1
+                    )
+                    self._external_unresolved_counts[(task_id, dep)] = count
+                    if count >= threshold:
+                        # Pop so the next crossing (if it persists) fires again.
+                        self._external_unresolved_counts.pop((task_id, dep), None)
+                        summary = (
+                            f'EXTERNAL_DEP_UNRESOLVED: task {task_id} — '
+                            f'dep {dep!r} unresolvable for {count} ticks '
+                            f'(status={status!r})'
+                        )
+                        detail = (
+                            f'Cross-project dep {dep!r} has returned sentinel '
+                            f'{status!r} for {count} consecutive ticks '
+                            f'(threshold={threshold}).  The dep string may be '
+                            f'malformed, or the referenced project/task may not '
+                            f'exist.  Task {task_id} is gated until resolved.'
+                        )
+                        if self._on_external_dep_block is not None:
+                            await self._on_external_dep_block(
+                                task_id,
+                                summary=summary,
+                                detail=detail,
+                                category='dependency_discovered',
+                            )
+                        else:
+                            logger.warning(
+                                'External dep %r unresolved x%d for task %s — '
+                                'no _on_external_dep_block callback installed',
+                                dep,
+                                count,
+                                task_id,
+                            )
+                    else:
+                        logger.debug(
+                            'Task %s: external dep %r status=%r (%d/%d ticks) — '
+                            'waiting silently',
+                            task_id,
+                            dep,
+                            status,
+                            count,
+                            threshold,
+                        )
+
+                else:
+                    # Any other live status (pending, in-progress, blocked, …):
+                    # wait silently and reset the sentinel counter so transient
+                    # blips don't accumulate.
+                    self._external_unresolved_counts.pop((task_id, dep), None)
 
     async def update_task(
         self,
