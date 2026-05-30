@@ -2919,6 +2919,68 @@ class TestGetStatusScoping:
 
 
 # ---------------------------------------------------------------------------
+# Step 9: TRACK B.2 restore hook RED tests
+# ---------------------------------------------------------------------------
+
+class TestRestoreSupersededDependencyEdges:
+    """_restore_superseded_dependency_edges must clear false dependency invalidations."""
+
+    def _make_mock_edge(self, *, uuid, fact, invalid_at=None):
+        edge = MagicMock()
+        edge.uuid = uuid
+        edge.fact = fact
+        edge.invalid_at = invalid_at
+        return edge
+
+    @pytest.mark.asyncio
+    async def test_restores_only_invalidated_dependency_edges(self, service):
+        """Only edges that are (a) invalidated AND (b) dependency facts are restored."""
+        from datetime import UTC, datetime
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        edge_a = self._make_mock_edge(
+            uuid='a', fact='Task 562 depends on Task 557', invalid_at=ts,
+        )
+        edge_b = self._make_mock_edge(
+            uuid='b', fact='Task 562 reached status done', invalid_at=ts,
+        )
+        edge_c = self._make_mock_edge(
+            uuid='c', fact='Task 563 depends on Task 558', invalid_at=None,
+        )
+
+        result = MagicMock()
+        result.edges = [edge_a, edge_b, edge_c]
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'a', 'fact': 'Task 562 depends on Task 557', 'refreshed_nodes': []}
+        )
+
+        count = await service._restore_superseded_dependency_edges(result, group_id='proj')
+        assert count == 1, f'Expected 1 restored edge, got {count}'
+        service.graphiti.update_edge.assert_called_once_with(
+            'a', group_id='proj', clear_invalid_at=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_none_result(self, service):
+        """Returns 0 and makes no calls when result is None."""
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_superseded_dependency_edges(None, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_empty_edges(self, service):
+        """Returns 0 and makes no calls when result.edges is empty."""
+        result = MagicMock()
+        result.edges = []
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_superseded_dependency_edges(result, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Step 7: TRACK B.2 _is_dependency_fact helper RED tests
 # ---------------------------------------------------------------------------
 
