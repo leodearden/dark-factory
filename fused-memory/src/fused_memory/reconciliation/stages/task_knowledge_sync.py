@@ -28,7 +28,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
-    generate_summary_nonce,
+    build_summary_nonce_section,
 )
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.prompts import (
@@ -1795,11 +1795,9 @@ class TaskKnowledgeSync(BaseStage):
         # (~0.92 threshold) that silently dropped structurally-uniform summaries in 8+
         # confirmed recurrences.  The nonce is additive: run_id, flag_id UUIDs, task IDs,
         # and uniqueness_token all remain in the prompt guidance.
-        summary_nonce_section = (
-            f'\n### Per-Cycle Summary Nonce\n'
-            f'summary_nonce: {generate_summary_nonce()}\n'
-            f'(Prepend this nonce as the FIRST line of your per-cycle summary content.)\n'
-        )
+        # Task 1574: delegated to build_summary_nonce_section() so Stage 1 and Stage 2
+        # share identical section wording and cannot silently drift.
+        summary_nonce_section = build_summary_nonce_section()
 
         # Step 5 in the Your Task block below ("append=False for hint conversion")
         # is grounded in Mem0 memory 0b0eeb8d (old-wins semantics for list-format

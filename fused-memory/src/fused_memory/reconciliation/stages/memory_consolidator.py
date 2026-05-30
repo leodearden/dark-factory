@@ -13,7 +13,10 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED, generate_summary_nonce
+from fused_memory.reconciliation.cli_stage_runner import (
+    STAGE1_DISALLOWED,
+    build_summary_nonce_section,
+)
 from fused_memory.reconciliation.flag_dedup import dedup_flags, filter_false_absence_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -381,17 +384,14 @@ Review the above data and perform memory consolidation:
     def _build_summary_nonce_section(self) -> str:
         """Return the Per-Cycle Summary Nonce payload section with a fresh CSPRNG nonce.
 
+        Delegates to the shared cli_stage_runner.build_summary_nonce_section() helper
+        so Stage 1 and Stage 2 produce identical section wording and cannot drift.
         Generates a new 8-char hex nonce on each call (secrets.token_hex(4)) so that
         consecutive per-cycle summaries embed distinctly in Mem0's vector space,
         defeating the ~0.92 cosine-similarity dedup threshold that was silently dropping
         summaries (confirmed failure: run 899d2dad, summary 1ad1d2f5; task 1574).
-        Mirrors Stage 2's nonce injection in task_knowledge_sync.py (task 1572).
         """
-        return (
-            f'\n### Per-Cycle Summary Nonce\n'
-            f'summary_nonce: {generate_summary_nonce()}\n'
-            f'(Prepend this nonce as the FIRST line of your per-cycle summary content.)\n'
-        )
+        return build_summary_nonce_section()
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""

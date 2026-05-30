@@ -119,8 +119,9 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 **Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
 `add_memory`, the content string MUST begin with the `summary_nonce` value found in \
-the "### Per-Cycle Summary Nonce" section of the payload context, formatted as the \
-FIRST LINE: `summary_nonce: <value>`. After that first line, include all of: \
+the "### Per-Cycle Summary Nonce" section of the payload context (if that section is \
+present), formatted as the FIRST LINE: `summary_nonce: <value>`. After that first \
+line (or as the first line when the nonce section is absent), include all of: \
 (1) the reconciliation `run_id` (provided in the payload context), \
 (2) the full list of flag UUIDs/markers emitted this cycle (or "none" if zero), \
 (3) Stage 1's substantive mutation IDs this cycle — memory IDs added/deleted, \
