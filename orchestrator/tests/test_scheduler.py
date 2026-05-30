@@ -2168,34 +2168,7 @@ class TestFairness:
         # And A's park was cleaned up on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
 
-    # ---- scheduler_v2 gate tests ----
-
-    @pytest.mark.asyncio
-    async def test_scheduler_v2_default_false_no_parks_installed(self):
-        """When scheduler_v2=False, parks are never installed even past threshold."""
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        config.fairness.skip_threshold = 1  # fire fast
-        config.fairness.scheduler_v2 = False
-        scheduler = Scheduler(config)
-
-        # Seed compiler/src so A always fails.
-        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
-        scheduler._dispatched.add('seed')
-
-        a = self._broad_task()
-        b = self._narrow_task('B', 'eval/src', priority='medium')
-        scheduler.get_tasks = AsyncMock(return_value=[a, b])
-
-        # Run several ticks past the threshold.
-        for _ in range(5):
-            result = await scheduler.acquire_next()
-            if result:
-                scheduler.release(result.task_id)
-
-        # Skip counter should have climbed.
-        assert scheduler._skip_count.get('A', 0) >= 1
-        # But no parks should be installed when scheduler_v2=False.
-        assert not scheduler.lock_table.has_parks('A')
+    # ---- skip-threshold park tests (unconditional since scheduler_v2 gate removed) ----
 
     @pytest.mark.asyncio
     async def test_scheduler_v2_true_installs_parks(self):

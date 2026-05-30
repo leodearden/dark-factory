@@ -1725,7 +1725,6 @@ class Scheduler:
             )
         if (
             count >= threshold
-            and self.config.fairness.scheduler_v2
             and not self.lock_table.has_parks(task_id)
         ):
             installed, evicted_pairs = self.lock_table.install_parks(task_id, modules, tier)
