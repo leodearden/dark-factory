@@ -1883,6 +1883,13 @@ def create_mcp_server(
         for dep in deps:
             # Parse: split on first colon
             project_id, sep, task_id = dep.partition(':')
+            # Validate: malformed if no colon, empty project_id, empty task_id,
+            # or task_id not a plain non-negative integer (rejects dotted subtask
+            # forms like "15.2", signs, non-numerics — mirrors add_dependency's
+            # subtask rejection).
+            if not sep or not project_id or not task_id or not task_id.isdigit():
+                result[dep] = 'malformed'
+                continue
             # Look up project_root in registry
             if project_id not in _kp:
                 result[dep] = 'unknown_project'
