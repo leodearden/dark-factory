@@ -449,3 +449,61 @@ class TestHeadlineSequencing:
         assert tick_b_result == 'T', (
             f'Tick B: upstream done → must dispatch T; got {tick_b_result!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S5 RED — row 3: cancelled upstream → human escalation, no dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCancelledUpstreamEscalation:
+    """Row 3: cancelled upstream dep → immediate L1 escalation + task blocked.
+
+    When an upstream dep reaches 'cancelled', the scheduler must:
+    1. NOT dispatch the dependent task.
+    2. Set the dependent task to 'blocked' (via set_task_status through the session).
+    3. File exactly one pending L1 escalation whose summary starts with
+       'EXTERNAL_DEP_CANCELLED'.
+    This exercises the full chain:
+      scheduler gate → _apply_external_dep_policy → _on_external_dep_block
+      → harness._block_and_escalate_external_dep → real EscalationQueue.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_upstream_escalates_not_dispatched(
+        self, tmp_path: Path
+    ) -> None:
+        """Cancelled external dep → T not dispatched, L1 filed, task blocked."""
+        harness, session = build_harness(tmp_path)
+        upstream_task_id = '7'
+        dep_string = f'{_UPSTREAM_PROJECT}:{upstream_task_id}'
+
+        register_pending_dependent_task(session, 'T', external_deps=[dep_string])
+        set_upstream_status(session, upstream_task_id, 'cancelled')
+
+        # One tick: cancelled dep must not dispatch T but must escalate.
+        tick_result = await run_tick(harness)
+
+        # (a) T must NOT be dispatched.
+        assert tick_result is None, (
+            f'Cancelled upstream → T must NOT be dispatched; got {tick_result!r}'
+        )
+
+        # (b) Exactly one pending L1 escalation for T.
+        escs = escalations_for(harness, 'T')
+        assert len(escs) == 1, (
+            f'Expected exactly 1 pending L1 for T; got {len(escs)}: {escs!r}'
+        )
+        esc = escs[0]
+        assert esc.level == 1, f'Expected level==1; got {esc.level}'
+        assert 'EXTERNAL_DEP_CANCELLED' in esc.summary, (
+            f'Expected EXTERNAL_DEP_CANCELLED prefix in summary; got {esc.summary!r}'
+        )
+
+        # (c) T's status in the dependent_tasks list must now be 'blocked'.
+        t_status = next(
+            (t['status'] for t in session.dependent_tasks if str(t.get('id')) == 'T'),
+            None,
+        )
+        assert t_status == 'blocked', (
+            f"Expected T.status=='blocked' after cancelled-dep policy; got {t_status!r}"
+        )
