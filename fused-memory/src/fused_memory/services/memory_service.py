@@ -330,6 +330,7 @@ class MemoryService:
             return 0
 
         restored = 0
+        failed = 0
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is None:
                 continue
@@ -337,15 +338,32 @@ class MemoryService:
             if not _is_dependency_fact(fact):
                 continue
             edge_uuid = getattr(edge, 'uuid', '') or ''
-            await self.graphiti.update_edge(
-                edge_uuid, group_id=group_id, clear_invalid_at=True
-            )
-            restored += 1
+            try:
+                await self.graphiti.update_edge(
+                    edge_uuid, group_id=group_id, clear_invalid_at=True
+                )
+                restored += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write.  Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to restore dependency edge %s; will retry on next episode',
+                    edge_uuid,
+                )
+                failed += 1
 
         if restored > 0:
             logger.info(
                 'Restored %d falsely-superseded dependency edge(s) after add_episode',
                 restored,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to restore %d dependency edge(s) after add_episode',
+                failed,
             )
         return restored
 
@@ -1335,7 +1353,7 @@ class MemoryService:
         safer than overcounting, so the behaviour is intentional.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
-            raise ValueError('update_edge requires fact or invalid_at to be set')
+            raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
         write_op_id = str(uuid_mod.uuid4())
 
         params: dict[str, Any] = {'edge_uuid': edge_uuid}

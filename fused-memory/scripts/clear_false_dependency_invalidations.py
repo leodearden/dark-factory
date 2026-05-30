@@ -141,6 +141,14 @@ async def _run(args: argparse.Namespace) -> int:
             logger.info(
                 'Cleared %d/%d edge(s).', report['cleared'], report['edges_total']
             )
+            # Return non-zero when apply mode had partial failures so callers
+            # and CI pipelines can detect incomplete repairs.
+            if report['cleared'] < report['edges_total']:
+                failed = report['edges_total'] - report['cleared']
+                logger.error(
+                    '%d edge(s) failed to clear — check logs for details.', failed
+                )
+                return 1
         return 0
     finally:
         if hasattr(memory, 'close'):

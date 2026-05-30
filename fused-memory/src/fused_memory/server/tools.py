@@ -1068,7 +1068,7 @@ def create_mcp_server(
             }
         if normalised_fact is None and parsed_invalid_at is None and not clear_invalid_at:
             return {
-                'error': 'update_edge requires fact or invalid_at',
+                'error': 'update_edge requires fact, invalid_at, or clear_invalid_at',
                 'error_type': 'ValidationError',
             }
         try:

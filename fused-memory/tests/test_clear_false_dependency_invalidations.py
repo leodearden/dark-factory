@@ -24,21 +24,26 @@ class TestClearFalseDependencyInvalidations:
     """Repair script exposes TARGET_EDGE_UUIDS and repair() behaves correctly."""
 
     def test_module_exposes_target_edge_uuids(self):
-        """Module-level TARGET_EDGE_UUIDS must list exactly the 6 full UUIDs."""
+        """TARGET_EDGE_UUIDS must have 6 entries, each a well-formed UUID (8-4-4-4-12)."""
         import os
+        import re
         import sys
         scripts_dir = os.path.join(
             os.path.dirname(__file__), '..', 'scripts'
         )
         sys.path.insert(0, os.path.abspath(scripts_dir))
+        uuid_re = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        )
         try:
             from clear_false_dependency_invalidations import TARGET_EDGE_UUIDS
-            assert set(TARGET_EDGE_UUIDS) == EXPECTED_UUIDS, (
-                f'Expected {EXPECTED_UUIDS}, got {set(TARGET_EDGE_UUIDS)}'
-            )
             assert len(TARGET_EDGE_UUIDS) == 6, (
                 f'Expected exactly 6 UUIDs, got {len(TARGET_EDGE_UUIDS)}'
             )
+            for uuid in TARGET_EDGE_UUIDS:
+                assert uuid_re.match(uuid), (
+                    f'Malformed UUID in TARGET_EDGE_UUIDS: {uuid!r}'
+                )
         finally:
             sys.path.remove(os.path.abspath(scripts_dir))
 

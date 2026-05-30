@@ -893,7 +893,7 @@ class TestUpdateEdge:
 
     @pytest.mark.asyncio
     async def test_update_edge_requires_fact_or_invalid_at(self, service):
-        with pytest.raises(ValueError, match='fact or invalid_at'):
+        with pytest.raises(ValueError, match='fact, invalid_at, or clear_invalid_at'):
             await service.update_edge(edge_uuid='e-1', project_id='proj')
 
     @pytest.mark.asyncio
@@ -2108,6 +2108,49 @@ class TestExecuteGraphitiWriteWithDedup:
         assert result is None
         service.graphiti.bulk_remove_edges.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_restore_hook_for_invalidated_dep_edges(self, service):
+        """_execute_graphiti_write invokes the restore hook when add_episode returns
+        an invalidated dependency edge — guards against the hook being accidentally removed.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+        dep_edge = MockEdge(
+            fact='Task 562 depends on Task 557',
+            uuid='dep-edge-1',
+            source_node_uuid='s1',
+            target_node_uuid='t1',
+        )
+        dep_edge.invalid_at = ts  # falsely superseded
+
+        mock_result = MockAddEpisodeResult(edges=[dep_edge])
+        mock_result.entity_edges = []
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'dep-edge-1', 'fact': 'Task 562 depends on Task 557',
+                          'refreshed_nodes': []}
+        )
+
+        payload = {
+            'name': 'ep_restore',
+            'content': 'Task 562 depends on Task 557',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        # The restore hook must have cleared the false invalidation
+        service.graphiti.update_edge.assert_called_once_with(
+            'dep-edge-1', group_id='test', clear_invalid_at=True
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
@@ -3061,7 +3104,7 @@ class TestUpdateEdgeClearInvalidAt:
     @pytest.mark.asyncio
     async def test_all_none_still_raises(self, service):
         """ValueError must still be raised when all three (fact/invalid_at/clear_invalid_at) are falsy."""
-        with pytest.raises(ValueError, match='fact or invalid_at'):
+        with pytest.raises(ValueError, match='fact, invalid_at, or clear_invalid_at'):
             await service.update_edge(
                 edge_uuid='e-1', project_id='proj',
                 fact=None, invalid_at=None, clear_invalid_at=False,
