@@ -5997,3 +5997,170 @@ class TestGetExternalStatuses:
         result_ok, err_ok = await scheduler.get_external_statuses(['dark_factory:5'])
         assert result_ok == {'dark_factory:5': 'done'}
         assert err_ok is None
+
+
+# ---------------------------------------------------------------------------
+# TestDepsSatisfiedExternalGate (task 1580 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestDepsSatisfiedExternalGate:
+    """Unit tests for the external-dep boolean gate added to _deps_satisfied.
+
+    The gate is PURE (no side effects, no escalation calls).  It is opt-in:
+    passing external_status_cache=None / external_resolver_failed=False (the
+    defaults) reproduces byte-identical legacy behaviour — existing tests in
+    TestDepsSatisfied remain valid without modification.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def _task_with_external_dep(self, dep: str = 'dark_factory:5') -> dict:
+        """Build a minimal pending task with one external dep."""
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+
+    # --- done → satisfied ---------------------------------------------------
+
+    def test_external_dep_done_satisfied(self, scheduler: Scheduler):
+        """External dep with status 'done' → _deps_satisfied returns True."""
+        task = self._task_with_external_dep()
+        status_map: dict[str, str] = {}
+        cache = {'dark_factory:5': 'done'}
+        assert scheduler._deps_satisfied(task, status_map, external_status_cache=cache) is True
+
+    # --- live / non-done statuses → not satisfied ---------------------------
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked'])
+    def test_external_dep_live_status_not_satisfied(
+        self, scheduler: Scheduler, status: str
+    ):
+        """External dep with a live non-done status → _deps_satisfied returns False."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': status}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- cancelled → not satisfied (strict, PRD decision 1) ----------------
+
+    def test_external_dep_cancelled_not_satisfied(self, scheduler: Scheduler):
+        """External dep with status 'cancelled' → False (strict, PRD decision 1)."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': 'cancelled'}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- sentinel statuses → not satisfied ----------------------------------
+
+    @pytest.mark.parametrize(
+        'sentinel', ['unknown_project', 'unknown_task', 'malformed']
+    )
+    def test_external_dep_sentinel_not_satisfied(
+        self, scheduler: Scheduler, sentinel: str
+    ):
+        """External dep resolving to a sentinel → _deps_satisfied returns False."""
+        task = self._task_with_external_dep()
+        cache = {'dark_factory:5': sentinel}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- dep missing from cache → not satisfied -----------------------------
+
+    def test_external_dep_missing_from_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """A dep absent from the cache → _deps_satisfied returns False (conservative)."""
+        task = self._task_with_external_dep()
+        # Cache exists but does not include 'dark_factory:5'
+        cache: dict[str, str] = {}
+        assert (
+            scheduler._deps_satisfied(task, {}, external_status_cache=cache) is False
+        )
+
+    # --- resolver_failed=True → not satisfied regardless of cache -----------
+
+    def test_external_resolver_failed_not_satisfied(self, scheduler: Scheduler):
+        """external_resolver_failed=True → False regardless of cache contents."""
+        task = self._task_with_external_dep()
+        # Cache says done — but resolver failed so we must not satisfy
+        cache = {'dark_factory:5': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, {}, external_status_cache=cache, external_resolver_failed=True
+            )
+            is False
+        )
+
+    def test_external_resolver_failed_no_cache_not_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """external_resolver_failed=True with empty cache → False."""
+        task = self._task_with_external_dep()
+        assert (
+            scheduler._deps_satisfied(
+                task, {}, external_status_cache={}, external_resolver_failed=True
+            )
+            is False
+        )
+
+    # --- backward compatibility: no external_deps → legacy behaviour --------
+
+    def test_no_external_deps_legacy_local_dep_done(self, scheduler: Scheduler):
+        """Task with no external_deps and legacy params → legacy semantics unchanged."""
+        task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {},
+        }
+        status_map = {'1': 'done'}
+        # Omitting external_status_cache / external_resolver_failed — defaults
+        assert scheduler._deps_satisfied(task, status_map) is True
+
+    def test_no_external_deps_legacy_local_dep_pending(self, scheduler: Scheduler):
+        """Task with no external_deps: local dep pending → still False (legacy)."""
+        task = {
+            'id': '2',
+            'dependencies': [{'id': 1}],
+            'metadata': {},
+        }
+        status_map = {'1': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is False
+
+    # --- mixed: local-done + external-pending → not satisfied ---------------
+
+    def test_local_done_external_pending_not_satisfied(self, scheduler: Scheduler):
+        """Local deps done but external dep 'pending' → overall not satisfied."""
+        task = {
+            'id': '10',
+            'dependencies': [{'id': '9'}],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        status_map = {'9': 'done'}
+        cache = {'dark_factory:5': 'pending'}
+        assert (
+            scheduler._deps_satisfied(task, status_map, external_status_cache=cache)
+            is False
+        )
+
+    def test_external_done_local_pending_not_satisfied(self, scheduler: Scheduler):
+        """External dep done but local dep pending → overall not satisfied."""
+        task = {
+            'id': '10',
+            'dependencies': [{'id': '9'}],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+        status_map = {'9': 'pending'}
+        cache = {'dark_factory:5': 'done'}
+        assert (
+            scheduler._deps_satisfied(task, status_map, external_status_cache=cache)
+            is False
+        )
