@@ -5935,12 +5935,12 @@ class TestGetExternalStatuses:
         _result, _err = await scheduler.get_external_statuses(['dark_factory:5'])
 
         mcp_mock.assert_called_once()
-        # The tool name must be 'get_external_statuses' (positional arg 1 of mcp_call)
-        call_args = mcp_mock.call_args[0]
-        assert call_args[1] == 'get_external_statuses', (
-            f"Expected tool name 'get_external_statuses'; got {call_args[1]!r}"
+        # mcp_call signature: (url, 'tools/call', {'name': ..., 'arguments': ...})
+        call_payload = mcp_mock.call_args[0][2]  # third positional arg
+        assert call_payload.get('name') == 'get_external_statuses', (
+            f"Expected name='get_external_statuses'; got {call_payload.get('name')!r}"
         )
-        arguments = call_args[2]['arguments']
+        arguments = call_payload['arguments']
         assert arguments.get('deps') == ['dark_factory:5'], (
             f"Expected deps=['dark_factory:5']; got {arguments!r}"
         )

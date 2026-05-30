@@ -1384,6 +1384,40 @@ class Scheduler:
             return {}, e
         return {}, None
 
+    async def get_external_statuses(
+        self, deps: list[str]
+    ) -> tuple[dict[str, str], Exception | None]:
+        """Return a ``(statuses, error)`` tuple for a list of cross-project deps.
+
+        Issues a single ``get_external_statuses`` MCP call (no ``project_root``
+        — the tool is cross-project by design).  The dep strings are passed
+        verbatim; the returned dict is keyed by those same dep strings.
+
+        Sentinels returned by the tool (``unknown_project``, ``unknown_task``,
+        ``malformed``) are surfaced as-is — the caller decides policy.
+
+        Returns:
+            ``({dep: status}, None)`` on success.
+            ``({}, exception)`` on any failure — transient raises are swallowed
+            into the error slot (fail-safe; caller should skip policy effects).
+        """
+        try:
+            arguments: dict = {'deps': list(deps)}
+            result = await self.dispatch_tool(
+                'get_external_statuses', arguments, timeout=15
+            )
+            statuses = self._parse_tool_text_result(result, 'statuses')
+            if isinstance(statuses, dict):
+                return statuses, None
+        except Exception as e:
+            logger.exception(
+                'Failed to fetch external dep statuses: %s: %s',
+                type(e).__name__,
+                e,
+            )
+            return {}, e
+        return {}, None
+
     async def update_task(
         self,
         task_id: str,
