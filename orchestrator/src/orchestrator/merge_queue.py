@@ -16,7 +16,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
-import os
+import posixpath
 import shutil
 import time
 from collections.abc import Awaitable, Callable
@@ -388,19 +388,23 @@ def _normalize_plan_path(entry: str) -> str:
     """Return a git-canonical form of a declared plan path for comparison.
 
     Strips leading ``./`` and collapses redundant separators via
-    ``os.path.normpath``.  Guards the degenerate case where normpath maps
-    ``'.'`` / ``'./'`` to ``'.'`` (the repo root), which would spuriously
-    prefix-match every touched path — in that case the original string is
-    returned so the entry falls through and is correctly flagged.
+    ``posixpath.normpath`` (always POSIX-style, regardless of host OS, so
+    the canonical form always matches git's forward-slash output).  Guards
+    the degenerate case where normpath maps ``'.'`` / ``'./'`` to ``'.'``
+    (the repo root), which would spuriously prefix-match every touched path —
+    in that case the original string is returned so the entry falls through
+    and is correctly flagged.
 
     Examples::
 
         './.jcodemunch.jsonc' → '.jcodemunch.jsonc'
         './src/a.py'          → 'src/a.py'
         './src/pkg'           → 'src/pkg'
-        'src/b.py'            → 'src/b.py'   (unchanged)
+        './src/pkg/'          → 'src/pkg'   (trailing slash collapsed)
+        'src//pkg'            → 'src/pkg'   (redundant separator collapsed)
+        'src/b.py'            → 'src/b.py'  (unchanged)
     """
-    norm = os.path.normpath(entry)
+    norm = posixpath.normpath(entry)
     # normpath maps '' / '.' / './' → '.', which denotes the repo root.
     # Empty entries are already filtered by the caller; guard '.' so it
     # can't spuriously match the repo root prefix.

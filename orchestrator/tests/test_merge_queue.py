@@ -5176,6 +5176,45 @@ class TestCheckPlanFilesTouchedInBranch:
         )
         assert result.not_touched == ['./phantom.py']
 
+    async def test_redundant_separator_and_trailing_slash_normalized(
+        self, git_ops: GitOps,
+    ):
+        """Trailing slashes and redundant separators are collapsed before matching.
+
+        Declare ``'./src/pkg/'`` (trailing slash) and ``'src//pkg'``
+        (redundant separator) when the branch touched ``'src/pkg/mod_a.py'``
+        → gate must pass for both (not_touched == []).
+
+        Pins the docstring contract: _normalize_plan_path collapses trailing
+        slashes and ``//``-style redundant separators, not just the ``./``
+        prefix.
+        """
+        wt = (await git_ops.create_worktree('plan-redundant-sep')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src' / 'pkg').mkdir(parents=True)
+        (wt / 'src' / 'pkg' / 'mod_a.py').write_text('a = 1\n')
+        await git_ops.commit(wt, 'Add src/pkg/mod_a.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        # Trailing-slash variant: './src/pkg/' normalizes to 'src/pkg'
+        result = await _check_plan_files_touched_in_branch(
+            ['./src/pkg/'], base, head, git_ops,
+            task_id='redundant-trailing-slash',
+        )
+        assert result.not_touched == [], \
+            "trailing-slash variant should be satisfied"
+
+        # Redundant-separator variant: 'src//pkg' normalizes to 'src/pkg'
+        result = await _check_plan_files_touched_in_branch(
+            ['src//pkg'], base, head, git_ops,
+            task_id='redundant-double-slash',
+        )
+        assert result.not_touched == [], \
+            "redundant-separator variant should be satisfied"
+
 
 @pytest.mark.asyncio
 class TestCheckPostMergeEquivalence:
