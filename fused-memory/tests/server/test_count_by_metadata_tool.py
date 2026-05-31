@@ -70,6 +70,12 @@ class TestCountMemoriesByMetadataTool:
         )
         assert 'error' not in result, f"Unexpected error in result: {result!r}"
 
+        # Service must have been called with the exact project_id and filters
+        mock_service.count_memories_by_metadata.assert_called_once_with(
+            project_id=_PROJECT_ID,
+            filters={'kind': 'cycle_summary', 'run_id': 'notfound'},
+        )
+
     @pytest.mark.asyncio
     async def test_invalid_project_id_returns_validation_error_without_calling_service(self):
         """Invalid project_id (contains unsafe chars) returns a validation error dict

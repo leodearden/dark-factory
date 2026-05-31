@@ -790,6 +790,13 @@ def create_mcp_server(
         Use it for deterministic existence checks where semantic ranking may miss a
         present-but-low-similarity result.
 
+        **Mem0/Qdrant-only scope:** This tool counts only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries, preferences_and_norms,
+        procedural_knowledge). It does NOT query Graphiti and will return 0 for facts
+        stored in the graph store (entities_and_relations, temporal_facts,
+        decisions_and_rationale). Do not use it to confirm the existence of
+        Graphiti-stored facts — it will silently return 0 even when those facts exist.
+
         Primary use-case: confirming whether a Stage 2 per-cycle summary exists for a
         given run_id before concluding it is missing and triggering reconstruction.
         Example call:
