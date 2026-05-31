@@ -8247,8 +8247,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert result['reported'] == 3
 
         @pytest.mark.asyncio
-        async def test_run_clamps_stage1_flags_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
-            """run() clamps stage1_flags_processed to prior_reports[0] truth and warns."""
+        async def test_run_clamps_stage1_analytical_findings_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
+            """run() clamps stage1_analytical_findings_processed to prior_reports[0] truth and warns."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
@@ -8266,7 +8266,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=_make_stage2_guard_cli_result(
-                        [], stats={'stage1_flags_processed': 3}
+                        [], stats={'stage1_analytical_findings_processed': 3}
                     )),
                 ),
                 caplog.at_level(
@@ -8281,8 +8281,10 @@ class TestTaskKnowledgeSyncStage2Guards:
                     run_id='test-run-1137-d',
                 )
 
-            # Guard 4: stage1_flags_processed clamped to 5 (truth from prior_reports)
-            assert report.stats.get('stage1_flags_processed') == 5
+            # Guard 4: stage1_analytical_findings_processed clamped to 5 (truth from prior_reports)
+            assert report.stats.get('stage1_analytical_findings_processed') == 5
+            # old key must NOT appear
+            assert 'stage1_flags_processed' not in report.stats
 
             # Guard 4: WARNING log
             target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -8290,10 +8292,10 @@ class TestTaskKnowledgeSyncStage2Guards:
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(guard_logs) == 1, (
-                f'expected one stage1_flags_processed_mismatch WARNING, got {len(guard_logs)}'
+                f'expected one stage1_analytical_findings_processed_mismatch WARNING, got {len(guard_logs)}'
             )
             rec = guard_logs[0]
             assert getattr(rec, 'expected', None) == 5
@@ -8337,7 +8339,7 @@ class TestTaskKnowledgeSyncStage2Guards:
               (a) terminal-state update_task violation (task 42 -> done)
               (b) set_task_status post-action mismatch (task 7: target=done, live=pending)
               (c) stall-guard freshness violation (task 11: snapshot=in-progress, live=done)
-            Stats seed: tasks_modified=5, memories_written=3, stage1_flags_processed=1
+            Stats seed: tasks_modified=5, memories_written=3, stage1_analytical_findings_processed=1
             Stage 1 prior report: 4 items_flagged -> Guard 4 expects 4, reported 1 -> mismatch.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
@@ -8407,7 +8409,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                         stats={
                             'tasks_modified': 5,
                             'memories_written': 3,
-                            'stage1_flags_processed': 1,
+                            'stage1_analytical_findings_processed': 1,
                         },
                     )),
                 ),
@@ -8437,8 +8439,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             # Guard 2: stall_guard_freshness_violations=1
             assert report.stats.get('stall_guard_freshness_violations') == 1
 
-            # Guard 4: stage1_flags_processed clamped to 4 (truth from prior_reports)
-            assert report.stats.get('stage1_flags_processed') == 4
+            # Guard 4: stage1_analytical_findings_processed clamped to 4 (truth from prior_reports)
+            assert report.stats.get('stage1_analytical_findings_processed') == 4
 
             # Exactly four structured log records (one per guard):
             # 1 INFO skipped_done_task
@@ -8472,15 +8474,15 @@ class TestTaskKnowledgeSyncStage2Guards:
                 f'expected 1 stall_guard_freshness_violation WARNING, got {len(freshness_logs)}'
             )
 
-            # 1 WARNING stage1_flags_processed_mismatch
+            # 1 WARNING stage1_analytical_findings_processed_mismatch
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1, (
-                f'expected 1 stage1_flags_processed_mismatch WARNING, got {len(flag_logs)}'
+                f'expected 1 stage1_analytical_findings_processed_mismatch WARNING, got {len(flag_logs)}'
             )
 
         @pytest.mark.asyncio
@@ -8513,7 +8515,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                         [],
                         stats={
                             'tasks_modified': 5,
-                            'stage1_flags_processed': 1,
+                            'stage1_analytical_findings_processed': 1,
                         },
                     )),
                 ),
@@ -8539,16 +8541,16 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert report.stats.get('tasks_modified') == 5
 
             # Guard 4 must still fire (pure stats arithmetic, no write_journal dependency)
-            assert report.stats.get('stage1_flags_processed') == 4  # clamped to truth
+            assert report.stats.get('stage1_analytical_findings_processed') == 4  # clamped to truth
 
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1, (
-                f'expected 1 stage1_flags_processed_mismatch WARNING even with null journal, '
+                f'expected 1 stage1_analytical_findings_processed_mismatch WARNING even with null journal, '
                 f'got {len(flag_logs)}'
             )
 
@@ -8574,7 +8576,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=self._make_cli_result(
                         [],
-                        stats={'tasks_modified': 2, 'stage1_flags_processed': 0},
+                        stats={'tasks_modified': 2, 'stage1_analytical_findings_processed': 0},
                     )),
                 ),
                 caplog.at_level(
@@ -8593,12 +8595,12 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert 'not_applicable_count' not in report.stats
             assert 'set_task_status_post_action_mismatches' not in report.stats
             assert 'stall_guard_freshness_violations' not in report.stats
-            # Guard 4 fires: stage1_flags_processed clamped from 0 to 3
-            assert report.stats.get('stage1_flags_processed') == 3
+            # Guard 4 fires: stage1_analytical_findings_processed clamped from 0 to 3
+            assert report.stats.get('stage1_analytical_findings_processed') == 3
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1
 
@@ -8629,7 +8631,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=self._make_cli_result(
                         [],
-                        stats={'tasks_modified': 1, 'stage1_flags_processed': 0},
+                        stats={'tasks_modified': 1, 'stage1_analytical_findings_processed': 0},
                     )),
                 ),
                 caplog.at_level(
@@ -8659,7 +8661,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert 'set_task_status_post_action_mismatches' not in report.stats
             assert 'stall_guard_freshness_violations' not in report.stats
             # Guard 4 still fires
-            assert report.stats.get('stage1_flags_processed') == 2
+            assert report.stats.get('stage1_analytical_findings_processed') == 2
 
         @pytest.mark.asyncio
         async def test_cache_build_failure_no_false_positives(
