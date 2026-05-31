@@ -1435,7 +1435,7 @@ class TaskKnowledgeSync(BaseStage):
         flag_check = _check_flag_counter_completeness(report.stats, prior_reports)
         if flag_check['mismatch']:
             logger.warning(
-                'reconciliation.stage1_flags_processed_mismatch',
+                'reconciliation.stage1_analytical_findings_processed_mismatch',
                 extra={
                     'run_id': run_id,
                     'project_id': self.project_id,
@@ -1444,7 +1444,7 @@ class TaskKnowledgeSync(BaseStage):
                 },
             )
             # Clamp to truth so downstream verifiers see the real picture.
-            report.stats['stage1_flags_processed'] = flag_check['expected']
+            report.stats['stage1_analytical_findings_processed'] = flag_check['expected']
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
