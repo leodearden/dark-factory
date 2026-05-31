@@ -5071,6 +5071,111 @@ class TestCheckPlanFilesTouchedInBranch:
         )
         assert result.not_touched == ['phantom/typo.py']
 
+    # ------------------------------------------------------------------
+    # ./-prefixed declared plan path regression tests (task 1587)
+    # ------------------------------------------------------------------
+
+    async def test_dot_slash_prefixed_root_file_is_satisfied(
+        self, git_ops: GitOps,
+    ):
+        """Exact 4099 repro: declare './.jcodemunch.jsonc' when the branch
+        touched '.jcodemunch.jsonc' → gate must pass (not_touched == []).
+
+        RED before fix: literal membership check misses because
+        './.jcodemunch.jsonc' != '.jcodemunch.jsonc', and the blob-type
+        ls-tree result has no ' tree ' so the entry falls through to
+        not_touched.
+        """
+        wt = (await git_ops.create_worktree('plan-dot-slash-root')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / '.jcodemunch.jsonc').write_text('{"a": 1}\n')
+        await git_ops.commit(wt, 'Add .jcodemunch.jsonc')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['./.jcodemunch.jsonc'], base, head, git_ops,
+            task_id='dot-slash-root',
+        )
+        assert result.not_touched == []
+
+    async def test_dot_slash_prefixed_subdir_file_is_satisfied(
+        self, git_ops: GitOps,
+    ):
+        """Declare './src/a.py' when the branch touched 'src/a.py'
+        → gate must pass (not_touched == []).
+
+        RED before fix: literal membership check misses because
+        './src/a.py' != 'src/a.py'.
+        """
+        wt = (await git_ops.create_worktree('plan-dot-slash-subdir')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src').mkdir()
+        (wt / 'src' / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt, 'Add src/a.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['./src/a.py'], base, head, git_ops,
+            task_id='dot-slash-subdir',
+        )
+        assert result.not_touched == []
+
+    async def test_dot_slash_prefixed_directory_is_satisfied(
+        self, git_ops: GitOps,
+    ):
+        """Declare './src/pkg' when the branch touched 'src/pkg/mod_a.py'
+        → gate must pass (not_touched == []).
+
+        RED before fix: the directory prefix is built as './src/pkg/' which
+        fails to prefix-match the un-prefixed touched path 'src/pkg/mod_a.py'.
+        """
+        wt = (await git_ops.create_worktree('plan-dot-slash-dir')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src' / 'pkg').mkdir(parents=True)
+        (wt / 'src' / 'pkg' / 'mod_a.py').write_text('a = 1\n')
+        await git_ops.commit(wt, 'Add src/pkg/mod_a.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['./src/pkg'], base, head, git_ops,
+            task_id='dot-slash-dir',
+        )
+        assert result.not_touched == []
+
+    async def test_dot_slash_prefixed_untouched_entry_still_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Declare './phantom.py' when the branch touched only 'real.py'
+        → must still be flagged with the ORIGINAL declared path preserved.
+
+        No-false-negative guard: normalization must not cause a spurious
+        match.  Also pins the contract that not_touched preserves the
+        architect's declared string (not a rewritten form).
+        """
+        wt = (await git_ops.create_worktree('plan-dot-slash-phantom')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'real.py').write_text('r = 1\n')
+        await git_ops.commit(wt, 'Add real.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['./phantom.py'], base, head, git_ops,
+            task_id='dot-slash-phantom',
+        )
+        assert result.not_touched == ['./phantom.py']
+
 
 @pytest.mark.asyncio
 class TestCheckPostMergeEquivalence:
