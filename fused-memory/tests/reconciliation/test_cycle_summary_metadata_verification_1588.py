@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import pytest
 
+from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
 
 class TestStage2ProducerMetadataInstruction:
@@ -64,4 +66,56 @@ class TestStage2ProducerMetadataInstruction:
         )
         assert 'run_id' in section_text, (
             "The Per-Cycle Summary section must mention 'run_id' in the metadata instruction."
+        )
+
+
+class TestStage3VerifierPrompt:
+    """Stage 3 must list the new count tool and document two-path cycle-summary verification."""
+
+    def test_stage3_prompt_lists_count_memories_by_metadata_tool(self):
+        """STAGE3_SYSTEM_PROMPT must list mcp__fused-memory__count_memories_by_metadata
+        under Available Tools so the agent knows it can use it."""
+        assert 'mcp__fused-memory__count_memories_by_metadata' in STAGE3_SYSTEM_PROMPT, (
+            "STAGE3_SYSTEM_PROMPT must include 'mcp__fused-memory__count_memories_by_metadata' "
+            "in the Available Tools section so Stage 3 knows the tool is accessible."
+        )
+
+    def test_stage3_prompt_contains_cycle_summary_verification_section(self):
+        """STAGE3_SYSTEM_PROMPT must contain a two-path cycle-summary verification section."""
+        prompt = STAGE3_SYSTEM_PROMPT
+        # Must mention semantic search as Path 1
+        assert 'cycle' in prompt.lower() and 'summary' in prompt.lower(), (
+            "STAGE3_SYSTEM_PROMPT must reference cycle summary verification."
+        )
+        # Must mention the metadata-keyed query with kind='cycle_summary' and run_id
+        assert 'cycle_summary' in prompt, (
+            "STAGE3_SYSTEM_PROMPT must reference {'kind':'cycle_summary'} in the "
+            "metadata-keyed verification path."
+        )
+        assert 'count_memories_by_metadata' in prompt, (
+            "STAGE3_SYSTEM_PROMPT must reference count_memories_by_metadata for Path 2."
+        )
+
+    def test_stage3_prompt_declares_both_paths_empty_rule(self):
+        """STAGE3_SYSTEM_PROMPT must state the summary is declared missing only when
+        BOTH paths return nothing (or equivalent wording)."""
+        prompt = STAGE3_SYSTEM_PROMPT
+        # The prompt must explicitly mention that BOTH paths must come up empty
+        # before reporting the summary as missing.
+        has_both_rule = (
+            'both' in prompt.lower()
+            and ('path' in prompt.lower() or 'search' in prompt.lower())
+        )
+        assert has_both_rule, (
+            "STAGE3_SYSTEM_PROMPT must state that the summary is declared missing only "
+            "when BOTH the semantic search path AND the metadata-count path return nothing."
+        )
+
+    def test_stage3_disallowed_does_not_contain_count_memories_by_metadata(self):
+        """Regression guard: mcp__fused-memory__count_memories_by_metadata must NOT be
+        in STAGE3_DISALLOWED so it stays auto-allowed in Stage 3's read-only mode."""
+        assert 'mcp__fused-memory__count_memories_by_metadata' not in STAGE3_DISALLOWED, (
+            "'mcp__fused-memory__count_memories_by_metadata' must NOT be in STAGE3_DISALLOWED — "
+            "it is a read-only tool that Stage 3 must be able to use for metadata-keyed "
+            "cycle-summary existence checks."
         )
