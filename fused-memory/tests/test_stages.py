@@ -8194,7 +8194,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [prior_report])
             assert result['expected'] == 5
             assert result['reported'] == 3
             assert result['mismatch'] is True
@@ -8207,14 +8207,14 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 5}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 5}, [prior_report])
             assert result['expected'] == 5
             assert result['reported'] == 5
             assert result['mismatch'] is False
 
         def test_unit_empty_prior_reports_no_mismatch(self):
             """No prior reports -> expected=0, mismatch=False."""
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [])
             assert result['expected'] == 0
             assert result['reported'] == 3
             assert result['mismatch'] is False
@@ -8241,7 +8241,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [prior_report])
             assert result['mismatch'] is False
             assert result['expected'] == 0  # no baseline used
             assert result['reported'] == 3
