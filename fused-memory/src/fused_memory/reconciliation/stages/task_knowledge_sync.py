@@ -1446,6 +1446,13 @@ class TaskKnowledgeSync(BaseStage):
             # Clamp to truth so downstream verifiers see the real picture.
             report.stats['stage1_analytical_findings_processed'] = flag_check['expected']
 
+        # Normalize: ensure both Stage 2 counters are always present in stats so
+        # Stage 3's audit sees a deterministic, present pair via recon_report's
+        # free-form stats passthrough.  setdefault preserves any agent-reported
+        # value (including a clamped analytical value written above).
+        report.stats.setdefault('stage1_analytical_findings_processed', 0)
+        report.stats.setdefault('stage1_mem0_flags_processed', 0)
+
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
 
