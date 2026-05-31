@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
@@ -118,4 +119,66 @@ class TestStage3VerifierPrompt:
             "'mcp__fused-memory__count_memories_by_metadata' must NOT be in STAGE3_DISALLOWED — "
             "it is a read-only tool that Stage 3 must be able to use for metadata-keyed "
             "cycle-summary existence checks."
+        )
+
+
+class TestStage1PreCheckExtension:
+    """Stage 1 'Pre-Check: Already-Reconstructed Stage 2 Summaries' block must be
+    extended with the metadata-keyed Path 2 and the both-empty rule."""
+
+    def test_stage1_precheck_references_count_memories_by_metadata(self):
+        """STAGE1_SYSTEM_PROMPT must reference mcp__fused-memory__count_memories_by_metadata
+        in the 'Pre-Check: Already-Reconstructed Stage 2 Summaries' block."""
+        assert 'count_memories_by_metadata' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must reference 'count_memories_by_metadata' in the "
+            "Pre-Check: Already-Reconstructed Stage 2 Summaries section to document "
+            "the metadata-keyed second verification path."
+        )
+
+    def test_stage1_precheck_references_cycle_summary_metadata_key(self):
+        """STAGE1_SYSTEM_PROMPT must reference {'kind':'cycle_summary','run_id':<run_id>}
+        as the filter for the metadata-keyed Path 2 in the pre-check."""
+        assert 'cycle_summary' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must reference 'cycle_summary' as the metadata kind "
+            "filter for the metadata-keyed pre-check path."
+        )
+
+    def test_stage1_precheck_declares_both_paths_empty_rule(self):
+        """STAGE1_SYSTEM_PROMPT pre-check must state that the missing-summary finding
+        is emitted only when BOTH the semantic search AND the metadata count come up empty."""
+        prompt = STAGE1_SYSTEM_PROMPT
+        # Find the pre-check section
+        precheck_idx = prompt.find('Pre-Check: Already-Reconstructed Stage 2 Summaries')
+        assert precheck_idx != -1, (
+            "STAGE1_SYSTEM_PROMPT must contain the "
+            "'Pre-Check: Already-Reconstructed Stage 2 Summaries' block."
+        )
+        precheck_text = prompt[precheck_idx:]
+        has_both_rule = (
+            'both' in precheck_text.lower()
+            and ('path' in precheck_text.lower() or 'empty' in precheck_text.lower())
+        )
+        assert has_both_rule, (
+            "The Stage 1 pre-check block must state that a missing-summary finding is "
+            "emitted only when BOTH the semantic search and the metadata count return nothing."
+        )
+
+    def test_stage1_precheck_instructs_tool_error_skip_reconstruction(self):
+        """STAGE1_SYSTEM_PROMPT must instruct that a count_memories_by_metadata tool error
+        means inconclusive — do not reconstruct (conservative/fail-safe semantics)."""
+        prompt = STAGE1_SYSTEM_PROMPT
+        precheck_idx = prompt.find('Pre-Check: Already-Reconstructed Stage 2 Summaries')
+        assert precheck_idx != -1
+        precheck_text = prompt[precheck_idx:]
+        # The precheck must say something about tool error → skip reconstruction
+        has_error_caveat = (
+            'error' in precheck_text.lower()
+            and ('inconclusive' in precheck_text.lower() or 'skip' in precheck_text.lower()
+                 or 'not reconstruct' in precheck_text.lower()
+                 or 'do not reconstruct' in precheck_text.lower())
+        )
+        assert has_error_caveat, (
+            "Stage 1 pre-check must instruct that a count tool error means inconclusive "
+            "and that reconstruction should be skipped (fail-safe: avoid false-positive "
+            "reconstruction)."
         )
