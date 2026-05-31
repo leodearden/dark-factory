@@ -8301,6 +8301,93 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert getattr(rec, 'expected', None) == 5
             assert getattr(rec, 'reported', None) == 3
 
+        @pytest.mark.asyncio
+        async def test_run_both_counters_default_to_zero_when_absent(self, stage2_guard_mock_deps, caplog):
+            """When agent emits neither counter, run() ensures both default to 0.
+
+            A memory_consolidator prior with 0 items_flagged means no mismatch;
+            both stage1_analytical_findings_processed and stage1_mem0_flags_processed
+            must be present in report.stats with value 0 even if the agent omitted them.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[],  # 0 items → expected=0, no mismatch
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={}  # agent emits neither counter
+                    )),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-norm-both-default',
+                )
+
+            assert report.stats.get('stage1_analytical_findings_processed') == 0, (
+                'stage1_analytical_findings_processed must default to 0'
+            )
+            assert report.stats.get('stage1_mem0_flags_processed') == 0, (
+                'stage1_mem0_flags_processed must default to 0'
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_mem0_counter_agent_value_preserved(self, stage2_guard_mock_deps, caplog):
+            """Agent-reported stage1_mem0_flags_processed is NOT overwritten.
+
+            When the agent emits stage1_mem0_flags_processed=4 and there is no
+            mismatch on stage1_analytical_findings_processed (0-item prior, 0 reported),
+            run() must preserve the agent value of 4 and ensure
+            stage1_analytical_findings_processed is present as 0.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[],  # 0 items → no analytical mismatch
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={'stage1_mem0_flags_processed': 4}
+                    )),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-norm-mem0-preserved',
+                )
+
+            assert report.stats.get('stage1_mem0_flags_processed') == 4, (
+                'agent-reported stage1_mem0_flags_processed must not be overwritten'
+            )
+            assert report.stats.get('stage1_analytical_findings_processed') == 0, (
+                'stage1_analytical_findings_processed must default to 0 (no mismatch)'
+            )
+
     class TestComposition:
         """All four guards fire in a single stage.run() invocation."""
 
