@@ -173,6 +173,18 @@ class TestDisallowedToolLists:
         """
         assert 'mcp__fused-memory__add_subtask' in STAGE2_DISALLOWED
 
+    def test_count_memories_by_metadata_not_in_stage3_disallowed(self):
+        """Pin count_memories_by_metadata as auto-allowed (read-only) in Stage 3.
+
+        count_memories_by_metadata is a read-only exact-count tool used by Stage 3
+        for the metadata-keyed Path 2 of cycle-summary verification.  It must NOT
+        appear in STAGE3_DISALLOWED so that Stage 3 agents can call it without
+        restriction.  This guard catches accidental future addition to any of the
+        DISALLOW_MEMORY_WRITES, DISALLOW_TASK_WRITES, or DISALLOW_BUILTIN lists
+        that compose STAGE3_DISALLOWED.
+        """
+        assert 'mcp__fused-memory__count_memories_by_metadata' not in STAGE3_DISALLOWED
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""

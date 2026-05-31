@@ -778,6 +778,62 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def count_memories_by_metadata(
+        project_id: str,
+        filters: dict,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Count memories matching exact metadata equality filters (deterministic, not semantic).
+
+        Unlike ``search``, this tool does NOT rank by vector similarity — it queries
+        Qdrant's count API with a direct payload filter, returning an exact integer count.
+        Use it for deterministic existence checks where semantic ranking may miss a
+        present-but-low-similarity result.
+
+        **Mem0/Qdrant-only scope:** This tool counts only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries, preferences_and_norms,
+        procedural_knowledge). It does NOT query Graphiti and will return 0 for facts
+        stored in the graph store (entities_and_relations, temporal_facts,
+        decisions_and_rationale). Do not use it to confirm the existence of
+        Graphiti-stored facts — it will silently return 0 even when those facts exist.
+
+        Primary use-case: confirming whether a Stage 2 per-cycle summary exists for a
+        given run_id before concluding it is missing and triggering reconstruction.
+        Example call:
+            count_memories_by_metadata(
+                project_id="dark_factory",
+                filters={"kind": "cycle_summary", "run_id": "<run_id>"},
+            )
+        A return value > 0 means the summary is present; 0 means it was not found by
+        metadata key (legacy summaries lacking metadata.run_id will return 0 — fall back
+        to semantic search as Path 1).
+
+        This tool is intentionally read-only and is NOT included in any DISALLOW_* list,
+        so it is auto-allowed in Stage 3's read-only integrity-check mode.
+
+        Args:
+            project_id: Project scope (required)
+            filters: Exact metadata key-value pairs to match (e.g. {'kind': 'cycle_summary', 'run_id': '...'})
+        """
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            count = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters=filters,
+            )
+            return {
+                'count': count,
+                'project_id': project_id,
+                'filters': filters,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'count_memories_by_metadata error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_entity(
         name: str,
         project_id: str,

@@ -21,6 +21,9 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__get_tasks` — list all tasks
 - `mcp__fused-memory__get_task` — get a single task by ID
+- `mcp__fused-memory__count_memories_by_metadata` — deterministic exact-count query \
+  against Qdrant metadata payload (not semantic); use for existence checks such as \
+  confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>}}`
 
 You do NOT have write or mutation tools.
 
@@ -58,6 +61,34 @@ Instead of an `affected_ids` list, attach typed citations via the recon_report t
 The harness assembles all findings into a `flagged_items` array in the final report. \
 Do NOT emit a structured JSON response — use `mcp__recon-report__add_finding` for each \
 finding (see Report Channel below).
+
+## Cycle-Summary Verification (two-path)
+Before reporting a Stage 2 per-cycle summary as missing for a given run, use BOTH \
+of the following paths — declare the summary missing ONLY if BOTH return nothing:
+
+**Path 1 — General semantic search** (existing approach): \
+`mcp__fused-memory__search(query="run_id: <run_id>", project_id=..., \
+categories=['observations_and_summaries'], stores=['mem0'], limit=10)` \
+Inspect results whose content contains `run_id: <run_id>`.
+
+**Path 2 — Metadata-keyed existence count** (new, deterministic): \
+`mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'kind': 'cycle_summary', 'run_id': '<run_id>'}})` \
+A return value > 0 means the summary is present. This path catches summaries that \
+semantic search misses due to low cosine-similarity ranking — confirmed false negative: \
+run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71 and never surfaced in 6-angle \
+general searches, triggering wasteful reconstruction (task 1588).
+
+**Decision rule**: if EITHER path finds the summary, do NOT report it as missing. \
+Only report the summary as missing when BOTH Path 1 returns no matching content AND \
+Path 2 returns count=0. \
+**Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
+unavailable), treat as inconclusive and do NOT report the summary as missing — the \
+documented harm is false-positive reconstruction, so bias toward not reconstructing on \
+uncertainty. Note the tool error in your cycle report instead.
+
+Legacy summaries written before task 1588 lack `metadata.run_id`, so Path 2 returns 0 \
+for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {_RECON_REPORT_TOOL_GUIDANCE}

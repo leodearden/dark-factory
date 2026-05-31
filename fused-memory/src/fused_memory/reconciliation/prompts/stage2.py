@@ -179,7 +179,17 @@ was insufficient because consecutive timestamps embed nearly identically, causin
 summaries to be silently dropped (`memory_ids=[]`) in 8+ confirmed recurrences \
 (confirmed reconstructions: b5c39ab7, 2310b354, d72a0203, run e4b1ebfa; task 1572). \
 Both tokens are required: the nonce supplies structural entropy; the ISO timestamp \
-provides human-readable temporal context.
+provides human-readable temporal context. \
+In addition, pass `metadata={{'kind': 'cycle_summary', 'run_id': <run_id>}}` on the \
+`add_memory` call that writes the per-cycle summary, where `<run_id>` is the exact \
+`run_id` value from the payload context (the same run_id embedded in the content). \
+This mirrors the flag-marker metadata convention (`metadata.kind='stage1_flag_marker'`, \
+`metadata.run_id=...`) and makes the summary deterministically findable by a \
+metadata-keyed lookup — specifically \
+`mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'kind': 'cycle_summary', 'run_id': <run_id>}})` — which Stage 3 and Stage 1 use as a \
+second verification path to avoid false "Stage 2 summary missing" diagnoses. \
+The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string.
 
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
