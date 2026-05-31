@@ -523,12 +523,13 @@ def _check_flag_counter_completeness(
     report_stats: dict,
     prior_reports: list[StageReport],
 ) -> dict:
-    """Compare ``report.stats['stage1_flags_processed']`` against Stage 1's truth.
+    """Compare ``report.stats['stage1_analytical_findings_processed']`` against Stage 1's truth.
 
     Stage 1 (memory_consolidator) emits ``StageReport.items_flagged`` — the
-    definitive list of flags it raised for Stage 2 to process.  This guard
-    compares that ground-truth count against whatever Stage 2 self-reported in
-    ``stats['stage1_flags_processed']``.
+    definitive list of structured analytical flags it raised for Stage 2 to
+    review.  This guard compares that ground-truth count against whatever
+    Stage 2 self-reported in ``stats['stage1_analytical_findings_processed']``
+    (the count of Stage 1 flagged_items that Stage 2 actually reviewed).
 
     Pure stats-arithmetic — no taskmaster calls, no I/O.
 
@@ -546,7 +547,7 @@ def _check_flag_counter_completeness(
         ``mismatch`` is ``True`` only when a Stage 1 baseline exists and
         ``reported != expected``.
     """
-    reported = report_stats.get('stage1_flags_processed', 0)
+    reported = report_stats.get('stage1_analytical_findings_processed', 0)
     if not prior_reports:
         return {'expected': 0, 'reported': reported, 'mismatch': False}
 
