@@ -16,6 +16,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
+import os
 import shutil
 import time
 from collections.abc import Awaitable, Callable
@@ -383,6 +384,29 @@ async def _check_plan_targets_in_tree(
     return DropGuardResult(dropped=real_drops)
 
 
+def _normalize_plan_path(entry: str) -> str:
+    """Return a git-canonical form of a declared plan path for comparison.
+
+    Strips leading ``./`` and collapses redundant separators via
+    ``os.path.normpath``.  Guards the degenerate case where normpath maps
+    ``'.'`` / ``'./'`` to ``'.'`` (the repo root), which would spuriously
+    prefix-match every touched path — in that case the original string is
+    returned so the entry falls through and is correctly flagged.
+
+    Examples::
+
+        './.jcodemunch.jsonc' → '.jcodemunch.jsonc'
+        './src/a.py'          → 'src/a.py'
+        './src/pkg'           → 'src/pkg'
+        'src/b.py'            → 'src/b.py'   (unchanged)
+    """
+    norm = os.path.normpath(entry)
+    # normpath maps '' / '.' / './' → '.', which denotes the repo root.
+    # Empty entries are already filtered by the caller; guard '.' so it
+    # can't spuriously match the repo root prefix.
+    return entry if norm == '.' else norm
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -417,19 +441,24 @@ async def _check_plan_files_touched_in_branch(
     for entry in plan_files:
         if not entry:
             continue
-        if entry in touched_set:
+        # Normalize the declared path to git-canonical form (strip leading ./)
+        # before comparison.  The touched_set is already canonical git output.
+        # Keep the original `entry` for diagnostics so the escalation message
+        # reflects exactly what the architect wrote in plan.json.
+        norm = _normalize_plan_path(entry)
+        if norm in touched_set:
             continue
 
         # Directory match: ask the branch tree what kind of object the
         # entry names.  ``git ls-tree`` prints "<mode> tree <sha>\t<path>"
         # for directories and "<mode> blob <sha>\t<path>" for files.
         rc, ls_out, ls_err = await _run(
-            ['git', 'ls-tree', branch_head, '--', entry],
+            ['git', 'ls-tree', branch_head, '--', norm],
             cwd=git_ops.project_root,
         )
         if rc == 0 and ls_out.strip() and ' tree ' in ls_out:
             # Directory: prefix-match against the touched set.
-            prefix = entry.rstrip('/') + '/'
+            prefix = norm.rstrip('/') + '/'
             if any(t.startswith(prefix) for t in touched_set):
                 continue
 
