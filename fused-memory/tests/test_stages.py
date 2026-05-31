@@ -36,6 +36,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _check_flag_counter_completeness,
+    _check_mem0_flag_counter_completeness,
     _check_stall_guard_freshness,
     _classify_terminal_state_violations,
     _format_flagged,
@@ -8194,7 +8195,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [prior_report])
             assert result['expected'] == 5
             assert result['reported'] == 3
             assert result['mismatch'] is True
@@ -8207,14 +8208,14 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 5}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 5}, [prior_report])
             assert result['expected'] == 5
             assert result['reported'] == 5
             assert result['mismatch'] is False
 
         def test_unit_empty_prior_reports_no_mismatch(self):
             """No prior reports -> expected=0, mismatch=False."""
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [])
             assert result['expected'] == 0
             assert result['reported'] == 3
             assert result['mismatch'] is False
@@ -8241,14 +8242,49 @@ class TestTaskKnowledgeSyncStage2Guards:
                 completed_at=datetime.now(tz=UTC),
                 items_flagged=[{'id': str(i)} for i in range(5)],
             )
-            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            result = _check_flag_counter_completeness({'stage1_analytical_findings_processed': 3}, [prior_report])
             assert result['mismatch'] is False
             assert result['expected'] == 0  # no baseline used
             assert result['reported'] == 3
 
+        def test_unit_falls_back_to_old_key_for_compat(self):
+            """Backward-compat: stage1_flags_processed is used when new key is absent.
+
+            An in-flight or cached Stage 2 agent may still emit the pre-rename key
+            (stage1_flags_processed) from task 1589.  The guard must read it and report
+            the correct value rather than defaulting to 0 and generating a spurious mismatch.
+            """
+            prior_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+            # Only old key present, new key absent
+            result = _check_flag_counter_completeness({'stage1_flags_processed': 5}, [prior_report])
+            assert result['reported'] == 5
+            assert result['expected'] == 5
+            assert result['mismatch'] is False
+
+        def test_unit_new_key_takes_precedence_over_old_key(self):
+            """New key stage1_analytical_findings_processed takes precedence over the old key."""
+            prior_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+            # Both keys present: new key (3) wins over old key (5)
+            result = _check_flag_counter_completeness(
+                {'stage1_analytical_findings_processed': 3, 'stage1_flags_processed': 5},
+                [prior_report],
+            )
+            assert result['reported'] == 3
+            assert result['mismatch'] is True
+
         @pytest.mark.asyncio
-        async def test_run_clamps_stage1_flags_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
-            """run() clamps stage1_flags_processed to prior_reports[0] truth and warns."""
+        async def test_run_clamps_stage1_analytical_findings_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
+            """run() clamps stage1_analytical_findings_processed to prior_reports[0] truth and warns."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
@@ -8266,7 +8302,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=_make_stage2_guard_cli_result(
-                        [], stats={'stage1_flags_processed': 3}
+                        [], stats={'stage1_analytical_findings_processed': 3}
                     )),
                 ),
                 caplog.at_level(
@@ -8281,8 +8317,10 @@ class TestTaskKnowledgeSyncStage2Guards:
                     run_id='test-run-1137-d',
                 )
 
-            # Guard 4: stage1_flags_processed clamped to 5 (truth from prior_reports)
-            assert report.stats.get('stage1_flags_processed') == 5
+            # Guard 4: stage1_analytical_findings_processed clamped to 5 (truth from prior_reports)
+            assert report.stats.get('stage1_analytical_findings_processed') == 5
+            # old key must NOT appear
+            assert 'stage1_flags_processed' not in report.stats
 
             # Guard 4: WARNING log
             target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -8290,14 +8328,334 @@ class TestTaskKnowledgeSyncStage2Guards:
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(guard_logs) == 1, (
-                f'expected one stage1_flags_processed_mismatch WARNING, got {len(guard_logs)}'
+                f'expected one stage1_analytical_findings_processed_mismatch WARNING, got {len(guard_logs)}'
             )
             rec = guard_logs[0]
             assert getattr(rec, 'expected', None) == 5
             assert getattr(rec, 'reported', None) == 3
+
+        @pytest.mark.asyncio
+        async def test_run_both_counters_default_to_zero_when_absent(self, stage2_guard_mock_deps, caplog):
+            """When agent emits neither counter, run() ensures both default to 0.
+
+            A memory_consolidator prior with 0 items_flagged means no mismatch;
+            both stage1_analytical_findings_processed and stage1_mem0_flags_processed
+            must be present in report.stats with value 0 even if the agent omitted them.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[],  # 0 items → expected=0, no mismatch
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={}  # agent emits neither counter
+                    )),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-norm-both-default',
+                )
+
+            assert report.stats.get('stage1_analytical_findings_processed') == 0, (
+                'stage1_analytical_findings_processed must default to 0'
+            )
+            assert report.stats.get('stage1_mem0_flags_processed') == 0, (
+                'stage1_mem0_flags_processed must default to 0'
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_mem0_counter_agent_value_preserved(self, stage2_guard_mock_deps, caplog):
+            """Agent-reported stage1_mem0_flags_processed is NOT overwritten.
+
+            When the agent emits stage1_mem0_flags_processed=4 backed by 4
+            flag_deleted_records, and there is no mismatch on
+            stage1_analytical_findings_processed (0-item prior, 0 reported),
+            run() must preserve the agent value of 4 and ensure
+            stage1_analytical_findings_processed is present as 0.
+
+            Guard 4b cross-checks stage1_mem0_flags_processed against the count
+            of flag_deleted action records in stats['flag_deleted_records'], so the
+            records list must match the counter for the value to be preserved.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[],  # 0 items → no analytical mismatch
+            )
+
+            # 4 flag_deleted records to match stage1_mem0_flags_processed=4
+            flag_records = [
+                {'action': 'flag_deleted', 'flag_id': f'flag-{i}', 'reason': 'processed'}
+                for i in range(4)
+            ]
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={
+                            'stage1_mem0_flags_processed': 4,
+                            'flag_deleted_records': flag_records,
+                        }
+                    )),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-norm-mem0-preserved',
+                )
+
+            assert report.stats.get('stage1_mem0_flags_processed') == 4, (
+                'agent-reported stage1_mem0_flags_processed must not be overwritten'
+            )
+            assert report.stats.get('stage1_analytical_findings_processed') == 0, (
+                'stage1_analytical_findings_processed must default to 0 (no mismatch)'
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_analytical_clamped_mem0_preserved_simultaneously(self, stage2_guard_mock_deps, caplog):
+            """Analytical mismatch clamp does NOT disturb a consistent mem0 counter.
+
+            This is the most likely real-world interaction of the two guards: Guard 4
+            clamps stage1_analytical_findings_processed while Guard 4b finds no mismatch
+            for stage1_mem0_flags_processed (records match counter) and preserves it.
+
+            Setup:
+              - prior_reports[0] with 5 items_flagged
+              - agent stats: {stage1_analytical_findings_processed: 2,  <- wrong (should be 5)
+                              stage1_mem0_flags_processed: 4,            <- correct (4 records)
+                              flag_deleted_records: [... x4 ...]}
+            Expected:
+              - stage1_analytical_findings_processed clamped to 5
+              - stage1_mem0_flags_processed remains 4
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(5)],  # 5 items → expected=5
+            )
+
+            flag_records = [
+                {'action': 'flag_deleted', 'flag_id': f'flag-{i}', 'reason': 'processed'}
+                for i in range(4)
+            ]
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={
+                            'stage1_analytical_findings_processed': 2,  # wrong → clamped
+                            'stage1_mem0_flags_processed': 4,           # correct → preserved
+                            'flag_deleted_records': flag_records,
+                        }
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-dual-guard',
+                )
+
+            # Guard 4 clamped analytical to 5
+            assert report.stats.get('stage1_analytical_findings_processed') == 5, (
+                'stage1_analytical_findings_processed must be clamped to 5'
+            )
+            # Guard 4b found no mismatch → mem0 preserved
+            assert report.stats.get('stage1_mem0_flags_processed') == 4, (
+                'stage1_mem0_flags_processed must not be disturbed by the analytical clamp'
+            )
+            # Exactly one WARNING: the analytical mismatch (no mem0 mismatch)
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            analytical_warns = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
+            ]
+            assert len(analytical_warns) == 1
+            mem0_warns = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_mem0_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(mem0_warns) == 0, 'Guard 4b must not fire when records match counter'
+
+    class TestMem0FlagCounterCompleteness:
+        """Unit + integration tests for _check_mem0_flag_counter_completeness helper."""
+
+        def test_unit_mismatch_detected(self):
+            """3 flag_deleted records but counter reports 2 → mismatch True."""
+            stats = {
+                'stage1_mem0_flags_processed': 2,
+                'flag_deleted_records': [
+                    {'action': 'flag_deleted', 'flag_id': f'f{i}', 'reason': 'processed'}
+                    for i in range(3)
+                ],
+            }
+            result = _check_mem0_flag_counter_completeness(stats)
+            assert result['expected'] == 3
+            assert result['reported'] == 2
+            assert result['mismatch'] is True
+
+        def test_unit_counts_match_no_mismatch(self):
+            """3 flag_deleted records, counter reports 3 → mismatch False."""
+            stats = {
+                'stage1_mem0_flags_processed': 3,
+                'flag_deleted_records': [
+                    {'action': 'flag_deleted', 'flag_id': f'f{i}', 'reason': 'processed'}
+                    for i in range(3)
+                ],
+            }
+            result = _check_mem0_flag_counter_completeness(stats)
+            assert result['expected'] == 3
+            assert result['reported'] == 3
+            assert result['mismatch'] is False
+
+        def test_unit_empty_records_zero_counter(self):
+            """No flag_deleted_records and counter=0 → no mismatch."""
+            result = _check_mem0_flag_counter_completeness({'stage1_mem0_flags_processed': 0})
+            assert result['expected'] == 0
+            assert result['reported'] == 0
+            assert result['mismatch'] is False
+
+        def test_unit_absent_records_key_defaults_to_zero(self):
+            """Missing flag_deleted_records → expected=0; non-zero counter → mismatch."""
+            result = _check_mem0_flag_counter_completeness({'stage1_mem0_flags_processed': 4})
+            assert result['expected'] == 0
+            assert result['reported'] == 4
+            assert result['mismatch'] is True
+
+        def test_unit_non_flag_deleted_records_not_counted(self):
+            """Records with action != 'flag_deleted' are ignored for the expected count."""
+            stats = {
+                'stage1_mem0_flags_processed': 1,
+                'flag_deleted_records': [
+                    {'action': 'flag_deleted', 'flag_id': 'f1', 'reason': 'processed'},
+                    {'action': 'other_action', 'flag_id': 'f2', 'reason': 'other'},
+                ],
+            }
+            result = _check_mem0_flag_counter_completeness(stats)
+            assert result['expected'] == 1  # only the flag_deleted record counts
+            assert result['mismatch'] is False
+
+        def test_unit_malformed_records_list_skipped(self):
+            """Non-dict items in flag_deleted_records are skipped gracefully."""
+            stats = {
+                'stage1_mem0_flags_processed': 1,
+                'flag_deleted_records': [
+                    'not-a-dict',
+                    None,
+                    {'action': 'flag_deleted', 'flag_id': 'f1', 'reason': 'processed'},
+                ],
+            }
+            result = _check_mem0_flag_counter_completeness(stats)
+            assert result['expected'] == 1
+            assert result['mismatch'] is False
+
+        @pytest.mark.asyncio
+        async def test_run_clamps_stage1_mem0_flags_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
+            """run() clamps stage1_mem0_flags_processed to flag_deleted record count and warns.
+
+            Agent reports stage1_mem0_flags_processed=5 but flag_deleted_records has only 2
+            entries → Guard 4b detects mismatch, emits WARNING, and clamps to 2.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[],  # 0 items → no analytical mismatch
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                        [], stats={
+                            'stage1_mem0_flags_processed': 5,  # over-reported
+                            'flag_deleted_records': [
+                                {'action': 'flag_deleted', 'flag_id': f'f{i}', 'reason': 'processed'}
+                                for i in range(2)  # only 2 actual deletions
+                            ],
+                        }
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-mem0-guard',
+                )
+
+            # Guard 4b clamped to 2 (count of flag_deleted records)
+            assert report.stats.get('stage1_mem0_flags_processed') == 2, (
+                'stage1_mem0_flags_processed must be clamped to 2'
+            )
+            # Exactly one WARNING for the mem0 mismatch
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            mem0_warns = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_mem0_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(mem0_warns) == 1, (
+                f'expected one stage1_mem0_flags_processed_mismatch WARNING, got {len(mem0_warns)}'
+            )
+            rec = mem0_warns[0]
+            assert getattr(rec, 'expected', None) == 2
+            assert getattr(rec, 'reported', None) == 5
 
     class TestComposition:
         """All four guards fire in a single stage.run() invocation."""
@@ -8337,7 +8695,7 @@ class TestTaskKnowledgeSyncStage2Guards:
               (a) terminal-state update_task violation (task 42 -> done)
               (b) set_task_status post-action mismatch (task 7: target=done, live=pending)
               (c) stall-guard freshness violation (task 11: snapshot=in-progress, live=done)
-            Stats seed: tasks_modified=5, memories_written=3, stage1_flags_processed=1
+            Stats seed: tasks_modified=5, memories_written=3, stage1_analytical_findings_processed=1
             Stage 1 prior report: 4 items_flagged -> Guard 4 expects 4, reported 1 -> mismatch.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
@@ -8407,7 +8765,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                         stats={
                             'tasks_modified': 5,
                             'memories_written': 3,
-                            'stage1_flags_processed': 1,
+                            'stage1_analytical_findings_processed': 1,
                         },
                     )),
                 ),
@@ -8437,8 +8795,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             # Guard 2: stall_guard_freshness_violations=1
             assert report.stats.get('stall_guard_freshness_violations') == 1
 
-            # Guard 4: stage1_flags_processed clamped to 4 (truth from prior_reports)
-            assert report.stats.get('stage1_flags_processed') == 4
+            # Guard 4: stage1_analytical_findings_processed clamped to 4 (truth from prior_reports)
+            assert report.stats.get('stage1_analytical_findings_processed') == 4
 
             # Exactly four structured log records (one per guard):
             # 1 INFO skipped_done_task
@@ -8472,15 +8830,15 @@ class TestTaskKnowledgeSyncStage2Guards:
                 f'expected 1 stall_guard_freshness_violation WARNING, got {len(freshness_logs)}'
             )
 
-            # 1 WARNING stage1_flags_processed_mismatch
+            # 1 WARNING stage1_analytical_findings_processed_mismatch
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1, (
-                f'expected 1 stage1_flags_processed_mismatch WARNING, got {len(flag_logs)}'
+                f'expected 1 stage1_analytical_findings_processed_mismatch WARNING, got {len(flag_logs)}'
             )
 
         @pytest.mark.asyncio
@@ -8513,7 +8871,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                         [],
                         stats={
                             'tasks_modified': 5,
-                            'stage1_flags_processed': 1,
+                            'stage1_analytical_findings_processed': 1,
                         },
                     )),
                 ),
@@ -8539,16 +8897,16 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert report.stats.get('tasks_modified') == 5
 
             # Guard 4 must still fire (pure stats arithmetic, no write_journal dependency)
-            assert report.stats.get('stage1_flags_processed') == 4  # clamped to truth
+            assert report.stats.get('stage1_analytical_findings_processed') == 4  # clamped to truth
 
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1, (
-                f'expected 1 stage1_flags_processed_mismatch WARNING even with null journal, '
+                f'expected 1 stage1_analytical_findings_processed_mismatch WARNING even with null journal, '
                 f'got {len(flag_logs)}'
             )
 
@@ -8574,7 +8932,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=self._make_cli_result(
                         [],
-                        stats={'tasks_modified': 2, 'stage1_flags_processed': 0},
+                        stats={'tasks_modified': 2, 'stage1_analytical_findings_processed': 0},
                     )),
                 ),
                 caplog.at_level(
@@ -8593,12 +8951,12 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert 'not_applicable_count' not in report.stats
             assert 'set_task_status_post_action_mismatches' not in report.stats
             assert 'stall_guard_freshness_violations' not in report.stats
-            # Guard 4 fires: stage1_flags_processed clamped from 0 to 3
-            assert report.stats.get('stage1_flags_processed') == 3
+            # Guard 4 fires: stage1_analytical_findings_processed clamped from 0 to 3
+            assert report.stats.get('stage1_analytical_findings_processed') == 3
             flag_logs = [
                 r for r in caplog.records
                 if r.name == target_logger
-                and 'stage1_flags_processed_mismatch' in r.getMessage()
+                and 'stage1_analytical_findings_processed_mismatch' in r.getMessage()
             ]
             assert len(flag_logs) == 1
 
@@ -8629,7 +8987,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                     new=AsyncMock(return_value=self._make_cli_result(
                         [],
-                        stats={'tasks_modified': 1, 'stage1_flags_processed': 0},
+                        stats={'tasks_modified': 1, 'stage1_analytical_findings_processed': 0},
                     )),
                 ),
                 caplog.at_level(
@@ -8659,7 +9017,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert 'set_task_status_post_action_mismatches' not in report.stats
             assert 'stall_guard_freshness_violations' not in report.stats
             # Guard 4 still fires
-            assert report.stats.get('stage1_flags_processed') == 2
+            assert report.stats.get('stage1_analytical_findings_processed') == 2
 
         @pytest.mark.asyncio
         async def test_cache_build_failure_no_false_positives(

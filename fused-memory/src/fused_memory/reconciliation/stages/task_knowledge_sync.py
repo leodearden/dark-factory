@@ -523,12 +523,13 @@ def _check_flag_counter_completeness(
     report_stats: dict,
     prior_reports: list[StageReport],
 ) -> dict:
-    """Compare ``report.stats['stage1_flags_processed']`` against Stage 1's truth.
+    """Compare ``report.stats['stage1_analytical_findings_processed']`` against Stage 1's truth.
 
     Stage 1 (memory_consolidator) emits ``StageReport.items_flagged`` — the
-    definitive list of flags it raised for Stage 2 to process.  This guard
-    compares that ground-truth count against whatever Stage 2 self-reported in
-    ``stats['stage1_flags_processed']``.
+    definitive list of structured analytical flags it raised for Stage 2 to
+    review.  This guard compares that ground-truth count against whatever
+    Stage 2 self-reported in ``stats['stage1_analytical_findings_processed']``
+    (the count of Stage 1 flagged_items that Stage 2 actually reviewed).
 
     Pure stats-arithmetic — no taskmaster calls, no I/O.
 
@@ -546,7 +547,13 @@ def _check_flag_counter_completeness(
         ``mismatch`` is ``True`` only when a Stage 1 baseline exists and
         ``reported != expected``.
     """
-    reported = report_stats.get('stage1_flags_processed', 0)
+    reported = report_stats.get('stage1_analytical_findings_processed')
+    if reported is None:
+        # Backward-compat: in-flight or cached Stage 2 agents may still emit the
+        # pre-rename key (task 1589).  Prompt and reader move together at deploy
+        # time, but the fallback ensures no spurious mismatch during rollout when
+        # an old-prompt agent is still running.
+        reported = report_stats.get('stage1_flags_processed', 0)
     if not prior_reports:
         return {'expected': 0, 'reported': reported, 'mismatch': False}
 
@@ -558,6 +565,41 @@ def _check_flag_counter_completeness(
         return {'expected': 0, 'reported': reported, 'mismatch': False}
 
     expected = len(prior_reports[0].items_flagged)
+    return {
+        'expected': expected,
+        'reported': reported,
+        'mismatch': expected != reported,
+    }
+
+
+def _check_mem0_flag_counter_completeness(report_stats: dict) -> dict:
+    """Compare ``report.stats['stage1_mem0_flags_processed']`` against the flag_deleted records.
+
+    The Stage 2 prompt requires emitting one ``flag_deleted`` action record per FIX C
+    deletion into ``stats['flag_deleted_records']`` — a list of
+    ``{"action": "flag_deleted", "flag_id": ..., "reason": ...}`` dicts.
+    This guard uses that list as the ground-truth count so an agent that under- or
+    over-reports the Mem0 counter is caught and clamped, mirroring the analytical guard
+    in :func:`_check_flag_counter_completeness`.
+
+    Pure stats-arithmetic — no taskmaster calls, no I/O.
+
+    Args:
+        report_stats: The ``StageReport.stats`` dict from Stage 2's run.
+
+    Returns:
+        ``{'expected': int, 'reported': int, 'mismatch': bool}``
+        ``expected`` is the count of ``{"action": "flag_deleted", ...}`` dicts in
+        ``stats['flag_deleted_records']`` (defaults to 0 when the key is absent or
+        the list is empty).  ``mismatch`` is ``True`` only when
+        ``expected != reported``.
+    """
+    records = report_stats.get('flag_deleted_records', [])
+    expected = sum(
+        1 for r in (records if isinstance(records, list) else [])
+        if isinstance(r, dict) and r.get('action') == 'flag_deleted'
+    )
+    reported = report_stats.get('stage1_mem0_flags_processed', 0)
     return {
         'expected': expected,
         'reported': reported,
@@ -1285,7 +1327,7 @@ class TaskKnowledgeSync(BaseStage):
 
         Degrades gracefully when ``self.journal`` or
         ``self.journal.write_journal`` is ``None`` — Guards 1-3 skip (no ops
-        available), Guard 4 still fires (pure stats arithmetic).
+        available), Guards 4 and 4b still fire (pure stats arithmetic).
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
@@ -1430,11 +1472,11 @@ class TaskKnowledgeSync(BaseStage):
                         },
                     )
 
-        # Guard 4 — flag-counter completeness (pure stats arithmetic, no I/O)
+        # Guard 4 — analytical flag-counter completeness (pure stats arithmetic, no I/O)
         flag_check = _check_flag_counter_completeness(report.stats, prior_reports)
         if flag_check['mismatch']:
             logger.warning(
-                'reconciliation.stage1_flags_processed_mismatch',
+                'reconciliation.stage1_analytical_findings_processed_mismatch',
                 extra={
                     'run_id': run_id,
                     'project_id': self.project_id,
@@ -1443,7 +1485,32 @@ class TaskKnowledgeSync(BaseStage):
                 },
             )
             # Clamp to truth so downstream verifiers see the real picture.
-            report.stats['stage1_flags_processed'] = flag_check['expected']
+            report.stats['stage1_analytical_findings_processed'] = flag_check['expected']
+
+        # Guard 4b — Mem0 flag-counter completeness (pure stats arithmetic, no I/O)
+        # Counts flag_deleted action records in stats['flag_deleted_records'] as the
+        # ground-truth source, giving stage1_mem0_flags_processed the same clamp/warn
+        # coverage as the analytical counter.
+        mem0_check = _check_mem0_flag_counter_completeness(report.stats)
+        if mem0_check['mismatch']:
+            logger.warning(
+                'reconciliation.stage1_mem0_flags_processed_mismatch',
+                extra={
+                    'run_id': run_id,
+                    'project_id': self.project_id,
+                    'expected': mem0_check['expected'],
+                    'reported': mem0_check['reported'],
+                },
+            )
+            # Clamp to truth so downstream verifiers see the real picture.
+            report.stats['stage1_mem0_flags_processed'] = mem0_check['expected']
+
+        # Normalize: ensure both Stage 2 counters are always present in stats so
+        # Stage 3's audit sees a deterministic, present pair via recon_report's
+        # free-form stats passthrough.  setdefault preserves any agent-reported
+        # value (including a clamped value written above by Guard 4 or 4b).
+        report.stats.setdefault('stage1_analytical_findings_processed', 0)
+        report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
