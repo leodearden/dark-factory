@@ -16,8 +16,6 @@ Covers:
 
 from __future__ import annotations
 
-import pytest
-
 from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT

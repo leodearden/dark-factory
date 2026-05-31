@@ -7,7 +7,7 @@ per-cycle summary is present for a given run_id.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
