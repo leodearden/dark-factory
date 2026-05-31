@@ -977,13 +977,25 @@ def scope_module_config(
     )
 
 
-def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
+def _build_fallback_config(
+    task_files: list[str],
+    config: OrchestratorConfig | None = None,
+) -> ModuleConfig | None:
     """Build a synthetic ModuleConfig from *task_files* when no module configs match.
 
-    Filters to ``.py`` files, classifies into source vs test, and builds bare
-    ``ruff check``/``pyright``/``pytest`` commands (no ``uv run`` wrapper —
-    callers run these in the worktree root where venvs aren't needed for the
-    fallback path).
+    Filters to ``.py`` files, classifies into source vs test, and builds
+    targeted commands.  When *config* provides non-default commands (e.g.
+    ``uv run --extra dev --extra web pytest``), those are used directly so
+    that tools not installed globally can still be reached.
+
+    For ``lint_command`` and ``type_check_command``, :func:`_scope_command`
+    narrows the configured command to the touched files when the standard tool
+    keyword appears (e.g. ``ruff check`` in ``uv run ruff check``), and
+    returns the command unchanged when it doesn't (e.g. ``true`` or
+    ``mypy``-based type checking).  For ``test_command``, the configured
+    command is used as-is when it differs from the bare ``pytest`` default so
+    that complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are
+    not mangled by :func:`_scope_command`'s naive dash-token extraction.
 
     Returns ``None`` when no ``.py`` files are found.
     """
@@ -1001,8 +1013,29 @@ def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
     # conftest.py is already excluded by _is_test_file at any depth.
     test_files = [f for f in py_files if _is_test_file(f)]
 
-    lint_cmd = 'ruff check ' + ' '.join(py_files)
-    type_cmd = 'pyright ' + ' '.join(py_files)
+    # Lint and type commands: use configured commands when *config* is provided.
+    # _scope_command narrows to the touched files when the standard tool keyword
+    # appears in the command, and returns unchanged when it doesn't.
+    if config is not None:
+        lint_cmd = _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+        type_cmd = _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+    else:
+        lint_cmd = 'ruff check ' + ' '.join(py_files)
+        type_cmd = 'pyright ' + ' '.join(py_files)
+
+    # Test command: when a non-default configured command exists (e.g.
+    # `uv run --extra dev --extra web pytest -m 'not slow' --ignore=tests/e2e`),
+    # use it as-is to avoid mangling multi-token flags.  The configured command
+    # already encodes which extras, markers, and ignores are required.
+    if config is not None and config.test_command != 'pytest':
+        test_cmd: str | None = config.test_command if (test_files or has_conftest) else None
+        return ModuleConfig(
+            prefix='__fallback__',
+            lint_command=lint_cmd,
+            type_check_command=type_cmd,
+            test_command=test_cmd,
+        )
+
     if has_conftest:
         conftest_dirs = sorted({
             f.rsplit('/', 1)[0] if '/' in f else '.'
@@ -2095,7 +2128,7 @@ async def run_scoped_verification(
                 return _trivial_pass(
                     'No source files changed — verify trivially passes',
                 )
-            fallback = _build_fallback_config(existing_files)
+            fallback = _build_fallback_config(existing_files, config)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,

@@ -3567,6 +3567,82 @@ class TestBuildFallbackConfigConftest:
         assert 'conftest.py' not in result.test_command
 
 
+class TestBuildFallbackConfigWithNonDefaultCommands:
+    """``_build_fallback_config`` uses project-configured commands when non-default.
+
+    Projects that run tools via ``uv run`` (or any other wrapper) have
+    ``pytest``/``ruff``/``pyright`` absent from PATH.  When *config* carries
+    non-default ``test_command``, ``lint_command``, or ``type_check_command``,
+    the fallback must use those rather than bare tool names, or the verify loop
+    exits with ``command not found`` (rc 127).
+    """
+
+    def _make_config(self, tmp_path: Path, **kwargs) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, **kwargs)
+
+    def test_uv_run_test_command_used_as_is_for_test_files(self, tmp_path: Path) -> None:
+        """Non-default test_command is forwarded unchanged when test files changed."""
+        cfg = self._make_config(
+            tmp_path,
+            test_command="uv run --extra dev --extra web pytest -m 'not slow' --ignore=tests/e2e",
+        )
+        result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
+        assert result is not None
+        assert result.test_command == "uv run --extra dev --extra web pytest -m 'not slow' --ignore=tests/e2e"
+
+    def test_noop_lint_command_used_as_is(self, tmp_path: Path) -> None:
+        """lint_command='true' is returned unchanged (no ruff invocation)."""
+        cfg = self._make_config(
+            tmp_path,
+            lint_command='true',
+            test_command="uv run --extra dev pytest",
+        )
+        result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
+        assert result is not None
+        assert result.lint_command == 'true'
+
+    def test_mypy_type_command_returned_unchanged(self, tmp_path: Path) -> None:
+        """type_check_command using mypy (no 'pyright' keyword) is returned unchanged."""
+        cfg = self._make_config(
+            tmp_path,
+            type_check_command='uv run --extra dev mypy src/my_pkg',
+            test_command="uv run --extra dev pytest",
+        )
+        result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
+        assert result is not None
+        assert result.type_check_command == 'uv run --extra dev mypy src/my_pkg'
+
+    def test_no_test_command_when_no_test_files(self, tmp_path: Path) -> None:
+        """Non-default test_command is suppressed when no test files changed."""
+        cfg = self._make_config(
+            tmp_path,
+            test_command="uv run --extra dev pytest -m 'not slow'",
+        )
+        result = _build_fallback_config(['src/my_pkg/module.py'], cfg)
+        assert result is not None
+        assert result.test_command is None
+
+    def test_no_config_preserves_original_bare_commands(self) -> None:
+        """Without config, the original bare pytest/ruff/pyright commands are used."""
+        result = _build_fallback_config(['tests/unit/test_foo.py'])
+        assert result is not None
+        assert result.test_command == 'pytest tests/unit/test_foo.py'
+        assert result.lint_command is not None
+        assert result.lint_command.startswith('ruff check')
+        assert result.type_check_command is not None
+        assert result.type_check_command.startswith('pyright')
+
+    def test_conftest_with_non_default_test_command(self, tmp_path: Path) -> None:
+        """Conftest change with non-default test_command still triggers test_command."""
+        cfg = self._make_config(
+            tmp_path,
+            test_command="uv run --extra dev pytest -m 'not slow'",
+        )
+        result = _build_fallback_config(['tests/conftest.py'], cfg)
+        assert result is not None
+        assert result.test_command == "uv run --extra dev pytest -m 'not slow'"
+
+
 class TestPruneArchiveDedupedAtAggregateSite:
     """Tests ensuring ``_prune_archive`` is called exactly once per
     ``run_scoped_verification``, not once-per-module inside
