@@ -296,24 +296,42 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
 ## Pre-Check: Already-Reconstructed Stage 2 Summaries
-Before emitting a "missing Stage 2 summary" finding for a run, search Mem0 for an \
-existing Stage 2 summary written by a prior remediation pass:
+Before emitting a "missing Stage 2 summary" finding for a run, use BOTH of the \
+following paths — declare the summary missing ONLY if BOTH return nothing:
 
-  search(query="run_id: <run_id>", project_id=..., \
-  categories=['observations_and_summaries'], stores=['mem0'], limit=10)
+**Path 1 — General semantic search** (existing approach): \
+`mcp__fused-memory__search(query="run_id: <run_id>", project_id=..., \
+categories=['observations_and_summaries'], stores=['mem0'], limit=10)` \
+where `<run_id>` is the run_id value from the `## Reconciliation Context` section. \
+If the search returns a result whose content contains `run_id: <run_id>`, the summary \
+is present.
 
-where `<run_id>` is the run_id value from the `## Reconciliation Context` section \
-(the same run_id used for flag markers). If the search returns a result whose content \
-contains `run_id: <run_id>`, do NOT emit the missing-summary finding — Stage 2 already \
-wrote the per-cycle summary for that run. Note in your cycle report that the summary \
-already exists, e.g. "Stage 2 summary for run_id=<run_id> already present — skipping \
-reconstruction." Rationale: back-to-back remediation passes otherwise trigger \
-double-reconstruction of the same Stage 2 summary, producing duplicate per-cycle \
-entries that a later cycle must clean up. This pre-check closes that loop; it mirrors \
-the Flag Suppression Check below, which also confirms an existing Mem0 record before \
-emitting a finding. Note: this is a best-effort heuristic — semantic search may miss \
-an existing summary due to ranking or limit=10 truncation; any duplicates that slip \
-through can be cleaned up in a later consolidation cycle.
+**Path 2 — Metadata-keyed existence count** (deterministic): \
+`mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'kind': 'cycle_summary', 'run_id': '<run_id>'}})` \
+A return value > 0 means the summary is present. This path catches summaries that \
+semantic search misses due to low cosine-similarity ranking (confirmed false negative: \
+run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful reconstruction; \
+task 1588).
+
+**Decision rule**: if EITHER path confirms the summary exists, do NOT emit the \
+missing-summary finding — Stage 2 already wrote the per-cycle summary for that run. \
+Note in your cycle report, e.g. \
+"Stage 2 summary for run_id=<run_id> already present — skipping reconstruction." \
+Only emit the missing-summary finding when BOTH Path 1 returns no matching content AND \
+Path 2 returns count=0.
+
+**Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
+unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
+false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
+reconstruction on uncertainty. Note the tool error in your cycle report instead. \
+This mirrors the Flag Suppression Check's conservative handling of search failures.
+
+Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
+the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
+up. The two-path approach eliminates the false-negative risk from semantic-search \
+ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
+`metadata.run_id`, so Path 2 returns 0 for them — Path 1 remains their fallback.
 
 ## Pre-Check: Existing Task Completion Summary by task_id
 Before emitting a "missing completion summary" finding for a specific task, ALSO \
