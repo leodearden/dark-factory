@@ -4291,9 +4291,9 @@ class TestWipHaltSpeculativeMergeWorker:
                 side_effect=RuntimeError('cleanup boom'),
             ),
             patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            pytest.raises(RuntimeError, match='cleanup boom'),
         ):
-            with pytest.raises(RuntimeError, match='cleanup boom'):
-                await worker._verify_and_advance(item)
+            await worker._verify_and_advance(item)
 
         # PRIMARY discriminator: queue must NOT be halted when cleanup raised
         # before the wip_halted outcome could reach the workflow.
