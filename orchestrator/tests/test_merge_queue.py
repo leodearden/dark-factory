@@ -9105,3 +9105,291 @@ class TestReverifyRebasedTree:
         )
         # _run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeMergeWorkerGate — step-7 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorkerGate:
+    """End-to-end integration tests for the disjoint-delta re-verify gate.
+
+    Each test builds a SpeculativeItem via worker._remerge(req, None),
+    simulates intervening main movement by committing directly in
+    project_root, then drives worker._verify_and_advance(item) and asserts
+    the expected outcome and run_scoped_verification call count.
+
+    Scenarios
+    ---------
+    (a) GATE-on-red: overlapping shared.py churn; 1st verify (step-4) passes,
+        2nd (gate re-verify) fails → outcome blocked, main stays at moved-main
+        SHA (rebased overlapping tree never lands).
+    (b) Overlap+green: overlapping churn, both verify calls pass → outcome
+        done, branch-edit AND main-edit both on main, called twice.
+    (c) Disjoint: branch_only.py vs main_only.py → outcome done, called
+        exactly once (fast path preserved — no gate verify).
+    (d) Regression: main does NOT move → outcome done, called once.
+
+    Scenarios (a) and (b) fail BEFORE wiring because the CAS loop does not
+    pass reverify_on_rebase=True nor handle the rebased_pending_reverify
+    result (so verify is only called once and main advances unguarded).
+    """
+
+    # 20-line shared base file; edits to line1 (branch) and line18 (main)
+    # are non-adjacent so the rebase is always a clean 3-way merge.
+    _SHARED_BASE: str = ''.join(f'line{i}\n' for i in range(20))
+
+    async def _setup_overlap_branch(
+        self,
+        git_ops: GitOps,
+        branch_name: str,
+        config: OrchestratorConfig,
+    ) -> tuple[Path, MergeRequest]:
+        """Commit shared.py (20 lines) on main, then create a branch that
+        edits line1 (top).  Returns (branch_wt, req).  main is at fork_sha.
+        Does NOT call _remerge.
+        """
+        # Commit shared.py baseline on main
+        (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', f'Add shared.py for {branch_name}'],
+            cwd=git_ops.project_root,
+        )
+
+        # Branch edits line1 (top) — non-adjacent to the line18 main edit
+        branch_wt = (await git_ops.create_worktree(branch_name)).path
+        (branch_wt / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(branch_wt, f'Branch {branch_name}: edit top of shared.py')
+
+        req = _make_request(branch_name, branch_name, branch_wt, config)
+        return branch_wt, req
+
+    async def test_gate_on_red_blocks_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a) GATE-on-red: overlapping churn, 1st verify passes, 2nd fails.
+
+        Core safety property: the rebased overlapping tree must NEVER land on
+        main.  outcome must be blocked and main must stay at the moved-main SHA.
+        run_scoped_verification must be called exactly twice (initial + gate).
+        """
+        branch = 'smwg-red'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch(git_ops, branch, config)
+
+        # _remerge: merge branch into current main
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got immediate_outcome={item.immediate_outcome!r}'
+        )
+
+        # Move main: edit line18 (bottom) — produces overlapping delta
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: edit bottom of shared.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            n = len(verify_calls) + 1
+            verify_calls.append(n)
+            if n == 1:
+                # Initial verify (step-4): pass
+                return MagicMock(passed=True, summary='')
+            # Gate re-verify (2nd call): fail
+            return MagicMock(
+                passed=False, summary='gate re-verify failed',
+                timed_out=False,
+                failure_report=MagicMock(return_value=None),
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert not advanced, (
+            '(a) Gate-on-red: expected _verify_and_advance to return False'
+        )
+        outcome = req.result.result()
+        assert outcome.status == 'blocked', (
+            f'(a) Gate-on-red: expected blocked, got {outcome.status!r}: {outcome}'
+        )
+        # Main must NOT have advanced to the rebased tree
+        current_main = await git_ops.get_main_sha()
+        assert current_main == moved_main_sha, (
+            f'(a) Main must not advance past moved_main_sha. '
+            f'Expected {moved_main_sha[:8]}, got {current_main[:8]}'
+        )
+        # Gate verify must have been triggered
+        assert len(verify_calls) == 2, (
+            f'(a) Expected run_scoped_verification called 2 times '
+            f'(initial + gate), got {len(verify_calls)}'
+        )
+
+    async def test_overlap_green_advances_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(b) Overlap+green: overlapping churn, both verify passes.
+
+        Both the branch edit (line1) and the main-movement edit (line18) must
+        appear on main after the advance.  run_scoped_verification called twice.
+        """
+        branch = 'smwg-green'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch(git_ops, branch, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        )
+
+        # Move main: edit line18 (bottom) — overlapping delta
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: edit bottom of shared.py (green)'],
+            cwd=git_ops.project_root,
+        )
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(b) Overlap+green: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(b) Overlap+green: expected done, got {outcome.status!r}: {outcome}'
+        )
+        # Both the branch edit and the main-movement edit must appear on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:shared.py'], cwd=git_ops.project_root,
+        )
+        assert 'branch-edit' in content, (
+            '(b) branch edit must appear on main after overlap+green advance'
+        )
+        assert 'main-edit' in content, (
+            '(b) main-movement edit must appear on main after overlap+green advance'
+        )
+        # Gate re-verify must have been called (overlap → two verify calls total)
+        assert len(verify_calls) == 2, (
+            f'(b) Expected run_scoped_verification called 2 times, '
+            f'got {len(verify_calls)}'
+        )
+
+    async def test_disjoint_no_extra_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(c) Disjoint: branch_only.py vs main_only.py — no shared files.
+
+        Fast path: the gate detects no overlap and skips re-verify.
+        run_scoped_verification called exactly once (initial verify only).
+        """
+        branch = 'smwg-disjoint'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = await _make_branch_with_file(
+            git_ops, branch, 'branch_only.py', 'branch = 1\n',
+        )
+        req = _make_request(branch, branch, branch_wt, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None
+
+        # Move main: add a DISJOINT file (no shared files touched)
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: add main_only.py (disjoint)'],
+            cwd=git_ops.project_root,
+        )
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(c) Disjoint: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(c) Disjoint: expected done, got {outcome.status!r}: {outcome}'
+        )
+        # Fast path: must NOT trigger a second verify call
+        assert len(verify_calls) == 1, (
+            f'(c) Disjoint fast path: expected 1 verify call, got {len(verify_calls)}'
+        )
+
+    async def test_no_movement_regression(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(d) Regression: main does NOT move between _remerge and
+        _verify_and_advance.  No gate is triggered; outcome done, one call.
+        """
+        branch = 'smwg-noop'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = await _make_branch_with_file(
+            git_ops, branch, 'noop_branch.py', 'x = 1\n',
+        )
+        req = _make_request(branch, branch, branch_wt, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None
+
+        # main does NOT move
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(d) No-movement: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(d) No-movement regression: expected done, got {outcome.status!r}: {outcome}'
+        )
+        assert len(verify_calls) == 1, (
+            f'(d) No-movement: expected 1 verify call, got {len(verify_calls)}'
+        )
