@@ -586,6 +586,79 @@ async def test_consumer_non_halt_blocked_preserves_existing_path(
 
 
 @pytest.mark.asyncio
+async def test_consumer_halt_already_owned_skips_escalate(
+    tmp_path: Path,
+    mock_orch_config: MagicMock,
+) -> None:
+    """Consumer falls through to _mark_blocked when halt is ALREADY owned.
+
+    Third arm of the orphan-halt probe truth table::
+
+        merge_worker is not None        ← True
+        and merge_worker.is_wip_halted  ← True
+        and merge_worker.halt_owner_esc_id is None  ← FALSE (owner pre-set)
+
+    The probe does NOT fire → existing _mark_blocked(escalate_to_human=True)
+    path runs.  The pre-existing owner is NOT overwritten and no new escalation
+    is submitted.
+
+    This verifies the ``worker_owner`` parameter in ``_make_consumer_fixture``
+    is exercised, and pins the third arm so a future refactor cannot
+    accidentally double-register an owner via ``set_halt_owner`` (which asserts
+    ``owner is None``).
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': 'T4', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': 'T4', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred',
+         'metadata': {'train': {'id': 'T4', 'order': 2}}},
+    ]
+    wf, scheduler, queue, merge_queue, worker = _make_consumer_fixture(
+        task_id='103',
+        metadata={'train': {'id': 'T4', 'order': 2}},
+        tasks_by_train_return=members,
+        worker_halted=True,
+        worker_owner='esc-preexisting-1',  # ← probe's third condition is False
+        tmp_path=tmp_path,
+        mock_orch_config=mock_orch_config,
+    )
+
+    mock_mb = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mock_mb  # type: ignore[method-assign]
+
+    # A halt-inducing outcome that would trigger _escalate_train_halt if unowned.
+    halt_outcome = MergeOutcome(status='wip_halted', overlap_files=['z.py'])
+    wf._await_cancellable = AsyncMock(return_value=halt_outcome)  # type: ignore[method-assign]
+
+    result = await wf._maybe_enqueue_group_merge()
+
+    # (a) Pre-existing owner NOT overwritten.
+    assert worker.halt_owner_esc_id == 'esc-preexisting-1', (
+        f'halt_owner_esc_id must remain "esc-preexisting-1", '
+        f'got {worker.halt_owner_esc_id!r}'
+    )
+
+    # (b) No new escalation submitted (probe did not fire).
+    submitted = list(queue.get_by_task('103'))
+    assert len(submitted) == 0, (
+        f'No new escalation should be submitted when halt is already owned; '
+        f'got {submitted!r}'
+    )
+
+    # (c) Plain _mark_blocked(escalate_to_human=True) was called.
+    mock_mb.assert_awaited_once()
+    call_args = mock_mb.call_args
+    assert (
+        call_args.kwargs.get('escalate_to_human') is True
+        or 'escalate_to_human=True' in str(call_args)
+    ), f'Expected escalate_to_human=True in _mark_blocked call: {call_args!r}'
+
+    assert result == WorkflowOutcome.BLOCKED
+
+
+@pytest.mark.asyncio
 async def test_consumer_no_merge_worker_preserves_existing_path(
     tmp_path: Path,
     mock_orch_config: MagicMock,
