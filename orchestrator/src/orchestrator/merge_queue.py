@@ -142,6 +142,15 @@ fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX
 a landed merge must never be blocked by a flaky hang or infra error, so the
 check fails open on timeouts and worktree-create exceptions."""
 
+_HALT_ADVANCE_RESULTS: tuple[str, ...] = (
+    'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
+)
+"""``advance_main`` result codes that can trigger a WIP halt.
+
+Shared between :class:`MergeWorker` and :class:`SpeculativeMergeWorker` to
+avoid silent divergence: if the set of halt-triggering results ever changes,
+updating this single constant propagates to both workers automatically."""
+
 
 @dataclass
 class PostMergePyrightResult:
@@ -304,7 +313,7 @@ async def _run_post_merge_verify(
     )
     if disk_reason is not None:
         await git_ops.cleanup_merge_worktree(merge_wt)
-        return MergeOutcome('blocked', reason=disk_reason)
+        return MergeOutcome('blocked', reason=disk_reason, verify_skipped=True)
     # max_retries=0: post-merge verify hangs are usually deterministic
     # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
     # is_merge_verify=True: merge worktrees are freshly created per
@@ -1538,6 +1547,10 @@ class MergeOutcome:
     merge_sha: str | None = None
     push_status: str | None = None
     failure_diagnostic: dict[str, str] | None = None
+    verify_skipped: bool = False
+    """True when the disk guard fired and ``run_scoped_verification`` was never
+    called.  Lets callers distinguish a disk-guard short-circuit from an actual
+    verification failure in log messages."""
 
 
 @dataclass
@@ -2196,8 +2209,7 @@ class MergeWorker(_WipHaltMixin):
                 enospc_retries=self._post_merge_verify_enospc_retries,
             )
 
-        HALT_RESULTS = ('wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance')
-        if result in HALT_RESULTS and self._request_abandoned(req):
+        if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
             # Workflow soft-cancelled mid-merge: dropping the request
             # prevents the orphan-halt window where no escalation owner
             # is registered (2026-05-04 incident).
@@ -3173,11 +3185,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'blocked', reason=f'Verification error: {exc}',
                     ))
                 return False
-            logger.info(
-                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                f'passed={out is None})'
-            )
-            if out is not None:
+            if out is None:
+                logger.info(
+                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                    f'passed=True)'
+                )
+            elif out.verify_skipped:
+                # Disk guard fired — run_scoped_verification was never called;
+                # log 'skipped' rather than 'passed=False' to avoid misleading
+                # post-mortem triage of merge-queue stalls (2026-06-01).
+                logger.info(
+                    f'Task {req.task_id}: verify skipped: low disk '
+                    f'(merge={merge_commit[:8]})'
+                )
+                if not req.result.done():
+                    req.result.set_result(out)
+                return False
+            else:
+                logger.info(
+                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                    f'passed=False)'
+                )
                 if not req.result.done():
                     req.result.set_result(out)
                 return False
@@ -3219,8 +3247,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req.result.set_result(outcome)
                 return True
 
-            HALT_RESULTS = ('wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance')
-            if result in HALT_RESULTS and self._request_abandoned(req):
+            if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
                 # Workflow soft-cancelled mid-merge: dropping the request
                 # prevents the orphan-halt window where no escalation
                 # owner is registered (2026-05-04 incident).

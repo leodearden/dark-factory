@@ -8075,6 +8075,10 @@ class TestRunPostMergeVerify:
         assert result is not None
         assert result.status == 'blocked'
         assert result.reason == disk_reason
+        assert result.verify_skipped is True, (
+            'disk guard must set verify_skipped=True so callers can log '
+            '"verify skipped: low disk" instead of "passed=False"'
+        )
         git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
         mock_verify.assert_not_awaited()
 
@@ -8108,6 +8112,9 @@ class TestRunPostMergeVerify:
         assert result.status == 'blocked'
         assert result.reason.startswith('Post-merge verification failed:'), (
             f'unexpected reason: {result.reason!r}'
+        )
+        assert result.verify_skipped is False, (
+            'actual verify failure must NOT set verify_skipped (verify ran)'
         )
         git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
 
@@ -8564,3 +8571,29 @@ class TestWipHaltMixin:
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(ABANDONED_REASON_PREFIX)
         assert 't' in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# TestHaltAdvanceResults — pin _HALT_ADVANCE_RESULTS module constant
+# ---------------------------------------------------------------------------
+
+
+class TestHaltAdvanceResults:
+    """Pins that _HALT_ADVANCE_RESULTS is a single module-level constant shared
+    by both workers, preventing silent MergeWorker/SpeculativeMergeWorker drift."""
+
+    def test_is_importable(self) -> None:
+        """_HALT_ADVANCE_RESULTS must be importable (fails before amendment)."""
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS  # noqa: F401
+
+    def test_contains_expected_results(self) -> None:
+        """All four halt-triggering advance_main results must be present."""
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
+
+        expected = frozenset({
+            'wip_overlap', 'pop_conflict',
+            'unmerged_state', 'pop_conflict_no_advance',
+        })
+        assert frozenset(_HALT_ADVANCE_RESULTS) == expected, (
+            f'_HALT_ADVANCE_RESULTS mismatch: {_HALT_ADVANCE_RESULTS!r}'
+        )
