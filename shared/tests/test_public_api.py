@@ -21,6 +21,7 @@ class TestTopLevelImports:
             UsageCapConfig,
             UsageGate,
             classify_agent_failure,
+            connect_daemon,
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
@@ -44,6 +45,7 @@ class TestTopLevelImports:
         assert AgentFailureClass is not None
         assert AgentFailureKind is not None
         assert classify_agent_failure is not None
+        assert connect_daemon is not None
 
 
 class TestModuleLevelAll:
@@ -97,7 +99,7 @@ class TestModuleLevelAll:
 
         assert hasattr(async_sqlite_base, '__all__'), 'async_sqlite_base must define __all__'
         assert set(async_sqlite_base.__all__) == {
-            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'CheckpointResult', 'AsyncSqliteBase'
+            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult', 'AsyncSqliteBase'
         }
 
     def test_locking_all(self):

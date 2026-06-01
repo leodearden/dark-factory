@@ -5,6 +5,7 @@ from shared.async_sqlite_base import (
     CheckpointResult,
     apply_full_durability_pragmas,
     apply_wal_pragmas,
+    connect_daemon,
 )
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
@@ -31,6 +32,7 @@ __all__ = [
     'CheckpointResult',
     'apply_wal_pragmas',
     'apply_full_durability_pragmas',
+    'connect_daemon',
     'apply_full_durability_pragmas_sync',
     'CAP_HIT_RESUME_PROMPT',
     'CRASH_RECOVERY_RESUME_PROMPT',
