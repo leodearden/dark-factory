@@ -8360,3 +8360,128 @@ class TestFinalizeAdvancedMerge:
 
         assert outcome.status == 'done'
         assert outcome.merge_sha == 'the-fallback-sha'
+
+
+# ---------------------------------------------------------------------------
+# TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailure:
+    """Direct unit tests for the _map_advance_failure module-level helper."""
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops._last_recovery_branch = 'recovery/branch-abc'
+        git_ops._last_overlap_files = ['foo.py', 'bar.py']
+        git_ops._last_advanced_sha = 'adv-sha-123'
+        return git_ops
+
+    async def test_wip_overlap_halts_returns_wip_halted(self) -> None:
+        """(a) wip_overlap → halt called once, push NOT awaited, task_id STILL in cas_retries."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-adv-fail'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'wip_overlap',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'wip_halted'
+        assert outcome.overlap_files == git_ops._last_overlap_files
+        assert 'WIP overlaps merge diff:' in outcome.reason
+        halt.assert_called_once_with('advance_main: wip_overlap')
+        git_ops.push_main.assert_not_awaited()
+        assert task_id in cas_retries, 'wip_overlap must NOT pop cas_retries'
+
+    async def test_pop_conflict_halts_pushes_returns_done_wip_recovery(self) -> None:
+        """(b) pop_conflict → halt called, push_main awaited, done_wip_recovery with recovery branch."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-pop-conf'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.recovery_branch == git_ops._last_recovery_branch
+        assert outcome.push_status == 'pushed'
+        assert outcome.merge_sha == git_ops._last_advanced_sha
+        halt.assert_called_once_with('advance_main: pop_conflict')
+        git_ops.push_main.assert_awaited_once()
+
+    async def test_unmerged_state_halts_pops_retries(self) -> None:
+        """(c) unmerged_state → halt with unmerged message, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-unmerged'
+        cas_retries = {task_id: 2}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'unmerged_state',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'unmerged_state'
+        assert task_id in outcome.reason
+        assert 'unmerged_state' in outcome.reason
+        halt.assert_called_once()
+        assert 'unmerged_state' in halt.call_args[0][0]
+        assert task_id not in cas_retries
+
+    async def test_pop_conflict_no_advance_halts_pops_retries(self) -> None:
+        """(d) pop_conflict_no_advance → halt, recovery_branch from git_ops, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-no-adv'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict_no_advance',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'wip_recovery_no_advance'
+        assert outcome.recovery_branch == git_ops._last_recovery_branch
+        halt.assert_called_once_with('advance_main: pop_conflict_no_advance')
+        assert task_id not in cas_retries
+
+    @pytest.mark.parametrize('result', ['not_descendant', 'contaminated', 'stash_failed'])
+    async def test_terminal_results_block_no_halt(self, result: str) -> None:
+        """(e) not_descendant/contaminated/stash_failed → blocked with exact reason, halt NOT called, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-terminal'
+        cas_retries = {task_id: 3}
+
+        outcome = await _map_advance_failure(
+            git_ops, result,
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason == f'advance_main failed ({result}) for task {task_id}'
+        halt.assert_not_called()
+        assert task_id not in cas_retries
