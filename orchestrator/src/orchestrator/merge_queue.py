@@ -2167,10 +2167,15 @@ class SpeculativeMergeWorker:
         git_ops: GitOps,
         queue: asyncio.Queue[MergeRequest],
         event_store: EventStore | None = None,
+        on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
         self._event_store = event_store
+        # Post-merge notification hook — called with (task_id, base_sha,
+        # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
+        # coordinator bug never blocks or fails the merge.  See task 1592.
+        self._on_merge_landed = on_merge_landed
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -3360,6 +3365,15 @@ class SpeculativeMergeWorker:
                 push_status = await self._git_ops.push_main()
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
+                if self._on_merge_landed is not None:
+                    try:
+                        await self._on_merge_landed(req.task_id, item.base_sha, advanced_sha)
+                    except Exception:
+                        logger.warning(
+                            'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                            req.task_id,
+                            exc_info=True,
+                        )
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):
