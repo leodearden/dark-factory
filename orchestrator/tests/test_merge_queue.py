@@ -8790,3 +8790,159 @@ class TestAdvanceMainReverifyOnRebase:
         finally:
             if merge_wt:
                 await git_ops.cleanup_merge_worktree(merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# TestRebaseDeltaTouchedOverlap — step-3 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRebaseDeltaTouchedOverlap:
+    """Unit tests for _rebase_delta_touched_overlap helper.
+
+    The helper computes the intersection of:
+      • branch_touched: files the branch changed since its fork from rebased_from
+      • intervening:    files changed on main from rebased_from to rebased_onto
+
+    Fails CLOSED on any git error: returns a non-empty sentinel so the caller
+    re-verifies rather than skipping.
+    """
+
+    async def test_disjoint_returns_empty(self, git_ops: GitOps) -> None:
+        """(a) Disjoint: branch adds branch_only.py, main adds main_only.py.
+
+        The intersection must be empty (no overlap → no re-verify).
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        # Create the branch worktree at the fork point (current main)
+        fork_sha = await git_ops.get_main_sha()  # F = rebased_from
+        wt = (await git_ops.create_worktree('delta-disjoint')).path
+        (wt / 'branch_only.py').write_text('branch = 1\n')
+        await git_ops.commit(wt, 'Branch: add branch_only.py')
+
+        # Simulate intervening main commit (disjoint file)
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add main_only.py'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        assert overlap == [], (
+            f'Disjoint: expected empty overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_overlap_returns_shared_file(self, git_ops: GitOps) -> None:
+        """(b) Overlap: branch edits top of shared.py, main edits bottom.
+
+        After a clean 3-way rebase the touched sets intersect on shared.py.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        # Commit a 20-line base file on main before the fork
+        base_content = ''.join(f'line{i}\n' for i in range(20))
+        (git_ops.project_root / 'shared.py').write_text(base_content)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add shared.py'],
+            cwd=git_ops.project_root,
+        )
+        fork_sha = await git_ops.get_main_sha()  # F = rebased_from
+
+        # Branch edits near the TOP (line1 area)
+        wt = (await git_ops.create_worktree('delta-overlap')).path
+        (wt / 'shared.py').write_text(
+            base_content.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(wt, 'Branch: edit top of shared.py')
+
+        # Intervening main commit edits near the BOTTOM (line18 area)
+        (git_ops.project_root / 'shared.py').write_text(
+            base_content.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: edit bottom of shared.py'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        assert 'shared.py' in overlap, (
+            f'Overlap: expected shared.py in overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_task_dir_changes_excluded(self, git_ops: GitOps) -> None:
+        """(c) .task/ changes are excluded from both the branch-touched set
+        and the intervening-delta set.
+
+        The branch adds .task/plan.json and branch_only.py; main adds
+        .task/state.json (via its own commit) and main_only.py.  Only the
+        non-.task/ files appear in the respective sets; the intersection
+        of {branch_only.py} and {main_only.py} is still empty.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        fork_sha = await git_ops.get_main_sha()
+        wt = (await git_ops.create_worktree('delta-taskdir')).path
+
+        # Branch adds a real file and a .task/ file
+        (wt / 'branch_file.py').write_text('b = 1\n')
+        (wt / '.task').mkdir(exist_ok=True)
+        (wt / '.task' / 'plan.json').write_text('{"branch": true}\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'Branch: real + .task/'], cwd=wt)
+
+        # Intervening main commit adds a real file and a .task/ file
+        (git_ops.project_root / 'main_file.py').write_text('m = 1\n')
+        (git_ops.project_root / '.task').mkdir(exist_ok=True)
+        (git_ops.project_root / '.task' / 'state.json').write_text(
+            '{"main": true}\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: real + .task/'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        # Intersection of {branch_file.py} and {main_file.py} = {} — disjoint
+        assert overlap == [], (
+            f'task-dir exclusion: expected empty overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_fail_closed_on_bogus_ref(self, git_ops: GitOps) -> None:
+        """(d) Fail CLOSED: bogus rebased_from causes a git error; the helper
+        must return a non-empty sentinel list so the caller re-verifies.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        wt = (await git_ops.create_worktree('delta-failclosed')).path
+        (wt / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Branch: add file.py')
+        rebased_onto = await git_ops.get_main_sha()
+
+        # Pass a nonsense SHA as rebased_from — merge-base or diff will fail
+        bogus_sha = 'deadbeef' * 5  # 40 char hex but doesn't exist
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, bogus_sha, rebased_onto, git_ops,
+        )
+        assert len(overlap) > 0, (
+            f'Fail-closed: bogus ref must return non-empty sentinel, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
