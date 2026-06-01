@@ -3799,8 +3799,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._gate_retries.pop(req.task_id, None)
                 # Cleanup BEFORE _map_advance_failure so a cleanup raise
                 # propagates before halt_for_wip is ever called -- mirroring
-                # the serial MergeWorker path (cleanup@2604 before map@2622)
-                # and the abandoned-request short-circuit just above (3793).
+                # the serial MergeWorker path (cleanup_merge_worktree before
+                # _map_advance_failure in MergeWorker._process_one) and the
+                # abandoned-request short-circuit just above this block.
                 # Without this order, a cleanup raise strands the queue
                 # halted with no escalation owner on the single-task workflow
                 # path, which routes 'blocked' to _mark_blocked with no
