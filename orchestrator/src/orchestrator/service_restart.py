@@ -22,8 +22,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
@@ -105,8 +106,8 @@ class StaleServiceRestartCoordinator:
     def __init__(
         self,
         *,
-        git_ops: 'GitOps',
-        event_store: 'EventStore | None',
+        git_ops: GitOps,
+        event_store: EventStore | None,
         watch_prefixes: list[str] | None = None,
         debounce_secs: float = 120.0,
         enabled: bool = True,
