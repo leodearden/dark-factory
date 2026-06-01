@@ -30,6 +30,7 @@ import time
 WATCHED = [
     (8102, "orchestrator-dark-factory.service"),
     (8100, "orchestrator-reify.service"),
+    (8106, "orchestrator-my-solar-challenge.service"),
 ]
 
 # Skip the port probe for a unit that started within this many seconds.

@@ -509,6 +509,17 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
         f"orchestrator/config.yaml escalation.port ({df_port})"
     )
 
+    # --- my-solar-challenge orchestrator (check if present) ---
+    my_solar_config_path = pathlib.Path("/home/leo/src/my-solar-challenge/orchestrator.yaml")
+    if my_solar_config_path.exists():
+        my_solar_cfg = yaml.safe_load(my_solar_config_path.read_text())
+        my_solar_port = _extract_escalation_port(my_solar_cfg, my_solar_config_path)
+        assert unit_to_port["orchestrator-my-solar-challenge.service"] == my_solar_port, (
+            f"WATCHED port for orchestrator-my-solar-challenge.service "
+            f"({unit_to_port['orchestrator-my-solar-challenge.service']}) != "
+            f"my-solar-challenge/orchestrator.yaml escalation.port ({my_solar_port})"
+        )
+
     # --- reify orchestrator (skip if absent in this environment) ---
     reify_config_path = pathlib.Path("/home/leo/src/reify/orchestrator.yaml")
     if not reify_config_path.exists():
@@ -528,12 +539,13 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
 
 
 def test_main_targets_expected_pairs() -> None:
-    """WATCHED must list the two orchestrator (port, unit) pairs in order."""
+    """WATCHED must list the orchestrator (port, unit) pairs in order."""
     wdog = _load_watchdog()
     assert hasattr(wdog, "WATCHED"), "Module must expose a WATCHED constant"
     assert wdog.WATCHED == [
         (8102, "orchestrator-dark-factory.service"),
         (8100, "orchestrator-reify.service"),
+        (8106, "orchestrator-my-solar-challenge.service"),
     ]
 
 
@@ -696,8 +708,8 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
 
     wdog.main()
 
-    assert len(probed) == 2, (
-        f"Both ports must be probed when outside grace window; probed: {probed}"
+    assert len(probed) == len(wdog.WATCHED), (
+        f"All watched ports must be probed when outside grace window; probed: {probed}"
     )
     assert restarted == [], "No restart expected when ports are listening"
 
@@ -730,8 +742,8 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
 
     wdog.main()
 
-    assert len(probed) == 2, (
-        f"When elapsed is None, both ports must be probed; probed: {probed}"
+    assert len(probed) == len(wdog.WATCHED), (
+        f"When elapsed is None, all watched ports must be probed; probed: {probed}"
     )
 
 
