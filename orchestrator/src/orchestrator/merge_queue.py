@@ -1787,10 +1787,41 @@ class SpeculativeItem:
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
 
 
+class _TrainMergeHost(Protocol):
+    """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
+
+    Both :class:`MergeWorker` and :class:`SpeculativeMergeWorker` inherit
+    :class:`_WipHaltMixin` and define every attribute / constant listed here;
+    the Protocol lets ``_do_train_merge`` accept either worker type without
+    creating a coupling to the concrete class hierarchy.
+
+    The surface is intentionally narrow — only the state that the shared
+    train-merge pipeline actually touches.  Adding new attributes here does
+    NOT require touching ``_WipHaltMixin``; both concrete workers already
+    define them in their own ``__init__``.
+    """
+
+    # ── Git / event dependencies ──────────────────────────────────────────
+    _git_ops: GitOps
+    _event_store: EventStore | None
+
+    # ── Per-task counters (mutated by shared helpers) ─────────────────────
+    _post_merge_verify_timeouts: dict[str, int]
+    _post_merge_verify_enospc_retries: dict[str, int]
+    _cas_retries: dict[str, int]
+
+    # ── Class-level thresholds ────────────────────────────────────────────
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int
+
+    # ── WIP halt / abandon helpers ────────────────────────────────────────
+    def halt_for_wip(self, reason: str) -> None: ...
+    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
+
+
 async def _do_train_merge(
-    git_ops: GitOps,
+    worker: _TrainMergeHost,
     req: GroupMergeRequest,
-    event_store: EventStore | None,
 ) -> MergeOutcome:
     """Atomic train-merge pipeline shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -1810,6 +1841,10 @@ async def _do_train_merge(
     (step 4) covers the happy path where main is unmoved and all members are
     already merge-deferred.
     """
+    # Unpack worker state so the rest of the function reads like the single-task path.
+    git_ops = worker._git_ops
+    event_store = worker._event_store
+
     t0 = time.monotonic()
     logger.info(
         'Train %s: starting atomic merge of %d members via tip branch %s',
@@ -1927,19 +1962,21 @@ async def _do_train_merge(
             f'but merge_worktree is None'
         )
 
-    # (e) Workspace-wide post-merge verify (scenario 5 red gate).
-    verify = await run_scoped_verification(
-        merge_wt, req.config, req.module_configs,
-        task_files=req.task_files,
-        max_retries=0,
-        is_merge_verify=True,
-        force_workspace=req.config.merge_verify_workspace,
-        role='merge',
+    # (e) Workspace-wide post-merge verify via the shared helper.
+    # _run_post_merge_verify runs the pre-verify disk guard, the scoped
+    # verification (with ENOSPC prune-retry), and the timeout loop-breaker
+    # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
+    # (and cleans up merge_wt) when any controlled failure fires.
+    verify_outcome = await _run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
     )
-    if not verify.passed:
-        await git_ops.cleanup_merge_worktree(merge_wt)
-        reason = f'Post-merge verification failed: {verify.failure_report()}'
-        logger.info('Train %s: verify gate red: %s', req.train_id, reason)
+    if verify_outcome is not None:
+        reason = verify_outcome.reason
+        logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
         _emit_train_event(
             event_store, EventType.train_derailed,
             task_id=req.task_id, train_id=req.train_id,
@@ -1947,7 +1984,7 @@ async def _do_train_merge(
             data={'derail_reason': reason},
         )
         _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-        return MergeOutcome('blocked', reason=reason)
+        return verify_outcome
 
     # (f) CAS-advance main.
     adv = await git_ops.advance_main(
@@ -2275,7 +2312,7 @@ class MergeWorker(_WipHaltMixin):
         # _do_train_merge pipeline which owns rebase + merge + verify + advance
         # + member callbacks.  The rest of _do_merge is the single-task path.
         if isinstance(req, GroupMergeRequest):
-            return await _do_train_merge(self._git_ops, req, self._event_store)
+            return await _do_train_merge(self, req)
 
         t0 = time.monotonic()
 
@@ -2726,9 +2763,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 'for an idle pipeline before submitting a train',
                                 req.train_id, spec_base[:12],
                             )
-                        outcome = await _do_train_merge(
-                            self._git_ops, req, self._event_store,
-                        )
+                        outcome = await _do_train_merge(self, req)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
