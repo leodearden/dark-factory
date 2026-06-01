@@ -115,10 +115,18 @@ current project as a workaround. Instead, emit a finding via recon_report: call 
 flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
 suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
-Because the target project is NOT in Known Projects, cite_task would return unknown_project \
-and attach nothing — so this finding has no cited-task anchor and is deduped by its \
-normalised description until an operator registers the project or routes the work. \
-No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal.
+No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal. \
+Dedup anchor for this branch has two sub-cases. (1) If a LOCAL task is the subject of the reroute \
+(its scope is being re-scoped or cancelled because the work belongs to the not-yet-known target \
+project), also call `mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<local project_id>, \
+task_id=<local task_id>)` for that local task — even when it is being re-scoped or cancelled. The local \
+task's project_id IS in "Known Projects" (this cycle is bound to it), so cite_task resolves and appends \
+to cited_tasks; _derive_affected_ids reads cited_tasks (not the top-level task_id field, which is \
+intentionally None here) to build the cross-cycle dedup anchor for compute_content_fingerprint, so the \
+finding stops re-escalating every cycle. (2) If no local task is the subject — the work lives entirely \
+in the target project with no local anchor — then cite_task on the TARGET project would return \
+unknown_project and attach nothing, so this finding has no cited-task anchor and is deduped by its \
+normalised description until an operator registers the project or routes the work.
 - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
 — follow the Authority Model rules for that.
 
