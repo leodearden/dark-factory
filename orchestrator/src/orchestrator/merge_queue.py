@@ -971,6 +971,19 @@ async def _rebase_delta_touched_overlap(
     """
     label = task_id or '<unknown>'
 
+    # Fail-CLOSED guard: rebased_from is required to compute the intervening
+    # delta.  If it is falsy (e.g. a future caller passes
+    # reverify_on_rebase=True with expected_main=None), we cannot safely
+    # determine whether the rebase is disjoint, so return the sentinel to
+    # force re-verification rather than silently passing None to git.
+    if not rebased_from:
+        logger.warning(
+            'rebase-delta-overlap: rebased_from is falsy (%r); failing '
+            'closed. task_id=%s',
+            rebased_from, label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+
     # 1. Resolve branch HEAD
     rc, head_out, head_err = await _run(
         ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
@@ -2493,6 +2506,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
         self._cas_retries: dict[str, int] = {}
+        # Per-task gate-iteration counter for rebased_pending_reverify results.
+        # Separate from _cas_retries so that disjoint rebases (where no extra
+        # verify is run) do not consume the CAS-failure budget.  Bounded by
+        # MAX_CAS_RETRIES to prevent runaway gate loops on a perpetually-moving
+        # main; cleared on exhaustion or when the task leaves the queue.
+        self._gate_retries: dict[str, int] = {}
         # Per-task consecutive post-merge-verify-timeout counter.  Bumped by
         # the Verifier when a post-merge verify finishes with timed_out=True,
         # cleared on a successful CAS advance.  Keyed by task_id; lives
@@ -3444,6 +3463,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # it here lowers peak worktree count under disk pressure and
                 # mirrors MergeWorker which already cleans merge_wt right after
                 # advance_main.
+                self._gate_retries.pop(req.task_id, None)
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 outcome = await _finalize_advanced_merge(
                     self._git_ops, req, self._event_store,
@@ -3486,9 +3506,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # advance_main rebased merge_wt onto the new main but did NOT
                 # update-ref.  Read side channels immediately before any further
                 # advance_main call could overwrite them.
-                rebased_sha: str = self._git_ops._last_advanced_sha  # type: ignore[attr-defined]
-                rebased_from: str = self._git_ops._rebased_from       # type: ignore[attr-defined]
-                rebased_onto: str = self._git_ops._rebased_onto       # type: ignore[attr-defined]
+                # Use getattr with None defaults so a missing attribute raises a
+                # clear AssertionError rather than a bare AttributeError, turning
+                # a silent contract violation into an observable failure.
+                rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
+                rebased_from = getattr(self._git_ops, '_rebased_from', None)
+                rebased_onto = getattr(self._git_ops, '_rebased_onto', None)
+                if rebased_sha is None or rebased_from is None or rebased_onto is None:
+                    raise AssertionError(
+                        f'advance_main returned rebased_pending_reverify but '
+                        f'side-channel attributes are not all set (task '
+                        f'{req.task_id}): _last_advanced_sha={rebased_sha!r}, '
+                        f'_rebased_from={rebased_from!r}, '
+                        f'_rebased_onto={rebased_onto!r}'
+                    )
 
                 gate = await _reverify_rebased_tree(
                     self._git_ops, req, merge_wt,
@@ -3507,21 +3538,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return False
 
                 # Disjoint, or overlap+green: advance with the verified rebased
-                # SHA.  Reuse the CAS-retry counter so runaway gate loops are
-                # bounded by MAX_CAS_RETRIES just like plain CAS retries.
+                # SHA.  Use the dedicated _gate_retries counter (not _cas_retries)
+                # so benign disjoint rebases do not draw from the CAS-failure
+                # budget.  Both counters are bounded by MAX_CAS_RETRIES to
+                # prevent runaway loops; they are tracked independently.
                 current_sha = rebased_sha
-                total = self._cas_retries.get(req.task_id, 0) + 1
-                self._cas_retries[req.task_id] = total
-                if total > self.MAX_CAS_RETRIES:
-                    self._cas_retries.pop(req.task_id, None)
+                gate_total = self._gate_retries.get(req.task_id, 0) + 1
+                self._gate_retries[req.task_id] = gate_total
+                if gate_total > self.MAX_CAS_RETRIES:
+                    self._gate_retries.pop(req.task_id, None)
                     logger.warning(
-                        'Task %s: CAS/gate retry limit exhausted after gate '
+                        'Task %s: gate retry limit exhausted after gate '
                         'cleared (%d attempts)',
                         req.task_id, self.MAX_CAS_RETRIES,
                     )
                     _emit_merge_attempt(
                         self._event_store, req.task_id, 'cas_exhausted',
-                        attempt=total,
+                        attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
                     await self._git_ops.cleanup_merge_worktree(merge_wt)
@@ -3529,15 +3562,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.result.set_result(MergeOutcome(
                             'blocked',
                             reason=(
-                                f'CAS retry limit exhausted after '
+                                f'Gate retry limit exhausted after '
                                 f'{self.MAX_CAS_RETRIES} attempts for task '
                                 f'{req.task_id}'
                             ),
                         ))
                     return False
 
-                # Rebuild item so the next advance_main call uses rebased_onto
-                # as the expected CAS base (main now points at rebased_onto).
+                # Rebuild item with base_sha = rebased_onto so the NEXT call to
+                # advance_main uses rebased_onto as expected_main.  On a second
+                # rebase, _rebased_from will be set to rebased_onto (not the
+                # original fork point), so _rebase_delta_touched_overlap only
+                # computes the INCREMENTAL new delta — not the full interval
+                # from the original base.  This ensures repeated gate verifies
+                # on a hot main are scoped to new churn only.
                 item = SpeculativeItem(
                     request=item.request,
                     merge_result=item.merge_result,
@@ -3549,12 +3587,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 logger.info(
                     'Task %s: gate cleared (disjoint or green re-verify); '
-                    'advancing with rebased SHA %s',
+                    'advancing with rebased SHA %s (gate attempt %d/%d)',
                     req.task_id, rebased_sha[:8],
+                    gate_total, self.MAX_CAS_RETRIES,
                 )
                 _emit_merge_attempt(
-                    self._event_store, req.task_id, 'cas_retry',
-                    attempt=total,
+                    self._event_store, req.task_id, 'gate_retry',
+                    attempt=gate_total,
                     duration_ms=_elapsed_ms(item.started_monotonic),
                 )
                 continue
@@ -3566,8 +3605,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if result in ('unmerged_state', 'pop_conflict_no_advance'):
                     self._cas_retries.pop(req.task_id, None)
+                    self._gate_retries.pop(req.task_id, None)
                 return False
             if result != 'cas_failed':
+                self._gate_retries.pop(req.task_id, None)
                 outcome = await _map_advance_failure(
                     self._git_ops, result,
                     task_id=req.task_id,
@@ -3586,6 +3627,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._cas_retries[req.task_id] = total
             if total > self.MAX_CAS_RETRIES:
                 self._cas_retries.pop(req.task_id, None)
+                self._gate_retries.pop(req.task_id, None)
                 logger.warning(
                     f'Task {req.task_id}: CAS retry limit exhausted '
                     f'({self.MAX_CAS_RETRIES} attempts)'
