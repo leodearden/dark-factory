@@ -633,6 +633,22 @@ class TaskWorkflow:
                 self.task_id, train_id, result.reason,
             )
             return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Orphan-halt probe: _map_advance_failure halted the merge queue (one of the
+        # four halt-inducing statuses: wip_halted, done_wip_recovery,
+        # wip_recovery_no_advance, unmerged_state) and halt_owner_esc_id is None,
+        # so harness._on_escalation_resolved cannot unhalt the queue on L1 resolution.
+        # Register the halt owner NOW so resolving the L1 auto-unhalts the queue
+        # (parity with the single-task _handle_wip_conflict path — task 1599).
+        # The probe is ground truth: it fires only when the queue IS halted with no
+        # owner, is future-proof against new halt statuses, and never misfires on
+        # genuine non-halt 'blocked' outcomes (rebase-conflict/cas_failed do NOT call
+        # halt(), so is_wip_halted stays False for those paths).
+        if (
+            self.merge_worker is not None
+            and self.merge_worker.is_wip_halted
+            and self.merge_worker.halt_owner_esc_id is None
+        ):
+            return await self._escalate_train_halt(result, train_id)
         # Genuine failure (conflict/verify-red/rebase-conflict) → escalate to human
         # so a broken train is never silently parked forever (scenarios 5/8).
         return await self._mark_blocked(
