@@ -2034,14 +2034,35 @@ async def _do_train_merge(
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
+        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        if adv == 'cas_failed':
+            # advance_main already retried internally; workflow re-parks the
+            # train.  Return a simple blocked rather than routing through
+            # _map_advance_failure (which does not handle cas_failed).
+            _emit_train_event(
+                event_store, EventType.train_derailed,
+                task_id=req.task_id, train_id=req.train_id,
+                member_task_ids=req.member_task_ids,
+                data={'derail_reason': f'Train merge advance failed: {adv}'},
+            )
+            return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
+        # All other codes (wip_overlap, pop_conflict, unmerged_state, …) route
+        # through the shared failure mapper so the train gets the same
+        # wip-halt + escalation routing as the single-task path.
+        outcome = await _map_advance_failure(
+            git_ops, adv,
+            task_id=req.task_id,
+            merge_commit_fallback=merge_commit,
+            halt=worker.halt_for_wip,
+            cas_retries=worker._cas_retries,
+        )
         _emit_train_event(
             event_store, EventType.train_derailed,
             task_id=req.task_id, train_id=req.train_id,
             member_task_ids=req.member_task_ids,
             data={'derail_reason': f'Train merge advance failed: {adv}'},
         )
-        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-        return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
+        return outcome
 
     # advance succeeded — run equivalence + pyright + push via shared finalize.
     # merge_wt has already been cleaned up above (caller contract for finalize).
