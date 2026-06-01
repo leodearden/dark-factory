@@ -9946,7 +9946,11 @@ class TestSummaryNonce:
     """
 
     def test_nonce_format_is_8_lowercase_hex_chars(self):
-        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$."""
+        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$.
+
+        Backward-compatibility anchor (task 1590): the no-arg call must always
+        return a bare 8-char hex token — untouched by the prefix feature.
+        """
         import re
 
         from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
@@ -9955,5 +9959,54 @@ class TestSummaryNonce:
         assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
         assert re.fullmatch(r'[0-9a-f]{8}', nonce), (
             f'Expected 8 lowercase hex chars matching ^[0-9a-f]{{8}}$, got {nonce!r}'
+        )
+
+    def test_prefixed_nonce_stage1_format(self):
+        """generate_summary_nonce('STAGE1') returns a str matching ^STAGE1_[0-9a-f]{8}$.
+
+        Task 1590: stage-prefixed nonces structurally distinguish Stage 1 and Stage 2
+        summaries so their leading tokens differ, further separating them in Mem0's
+        embedding space.  RED until step-2 impl adds the prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        nonce = generate_summary_nonce('STAGE1')
+        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
+        assert re.fullmatch(r'STAGE1_[0-9a-f]{8}', nonce), (
+            f"Expected 'STAGE1_<8-hex>' matching ^STAGE1_[0-9a-f]{{8}}$, got {nonce!r}"
+        )
+
+    def test_prefixed_nonce_stage2_format(self):
+        """generate_summary_nonce('STAGE2') returns a str matching ^STAGE2_[0-9a-f]{8}$.
+
+        Task 1590: mirrors stage1 test; ensures Stage 2 nonces always lead with 'STAGE2_'.
+        RED until step-2 impl adds the prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        nonce = generate_summary_nonce('STAGE2')
+        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
+        assert re.fullmatch(r'STAGE2_[0-9a-f]{8}', nonce), (
+            f"Expected 'STAGE2_<8-hex>' matching ^STAGE2_[0-9a-f]{{8}}$, got {nonce!r}"
+        )
+
+    def test_stage1_and_stage2_nonces_are_never_equal(self):
+        """generate_summary_nonce('STAGE1') != generate_summary_nonce('STAGE2').
+
+        Task 1590: the two prefixes guarantee the tokens can NEVER be lexically equal —
+        'STAGE1_...' vs 'STAGE2_...' always differ regardless of the hex suffix.
+        RED until step-2 impl adds the prefix parameter.
+        """
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        s1 = generate_summary_nonce('STAGE1')
+        s2 = generate_summary_nonce('STAGE2')
+        assert s1 != s2, (
+            f"generate_summary_nonce('STAGE1') and generate_summary_nonce('STAGE2') must "
+            f"never be equal — they have different stage prefixes; got {s1!r} and {s2!r}"
         )
 
