@@ -10010,3 +10010,84 @@ class TestSummaryNonce:
             f"never be equal — they have different stage prefixes; got {s1!r} and {s2!r}"
         )
 
+
+class TestBuildSummaryNonceSectionPrefix:
+    """build_summary_nonce_section() prefix forwarding tests (task 1590).
+
+    Verifies that the helper accepts an optional stage prefix and produces
+    a section line in the form 'summary_nonce: STAGE1_<8-hex>' or
+    'summary_nonce: STAGE2_<8-hex>', while keeping no-arg calls backward-compatible.
+    RED until step-4 impl adds the prefix parameter to build_summary_nonce_section.
+    """
+
+    def test_no_arg_backward_compat(self):
+        """No-arg build_summary_nonce_section() still matches 'summary_nonce: [0-9a-f]{8}'.
+
+        Backward-compat anchor: must stay GREEN across step-4 impl.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section()
+        assert re.search(r'summary_nonce: [0-9a-f]{8}', section), (
+            f"No-arg build_summary_nonce_section() must include 'summary_nonce: <8-hex>'; "
+            f"got: {section!r}"
+        )
+
+    def test_stage1_prefix_produces_prefixed_nonce(self):
+        """build_summary_nonce_section('STAGE1') must contain 'summary_nonce: STAGE1_<8-hex>'.
+
+        Task 1590: verifies the helper forwards the prefix to generate_summary_nonce.
+        RED until step-4 impl adds prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section('STAGE1')
+        assert re.search(r'summary_nonce: STAGE1_[0-9a-f]{8}', section), (
+            f"build_summary_nonce_section('STAGE1') must contain "
+            f"'summary_nonce: STAGE1_<8-hex>'; got: {section!r}"
+        )
+
+    def test_stage2_prefix_produces_prefixed_nonce(self):
+        """build_summary_nonce_section('STAGE2') must contain 'summary_nonce: STAGE2_<8-hex>'.
+
+        Task 1590: mirrors stage1 test for Stage 2.
+        RED until step-4 impl adds prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section('STAGE2')
+        assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', section), (
+            f"build_summary_nonce_section('STAGE2') must contain "
+            f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
+        )
+
+    def test_cross_stage_nonce_values_are_never_equal(self):
+        """Nonce values from build_summary_nonce_section('STAGE1') vs ('STAGE2') are always distinct.
+
+        Task 1590: STAGE1_ and STAGE2_ prefixes guarantee the full nonce strings
+        (prefix + hex suffix) can never be equal regardless of the hex suffix.
+        RED until step-4 impl adds prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section1 = build_summary_nonce_section('STAGE1')
+        section2 = build_summary_nonce_section('STAGE2')
+
+        m1 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', section1)
+        m2 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', section2)
+
+        assert m1, f"No 'summary_nonce: STAGE1_<8-hex>' in section: {section1!r}"
+        assert m2, f"No 'summary_nonce: STAGE2_<8-hex>' in section: {section2!r}"
+        assert m1.group(1) != m2.group(1), (
+            f"STAGE1 and STAGE2 nonces must never be equal; "
+            f"got {m1.group(1)!r} and {m2.group(1)!r}"
+        )
+
