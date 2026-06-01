@@ -35,6 +35,7 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     files_to_modules,
 )
+from orchestrator.service_restart import StaleServiceRestartCoordinator
 from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -441,6 +442,12 @@ class Harness:
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+
+        # Post-merge staleness hook — restart fused-memory.service when a
+        # landed diff touches fused-memory/src/.  Built in _start_merge_worker
+        # (where git_ops/event_store/config are all live) and fired from the
+        # run-forever idle branch (a verified no-dispatched-agents quiet window).
+        self._service_restart_coordinator: StaleServiceRestartCoordinator | None = None
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
@@ -864,6 +871,10 @@ class Harness:
                                 self.config.idle_poll_secs,
                             )
                             self._last_idle_poll_log = now
+                        # Post-merge staleness hook: restart fused-memory.service
+                        # if a code-touching merge has been debounced and the
+                        # orchestrator is idle (no dispatched agents = quiet window).
+                        await self._maybe_restart_stale_service(agents_idle=True)
                         await asyncio.sleep(self.config.idle_poll_secs)
                         continue
                     # Wait for any active task to complete, then retry.
@@ -3109,11 +3120,19 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Uses SpeculativeMergeWorker (two-coroutine pipeline) by default.
         MergeWorker (serial) is preserved but deprecated.
+
+        Also builds and stores the StaleServiceRestartCoordinator and wires
+        its note_merge method as the merge worker's on_merge_landed callback.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
+        self._service_restart_coordinator = self._build_service_restart_coordinator()
+
         self._merge_worker = SpeculativeMergeWorker(
-            self.git_ops, self._merge_queue, event_store=self.event_store,
+            self.git_ops,
+            self._merge_queue,
+            event_store=self.event_store,
+            on_merge_landed=self._service_restart_coordinator.note_merge,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
@@ -3129,6 +3148,36 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._merge_worker_task
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
+
+    def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
+        """Construct a StaleServiceRestartCoordinator from the current config.
+
+        Called once from _start_merge_worker (where git_ops, event_store, and
+        config are all live).  The coordinator is stored on self so the
+        run-forever idle branch can call maybe_restart(agents_idle=True).
+        """
+        return StaleServiceRestartCoordinator(
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            watch_prefixes=self.config.fused_memory_restart_watch_prefixes,
+            debounce_secs=self.config.fused_memory_restart_debounce_secs,
+            enabled=self.config.fused_memory_restart_on_merge_enabled,
+            script_path=self.config.fused_memory_restart_script,
+            project_root=self.config.project_root,
+        )
+
+    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
+        """Delegate to the service-restart coordinator, if one is wired.
+
+        Called from the run-forever idle branch (active is empty — a verified
+        quiet window).  No-op when the coordinator is None or disabled.
+        Returns True when the restart was fired, False otherwise.
+        """
+        if self._service_restart_coordinator is None:
+            return False
+        return await self._service_restart_coordinator.maybe_restart(
+            agents_idle=agents_idle
+        )
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.

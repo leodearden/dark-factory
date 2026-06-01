@@ -65,14 +65,15 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 #   Stage 3 — "## Report Channel" section header + read-only NOTE inserted
 #             between the cite-tool list and the stats line.
 #
-# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3):
-#   When a finding targets a specific task, pass task_id= at the top level of
-#   add_finding() in addition to cite_task().  The dedup engine's cited_tasks
-#   fallback derives a signature from the sorted union of all cited task IDs;
-#   that signature changes whenever citations grow or shrink, defeating
-#   recurrence tracking for evolving multi-task findings.  An explicit top-level
-#   task_id is stable and should always be set when there is a clear primary
-#   subject task.
+# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected task-1594):
+#   _derive_affected_ids reads cited_tasks (not the top-level task_id field of
+#   add_finding) when building the fingerprint identity for compute_content_fingerprint.
+#   Always call cite_task for the primary subject task so the fingerprint is stable.
+#   For multi-task findings, the cited_tasks signature shifts as citations grow or
+#   shrink — pass task_id=<primary> at the top level of add_finding as a supplementary
+#   stable anchor when one primary subject exists.
+#   Exception: cross_project findings use task_id=None (operator routing); cite_task
+#   is the sole dedup anchor there (see ## Cross-Project Routing in stage2.py).
 _RECON_REPORT_TOOL_GUIDANCE = (
     'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
     ' — do NOT call it yourself. For each finding, call `mcp__recon-report__add_finding(...)`'
@@ -83,11 +84,15 @@ _RECON_REPORT_TOOL_GUIDANCE = (
     ' copy the UUID verbatim from the `id` field of a fresh tool result'
     ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
     '- `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>,'
-    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**: when the finding'
-    ' has a clear primary subject task, also pass `task_id=<that task_id>` at the top'
-    ' level of `add_finding(...)`. The dedup engine prefers the top-level field; the'
-    ' cited_tasks fallback signature changes as citation sets grow, defeating recurrence'
-    ' tracking.\n'
+    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**:'
+    ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
+    ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
+    ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
+    ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
+    ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
+    ' supplementary stable anchor when one clear primary subject exists. Exception:'
+    ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
+    ' sole dedup anchor there.\n'
     "- `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>,"
     " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
     ' `id` field of a fresh tool result.\n'

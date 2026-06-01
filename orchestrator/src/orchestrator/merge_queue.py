@@ -2278,10 +2278,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         git_ops: GitOps,
         queue: asyncio.Queue[MergeRequest],
         event_store: EventStore | None = None,
+        on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
         self._event_store = event_store
+        # Post-merge notification hook — called with (task_id, base_sha,
+        # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
+        # coordinator bug never blocks or fails the merge.  See task 1592.
+        self._on_merge_landed = on_merge_landed
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -3245,6 +3250,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 if not req.result.done():
                     req.result.set_result(outcome)
+                # SMW-only post-merge notification hook (task 1592).  Fires only
+                # on a 'done' landing: _finalize_advanced_merge may instead
+                # return a 'blocked' outcome (equivalence/pyright gate), and
+                # main's pre-refactor inline code reached this hook only after
+                # those gates passed (they returned early on failure).  Guard on
+                # status == 'done' to preserve that semantics; outcome.merge_sha
+                # carries the advanced SHA that the old inline code passed.
+                # MergeWorker deliberately has no such hook.
+                if (
+                    outcome.status == 'done'
+                    and outcome.merge_sha is not None
+                    and self._on_merge_landed is not None
+                ):
+                    try:
+                        await self._on_merge_landed(
+                            req.task_id, item.base_sha, outcome.merge_sha
+                        )
+                    except Exception:
+                        logger.warning(
+                            'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                            req.task_id,
+                            exc_info=True,
+                        )
                 return True
 
             if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):

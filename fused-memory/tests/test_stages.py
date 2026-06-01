@@ -10055,4 +10055,3 @@ class TestBuildSummaryNonceSectionPrefix:
             f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
         )
 
-

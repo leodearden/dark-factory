@@ -176,6 +176,11 @@ class EventType(StrEnum):
     train_merged = 'train_merged'
     train_derailed = 'train_derailed'
 
+    # Service lifecycle — emitted when the post-merge staleness hook triggers
+    # a restart of a backing service (e.g. fused-memory.service after a merge
+    # whose landed diff touched fused-memory/src/).
+    service_restart = 'service_restart'
+
 
 class EventStore:
     """Append-only SQLite event store.

@@ -92,18 +92,41 @@ Note: update Mem0 procedure AFTER task completes, not now.
 Each reconciliation cycle is bound to one project. However, a finding may identify work \
 whose scope belongs to a different project (e.g. the underlying bug lives in another repo). \
 When this happens:
-- If the target project appears in the payload's "Known Projects" section, pass that \
-project's project_root to `mcp__fused-memory__submit_task` and its project_id to any \
-memory writes. The path-scope guard validates the routing and rejects tasks that cite paths \
-owned by another project with a structured `DarkFactoryPathScopeViolation` error — its \
-`suggested_project` field tells you where to resubmit.
+- If the target project appears in the payload's "Known Projects" section:
+  - To create new work there: pass that project's project_root to \
+`mcp__fused-memory__submit_task` and its project_id to any memory writes. The path-scope \
+guard validates the routing and rejects tasks that cite paths owned by another project with \
+a structured `DarkFactoryPathScopeViolation` error — its `suggested_project` field tells you \
+where to resubmit.
+  - To surface a relationship to an EXISTING task there (rather than creating new work): emit \
+`mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
+flag_type='cross_project', actionable=False, description=<summary>, \
+suggested_action=<evidence notes>, task_id=None)`, then immediately call \
+`mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<that project_id>, \
+task_id=<existing foreign task_id>)` — because the project IS in Known Projects, cite_task \
+resolves it and appends to cited_tasks; that citation is the cross-cycle dedup anchor \
+(without it, _derive_affected_ids returns [] and the escalation fingerprint hashes the \
+drifting description, causing the finding to re-escalate every cycle). \
+cite_task ONLY records a citation for project_ids listed in Known Projects — calling it for \
+an unlisted project returns unknown_project and attaches nothing.
 - If no project_root in "Known Projects" matches the scope, do NOT file the task in the \
 current project as a workaround. Instead, emit a finding via recon_report: call \
 `mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
 flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
 suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
-No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal.
+No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal. \
+Dedup anchor for this branch has two sub-cases. (1) If a LOCAL task is the subject of the reroute \
+(its scope is being re-scoped or cancelled because the work belongs to the not-yet-known target \
+project), also call `mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<local project_id>, \
+task_id=<local task_id>)` for that local task — even when it is being re-scoped or cancelled. The local \
+task's project_id IS in "Known Projects" (this cycle is bound to it), so cite_task resolves and appends \
+to cited_tasks; _derive_affected_ids reads cited_tasks (not the top-level task_id field, which is \
+intentionally None here) to build the cross-cycle dedup anchor for compute_content_fingerprint, so the \
+finding stops re-escalating every cycle. (2) If no local task is the subject — the work lives entirely \
+in the target project with no local anchor — then cite_task on the TARGET project would return \
+unknown_project and attach nothing, so this finding has no cited-task anchor and is deduped by its \
+normalised description until an operator registers the project or routes the work.
 - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
 — follow the Authority Model rules for that.
 
