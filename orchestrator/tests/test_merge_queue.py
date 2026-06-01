@@ -8200,3 +8200,163 @@ class TestRunPostMergeVerify:
                 )
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestFinalizeAdvancedMerge — unit tests for the _finalize_advanced_merge helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeAdvancedMerge:
+    """Direct unit tests for the _finalize_advanced_merge module-level helper."""
+
+    def _make_git_ops(self, *, last_advanced_sha: str | None = 'abc123def') -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops._last_advanced_sha = last_advanced_sha
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-finalize-test'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+        return req
+
+    def _primed_dicts(self, task_id: str) -> tuple[dict, dict, dict]:
+        cas_retries = {task_id: 1}
+        timeouts = {task_id: 1}
+        enospc_retries = {task_id: 1}
+        return cas_retries, timeouts, enospc_retries
+
+    async def test_success_path_returns_done_pops_counters(self) -> None:
+        """(a) equivalence=[] + pyright not broken → done with merge_sha + push_main called; counters cleared."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done'
+        assert outcome.merge_sha == git_ops._last_advanced_sha
+        assert outcome.push_status == 'pushed'
+        git_ops.push_main.assert_awaited_once()
+        assert req.task_id not in cas_retries
+        assert req.task_id not in timeouts
+        assert req.task_id not in enospc_retries
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_equivalence_failure_blocks_no_push(self) -> None:
+        """(b) equivalence returns non-empty → blocked with equiv prefix; push NOT called."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['file.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()) as mock_pyright,
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        git_ops.push_main.assert_not_awaited()
+        mock_pyright.assert_not_awaited()
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_pyright_broken_blocks_no_push(self) -> None:
+        """(c) pyright .broken True → blocked with pyright prefix, failing subproject in reason; push NOT called."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_broken = MagicMock(broken=True, failing_subprojects=['mypackage'], detail='type error detail')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_broken)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        assert 'mypackage' in outcome.reason
+        git_ops.push_main.assert_not_awaited()
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_no_last_advanced_sha_uses_fallback(self) -> None:
+        """(d) _last_advanced_sha absent/None → advanced_sha falls back to merge_commit_fallback."""
+        from orchestrator.merge_queue import _finalize_advanced_merge
+
+        git_ops = self._make_git_ops(last_advanced_sha=None)
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='the-fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done'
+        assert outcome.merge_sha == 'the-fallback-sha'
