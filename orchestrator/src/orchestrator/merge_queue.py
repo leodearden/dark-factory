@@ -1842,6 +1842,47 @@ async def _do_train_merge(
 ) -> MergeOutcome:
     """Atomic train-merge pipeline shared by MergeWorker and SpeculativeMergeWorker.
 
+    BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
+    core at PARITY with MergeWorker._do_merge — specifically:
+      • disk-guard pre-verify short-circuit (_run_post_merge_verify)
+      • verify-timeout loop-breaker (worker._post_merge_verify_timeouts)
+      • post-merge content-equivalence gate (_finalize_advanced_merge)
+      • unscoped pyright gate (_finalize_advanced_merge)
+      • push_main (outcome.push_status propagated from _finalize_advanced_merge)
+      • wip-halt + escalation routing for non-'advanced' advance results
+        (_map_advance_failure via worker.halt_for_wip)
+
+    DEFENSIBLE DELTAS — behaviours intentionally absent from the train path
+    despite being present in MergeWorker or SpeculativeMergeWorker:
+
+    1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate lives ONLY in
+       SpeculativeMergeWorker._verify_and_advance's CAS loop.  MergeWorker (the
+       readable serial reference) also does NOT pass it.  "Parity" means parity
+       with MergeWorker, not the spec-worker CAS loop.  Adding the gate here
+       would duplicate speculative-worker logic that has no business in the train.
+
+    2. Pyright redundant-but-harmless: the train always rebases its tip onto
+       main before merging, so the type surface is fresh.  The post-merge
+       unscoped pyright run is therefore redundant in the common case but is
+       kept for uniformity and because the cost is low relative to the safety
+       guarantee.
+
+    3. No drop-guard (_check_plan_targets_in_tree): the drop guard targets
+       conflict-RESOLUTION drops (a human resolved and accidentally removed work).
+       Trains abort cleanly on rebase conflict (TRAIN_REBASE_CONFLICT), so there
+       is no conflict-resolution step from which targets can be dropped.  The
+       post-merge equivalence check covers rebase-rewrite.
+
+    4. No ``skip_verify``: the train always rebases its tip and needs the full
+       workspace-green gate.  The single-task ``skip_verify`` path is triggered
+       by a pre-rebased branch; trains always start from a fresh rebase.
+
+    5. ``cas_failed`` → ``blocked``: ``advance_main`` already retried internally
+       up to ``max_advance_attempts``; the workflow re-parks an incomplete train
+       for retry.  Mapping a residual ``cas_failed`` to ``blocked`` (not
+       re-enqueuing directly) is correct — the orchestrator will re-dispatch on
+       the next scheduler tick.
+
     Implements PRD δ₁ spec §9.6:
     (a) Status pre-check — all members must be ``merge-deferred``.
     (b) Tip rebase — ``rebase_onto_main`` rebases the tip onto current main;
@@ -1852,11 +1893,8 @@ async def _do_train_merge(
         enforces the workspace-wide post-merge green gate (scenario 5).
     (e) CAS advance — ``advance_main`` atomically updates the main ref.
     (f) Member callbacks — ``req.mark_member_done`` is called for each member
-        ONLY after advance succeeds (invariant: members flip iff main lands).
-
-    Pre-checks (a)+(b) are added in steps 6 and 8; this initial implementation
-    (step 4) covers the happy path where main is unmoved and all members are
-    already merge-deferred.
+        ONLY after advance + _finalize_advanced_merge succeed (invariant: members
+        flip iff main lands AND post-merge gates pass).
     """
     # Unpack worker state so the rest of the function reads like the single-task path.
     git_ops = worker._git_ops
