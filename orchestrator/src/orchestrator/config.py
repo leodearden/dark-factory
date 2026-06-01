@@ -821,6 +821,19 @@ class OrchestratorConfig(BaseSettings):
     # reap the provably-empty ones, then prune stale git admin entries.
     worktree_orphan_reaper_enabled: bool = Field(default=True)
 
+    # Post-merge staleness hook — restarts fused-memory.service exactly once
+    # (debounced) after a merge whose landed diff touches fused-memory/src/.
+    # Fires only at the orchestrator's idle quiet-window (no dispatched agents).
+    # See orchestrator/src/orchestrator/service_restart.py for policy details.
+    fused_memory_restart_on_merge_enabled: bool = Field(default=True)
+    fused_memory_restart_debounce_secs: float = Field(default=120.0)
+    fused_memory_restart_watch_prefixes: list[str] = Field(
+        default_factory=lambda: ['fused-memory/src/']
+    )
+    fused_memory_restart_script: str = Field(
+        default='scripts/restart-fused-memory.sh'
+    )
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such
