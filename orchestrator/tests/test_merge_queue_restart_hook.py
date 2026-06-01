@@ -18,7 +18,6 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 
-
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue.py
 # ---------------------------------------------------------------------------

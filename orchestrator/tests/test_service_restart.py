@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     diff_touches_watched_paths,
 )
-
 
 DEFAULT_PREFIXES = ['fused-memory/src/']
 
@@ -225,7 +225,7 @@ def _make_coordinator_with_mutable_clock(
     debounce_secs: float = 120.0,
     enabled: bool = True,
     restart_executor: AsyncMock | None = None,
-) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock]:
+) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock, MagicMock]:
     """Build a coordinator with a mutable-list clock and injectable executor."""
     git_ops = MagicMock()
     git_ops.get_merge_diff_files = AsyncMock(return_value=diff_files)
@@ -243,13 +243,13 @@ def _make_coordinator_with_mutable_clock(
         restart_executor=executor,
         clock=lambda: current_time[0],
     )
-    return coord, current_time, executor
+    return coord, current_time, executor, event_store
 
 
 @pytest.mark.asyncio
 async def test_maybe_restart_not_pending_returns_false() -> None:
     """(a) not pending → no executor call, returns False."""
-    coord, current_time, executor = _make_coordinator_with_mutable_clock([])
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock([])
 
     result = await coord.maybe_restart(agents_idle=True)
 
@@ -260,7 +260,7 @@ async def test_maybe_restart_not_pending_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_maybe_restart_pending_but_not_idle_defers() -> None:
     """(b) pending but agents_idle=False → no executor call, returns False, still pending."""
-    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'], debounce_secs=0.0
     )
     current_time[0] = 1000.0
@@ -278,7 +278,7 @@ async def test_maybe_restart_pending_but_not_idle_defers() -> None:
 @pytest.mark.asyncio
 async def test_maybe_restart_pending_idle_debounce_not_elapsed() -> None:
     """(c) pending, agents_idle=True, debounce NOT elapsed → no call, returns False."""
-    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'], debounce_secs=120.0
     )
     current_time[0] = 1000.0
@@ -297,7 +297,7 @@ async def test_maybe_restart_pending_idle_debounce_not_elapsed() -> None:
 async def test_maybe_restart_fires_when_all_conditions_met(caplog: pytest.LogCaptureFixture) -> None:
     """(d) pending, agents_idle=True, debounce elapsed → fires once, event emitted, pending cleared."""
     import logging
-    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+    coord, current_time, executor, event_store_mock = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'], debounce_secs=120.0
     )
     current_time[0] = 1000.0
@@ -313,8 +313,8 @@ async def test_maybe_restart_fires_when_all_conditions_met(caplog: pytest.LogCap
     executor.assert_awaited_once()
 
     # Check event emitted via event_store
-    coord._event_store.emit.assert_called_once()
-    call_kwargs = coord._event_store.emit.call_args
+    event_store_mock.emit.assert_called_once()
+    call_kwargs = event_store_mock.emit.call_args
     data = call_kwargs.kwargs['data']
     assert data['service'] == 'fused-memory'
     assert 'task-42' in data['trigger_task_ids']
@@ -328,7 +328,7 @@ async def test_maybe_restart_fires_when_all_conditions_met(caplog: pytest.LogCap
 @pytest.mark.asyncio
 async def test_maybe_restart_idempotent_no_double_fire() -> None:
     """(e) calling maybe_restart again with no new note_merge → executor NOT called again."""
-    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'], debounce_secs=120.0
     )
     current_time[0] = 1000.0
@@ -423,7 +423,8 @@ async def test_burst_coalescing_fires_exactly_once_after_last_merge() -> None:
 @pytest.mark.asyncio
 async def test_default_executor_spawns_script_detached() -> None:
     """Default executor spawns scripts/restart-fused-memory.sh --drain detached."""
-    from unittest.mock import patch, MagicMock as MM
+    from unittest.mock import MagicMock as MM
+    from unittest.mock import patch
 
     git_ops = MagicMock()
     git_ops.get_merge_diff_files = AsyncMock(return_value=['fused-memory/src/server/main.py'])

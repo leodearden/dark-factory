@@ -23,7 +23,6 @@ import pytest
 from orchestrator.harness import Harness
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
