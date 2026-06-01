@@ -13,7 +13,11 @@ Verifies end-to-end that a null-task_id cross_project finding:
                with _derive_affected_ids (escalation fingerprint path) —
                TestFingerprintPathCrossCycleFold.
 
-Only stage2.py is edited (step-2); the dedup machinery tested here
+  Review fix (step-5): the UNKNOWN-project branch cannot carry a dedup anchor
+               and 'appears in Known Projects' ↔ 'in known_projects' ↔
+               'cite_task succeeds' — TestUnknownProjectBranchHasNoAnchor.
+
+Only stage2.py is edited (step-2, step-6); the dedup machinery tested here
 (compute_flag_signature, dedup_flags, _derive_affected_ids,
 compute_content_fingerprint) already landed on main via task-1573's siblings.
 """
@@ -107,6 +111,30 @@ def _build_state_with_reify_project() -> ReconReportState:
         task_interceptor=task_interceptor,
     )
     state.known_projects['reify'] = '/tmp/reify'
+    return state
+
+
+def _build_state_without_reify() -> ReconReportState:
+    """Build a ReconReportState WITHOUT 'reify' in known_projects.
+
+    Mirrors _build_state_with_reify_project but SKIPS the
+    ``state.known_projects['reify'] = ...`` line, so cite_task for
+    project_id='reify' returns 'unknown_project' and attaches nothing.
+    The task_interceptor mock is still non-None so the test can assert
+    it is never called (the known_projects guard short-circuits first).
+    """
+    task_interceptor = AsyncMock()
+    task_interceptor.get_task = AsyncMock(return_value={
+        'title': 'Reify foreign task 3803',
+        'data': {},
+    })
+
+    state = ReconReportState(
+        ttl_seconds=3600,
+        clock=lambda: 0.0,
+        task_interceptor=task_interceptor,
+    )
+    # known_projects intentionally left empty — 'reify' is NOT registered
     return state
 
 
@@ -451,4 +479,116 @@ class TestFingerprintPathCrossCycleFold:
         assert fp1 != fp2, (
             'Citation-less findings with different descriptions must produce DIFFERENT '
             f'fingerprints (description-hash fallback); fp1={fp1!r}, fp2={fp2!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Review fix: UNKNOWN-project branch has no anchor (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownProjectBranchHasNoAnchor:
+    """Regression: the UNKNOWN-project branch cannot carry a cross-cycle dedup anchor.
+
+    Root cause (caught by code review): step-2 placed the cite_task call inside
+    the stage2.py bullet that fires when 'no project_root in Known Projects matches
+    the scope' (target project NOT registered in known_projects). However,
+    ReconReportState.cite_task returns 'unknown_project' (and appends nothing) when
+    project_id not in self.known_projects (recon_report.py:551). The branch
+    precondition and cite_task's guard are mutually exclusive — the anchor never
+    materializes in that branch.
+
+    server/main.py builds ONE known_projects map and feeds it to BOTH
+    state.known_projects (gating cite_task) AND the payload's Known Projects section
+    (rendered by _format_known_projects_section). So:
+
+        'appears in Known Projects' ↔ 'in known_projects' ↔ 'cite_task succeeds'
+
+    The corrected step-6 prompt must key cite_task on EXACTLY this condition
+    (KNOWN-project branch only). These characterization tests lock in the
+    invariant and guard against re-introducing the doomed unknown-project call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cite_task_unknown_project_attaches_no_anchor(self):
+        """cite_task on an unregistered project returns unknown_project and
+        leaves cited_tasks empty — no anchor is attached in the unknown branch."""
+        state = _build_state_without_reify()
+        state.start_report(_RUN_ID, _STAGE, _PROJECT_ID)
+
+        r = state.add_finding(
+            run_id=_RUN_ID,
+            severity='moderate',
+            category='cross_project_routing',
+            description='Work belongs to reify/3803 — target project NOT in known_projects',
+            suggested_action='Operator must register reify and route manually',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+
+        # cite_task must fail because 'reify' is not in known_projects
+        cite_result = await state.cite_task(
+            run_id=_RUN_ID,
+            finding_id=finding_id,
+            project_id='reify',
+            task_id='3803',
+        )
+
+        # (1) cite_task returns the unknown_project sentinel — matches _ERR_UNKNOWN_PROJECT
+        assert cite_result.get('error') == 'unknown_project', (
+            f'Expected error="unknown_project" when project not registered; got {cite_result!r}'
+        )
+
+        # (2) finding's cited_tasks is EMPTY — no anchor was attached
+        assembled = state.get_assembled_report(_RUN_ID, _STAGE)
+        assert assembled is not None, 'get_assembled_report returned None'
+        items = assembled['flagged_items']
+        assert len(items) == 1
+        finding = items[0]
+        assert finding.get('cited_tasks') == [], (
+            f'cited_tasks must be [] when project is unregistered; got {finding.get("cited_tasks")!r}'
+        )
+
+        # (3) the known_projects guard at L551 short-circuits BEFORE the get_task
+        # service call at L558 — so the mock is never awaited
+        state._task_interceptor.get_task.assert_not_awaited()
+
+    def test_known_projects_section_lists_project_iff_registered(self):
+        """_format_known_projects_section renders 'reify' only when it is in known_projects.
+
+        Together with test_cross_project_finding_carries_cited_tasks (step-1, where
+        'reify' IS registered and cite_task succeeds), this locks in the full invariant:
+
+            'appears in Known Projects payload section'
+            ↔ 'project_id in state.known_projects'
+            ↔ 'cite_task returns success and appends to cited_tasks'
+
+        The corrected step-6 prompt must key the cite_task directive on EXACTLY this
+        condition — it must appear in the KNOWN-project branch, not the unknown-project one.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        # Two-project case: 'reify' registered → section renders and contains 'reify'
+        stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
+        stage.project_id = 'dark_factory'
+        stage.known_projects = {'dark_factory': '/a', 'reify': '/b'}
+        section = stage._format_known_projects_section()
+        assert 'reify' in section, (
+            f"'reify' must appear in Known Projects section when registered; got:\n{section!r}"
+        )
+
+        # Single-project case: < 2 projects guard (L1927) → empty string
+        # 'reify' is absent from the payload — the LLM's Known Projects section
+        # does NOT list it, consistent with cite_task failing for an unregistered project
+        stage_solo = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
+        stage_solo.project_id = 'dark_factory'
+        stage_solo.known_projects = {'dark_factory': '/a'}
+        section_solo = stage_solo._format_known_projects_section()
+        assert section_solo == '', (
+            f'Section must be empty when fewer than 2 projects known; got:\n{section_solo!r}'
         )
