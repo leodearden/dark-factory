@@ -90,8 +90,8 @@ Two registrations. The reconciliation one is destructive (restarts a shared serv
 
 Full procedure and rationale in **`references/recon-registration.md`**. The shape:
 
-1. Append the target's absolute path to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in `<dark-factory>/scripts/fused-memory.service.template` — the source of truth — and **keep `dashboard.service.template` in sync** (the same var lives there too).
-2. Apply it to the live unit `~/.config/systemd/user/fused-memory.service` with a **surgical one-line edit** (append `,<target>`), then `systemctl --user daemon-reload`. Do *not* re-render from the template unless you substitute *both* `__REPO_ROOT__` and `__UV_PATH__` — a partial render leaves `ExecStart` broken.
+1. Registration is a **local setting — do NOT commit it.** The committed templates (`scripts/fused-memory.service.template`, `scripts/dashboard.service.template`) intentionally default to this repo only; the maintainer's other projects don't belong in source control (a fresh clone won't have them).
+2. Append `,<target>` to the `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in the **installed** units with a **surgical one-line edit** — `~/.config/systemd/user/fused-memory.service` (governs reconciliation) and, for parity, `~/.config/systemd/user/dark-factory-dashboard.service` (dashboard aggregation) — then `systemctl --user daemon-reload`. Do *not* re-render from the template unless you substitute *both* `__REPO_ROOT__` and `__UV_PATH__` — a partial render leaves `ExecStart` broken.
 3. **Confirm with the user, then `systemctl --user restart fused-memory`.** ⚠️ This severs *this* session's fused-memory MCP tools — they do not reconnect. That's acceptable: nothing after this point needs MCP in this session, and the sessions you spawn in Stage 7 get fresh connections to the restarted server.
 4. Verify: a python-urllib probe to `8002/health` returns healthy, and `journalctl --user -u fused-memory` shows the new project in the `project_prefix_registry` line. Detection is heuristic (it may not claim ambiguous prefixes like `src/`), so *confirm in the log* rather than assuming.
 

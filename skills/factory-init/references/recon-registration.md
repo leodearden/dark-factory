@@ -11,29 +11,23 @@ fused-memory's write path (`add_memory`, `submit_task`, `set_task_status`, …) 
 
 The registry is built from two sources at fused-memory startup:
 1. `taskmaster.project_root` in `fused-memory/config/config.yaml` (dark-factory's own primary project).
-2. The `DASHBOARD_KNOWN_PROJECT_ROOTS` env var — a comma-separated list of absolute paths for every *additional* project. This is what you extend.
+2. The `DASHBOARD_KNOWN_PROJECT_ROOTS` env var on the **installed** fused-memory unit — a comma-separated list of absolute paths for every *additional* project. This is what you extend, **as a local setting** (the committed template defaults to this repo only — don't commit your other projects).
 
 ## Procedure
 
 Let `<DF>` be the dark-factory repo root and `<TARGET>` the absolute target path.
 
-### 1. Edit the source of truth (the template)
+### 1. Register in the installed units (a LOCAL setting — do NOT commit)
 
-`<DF>/scripts/fused-memory.service.template` has a line like:
+The committed templates default to **this repo only**: `<DF>/scripts/fused-memory.service.template` (and `dashboard.service.template`) ship `DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`. dark-factory is a standalone project — the maintainer's other repos don't belong in source control, since a fresh clone won't have them. So register `<TARGET>` by editing the **installed** units and leave the committed templates alone.
 
-```
-Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
-```
+The live units at `$HOME/.config/systemd/user/` already have every placeholder resolved. **Do not** re-render from the template by substituting only `__REPO_ROOT__` — the template also contains `__UV_PATH__` (the `ExecStart` line), and a partial `sed` render would leave that placeholder literal and the restart would fail. (If you ever do re-render, substitute *both*: `sed -e 's|__REPO_ROOT__|<DF>|g' -e "s|__UV_PATH__|$(command -v uv)|g"`.)
 
-Append `,<TARGET>` to the end of that line. Editing the template (not just the live unit) means the registration survives the next time anyone re-runs `setup-host.sh`. `__REPO_ROOT__` is a placeholder for `<DF>` and is fine to leave as-is — the new entry is a literal absolute path.
+Append `,<TARGET>` with a **surgical one-line edit** to the single `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in **both** live units:
+- `~/.config/systemd/user/fused-memory.service` — governs **reconciliation** (the recon-storm hazard; this is the load-bearing one).
+- `~/.config/systemd/user/dark-factory-dashboard.service` — dashboard cost/burndown aggregation (cosmetic, but keep it in parity).
 
-**Keep `dashboard.service.template` in sync.** The same `DASHBOARD_KNOWN_PROJECT_ROOTS=` line appears in `<DF>/scripts/dashboard.service.template` (the comment in the fused-memory template says so explicitly). Make the identical append there, or the project won't show on the dashboard. The fused-memory copy is the one that governs reconciliation (the recon-storm hazard); the dashboard copy is cosmetic but should match.
-
-### 2. Apply to the live unit (surgical edit — do NOT re-render)
-
-The live unit at `$HOME/.config/systemd/user/fused-memory.service` already has every placeholder resolved. **Do not** re-render it from the template by substituting only `__REPO_ROOT__` — the template also contains `__UV_PATH__` (the `ExecStart` line), and a partial `sed` render would leave that placeholder literal and the restart would fail. (If you ever do re-render, substitute *both*: `sed -e 's|__REPO_ROOT__|<DF>|g' -e "s|__UV_PATH__|$(command -v uv)|g"`.)
-
-Instead, append `,<TARGET>` to the single `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in the live unit (and, for parity, the live dashboard unit `dark-factory-dashboard.service`), then reload:
+Then reload:
 
 ```bash
 systemctl --user daemon-reload
@@ -46,7 +40,7 @@ systemctl --user show fused-memory.service -p Environment | tr ' ' '\n' | grep D
 # expect the line to now end with ,<TARGET>
 ```
 
-### 3. Restart (CONFIRM WITH THE USER FIRST)
+### 2. Restart (CONFIRM WITH THE USER FIRST)
 
 ```bash
 systemctl --user restart fused-memory
@@ -56,7 +50,7 @@ systemctl --user restart fused-memory
 
 Do **not** restart fused-memory if a dark-factory orchestrator run is mid-flight against another project unless the user accepts the interruption — the restart is global to the shared server.
 
-### 4. Verify
+### 3. Verify
 
 ```bash
 # Health probe — curl is broken on this host, so use python urllib:

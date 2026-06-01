@@ -69,12 +69,13 @@ queue:
 #   1. taskmaster.project_root below (this server's primary project).
 #   2. DASHBOARD_KNOWN_PROJECT_ROOTS env var — a comma-separated list of
 #      absolute paths for *all* additional projects reconciled by this server.
-#      Defined in scripts/fused-memory.service.template (see ExecStart env).
-#      Example: DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
+#      The committed template (scripts/fused-memory.service.template) defaults to
+#      this repo only; additional roots are a LOCAL setting, appended to the
+#      INSTALLED unit (~/.config/systemd/user/fused-memory.service).
+#      Example: DASHBOARD_KNOWN_PROJECT_ROOTS=/abs/path/proj-a,/abs/path/proj-b
 #
-# Basename derivation: /home/leo/src/know-live  →  know_live  (lowercase,
-# dashes replaced by underscores).  The canonical project_ids are therefore:
-#   dark_factory, reify, autopilot_video, autotrade, know_live
+# Basename derivation: /abs/path/my-project  →  my_project  (lowercase,
+# dashes replaced by underscores).
 #
 # If a project_id passed to run_full_cycle() has no entry in this registry,
 # the harness raises UnknownProjectError pre-flight (no silent fallback to any path).
