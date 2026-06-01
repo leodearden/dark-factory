@@ -27,7 +27,6 @@ from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # _FakeMergeWorker — mirrors test_workflow_halt_owner._FakeMergeWorker
 # ---------------------------------------------------------------------------
@@ -397,6 +396,7 @@ def _make_consumer_fixture(
       - A real EscalationQueue (so _escalate_train_halt end-to-end registers owner)
     """
     from _orch_helpers import pydantic_spec
+
     from orchestrator.config import OrchestratorConfig
 
     assignment = MagicMock()
@@ -597,6 +597,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     is False → plain _mark_blocked(escalate_to_human=True) fall-through.
     """
     from _orch_helpers import pydantic_spec
+
     from orchestrator.config import OrchestratorConfig
 
     members = [
