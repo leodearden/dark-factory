@@ -212,3 +212,132 @@ async def test_note_merge_disabled_short_circuits() -> None:
     assert result is False
     assert coord.is_pending is False
     mock_diff.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# maybe_restart tests
+# ---------------------------------------------------------------------------
+
+
+def _make_coordinator_with_mutable_clock(
+    diff_files: list[str],
+    *,
+    debounce_secs: float = 120.0,
+    enabled: bool = True,
+    restart_executor: AsyncMock | None = None,
+) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock]:
+    """Build a coordinator with a mutable-list clock and injectable executor."""
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=diff_files)
+    event_store = MagicMock()
+    # Mutable current time — tests advance by writing current_time[0]
+    current_time: list[float] = [0.0]
+    executor = restart_executor or AsyncMock()
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=debounce_secs,
+        enabled=enabled,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+    return coord, current_time, executor
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_not_pending_returns_false() -> None:
+    """(a) not pending → no executor call, returns False."""
+    coord, current_time, executor = _make_coordinator_with_mutable_clock([])
+
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_pending_but_not_idle_defers() -> None:
+    """(b) pending but agents_idle=False → no executor call, returns False, still pending."""
+    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Should be pending now; advance time well past debounce
+    current_time[0] = 2000.0
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is False
+    assert coord.is_pending is True
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_pending_idle_debounce_not_elapsed() -> None:
+    """(c) pending, agents_idle=True, debounce NOT elapsed → no call, returns False."""
+    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=120.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Advance only 60 s (< 120 s debounce)
+    current_time[0] = 1060.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False
+    assert coord.is_pending is True
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_fires_when_all_conditions_met(caplog: pytest.LogCaptureFixture) -> None:
+    """(d) pending, agents_idle=True, debounce elapsed → fires once, event emitted, pending cleared."""
+    import logging
+    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=120.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-42', 'base_sha_abc', 'head_sha_xyz')
+
+    # Advance past debounce
+    current_time[0] = 1200.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    assert coord.is_pending is False
+    executor.assert_awaited_once()
+
+    # Check event emitted via event_store
+    coord._event_store.emit.assert_called_once()
+    call_kwargs = coord._event_store.emit.call_args
+    data = call_kwargs.kwargs['data']
+    assert data['service'] == 'fused-memory'
+    assert 'task-42' in data['trigger_task_ids']
+    assert 'head_sha_xyz' in data['merge_shas']
+    assert data['reason'] == 'post_merge_fused_memory_code_change'
+
+    # WARNING must have been logged
+    assert any('Restarting fused-memory' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_idempotent_no_double_fire() -> None:
+    """(e) calling maybe_restart again with no new note_merge → executor NOT called again."""
+    coord, current_time, executor = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=120.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-42', 'base', 'head')
+
+    current_time[0] = 1200.0
+    first = await coord.maybe_restart(agents_idle=True)
+    second = await coord.maybe_restart(agents_idle=True)
+
+    assert first is True
+    assert second is False
+    executor.assert_awaited_once()  # exactly once total
