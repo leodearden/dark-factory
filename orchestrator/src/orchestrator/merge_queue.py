@@ -1042,6 +1042,83 @@ async def _rebase_delta_touched_overlap(
     return sorted(branch_touched & intervening)
 
 
+async def _reverify_rebased_tree(
+    git_ops: GitOps,
+    req: 'MergeRequest',
+    merge_wt: Path,
+    *,
+    rebased_from: str,
+    rebased_onto: str,
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    max_timeouts: int,
+    max_enospc: int,
+) -> 'MergeOutcome | None':
+    """Shared gate for the disjoint-delta re-verify check.
+
+    Called by the SpeculativeMergeWorker CAS loop after
+    ``advance_main`` returns ``'rebased_pending_reverify'``.
+
+    Algorithm
+    ---------
+    1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
+       the branch-touched file set and the intervening main delta.
+    2. **Disjoint** (empty intersection): return ``None``.  The caller can
+       advance immediately — the intervening churn cannot interact with the
+       branch's changes.  No extra verify call is made.
+    3. **Overlapping** (non-empty intersection): log a warning and delegate to
+       ``_run_post_merge_verify``, which runs the full post-merge scoped
+       verification against the rebased *merge_wt*.
+
+       * ``None`` return → verification passed; caller may advance.
+       * ``MergeOutcome`` return → verification failed or disk-guard fired;
+         *merge_wt* has already been cleaned up by ``_run_post_merge_verify``.
+
+    Parameters
+    ----------
+    git_ops:
+        GitOps instance.
+    req:
+        The MergeRequest whose worktree and task_id are inspected.
+    merge_wt:
+        The merge worktree, currently positioned at the rebased SHA.
+    rebased_from:
+        The original ``expected_main`` SHA (pre-churn main tip).
+    rebased_onto:
+        The current main SHA the branch was rebased onto.
+    timeouts / enospc_retries / max_timeouts / max_enospc:
+        Forwarded verbatim to ``_run_post_merge_verify``.
+    """
+    overlap = await _rebase_delta_touched_overlap(
+        req.worktree, rebased_from, rebased_onto, git_ops,
+        task_id=req.task_id,
+    )
+
+    if not overlap:
+        # Disjoint: the intervening main churn does not intersect the branch's
+        # touched files — the rebased tree is safe to advance without re-verify.
+        logger.debug(
+            'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
+            '— skipping re-verify',
+            req.task_id, rebased_from[:8], rebased_onto[:8],
+        )
+        return None
+
+    logger.warning(
+        'Task %s: rebased tree overlaps intervening delta (%s..%s) '
+        'on %d file(s) [%s] — triggering re-verify',
+        req.task_id, rebased_from[:8], rebased_onto[:8],
+        len(overlap), ', '.join(overlap[:5]),
+    )
+    return await _run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts=timeouts,
+        enospc_retries=enospc_retries,
+        max_timeouts=max_timeouts,
+        max_enospc=max_enospc,
+    )
+
+
 # Maximum number of characters to include in the detail field of a
 # ``PostMergePyrightResult`` — keeps the blocked reason string in the
 # escalation payload under reasonable size limits.
