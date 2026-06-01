@@ -31,7 +31,10 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, TrainMembership, _run
 from orchestrator.merge_queue import (
+    ABANDONED_REASON_PREFIX,
+    POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
@@ -1950,4 +1953,159 @@ class TestScenario12DegenerateTrainOfOne:
         assert result12.returncode == 0, (
             f"cargo test --workspace must be green at the final main tip "
             f"(degenerate train-of-one: no red-main window): {result12.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate tests (steps 01-10): disk-guard, loop-breaker, equivalence, push,
+# wip-halt — drive through MergeWorker._do_merge, no cargo required.
+# These tests use a simple git repo (plain text files) rather than the cargo
+# fixture, so they run on any machine regardless of Rust toolchain availability.
+# ---------------------------------------------------------------------------
+
+_GIB = 1024**3
+
+
+def _make_passing_verify_result() -> VerifyResult:
+    """Return a passing VerifyResult for use as run_scoped_verification mock return."""
+    return VerifyResult(
+        passed=True,
+        test_output="ok\n",
+        lint_output="",
+        type_output="",
+        summary="All tests passed",
+    )
+
+
+async def _setup_gate_train(
+    tmp_path: Path,
+    *,
+    train_id: str = "train-gate",
+    member_names: tuple[str, str, str] = ("g-a", "g-b", "g-c"),
+) -> tuple[GitOps, OrchestratorConfig, GroupMergeRequest]:
+    """Set up a minimal git repo with a real stacked 3-member train (no cargo).
+
+    Returns (git_ops, config, req) ready for worker._do_merge() testing.
+    Each member adds one unique .txt file so diffs are always non-empty.
+    """
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    await _run(["git", "init", "-b", "main"], cwd=repo)
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+    await _run(["git", "config", "user.name", "Test"], cwd=repo)
+    (repo / "README.md").write_text("# gate test repo\n")
+    await _run(["git", "add", "-A"], cwd=repo)
+    await _run(["git", "commit", "-m", "initial"], cwd=repo)
+
+    git_cfg = GitConfig(
+        main_branch="main",
+        branch_prefix="task/",
+        remote="origin",
+        worktree_dir=".worktrees",
+        push_after_advance=False,
+    )
+    config = OrchestratorConfig(project_root=repo, git=git_cfg)
+    git_ops = GitOps(git_cfg, repo)
+
+    a_name, b_name, c_name = member_names
+
+    # Get current main SHA as base for first member.
+    _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+    main_sha = main_sha.strip()
+
+    wt_a, sha_a = await make_stacked_member(
+        git_ops, a_name, main_sha,
+        lambda wt, n=a_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+    wt_b, sha_b = await make_stacked_member(
+        git_ops, b_name, sha_a,
+        lambda wt, n=b_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+    wt_c, _sha_c = await make_stacked_member(
+        git_ops, c_name, sha_b,
+        lambda wt, n=c_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+
+    req = build_group_merge_request(
+        git_ops=git_ops,
+        config=config,
+        train_id=train_id,
+        member_names=list(member_names),
+        tip_name=c_name,
+        tip_worktree=wt_c,
+    )
+
+    return git_ops, config, req
+
+
+# ---------------------------------------------------------------------------
+# Gate test 01: disk guard fires — step-01 RED / step-02 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate01TrainDiskGuard:
+    """step-01 RED: _do_train_merge has no disk guard; disk pressure is ignored.
+
+    After step-02 (GREEN): _do_train_merge uses _run_post_merge_verify which
+    runs the pre-verify disk guard; persistent low disk → blocked/verify_skipped.
+    """
+
+    async def test_train_disk_guard_skips_verify(self, tmp_path: Path) -> None:
+        """Disk persists low after prune → blocked, verify_skipped=True, TRANSIENT_INFRA."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-disk-gate",
+        )
+
+        # Record main SHA before (must be unmoved on block).
+        _, main_sha_before, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        main_sha_before = main_sha_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch(
+                "orchestrator.merge_queue.shutil.disk_usage",
+                return_value=MagicMock(free=1 * _GIB),  # 1 GiB << 10 GiB threshold
+            ),
+            patch.object(
+                git_ops,
+                "prune_stale_merge_worktrees",
+                AsyncMock(return_value=[]),  # prune frees nothing
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with the disk-guard reason.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.verify_skipped is True, (
+            "expected verify_skipped=True when disk guard fires"
+        )
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f"expected TRANSIENT_INFRA prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) main SHA must be unmoved (advance_main must not have run).
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        assert main_sha_after.strip() == main_sha_before, (
+            f"main must not advance on disk-guard block; "
+            f"moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (3) No member flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when disk guard blocks train; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
         )
