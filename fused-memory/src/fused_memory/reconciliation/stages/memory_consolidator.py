@@ -382,16 +382,20 @@ Review the above data and perform memory consolidation:
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
 
     def _build_summary_nonce_section(self) -> str:
-        """Return the Per-Cycle Summary Nonce payload section with a fresh CSPRNG nonce.
+        """Return the Per-Cycle Summary Nonce payload section with a fresh STAGE1-prefixed nonce.
 
         Delegates to the shared cli_stage_runner.build_summary_nonce_section() helper
-        so Stage 1 and Stage 2 produce identical section wording and cannot drift.
-        Generates a new 8-char hex nonce on each call (secrets.token_hex(4)) so that
-        consecutive per-cycle summaries embed distinctly in Mem0's vector space,
-        defeating the ~0.92 cosine-similarity dedup threshold that was silently dropping
-        summaries (confirmed failure: run 899d2dad, summary 1ad1d2f5; task 1574).
+        so Stage 1 and Stage 2 produce identical section wording and cannot drift
+        (task 1574 single-source-of-truth design).
+
+        Task 1590: passes 'STAGE1' prefix so Stage 1 nonces always lead with 'STAGE1_',
+        making stage origin explicit and ensuring Stage 1 and Stage 2 summaries can never
+        share a leading nonce token, further separating them in Mem0's embedding space.
+
+        This single method feeds BOTH the legacy _format_payload (line ~263) and the
+        event-driven _format_assembled_payload (line ~331) paths.
         """
-        return build_summary_nonce_section()
+        return build_summary_nonce_section('STAGE1')
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
