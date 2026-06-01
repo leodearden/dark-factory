@@ -184,15 +184,19 @@ class TestStage1PayloadOmitsProjectRootWhenUnset:
 
 class TestStage1PayloadSummaryNonce:
     """assemble_payload / _format_assembled_payload inject '### Per-Cycle Summary Nonce'
-    with a fresh 8-hex CSPRNG nonce per call — mirrors Stage 2 (task 1572).
+    with a fresh STAGE1-prefixed CSPRNG nonce per call (task 1590).
+
+    Task 1590: nonce format updated from bare '<8-hex>' to 'STAGE1_<8-hex>' so
+    Stage 1 and Stage 2 summaries always lead with structurally distinct tokens.
     """
 
     @pytest.mark.asyncio
     async def test_legacy_path_contains_nonce_section(self):
         """Legacy assemble_payload (time-windowed path) includes '### Per-Cycle Summary Nonce'
-        and a summary_nonce: <8-hex> line.
+        and a summary_nonce: STAGE1_<8-hex> line.
 
-        RED before step-2 impl: no nonce section injected yet.
+        Task 1590: regex updated from bare '[0-9a-f]{8}' to 'STAGE1_[0-9a-f]{8}'.
+        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
         """
         stage = _make_consolidator()
         watermark = Watermark(project_id='test_project')
@@ -205,19 +209,23 @@ class TestStage1PayloadSummaryNonce:
             "assemble_payload must inject '### Per-Cycle Summary Nonce' section "
             "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
         )
-        m = re.search(r'summary_nonce: ([0-9a-f]{8})', payload)
+        m = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload)
         assert m is not None, (
-            "assemble_payload must include 'summary_nonce: <8-hex>' in the payload "
-            f"(regex r'summary_nonce: [0-9a-f]{{8}}' found no match); payload excerpt:\n"
+            "assemble_payload must include 'summary_nonce: STAGE1_<8-hex>' in the payload "
+            f"(regex r'summary_nonce: STAGE1_[0-9a-f]{{8}}' found no match); payload excerpt:\n"
             f"{payload[:500]}"
+        )
+        assert m.group(1).startswith('STAGE1_'), (
+            f"summary_nonce must begin with 'STAGE1_'; got {m.group(1)!r}"
         )
 
     @pytest.mark.asyncio
     async def test_legacy_path_nonce_is_fresh_per_call(self):
-        """Two consecutive assemble_payload calls produce distinct summary_nonce values.
+        """Two consecutive assemble_payload calls produce distinct STAGE1-prefixed nonces.
 
         Proves each call generates a fresh CSPRNG nonce rather than caching one value.
-        RED before step-2 impl: no nonce injected at all.
+        Task 1590: regex updated to match 'STAGE1_<8-hex>' form.
+        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
         """
         stage = _make_consolidator()
         watermark = Watermark(project_id='test_project')
@@ -229,10 +237,10 @@ class TestStage1PayloadSummaryNonce:
             events=[], watermark=watermark, prior_reports=[]
         )
 
-        m1 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload1)
-        m2 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload2)
+        m1 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload1)
+        m2 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload2)
         assert m1 is not None and m2 is not None, (
-            "Both assemble_payload calls must emit a summary_nonce; "
+            "Both assemble_payload calls must emit a 'summary_nonce: STAGE1_<8-hex>'; "
             "one or both were missing."
         )
         assert m1.group(1) != m2.group(1), (
@@ -242,9 +250,10 @@ class TestStage1PayloadSummaryNonce:
 
     @pytest.mark.asyncio
     async def test_assembled_path_contains_nonce_section(self):
-        """_format_assembled_payload (ContextAssembler path) includes nonce section.
+        """_format_assembled_payload (ContextAssembler path) includes STAGE1-prefixed nonce.
 
-        RED before step-4 impl: _format_assembled_payload does not inject the nonce.
+        Task 1590: regex updated from bare '[0-9a-f]{8}' to 'STAGE1_[0-9a-f]{8}'.
+        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
         """
         stage = _make_consolidator()
         stage.assembled_payload = AssembledPayload(events=[], context_items={})
@@ -258,11 +267,14 @@ class TestStage1PayloadSummaryNonce:
             "_format_assembled_payload must inject '### Per-Cycle Summary Nonce' section "
             "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
         )
-        m = re.search(r'summary_nonce: ([0-9a-f]{8})', payload)
+        m = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload)
         assert m is not None, (
-            "_format_assembled_payload must include 'summary_nonce: <8-hex>' in the payload "
-            f"(regex r'summary_nonce: [0-9a-f]{{8}}' found no match); payload excerpt:\n"
+            "_format_assembled_payload must include 'summary_nonce: STAGE1_<8-hex>' in the payload "
+            f"(regex r'summary_nonce: STAGE1_[0-9a-f]{{8}}' found no match); payload excerpt:\n"
             f"{payload[:500]}"
+        )
+        assert m.group(1).startswith('STAGE1_'), (
+            f"summary_nonce must begin with 'STAGE1_'; got {m.group(1)!r}"
         )
 
 
