@@ -8191,13 +8191,13 @@ class TestRunPostMergeVerify:
                 'orchestrator.merge_queue.run_scoped_verification',
                 AsyncMock(side_effect=RuntimeError('boom')),
             ),
+            pytest.raises(RuntimeError, match='boom'),
         ):
-            with pytest.raises(RuntimeError, match='boom'):
-                await _run_post_merge_verify(
-                    git_ops, req, merge_wt,
-                    timeouts={}, enospc_retries={},
-                    max_timeouts=2, max_enospc=1,
-                )
+            await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
 
@@ -8235,8 +8235,6 @@ class TestFinalizeAdvancedMerge:
     async def test_success_path_returns_done_pops_counters(self) -> None:
         """(a) equivalence=[] + pyright not broken → done with merge_sha + push_main called; counters cleared."""
         from orchestrator.merge_queue import (
-            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             _finalize_advanced_merge,
         )
 

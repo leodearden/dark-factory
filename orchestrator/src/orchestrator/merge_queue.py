@@ -382,7 +382,7 @@ async def _finalize_advanced_merge(
     *,
     merge_commit_fallback: str,
     base_sha: str,
-    started_monotonic: float,
+    started_monotonic: float | None,
     cas_retries: dict[str, int],
     timeouts: dict[str, int],
     enospc_retries: dict[str, int],
