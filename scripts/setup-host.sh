@@ -161,6 +161,7 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
 
@@ -176,6 +177,8 @@ systemctl --user enable orchestrator-dark-factory.service
 # autopilot-video joined the unattended workload 2026-05-29 (separate target,
 # selected purely via --config). Enabled by default like the other two.
 systemctl --user enable orchestrator-autopilot-video.service
+# my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
+systemctl --user enable orchestrator-my-solar-challenge.service
 ok "orchestrator units + watchdog installed and enabled"
 
 # ---------------------------------------------------------------------------
