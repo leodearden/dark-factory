@@ -633,6 +633,22 @@ class TaskWorkflow:
                 self.task_id, train_id, result.reason,
             )
             return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Orphan-halt probe: _map_advance_failure halted the merge queue (one of the
+        # four halt-inducing statuses: wip_halted, done_wip_recovery,
+        # wip_recovery_no_advance, unmerged_state) and halt_owner_esc_id is None,
+        # so harness._on_escalation_resolved cannot unhalt the queue on L1 resolution.
+        # Register the halt owner NOW so resolving the L1 auto-unhalts the queue
+        # (parity with the single-task _handle_wip_conflict path — task 1599).
+        # The probe is ground truth: it fires only when the queue IS halted with no
+        # owner, is future-proof against new halt statuses, and never misfires on
+        # genuine non-halt 'blocked' outcomes (rebase-conflict/cas_failed do NOT call
+        # halt(), so is_wip_halted stays False for those paths).
+        if (
+            self.merge_worker is not None
+            and self.merge_worker.is_wip_halted
+            and self.merge_worker.halt_owner_esc_id is None
+        ):
+            return await self._escalate_train_halt(result, train_id)
         # Genuine failure (conflict/verify-red/rebase-conflict) → escalate to human
         # so a broken train is never silently parked forever (scenarios 5/8).
         return await self._mark_blocked(
@@ -3962,14 +3978,35 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
 
-    async def _submit_halt_escalation_and_wait(self, esc: Escalation) -> None:
-        """Submit a halt-owning escalation, register ownership, and wait for resolution.
+    def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
+        """Submit a halt-owning escalation and register halt ownership.  Non-waiting.
+
+        This is the load-bearing submit → set_halt_owner ordering shared by:
+          - ``_submit_halt_escalation_and_wait`` (single-task path; follows with an await)
+          - ``_escalate_train_halt`` (train path; does not await — tip stays BLOCKED and
+            re-dispatches when the L1 is resolved and the queue is unhalted)
 
         Order is significant: set_halt_owner MUST follow a successful submit.
         A registered owner with no pending escalation cannot be resolved by
         _on_escalation_resolved, so the halt would be permanent.  If submit
         raises, the exception propagates before set_halt_owner is reached and
         no orphan halt is registered.
+
+        Callers must guard with ``if self.escalation_queue:`` before calling.
+        """
+        assert self.escalation_queue is not None, (
+            '_submit_halt_owning_escalation requires escalation_queue; '
+            'callers must guard with `if self.escalation_queue:`'
+        )
+        self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
+        if self.merge_worker is not None:
+            self.merge_worker.set_halt_owner(esc.id)
+
+    async def _submit_halt_escalation_and_wait(self, esc: Escalation) -> None:
+        """Submit a halt-owning escalation, register ownership, and wait for resolution.
+
+        Delegates the load-bearing submit → set_halt_owner ordering to
+        ``_submit_halt_owning_escalation``, then awaits ``_escalation_event``.
 
         On cancellation or any other BaseException raised after set_halt_owner
         (including event_store.emit failures or task cancellation during the
@@ -3981,9 +4018,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             '_submit_halt_escalation_and_wait requires escalation_queue; '
             'callers must guard with `if self.escalation_queue:`'
         )
-        self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
-        if self.merge_worker is not None:
-            self.merge_worker.set_halt_owner(esc.id)
+        self._submit_halt_owning_escalation(esc)  # submit + set_halt_owner (load-bearing order)
         # try/except starts here so emit, event setup, AND the await are all
         # protected — any BaseException after set_halt_owner triggers cleanup.
         try:
@@ -4010,6 +4045,273 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.merge_worker.unhalt_wip(reason='workflow_cancelled')
             raise
 
+    def _build_wip_halt_escalation_text(
+        self,
+        status: str,
+        result,
+        *,
+        branch_name: str | None = None,
+        train_id: str | None = None,
+    ) -> tuple[str, str, str]:
+        """Build ``(category, summary, detail)`` for a WIP-halt level-1 escalation.
+
+        Shared by both the single-task handlers (``branch_name=...``) and the
+        train consumer ``_escalate_train_halt`` (``train_id=...``), so that
+        human-readable recovery instructions live in one place and cannot drift.
+
+        The task-context label (``'Merge for task X (branch Y)'`` vs
+        ``'Train merge for task X (train Y)'``) and one train-specific
+        split-brain note for ``done_wip_recovery`` are the only per-path
+        variations.
+
+        Parameters
+        ----------
+        status:
+            The ``MergeOutcome.status`` string.  Handled: ``'unmerged_state'``,
+            ``'done_wip_recovery'``, ``'wip_recovery_no_advance'``,
+            ``'wip_halted'`` (default branch).
+        result:
+            The ``MergeOutcome`` object (for ``overlap_files``,
+            ``recovery_branch``).
+        branch_name:
+            Single-task context — the local branch being merged.
+            Mutually exclusive with ``train_id``.
+        train_id:
+            Train context — the train identifier string.
+            Mutually exclusive with ``branch_name``.
+
+        Returns
+        -------
+        ``(category, summary, detail)`` :
+            Ready for ``Escalation(category=..., summary=..., detail=...)``.
+        """
+        is_train = train_id is not None
+        task_id = self.task_id
+
+        # Context label used in the detail intro sentence.
+        if is_train:
+            merge_ctx = f'Train merge for task {task_id} (train {train_id!r})'
+        elif branch_name is not None:
+            merge_ctx = f'Merge for task {task_id} (branch {branch_name})'
+        else:
+            merge_ctx = f'Merge for task {task_id}'
+
+        if status == 'unmerged_state':
+            category = 'unmerged_state'
+            if is_train:
+                summary = (
+                    f'Train member {task_id} blocked: '
+                    f'project_root has unresolved (UU/AA/DD) markers'
+                )
+            else:
+                summary = (
+                    'project_root has unresolved (UU/AA/DD) markers — '
+                    'merge queue halted'
+                )
+            detail = (
+                f'{merge_ctx} was blocked because project_root already has unresolved '
+                f'merge conflicts (UU/AA/DD markers) from a prior, unrelated event — '
+                f'the merge queue refuses to stash/advance over a partially resolved tree.\n\n'
+                f'Action required: inspect ``git status`` in project_root, '
+                f'resolve the existing merge state (``git mergetool`` / edit '
+                f'the conflicted files / ``git reset`` to abandon the prior '
+                f'merge), then resolve this escalation to un-halt the merge queue.\n\n'
+                f'Manual intervention required — do NOT let automated tooling '
+                f'resolve this escalation.'
+            )
+
+        elif status == 'done_wip_recovery':
+            category = 'wip_conflict'
+            recovery_branch = result.recovery_branch or '(unknown)'
+            if is_train:
+                summary = (
+                    f'Train member {task_id}: stash pop conflict — '
+                    f'WIP preserved on {recovery_branch}'
+                )
+                wip_clause = (
+                    'uncommitted WIP produced conflicts '
+                    '(split-brain: merge landed, members NOT flipped to done).'
+                )
+                # Task 1599 / Suggestion 4: the merge is already on main.
+                # Instruct the human to flip all members done before resolving
+                # so the re-dispatch does not re-attempt the already-landed merge.
+                post_resolve = (
+                    'Note: the merge commit is already on main.  Before resolving this '
+                    'escalation, ensure all train members are marked done — the train '
+                    're-dispatches on unhalt and re-entering the merge queue with an '
+                    'already-merged tip may produce a confusing split result.\n\n'
+                    'Resolve this escalation to un-halt the merge queue.'
+                )
+            else:
+                summary = f'Stash pop conflict — WIP preserved on {recovery_branch}'
+                wip_clause = 'your uncommitted WIP produced conflicts.'
+                post_resolve = 'Resolve this escalation to un-halt the merge queue.'
+            detail = (
+                f'{merge_ctx} landed on main successfully, but the stash pop of '
+                f'{wip_clause}\n\n'
+                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
+                f'To recover:\n'
+                f'  git checkout {recovery_branch}\n'
+                f'  # Review and cherry-pick or reapply your changes\n\n'
+                f'{post_resolve}'
+            )
+
+        elif status == 'wip_recovery_no_advance':
+            category = 'wip_conflict'
+            recovery_branch = result.recovery_branch or '(unknown)'
+            if is_train:
+                summary = (
+                    f'Train member {task_id}: stash pop conflict (no advance) — '
+                    f'WIP on {recovery_branch}'
+                )
+                no_advance_intro = (
+                    f'{merge_ctx} did NOT advance main (CAS failure path). '
+                    f'A stash pop conflict occurred, leaving'
+                )
+            else:
+                summary = (
+                    f'Stash pop conflict (merge did not advance) — '
+                    f'WIP on {recovery_branch}'
+                )
+                no_advance_intro = (
+                    f'{merge_ctx} did NOT advance main. '
+                    f'A stash pop conflict occurred after a CAS failure, leaving'
+                )
+            detail = (
+                f'{no_advance_intro} the working tree in an unresolvable state.\n\n'
+                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
+                f'The merge queue has been halted. To recover:\n'
+                f'  git checkout {recovery_branch}\n'
+                f'  # Review and reapply your changes to a clean branch\n\n'
+                f'Manual intervention required — do NOT let automated tooling '
+                f'resolve this escalation. Resolve this escalation to un-halt '
+                f'the merge queue.'
+            )
+
+        else:
+            # wip_halted (and any future halt-inducing status the probe catches)
+            category = 'wip_conflict'
+            overlap = result.overlap_files or []
+            if is_train:
+                summary = (
+                    f'Train member {task_id}: WIP overlaps merge diff: '
+                    + ', '.join(overlap[:5])
+                )
+                subject_ctx = f'train member {task_id} (train {train_id!r})'
+            else:
+                summary = f'WIP overlaps merge diff: {", ".join(overlap[:5])}'
+                branch_str = f' (branch {branch_name})' if branch_name else ''
+                subject_ctx = f'task {task_id}{branch_str}'
+            detail = (
+                f'Merge for {subject_ctx} was blocked because uncommitted '
+                f'work in project_root overlaps the merge diff.\n\n'
+                f'Overlapping files:\n'
+                + '\n'.join(f'  - {f}' for f in overlap)
+                + '\n\nAction required: commit or stash the WIP, then resolve this '
+                'escalation to un-halt the merge queue and retry.'
+            )
+
+        return category, summary, detail
+
+    async def _escalate_train_halt(
+        self, result, train_id: str,
+    ) -> WorkflowOutcome:
+        """Handle a train WIP-halt outcome: build per-status L1, own the halt, block tip.
+
+        Called from ``_maybe_enqueue_group_merge`` when the orphan-halt probe fires::
+
+            merge_worker is not None
+            and merge_worker.is_wip_halted
+            and merge_worker.halt_owner_esc_id is None
+
+        Covers all four ``_map_advance_failure`` halt-inducing statuses:
+          - ``wip_halted``             → category='wip_conflict'  (WIP overlaps diff)
+          - ``done_wip_recovery``      → category='wip_conflict'  (merge landed; stash pop conflict)
+          - ``wip_recovery_no_advance``→ category='wip_conflict'  (CAS failure; no advance)
+          - ``unmerged_state``         → category='unmerged_state' (pre-existing UU/AA/DD)
+
+        Unlike the single-task ``_handle_wip_conflict`` etc., this helper does NOT
+        await escalation resolution — the train tip stays BLOCKED and re-dispatches
+        once the halt is cleared.  This avoids reintroducing the cancellation-orphan
+        surface that task 1448 hardened for inline-waiting coroutines.
+
+        When ``escalation_queue is None`` (config-absent deployment), logs a warning
+        and falls back to plain BLOCKED with no owner registered.
+
+        Auto-recovery parity (task 1599):
+          Resolving the returned L1 triggers harness._on_escalation_resolved →
+          unhalt_wip() because ``_submit_halt_owning_escalation`` registered this
+          workflow as halt owner.  harness._rehydrate_merge_halt re-owns the L1
+          across restarts (category in {wip_conflict, unmerged_state}).
+        """
+        status = result.status
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            status, result, train_id=train_id,
+        )
+
+        reason = (
+            f'Train halt: merge for task {self.task_id} (train {train_id!r}) '
+            f'halted the merge queue ({status})'
+        )
+        logger.warning(
+            'Task %s: train halt (%s) — %s',
+            self.task_id, status,
+            'creating level-1 escalation' if self.escalation_queue
+            else 'escalation_queue=None, cannot register halt owner',
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            train_state = await self._build_train_state()
+
+            # Defensive re-check: the consumer's orphan-halt probe validated
+            # halt_owner_esc_id is None before calling us, but _build_train_state()
+            # contains an await and another coroutine could (theoretically) set the
+            # owner during that window.  In the current serial merge-worker design
+            # this window is unreachable, but re-checking prevents a hard crash
+            # from the 'owner already set' assertion inside set_halt_owner if the
+            # worker ever becomes concurrent.  Mirror the escalation_queue=None
+            # fallback: log a warning and fall through to plain BLOCKED.
+            if (
+                self.merge_worker is not None
+                and self.merge_worker.halt_owner_esc_id is not None
+            ):
+                logger.warning(
+                    'Task %s: halt owner set concurrently during _build_train_state '
+                    '(owner: %r) — skipping duplicate set_halt_owner; plain BLOCKED',
+                    self.task_id, self.merge_worker.halt_owner_esc_id,
+                )
+            else:
+                esc = Escalation(
+                    id=self.escalation_queue.make_id(self.task_id),
+                    task_id=self.task_id,
+                    agent_role='orchestrator',
+                    severity='blocking',
+                    category=category,
+                    summary=summary,
+                    detail=detail,
+                    suggested_action='manual_intervention',
+                    level=1,
+                    worktree=str(self.worktree) if self.worktree else None,
+                    workflow_state=self.state.value,
+                    train_state=train_state,
+                )
+                self._submit_halt_owning_escalation(esc)
+                logger.info(
+                    'Task %s: train halt L1 %r submitted and halt ownership registered',
+                    self.task_id, esc.id,
+                )
+        else:
+            logger.warning(
+                'Task %s: merge queue is halted (train %r) but escalation_queue is '
+                'None — halt owner cannot be registered; manual unhalt_merge_queue '
+                'required to clear the orphan halt',
+                self.task_id, train_id,
+            )
+
+        return await self._mark_blocked(reason, detail=detail, skip_escalation=True)
+
     async def _handle_wip_conflict(
         self, result, branch_name: str,
     ) -> WorkflowOutcome:
@@ -4018,14 +4320,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         The merge did NOT land — WIP in project_root overlaps the merge diff.
         After the human resolves (commits/stashes WIP), the task retries the merge.
         """
-        overlap = result.overlap_files or []
-        detail = (
-            f'Merge for task {self.task_id} (branch {branch_name}) was blocked '
-            f'because uncommitted work in project_root overlaps the merge diff.\n\n'
-            f'Overlapping files:\n'
-            + '\n'.join(f'  - {f}' for f in overlap)
-            + '\n\nAction required: commit or stash the WIP, then resolve this '
-            'escalation to un-halt the merge queue and retry.'
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            result.status, result, branch_name=branch_name,
         )
         logger.warning(f'Task {self.task_id}: WIP overlap — creating level-1 escalation')
 
@@ -4037,8 +4333,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id,
                 agent_role='orchestrator',
                 severity='blocking',
-                category='wip_conflict',
-                summary=f'WIP overlaps merge diff: {", ".join(overlap[:5])}',
+                category=category,
+                summary=summary,
                 detail=detail,
                 suggested_action='manual_intervention',
                 level=1,
@@ -4063,14 +4359,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.merge_sha is not None:
             self._merge_sha = result.merge_sha
         recovery_branch = result.recovery_branch or '(unknown)'
-        detail = (
-            f'Merge for task {self.task_id} landed on main successfully, but '
-            f'the stash pop of your uncommitted WIP produced conflicts.\n\n'
-            f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-            f'To recover:\n'
-            f'  git checkout {recovery_branch}\n'
-            f'  # Review and cherry-pick or reapply your changes\n\n'
-            f'Resolve this escalation to un-halt the merge queue.'
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            result.status, result,
         )
         logger.warning(
             f'Task {self.task_id}: merge landed but stash pop conflicted — '
@@ -4085,8 +4375,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id,
                 agent_role='orchestrator',
                 severity='blocking',
-                category='wip_conflict',
-                summary=f'Stash pop conflict — WIP preserved on {recovery_branch}',
+                category=category,
+                summary=summary,
                 detail=detail,
                 suggested_action='manual_intervention',
                 level=1,
@@ -4110,17 +4400,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         landed), this returns BLOCKED because main was NOT advanced.
         """
         recovery_branch = result.recovery_branch or '(unknown)'
-        detail = (
-            f'Merge for task {self.task_id} did NOT advance main. '
-            f'A stash pop conflict occurred after a CAS failure, leaving '
-            f'the working tree in an unresolvable state.\n\n'
-            f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-            f'The merge queue has been halted. To recover:\n'
-            f'  git checkout {recovery_branch}\n'
-            f'  # Review and reapply your changes to a clean branch\n\n'
-            f'Manual intervention required — do NOT let automated tooling '
-            f'resolve this escalation. Resolve this escalation to un-halt '
-            f'the merge queue.'
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            result.status, result,
         )
         logger.warning(
             f'Task {self.task_id}: stash pop conflicted on CAS-failure path — '
@@ -4135,8 +4416,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id,
                 agent_role='orchestrator',
                 severity='blocking',
-                category='wip_conflict',
-                summary=f'Stash pop conflict (merge did not advance) — WIP on {recovery_branch}',
+                category=category,
+                summary=summary,
                 detail=detail,
                 suggested_action='manual_intervention',
                 level=1,
@@ -4159,19 +4440,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         inspects, cleans up project_root (``git mergetool`` / manual
         resolution / ``git reset``), and resolves the escalation.
         """
-        detail = (
-            f'Merge for task {self.task_id} (branch {branch_name}) was '
-            f'blocked because project_root already has unresolved merge '
-            f'conflicts (UU/AA/DD markers) from a prior, unrelated event — '
-            f'the merge queue refuses to stash/advance over a partially '
-            f'resolved tree.\n\n'
-            f'Action required: inspect ``git status`` in project_root, '
-            f'resolve the existing merge state (``git mergetool`` / edit '
-            f'the conflicted files / ``git reset`` to abandon the prior '
-            f'merge), then resolve this escalation to un-halt the merge '
-            f'queue.\n\n'
-            f'Manual intervention required — do NOT let automated tooling '
-            f'resolve this escalation.'
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            result.status, result, branch_name=branch_name,
         )
         logger.warning(
             f'Task {self.task_id}: unmerged_state in project_root — '
@@ -4186,11 +4456,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id,
                 agent_role='orchestrator',
                 severity='blocking',
-                category='unmerged_state',
-                summary=(
-                    'project_root has unresolved (UU/AA/DD) markers — '
-                    'merge queue halted'
-                ),
+                category=category,
+                summary=summary,
                 detail=detail,
                 suggested_action='manual_intervention',
                 level=1,

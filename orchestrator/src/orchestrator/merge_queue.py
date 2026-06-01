@@ -1883,26 +1883,38 @@ async def _do_train_merge(
        re-enqueuing directly) is correct — the orchestrator will re-dispatch on
        the next scheduler tick.
 
-    6. ``wip_halted`` / ``done_wip_recovery`` → human escalation for trains:
-       ``_map_advance_failure`` can return ``wip_halted`` (on ``wip_overlap``)
-       or ``done_wip_recovery`` (on ``pop_conflict`` — which also calls
-       ``push_main`` and creates a recovery branch).  For a *single* task these
-       statuses trigger automatic recovery in ``workflow.py``
-       (``_handle_wip_conflict`` / ``_handle_wip_recovery``).  For trains the
-       GroupMergeRequest consumer in ``workflow.py`` does not branch on these
-       statuses; both fall through to ``_mark_blocked(escalate_to_human=True)``.
+    6. ``wip_halted`` / ``done_wip_recovery`` / ``wip_recovery_no_advance`` /
+       ``unmerged_state`` → halt-owning L1 escalation for trains (task 1599):
+       ``_map_advance_failure`` can return any of these four statuses.  For a
+       *single* task they trigger automatic in-place recovery in ``workflow.py``
+       (``_handle_wip_conflict`` / ``_handle_wip_recovery`` / etc.) — which
+       awaits escalation resolution before retrying.  For a train, the
+       GroupMergeRequest consumer gates on the orphan-halt probe:
 
-       This means:
-       • ``wip_overlap`` halts the merge queue AND leaves it halted until a
-         human manually unhalts (no auto-recovery for trains, unlike single tasks).
-       • ``pop_conflict`` lands the train merge commit on main, creates a
-         recovery branch, but does NOT flip members and escalates to human
-         (a main-landed-but-tasks-blocked split-brain, resolved by human).
+           merge_worker.is_wip_halted AND halt_owner_esc_id is None
 
-       Both are *safe-by-escalation*, not silent faults — a human is notified
-       in both cases.  Auto-recovery parity is a follow-up concern; closing
-       the gap requires modifying ``workflow.py``'s GroupMergeRequest consumer
-       (currently outside task 1596's scope).
+       When the probe fires, ``_escalate_train_halt`` builds a per-status L1
+       (category='wip_conflict' or 'unmerged_state'), calls
+       ``_submit_halt_owning_escalation`` (submit → set_halt_owner), and
+       returns ``_mark_blocked(skip_escalation=True)`` — the tip stays BLOCKED
+       and re-dispatches once the L1 is resolved and the queue is unhalted.
+
+       This closes the asymmetry from the original implementation:
+       • Resolving the L1 now auto-unhalts the queue via
+         ``harness._on_escalation_resolved → unhalt_wip()`` (because
+         ``set_halt_owner`` was called).
+       • ``harness._rehydrate_merge_halt`` re-owns the L1 (category in
+         {wip_conflict, unmerged_state}) across restarts — restart-survival
+         parity with single tasks, with no harness change.
+
+       Two intentional remaining differences from the single-task path:
+       (i)  The train returns BLOCKED + re-dispatches rather than inline
+            wait-and-retry.  Inline-waiting reintroduces the cancellation-orphan
+            surface task 1448 had to harden; trains are multi-member so the
+            coroutine must not block waiting for human resolution.
+       (ii) ``done_wip_recovery`` escalates rather than returning DONE — the
+            merge landed on main but members were NOT flipped, a split-brain
+            that cannot safely map to the single-task DONE return.
 
     Implements PRD δ₁ spec §9.6:
     (a) Status pre-check — all members must be ``merge-deferred``.
