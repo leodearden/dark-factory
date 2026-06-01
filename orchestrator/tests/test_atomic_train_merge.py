@@ -31,7 +31,10 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, TrainMembership, _run
 from orchestrator.merge_queue import (
+    ABANDONED_REASON_PREFIX,
+    POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
@@ -1950,4 +1953,465 @@ class TestScenario12DegenerateTrainOfOne:
         assert result12.returncode == 0, (
             f"cargo test --workspace must be green at the final main tip "
             f"(degenerate train-of-one: no red-main window): {result12.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate tests (steps 01-10): disk-guard, loop-breaker, equivalence, push,
+# wip-halt — drive through MergeWorker._do_merge, no cargo required.
+# These tests use a simple git repo (plain text files) rather than the cargo
+# fixture, so they run on any machine regardless of Rust toolchain availability.
+# ---------------------------------------------------------------------------
+
+_GIB = 1024**3
+
+
+def _make_passing_verify_result() -> VerifyResult:
+    """Return a passing VerifyResult for use as run_scoped_verification mock return."""
+    return VerifyResult(
+        passed=True,
+        test_output="ok\n",
+        lint_output="",
+        type_output="",
+        summary="All tests passed",
+    )
+
+
+async def _setup_gate_train(
+    tmp_path: Path,
+    *,
+    train_id: str = "train-gate",
+    member_names: tuple[str, str, str] = ("g-a", "g-b", "g-c"),
+) -> tuple[GitOps, OrchestratorConfig, GroupMergeRequest]:
+    """Set up a minimal git repo with a real stacked 3-member train (no cargo).
+
+    Returns (git_ops, config, req) ready for worker._do_merge() testing.
+    Each member adds one unique .txt file so diffs are always non-empty.
+    """
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    await _run(["git", "init", "-b", "main"], cwd=repo)
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+    await _run(["git", "config", "user.name", "Test"], cwd=repo)
+    (repo / "README.md").write_text("# gate test repo\n")
+    await _run(["git", "add", "-A"], cwd=repo)
+    await _run(["git", "commit", "-m", "initial"], cwd=repo)
+
+    git_cfg = GitConfig(
+        main_branch="main",
+        branch_prefix="task/",
+        remote="origin",
+        worktree_dir=".worktrees",
+        push_after_advance=False,
+    )
+    config = OrchestratorConfig(project_root=repo, git=git_cfg)
+    git_ops = GitOps(git_cfg, repo)
+
+    a_name, b_name, c_name = member_names
+
+    # Get current main SHA as base for first member.
+    _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+    main_sha = main_sha.strip()
+
+    wt_a, sha_a = await make_stacked_member(
+        git_ops, a_name, main_sha,
+        lambda wt, n=a_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+    wt_b, sha_b = await make_stacked_member(
+        git_ops, b_name, sha_a,
+        lambda wt, n=b_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+    wt_c, _sha_c = await make_stacked_member(
+        git_ops, c_name, sha_b,
+        lambda wt, n=c_name: (wt / f"{n}.txt").write_text(f"{n}\n"),
+    )
+
+    req = build_group_merge_request(
+        git_ops=git_ops,
+        config=config,
+        train_id=train_id,
+        member_names=list(member_names),
+        tip_name=c_name,
+        tip_worktree=wt_c,
+    )
+
+    return git_ops, config, req
+
+
+# ---------------------------------------------------------------------------
+# Gate test 01: disk guard fires — step-01 RED / step-02 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate01TrainDiskGuard:
+    """step-01 RED: _do_train_merge has no disk guard; disk pressure is ignored.
+
+    After step-02 (GREEN): _do_train_merge uses _run_post_merge_verify which
+    runs the pre-verify disk guard; persistent low disk → blocked/verify_skipped.
+    """
+
+    async def test_train_disk_guard_skips_verify(self, tmp_path: Path) -> None:
+        """Disk persists low after prune → blocked, verify_skipped=True, TRANSIENT_INFRA."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-disk-gate",
+        )
+
+        # Record main SHA before (must be unmoved on block).
+        _, main_sha_before, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        main_sha_before = main_sha_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch(
+                "orchestrator.merge_queue.shutil.disk_usage",
+                return_value=MagicMock(free=1 * _GIB),  # 1 GiB << 10 GiB threshold
+            ),
+            patch.object(
+                git_ops,
+                "prune_stale_merge_worktrees",
+                AsyncMock(return_value=[]),  # prune frees nothing
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with the disk-guard reason.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.verify_skipped is True, (
+            "expected verify_skipped=True when disk guard fires"
+        )
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f"expected TRANSIENT_INFRA prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) main SHA must be unmoved (advance_main must not have run).
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        assert main_sha_after.strip() == main_sha_before, (
+            f"main must not advance on disk-guard block; "
+            f"moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (3) No member flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when disk guard blocks train; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 03: verify-timeout loop-breaker — step-03 RED / step-04 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate03TrainVerifyTimeoutLoopBreaker:
+    """step-03 RED: _do_train_merge has no loop-breaker short-circuit.
+
+    Pre-seeding worker._post_merge_verify_timeouts[tip] = MAX doesn't stop
+    _do_train_merge from doing git work today; with mocked passing verify it
+    returns 'done'.  After step-04 the loop-breaker fires before any git work
+    and returns blocked/ABANDONED prefix.
+    """
+
+    async def test_train_abandons_after_verify_timeout_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pre-seeded timeout counter at threshold → abandoned, no git work, 0 flips."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-loop-breaker",
+        )
+
+        # Record main SHA before attempt.
+        _, main_sha_before, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        main_sha_before = main_sha_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Pre-seed the timeout counter at the threshold.
+        tip_task_id = req.task_id  # tip is 'g-c' for default member names
+        worker._post_merge_verify_timeouts[tip_task_id] = (
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+        )
+
+        # Spy on merge_to_main — the loop-breaker must short-circuit BEFORE any git work.
+        with (
+            patch.object(git_ops, "merge_to_main", wraps=git_ops.merge_to_main) as spy_merge,
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with the ABANDONED prefix.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.reason.startswith(ABANDONED_REASON_PREFIX), (
+            f"expected ABANDONED prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) No git work ran (loop-breaker must fire before merge_to_main).
+        spy_merge.assert_not_called()
+
+        # (3) Main SHA must be unmoved.
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        assert main_sha_after.strip() == main_sha_before, (
+            f"main must not advance when loop-breaker fires; "
+            f"moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (4) No member flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when loop-breaker abandons; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 05: equivalence gate — step-05 RED / step-06 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate05TrainPostMergeEquivalence:
+    """step-05 RED: _do_train_merge never calls _check_post_merge_equivalence.
+
+    After step-06 (GREEN): trains route through _finalize_advanced_merge which
+    runs the equivalence check; failure → blocked/POST_MERGE_EQUIVALENCE prefix,
+    0 member flips, main DID advance (merge landed before the gate).
+    """
+
+    async def test_train_blocks_on_post_merge_equivalence_fail(
+        self, tmp_path: Path,
+    ) -> None:
+        """Equivalence check returns failures → blocked, 0 flips, main advanced."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-equiv-gate",
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch(
+                "orchestrator.merge_queue._check_post_merge_equivalence",
+                AsyncMock(return_value=["g-a/src/lib.rs"]),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with equivalence-failure reason.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f"expected POST_MERGE_EQUIVALENCE prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) No member flips (equivalence failed after landing).
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when equivalence gate fails; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+        )
+
+        # (3) Main DID advance (merge commit landed before the equivalence gate).
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        _, initial_main, _ = await _run(
+            ["git", "rev-list", "--max-parents=0", "main"], cwd=git_ops.project_root,
+        )
+        # main moved if there's more than the initial commit (a merge commit was added)
+        _, merge_count_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=git_ops.project_root,
+        )
+        assert int(merge_count_str.strip()) >= 1, (
+            "expected advance_main to have run (merge commit present on main); "
+            f"main SHA={main_sha_after.strip()!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 07: push_main + train telemetry — step-07 RED / step-08 GREEN
+# ---------------------------------------------------------------------------
+
+
+class _SpyEventStore:
+    """Minimal event store that collects emitted events for inspection.
+
+    Provides the same ``emit`` interface as :class:`EventStore` but stores
+    events in-memory.  Used by gate tests that need to inspect event payloads
+    without creating a real SQLite database.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: Any = None,
+        phase: Any = None,
+        role: Any = None,
+        data: dict | None = None,
+        cost_usd: Any = None,
+        duration_ms: Any = None,
+    ) -> None:
+        self.events.append({
+            "event_type": str(event_type),
+            "task_id": task_id,
+            "data": data or {},
+        })
+
+    def by_type(self, event_type_str: str) -> list[dict]:
+        return [e for e in self.events if e["event_type"] == event_type_str]
+
+
+@pytest.mark.asyncio
+class TestGate07TrainPushAndTelemetry:
+    """step-07 RED: finalize emits merge_attempt 'done' without train_id/member_task_ids.
+
+    After step-08 (GREEN): _finalize_advanced_merge accepts train_id and
+    member_task_ids kwargs and threads them into its _emit_merge_attempt calls.
+    """
+
+    async def test_train_pushes_main_and_tags_telemetry_on_success(
+        self, tmp_path: Path,
+    ) -> None:
+        """Happy train: push_main fires once, all members flip, done event tagged."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-push-telemetry",
+        )
+
+        spy_store = _SpyEventStore()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        # Pass the spy event store to the worker.
+        worker = MergeWorker(git_ops, queue, event_store=spy_store)  # type: ignore[arg-type]
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch.object(
+                git_ops, "push_main",
+                AsyncMock(return_value="pushed"),
+            ) as mock_push,
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is done with push_status set by finalize.
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done, got: {outcome!r}"
+        assert outcome.push_status == "pushed", (
+            f"expected push_status='pushed', got: {outcome.push_status!r}"
+        )
+
+        # (2) push_main called exactly once.
+        mock_push.assert_awaited_once()
+
+        # (3) All members flipped.
+        assert req.mark_member_done.call_count == len(req.member_task_ids), (  # type: ignore[union-attr]
+            f"expected {len(req.member_task_ids)} mark_member_done calls, "
+            f"got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
+        )
+
+        # (4) The merge_attempt 'done' event emitted by _finalize_advanced_merge
+        #     must carry train_id and member_task_ids for train correlation.
+        #     RED until step-08 adds these kwargs to _finalize_advanced_merge.
+        merge_attempt_events = spy_store.by_type("merge_attempt")
+        done_events = [
+            e for e in merge_attempt_events
+            if e["data"].get("outcome") == "done"
+        ]
+        assert done_events, (
+            f"expected at least one merge_attempt 'done' event; "
+            f"got events: {merge_attempt_events}"
+        )
+        # Assert the done event carries train correlation kwargs.
+        done_evt = done_events[0]  # finalize emits the sole 'done' event
+        assert done_evt["data"].get("train_id") == req.train_id, (
+            f"done event missing train_id; payload: {done_evt['data']}"
+        )
+        assert done_evt["data"].get("member_task_ids") == req.member_task_ids, (
+            f"done event missing member_task_ids; payload: {done_evt['data']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 09: wip_overlap halts the train — step-09 RED / step-10 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate09TrainWipOverlapHalt:
+    """step-09 RED: advance_main returns 'wip_overlap' but the train returns
+    a generic 'blocked' instead of routing through _map_advance_failure.
+
+    After step-10 (GREEN): non-'advanced' / non-'cas_failed' advance results
+    route through _map_advance_failure so trains get wip_halted + is_wip_halted.
+    """
+
+    async def test_train_wip_overlap_halts_queue(self, tmp_path: Path) -> None:
+        """wip_overlap from advance_main must halt the queue; no member flips."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-wip-halt",
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        _OVERLAP_FILES = ["crate_a/src/lib.rs"]
+
+        async def _wip_overlap_advance(*args: Any, **kwargs: Any) -> str:
+            git_ops._last_overlap_files = _OVERLAP_FILES
+            return "wip_overlap"
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch.object(
+                git_ops, "advance_main",
+                side_effect=_wip_overlap_advance,
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == "wip_halted", (
+            f"expected wip_halted, got: {outcome!r}"
+        )
+        assert outcome.overlap_files == _OVERLAP_FILES, (
+            f"expected overlap_files={_OVERLAP_FILES!r}, got: {outcome.overlap_files!r}"
+        )
+        assert worker.is_wip_halted, (
+            "expected worker.is_wip_halted to be True after wip_overlap"
+        )
+        # No member flips — main did NOT land cleanly.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"expected 0 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )

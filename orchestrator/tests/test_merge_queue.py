@@ -6581,6 +6581,49 @@ class TestGroupMergeRequestSpeculativeWorker:
         await worker.stop()
         await worker_task
 
+    async def test_speculative_worker_train_pushes_on_success(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Regression: step-02 signature change routes train via _do_train_merge(self, req).
+
+        Guards that SpeculativeMergeWorker._merger_loop correctly dispatches
+        GroupMergeRequest to _do_train_merge(self, req), which then calls
+        _finalize_advanced_merge with train_id/member_task_ids and propagates
+        push_status back to the caller.
+        """
+        req = await _make_stacked_train(git_ops, config, train_id='spec-push-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_verify_pass(),
+            ),
+            patch.object(
+                git_ops, 'push_main',
+                AsyncMock(return_value='pushed'),
+            ),
+        ):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        # (1) Outcome is done with push_status propagated from _finalize_advanced_merge.
+        assert outcome.status == 'done', f'expected done, got: {outcome!r}'
+        assert outcome.push_status == 'pushed', (
+            f'expected push_status="pushed", got: {outcome.push_status!r}'
+        )
+
+        # (2) All 3 members flipped.
+        assert req.mark_member_done.call_count == 3, (  # type: ignore[reportFunctionMemberAccess]
+            f'expected 3 mark_member_done calls, got {req.mark_member_done.call_count}'  # type: ignore[reportFunctionMemberAccess]
+        )
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestGroupMergeRequestPartialMemberFlipFailure (MergeWorker) — step-15 RED / step-16 GREEN

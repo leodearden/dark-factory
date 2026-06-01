@@ -396,6 +396,8 @@ async def _finalize_advanced_merge(
     timeouts: dict[str, int],
     enospc_retries: dict[str, int],
     log_label: str = '',
+    train_id: str | None = None,
+    member_task_ids: list[str] | None = None,
 ) -> MergeOutcome:
     """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -410,6 +412,12 @@ async def _finalize_advanced_merge(
     worker can retain its current log prefix
     (``''`` for MergeWorker, ``' (speculative)'`` for
     SpeculativeMergeWorker).
+
+    *train_id* and *member_task_ids* are optional train-correlation tags
+    forwarded to every ``_emit_merge_attempt`` call inside this function.
+    MergeWorker and SpeculativeMergeWorker pass ``None`` (no behavior
+    change); ``_do_train_merge`` passes the request's train metadata so
+    ``merge_attempt`` events stay tagged for downstream reconciliation.
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -434,6 +442,8 @@ async def _finalize_advanced_merge(
             event_store, req.task_id,
             'post_merge_equivalence_failed',
             duration_ms=_elapsed_ms(started_monotonic),
+            train_id=train_id,
+            member_task_ids=member_task_ids,
         )
         return MergeOutcome(
             'blocked',
@@ -463,6 +473,8 @@ async def _finalize_advanced_merge(
             event_store, req.task_id,
             'post_merge_pyright_broken',
             duration_ms=_elapsed_ms(started_monotonic),
+            train_id=train_id,
+            member_task_ids=member_task_ids,
         )
         return MergeOutcome(
             'blocked',
@@ -475,7 +487,12 @@ async def _finalize_advanced_merge(
         )
 
     logger.info(f'Task {req.task_id}: merged to main successfully')
-    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(started_monotonic))
+    _emit_merge_attempt(
+        event_store, req.task_id, 'done',
+        duration_ms=_elapsed_ms(started_monotonic),
+        train_id=train_id,
+        member_task_ids=member_task_ids,
+    )
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -1787,12 +1804,105 @@ class SpeculativeItem:
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
 
 
+class _TrainMergeHost(Protocol):
+    """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
+
+    Both :class:`MergeWorker` and :class:`SpeculativeMergeWorker` inherit
+    :class:`_WipHaltMixin` and define every attribute / constant listed here;
+    the Protocol lets ``_do_train_merge`` accept either worker type without
+    creating a coupling to the concrete class hierarchy.
+
+    The surface is intentionally narrow — only the state that the shared
+    train-merge pipeline actually touches.  Adding new attributes here does
+    NOT require touching ``_WipHaltMixin``; both concrete workers already
+    define them in their own ``__init__``.
+    """
+
+    # ── Git / event dependencies ──────────────────────────────────────────
+    _git_ops: GitOps
+    _event_store: EventStore | None
+
+    # ── Per-task counters (mutated by shared helpers) ─────────────────────
+    _post_merge_verify_timeouts: dict[str, int]
+    _post_merge_verify_enospc_retries: dict[str, int]
+    _cas_retries: dict[str, int]
+
+    # ── Class-level thresholds ────────────────────────────────────────────
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int
+
+    # ── WIP halt / abandon helpers ────────────────────────────────────────
+    def halt_for_wip(self, reason: str) -> None: ...
+    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
+
+
 async def _do_train_merge(
-    git_ops: GitOps,
+    worker: _TrainMergeHost,
     req: GroupMergeRequest,
-    event_store: EventStore | None,
 ) -> MergeOutcome:
     """Atomic train-merge pipeline shared by MergeWorker and SpeculativeMergeWorker.
+
+    BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
+    core at PARITY with MergeWorker._do_merge — specifically:
+      • disk-guard pre-verify short-circuit (_run_post_merge_verify)
+      • verify-timeout loop-breaker (worker._post_merge_verify_timeouts)
+      • post-merge content-equivalence gate (_finalize_advanced_merge)
+      • unscoped pyright gate (_finalize_advanced_merge)
+      • push_main (outcome.push_status propagated from _finalize_advanced_merge)
+      • wip-halt + escalation routing for non-'advanced' advance results
+        (_map_advance_failure via worker.halt_for_wip)
+
+    DEFENSIBLE DELTAS — behaviours intentionally absent from the train path
+    despite being present in MergeWorker or SpeculativeMergeWorker:
+
+    1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate lives ONLY in
+       SpeculativeMergeWorker._verify_and_advance's CAS loop.  MergeWorker (the
+       readable serial reference) also does NOT pass it.  "Parity" means parity
+       with MergeWorker, not the spec-worker CAS loop.  Adding the gate here
+       would duplicate speculative-worker logic that has no business in the train.
+
+    2. Pyright redundant-but-harmless: the train always rebases its tip onto
+       main before merging, so the type surface is fresh.  The post-merge
+       unscoped pyright run is therefore redundant in the common case but is
+       kept for uniformity and because the cost is low relative to the safety
+       guarantee.
+
+    3. No drop-guard (_check_plan_targets_in_tree): the drop guard targets
+       conflict-RESOLUTION drops (a human resolved and accidentally removed work).
+       Trains abort cleanly on rebase conflict (TRAIN_REBASE_CONFLICT), so there
+       is no conflict-resolution step from which targets can be dropped.  The
+       post-merge equivalence check covers rebase-rewrite.
+
+    4. No ``skip_verify``: the train always rebases its tip and needs the full
+       workspace-green gate.  The single-task ``skip_verify`` path is triggered
+       by a pre-rebased branch; trains always start from a fresh rebase.
+
+    5. ``cas_failed`` → ``blocked``: ``advance_main`` already retried internally
+       up to ``max_advance_attempts``; the workflow re-parks an incomplete train
+       for retry.  Mapping a residual ``cas_failed`` to ``blocked`` (not
+       re-enqueuing directly) is correct — the orchestrator will re-dispatch on
+       the next scheduler tick.
+
+    6. ``wip_halted`` / ``done_wip_recovery`` → human escalation for trains:
+       ``_map_advance_failure`` can return ``wip_halted`` (on ``wip_overlap``)
+       or ``done_wip_recovery`` (on ``pop_conflict`` — which also calls
+       ``push_main`` and creates a recovery branch).  For a *single* task these
+       statuses trigger automatic recovery in ``workflow.py``
+       (``_handle_wip_conflict`` / ``_handle_wip_recovery``).  For trains the
+       GroupMergeRequest consumer in ``workflow.py`` does not branch on these
+       statuses; both fall through to ``_mark_blocked(escalate_to_human=True)``.
+
+       This means:
+       • ``wip_overlap`` halts the merge queue AND leaves it halted until a
+         human manually unhalts (no auto-recovery for trains, unlike single tasks).
+       • ``pop_conflict`` lands the train merge commit on main, creates a
+         recovery branch, but does NOT flip members and escalates to human
+         (a main-landed-but-tasks-blocked split-brain, resolved by human).
+
+       Both are *safe-by-escalation*, not silent faults — a human is notified
+       in both cases.  Auto-recovery parity is a follow-up concern; closing
+       the gap requires modifying ``workflow.py``'s GroupMergeRequest consumer
+       (currently outside task 1596's scope).
 
     Implements PRD δ₁ spec §9.6:
     (a) Status pre-check — all members must be ``merge-deferred``.
@@ -1804,12 +1914,13 @@ async def _do_train_merge(
         enforces the workspace-wide post-merge green gate (scenario 5).
     (e) CAS advance — ``advance_main`` atomically updates the main ref.
     (f) Member callbacks — ``req.mark_member_done`` is called for each member
-        ONLY after advance succeeds (invariant: members flip iff main lands).
-
-    Pre-checks (a)+(b) are added in steps 6 and 8; this initial implementation
-    (step 4) covers the happy path where main is unmoved and all members are
-    already merge-deferred.
+        ONLY after advance + _finalize_advanced_merge succeed (invariant: members
+        flip iff main lands AND post-merge gates pass).
     """
+    # Unpack worker state so the rest of the function reads like the single-task path.
+    git_ops = worker._git_ops
+    event_store = worker._event_store
+
     t0 = time.monotonic()
     logger.info(
         'Train %s: starting atomic merge of %d members via tip branch %s',
@@ -1842,6 +1953,25 @@ async def _do_train_merge(
         member_task_ids=req.member_task_ids,
         data={'member_count': len(req.member_task_ids), 'base_sha': base_sha_t0},
     )
+
+    # Loop-breaker: if this train's tip has timed out in post-merge verify
+    # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon without any git
+    # work — mirrors MergeWorker._do_merge:2286-2298.  A stuck verify
+    # can otherwise burn merge-queue capacity for 30+ minutes per attempt.
+    prior_timeouts = worker._post_merge_verify_timeouts.get(req.task_id, 0)
+    if prior_timeouts >= worker.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+        logger.warning(
+            'Train %s: abandoning merge — %d consecutive post-merge '
+            'verify timeouts (threshold=%d)',
+            req.train_id, prior_timeouts,
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id, 'abandoned_verify_timeouts',
+            attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
+            **_train_emit_kwargs,
+        )
+        return worker._abandon_outcome(req.task_id, prior_timeouts)
 
     # (a) Status pre-check: all members must be 'merge-deferred'.
     statuses = await req.status_check(req.member_task_ids)
@@ -1927,19 +2057,21 @@ async def _do_train_merge(
             f'but merge_worktree is None'
         )
 
-    # (e) Workspace-wide post-merge verify (scenario 5 red gate).
-    verify = await run_scoped_verification(
-        merge_wt, req.config, req.module_configs,
-        task_files=req.task_files,
-        max_retries=0,
-        is_merge_verify=True,
-        force_workspace=req.config.merge_verify_workspace,
-        role='merge',
+    # (e) Workspace-wide post-merge verify via the shared helper.
+    # _run_post_merge_verify runs the pre-verify disk guard, the scoped
+    # verification (with ENOSPC prune-retry), and the timeout loop-breaker
+    # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
+    # (and cleans up merge_wt) when any controlled failure fires.
+    verify_outcome = await _run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
     )
-    if not verify.passed:
-        await git_ops.cleanup_merge_worktree(merge_wt)
-        reason = f'Post-merge verification failed: {verify.failure_report()}'
-        logger.info('Train %s: verify gate red: %s', req.train_id, reason)
+    if verify_outcome is not None:
+        reason = verify_outcome.reason
+        logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
         _emit_train_event(
             event_store, EventType.train_derailed,
             task_id=req.task_id, train_id=req.train_id,
@@ -1947,7 +2079,7 @@ async def _do_train_merge(
             data={'derail_reason': reason},
         )
         _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-        return MergeOutcome('blocked', reason=reason)
+        return verify_outcome
 
     # (f) CAS-advance main.
     adv = await git_ops.advance_main(
@@ -1957,34 +2089,79 @@ async def _do_train_merge(
         expected_main=main_sha,
     )
 
-    # Capture _last_advanced_sha BEFORE cleanup_merge_worktree — the side
-    # channel must be read while still fresh (before any future call could
-    # clear it), and before the merge_commit SHA drifts out of scope.
-    if adv == 'advanced':
-        pre_cleanup_advanced_sha: str | None = git_ops._last_advanced_sha
-        if not pre_cleanup_advanced_sha:
-            logger.warning(
-                'Train %s: _last_advanced_sha not set after advance; '
-                'falling back to merge_commit %s — member SHA may be pre-rebase',
-                req.train_id, merge_commit,
-            )
-    else:
-        pre_cleanup_advanced_sha = None
-
     await git_ops.cleanup_merge_worktree(merge_wt)
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
+        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        if adv == 'cas_failed':
+            # advance_main already retried internally; workflow re-parks the
+            # train.  Return a simple blocked rather than routing through
+            # _map_advance_failure (which does not handle cas_failed).
+            _emit_train_event(
+                event_store, EventType.train_derailed,
+                task_id=req.task_id, train_id=req.train_id,
+                member_task_ids=req.member_task_ids,
+                data={'derail_reason': f'Train merge advance failed: {adv}'},
+            )
+            return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
+        # All other codes (wip_overlap, pop_conflict, unmerged_state, …) route
+        # through the shared failure mapper so the train gets the same
+        # wip-halt + escalation routing as the single-task path.
+        #
+        # NOTE — behaviour-asymmetry (documented in docstring delta #6):
+        # _map_advance_failure can return wip_halted (wip_overlap) or
+        # done_wip_recovery (pop_conflict).  For single tasks workflow.py
+        # handles these with _handle_wip_conflict / _handle_wip_recovery.
+        # For trains the GroupMergeRequest consumer falls through to
+        # _mark_blocked(escalate_to_human=True) in both cases — intentional
+        # safe-by-escalation behaviour; auto-recovery parity is a follow-up
+        # (requires changes to workflow.py, outside task 1596 scope).
+        outcome = await _map_advance_failure(
+            git_ops, adv,
+            task_id=req.task_id,
+            merge_commit_fallback=merge_commit,
+            halt=worker.halt_for_wip,
+            cas_retries=worker._cas_retries,
+        )
         _emit_train_event(
             event_store, EventType.train_derailed,
             task_id=req.task_id, train_id=req.train_id,
             member_task_ids=req.member_task_ids,
             data={'derail_reason': f'Train merge advance failed: {adv}'},
         )
-        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-        return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
+        return outcome
 
-    advanced_sha: str = pre_cleanup_advanced_sha or merge_commit
+    # advance succeeded — run equivalence + pyright + push via shared finalize.
+    # merge_wt has already been cleaned up above (caller contract for finalize).
+    # t0 is passed as started_monotonic so finalize's duration_ms is accurate
+    # for the whole train attempt, not just the post-advance window.
+    outcome = await _finalize_advanced_merge(
+        git_ops, req, event_store,
+        merge_commit_fallback=merge_commit,
+        base_sha=main_sha,
+        started_monotonic=t0,
+        cas_retries=worker._cas_retries,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        log_label=' (train)',
+        train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+    )
+    if outcome.status != 'done':
+        # Equivalence or pyright gate fired — main landed but post-merge gates
+        # failed.  Emit derailed and return without flipping members.
+        logger.info('Train %s: finalize blocked: %s', req.train_id, outcome.reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': outcome.reason},
+        )
+        return outcome  # no member flips
+
+    # outcome.merge_sha: post-rebase advanced SHA resolved by finalize (rebase-robust).
+    advanced_sha: str = outcome.merge_sha  # type: ignore[assignment]
 
     _emit_train_event(
         event_store, EventType.train_merged,
@@ -1993,7 +2170,7 @@ async def _do_train_merge(
         data={'merge_commit_sha': advanced_sha, 'base_sha': main_sha},
     )
 
-    # (g) Flip all members done — ONLY after advance succeeds.
+    # (g) Flip all members done — ONLY after advance + finalize succeed.
     # Each callback is wrapped in try/except so a single scheduler blip does
     # NOT abort the remaining flips (split-brain prevention) and does NOT
     # surface as a 'blocked' outcome that contradicts the landed git state.
@@ -2027,12 +2204,13 @@ async def _do_train_merge(
         _emit_merge_attempt(event_store, req.task_id, 'train_partial_flip', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
+    # _finalize_advanced_merge already emitted merge_attempt 'done'; return its
+    # outcome directly so push_status is propagated to the caller.
     logger.info(
         'Train %s: landed at %s; %d members marked done',
         req.train_id, advanced_sha[:12], len(req.member_task_ids),
     )
-    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-    return MergeOutcome('done', merge_sha=advanced_sha)
+    return outcome
 
 
 class _WipHaltMixin:
@@ -2141,13 +2319,13 @@ class MergeWorker(_WipHaltMixin):
     # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
     # alternating on the merge queue for hours, each dying at the 30-min
     # warm timeout).  Counter resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # After a post-merge verify fails with an ENOSPC signature, prune stale
     # _merge-* worktrees and retry the verify at most this many times before
     # escalating as transient infra.  Disk pressure is often self-healing, so
     # one retry-after-prune is the conservative middle ground between blindly
     # blocking and looping.  Resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
 
     def __init__(
         self,
@@ -2275,7 +2453,7 @@ class MergeWorker(_WipHaltMixin):
         # _do_train_merge pipeline which owns rebase + merge + verify + advance
         # + member callbacks.  The rest of _do_merge is the single-task path.
         if isinstance(req, GroupMergeRequest):
-            return await _do_train_merge(self._git_ops, req, self._event_store)
+            return await _do_train_merge(self, req)
 
         t0 = time.monotonic()
 
@@ -2484,9 +2662,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS — see that class
     # for rationale.  Kept as a class attribute so tests can monkeypatch
     # per-class if the two workers ever diverge.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
 
     def __init__(
         self,
@@ -2726,9 +2904,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 'for an idle pipeline before submitting a train',
                                 req.train_id, spec_base[:12],
                             )
-                        outcome = await _do_train_merge(
-                            self._git_ops, req, self._event_store,
-                        )
+                        outcome = await _do_train_merge(self, req)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
