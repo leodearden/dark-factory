@@ -2183,3 +2183,70 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
             f"mark_member_done must not fire when loop-breaker abandons; "
             f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
         )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 05: equivalence gate — step-05 RED / step-06 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate05TrainPostMergeEquivalence:
+    """step-05 RED: _do_train_merge never calls _check_post_merge_equivalence.
+
+    After step-06 (GREEN): trains route through _finalize_advanced_merge which
+    runs the equivalence check; failure → blocked/POST_MERGE_EQUIVALENCE prefix,
+    0 member flips, main DID advance (merge landed before the gate).
+    """
+
+    async def test_train_blocks_on_post_merge_equivalence_fail(
+        self, tmp_path: Path,
+    ) -> None:
+        """Equivalence check returns failures → blocked, 0 flips, main advanced."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-equiv-gate",
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch(
+                "orchestrator.merge_queue._check_post_merge_equivalence",
+                AsyncMock(return_value=["g-a/src/lib.rs"]),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with equivalence-failure reason.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f"expected POST_MERGE_EQUIVALENCE prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) No member flips (equivalence failed after landing).
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when equivalence gate fails; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+        )
+
+        # (3) Main DID advance (merge commit landed before the equivalence gate).
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        _, initial_main, _ = await _run(
+            ["git", "rev-list", "--max-parents=0", "main"], cwd=git_ops.project_root,
+        )
+        # main moved if there's more than the initial commit (a merge commit was added)
+        _, merge_count_str, _ = await _run(
+            ["git", "rev-list", "--merges", "--count", "main"], cwd=git_ops.project_root,
+        )
+        assert int(merge_count_str.strip()) >= 1, (
+            "expected advance_main to have run (merge commit present on main); "
+            f"main SHA={main_sha_after.strip()!r}"
+        )
