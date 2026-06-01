@@ -341,3 +341,128 @@ async def test_maybe_restart_idempotent_no_double_fire() -> None:
     assert first is True
     assert second is False
     executor.assert_awaited_once()  # exactly once total
+
+
+# ---------------------------------------------------------------------------
+# Burst-coalescing (step-7) + default executor tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_burst_coalescing_fires_exactly_once_after_last_merge() -> None:
+    """A burst of fused-memory merges debounces into exactly ONE restart.
+
+    Timeline:
+    - t=0: note_merge #1 — arms pending, last_request=0
+    - t=30: maybe_restart → debounce not elapsed (need 120s from last note_merge)
+    - t=60: note_merge #2 — re-arms, last_request=60
+    - t=90: maybe_restart → only 30s since last note_merge → still deferred
+    - t=120: note_merge #3 — re-arms, last_request=120
+    - t=150: maybe_restart → only 30s since last note_merge → still deferred
+    - t=240 (120s after last): maybe_restart → fires exactly once
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['fused-memory/src/server/main.py'])
+    event_store = MagicMock()
+    executor = AsyncMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=120.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+
+    current_time[0] = 0.0
+    await coord.note_merge('task-1', 'base1', 'head1')
+    assert coord.is_pending
+
+    # 30s — debounce not elapsed (0s since last note_merge at t=0 → 30s elapsed < 120)
+    current_time[0] = 30.0
+    r = await coord.maybe_restart(agents_idle=True)
+    assert r is False
+    executor.assert_not_awaited()
+
+    # t=60: second merge re-arms, resets last_request to 60
+    current_time[0] = 60.0
+    await coord.note_merge('task-2', 'base2', 'head2')
+
+    # t=90: only 30s since last note_merge (t=60) — still deferred
+    current_time[0] = 90.0
+    r = await coord.maybe_restart(agents_idle=True)
+    assert r is False
+    executor.assert_not_awaited()
+
+    # t=120: third merge re-arms, resets last_request to 120
+    current_time[0] = 120.0
+    await coord.note_merge('task-3', 'base3', 'head3')
+
+    # t=150: only 30s since last note_merge (t=120) — still deferred
+    current_time[0] = 150.0
+    r = await coord.maybe_restart(agents_idle=True)
+    assert r is False
+    executor.assert_not_awaited()
+
+    # t=240: 120s since last note_merge (t=120) — fires!
+    current_time[0] = 240.0
+    r = await coord.maybe_restart(agents_idle=True)
+    assert r is True
+    executor.assert_awaited_once()
+    assert not coord.is_pending
+
+    # Calling again without a new note_merge → no second fire
+    r = await coord.maybe_restart(agents_idle=True)
+    assert r is False
+    executor.assert_awaited_once()  # still exactly one call total
+
+
+@pytest.mark.asyncio
+async def test_default_executor_spawns_script_detached() -> None:
+    """Default executor spawns scripts/restart-fused-memory.sh --drain detached."""
+    from unittest.mock import patch, MagicMock as MM
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['fused-memory/src/server/main.py'])
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+
+    # Construct WITHOUT injecting restart_executor to exercise the default path
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,  # no debounce — fire immediately
+        enabled=True,
+        project_root='/fake/project',
+        script_path='scripts/restart-fused-memory.sh',
+        clock=lambda: current_time[0],
+    )
+
+    current_time[0] = 0.0
+    await coord.note_merge('task-1', 'base1', 'head1')
+
+    # Patch asyncio.create_subprocess_exec inside the service_restart module
+    fake_proc = MM()
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        r = await coord.maybe_restart(agents_idle=True)
+
+    assert r is True
+    mock_exec.assert_awaited_once()
+    call_args = mock_exec.call_args
+    # Positional args: script path and --drain flag
+    pos_args = call_args.args if call_args.args else call_args[0]
+    assert str(pos_args[0]).endswith('scripts/restart-fused-memory.sh')
+    assert pos_args[1] == '--drain'
+    # Must be spawned detached (fire-and-forget, survives MCP reconnect)
+    assert call_args.kwargs.get('start_new_session') is True
+    # The process must NOT be awaited — fake_proc.wait/communicate not called
+    fake_proc.wait.assert_not_called()
+    fake_proc.communicate.assert_not_called()
