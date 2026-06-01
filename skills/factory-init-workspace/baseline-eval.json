@@ -1,0 +1,171 @@
+{
+  "skill_name": "factory-init",
+  "description": "Onboard a software project \u2014 brand-new or with existing code \u2014 so the dark-factory orchestrator can develop it. Use this skill whenever the user wants to 'factory-init' a repo, 'set up a project for the orchestrator', 'make this repo a dark-factory target', 'register a new project', 'onboard <repo> into the factory', or points at a directory and asks to get it ready for autonomous development \u2014 even if they don't say 'factory-init'. It ensures dark-factory is installed (installing it is out of scope), ensures a git repo, picks a hyphen-free canonical project_id and an unused escalation port, writes the per-project config (orchestrator.yaml, .mcp.json, .envrc, .gitignore, CLAUDE.md pin), registers the project with fused-memory reconciliation, then routes to the right next skill: review-briefing \u2192 review for existing code, or a goals discussion \u2192 /prd batch for a greenfield project. Optionally (when the user wants unattended operation) sets up a supervised systemd orchestrator unit so the project runs in the always-on autonomous workload. NOT for: installing/bootstrapping dark-factory itself (a separate skill), running the orchestrator (/orchestrate), authoring a single PRD (/prd), or unblocking tasks (/unblock).",
+  "results": [
+    {
+      "query": "make this repo a dark-factory target so it runs unattended like reify does",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "factory-init ../widget-shop",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "i want to add my-new-app (it's at ~/src/my-new-app, python/fastapi, has a test suite) to the set of projects the orchestrator builds",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "ok i just dropped a fresh clone of our invoicer service into /home/leo/src/invoicer \u2014 get it wired up so the orchestrator can start churning through tasks on it",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "spin up a brand-new project for autonomous dev \u2014 empty dir at ~/src/pricing-engine, nothing in it yet, i want to start queueing PRDs",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "onboard the photoschedule repo into dark factory, it's a flask thing with a decent test suite already",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "register /home/leo/src/scraper with the factory \u2014 it needs to show up on the dashboard and have reconciliation track its tasks",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "get ~/src/ledger ready for dark factory please",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "i've got a rust cli at ~/src/blink i want the orchestrator developing \u2014 what do i need to wire up, config + a port + all that?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "run the orchestrator on my-solar-challenge and show me the current task tree",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "can you set up the timesheet-tool dir so the orchestrator picks it up overnight? it's just a git repo, no code yet",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "let's write a PRD for the new tariff-comparison feature in my-solar-challenge",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "task 88 in reify is blocked on review issues, can you unblock it",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "create a review briefing for the know-live repo",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "the orchestrator stopped picking up autopilot-video tasks, i think fused-memory crashed \u2014 can you check what's wrong",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "just git init this folder and do an initial commit, that's all i need",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "add the playwright MCP server to the .mcp.json in reify",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "what escalation port does autopilot-video use again?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "set up a systemd timer to run my nightly database backup script",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "set up dark-factory on this machine from scratch \u2014 docker, fused-memory, the whole stack",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 20,
+    "passed": 10,
+    "failed": 10
+  }
+}

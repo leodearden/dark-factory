@@ -1,0 +1,4 @@
+[
+  {"query": "get ~/src/ledger ready for dark factory please", "should_trigger": true},
+  {"query": "what escalation port does autopilot-video use again?", "should_trigger": false}
+]

@@ -1,0 +1,23 @@
+[
+  {"query": "factory-init ../widget-shop", "should_trigger": true},
+  {"query": "ok i just dropped a fresh clone of our invoicer service into /home/leo/src/invoicer — get it wired up so the orchestrator can start churning through tasks on it", "should_trigger": true},
+  {"query": "make this repo a dark-factory target so it runs unattended like reify does", "should_trigger": true},
+  {"query": "i want to add my-new-app (it's at ~/src/my-new-app, python/fastapi, has a test suite) to the set of projects the orchestrator builds", "should_trigger": true},
+  {"query": "spin up a brand-new project for autonomous dev — empty dir at ~/src/pricing-engine, nothing in it yet, i want to start queueing PRDs", "should_trigger": true},
+  {"query": "register /home/leo/src/scraper with the factory — it needs to show up on the dashboard and have reconciliation track its tasks", "should_trigger": true},
+  {"query": "onboard the photoschedule repo into dark factory, it's a flask thing with a decent test suite already", "should_trigger": true},
+  {"query": "i've got a rust cli at ~/src/blink i want the orchestrator developing — what do i need to wire up, config + a port + all that?", "should_trigger": true},
+  {"query": "get ~/src/ledger ready for dark factory please", "should_trigger": true},
+  {"query": "can you set up the timesheet-tool dir so the orchestrator picks it up overnight? it's just a git repo, no code yet", "should_trigger": true},
+
+  {"query": "run the orchestrator on my-solar-challenge and show me the current task tree", "should_trigger": false},
+  {"query": "let's write a PRD for the new tariff-comparison feature in my-solar-challenge", "should_trigger": false},
+  {"query": "task 88 in reify is blocked on review issues, can you unblock it", "should_trigger": false},
+  {"query": "set up dark-factory on this machine from scratch — docker, fused-memory, the whole stack", "should_trigger": false},
+  {"query": "the orchestrator stopped picking up autopilot-video tasks, i think fused-memory crashed — can you check what's wrong", "should_trigger": false},
+  {"query": "create a review briefing for the know-live repo", "should_trigger": false},
+  {"query": "just git init this folder and do an initial commit, that's all i need", "should_trigger": false},
+  {"query": "add the playwright MCP server to the .mcp.json in reify", "should_trigger": false},
+  {"query": "what escalation port does autopilot-video use again?", "should_trigger": false},
+  {"query": "set up a systemd timer to run my nightly database backup script", "should_trigger": false}
+]
