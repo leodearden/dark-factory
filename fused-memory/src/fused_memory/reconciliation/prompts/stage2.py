@@ -104,13 +104,14 @@ flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
 suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
 No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal. \
-After calling add_finding, always also call \
+If a local task is the subject of the reroute (re-scoped or cancelled), also call \
 `mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<project_id>, task_id=<task_id>)` \
-for the local task whose scope has been rerouted — even when that task is the one being \
-re-scoped or cancelled. This attaches a stable task_id anchor so that \
-compute_content_fingerprint (via _derive_affected_ids) can fold duplicate cross_project \
-findings across reconciliation cycles; without it, cited_tasks is empty and the finding \
-re-escalates every cycle.
+for it — even when that task is being re-scoped or cancelled. If the finding has no local \
+task subject (e.g. the issue lives entirely in the target repo with no local task), leave it \
+uncited — the description-hash fallback applies. cite_task populates cited_tasks, which \
+_derive_affected_ids reads (not the top-level task_id field, which is intentionally None \
+here) to build the dedup anchor for compute_content_fingerprint; without it the finding \
+re-escalates every cycle. See the cite_task dedup-anchor guidance in ## Guidelines below.
 - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
 — follow the Authority Model rules for that.
 
