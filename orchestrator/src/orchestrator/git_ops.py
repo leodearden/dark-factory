@@ -45,6 +45,7 @@ AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
+    'rebased_pending_reverify',
 ]
 
 
@@ -1500,6 +1501,7 @@ class GitOps:
         branch: str | None = None,
         max_attempts: int = 3,
         expected_main: str | None = None,
+        reverify_on_rebase: bool = False,
     ) -> AdvanceResult:
         """Advance main branch ref to *merge_sha* atomically.
 
@@ -1550,6 +1552,7 @@ class GitOps:
         ``MergeResult.merge_commit`` (which is stale after a rebase).
         """
         full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
+        rebased = False  # Track whether any rebase/re-merge occurred this call
 
         for attempt in range(max_attempts):
             # ── .task/ contamination gate (FINAL DEFENSE) ─────────────
@@ -1592,6 +1595,7 @@ class GitOps:
                     ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
                 )
                 merge_sha = new_sha.strip()
+                rebased = True
                 continue  # re-check is_ancestor at top of loop
 
             # Rebase failed — abort and try a fresh re-merge if we have
@@ -1635,6 +1639,7 @@ class GitOps:
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )
             merge_sha = new_sha.strip()
+            rebased = True
             continue  # re-check is_ancestor at top of loop
         else:
             # Exhausted all attempts
@@ -1644,6 +1649,27 @@ class GitOps:
                 f'{self.config.main_branch}'
             )
             return 'not_descendant'
+
+        # ── Reverify-on-rebase gate ──────────────────────────────────
+        # When reverify_on_rebase is set and a rebase (or re-merge) occurred,
+        # park merge_worktree at the rebased SHA and hand control back to the
+        # caller WITHOUT advancing main.  The caller must intersect the
+        # intervening delta with the branch-touched file set; if overlapping it
+        # must re-verify the rebased tree before calling advance_main again.
+        if reverify_on_rebase and rebased:
+            self._last_advanced_sha = merge_sha
+            self._rebased_from = expected_main  # original base provided by caller
+            _, onto_sha, _ = await _run(
+                ['git', 'rev-parse', self.config.main_branch],
+                cwd=self.project_root,
+            )
+            self._rebased_onto = onto_sha.strip()
+            logger.info(
+                'advance_main: reverify_on_rebase — rebased tree parked at '
+                '%s; returning rebased_pending_reverify (no update-ref)',
+                merge_sha[:8],
+            )
+            return 'rebased_pending_reverify'
 
         # ── Pre-advance unmerged state guard ────────────────────────
         # Belt-and-braces: reject immediately if project_root already has
