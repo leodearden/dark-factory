@@ -102,7 +102,12 @@ current project as a workaround. Instead, emit a finding via recon_report: call 
 `mcp__recon-report__add_finding(severity='moderate', category='cross_project_routing', \
 flag_type='cross_project', actionable=False, \
 description=<one-line summary + target_project_hint>, \
-suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
+suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually, \
+then immediately call `mcp__recon-report__cite_task(finding_id=<finding_id>, \
+project_id=<target_project_id>, task_id=<foreign_task_id>)` to attach the foreign task as a \
+citation — this is the cross-cycle dedup anchor (without it, _derive_affected_ids returns [] \
+and the escalation fingerprint falls back to hashing the drifting description, causing the \
+finding to re-escalate every cycle instead of folding). \
 No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal.
 - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
 — follow the Authority Model rules for that.
