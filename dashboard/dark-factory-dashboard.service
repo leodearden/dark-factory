@@ -10,8 +10,8 @@ ExecStart=/home/leo/.local/bin/uv run --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080
 
-# Multi-project cost aggregation (comma-separated; avoid spaces inside the value — systemd would treat them as assignment separators)
-Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
+# Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
+Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory
 
 # Restart policy: always restart on failure, back off up to 60s
 Restart=on-failure

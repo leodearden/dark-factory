@@ -22,16 +22,12 @@ HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
 
 TEMPLATE_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
-    "__REPO_ROOT__,"
-    "/home/leo/src/reify,"
-    "/home/leo/src/autopilot-video"
+    "__REPO_ROOT__"
 )
 
 HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
-    "/home/leo/src/dark-factory,"
-    "/home/leo/src/reify,"
-    "/home/leo/src/autopilot-video"
+    "/home/leo/src/dark-factory"
 )
 
 # These are the literal paths baked into the committed hardcoded service file;
