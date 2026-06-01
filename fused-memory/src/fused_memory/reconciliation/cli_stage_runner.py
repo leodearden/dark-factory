@@ -268,23 +268,33 @@ def generate_summary_nonce(prefix: str = '') -> str:
     return raw
 
 
-def build_summary_nonce_section() -> str:
+def build_summary_nonce_section(prefix: str = '') -> str:
     """Return the full '### Per-Cycle Summary Nonce' payload section string.
 
     Shared by Stage 1 (memory_consolidator) and Stage 2 (task_knowledge_sync)
-    so both stages produce identical section wording and cannot silently drift.
-    Generates a fresh CSPRNG nonce on each call via generate_summary_nonce().
+    so both stages produce identical section wording and cannot silently drift
+    (task 1574 single-source-of-truth design).
+
+    Task 1590: Stage 1 passes 'STAGE1' and Stage 2 passes 'STAGE2' so their
+    summaries always lead with a stage-labeled nonce, making stage origin
+    explicit and further separating them in Mem0's embedding space.
+
+    Generates a fresh CSPRNG nonce on each call via generate_summary_nonce(prefix).
+
+    Args:
+        prefix: Optional stage label forwarded to generate_summary_nonce()
+            (e.g. 'STAGE1', 'STAGE2').  Defaults to '' for backward compat.
 
     Returns:
         Multi-line string ready to embed in a payload f-string, e.g.::
 
             \\n### Per-Cycle Summary Nonce\\n
-            summary_nonce: a3f7c21b\\n
+            summary_nonce: STAGE1_a3f7c21b\\n
             (Prepend this nonce as the FIRST line of your per-cycle summary content.)\\n
     """
     return (
         f'\n### Per-Cycle Summary Nonce\n'
-        f'summary_nonce: {generate_summary_nonce()}\n'
+        f'summary_nonce: {generate_summary_nonce(prefix)}\n'
         f'(Prepend this nonce as the FIRST line of your per-cycle summary content.)\n'
     )
 
