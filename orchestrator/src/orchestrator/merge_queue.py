@@ -2289,13 +2289,13 @@ class MergeWorker(_WipHaltMixin):
     # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
     # alternating on the merge queue for hours, each dying at the 30-min
     # warm timeout).  Counter resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # After a post-merge verify fails with an ENOSPC signature, prune stale
     # _merge-* worktrees and retry the verify at most this many times before
     # escalating as transient infra.  Disk pressure is often self-healing, so
     # one retry-after-prune is the conservative middle ground between blindly
     # blocking and looping.  Resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
 
     def __init__(
         self,
@@ -2632,9 +2632,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS — see that class
     # for rationale.  Kept as a class attribute so tests can monkeypatch
     # per-class if the two workers ever diverge.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
 
     def __init__(
         self,
