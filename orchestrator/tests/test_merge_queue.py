@@ -8597,3 +8597,196 @@ class TestHaltAdvanceResults:
         assert frozenset(_HALT_ADVANCE_RESULTS) == expected, (
             f'_HALT_ADVANCE_RESULTS mismatch: {_HALT_ADVANCE_RESULTS!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAdvanceMainReverifyOnRebase — step-1 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainReverifyOnRebase:
+    """advance_main gains an opt-in reverify_on_rebase flag.
+
+    When set, a rebase-then-break inside the for-attempt loop causes
+    advance_main to:
+      • expose the rebased SHA via _last_advanced_sha
+      • expose the original expected_main via _rebased_from
+      • expose the rebased-onto SHA via _rebased_onto
+      • return 'rebased_pending_reverify' WITHOUT calling update-ref
+
+    The default (flag omitted / False) is unchanged: rebase + advance.
+    """
+
+    async def test_reverify_on_rebase_returns_new_result(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(a) reverify_on_rebase=True + main moves → rebased_pending_reverify,
+        main stays at moved-main SHA, side channels populated, merge_wt at
+        rebased SHA.
+        """
+        # Build a branch commit
+        worktree = (await git_ops.create_worktree('rev-branch')).path
+        (worktree / 'branch_only.py').write_text('branch = 1\n')
+        await git_ops.commit(worktree, 'Add branch_only.py')
+
+        # Capture base_sha and create the merge commit
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-branch')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        merge_commit = result.merge_commit.strip()
+        merge_wt = result.merge_worktree
+
+        # Move main by adding a DISJOINT file directly in project_root
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Disjoint: add main_only.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+        assert moved_main_sha != base_sha, 'main must have moved for the test'
+
+        try:
+            advanced = await git_ops.advance_main(
+                merge_commit, merge_wt,
+                branch='rev-branch',
+                expected_main=base_sha,
+                reverify_on_rebase=True,
+            )
+
+            # Must return the new gate result, NOT 'advanced'
+            assert advanced == 'rebased_pending_reverify', (
+                f'Expected rebased_pending_reverify, got {advanced!r}'
+            )
+
+            # Main must NOT have been advanced (still at moved_main_sha)
+            current_main = await git_ops.get_main_sha()
+            assert current_main == moved_main_sha, (
+                f'Main must not have advanced: expected {moved_main_sha[:8]}, '
+                f'got {current_main[:8]}'
+            )
+
+            # Side channels must be set
+            rebased_sha = getattr(git_ops, '_last_advanced_sha', None)
+            assert rebased_sha is not None, '_last_advanced_sha must be set'
+            rebased_from = getattr(git_ops, '_rebased_from', None)
+            assert rebased_from == base_sha, (
+                f'_rebased_from must be original base_sha {base_sha[:8]}, '
+                f'got {rebased_from!r}'
+            )
+            rebased_onto = getattr(git_ops, '_rebased_onto', None)
+            assert rebased_onto == moved_main_sha, (
+                f'_rebased_onto must be moved_main_sha {moved_main_sha[:8]}, '
+                f'got {rebased_onto!r}'
+            )
+
+            # _last_advanced_sha must be a descendant of moved_main
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', moved_main_sha, rebased_sha],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, (
+                f'rebased_sha {rebased_sha[:8]} must be a descendant of '
+                f'moved_main {moved_main_sha[:8]}'
+            )
+
+            # merge_wt HEAD must equal _last_advanced_sha
+            wt_rc, wt_head, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
+            )
+            assert wt_rc == 0
+            assert wt_head.strip() == rebased_sha, (
+                f'merge_wt HEAD {wt_head.strip()[:8]} must equal '
+                f'_last_advanced_sha {rebased_sha[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_no_rebase_needed_returns_advanced(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(b) reverify_on_rebase=True but no rebase needed → returns 'advanced'.
+
+        When main has NOT moved, the merge commit is already a descendant of
+        main.  No rebase occurs, so the gate is not triggered even with the
+        flag set.
+        """
+        worktree = (await git_ops.create_worktree('rev-no-rebase')).path
+        (worktree / 'no_rebase.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add no_rebase.py')
+
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-no-rebase')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        # Main has NOT moved — no rebase needed
+        try:
+            advanced = await git_ops.advance_main(
+                result.merge_commit, result.merge_worktree,
+                branch='rev-no-rebase',
+                expected_main=base_sha,
+                reverify_on_rebase=True,
+            )
+            assert advanced == 'advanced', (
+                f'No rebase → must return advanced, got {advanced!r}'
+            )
+            # Main must have moved to the merge commit
+            current_main = await git_ops.get_main_sha()
+            assert current_main != base_sha, 'Main must have been advanced'
+        finally:
+            if result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_backward_compat_default_flag_still_advances(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(c) Backward compat: default (flag omitted) → rebase still advances.
+
+        MergeWorker and _do_train_merge callers that don't pass
+        reverify_on_rebase must be unaffected.
+        """
+        worktree = (await git_ops.create_worktree('rev-compat')).path
+        (worktree / 'compat.py').write_text('c = 1\n')
+        await git_ops.commit(worktree, 'Add compat.py')
+
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-compat')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        merge_wt = result.merge_worktree
+
+        # Move main by adding a disjoint file
+        (git_ops.project_root / 'compat_main.py').write_text('cm = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Disjoint: add compat_main.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+
+        try:
+            # Default flag (not passed) — should still rebase and advance
+            advanced = await git_ops.advance_main(
+                result.merge_commit, merge_wt,
+                branch='rev-compat',
+                expected_main=base_sha,
+                # reverify_on_rebase NOT passed — default False
+            )
+            # With default flag, advance_main rebases and advances (old behavior)
+            assert advanced in ('advanced', 'cas_failed'), (
+                f'Default flag: expected advanced or cas_failed, got {advanced!r}'
+            )
+            if advanced == 'advanced':
+                current_main = await git_ops.get_main_sha()
+                assert current_main != moved_main_sha, (
+                    'Main must have advanced past moved_main_sha'
+                )
+        finally:
+            if merge_wt:
+                await git_ops.cleanup_merge_worktree(merge_wt)
