@@ -3797,6 +3797,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return False
             if result != 'cas_failed':
                 self._gate_retries.pop(req.task_id, None)
+                # Cleanup BEFORE _map_advance_failure so a cleanup raise
+                # propagates before halt_for_wip is ever called -- mirroring
+                # the serial MergeWorker path (cleanup_merge_worktree before
+                # _map_advance_failure in MergeWorker._process_one) and the
+                # abandoned-request short-circuit just above this block.
+                # Without this order, a cleanup raise strands the queue
+                # halted with no escalation owner on the single-task workflow
+                # path, which routes 'blocked' to _mark_blocked with no
+                # is_wip_halted probe (task 1598).
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
                 outcome = await _map_advance_failure(
                     self._git_ops, result,
                     task_id=req.task_id,
@@ -3804,7 +3814,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     halt=self.halt_for_wip,
                     cas_retries=self._cas_retries,
                 )
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(outcome)
                 return False

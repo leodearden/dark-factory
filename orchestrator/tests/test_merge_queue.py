@@ -4248,6 +4248,69 @@ class TestWipHaltSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    async def test_cleanup_raise_on_wip_overlap_does_not_strand_halt(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """cleanup_merge_worktree raise must NOT strand the queue in a halted state.
+
+        Verify that when cleanup_merge_worktree raises after advance_main returns
+        'wip_overlap', the WIP halt is never set -- because cleanup must run
+        BEFORE _map_advance_failure (which calls halt_for_wip).
+
+        RED on buggy ordering: _map_advance_failure halts (via halt_for_wip)
+        before cleanup_merge_worktree raises, so is_wip_halted is True.
+        GREEN after fix: cleanup moved before _map_advance_failure so the
+        RuntimeError propagates before halt_for_wip is ever invoked.
+
+        Calls _verify_and_advance directly (not via worker.run()) so the
+        RuntimeError propagates to the test -- the run()-loop's except handler
+        would otherwise suppress the re-raise and resolve 'blocked'.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'clnup-raise', 'file_clnup.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('clnup-raise', 'clnup-raise', wt, config)
+
+        # Build a real flowing item BEFORE the patch block so _remerge's
+        # own merge paths run against the real git_ops (not the raising mock).
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got immediate_outcome={item.immediate_outcome!r}'
+        )
+
+        async def _wip_overlap(*args: Any, **kwargs: Any):
+            git_ops._last_overlap_files = ['file_clnup.py']
+            return 'wip_overlap'
+
+        try:
+            with (
+                patch.object(git_ops, 'advance_main', side_effect=_wip_overlap),
+                patch.object(
+                    git_ops, 'cleanup_merge_worktree',
+                    side_effect=RuntimeError('cleanup boom'),
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+                pytest.raises(RuntimeError, match='cleanup boom'),
+            ):
+                await worker._verify_and_advance(item)
+
+            # PRIMARY discriminator: queue must NOT be halted when cleanup raised
+            # before the wip_halted outcome could reach the workflow.
+            # The single-task workflow path registers a halt owner only on an
+            # explicit 'wip_halted' status; a 'blocked' outcome (what the
+            # run()-loop's except handler would deliver) leaves the halt silently
+            # orphaned with no escalation owner (task 1598).
+            assert not worker.is_wip_halted
+            assert worker.halt_owner_esc_id is None
+        finally:
+            # Best-effort: clean up the merge worktree the patched
+            # cleanup_merge_worktree left behind, so the fixture is left clean.
+            with contextlib.suppress(Exception):
+                if item.merge_wt is not None:
+                    await git_ops.cleanup_merge_worktree(item.merge_wt)
+
 
 @pytest.mark.parametrize(
     'worker_cls', [MergeWorker, SpeculativeMergeWorker],
