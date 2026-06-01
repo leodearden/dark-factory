@@ -1807,58 +1807,24 @@ async def _do_train_merge(
     return MergeOutcome('done', merge_sha=advanced_sha)
 
 
-class MergeWorker:
-    """Single coroutine that processes merge requests serially.
+class _WipHaltMixin:
+    """Shared WIP-halt machinery and request-abandoned helper.
 
-    Owns all main-branch advancement via CAS ``update-ref``.  The harness
-    creates one instance and passes the same ``asyncio.Queue`` to every
-    ``TaskWorkflow``.
+    Provides the byte-identical halt-owner methods that both
+    :class:`MergeWorker` and :class:`SpeculativeMergeWorker` expose as
+    public API to ``workflow.py`` and ``harness.py``.
+
+    Methods-only: each concrete worker's ``__init__`` is responsible for
+    creating the instance attributes::
+
+        self._wip_halt = asyncio.Event(); self._wip_halt.set()
+        self._halt_owner_esc_id: str | None = None
     """
 
-    MAX_CAS_RETRIES = 5
-    # After this many consecutive post-merge verify TIMEOUTS for the same
-    # task, the merge queue stops trying and returns an 'abandoned' blocked
-    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
-    # alternating on the merge queue for hours, each dying at the 30-min
-    # warm timeout).  Counter resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
-    # After a post-merge verify fails with an ENOSPC signature, prune stale
-    # _merge-* worktrees and retry the verify at most this many times before
-    # escalating as transient infra.  Disk pressure is often self-healing, so
-    # one retry-after-prune is the conservative middle ground between blindly
-    # blocking and looping.  Resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
-
-    def __init__(
-        self,
-        git_ops: GitOps,
-        queue: asyncio.Queue[MergeRequest],
-        event_store: EventStore | None = None,
-    ):
-        self._git_ops = git_ops
-        self._queue = queue
-        self._event_store = event_store
-        # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
-        self._urgent: collections.deque[MergeRequest] = collections.deque()
-        self._running = True
-        # Per-task CAS re-enqueue counter — prevents infinite loops
-        self._cas_retries: dict[str, int] = {}
-        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
-        # when a verify times out, cleared on a successful merge.  Keyed by
-        # task_id; lives across submissions (re-submits of the same task
-        # after an orchestrator re-queue also feed this counter).
-        self._post_merge_verify_timeouts: dict[str, int] = {}
-        # Per-task ENOSPC prune-and-retry counter (see
-        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
-        # the timeout counter: persists across submissions, reset on success.
-        self._post_merge_verify_enospc_retries: dict[str, int] = {}
-        # WIP halt: cleared when halted, set when running
-        self._wip_halt = asyncio.Event()
-        self._wip_halt.set()  # not halted initially
-        # ID of the escalation that owns the current halt. Registered by the
-        # workflow handler after it submits the L1 escalation. Single source
-        # of truth for the resolve-callback un-halt path.
-        self._halt_owner_esc_id: str | None = None
+    # Class-level annotations so pyright sees the attributes without an
+    # __init__ on the mixin itself.
+    _wip_halt: asyncio.Event
+    _halt_owner_esc_id: str | None
 
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
         """Build the terminal MergeOutcome for the loop-breaker.
@@ -1931,6 +1897,60 @@ class MergeWorker:
             )
             return True
         return False
+
+
+class MergeWorker(_WipHaltMixin):
+    """Single coroutine that processes merge requests serially.
+
+    Owns all main-branch advancement via CAS ``update-ref``.  The harness
+    creates one instance and passes the same ``asyncio.Queue`` to every
+    ``TaskWorkflow``.
+    """
+
+    MAX_CAS_RETRIES = 5
+    # After this many consecutive post-merge verify TIMEOUTS for the same
+    # task, the merge queue stops trying and returns an 'abandoned' blocked
+    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
+    # alternating on the merge queue for hours, each dying at the 30-min
+    # warm timeout).  Counter resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    # After a post-merge verify fails with an ENOSPC signature, prune stale
+    # _merge-* worktrees and retry the verify at most this many times before
+    # escalating as transient infra.  Disk pressure is often self-healing, so
+    # one retry-after-prune is the conservative middle ground between blindly
+    # blocking and looping.  Resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+
+    def __init__(
+        self,
+        git_ops: GitOps,
+        queue: asyncio.Queue[MergeRequest],
+        event_store: EventStore | None = None,
+    ):
+        self._git_ops = git_ops
+        self._queue = queue
+        self._event_store = event_store
+        # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
+        self._urgent: collections.deque[MergeRequest] = collections.deque()
+        self._running = True
+        # Per-task CAS re-enqueue counter — prevents infinite loops
+        self._cas_retries: dict[str, int] = {}
+        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
+        # when a verify times out, cleared on a successful merge.  Keyed by
+        # task_id; lives across submissions (re-submits of the same task
+        # after an orchestrator re-queue also feed this counter).
+        self._post_merge_verify_timeouts: dict[str, int] = {}
+        # Per-task ENOSPC prune-and-retry counter (see
+        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
+        # the timeout counter: persists across submissions, reset on success.
+        self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # WIP halt: cleared when halted, set when running
+        self._wip_halt = asyncio.Event()
+        self._wip_halt.set()  # not halted initially
+        # ID of the escalation that owns the current halt. Registered by the
+        # workflow handler after it submits the L1 escalation. Single source
+        # of truth for the resolve-callback un-halt path.
+        self._halt_owner_esc_id: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -2219,7 +2239,7 @@ class MergeWorker:
         return None  # don't resolve Future — will be reprocessed
 
 
-class SpeculativeMergeWorker:
+class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
     The Merger coroutine creates merge commits; the Verifier coroutine runs
@@ -2285,82 +2305,6 @@ class SpeculativeMergeWorker:
         self._inflight_req: MergeRequest | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
-
-    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
-        """Build the terminal MergeOutcome for the loop-breaker.
-
-        Mirror of ``MergeWorker._abandon_outcome`` — kept in sync so
-        downstream classifiers (steward, dashboard) see the same reason
-        prefix regardless of which worker served the request.
-        """
-        return MergeOutcome(
-            'blocked',
-            reason=(
-                f'{ABANDONED_REASON_PREFIX} {count} times for task '
-                f'{task_id} — manual investigation required. '
-                'The merge queue has stopped retrying this task to avoid '
-                'starving the queue behind a deterministic verify hang.'
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Public API (same interface as MergeWorker)
-    # ------------------------------------------------------------------
-
-    def halt_for_wip(self, reason: str) -> None:
-        """Halt the merge queue due to a WIP conflict."""
-        logger.warning('Merge queue halted for WIP: %s', reason)
-        self._wip_halt.clear()
-        self._halt_owner_esc_id = None
-
-    def set_halt_owner(self, esc_id: str) -> None:
-        """Register the escalation that owns the current halt.
-
-        The workflow calls this right after submitting its halt-triggering
-        escalation. Asserts owner is currently None — a double-register
-        indicates a double-halt bug that should fail loudly.
-        """
-        assert self._halt_owner_esc_id is None, (
-            f'halt owner already set to {self._halt_owner_esc_id!r}, '
-            f'refusing to overwrite with {esc_id!r}'
-        )
-        self._halt_owner_esc_id = esc_id
-
-    def is_halt_owner(self, esc_id: str) -> bool:
-        """True iff esc_id is the currently registered halt owner."""
-        return (
-            self._halt_owner_esc_id is not None
-            and self._halt_owner_esc_id == esc_id
-        )
-
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        """Resume the merge queue after WIP conflict resolution."""
-        logger.info(
-            'Merge queue un-halted (WIP conflict resolved%s)',
-            f', reason={reason!r}' if reason else '',
-        )
-        self._wip_halt.set()
-        self._halt_owner_esc_id = None
-
-    @property
-    def is_wip_halted(self) -> bool:
-        return not self._wip_halt.is_set()
-
-    @property
-    def halt_owner_esc_id(self) -> str | None:
-        """Read-only public view of the current halt-owner escalation id."""
-        return self._halt_owner_esc_id
-
-    def _request_abandoned(self, req: MergeRequest) -> bool:
-        """True iff the requester cancelled the result future — drop the request."""
-        if req.result.cancelled():
-            logger.info(
-                'Task %s: merge request abandoned by waiter '
-                '(future cancelled) — dropping request without halting queue',
-                req.task_id,
-            )
-            return True
-        return False
 
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""
