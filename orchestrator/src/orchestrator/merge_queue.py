@@ -2013,20 +2013,6 @@ async def _do_train_merge(
         expected_main=main_sha,
     )
 
-    # Capture _last_advanced_sha BEFORE cleanup_merge_worktree — the side
-    # channel must be read while still fresh (before any future call could
-    # clear it), and before the merge_commit SHA drifts out of scope.
-    if adv == 'advanced':
-        pre_cleanup_advanced_sha: str | None = git_ops._last_advanced_sha
-        if not pre_cleanup_advanced_sha:
-            logger.warning(
-                'Train %s: _last_advanced_sha not set after advance; '
-                'falling back to merge_commit %s — member SHA may be pre-rebase',
-                req.train_id, merge_commit,
-            )
-    else:
-        pre_cleanup_advanced_sha = None
-
     await git_ops.cleanup_merge_worktree(merge_wt)
 
     if adv != 'advanced':
@@ -2040,7 +2026,34 @@ async def _do_train_merge(
         _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=f'Train merge advance failed: {adv}')
 
-    advanced_sha: str = pre_cleanup_advanced_sha or merge_commit
+    # advance succeeded — run equivalence + pyright + push via shared finalize.
+    # merge_wt has already been cleaned up above (caller contract for finalize).
+    # t0 is passed as started_monotonic so finalize's duration_ms is accurate
+    # for the whole train attempt, not just the post-advance window.
+    outcome = await _finalize_advanced_merge(
+        git_ops, req, event_store,
+        merge_commit_fallback=merge_commit,
+        base_sha=main_sha,
+        started_monotonic=t0,
+        cas_retries=worker._cas_retries,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        log_label=' (train)',
+    )
+    if outcome.status != 'done':
+        # Equivalence or pyright gate fired — main landed but post-merge gates
+        # failed.  Emit derailed and return without flipping members.
+        logger.info('Train %s: finalize blocked: %s', req.train_id, outcome.reason)
+        _emit_train_event(
+            event_store, EventType.train_derailed,
+            task_id=req.task_id, train_id=req.train_id,
+            member_task_ids=req.member_task_ids,
+            data={'derail_reason': outcome.reason},
+        )
+        return outcome  # no member flips
+
+    # outcome.merge_sha: post-rebase advanced SHA resolved by finalize (rebase-robust).
+    advanced_sha: str = outcome.merge_sha  # type: ignore[assignment]
 
     _emit_train_event(
         event_store, EventType.train_merged,
@@ -2049,7 +2062,7 @@ async def _do_train_merge(
         data={'merge_commit_sha': advanced_sha, 'base_sha': main_sha},
     )
 
-    # (g) Flip all members done — ONLY after advance succeeds.
+    # (g) Flip all members done — ONLY after advance + finalize succeed.
     # Each callback is wrapped in try/except so a single scheduler blip does
     # NOT abort the remaining flips (split-brain prevention) and does NOT
     # surface as a 'blocked' outcome that contradicts the landed git state.
@@ -2083,11 +2096,11 @@ async def _do_train_merge(
         _emit_merge_attempt(event_store, req.task_id, 'train_partial_flip', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
+    # _finalize_advanced_merge already emitted merge_attempt 'done'; just log + return.
     logger.info(
         'Train %s: landed at %s; %d members marked done',
         req.train_id, advanced_sha[:12], len(req.member_task_ids),
     )
-    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
     return MergeOutcome('done', merge_sha=advanced_sha)
 
 
