@@ -1878,6 +1878,25 @@ async def _do_train_merge(
         data={'member_count': len(req.member_task_ids), 'base_sha': base_sha_t0},
     )
 
+    # Loop-breaker: if this train's tip has timed out in post-merge verify
+    # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon without any git
+    # work — mirrors MergeWorker._do_merge:2286-2298.  A stuck verify
+    # can otherwise burn merge-queue capacity for 30+ minutes per attempt.
+    prior_timeouts = worker._post_merge_verify_timeouts.get(req.task_id, 0)
+    if prior_timeouts >= worker.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+        logger.warning(
+            'Train %s: abandoning merge — %d consecutive post-merge '
+            'verify timeouts (threshold=%d)',
+            req.train_id, prior_timeouts,
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id, 'abandoned_verify_timeouts',
+            attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
+            **_train_emit_kwargs,
+        )
+        return worker._abandon_outcome(req.task_id, prior_timeouts)
+
     # (a) Status pre-check: all members must be 'merge-deferred'.
     statuses = await req.status_check(req.member_task_ids)
     incomplete = [
