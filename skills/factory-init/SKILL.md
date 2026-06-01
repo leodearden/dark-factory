@@ -1,6 +1,6 @@
 ---
 name: factory-init
-description: "Onboard a software project — brand-new or with existing code — so the dark-factory orchestrator can develop it. Use this skill whenever the user wants to 'factory-init' a repo, 'set up a project for the orchestrator', 'make this repo a dark-factory target', 'register a new project', 'onboard <repo> into the factory', or points at a directory and asks to get it ready for autonomous development — even if they don't say 'factory-init'. It ensures dark-factory is installed (installing it is out of scope), ensures a git repo, picks a hyphen-free canonical project_id and an unused escalation port, writes the per-project config (orchestrator.yaml, .mcp.json, .envrc, .gitignore, CLAUDE.md pin), registers the project with fused-memory reconciliation, then routes to the right next skill: review-briefing → review for existing code, or a goals discussion → /prd batch for a greenfield project. NOT for: installing/bootstrapping dark-factory itself (a separate skill), running the orchestrator (/orchestrate), authoring a single PRD (/prd), or unblocking tasks (/unblock)."
+description: "Onboard a software project — brand-new or with existing code — so the dark-factory orchestrator can develop it. Use this skill whenever the user wants to 'factory-init' a repo, 'set up a project for the orchestrator', 'make this repo a dark-factory target', 'register a new project', 'onboard <repo> into the factory', or points at a directory and asks to get it ready for autonomous development — even if they don't say 'factory-init'. It ensures dark-factory is installed (installing it is out of scope), ensures a git repo, picks a hyphen-free canonical project_id and an unused escalation port, writes the per-project config (orchestrator.yaml, .mcp.json, .envrc, .gitignore, CLAUDE.md pin), registers the project with fused-memory reconciliation, then routes to the right next skill: review-briefing → review for existing code, or a goals discussion → /prd batch for a greenfield project. Optionally (when the user wants unattended operation) sets up a supervised systemd orchestrator unit so the project runs in the always-on autonomous workload. NOT for: installing/bootstrapping dark-factory itself (a separate skill), running the orchestrator (/orchestrate), authoring a single PRD (/prd), or unblocking tasks (/unblock)."
 ---
 
 # Factory Init
@@ -119,13 +119,22 @@ Decide whether the repo already has substantive source (real modules under `src/
 2. For each slice, `/spawn /prd "<framing of this slice>"` **serially** — wait for each to finish before starting the next. Serial because PRDs share seams (the /prd skill's G4 cross-PRD ownership gate), so later PRDs reference what earlier ones established.
 3. The result is an initial batch of queued tasks, ready for `/orchestrate`.
 
+## Stage 8 — Go unattended (optional, gated, post-queueing)
+
+Only if the user wants the project in the **always-on autonomous workload** — a deliberate commitment (it spends budget and changes code without a human in the loop). Full procedure in **`references/supervised-unit.md`**. Three layers:
+
+1. **The unit** — `orchestrator-<name>.service` (modelled on `scripts/orchestrator-reify.service`): `WorkingDirectory=<dark-factory>`, `ExecStartPre` waits for port 8002, `ExecStart=… orchestrator run --config <target>/orchestrator.yaml`, `Wants=fused-memory`, `Restart=on-failure`, StartLimit guard. `enable --now` makes it run.
+2. **Persistence** — copy the unit into `<dark-factory>/scripts/` and add `cp` + `enable` lines to `setup-host.sh` so a host re-provision keeps it. Commit both.
+3. **Watchdog** (optional) — add `(<escalation_port>, unit)` to `WATCHED` in `orchestrator-watchdog.py` *and* update its drift test. Skippable: `autopilot-video` runs without it, relying on `Restart=on-failure`.
+
+⚠️ **Timing is load-bearing:** only `enable --now` (and only add to the watchdog) **after the project has `pending` tasks**. An orchestrator started against an empty/all-done tree exits "No pending tasks found"; under the watchdog that becomes a 60s crash-loop. Confirm `orchestrator status --config <target>/orchestrator.yaml` shows ≥1 `pending` first. The watchdog skips disabled units, so installing-but-leaving-disabled before queueing is the safe fallback.
+
 ## Offer anything else
 
 Surface these as options once the core onboarding is done; don't do them unprompted:
 
 - **Commit the new config** to the repo so it's tracked (worth doing — untracked config referenced by tooling is a known foot-gun).
 - **direnv install** (`sudo apt install direnv` + shell hook) — one-time, makes `.envrc` live so you don't need `--config`. Confirm before any sudo.
-- **A supervised systemd orchestrator unit** for always-on projects, modelled on `scripts/orchestrator-reify.service`.
 - **A PRD project overlay** at `<target>/.claude/skills/prd/project.md` if the user wants project-specific G2/G3 vocabulary for decomposition.
 
 ## Pitfalls (most are in memory for a reason)
