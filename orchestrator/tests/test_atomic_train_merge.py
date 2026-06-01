@@ -2109,3 +2109,77 @@ class TestGate01TrainDiskGuard:
             f"mark_member_done must not fire when disk guard blocks train; "
             f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
         )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 03: verify-timeout loop-breaker — step-03 RED / step-04 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate03TrainVerifyTimeoutLoopBreaker:
+    """step-03 RED: _do_train_merge has no loop-breaker short-circuit.
+
+    Pre-seeding worker._post_merge_verify_timeouts[tip] = MAX doesn't stop
+    _do_train_merge from doing git work today; with mocked passing verify it
+    returns 'done'.  After step-04 the loop-breaker fires before any git work
+    and returns blocked/ABANDONED prefix.
+    """
+
+    async def test_train_abandons_after_verify_timeout_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pre-seeded timeout counter at threshold → abandoned, no git work, 0 flips."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-loop-breaker",
+        )
+
+        # Record main SHA before attempt.
+        _, main_sha_before, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        main_sha_before = main_sha_before.strip()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Pre-seed the timeout counter at the threshold.
+        tip_task_id = req.task_id  # tip is 'g-c' for default member names
+        worker._post_merge_verify_timeouts[tip_task_id] = (
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+        )
+
+        # Spy on merge_to_main — the loop-breaker must short-circuit BEFORE any git work.
+        with (
+            patch.object(git_ops, "merge_to_main", wraps=git_ops.merge_to_main) as spy_merge,
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is blocked with the ABANDONED prefix.
+        assert outcome is not None
+        assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
+        assert outcome.reason.startswith(ABANDONED_REASON_PREFIX), (
+            f"expected ABANDONED prefix, got: {outcome.reason!r}"
+        )
+
+        # (2) No git work ran (loop-breaker must fire before merge_to_main).
+        spy_merge.assert_not_called()
+
+        # (3) Main SHA must be unmoved.
+        _, main_sha_after, _ = await _run(
+            ["git", "rev-parse", "main"], cwd=git_ops.project_root,
+        )
+        assert main_sha_after.strip() == main_sha_before, (
+            f"main must not advance when loop-breaker fires; "
+            f"moved from {main_sha_before!r} to {main_sha_after.strip()!r}"
+        )
+
+        # (4) No member flips.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"mark_member_done must not fire when loop-breaker abandons; "
+            f"got {req.mark_member_done.call_count} call(s)"  # type: ignore[union-attr]
+        )
