@@ -9999,23 +9999,6 @@ class TestSummaryNonce:
             f"Expected 'STAGE2_<8-hex>' matching ^STAGE2_[0-9a-f]{{8}}$, got {nonce!r}"
         )
 
-    def test_stage1_and_stage2_nonces_are_never_equal(self):
-        """generate_summary_nonce('STAGE1') != generate_summary_nonce('STAGE2').
-
-        Task 1590: the two prefixes guarantee the tokens can NEVER be lexically equal —
-        'STAGE1_...' vs 'STAGE2_...' always differ regardless of the hex suffix.
-        RED until step-2 impl adds the prefix parameter.
-        """
-        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
-
-        s1 = generate_summary_nonce('STAGE1')
-        s2 = generate_summary_nonce('STAGE2')
-        assert s1 != s2, (
-            f"generate_summary_nonce('STAGE1') and generate_summary_nonce('STAGE2') must "
-            f"never be equal — they have different stage prefixes; got {s1!r} and {s2!r}"
-        )
-
-
 class TestBuildSummaryNonceSectionPrefix:
     """build_summary_nonce_section() prefix forwarding tests (task 1590).
 
@@ -10072,27 +10055,4 @@ class TestBuildSummaryNonceSectionPrefix:
             f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
         )
 
-    def test_cross_stage_nonce_values_are_never_equal(self):
-        """Nonce values from build_summary_nonce_section('STAGE1') vs ('STAGE2') are always distinct.
-
-        Task 1590: STAGE1_ and STAGE2_ prefixes guarantee the full nonce strings
-        (prefix + hex suffix) can never be equal regardless of the hex suffix.
-        RED until step-4 impl adds prefix parameter.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
-
-        section1 = build_summary_nonce_section('STAGE1')
-        section2 = build_summary_nonce_section('STAGE2')
-
-        m1 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', section1)
-        m2 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', section2)
-
-        assert m1, f"No 'summary_nonce: STAGE1_<8-hex>' in section: {section1!r}"
-        assert m2, f"No 'summary_nonce: STAGE2_<8-hex>' in section: {section2!r}"
-        assert m1.group(1) != m2.group(1), (
-            f"STAGE1 and STAGE2 nonces must never be equal; "
-            f"got {m1.group(1)!r} and {m2.group(1)!r}"
-        )
 

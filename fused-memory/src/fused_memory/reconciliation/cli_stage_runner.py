@@ -250,7 +250,8 @@ def generate_summary_nonce(prefix: str = '') -> str:
 
     Task 1590: each stage now passes its own prefix label ('STAGE1' / 'STAGE2')
     so their nonces always lead with different tokens, making stage origin
-    explicit and further separating them in Mem0's embedding space.
+    explicit and auditable in the leading token (the 32-bit hex suffix still
+    supplies the structural entropy that defeats cosine-similarity dedup).
 
     Args:
         prefix: Optional stage label to prepend (e.g. 'STAGE1', 'STAGE2').
@@ -277,7 +278,8 @@ def build_summary_nonce_section(prefix: str = '') -> str:
 
     Task 1590: Stage 1 passes 'STAGE1' and Stage 2 passes 'STAGE2' so their
     summaries always lead with a stage-labeled nonce, making stage origin
-    explicit and further separating them in Mem0's embedding space.
+    explicit and auditable in the leading token (the 32-bit hex suffix still
+    supplies the structural entropy that defeats cosine-similarity dedup).
 
     Generates a fresh CSPRNG nonce on each call via generate_summary_nonce(prefix).
 
