@@ -142,6 +142,15 @@ fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX
 a landed merge must never be blocked by a flaky hang or infra error, so the
 check fails open on timeouts and worktree-create exceptions."""
 
+_HALT_ADVANCE_RESULTS: tuple[str, ...] = (
+    'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
+)
+"""``advance_main`` result codes that can trigger a WIP halt.
+
+Shared between :class:`MergeWorker` and :class:`SpeculativeMergeWorker` to
+avoid silent divergence: if the set of halt-triggering results ever changes,
+updating this single constant propagates to both workers automatically."""
+
 
 @dataclass
 class PostMergePyrightResult:
@@ -270,6 +279,297 @@ async def _ensure_verify_disk_space(
         f'{free / gib:.2f} GiB free (threshold {min_free_bytes / gib:.2f} GiB) '
         f'after pruning {len(pruned)} stale merge worktree(s); skipping '
         f'post-merge verify to avoid a doomed build under disk pressure.'
+    )
+
+
+async def _run_post_merge_verify(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_wt: Path,
+    *,
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    max_timeouts: int,
+    max_enospc: int,
+) -> MergeOutcome | None:
+    """Run post-merge verification for a single task.
+
+    Shared by :class:`MergeWorker` and :class:`SpeculativeMergeWorker`.
+
+    Returns ``None`` when verification passes; returns a ``MergeOutcome``
+    (and cleans up *merge_wt*) when it fails via a controlled path (disk
+    guard, verify-not-passed).  Does **not** contain a ``try/except`` — any
+    exception from ``run_scoped_verification`` propagates to the caller.
+    ``MergeWorker`` calls this bare (exceptions reach ``_process``);
+    ``SpeculativeMergeWorker`` wraps the call in its existing ``try/except``
+    that maps a raised verify to a ``'Verification error: ...'`` outcome.
+    """
+    # Pre-verify disk guard: if free space is low, prune stale merge
+    # worktrees; if still low, skip the build and escalate as transient
+    # infra rather than entering a doomed multi-minute ENOSPC build.
+    disk_reason = await _ensure_verify_disk_space(
+        git_ops, merge_wt,
+        req.config.merge_verify_min_free_disk_bytes, req.task_id,
+    )
+    if disk_reason is not None:
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        return MergeOutcome('blocked', reason=disk_reason, verify_skipped=True)
+    # max_retries=0: post-merge verify hangs are usually deterministic
+    # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
+    # is_merge_verify=True: merge worktrees are freshly created per
+    # merge (no `.task/` dir and no warm cargo cache), so they need
+    # the cold timeout despite `_is_verify_cold`'s filesystem
+    # heuristic classifying them as warm.
+    verify = await run_scoped_verification(
+        merge_wt, req.config, req.module_configs,
+        task_files=req.task_files,
+        max_retries=0,
+        is_merge_verify=True,
+        force_workspace=req.config.merge_verify_workspace,
+        role='merge',
+    )
+    # Transient-infra (disk pressure) retry: an ENOSPC failure is
+    # often a self-healing host condition.  Prune stale _merge-*
+    # worktrees (never task worktrees) and retry the verify once in
+    # the same merge_wt before escalating.
+    if not verify.passed and _verify_hit_enospc(verify):
+        prior_enospc = enospc_retries.get(req.task_id, 0)
+        if prior_enospc < max_enospc:
+            enospc_retries[req.task_id] = prior_enospc + 1
+            pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+            logger.warning(
+                'Task %s: post-merge verify hit ENOSPC; pruned %d '
+                'stale merge worktree(s), retrying verify once',
+                req.task_id, len(pruned),
+            )
+            verify = await run_scoped_verification(
+                merge_wt, req.config, req.module_configs,
+                task_files=req.task_files,
+                max_retries=0,
+                is_merge_verify=True,
+                force_workspace=req.config.merge_verify_workspace,
+                role='merge',
+            )
+    if not verify.passed:
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        # Persistent ENOSPC after the prune-and-retry → transient infra.
+        if _verify_hit_enospc(verify):
+            detail = verify.failure_report()
+            reason = (
+                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+                f'still reports no space left on device after pruning '
+                f'stale merge worktrees and retrying. {verify.summary}'
+            )
+            if detail:
+                reason = f'{reason}\n\n{detail}'
+            return MergeOutcome('blocked', reason=reason)
+        detail = verify.failure_report()
+        reason = f'Post-merge verification failed: {verify.summary}'
+        if detail:
+            reason = f'{reason}\n\n{detail}'
+        # Loop-breaker bookkeeping: bump only when the failure was a
+        # pure timeout.  Real test/lint/type failures already bubble
+        # up to the steward and don't drive the re-queue oscillation
+        # the loop-breaker is designed to catch.
+        if verify.timed_out:
+            new_count = timeouts.get(req.task_id, 0) + 1
+            timeouts[req.task_id] = new_count
+            if new_count >= max_timeouts:
+                logger.warning(
+                    'Task %s: post-merge verify timed out %d times in a '
+                    'row — next submission will be abandoned',
+                    req.task_id, new_count,
+                )
+        return MergeOutcome('blocked', reason=reason)
+    return None
+
+
+async def _finalize_advanced_merge(
+    git_ops: GitOps,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    *,
+    merge_commit_fallback: str,
+    base_sha: str,
+    started_monotonic: float | None,
+    cas_retries: dict[str, int],
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    log_label: str = '',
+) -> MergeOutcome:
+    """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
+
+    Pops per-task counters, resolves the advanced SHA, runs the
+    equivalence and pyright gates, and returns a :class:`MergeOutcome`.
+    Does **not** touch *merge_wt* — callers must clean it up before
+    calling this function (MergeWorker already does so right after
+    ``advance_main``; SpeculativeMergeWorker moves its pre-pyright
+    cleanup to before this call).
+
+    *log_label* is interpolated into warning log messages so each
+    worker can retain its current log prefix
+    (``''`` for MergeWorker, ``' (speculative)'`` for
+    SpeculativeMergeWorker).
+    """
+    cas_retries.pop(req.task_id, None)
+    timeouts.pop(req.task_id, None)
+    enospc_retries.pop(req.task_id, None)
+    # Use the post-rebase SHA actually placed on main (advance_main
+    # rebases on CAS retry; merge_commit_fallback is the stale
+    # pre-rebase SHA and would fail done_provenance ancestor check).
+    advanced_sha = getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
+
+    # Decision-2 post-merge content-equivalence check.
+    equiv_failed = await _check_post_merge_equivalence(
+        req.worktree, advanced_sha, git_ops, base_sha,
+        task_id=req.task_id,
+    )
+    if equiv_failed:
+        logger.warning(
+            'Task %s%s: post-merge equivalence failed — '
+            'branch HEAD and advanced main %s diverge in: %r',
+            req.task_id, log_label, advanced_sha[:12], equiv_failed,
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id,
+            'post_merge_equivalence_failed',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                f'branch and main diverge in '
+                f'{", ".join(equiv_failed)}. '
+                f'Conflict resolution likely dropped or rewrote '
+                f'work; review {advanced_sha[:12]} against the '
+                f'task branch tip.'
+            ),
+        )
+
+    # Decision-3 post-merge unscoped type-check.
+    pyright_result = await _check_post_merge_pyright(
+        advanced_sha, git_ops, req.config, req.module_configs,
+        task_id=req.task_id,
+    )
+    if pyright_result.broken:
+        logger.warning(
+            'Task %s%s: post-merge unscoped type-check failed for %s on %s',
+            req.task_id, log_label,
+            ', '.join(pyright_result.failing_subprojects),
+            advanced_sha[:12],
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id,
+            'post_merge_pyright_broken',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                f'post-merge unscoped type-check failed for '
+                f'{", ".join(pyright_result.failing_subprojects)} '
+                f'on {advanced_sha[:12]}. {pyright_result.detail}'
+            ),
+        )
+
+    logger.info(f'Task {req.task_id}: merged to main successfully')
+    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(started_monotonic))
+    push_status = await git_ops.push_main()
+    return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
+
+
+async def _map_advance_failure(
+    git_ops: GitOps,
+    result: str,
+    *,
+    task_id: str,
+    merge_commit_fallback: str,
+    halt: Callable[[str], None],
+    cas_retries: dict[str, int],
+) -> MergeOutcome:
+    """Advance-failure result → MergeOutcome mapping shared by both workers.
+
+    Handles ``wip_overlap``, ``pop_conflict``, ``unmerged_state``,
+    ``pop_conflict_no_advance``, ``not_descendant``, ``contaminated``,
+    and ``stash_failed``.  Does **not** handle ``cas_failed``
+    (per-worker retry orchestration is a preserved difference) or the
+    request-abandoned early-out (kept per-worker because the two workers
+    differ on what to clean up).  Does **not** touch *merge_wt* — callers
+    must clean it up separately.
+
+    *halt* is the worker's ``halt_for_wip`` callable; *cas_retries* is
+    mutated for the terminal result codes (popped) but NOT for
+    ``wip_overlap`` (which is a recoverable halt, not a terminal outcome).
+    """
+    if result in ('wip_overlap', 'pop_conflict'):
+        halt(f'advance_main: {result}')
+        if result == 'pop_conflict':
+            # Main was advanced — push origin even though stash pop failed.
+            push_status = await git_ops.push_main()
+            recovery = getattr(git_ops, '_last_recovery_branch', None)
+            # Main IS on the post-rebase SHA — propagate it so workflow's
+            # _handle_wip_recovery → set_task_status('done') has valid
+            # done_provenance (otherwise the call hits "kind required").
+            advanced_sha = (
+                getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
+            )
+            return MergeOutcome(
+                'done_wip_recovery',
+                reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
+                recovery_branch=recovery,
+                push_status=push_status,
+                merge_sha=advanced_sha,
+            )
+        else:
+            overlap = getattr(git_ops, '_last_overlap_files', None)
+            return MergeOutcome(
+                'wip_halted',
+                reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
+                overlap_files=overlap,
+            )
+
+    if result == 'unmerged_state':
+        # Permanent block — pre-existing UU markers in project_root.
+        # Halt the queue and route to human escalation (not steward).
+        halt(
+            'advance_main: unmerged_state — project_root has unresolved merge '
+            'conflicts. Manual investigation required before any retry.'
+        )
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'unmerged_state',
+            reason=(
+                f'advance_main returned unmerged_state: project_root has '
+                f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
+                f'manual investigation required before any retry. '
+                f'(task {task_id})'
+            ),
+        )
+
+    if result == 'pop_conflict_no_advance':
+        # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
+        # Halt queue and return distinct outcome for human-level escalation.
+        halt('advance_main: pop_conflict_no_advance')
+        recovery = getattr(git_ops, '_last_recovery_branch', None)
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'wip_recovery_no_advance',
+            reason=(
+                f'Merge did not advance AND WIP stash pop conflicted. '
+                f'Recovery branch: {recovery}. '
+                f'Manual intervention required — do not retry automatically. '
+                f'(task {task_id})'
+            ),
+            recovery_branch=recovery,
+        )
+
+    # not_descendant / contaminated / stash_failed — permanent failure
+    cas_retries.pop(task_id, None)
+    return MergeOutcome(
+        'blocked',
+        reason=f'advance_main failed ({result}) for task {task_id}',
     )
 
 
@@ -1247,6 +1547,10 @@ class MergeOutcome:
     merge_sha: str | None = None
     push_status: str | None = None
     failure_diagnostic: dict[str, str] | None = None
+    verify_skipped: bool = False
+    """True when the disk guard fired and ``run_scoped_verification`` was never
+    called.  Lets callers distinguish a disk-guard short-circuit from an actual
+    verification failure in log messages."""
 
 
 @dataclass
@@ -1516,58 +1820,24 @@ async def _do_train_merge(
     return MergeOutcome('done', merge_sha=advanced_sha)
 
 
-class MergeWorker:
-    """Single coroutine that processes merge requests serially.
+class _WipHaltMixin:
+    """Shared WIP-halt machinery and request-abandoned helper.
 
-    Owns all main-branch advancement via CAS ``update-ref``.  The harness
-    creates one instance and passes the same ``asyncio.Queue`` to every
-    ``TaskWorkflow``.
+    Provides the byte-identical halt-owner methods that both
+    :class:`MergeWorker` and :class:`SpeculativeMergeWorker` expose as
+    public API to ``workflow.py`` and ``harness.py``.
+
+    Methods-only: each concrete worker's ``__init__`` is responsible for
+    creating the instance attributes::
+
+        self._wip_halt = asyncio.Event(); self._wip_halt.set()
+        self._halt_owner_esc_id: str | None = None
     """
 
-    MAX_CAS_RETRIES = 5
-    # After this many consecutive post-merge verify TIMEOUTS for the same
-    # task, the merge queue stops trying and returns an 'abandoned' blocked
-    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
-    # alternating on the merge queue for hours, each dying at the 30-min
-    # warm timeout).  Counter resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
-    # After a post-merge verify fails with an ENOSPC signature, prune stale
-    # _merge-* worktrees and retry the verify at most this many times before
-    # escalating as transient infra.  Disk pressure is often self-healing, so
-    # one retry-after-prune is the conservative middle ground between blindly
-    # blocking and looping.  Resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
-
-    def __init__(
-        self,
-        git_ops: GitOps,
-        queue: asyncio.Queue[MergeRequest],
-        event_store: EventStore | None = None,
-    ):
-        self._git_ops = git_ops
-        self._queue = queue
-        self._event_store = event_store
-        # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
-        self._urgent: collections.deque[MergeRequest] = collections.deque()
-        self._running = True
-        # Per-task CAS re-enqueue counter — prevents infinite loops
-        self._cas_retries: dict[str, int] = {}
-        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
-        # when a verify times out, cleared on a successful merge.  Keyed by
-        # task_id; lives across submissions (re-submits of the same task
-        # after an orchestrator re-queue also feed this counter).
-        self._post_merge_verify_timeouts: dict[str, int] = {}
-        # Per-task ENOSPC prune-and-retry counter (see
-        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
-        # the timeout counter: persists across submissions, reset on success.
-        self._post_merge_verify_enospc_retries: dict[str, int] = {}
-        # WIP halt: cleared when halted, set when running
-        self._wip_halt = asyncio.Event()
-        self._wip_halt.set()  # not halted initially
-        # ID of the escalation that owns the current halt. Registered by the
-        # workflow handler after it submits the L1 escalation. Single source
-        # of truth for the resolve-callback un-halt path.
-        self._halt_owner_esc_id: str | None = None
+    # Class-level annotations so pyright sees the attributes without an
+    # __init__ on the mixin itself.
+    _wip_halt: asyncio.Event
+    _halt_owner_esc_id: str | None
 
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
         """Build the terminal MergeOutcome for the loop-breaker.
@@ -1640,6 +1910,60 @@ class MergeWorker:
             )
             return True
         return False
+
+
+class MergeWorker(_WipHaltMixin):
+    """Single coroutine that processes merge requests serially.
+
+    Owns all main-branch advancement via CAS ``update-ref``.  The harness
+    creates one instance and passes the same ``asyncio.Queue`` to every
+    ``TaskWorkflow``.
+    """
+
+    MAX_CAS_RETRIES = 5
+    # After this many consecutive post-merge verify TIMEOUTS for the same
+    # task, the merge queue stops trying and returns an 'abandoned' blocked
+    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
+    # alternating on the merge queue for hours, each dying at the 30-min
+    # warm timeout).  Counter resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
+    # After a post-merge verify fails with an ENOSPC signature, prune stale
+    # _merge-* worktrees and retry the verify at most this many times before
+    # escalating as transient infra.  Disk pressure is often self-healing, so
+    # one retry-after-prune is the conservative middle ground between blindly
+    # blocking and looping.  Resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES = 1
+
+    def __init__(
+        self,
+        git_ops: GitOps,
+        queue: asyncio.Queue[MergeRequest],
+        event_store: EventStore | None = None,
+    ):
+        self._git_ops = git_ops
+        self._queue = queue
+        self._event_store = event_store
+        # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
+        self._urgent: collections.deque[MergeRequest] = collections.deque()
+        self._running = True
+        # Per-task CAS re-enqueue counter — prevents infinite loops
+        self._cas_retries: dict[str, int] = {}
+        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
+        # when a verify times out, cleared on a successful merge.  Keyed by
+        # task_id; lives across submissions (re-submits of the same task
+        # after an orchestrator re-queue also feed this counter).
+        self._post_merge_verify_timeouts: dict[str, int] = {}
+        # Per-task ENOSPC prune-and-retry counter (see
+        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
+        # the timeout counter: persists across submissions, reset on success.
+        self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # WIP halt: cleared when halted, set when running
+        self._wip_halt = asyncio.Event()
+        self._wip_halt.set()  # not halted initially
+        # ID of the escalation that owns the current halt. Registered by the
+        # workflow handler after it submits the L1 escalation. Single source
+        # of truth for the resolve-callback un-halt path.
+        self._halt_owner_esc_id: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -1853,89 +2177,15 @@ class MergeWorker:
                 f'(pre-rebased, main unchanged)'
             )
         if not skip_verify:
-            # Pre-verify disk guard: if free space is low, prune stale merge
-            # worktrees; if still low, skip the build and escalate as transient
-            # infra rather than entering a doomed multi-minute ENOSPC build.
-            disk_reason = await _ensure_verify_disk_space(
-                self._git_ops, merge_wt,
-                req.config.merge_verify_min_free_disk_bytes, req.task_id,
+            out = await _run_post_merge_verify(
+                self._git_ops, req, merge_wt,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
             )
-            if disk_reason is not None:
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                return MergeOutcome('blocked', reason=disk_reason)
-            # max_retries=0: post-merge verify hangs are usually deterministic
-            # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
-            # is_merge_verify=True: merge worktrees are freshly created per
-            # merge (no `.task/` dir and no warm cargo cache), so they need
-            # the cold timeout despite `_is_verify_cold`'s filesystem
-            # heuristic classifying them as warm.
-            verify = await run_scoped_verification(
-                merge_wt, req.config, req.module_configs,
-                task_files=req.task_files,
-                max_retries=0,
-                is_merge_verify=True,
-                force_workspace=req.config.merge_verify_workspace,
-                role='merge',
-            )
-            # Transient-infra (disk pressure) retry: an ENOSPC failure is
-            # often a self-healing host condition.  Prune stale _merge-*
-            # worktrees (never task worktrees) and retry the verify once in
-            # the same merge_wt before escalating.
-            if not verify.passed and _verify_hit_enospc(verify):
-                prior_enospc = self._post_merge_verify_enospc_retries.get(
-                    req.task_id, 0,
-                )
-                if prior_enospc < self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES:
-                    self._post_merge_verify_enospc_retries[req.task_id] = (
-                        prior_enospc + 1
-                    )
-                    pruned = await self._git_ops.prune_stale_merge_worktrees(
-                        keep=merge_wt,
-                    )
-                    logger.warning(
-                        'Task %s: post-merge verify hit ENOSPC; pruned %d '
-                        'stale merge worktree(s), retrying verify once',
-                        req.task_id, len(pruned),
-                    )
-                    verify = await run_scoped_verification(
-                        merge_wt, req.config, req.module_configs,
-                        task_files=req.task_files,
-                        max_retries=0,
-                        is_merge_verify=True,
-                        force_workspace=req.config.merge_verify_workspace,
-                        role='merge',
-                    )
-            if not verify.passed:
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                # Persistent ENOSPC after the prune-and-retry → transient infra.
-                if _verify_hit_enospc(verify):
-                    detail = verify.failure_report()
-                    reason = (
-                        f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
-                        f'still reports no space left on device after pruning '
-                        f'stale merge worktrees and retrying. {verify.summary}'
-                    )
-                    if detail:
-                        reason = f'{reason}\n\n{detail}'
-                    return MergeOutcome('blocked', reason=reason)
-                detail = verify.failure_report()
-                reason = f'Post-merge verification failed: {verify.summary}'
-                if detail:
-                    reason = f'{reason}\n\n{detail}'
-                # Loop-breaker bookkeeping: bump only when the failure was a
-                # pure timeout.  Real test/lint/type failures already bubble
-                # up to the steward and don't drive the re-queue oscillation
-                # the loop-breaker is designed to catch.
-                if verify.timed_out:
-                    new_count = prior_timeouts + 1
-                    self._post_merge_verify_timeouts[req.task_id] = new_count
-                    if new_count >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
-                        logger.warning(
-                            'Task %s: post-merge verify timed out %d times in a '
-                            'row — next submission will be abandoned',
-                            req.task_id, new_count,
-                        )
-                return MergeOutcome('blocked', reason=reason)
+            if out is not None:
+                return out
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
@@ -1949,167 +2199,28 @@ class MergeWorker:
         await self._git_ops.cleanup_merge_worktree(merge_wt)
 
         if result == 'advanced':
-            self._cas_retries.pop(req.task_id, None)
-            # Loop-breaker counter: a successful merge means whatever caused
-            # the earlier timeouts has cleared (e.g. test was flaky, host
-            # contention eased).  Reset so future timeouts start from 0.
-            self._post_merge_verify_timeouts.pop(req.task_id, None)
-            # Same for the ENOSPC retry budget — disk pressure has cleared.
-            self._post_merge_verify_enospc_retries.pop(req.task_id, None)
-            # Use the post-rebase SHA actually placed on main (advance_main
-            # rebases on CAS retry; merge_result.merge_commit is the stale
-            # pre-rebase SHA and would fail done_provenance ancestor check).
-            advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                or merge_result.merge_commit
+            return await _finalize_advanced_merge(
+                self._git_ops, req, self._event_store,
+                merge_commit_fallback=merge_result.merge_commit,
+                base_sha=main_sha,
+                started_monotonic=t0,
+                cas_retries=self._cas_retries,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+            )
 
-            # Decision-2 post-merge content-equivalence check: the branch's
-            # tip and the advanced main SHA must agree on every non-.task/
-            # path.  Catches conflict-resolution drops and rebase regressions
-            # that would otherwise land silently with a "successful merge"
-            # log line.  Loud failure here is preferable to a stuck-done
-            # task discovered hours later.
-            equiv_failed = await _check_post_merge_equivalence(
-                req.worktree, advanced_sha, self._git_ops, main_sha,
+        if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
+            # Workflow soft-cancelled mid-merge: dropping the request
+            # prevents the orphan-halt window where no escalation owner
+            # is registered (2026-05-04 incident).
+            return None
+        if result != 'cas_failed':
+            return await _map_advance_failure(
+                self._git_ops, result,
                 task_id=req.task_id,
-            )
-            if equiv_failed:
-                logger.warning(
-                    'Task %s: post-merge equivalence failed — '
-                    'branch HEAD and advanced main %s diverge in: %r',
-                    req.task_id, advanced_sha[:12], equiv_failed,
-                )
-                _emit_merge_attempt(
-                    self._event_store, req.task_id,
-                    'post_merge_equivalence_failed',
-                    duration_ms=_elapsed_ms(t0),
-                )
-                return MergeOutcome(
-                    'blocked',
-                    reason=(
-                        f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
-                        f'branch and main diverge in '
-                        f'{", ".join(equiv_failed)}. '
-                        f'Conflict resolution likely dropped or rewrote '
-                        f'work; review {advanced_sha[:12]} against the '
-                        f'task branch tip.'
-                    ),
-                )
-
-            # Decision-3 post-merge unscoped type-check: catch cross-PR union
-            # breaks that per-PR scoped verify cannot detect (PR A widens a
-            # Protocol; PR B, verified against pre-A main, adds a conformer
-            # satisfying the OLD Protocol; only the post-merge whole-package
-            # check catches the missing method after both land).
-            # No-op when module_configs is empty (preserves existing tests).
-            # Merge has already landed; we never revert — skip push instead.
-            pyright_result = await _check_post_merge_pyright(
-                advanced_sha, self._git_ops, req.config, req.module_configs,
-                task_id=req.task_id,
-            )
-            if pyright_result.broken:
-                logger.warning(
-                    'Task %s: post-merge unscoped type-check failed for %s on %s',
-                    req.task_id,
-                    ', '.join(pyright_result.failing_subprojects),
-                    advanced_sha[:12],
-                )
-                _emit_merge_attempt(
-                    self._event_store, req.task_id,
-                    'post_merge_pyright_broken',
-                    duration_ms=_elapsed_ms(t0),
-                )
-                return MergeOutcome(
-                    'blocked',
-                    reason=(
-                        f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-                        f'post-merge unscoped type-check failed for '
-                        f'{", ".join(pyright_result.failing_subprojects)} '
-                        f'on {advanced_sha[:12]}. {pyright_result.detail}'
-                    ),
-                )
-
-            logger.info(f'Task {req.task_id}: merged to main successfully')
-            _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            push_status = await self._git_ops.push_main()
-            return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
-
-        if result in ('wip_overlap', 'pop_conflict'):
-            # Halt the queue globally — no more merges until resolved
-            if self._request_abandoned(req):
-                # Workflow soft-cancelled mid-merge: dropping the request
-                # prevents the orphan-halt window where no escalation owner
-                # is registered (2026-05-04 incident).
-                return None
-            self.halt_for_wip(f'advance_main: {result}')
-            if result == 'pop_conflict':
-                # Main was advanced — push origin even though stash pop failed.
-                push_status = await self._git_ops.push_main()
-                recovery = getattr(self._git_ops, '_last_recovery_branch', None)
-                # Main IS on the post-rebase SHA — propagate it so workflow's
-                # _handle_wip_recovery → set_task_status('done') has valid
-                # done_provenance (otherwise the call hits "kind required").
-                advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                    or merge_result.merge_commit
-                return MergeOutcome(
-                    'done_wip_recovery',
-                    reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
-                    recovery_branch=recovery,
-                    push_status=push_status,
-                    merge_sha=advanced_sha,
-                )
-            else:
-                overlap = getattr(self._git_ops, '_last_overlap_files', None)
-                return MergeOutcome(
-                    'wip_halted',
-                    reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
-                    overlap_files=overlap,
-                )
-
-        if result == 'unmerged_state':
-            # Permanent block — pre-existing UU markers in project_root.
-            # Halt the queue and route to human escalation (not steward).
-            if self._request_abandoned(req):
-                return None
-            self.halt_for_wip(
-                'advance_main: unmerged_state — project_root has unresolved merge '
-                'conflicts. Manual investigation required before any retry.'
-            )
-            self._cas_retries.pop(req.task_id, None)
-            return MergeOutcome(
-                'unmerged_state',
-                reason=(
-                    f'advance_main returned unmerged_state: project_root has '
-                    f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
-                    f'manual investigation required before any retry. '
-                    f'(task {req.task_id})'
-                ),
-            )
-
-        if result == 'pop_conflict_no_advance':
-            # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
-            # Halt queue and return distinct outcome for human-level escalation.
-            if self._request_abandoned(req):
-                return None
-            self.halt_for_wip('advance_main: pop_conflict_no_advance')
-            recovery = getattr(self._git_ops, '_last_recovery_branch', None)
-            self._cas_retries.pop(req.task_id, None)
-            return MergeOutcome(
-                'wip_recovery_no_advance',
-                reason=(
-                    f'Merge did not advance AND WIP stash pop conflicted. '
-                    f'Recovery branch: {recovery}. '
-                    f'Manual intervention required — do not retry automatically. '
-                    f'(task {req.task_id})'
-                ),
-                recovery_branch=recovery,
-            )
-
-        if result in ('not_descendant', 'contaminated', 'stash_failed'):
-            # Permanent failure — do NOT re-enqueue
-            self._cas_retries.pop(req.task_id, None)
-            return MergeOutcome(
-                'blocked',
-                reason=f'advance_main failed ({result}) for task {req.task_id}',
+                merge_commit_fallback=merge_result.merge_commit,
+                halt=self.halt_for_wip,
+                cas_retries=self._cas_retries,
             )
 
         # result == 'cas_failed' — transient, re-enqueue with limit
@@ -2140,7 +2251,7 @@ class MergeWorker:
         return None  # don't resolve Future — will be reprocessed
 
 
-class SpeculativeMergeWorker:
+class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
     The Merger coroutine creates merge commits; the Verifier coroutine runs
@@ -2211,82 +2322,6 @@ class SpeculativeMergeWorker:
         self._inflight_req: MergeRequest | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
-
-    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
-        """Build the terminal MergeOutcome for the loop-breaker.
-
-        Mirror of ``MergeWorker._abandon_outcome`` — kept in sync so
-        downstream classifiers (steward, dashboard) see the same reason
-        prefix regardless of which worker served the request.
-        """
-        return MergeOutcome(
-            'blocked',
-            reason=(
-                f'{ABANDONED_REASON_PREFIX} {count} times for task '
-                f'{task_id} — manual investigation required. '
-                'The merge queue has stopped retrying this task to avoid '
-                'starving the queue behind a deterministic verify hang.'
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Public API (same interface as MergeWorker)
-    # ------------------------------------------------------------------
-
-    def halt_for_wip(self, reason: str) -> None:
-        """Halt the merge queue due to a WIP conflict."""
-        logger.warning('Merge queue halted for WIP: %s', reason)
-        self._wip_halt.clear()
-        self._halt_owner_esc_id = None
-
-    def set_halt_owner(self, esc_id: str) -> None:
-        """Register the escalation that owns the current halt.
-
-        The workflow calls this right after submitting its halt-triggering
-        escalation. Asserts owner is currently None — a double-register
-        indicates a double-halt bug that should fail loudly.
-        """
-        assert self._halt_owner_esc_id is None, (
-            f'halt owner already set to {self._halt_owner_esc_id!r}, '
-            f'refusing to overwrite with {esc_id!r}'
-        )
-        self._halt_owner_esc_id = esc_id
-
-    def is_halt_owner(self, esc_id: str) -> bool:
-        """True iff esc_id is the currently registered halt owner."""
-        return (
-            self._halt_owner_esc_id is not None
-            and self._halt_owner_esc_id == esc_id
-        )
-
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        """Resume the merge queue after WIP conflict resolution."""
-        logger.info(
-            'Merge queue un-halted (WIP conflict resolved%s)',
-            f', reason={reason!r}' if reason else '',
-        )
-        self._wip_halt.set()
-        self._halt_owner_esc_id = None
-
-    @property
-    def is_wip_halted(self) -> bool:
-        return not self._wip_halt.is_set()
-
-    @property
-    def halt_owner_esc_id(self) -> str | None:
-        """Read-only public view of the current halt-owner escalation id."""
-        return self._halt_owner_esc_id
-
-    def _request_abandoned(self, req: MergeRequest) -> bool:
-        """True iff the requester cancelled the result future — drop the request."""
-        if req.result.cancelled():
-            logger.info(
-                'Task %s: merge request abandoned by waiter '
-                '(future cancelled) — dropping request without halting queue',
-                req.task_id,
-            )
-            return True
-        return False
 
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""
@@ -3136,35 +3171,13 @@ class SpeculativeMergeWorker:
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
             )
-            # Pre-verify disk guard: if free space is low, prune stale merge
-            # worktrees; if still low, skip the build and escalate as transient
-            # infra rather than entering a doomed multi-minute ENOSPC build.
-            disk_reason = await _ensure_verify_disk_space(
-                self._git_ops, merge_wt,
-                req.config.merge_verify_min_free_disk_bytes, req.task_id,
-            )
-            if disk_reason is not None:
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                if not req.result.done():
-                    req.result.set_result(
-                        MergeOutcome('blocked', reason=disk_reason),
-                    )
-                return False
             try:
-                # max_retries=0: a hung post-merge verify is almost always a
-                # deterministic failure (e.g. deadlocked test); retries just
-                # multiply queue-wide stall.
-                # is_merge_verify=True: merge worktrees are freshly created
-                # per merge (no `.task/` dir and no warm cargo cache), so
-                # they need the cold timeout despite `_is_verify_cold`'s
-                # filesystem heuristic classifying them as warm.
-                verify = await run_scoped_verification(
-                    merge_wt, req.config, req.module_configs,
-                    task_files=req.task_files,
-                    max_retries=0,
-                    is_merge_verify=True,
-                    force_workspace=req.config.merge_verify_workspace,
-                    role='merge',
+                out = await _run_post_merge_verify(
+                    self._git_ops, req, merge_wt,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                    max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                 )
             except Exception as exc:
                 logger.info(
@@ -3177,87 +3190,29 @@ class SpeculativeMergeWorker:
                         'blocked', reason=f'Verification error: {exc}',
                     ))
                 return False
-
-            logger.info(
-                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                f'passed={verify.passed})'
-            )
-            # Transient-infra (disk pressure) retry: an ENOSPC failure is
-            # often a self-healing host condition.  Prune stale _merge-*
-            # worktrees (never task worktrees) and retry the verify once in
-            # the same merge_wt before escalating.
-            if not verify.passed and _verify_hit_enospc(verify):
-                prior_enospc = self._post_merge_verify_enospc_retries.get(
-                    req.task_id, 0,
+            if out is None:
+                logger.info(
+                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                    f'passed=True)'
                 )
-                if prior_enospc < self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES:
-                    self._post_merge_verify_enospc_retries[req.task_id] = (
-                        prior_enospc + 1
-                    )
-                    pruned = await self._git_ops.prune_stale_merge_worktrees(
-                        keep=merge_wt,
-                    )
-                    logger.warning(
-                        'Task %s: post-merge verify hit ENOSPC; pruned %d '
-                        'stale merge worktree(s), retrying verify once',
-                        req.task_id, len(pruned),
-                    )
-                    try:
-                        verify = await run_scoped_verification(
-                            merge_wt, req.config, req.module_configs,
-                            task_files=req.task_files,
-                            max_retries=0,
-                            is_merge_verify=True,
-                            force_workspace=req.config.merge_verify_workspace,
-                            role='merge',
-                        )
-                    except Exception as exc:
-                        await self._git_ops.cleanup_merge_worktree(merge_wt)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verification error: {exc}',
-                            ))
-                        return False
-            if not verify.passed:
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                # Persistent ENOSPC after the prune-and-retry → transient infra.
-                if _verify_hit_enospc(verify):
-                    if not req.result.done():
-                        detail = verify.failure_report()
-                        reason = (
-                            f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge '
-                            f'verify still reports no space left on device '
-                            f'after pruning stale merge worktrees and '
-                            f'retrying. {verify.summary}'
-                        )
-                        if detail:
-                            reason = f'{reason}\n\n{detail}'
-                        req.result.set_result(MergeOutcome(
-                            'blocked', reason=reason,
-                        ))
-                    return False
-                # Loop-breaker bookkeeping: bump only when the failure was a
-                # pure timeout.  Real test/lint/type failures already bubble
-                # up to the steward via the ``blocked`` outcome and do not
-                # drive the verify-timeout / re-queue oscillation this
-                # counter is designed to detect.
-                if verify.timed_out:
-                    new_count = self._post_merge_verify_timeouts.get(req.task_id, 0) + 1
-                    self._post_merge_verify_timeouts[req.task_id] = new_count
-                    if new_count >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
-                        logger.warning(
-                            'Task %s: post-merge verify timed out %d times in '
-                            'a row — next submission will be abandoned',
-                            req.task_id, new_count,
-                        )
+            elif out.verify_skipped:
+                # Disk guard fired — run_scoped_verification was never called;
+                # log 'skipped' rather than 'passed=False' to avoid misleading
+                # post-mortem triage of merge-queue stalls (2026-06-01).
+                logger.info(
+                    f'Task {req.task_id}: verify skipped: low disk '
+                    f'(merge={merge_commit[:8]})'
+                )
                 if not req.result.done():
-                    detail = verify.failure_report()
-                    reason = f'Post-merge verification failed: {verify.summary}'
-                    if detail:
-                        reason = f'{reason}\n\n{detail}'
-                    req.result.set_result(MergeOutcome(
-                        'blocked', reason=reason,
-                    ))
+                    req.result.set_result(out)
+                return False
+            else:
+                logger.info(
+                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                    f'passed=False)'
+                )
+                if not req.result.done():
+                    req.result.set_result(out)
                 return False
         else:
             logger.info(
@@ -3276,98 +3231,42 @@ class SpeculativeMergeWorker:
             )
 
             if result == 'advanced':
-                self._cas_retries.pop(req.task_id, None)
-                # Loop-breaker counter reset on success — see MergeWorker.
-                self._post_merge_verify_timeouts.pop(req.task_id, None)
-                # ENOSPC retry budget reset on success — see MergeWorker.
-                self._post_merge_verify_enospc_retries.pop(req.task_id, None)
-                # Use the post-rebase SHA actually placed on main (see
-                # advance_main docstring — local merge_commit is stale
-                # after a CAS-retry rebase and fails done_provenance
-                # ancestor check).
-                advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                    or merge_commit
-
-                # Decision-2 post-merge content-equivalence check (see
-                # MergeWorker for full rationale).  Speculative path runs
-                # the same gate so an over-eager rebase doesn't drop work.
-                # item.base_sha is the pre-merge main tip the merge was
-                # computed against (== base_for_merge); using it keeps the
-                # subtraction rebase-robust through the CAS-retry loop above.
-                equiv_failed = await _check_post_merge_equivalence(
-                    req.worktree, advanced_sha, self._git_ops, item.base_sha,
-                    task_id=req.task_id,
-                )
-                if equiv_failed:
-                    logger.warning(
-                        'Task %s (speculative): post-merge equivalence '
-                        'failed — branch HEAD and advanced main %s '
-                        'diverge in: %r',
-                        req.task_id, advanced_sha[:12], equiv_failed,
-                    )
-                    _emit_merge_attempt(
-                        self._event_store, req.task_id,
-                        'post_merge_equivalence_failed',
-                        duration_ms=_elapsed_ms(item.started_monotonic),
-                    )
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
-                                f'branch and main diverge in '
-                                f'{", ".join(equiv_failed)}. '
-                                f'Conflict resolution likely dropped or '
-                                f'rewrote work; review {advanced_sha[:12]} '
-                                f'against the task branch tip.'
-                            ),
-                        ))
-                    return True
-
-                # Cleanup merge_wt BEFORE the pyright check: the pyright helper
-                # creates its own detached worktree at advanced_sha, so keeping
-                # merge_wt alive here would briefly double the worktree count
-                # — doubling disk pressure in ENOSPC scenarios.  Mirrors the
-                # MergeWorker ordering at _do_merge line ~1455.
+                # Cleanup merge_wt BEFORE the finalize gate: neither the
+                # equivalence check (uses req.worktree) nor the pyright check
+                # (builds its own detached worktree) reads merge_wt — cleaning
+                # it here lowers peak worktree count under disk pressure and
+                # mirrors MergeWorker which already cleans merge_wt right after
+                # advance_main.
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
-                pyright_result = await _check_post_merge_pyright(
-                    advanced_sha, self._git_ops, req.config, req.module_configs,
-                    task_id=req.task_id,
+                outcome = await _finalize_advanced_merge(
+                    self._git_ops, req, self._event_store,
+                    merge_commit_fallback=merge_commit,
+                    base_sha=item.base_sha,
+                    started_monotonic=item.started_monotonic,
+                    cas_retries=self._cas_retries,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    log_label=' (speculative)',
                 )
-                if pyright_result.broken:
-                    logger.warning(
-                        'Task %s (speculative): post-merge unscoped type-check '
-                        'failed for %s on %s',
-                        req.task_id,
-                        ', '.join(pyright_result.failing_subprojects),
-                        advanced_sha[:12],
-                    )
-                    _emit_merge_attempt(
-                        self._event_store, req.task_id,
-                        'post_merge_pyright_broken',
-                        duration_ms=_elapsed_ms(item.started_monotonic),
-                    )
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-                                f'post-merge unscoped type-check failed for '
-                                f'{", ".join(pyright_result.failing_subprojects)} '
-                                f'on {advanced_sha[:12]}. {pyright_result.detail}'
-                            ),
-                        ))
-                    return True
-
-                logger.info(f'Task {req.task_id}: merged to main successfully')
-                _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
-                push_status = await self._git_ops.push_main()
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
-                if self._on_merge_landed is not None:
+                    req.result.set_result(outcome)
+                # SMW-only post-merge notification hook (task 1592).  Fires only
+                # on a 'done' landing: _finalize_advanced_merge may instead
+                # return a 'blocked' outcome (equivalence/pyright gate), and
+                # main's pre-refactor inline code reached this hook only after
+                # those gates passed (they returned early on failure).  Guard on
+                # status == 'done' to preserve that semantics; outcome.merge_sha
+                # carries the advanced SHA that the old inline code passed.
+                # MergeWorker deliberately has no such hook.
+                if (
+                    outcome.status == 'done'
+                    and outcome.merge_sha is not None
+                    and self._on_merge_landed is not None
+                ):
                     try:
-                        await self._on_merge_landed(req.task_id, item.base_sha, advanced_sha)
+                        await self._on_merge_landed(
+                            req.task_id, item.base_sha, outcome.merge_sha
+                        )
                     except Exception:
                         logger.warning(
                             'on_merge_landed hook raised for task %s; ignoring (fail-open)',
@@ -3376,98 +3275,25 @@ class SpeculativeMergeWorker:
                         )
                 return True
 
-            if result in ('wip_overlap', 'pop_conflict'):
-                # Halt the queue globally — no more merges until resolved
-                if self._request_abandoned(req):
-                    # Workflow soft-cancelled mid-merge: dropping the request
-                    # prevents the orphan-halt window where no escalation
-                    # owner is registered (2026-05-04 incident).
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
-                    return False
-                self.halt_for_wip(f'advance_main: {result}')
+            if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
+                # Workflow soft-cancelled mid-merge: dropping the request
+                # prevents the orphan-halt window where no escalation
+                # owner is registered (2026-05-04 incident).
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
-                if result == 'pop_conflict':
-                    # Main was advanced — push origin even though stash pop failed.
-                    push_status = await self._git_ops.push_main()
-                    recovery = getattr(self._git_ops, '_last_recovery_branch', None)
-                    # Main IS on the post-rebase SHA — propagate it so workflow's
-                    # _handle_wip_recovery → set_task_status('done') has valid
-                    # done_provenance (otherwise the call hits "kind required").
-                    advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                        or merge_commit
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'done_wip_recovery',
-                            reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
-                            recovery_branch=recovery,
-                            push_status=push_status,
-                            merge_sha=advanced_sha,
-                        ))
-                else:
-                    overlap = getattr(self._git_ops, '_last_overlap_files', None)
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'wip_halted',
-                            reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
-                            overlap_files=overlap,
-                        ))
-                return False
-
-            if result == 'unmerged_state':
-                # Pre-existing UU markers — halt queue, human escalation.
-                if self._request_abandoned(req):
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if result in ('unmerged_state', 'pop_conflict_no_advance'):
                     self._cas_retries.pop(req.task_id, None)
-                    return False
-                self.halt_for_wip(
-                    'advance_main: unmerged_state — project_root has unresolved '
-                    'merge conflicts. Manual investigation required before any retry.'
+                return False
+            if result != 'cas_failed':
+                outcome = await _map_advance_failure(
+                    self._git_ops, result,
+                    task_id=req.task_id,
+                    merge_commit_fallback=merge_commit,
+                    halt=self.halt_for_wip,
+                    cas_retries=self._cas_retries,
                 )
-                self._cas_retries.pop(req.task_id, None)
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome(
-                        'unmerged_state',
-                        reason=(
-                            f'advance_main returned unmerged_state: project_root has '
-                            f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
-                            f'manual investigation required before any retry. '
-                            f'(task {req.task_id})'
-                        ),
-                    ))
-                return False
-
-            if result == 'pop_conflict_no_advance':
-                # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
-                if self._request_abandoned(req):
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
-                    self._cas_retries.pop(req.task_id, None)
-                    return False
-                self.halt_for_wip('advance_main: pop_conflict_no_advance')
-                recovery = getattr(self._git_ops, '_last_recovery_branch', None)
-                self._cas_retries.pop(req.task_id, None)
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                if not req.result.done():
-                    req.result.set_result(MergeOutcome(
-                        'wip_recovery_no_advance',
-                        reason=(
-                            f'Merge did not advance AND WIP stash pop conflicted. '
-                            f'Recovery branch: {recovery}. '
-                            f'Manual intervention required — do not retry automatically. '
-                            f'(task {req.task_id})'
-                        ),
-                        recovery_branch=recovery,
-                    ))
-                return False
-
-            if result in ('not_descendant', 'contaminated', 'stash_failed'):
-                self._cas_retries.pop(req.task_id, None)
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
-                if not req.result.done():
-                    req.result.set_result(MergeOutcome(
-                        'blocked',
-                        reason=f'advance_main failed ({result}) for task {req.task_id}',
-                    ))
+                    req.result.set_result(outcome)
                 return False
 
             # result == 'cas_failed' — transient, retry with limit

@@ -7998,3 +7998,602 @@ class TestTrainLifecycleEvents:
         assert set(deferred_data['remaining_members']) == {'trn-b', 'trn-c'}, (
             f"Expected remaining_members={{trn-b, trn-c}}, got: {deferred_data['remaining_members']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRunPostMergeVerify — unit tests for the _run_post_merge_verify helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerify:
+    """Direct unit tests for the _run_post_merge_verify module-level helper.
+
+    The helper is imported at the top of the test class (not at module level)
+    so a missing symbol produces a readable ImportError on collection rather
+    than a hard SyntaxError.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-verify-test'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        return req
+
+    async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
+        """(a) disk guard returns None + verify passed → returns None; merge_wt NOT cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        enospc_retries: dict[str, int] = {}
+
+        passed_result = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_disk_guard_returns_reason_blocks(self) -> None:
+        """(b) disk guard returns reason string → MergeOutcome('blocked') with that reason; merge_wt cleaned once."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=disk_reason)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock()) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason == disk_reason
+        assert result.verify_skipped is True, (
+            'disk guard must set verify_skipped=True so callers can log '
+            '"verify skipped: low disk" instead of "passed=False"'
+        )
+        git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
+        mock_verify.assert_not_awaited()
+
+    async def test_verify_fails_non_enospc_blocks_and_cleans(self) -> None:
+        """(c) verify fails (non-ENOSPC) → MergeOutcome('blocked') reason starts 'Post-merge verification failed:' and merge_wt cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        failed_result = MagicMock(
+            passed=False, summary='Test suite exploded', timed_out=False,
+        )
+        failed_result.failure_report.return_value = ''
+        # Ensure ENOSPC is not triggered
+        failed_result.test_output = ''
+        failed_result.lint_output = ''
+        failed_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert result.verify_skipped is False, (
+            'actual verify failure must NOT set verify_skipped (verify ran)'
+        )
+        git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
+
+    async def test_verify_timeout_bumps_timeouts_dict(self) -> None:
+        """(d) verify fails with timed_out=True → timeouts dict bumped to 1 for req.task_id."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        timed_out_result = MagicMock(
+            passed=False, summary='verify timed out', timed_out=True,
+        )
+        timed_out_result.failure_report.return_value = ''
+        timed_out_result.test_output = ''
+        timed_out_result.lint_output = ''
+        timed_out_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert timeouts.get(req.task_id, 0) == 1, (
+            f'expected timeouts[task_id]=1, got: {timeouts}'
+        )
+
+    async def test_persistent_enospc_prunes_and_escalates(self) -> None:
+        """(e) persistent ENOSPC (both attempts) → prune awaited, enospc_retries bumped, transient infra blocked."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {result.reason!r}'
+        )
+        git_ops.prune_stale_merge_worktrees.assert_awaited_once()
+        assert enospc_retries.get(req.task_id, 0) == 1, (
+            f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
+        )
+
+    async def test_verify_exception_propagates_no_cleanup(self) -> None:
+        """(f) run_scoped_verification raises RuntimeError → exception propagates; merge_wt NOT cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestFinalizeAdvancedMerge — unit tests for the _finalize_advanced_merge helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeAdvancedMerge:
+    """Direct unit tests for the _finalize_advanced_merge module-level helper."""
+
+    def _make_git_ops(self, *, last_advanced_sha: str | None = 'abc123def') -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops._last_advanced_sha = last_advanced_sha
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-finalize-test'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+        return req
+
+    def _primed_dicts(self, task_id: str) -> tuple[dict, dict, dict]:
+        cas_retries = {task_id: 1}
+        timeouts = {task_id: 1}
+        enospc_retries = {task_id: 1}
+        return cas_retries, timeouts, enospc_retries
+
+    async def test_success_path_returns_done_pops_counters(self) -> None:
+        """(a) equivalence=[] + pyright not broken → done with merge_sha + push_main called; counters cleared."""
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done'
+        assert outcome.merge_sha == git_ops._last_advanced_sha
+        assert outcome.push_status == 'pushed'
+        git_ops.push_main.assert_awaited_once()
+        assert req.task_id not in cas_retries
+        assert req.task_id not in timeouts
+        assert req.task_id not in enospc_retries
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_equivalence_failure_blocks_no_push(self) -> None:
+        """(b) equivalence returns non-empty → blocked with equiv prefix; push NOT called."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['file.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()) as mock_pyright,
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        git_ops.push_main.assert_not_awaited()
+        mock_pyright.assert_not_awaited()
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_pyright_broken_blocks_no_push(self) -> None:
+        """(c) pyright .broken True → blocked with pyright prefix, failing subproject in reason; push NOT called."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_broken = MagicMock(broken=True, failing_subprojects=['mypackage'], detail='type error detail')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_broken)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        assert 'mypackage' in outcome.reason
+        git_ops.push_main.assert_not_awaited()
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_no_last_advanced_sha_uses_fallback(self) -> None:
+        """(d) _last_advanced_sha absent/None → advanced_sha falls back to merge_commit_fallback."""
+        from orchestrator.merge_queue import _finalize_advanced_merge
+
+        git_ops = self._make_git_ops(last_advanced_sha=None)
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='the-fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done'
+        assert outcome.merge_sha == 'the-fallback-sha'
+
+
+# ---------------------------------------------------------------------------
+# TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailure:
+    """Direct unit tests for the _map_advance_failure module-level helper."""
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops._last_recovery_branch = 'recovery/branch-abc'
+        git_ops._last_overlap_files = ['foo.py', 'bar.py']
+        git_ops._last_advanced_sha = 'adv-sha-123'
+        return git_ops
+
+    async def test_wip_overlap_halts_returns_wip_halted(self) -> None:
+        """(a) wip_overlap → halt called once, push NOT awaited, task_id STILL in cas_retries."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-adv-fail'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'wip_overlap',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'wip_halted'
+        assert outcome.overlap_files == git_ops._last_overlap_files
+        assert 'WIP overlaps merge diff:' in outcome.reason
+        halt.assert_called_once_with('advance_main: wip_overlap')
+        git_ops.push_main.assert_not_awaited()
+        assert task_id in cas_retries, 'wip_overlap must NOT pop cas_retries'
+
+    async def test_pop_conflict_halts_pushes_returns_done_wip_recovery(self) -> None:
+        """(b) pop_conflict → halt called, push_main awaited, done_wip_recovery with recovery branch."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-pop-conf'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.recovery_branch == git_ops._last_recovery_branch
+        assert outcome.push_status == 'pushed'
+        assert outcome.merge_sha == git_ops._last_advanced_sha
+        halt.assert_called_once_with('advance_main: pop_conflict')
+        git_ops.push_main.assert_awaited_once()
+
+    async def test_unmerged_state_halts_pops_retries(self) -> None:
+        """(c) unmerged_state → halt with unmerged message, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-unmerged'
+        cas_retries = {task_id: 2}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'unmerged_state',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'unmerged_state'
+        assert task_id in outcome.reason
+        assert 'unmerged_state' in outcome.reason
+        halt.assert_called_once()
+        assert 'unmerged_state' in halt.call_args[0][0]
+        assert task_id not in cas_retries
+
+    async def test_pop_conflict_no_advance_halts_pops_retries(self) -> None:
+        """(d) pop_conflict_no_advance → halt, recovery_branch from git_ops, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-no-adv'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict_no_advance',
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'wip_recovery_no_advance'
+        assert outcome.recovery_branch == git_ops._last_recovery_branch
+        halt.assert_called_once_with('advance_main: pop_conflict_no_advance')
+        assert task_id not in cas_retries
+
+    @pytest.mark.parametrize('result', ['not_descendant', 'contaminated', 'stash_failed'])
+    async def test_terminal_results_block_no_halt(self, result: str) -> None:
+        """(e) not_descendant/contaminated/stash_failed → blocked with exact reason, halt NOT called, cas_retries popped."""
+        from orchestrator.merge_queue import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = 'task-terminal'
+        cas_retries = {task_id: 3}
+
+        outcome = await _map_advance_failure(
+            git_ops, result,
+            task_id=task_id, merge_commit_fallback='fallback-sha',
+            halt=halt, cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason == f'advance_main failed ({result}) for task {task_id}'
+        halt.assert_not_called()
+        assert task_id not in cas_retries
+
+
+# ---------------------------------------------------------------------------
+# TestWipHaltMixin — unit tests pinning the _WipHaltMixin shared contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestWipHaltMixin:
+    """Pin the _WipHaltMixin contract as seen through both worker classes."""
+
+    def _make_worker(self, worker_cls: type) -> Any:
+        git_ops = MagicMock()
+        queue: asyncio.Queue = asyncio.Queue()
+        return worker_cls(git_ops, queue)
+
+    async def test_issubclass_pins_single_source(self, worker_cls: type) -> None:
+        """Both workers must subclass _WipHaltMixin (fails at import until S8)."""
+        from orchestrator.merge_queue import _WipHaltMixin
+
+        assert issubclass(MergeWorker, _WipHaltMixin)
+        assert issubclass(SpeculativeMergeWorker, _WipHaltMixin)
+
+    async def test_initial_state_not_halted(self, worker_cls: type) -> None:
+        """is_wip_halted is False immediately after construction."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        assert not worker.is_wip_halted
+
+    async def test_halt_for_wip_sets_halted(self, worker_cls: type) -> None:
+        """After halt_for_wip('x'), is_wip_halted True and halt_owner_esc_id still None."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('x')
+        assert worker.is_wip_halted
+        assert worker.halt_owner_esc_id is None
+
+    async def test_set_halt_owner_and_query(self, worker_cls: type) -> None:
+        """set_halt_owner('e1') → is_halt_owner('e1') True, is_halt_owner('e2') False, halt_owner_esc_id == 'e1'."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        assert worker.is_halt_owner('e1')
+        assert not worker.is_halt_owner('e2')
+        assert worker.halt_owner_esc_id == 'e1'
+
+    async def test_second_set_halt_owner_raises(self, worker_cls: type) -> None:
+        """A second set_halt_owner call raises AssertionError."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        with pytest.raises(AssertionError):
+            worker.set_halt_owner('e2')
+
+    async def test_unhalt_clears_state(self, worker_cls: type) -> None:
+        """After unhalt_wip(), is_wip_halted False and halt_owner_esc_id None."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        worker.unhalt_wip()
+        assert not worker.is_wip_halted
+        assert worker.halt_owner_esc_id is None
+
+    async def test_abandon_outcome_uses_prefix(self, worker_cls: type) -> None:
+        """_abandon_outcome('t', 3) → blocked MergeOutcome starting with ABANDONED_REASON_PREFIX containing 't'."""
+        from orchestrator.merge_queue import ABANDONED_REASON_PREFIX, _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        outcome = worker._abandon_outcome('t', 3)
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(ABANDONED_REASON_PREFIX)
+        assert 't' in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# TestHaltAdvanceResults — pin _HALT_ADVANCE_RESULTS module constant
+# ---------------------------------------------------------------------------
+
+
+class TestHaltAdvanceResults:
+    """Pins that _HALT_ADVANCE_RESULTS is a single module-level constant shared
+    by both workers, preventing silent MergeWorker/SpeculativeMergeWorker drift."""
+
+    def test_is_importable(self) -> None:
+        """_HALT_ADVANCE_RESULTS must be importable (fails before amendment)."""
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS  # noqa: F401
+
+    def test_contains_expected_results(self) -> None:
+        """All four halt-triggering advance_main results must be present."""
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
+
+        expected = frozenset({
+            'wip_overlap', 'pop_conflict',
+            'unmerged_state', 'pop_conflict_no_advance',
+        })
+        assert frozenset(_HALT_ADVANCE_RESULTS) == expected, (
+            f'_HALT_ADVANCE_RESULTS mismatch: {_HALT_ADVANCE_RESULTS!r}'
+        )
