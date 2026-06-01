@@ -8946,3 +8946,162 @@ class TestRebaseDeltaTouchedOverlap:
             f'Fail-closed: bogus ref must return non-empty sentinel, got {overlap!r}'
         )
         await git_ops.cleanup_merge_worktree(wt)
+
+
+# ---------------------------------------------------------------------------
+# TestReverifyRebasedTree — step-5 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReverifyRebasedTree:
+    """Unit tests for _reverify_rebased_tree shared gate.
+
+    The gate:
+    (a) Disjoint overlap → returns None, run_scoped_verification NOT called,
+        merge_wt still exists.
+    (b) Overlapping, green verify → returns None, run_scoped_verification
+        called exactly once, merge_wt still exists.
+    (c) Overlapping, red verify → returns blocked MergeOutcome,
+        merge_wt cleaned up.
+    """
+
+    async def _make_merge_wt(
+        self, git_ops: GitOps, branch_name: str, config: OrchestratorConfig,
+    ) -> tuple[Path, MergeRequest]:
+        """Create a branch, merge it, and return (merge_wt, req)."""
+        wt = await _make_branch_with_file(git_ops, branch_name, f'{branch_name}.py', 'x = 1\n')
+        result = await git_ops.merge_to_main(wt, branch_name)
+        assert result.success
+        assert result.merge_worktree is not None
+        req = _make_request(branch_name, branch_name, wt, config)
+        return result.merge_worktree, req
+
+    async def test_disjoint_no_reverify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a) Disjoint (overlap returns empty): gate returns None and does
+        NOT call run_scoped_verification.  merge_wt still exists.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-disjoint', config)
+        fork_sha = await git_ops.get_main_sha()
+        # Move main (so we have a rebased_onto)
+        (git_ops.project_root / 'rvrt_main.py').write_text('m = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=[]),  # disjoint
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Disjoint: expected None, got {result!r}'
+            )
+            verify_mock.assert_not_called()
+            assert merge_wt.exists(), 'merge_wt must still exist (not cleaned up)'
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_overlap_green_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(b) Overlapping + green verify: gate returns None,
+        run_scoped_verification called exactly once, merge_wt still exists.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
+        fork_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'rvrt_shared.py').write_text('s = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=['rvrt_shared.py']),  # overlapping
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Green verify: expected None, got {result!r}'
+            )
+            verify_mock.assert_called_once()
+            assert merge_wt.exists(), 'merge_wt must still exist after green verify'
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_overlap_red_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(c) Overlapping + red verify: gate returns blocked MergeOutcome,
+        merge_wt cleaned up.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
+        fork_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'rvrt_red.py').write_text('r = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_fail = AsyncMock(return_value=MagicMock(
+            passed=False, summary='Test failed', timed_out=False,
+            failure_report=MagicMock(return_value=None),
+        ))
+
+        with (
+            patch(
+                'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                new=AsyncMock(return_value=['rvrt_red.py']),  # overlapping
+            ),
+            patch('orchestrator.merge_queue.run_scoped_verification', verify_fail),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from=fork_sha,
+                rebased_onto=rebased_onto,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+            )
+        assert result is not None, 'Red verify: expected a MergeOutcome, got None'
+        assert isinstance(result, MergeOutcome)
+        assert result.status == 'blocked', (
+            f'Red verify: expected blocked status, got {result.status!r}'
+        )
+        # _run_post_merge_verify cleans up merge_wt on failure
+        assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
