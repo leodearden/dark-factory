@@ -375,6 +375,102 @@ async def _run_post_merge_verify(
     return None
 
 
+async def _finalize_advanced_merge(
+    git_ops: GitOps,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    *,
+    merge_commit_fallback: str,
+    base_sha: str,
+    started_monotonic: float,
+    cas_retries: dict[str, int],
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    log_label: str = '',
+) -> MergeOutcome:
+    """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
+
+    Pops per-task counters, resolves the advanced SHA, runs the
+    equivalence and pyright gates, and returns a :class:`MergeOutcome`.
+    Does **not** touch *merge_wt* — callers must clean it up before
+    calling this function (MergeWorker already does so right after
+    ``advance_main``; SpeculativeMergeWorker moves its pre-pyright
+    cleanup to before this call).
+
+    *log_label* is interpolated into warning log messages so each
+    worker can retain its current log prefix
+    (``''`` for MergeWorker, ``' (speculative)'`` for
+    SpeculativeMergeWorker).
+    """
+    cas_retries.pop(req.task_id, None)
+    timeouts.pop(req.task_id, None)
+    enospc_retries.pop(req.task_id, None)
+    # Use the post-rebase SHA actually placed on main (advance_main
+    # rebases on CAS retry; merge_commit_fallback is the stale
+    # pre-rebase SHA and would fail done_provenance ancestor check).
+    advanced_sha = getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
+
+    # Decision-2 post-merge content-equivalence check.
+    equiv_failed = await _check_post_merge_equivalence(
+        req.worktree, advanced_sha, git_ops, base_sha,
+        task_id=req.task_id,
+    )
+    if equiv_failed:
+        logger.warning(
+            'Task %s%s: post-merge equivalence failed — '
+            'branch HEAD and advanced main %s diverge in: %r',
+            req.task_id, log_label, advanced_sha[:12], equiv_failed,
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id,
+            'post_merge_equivalence_failed',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                f'branch and main diverge in '
+                f'{", ".join(equiv_failed)}. '
+                f'Conflict resolution likely dropped or rewrote '
+                f'work; review {advanced_sha[:12]} against the '
+                f'task branch tip.'
+            ),
+        )
+
+    # Decision-3 post-merge unscoped type-check.
+    pyright_result = await _check_post_merge_pyright(
+        advanced_sha, git_ops, req.config, req.module_configs,
+        task_id=req.task_id,
+    )
+    if pyright_result.broken:
+        logger.warning(
+            'Task %s%s: post-merge unscoped type-check failed for %s on %s',
+            req.task_id, log_label,
+            ', '.join(pyright_result.failing_subprojects),
+            advanced_sha[:12],
+        )
+        _emit_merge_attempt(
+            event_store, req.task_id,
+            'post_merge_pyright_broken',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                f'post-merge unscoped type-check failed for '
+                f'{", ".join(pyright_result.failing_subprojects)} '
+                f'on {advanced_sha[:12]}. {pyright_result.detail}'
+            ),
+        )
+
+    logger.info(f'Task {req.task_id}: merged to main successfully')
+    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(started_monotonic))
+    push_status = await git_ops.push_main()
+    return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
+
+
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
@@ -1977,89 +2073,15 @@ class MergeWorker:
         await self._git_ops.cleanup_merge_worktree(merge_wt)
 
         if result == 'advanced':
-            self._cas_retries.pop(req.task_id, None)
-            # Loop-breaker counter: a successful merge means whatever caused
-            # the earlier timeouts has cleared (e.g. test was flaky, host
-            # contention eased).  Reset so future timeouts start from 0.
-            self._post_merge_verify_timeouts.pop(req.task_id, None)
-            # Same for the ENOSPC retry budget — disk pressure has cleared.
-            self._post_merge_verify_enospc_retries.pop(req.task_id, None)
-            # Use the post-rebase SHA actually placed on main (advance_main
-            # rebases on CAS retry; merge_result.merge_commit is the stale
-            # pre-rebase SHA and would fail done_provenance ancestor check).
-            advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                or merge_result.merge_commit
-
-            # Decision-2 post-merge content-equivalence check: the branch's
-            # tip and the advanced main SHA must agree on every non-.task/
-            # path.  Catches conflict-resolution drops and rebase regressions
-            # that would otherwise land silently with a "successful merge"
-            # log line.  Loud failure here is preferable to a stuck-done
-            # task discovered hours later.
-            equiv_failed = await _check_post_merge_equivalence(
-                req.worktree, advanced_sha, self._git_ops, main_sha,
-                task_id=req.task_id,
+            return await _finalize_advanced_merge(
+                self._git_ops, req, self._event_store,
+                merge_commit_fallback=merge_result.merge_commit,
+                base_sha=main_sha,
+                started_monotonic=t0,
+                cas_retries=self._cas_retries,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
             )
-            if equiv_failed:
-                logger.warning(
-                    'Task %s: post-merge equivalence failed — '
-                    'branch HEAD and advanced main %s diverge in: %r',
-                    req.task_id, advanced_sha[:12], equiv_failed,
-                )
-                _emit_merge_attempt(
-                    self._event_store, req.task_id,
-                    'post_merge_equivalence_failed',
-                    duration_ms=_elapsed_ms(t0),
-                )
-                return MergeOutcome(
-                    'blocked',
-                    reason=(
-                        f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
-                        f'branch and main diverge in '
-                        f'{", ".join(equiv_failed)}. '
-                        f'Conflict resolution likely dropped or rewrote '
-                        f'work; review {advanced_sha[:12]} against the '
-                        f'task branch tip.'
-                    ),
-                )
-
-            # Decision-3 post-merge unscoped type-check: catch cross-PR union
-            # breaks that per-PR scoped verify cannot detect (PR A widens a
-            # Protocol; PR B, verified against pre-A main, adds a conformer
-            # satisfying the OLD Protocol; only the post-merge whole-package
-            # check catches the missing method after both land).
-            # No-op when module_configs is empty (preserves existing tests).
-            # Merge has already landed; we never revert — skip push instead.
-            pyright_result = await _check_post_merge_pyright(
-                advanced_sha, self._git_ops, req.config, req.module_configs,
-                task_id=req.task_id,
-            )
-            if pyright_result.broken:
-                logger.warning(
-                    'Task %s: post-merge unscoped type-check failed for %s on %s',
-                    req.task_id,
-                    ', '.join(pyright_result.failing_subprojects),
-                    advanced_sha[:12],
-                )
-                _emit_merge_attempt(
-                    self._event_store, req.task_id,
-                    'post_merge_pyright_broken',
-                    duration_ms=_elapsed_ms(t0),
-                )
-                return MergeOutcome(
-                    'blocked',
-                    reason=(
-                        f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-                        f'post-merge unscoped type-check failed for '
-                        f'{", ".join(pyright_result.failing_subprojects)} '
-                        f'on {advanced_sha[:12]}. {pyright_result.detail}'
-                    ),
-                )
-
-            logger.info(f'Task {req.task_id}: merged to main successfully')
-            _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            push_status = await self._git_ops.push_main()
-            return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
@@ -3203,95 +3225,25 @@ class SpeculativeMergeWorker:
             )
 
             if result == 'advanced':
-                self._cas_retries.pop(req.task_id, None)
-                # Loop-breaker counter reset on success — see MergeWorker.
-                self._post_merge_verify_timeouts.pop(req.task_id, None)
-                # ENOSPC retry budget reset on success — see MergeWorker.
-                self._post_merge_verify_enospc_retries.pop(req.task_id, None)
-                # Use the post-rebase SHA actually placed on main (see
-                # advance_main docstring — local merge_commit is stale
-                # after a CAS-retry rebase and fails done_provenance
-                # ancestor check).
-                advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                    or merge_commit
-
-                # Decision-2 post-merge content-equivalence check (see
-                # MergeWorker for full rationale).  Speculative path runs
-                # the same gate so an over-eager rebase doesn't drop work.
-                # item.base_sha is the pre-merge main tip the merge was
-                # computed against (== base_for_merge); using it keeps the
-                # subtraction rebase-robust through the CAS-retry loop above.
-                equiv_failed = await _check_post_merge_equivalence(
-                    req.worktree, advanced_sha, self._git_ops, item.base_sha,
-                    task_id=req.task_id,
-                )
-                if equiv_failed:
-                    logger.warning(
-                        'Task %s (speculative): post-merge equivalence '
-                        'failed — branch HEAD and advanced main %s '
-                        'diverge in: %r',
-                        req.task_id, advanced_sha[:12], equiv_failed,
-                    )
-                    _emit_merge_attempt(
-                        self._event_store, req.task_id,
-                        'post_merge_equivalence_failed',
-                        duration_ms=_elapsed_ms(item.started_monotonic),
-                    )
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
-                                f'branch and main diverge in '
-                                f'{", ".join(equiv_failed)}. '
-                                f'Conflict resolution likely dropped or '
-                                f'rewrote work; review {advanced_sha[:12]} '
-                                f'against the task branch tip.'
-                            ),
-                        ))
-                    return True
-
-                # Cleanup merge_wt BEFORE the pyright check: the pyright helper
-                # creates its own detached worktree at advanced_sha, so keeping
-                # merge_wt alive here would briefly double the worktree count
-                # — doubling disk pressure in ENOSPC scenarios.  Mirrors the
-                # MergeWorker ordering at _do_merge line ~1455.
+                # Cleanup merge_wt BEFORE the finalize gate: neither the
+                # equivalence check (uses req.worktree) nor the pyright check
+                # (builds its own detached worktree) reads merge_wt — cleaning
+                # it here lowers peak worktree count under disk pressure and
+                # mirrors MergeWorker which already cleans merge_wt right after
+                # advance_main.
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
-                pyright_result = await _check_post_merge_pyright(
-                    advanced_sha, self._git_ops, req.config, req.module_configs,
-                    task_id=req.task_id,
+                outcome = await _finalize_advanced_merge(
+                    self._git_ops, req, self._event_store,
+                    merge_commit_fallback=merge_commit,
+                    base_sha=item.base_sha,
+                    started_monotonic=item.started_monotonic,
+                    cas_retries=self._cas_retries,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    log_label=' (speculative)',
                 )
-                if pyright_result.broken:
-                    logger.warning(
-                        'Task %s (speculative): post-merge unscoped type-check '
-                        'failed for %s on %s',
-                        req.task_id,
-                        ', '.join(pyright_result.failing_subprojects),
-                        advanced_sha[:12],
-                    )
-                    _emit_merge_attempt(
-                        self._event_store, req.task_id,
-                        'post_merge_pyright_broken',
-                        duration_ms=_elapsed_ms(item.started_monotonic),
-                    )
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-                                f'post-merge unscoped type-check failed for '
-                                f'{", ".join(pyright_result.failing_subprojects)} '
-                                f'on {advanced_sha[:12]}. {pyright_result.detail}'
-                            ),
-                        ))
-                    return True
-
-                logger.info(f'Task {req.task_id}: merged to main successfully')
-                _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
-                push_status = await self._git_ops.push_main()
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
+                    req.result.set_result(outcome)
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):
