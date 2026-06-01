@@ -131,7 +131,6 @@ class StaleServiceRestartCoordinator:
         # State
         self._pending: bool = False
         self._last_request_monotonic: float = 0.0
-        self._last_restart_monotonic: float = 0.0
         # Accumulated trigger metadata for the current pending burst
         self._trigger_task_ids: list[str] = []
         self._trigger_merge_shas: list[str] = []
@@ -169,7 +168,12 @@ class StaleServiceRestartCoordinator:
             return False
 
         changed = await self._git_ops.get_merge_diff_files(base_sha, head_sha)
-        if not diff_touches_watched_paths(changed, self._watch_prefixes):
+        # Compute the matched subset once — used for both the gate decision and
+        # the log count, avoiding a redundant O(files × prefixes) re-scan.
+        watched_changed = [
+            f for f in changed if diff_touches_watched_paths([f], self._watch_prefixes)
+        ]
+        if not watched_changed:
             return False
 
         # Arm / re-arm
@@ -182,7 +186,7 @@ class StaleServiceRestartCoordinator:
             ' watched file(s)',
             head_sha[:12],
             task_id,
-            len([f for f in changed if diff_touches_watched_paths([f], self._watch_prefixes)]),
+            len(watched_changed),
         )
         return True
 
@@ -207,7 +211,21 @@ class StaleServiceRestartCoordinator:
         trigger_merge_shas = list(self._trigger_merge_shas)
 
         executor = self._restart_executor or self._default_restart_executor
-        await executor()
+        try:
+            await executor()
+        except Exception:
+            logger.warning(
+                'fused-memory restart executor failed; clearing pending to avoid'
+                ' a crash-loop on a permanently-missing or non-executable script.'
+                ' A new note_merge will re-arm.',
+                exc_info=True,
+            )
+            # Clear pending so subsequent idle ticks don't re-attempt and
+            # crash the orchestrator (fail-open, matching the design intent).
+            self._pending = False
+            self._trigger_task_ids = []
+            self._trigger_merge_shas = []
+            return False
 
         # Emit observability event
         if self._event_store is not None:
@@ -235,7 +253,6 @@ class StaleServiceRestartCoordinator:
         self._pending = False
         self._trigger_task_ids = []
         self._trigger_merge_shas = []
-        self._last_restart_monotonic = self._clock()
 
         return True
 

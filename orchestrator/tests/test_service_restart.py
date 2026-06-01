@@ -344,6 +344,67 @@ async def test_maybe_restart_idempotent_no_double_fire() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Executor-raises: fail-open robustness (amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_executor_raises_does_not_propagate(caplog: pytest.LogCaptureFixture) -> None:
+    """When the restart executor raises, maybe_restart returns False (fail-open).
+
+    The exception must NOT propagate — a missing/non-executable script must never
+    crash the orchestrator's run-forever loop.  Pending is also cleared so that
+    subsequent idle ticks don't retry and crash repeatedly.
+    """
+    import logging
+
+    raising_executor = AsyncMock(side_effect=FileNotFoundError('script not found'))
+    coord, current_time, _, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=120.0,
+        restart_executor=raising_executor,
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-42', 'base_sha', 'head_sha')
+    assert coord.is_pending
+
+    # Advance past debounce — executor would fire, but raises
+    current_time[0] = 1200.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=True)
+
+    # Fail-open: no propagation
+    assert result is False
+    # Pending cleared — subsequent ticks must not retry
+    assert coord.is_pending is False
+    # A warning with exc_info should have been logged
+    assert any('executor failed' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() -> None:
+    """After an executor failure, is_pending is False — subsequent idle ticks are no-ops."""
+    raising_executor = AsyncMock(side_effect=OSError('permission denied'))
+    coord, current_time, _, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_executor=raising_executor,
+    )
+    current_time[0] = 0.0
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # First call: executor raises, fail-open
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert not coord.is_pending
+
+    # Second call: no pending, must be a no-op (executor called exactly once total)
+    result2 = await coord.maybe_restart(agents_idle=True)
+    assert result2 is False
+    raising_executor.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Burst-coalescing (step-7) + default executor tests
 # ---------------------------------------------------------------------------
 
