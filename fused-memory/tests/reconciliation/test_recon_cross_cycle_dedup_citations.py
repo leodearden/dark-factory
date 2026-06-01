@@ -20,6 +20,16 @@ Verifies end-to-end that a null-task_id cross_project finding:
 Only stage2.py is edited (step-2, step-6); the dedup machinery tested here
 (compute_flag_signature, dedup_flags, _derive_affected_ids,
 compute_content_fingerprint) already landed on main via task-1573's siblings.
+
+NOTE — Coverage scope
+---------------------
+The only production change in this diff is the stage2.py prompt edit.  These
+tests do NOT assert the prompt's text; they are contract/characterization tests
+that pin the dedup machinery the prompt directs the LLM to use.
+TestUnknownProjectBranchHasNoAnchor in particular locks in the
+known-projects ↔ cite_task-success equivalence that motivated step-6's
+correction.  Prompt-behaviour verification lives in the LLM eval/cutover
+end-to-end suite (test_cutover_end_to_end.py), not here.
 """
 
 from __future__ import annotations
@@ -92,12 +102,17 @@ def _make_search_stub(
     return _stub
 
 
-def _build_state_with_reify_project() -> ReconReportState:
-    """Build a ReconReportState with 'reify' registered for cite_task.
+def _build_state(register_reify: bool = True) -> ReconReportState:
+    """Build a ReconReportState for cite_task tests.
 
-    The task_interceptor mock returns a minimal task dict so that
-    cite_task(project_id='reify', task_id='3803') succeeds.
-    No memory_service is needed for this scope (no entity/edge/memory cites).
+    When *register_reify* is True (default) the 'reify' project is added to
+    ``known_projects`` so that ``cite_task(project_id='reify', ...)`` succeeds.
+    When False, 'reify' is NOT registered and cite_task returns
+    ``unknown_project`` without attaching any anchor.
+
+    The task_interceptor mock is always non-None so tests can assert whether
+    ``get_task`` was (not) awaited.  No memory_service is needed for this
+    scope (no entity/edge/memory cites).
     """
     task_interceptor = AsyncMock()
     task_interceptor.get_task = AsyncMock(return_value={
@@ -110,31 +125,8 @@ def _build_state_with_reify_project() -> ReconReportState:
         clock=lambda: 0.0,  # deterministic; avoid asyncio.get_running_loop() in start_report
         task_interceptor=task_interceptor,
     )
-    state.known_projects['reify'] = '/tmp/reify'
-    return state
-
-
-def _build_state_without_reify() -> ReconReportState:
-    """Build a ReconReportState WITHOUT 'reify' in known_projects.
-
-    Mirrors _build_state_with_reify_project but SKIPS the
-    ``state.known_projects['reify'] = ...`` line, so cite_task for
-    project_id='reify' returns 'unknown_project' and attaches nothing.
-    The task_interceptor mock is still non-None so the test can assert
-    it is never called (the known_projects guard short-circuits first).
-    """
-    task_interceptor = AsyncMock()
-    task_interceptor.get_task = AsyncMock(return_value={
-        'title': 'Reify foreign task 3803',
-        'data': {},
-    })
-
-    state = ReconReportState(
-        ttl_seconds=3600,
-        clock=lambda: 0.0,
-        task_interceptor=task_interceptor,
-    )
-    # known_projects intentionally left empty — 'reify' is NOT registered
+    if register_reify:
+        state.known_projects['reify'] = '/tmp/reify'
     return state
 
 
@@ -158,7 +150,7 @@ class TestCrossProjectFindingCarriesCitedTasks:
     @pytest.mark.asyncio
     async def test_cross_project_finding_carries_cited_tasks(self):
         """cite_task on a null-task_id finding adds to cited_tasks without altering task_id."""
-        state = _build_state_with_reify_project()
+        state = _build_state()
         state.start_report(_RUN_ID, _STAGE, _PROJECT_ID)
 
         r = state.add_finding(
@@ -513,7 +505,7 @@ class TestUnknownProjectBranchHasNoAnchor:
     async def test_cite_task_unknown_project_attaches_no_anchor(self):
         """cite_task on an unregistered project returns unknown_project and
         leaves cited_tasks empty — no anchor is attached in the unknown branch."""
-        state = _build_state_without_reify()
+        state = _build_state(register_reify=False)
         state.start_report(_RUN_ID, _STAGE, _PROJECT_ID)
 
         r = state.add_finding(
