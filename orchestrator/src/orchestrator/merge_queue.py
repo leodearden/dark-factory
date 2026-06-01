@@ -1883,6 +1883,27 @@ async def _do_train_merge(
        re-enqueuing directly) is correct — the orchestrator will re-dispatch on
        the next scheduler tick.
 
+    6. ``wip_halted`` / ``done_wip_recovery`` → human escalation for trains:
+       ``_map_advance_failure`` can return ``wip_halted`` (on ``wip_overlap``)
+       or ``done_wip_recovery`` (on ``pop_conflict`` — which also calls
+       ``push_main`` and creates a recovery branch).  For a *single* task these
+       statuses trigger automatic recovery in ``workflow.py``
+       (``_handle_wip_conflict`` / ``_handle_wip_recovery``).  For trains the
+       GroupMergeRequest consumer in ``workflow.py`` does not branch on these
+       statuses; both fall through to ``_mark_blocked(escalate_to_human=True)``.
+
+       This means:
+       • ``wip_overlap`` halts the merge queue AND leaves it halted until a
+         human manually unhalts (no auto-recovery for trains, unlike single tasks).
+       • ``pop_conflict`` lands the train merge commit on main, creates a
+         recovery branch, but does NOT flip members and escalates to human
+         (a main-landed-but-tasks-blocked split-brain, resolved by human).
+
+       Both are *safe-by-escalation*, not silent faults — a human is notified
+       in both cases.  Auto-recovery parity is a follow-up concern; closing
+       the gap requires modifying ``workflow.py``'s GroupMergeRequest consumer
+       (currently outside task 1596's scope).
+
     Implements PRD δ₁ spec §9.6:
     (a) Status pre-check — all members must be ``merge-deferred``.
     (b) Tip rebase — ``rebase_onto_main`` rebases the tip onto current main;
@@ -2087,6 +2108,15 @@ async def _do_train_merge(
         # All other codes (wip_overlap, pop_conflict, unmerged_state, …) route
         # through the shared failure mapper so the train gets the same
         # wip-halt + escalation routing as the single-task path.
+        #
+        # NOTE — behaviour-asymmetry (documented in docstring delta #6):
+        # _map_advance_failure can return wip_halted (wip_overlap) or
+        # done_wip_recovery (pop_conflict).  For single tasks workflow.py
+        # handles these with _handle_wip_conflict / _handle_wip_recovery.
+        # For trains the GroupMergeRequest consumer falls through to
+        # _mark_blocked(escalate_to_human=True) in both cases — intentional
+        # safe-by-escalation behaviour; auto-recovery parity is a follow-up
+        # (requires changes to workflow.py, outside task 1596 scope).
         outcome = await _map_advance_failure(
             git_ops, adv,
             task_id=req.task_id,
