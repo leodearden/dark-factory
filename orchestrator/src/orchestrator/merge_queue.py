@@ -917,6 +917,131 @@ async def _check_post_merge_equivalence(
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
+# Sentinel returned by _rebase_delta_touched_overlap when a git error makes
+# the overlap status unknowable.  Any non-empty list causes the caller to
+# re-verify (fail-CLOSED policy).
+_OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
+
+
+async def _rebase_delta_touched_overlap(
+    task_worktree: Path,
+    rebased_from: str,
+    rebased_onto: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str]:
+    """Return the sorted intersection of branch-touched and intervening-delta files.
+
+    Determines whether the post-rebase tree needs re-verification by checking
+    whether the intervening main churn (``rebased_from`` → ``rebased_onto``)
+    overlaps with the files the branch itself changed.
+
+    Algorithm
+    ---------
+    1. Resolve ``branch_head`` from ``task_worktree`` HEAD.
+    2. Compute ``base = merge-base(branch_head, rebased_from)`` — the common
+       ancestor of the branch and the pre-churn main.
+    3. ``branch_touched = diff(base..branch_head) --no-renames :!.task/``
+    4. ``intervening   = diff(rebased_from..rebased_onto) --no-renames :!.task/``
+    5. Return ``sorted(set(branch_touched) & set(intervening))``.
+
+    Fail-CLOSED policy
+    ------------------
+    Any non-zero git return code causes the function to return the module-level
+    ``_OVERLAP_GIT_ERROR_SENTINEL`` (a non-empty list), so the caller
+    re-verifies rather than skipping the gate on uncertainty.  This is the
+    opposite of ``_check_post_merge_equivalence``, which fails open, because
+    here a false-skip of re-verify risks landing a broken main (catastrophic),
+    whereas a false-trigger of re-verify costs only throughput.
+
+    Parameters
+    ----------
+    task_worktree:
+        Worktree whose HEAD is the branch tip.
+    rebased_from:
+        The main SHA the branch was originally merged against (original
+        ``expected_main`` before main moved).
+    rebased_onto:
+        The current main SHA the branch was rebased onto.
+    git_ops:
+        Provides ``project_root`` for cross-worktree git operations.
+    task_id:
+        Optional task identifier for log messages.
+    """
+    label = task_id or '<unknown>'
+
+    # 1. Resolve branch HEAD
+    rc, head_out, head_err = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: rev-parse HEAD failed in %s '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            task_worktree, rc, head_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    branch_head = head_out.strip()
+
+    # 2. merge-base(branch_head, rebased_from) → common fork point
+    rc, mb_out, mb_err = await _run(
+        ['git', 'merge-base', branch_head, rebased_from],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: merge-base %s %s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            branch_head[:8], rebased_from[:8] if len(rebased_from) >= 8 else rebased_from,
+            rc, mb_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    base = mb_out.strip()
+
+    # 3. branch_touched: files the branch changed since the fork point
+    rc, bt_out, bt_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base, branch_head, '--', ':!.task/',
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: branch-touched diff %s..%s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            base[:8], branch_head[:8], rc, bt_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    branch_touched = {ln.strip() for ln in bt_out.splitlines() if ln.strip()}
+
+    if not branch_touched:
+        # Branch touched nothing (e.g. pure .task/ commit) — no overlap possible.
+        return []
+
+    # 4. intervening: files changed on main from rebased_from to rebased_onto
+    rc, iv_out, iv_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            rebased_from, rebased_onto, '--', ':!.task/',
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: intervening diff %s..%s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            rebased_from[:8] if len(rebased_from) >= 8 else rebased_from,
+            rebased_onto[:8], rc, iv_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    intervening = {ln.strip() for ln in iv_out.splitlines() if ln.strip()}
+
+    # 5. Intersection → sorted for deterministic output
+    return sorted(branch_touched & intervening)
+
+
 # Maximum number of characters to include in the detail field of a
 # ``PostMergePyrightResult`` — keeps the blocked reason string in the
 # escalation payload under reasonable size limits.
