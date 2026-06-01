@@ -1044,7 +1044,7 @@ async def _rebase_delta_touched_overlap(
 
 async def _reverify_rebased_tree(
     git_ops: GitOps,
-    req: 'MergeRequest',
+    req: MergeRequest,
     merge_wt: Path,
     *,
     rebased_from: str,
@@ -1053,7 +1053,7 @@ async def _reverify_rebased_tree(
     enospc_retries: dict[str, int],
     max_timeouts: int,
     max_enospc: int,
-) -> 'MergeOutcome | None':
+) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
     Called by the SpeculativeMergeWorker CAS loop after
