@@ -2358,3 +2358,60 @@ class TestGate07TrainPushAndTelemetry:
         assert done_evt["data"].get("member_task_ids") == req.member_task_ids, (
             f"done event missing member_task_ids; payload: {done_evt['data']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 09: wip_overlap halts the train — step-09 RED / step-10 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGate09TrainWipOverlapHalt:
+    """step-09 RED: advance_main returns 'wip_overlap' but the train returns
+    a generic 'blocked' instead of routing through _map_advance_failure.
+
+    After step-10 (GREEN): non-'advanced' / non-'cas_failed' advance results
+    route through _map_advance_failure so trains get wip_halted + is_wip_halted.
+    """
+
+    async def test_train_wip_overlap_halts_queue(self, tmp_path: Path) -> None:
+        """wip_overlap from advance_main must halt the queue; no member flips."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-wip-halt",
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        _OVERLAP_FILES = ["crate_a/src/lib.rs"]
+
+        async def _wip_overlap_advance(*args: Any, **kwargs: Any) -> str:
+            git_ops._last_overlap_files = _OVERLAP_FILES
+            return "wip_overlap"
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch.object(
+                git_ops, "advance_main",
+                side_effect=_wip_overlap_advance,
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == "wip_halted", (
+            f"expected wip_halted, got: {outcome!r}"
+        )
+        assert outcome.overlap_files == _OVERLAP_FILES, (
+            f"expected overlap_files={_OVERLAP_FILES!r}, got: {outcome.overlap_files!r}"
+        )
+        assert worker.is_wip_halted, (
+            "expected worker.is_wip_halted to be True after wip_overlap"
+        )
+        # No member flips — main did NOT land cleanly.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"expected 0 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
+        )
