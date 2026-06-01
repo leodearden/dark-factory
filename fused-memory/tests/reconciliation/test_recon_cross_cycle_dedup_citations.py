@@ -334,3 +334,121 @@ class TestSignaturePathCrossCycleDedup:
         assert result[0].get('last_seen_run_id') == 'r1', (
             f'Expected last_seen_run_id="r1", got {result[0].get("last_seen_run_id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Premise (3): escalation fingerprint path folds on cited_tasks (step-4)
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintPathCrossCycleFold:
+    """Premise (3) — harness._derive_affected_ids folds on cited_tasks across
+    cycles so compute_content_fingerprint is stable despite prose drift.
+
+    These tests guard on importorskip('escalation.dedupe'), mirroring harness.py's
+    conditional HAS_ESCALATION import.  If the escalation package is absent the
+    tests skip cleanly rather than ImportError.
+
+    Design contract verified here:
+    - When affected_ids is NON-EMPTY (because _derive_affected_ids extracts
+      task_id '3803' from cited_tasks), compute_content_fingerprint ignores the
+      description → SAME fingerprint across cycles despite prose drift.
+    - When affected_ids is EMPTY (citation-less finding), the fingerprint falls
+      back to hashing the normalised description → DIFFERENT fingerprints when
+      descriptions differ.  This is the failure mode that stage2.py's edit fixes.
+    """
+
+    def test_derive_affected_ids_extracts_task_id_from_cited_tasks(self):
+        """_derive_affected_ids extracts task_id from cited_tasks (cited_tasks first)."""
+        from fused_memory.reconciliation.harness import _derive_affected_ids
+
+        finding = {
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+        }
+        result = _derive_affected_ids(finding)
+        assert result == ['3803'], (
+            f'_derive_affected_ids must return ["3803"] from cited_tasks; got {result!r}'
+        )
+
+    def test_fingerprint_identical_across_prose_drift_when_cited_tasks_match(self):
+        """Same cited_tasks + different description → SAME fingerprint.
+
+        When affected_ids is non-empty, compute_content_fingerprint ignores the
+        description.  Two cycle instances of the same cross_project finding
+        (same cited_tasks, drifted prose) must produce an identical fingerprint
+        so the escalation dedup system folds them instead of re-escalating.
+        """
+        escalation_dedupe = pytest.importorskip('escalation.dedupe')
+        compute_content_fingerprint = escalation_dedupe.compute_content_fingerprint
+        from fused_memory.reconciliation.harness import _derive_affected_ids
+
+        finding_cycle1 = {
+            'category': 'cross_project_routing',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'description': 'Cycle 1: reify/3803 — orphaned edge needs operator routing',
+        }
+        finding_cycle2 = {
+            'category': 'cross_project_routing',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'description': 'Cycle 2: reify/3803 remains unrouted (summary has drifted)',
+        }
+
+        fp1 = compute_content_fingerprint(
+            'recon_integrity_issue',
+            finding_cycle1.get('category', ''),
+            _derive_affected_ids(finding_cycle1),
+            finding_cycle1.get('description', ''),
+        )
+        fp2 = compute_content_fingerprint(
+            'recon_integrity_issue',
+            finding_cycle2.get('category', ''),
+            _derive_affected_ids(finding_cycle2),
+            finding_cycle2.get('description', ''),
+        )
+
+        assert fp1 == fp2, (
+            'Same cited_tasks but different prose must produce IDENTICAL fingerprints '
+            f'(non-empty affected_ids ignores description); fp1={fp1!r}, fp2={fp2!r}'
+        )
+
+    def test_fingerprint_differs_when_citation_less_descriptions_drift(self):
+        """Empty cited_tasks + different description → DIFFERENT fingerprints.
+
+        This is the failure mode that step-2's stage2.py edit fixes:
+        without cite_task, cited_tasks=[] → _derive_affected_ids=[] →
+        fingerprint falls back to hashing the normalised description →
+        two cycles with drifted prose produce different fingerprints →
+        the finding re-escalates every cycle.
+        """
+        escalation_dedupe = pytest.importorskip('escalation.dedupe')
+        compute_content_fingerprint = escalation_dedupe.compute_content_fingerprint
+        from fused_memory.reconciliation.harness import _derive_affected_ids
+
+        finding_no_cite_1 = {
+            'category': 'cross_project_routing',
+            'cited_tasks': [],
+            'description': 'Cycle 1: cross-project issue alpha — unique prose',
+        }
+        finding_no_cite_2 = {
+            'category': 'cross_project_routing',
+            'cited_tasks': [],
+            'description': 'Cycle 2: cross-project issue beta — description has drifted',
+        }
+
+        fp1 = compute_content_fingerprint(
+            'recon_integrity_issue',
+            finding_no_cite_1.get('category', ''),
+            _derive_affected_ids(finding_no_cite_1),
+            finding_no_cite_1.get('description', ''),
+        )
+        fp2 = compute_content_fingerprint(
+            'recon_integrity_issue',
+            finding_no_cite_2.get('category', ''),
+            _derive_affected_ids(finding_no_cite_2),
+            finding_no_cite_2.get('description', ''),
+        )
+
+        assert fp1 != fp2, (
+            'Citation-less findings with different descriptions must produce DIFFERENT '
+            f'fingerprints (description-hash fallback); fp1={fp1!r}, fp2={fp2!r}'
+        )
