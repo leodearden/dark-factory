@@ -2250,3 +2250,111 @@ class TestGate05TrainPostMergeEquivalence:
             "expected advance_main to have run (merge commit present on main); "
             f"main SHA={main_sha_after.strip()!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Gate test 07: push_main + train telemetry — step-07 RED / step-08 GREEN
+# ---------------------------------------------------------------------------
+
+
+class _SpyEventStore:
+    """Minimal event store that collects emitted events for inspection.
+
+    Provides the same ``emit`` interface as :class:`EventStore` but stores
+    events in-memory.  Used by gate tests that need to inspect event payloads
+    without creating a real SQLite database.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: Any = None,
+        phase: Any = None,
+        role: Any = None,
+        data: dict | None = None,
+        cost_usd: Any = None,
+        duration_ms: Any = None,
+    ) -> None:
+        self.events.append({
+            "event_type": str(event_type),
+            "task_id": task_id,
+            "data": data or {},
+        })
+
+    def by_type(self, event_type_str: str) -> list[dict]:
+        return [e for e in self.events if e["event_type"] == event_type_str]
+
+
+@pytest.mark.asyncio
+class TestGate07TrainPushAndTelemetry:
+    """step-07 RED: finalize emits merge_attempt 'done' without train_id/member_task_ids.
+
+    After step-08 (GREEN): _finalize_advanced_merge accepts train_id and
+    member_task_ids kwargs and threads them into its _emit_merge_attempt calls.
+    """
+
+    async def test_train_pushes_main_and_tags_telemetry_on_success(
+        self, tmp_path: Path,
+    ) -> None:
+        """Happy train: push_main fires once, all members flip, done event tagged."""
+        git_ops, config, req = await _setup_gate_train(
+            tmp_path, train_id="train-push-telemetry",
+        )
+
+        spy_store = _SpyEventStore()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        # Pass the spy event store to the worker.
+        worker = MergeWorker(git_ops, queue, event_store=spy_store)  # type: ignore[arg-type]
+
+        with (
+            patch(
+                "orchestrator.merge_queue.run_scoped_verification",
+                AsyncMock(return_value=_make_passing_verify_result()),
+            ),
+            patch.object(
+                git_ops, "push_main",
+                AsyncMock(return_value="pushed"),
+            ) as mock_push,
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (1) Outcome is done with push_status set by finalize.
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done, got: {outcome!r}"
+        assert outcome.push_status == "pushed", (
+            f"expected push_status='pushed', got: {outcome.push_status!r}"
+        )
+
+        # (2) push_main called exactly once.
+        mock_push.assert_awaited_once()
+
+        # (3) All members flipped.
+        assert req.mark_member_done.call_count == len(req.member_task_ids), (  # type: ignore[union-attr]
+            f"expected {len(req.member_task_ids)} mark_member_done calls, "
+            f"got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
+        )
+
+        # (4) The merge_attempt 'done' event emitted by _finalize_advanced_merge
+        #     must carry train_id and member_task_ids for train correlation.
+        #     RED until step-08 adds these kwargs to _finalize_advanced_merge.
+        merge_attempt_events = spy_store.by_type("merge_attempt")
+        done_events = [
+            e for e in merge_attempt_events
+            if e["data"].get("outcome") == "done"
+        ]
+        assert done_events, (
+            f"expected at least one merge_attempt 'done' event; "
+            f"got events: {merge_attempt_events}"
+        )
+        # Assert the done event carries train correlation kwargs.
+        done_evt = done_events[0]  # finalize emits the sole 'done' event
+        assert done_evt["data"].get("train_id") == req.train_id, (
+            f"done event missing train_id; payload: {done_evt['data']}"
+        )
+        assert done_evt["data"].get("member_task_ids") == req.member_task_ids, (
+            f"done event missing member_task_ids; payload: {done_evt['data']}"
+        )

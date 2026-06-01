@@ -2096,12 +2096,13 @@ async def _do_train_merge(
         _emit_merge_attempt(event_store, req.task_id, 'train_partial_flip', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
-    # _finalize_advanced_merge already emitted merge_attempt 'done'; just log + return.
+    # _finalize_advanced_merge already emitted merge_attempt 'done'; return its
+    # outcome directly so push_status is propagated to the caller.
     logger.info(
         'Train %s: landed at %s; %d members marked done',
         req.train_id, advanced_sha[:12], len(req.member_task_ids),
     )
-    return MergeOutcome('done', merge_sha=advanced_sha)
+    return outcome
 
 
 class _WipHaltMixin:
