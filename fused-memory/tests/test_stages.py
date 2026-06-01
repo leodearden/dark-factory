@@ -10056,3 +10056,50 @@ class TestBuildSummaryNonceSectionPrefix:
         )
 
 
+class TestStage2CrossProjectCiteTaskInstruction:
+    """The Cross-Project Routing section must instruct cite_task.
+
+    Task 1594: when Stage 2 emits a cross_project finding the prompt must
+    explicitly tell it to also call cite_task so that cited_tasks carries a
+    stable task_id anchor.  Without that anchor:
+      - harness._derive_affected_ids returns [] (no cited_tasks)
+      - compute_content_fingerprint hashes only the drifting description text
+      - the finding re-escalates every reconciliation cycle (never folded by
+        cross-cycle dedup)
+
+    The task-1573 compute_flag_signature cited_tasks fallback in flag_dedup.py
+    is inert unless Stage 2 actually attaches a cite_task citation.
+
+    IMPORTANT: cite_task appears elsewhere in STAGE2_SYSTEM_PROMPT (the
+    ## Guidelines section interpolates _RECON_REPORT_TOOL_GUIDANCE).  The
+    assertion MUST be section-scoped via _extract_section so that it is a
+    genuine RED on the base branch and a real GREEN after the impl edit.
+    """
+
+    def test_cross_project_section_instructs_cite_task(self):
+        """Cross-Project Routing section must contain 'cite_task'.
+
+        Guards that Stage 2 is explicitly instructed to call cite_task when
+        emitting a cross_project finding so cited_tasks carries a task_id
+        anchor for _derive_affected_ids / compute_content_fingerprint
+        (task 1594 — without this the finding re-escalates every cycle).
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        section = _extract_section(prompt, '## Cross-Project Routing')
+        assert section, (
+            "Cross-Project Routing section not found in STAGE2_SYSTEM_PROMPT — "
+            "cannot verify cite_task instruction (task 1594)."
+        )
+        assert 'cite_task' in section, (
+            "The '## Cross-Project Routing' section of STAGE2_SYSTEM_PROMPT must "
+            "instruct Stage 2 to call cite_task for the local source task when emitting "
+            "a cross_project finding, so that cited_tasks carries a stable task_id anchor "
+            "that _derive_affected_ids / compute_content_fingerprint use to fold duplicate "
+            "cross_project findings cross-cycle (task 1594).  Without this instruction "
+            "the task-1573 compute_flag_signature cited_tasks fallback is inert and the "
+            "finding re-escalates every reconciliation cycle."
+        )
+
+
