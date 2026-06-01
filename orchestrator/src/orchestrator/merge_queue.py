@@ -3423,13 +3423,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
 
         # ── Step 5: CAS advance_main ──────────────────────────────────
+        # current_sha tracks the merge SHA to pass to advance_main.  After a
+        # clean rebase (rebased_pending_reverify), the gate clears it to the
+        # post-rebase SHA so the next advance_main call lands the verified tree.
+        current_sha = merge_commit
         retries = 0
         while True:
             result = await self._git_ops.advance_main(
-                merge_commit, merge_wt,
+                current_sha, merge_wt,
                 branch=req.branch,
                 max_attempts=req.config.max_advance_attempts,
                 expected_main=item.base_sha,
+                reverify_on_rebase=True,
             )
 
             if result == 'advanced':
@@ -3476,6 +3481,83 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             exc_info=True,
                         )
                 return True
+
+            if result == 'rebased_pending_reverify':
+                # advance_main rebased merge_wt onto the new main but did NOT
+                # update-ref.  Read side channels immediately before any further
+                # advance_main call could overwrite them.
+                rebased_sha: str = self._git_ops._last_advanced_sha  # type: ignore[attr-defined]
+                rebased_from: str = self._git_ops._rebased_from       # type: ignore[attr-defined]
+                rebased_onto: str = self._git_ops._rebased_onto       # type: ignore[attr-defined]
+
+                gate = await _reverify_rebased_tree(
+                    self._git_ops, req, merge_wt,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                    max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                )
+                if gate is not None:
+                    # Overlapping delta, verify failed (or disk guard fired).
+                    # _run_post_merge_verify already cleaned up merge_wt.
+                    if not req.result.done():
+                        req.result.set_result(gate)
+                    return False
+
+                # Disjoint, or overlap+green: advance with the verified rebased
+                # SHA.  Reuse the CAS-retry counter so runaway gate loops are
+                # bounded by MAX_CAS_RETRIES just like plain CAS retries.
+                current_sha = rebased_sha
+                total = self._cas_retries.get(req.task_id, 0) + 1
+                self._cas_retries[req.task_id] = total
+                if total > self.MAX_CAS_RETRIES:
+                    self._cas_retries.pop(req.task_id, None)
+                    logger.warning(
+                        'Task %s: CAS/gate retry limit exhausted after gate '
+                        'cleared (%d attempts)',
+                        req.task_id, self.MAX_CAS_RETRIES,
+                    )
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id, 'cas_exhausted',
+                        attempt=total,
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'blocked',
+                            reason=(
+                                f'CAS retry limit exhausted after '
+                                f'{self.MAX_CAS_RETRIES} attempts for task '
+                                f'{req.task_id}'
+                            ),
+                        ))
+                    return False
+
+                # Rebuild item so the next advance_main call uses rebased_onto
+                # as the expected CAS base (main now points at rebased_onto).
+                item = SpeculativeItem(
+                    request=item.request,
+                    merge_result=item.merge_result,
+                    merge_wt=item.merge_wt,
+                    base_sha=rebased_onto,
+                    speculative=item.speculative,
+                    skip_verify=item.skip_verify,
+                    started_monotonic=item.started_monotonic,
+                )
+                logger.info(
+                    'Task %s: gate cleared (disjoint or green re-verify); '
+                    'advancing with rebased SHA %s',
+                    req.task_id, rebased_sha[:8],
+                )
+                _emit_merge_attempt(
+                    self._event_store, req.task_id, 'cas_retry',
+                    attempt=total,
+                    duration_ms=_elapsed_ms(item.started_monotonic),
+                )
+                continue
 
             if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
                 # Workflow soft-cancelled mid-merge: dropping the request
