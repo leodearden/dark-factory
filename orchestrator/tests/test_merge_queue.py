@@ -8485,3 +8485,84 @@ class TestMapAdvanceFailure:
         assert outcome.reason == f'advance_main failed ({result}) for task {task_id}'
         halt.assert_not_called()
         assert task_id not in cas_retries
+
+
+# ---------------------------------------------------------------------------
+# TestWipHaltMixin — unit tests pinning the _WipHaltMixin shared contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestWipHaltMixin:
+    """Pin the _WipHaltMixin contract as seen through both worker classes."""
+
+    def _make_worker(self, worker_cls: type) -> Any:
+        git_ops = MagicMock()
+        queue: asyncio.Queue = asyncio.Queue()
+        return worker_cls(git_ops, queue)
+
+    async def test_issubclass_pins_single_source(self, worker_cls: type) -> None:
+        """Both workers must subclass _WipHaltMixin (fails at import until S8)."""
+        from orchestrator.merge_queue import _WipHaltMixin
+
+        assert issubclass(MergeWorker, _WipHaltMixin)
+        assert issubclass(SpeculativeMergeWorker, _WipHaltMixin)
+
+    async def test_initial_state_not_halted(self, worker_cls: type) -> None:
+        """is_wip_halted is False immediately after construction."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        assert not worker.is_wip_halted
+
+    async def test_halt_for_wip_sets_halted(self, worker_cls: type) -> None:
+        """After halt_for_wip('x'), is_wip_halted True and halt_owner_esc_id still None."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('x')
+        assert worker.is_wip_halted
+        assert worker.halt_owner_esc_id is None
+
+    async def test_set_halt_owner_and_query(self, worker_cls: type) -> None:
+        """set_halt_owner('e1') → is_halt_owner('e1') True, is_halt_owner('e2') False, halt_owner_esc_id == 'e1'."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        assert worker.is_halt_owner('e1')
+        assert not worker.is_halt_owner('e2')
+        assert worker.halt_owner_esc_id == 'e1'
+
+    async def test_second_set_halt_owner_raises(self, worker_cls: type) -> None:
+        """A second set_halt_owner call raises AssertionError."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        with pytest.raises(AssertionError):
+            worker.set_halt_owner('e2')
+
+    async def test_unhalt_clears_state(self, worker_cls: type) -> None:
+        """After unhalt_wip(), is_wip_halted False and halt_owner_esc_id None."""
+        from orchestrator.merge_queue import _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        worker.halt_for_wip('reason')
+        worker.set_halt_owner('e1')
+        worker.unhalt_wip()
+        assert not worker.is_wip_halted
+        assert worker.halt_owner_esc_id is None
+
+    async def test_abandon_outcome_uses_prefix(self, worker_cls: type) -> None:
+        """_abandon_outcome('t', 3) → blocked MergeOutcome starting with ABANDONED_REASON_PREFIX containing 't'."""
+        from orchestrator.merge_queue import ABANDONED_REASON_PREFIX, _WipHaltMixin  # noqa: F401
+
+        worker = self._make_worker(worker_cls)
+        outcome = worker._abandon_outcome('t', 3)
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(ABANDONED_REASON_PREFIX)
+        assert 't' in outcome.reason
