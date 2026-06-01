@@ -7998,3 +7998,205 @@ class TestTrainLifecycleEvents:
         assert set(deferred_data['remaining_members']) == {'trn-b', 'trn-c'}, (
             f"Expected remaining_members={{trn-b, trn-c}}, got: {deferred_data['remaining_members']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRunPostMergeVerify — unit tests for the _run_post_merge_verify helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerify:
+    """Direct unit tests for the _run_post_merge_verify module-level helper.
+
+    The helper is imported at the top of the test class (not at module level)
+    so a missing symbol produces a readable ImportError on collection rather
+    than a hard SyntaxError.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-verify-test'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        return req
+
+    async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
+        """(a) disk guard returns None + verify passed → returns None; merge_wt NOT cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        enospc_retries: dict[str, int] = {}
+
+        passed_result = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_disk_guard_returns_reason_blocks(self) -> None:
+        """(b) disk guard returns reason string → MergeOutcome('blocked') with that reason; merge_wt cleaned once."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=disk_reason)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock()) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason == disk_reason
+        git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
+        mock_verify.assert_not_awaited()
+
+    async def test_verify_fails_non_enospc_blocks_and_cleans(self) -> None:
+        """(c) verify fails (non-ENOSPC) → MergeOutcome('blocked') reason starts 'Post-merge verification failed:' and merge_wt cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        failed_result = MagicMock(
+            passed=False, summary='Test suite exploded', timed_out=False,
+        )
+        failed_result.failure_report.return_value = ''
+        # Ensure ENOSPC is not triggered
+        failed_result.test_output = ''
+        failed_result.lint_output = ''
+        failed_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'unexpected reason: {result.reason!r}'
+        )
+        git_ops.cleanup_merge_worktree.assert_awaited_once_with(merge_wt)
+
+    async def test_verify_timeout_bumps_timeouts_dict(self) -> None:
+        """(d) verify fails with timed_out=True → timeouts dict bumped to 1 for req.task_id."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        timeouts: dict[str, int] = {}
+        timed_out_result = MagicMock(
+            passed=False, summary='verify timed out', timed_out=True,
+        )
+        timed_out_result.failure_report.return_value = ''
+        timed_out_result.test_output = ''
+        timed_out_result.lint_output = ''
+        timed_out_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert timeouts.get(req.task_id, 0) == 1, (
+            f'expected timeouts[task_id]=1, got: {timeouts}'
+        )
+
+    async def test_persistent_enospc_prunes_and_escalates(self) -> None:
+        """(e) persistent ENOSPC (both attempts) → prune awaited, enospc_retries bumped, transient infra blocked."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra reason, got: {result.reason!r}'
+        )
+        git_ops.prune_stale_merge_worktrees.assert_awaited_once()
+        assert enospc_retries.get(req.task_id, 0) == 1, (
+            f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
+        )
+
+    async def test_verify_exception_propagates_no_cleanup(self) -> None:
+        """(f) run_scoped_verification raises RuntimeError → exception propagates; merge_wt NOT cleaned."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match='boom'):
+                await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={}, enospc_retries={},
+                    max_timeouts=2, max_enospc=1,
+                )
+
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
