@@ -8597,3 +8597,799 @@ class TestHaltAdvanceResults:
         assert frozenset(_HALT_ADVANCE_RESULTS) == expected, (
             f'_HALT_ADVANCE_RESULTS mismatch: {_HALT_ADVANCE_RESULTS!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAdvanceMainReverifyOnRebase — step-1 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainReverifyOnRebase:
+    """advance_main gains an opt-in reverify_on_rebase flag.
+
+    When set, a rebase-then-break inside the for-attempt loop causes
+    advance_main to:
+      • expose the rebased SHA via _last_advanced_sha
+      • expose the original expected_main via _rebased_from
+      • expose the rebased-onto SHA via _rebased_onto
+      • return 'rebased_pending_reverify' WITHOUT calling update-ref
+
+    The default (flag omitted / False) is unchanged: rebase + advance.
+    """
+
+    async def test_reverify_on_rebase_returns_new_result(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(a) reverify_on_rebase=True + main moves → rebased_pending_reverify,
+        main stays at moved-main SHA, side channels populated, merge_wt at
+        rebased SHA.
+        """
+        # Build a branch commit
+        worktree = (await git_ops.create_worktree('rev-branch')).path
+        (worktree / 'branch_only.py').write_text('branch = 1\n')
+        await git_ops.commit(worktree, 'Add branch_only.py')
+
+        # Capture base_sha and create the merge commit
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-branch')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        merge_commit = result.merge_commit.strip()
+        merge_wt = result.merge_worktree
+
+        # Move main by adding a DISJOINT file directly in project_root
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Disjoint: add main_only.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+        assert moved_main_sha != base_sha, 'main must have moved for the test'
+
+        try:
+            advanced = await git_ops.advance_main(
+                merge_commit, merge_wt,
+                branch='rev-branch',
+                expected_main=base_sha,
+                reverify_on_rebase=True,
+            )
+
+            # Must return the new gate result, NOT 'advanced'
+            assert advanced == 'rebased_pending_reverify', (
+                f'Expected rebased_pending_reverify, got {advanced!r}'
+            )
+
+            # Main must NOT have been advanced (still at moved_main_sha)
+            current_main = await git_ops.get_main_sha()
+            assert current_main == moved_main_sha, (
+                f'Main must not have advanced: expected {moved_main_sha[:8]}, '
+                f'got {current_main[:8]}'
+            )
+
+            # Side channels must be set
+            rebased_sha = getattr(git_ops, '_last_advanced_sha', None)
+            assert rebased_sha is not None, '_last_advanced_sha must be set'
+            rebased_from = getattr(git_ops, '_rebased_from', None)
+            assert rebased_from == base_sha, (
+                f'_rebased_from must be original base_sha {base_sha[:8]}, '
+                f'got {rebased_from!r}'
+            )
+            rebased_onto = getattr(git_ops, '_rebased_onto', None)
+            assert rebased_onto == moved_main_sha, (
+                f'_rebased_onto must be moved_main_sha {moved_main_sha[:8]}, '
+                f'got {rebased_onto!r}'
+            )
+
+            # _last_advanced_sha must be a descendant of moved_main
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', moved_main_sha, rebased_sha],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, (
+                f'rebased_sha {rebased_sha[:8]} must be a descendant of '
+                f'moved_main {moved_main_sha[:8]}'
+            )
+
+            # merge_wt HEAD must equal _last_advanced_sha
+            wt_rc, wt_head, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
+            )
+            assert wt_rc == 0
+            assert wt_head.strip() == rebased_sha, (
+                f'merge_wt HEAD {wt_head.strip()[:8]} must equal '
+                f'_last_advanced_sha {rebased_sha[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_no_rebase_needed_returns_advanced(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(b) reverify_on_rebase=True but no rebase needed → returns 'advanced'.
+
+        When main has NOT moved, the merge commit is already a descendant of
+        main.  No rebase occurs, so the gate is not triggered even with the
+        flag set.
+        """
+        worktree = (await git_ops.create_worktree('rev-no-rebase')).path
+        (worktree / 'no_rebase.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add no_rebase.py')
+
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-no-rebase')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        # Main has NOT moved — no rebase needed
+        try:
+            advanced = await git_ops.advance_main(
+                result.merge_commit, result.merge_worktree,
+                branch='rev-no-rebase',
+                expected_main=base_sha,
+                reverify_on_rebase=True,
+            )
+            assert advanced == 'advanced', (
+                f'No rebase → must return advanced, got {advanced!r}'
+            )
+            # Main must have moved to the merge commit
+            current_main = await git_ops.get_main_sha()
+            assert current_main != base_sha, 'Main must have been advanced'
+        finally:
+            if result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_backward_compat_default_flag_still_advances(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(c) Backward compat: default (flag omitted) → rebase still advances.
+
+        MergeWorker and _do_train_merge callers that don't pass
+        reverify_on_rebase must be unaffected.
+        """
+        worktree = (await git_ops.create_worktree('rev-compat')).path
+        (worktree / 'compat.py').write_text('c = 1\n')
+        await git_ops.commit(worktree, 'Add compat.py')
+
+        base_sha = await git_ops.get_main_sha()
+        result = await git_ops.merge_to_main(worktree, 'rev-compat')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        merge_wt = result.merge_worktree
+
+        # Move main by adding a disjoint file
+        (git_ops.project_root / 'compat_main.py').write_text('cm = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Disjoint: add compat_main.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+
+        try:
+            # Default flag (not passed) — should still rebase and advance
+            advanced = await git_ops.advance_main(
+                result.merge_commit, merge_wt,
+                branch='rev-compat',
+                expected_main=base_sha,
+                # reverify_on_rebase NOT passed — default False
+            )
+            # With default flag, advance_main rebases and advances (old behavior)
+            assert advanced in ('advanced', 'cas_failed'), (
+                f'Default flag: expected advanced or cas_failed, got {advanced!r}'
+            )
+            if advanced == 'advanced':
+                current_main = await git_ops.get_main_sha()
+                assert current_main != moved_main_sha, (
+                    'Main must have advanced past moved_main_sha'
+                )
+        finally:
+            if merge_wt:
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# TestRebaseDeltaTouchedOverlap — step-3 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRebaseDeltaTouchedOverlap:
+    """Unit tests for _rebase_delta_touched_overlap helper.
+
+    The helper computes the intersection of:
+      • branch_touched: files the branch changed since its fork from rebased_from
+      • intervening:    files changed on main from rebased_from to rebased_onto
+
+    Fails CLOSED on any git error: returns a non-empty sentinel so the caller
+    re-verifies rather than skipping.
+    """
+
+    async def test_disjoint_returns_empty(self, git_ops: GitOps) -> None:
+        """(a) Disjoint: branch adds branch_only.py, main adds main_only.py.
+
+        The intersection must be empty (no overlap → no re-verify).
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        # Create the branch worktree at the fork point (current main)
+        fork_sha = await git_ops.get_main_sha()  # F = rebased_from
+        wt = (await git_ops.create_worktree('delta-disjoint')).path
+        (wt / 'branch_only.py').write_text('branch = 1\n')
+        await git_ops.commit(wt, 'Branch: add branch_only.py')
+
+        # Simulate intervening main commit (disjoint file)
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add main_only.py'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        assert overlap == [], (
+            f'Disjoint: expected empty overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_overlap_returns_shared_file(self, git_ops: GitOps) -> None:
+        """(b) Overlap: branch edits top of shared.py, main edits bottom.
+
+        After a clean 3-way rebase the touched sets intersect on shared.py.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        # Commit a 20-line base file on main before the fork
+        base_content = ''.join(f'line{i}\n' for i in range(20))
+        (git_ops.project_root / 'shared.py').write_text(base_content)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add shared.py'],
+            cwd=git_ops.project_root,
+        )
+        fork_sha = await git_ops.get_main_sha()  # F = rebased_from
+
+        # Branch edits near the TOP (line1 area)
+        wt = (await git_ops.create_worktree('delta-overlap')).path
+        (wt / 'shared.py').write_text(
+            base_content.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(wt, 'Branch: edit top of shared.py')
+
+        # Intervening main commit edits near the BOTTOM (line18 area)
+        (git_ops.project_root / 'shared.py').write_text(
+            base_content.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: edit bottom of shared.py'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        assert 'shared.py' in overlap, (
+            f'Overlap: expected shared.py in overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_task_dir_changes_excluded(self, git_ops: GitOps) -> None:
+        """(c) .task/ changes are excluded from both the branch-touched set
+        and the intervening-delta set.
+
+        The branch adds .task/plan.json and branch_only.py; main adds
+        .task/state.json (via its own commit) and main_only.py.  Only the
+        non-.task/ files appear in the respective sets; the intersection
+        of {branch_only.py} and {main_only.py} is still empty.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        fork_sha = await git_ops.get_main_sha()
+        wt = (await git_ops.create_worktree('delta-taskdir')).path
+
+        # Branch adds a real file and a .task/ file
+        (wt / 'branch_file.py').write_text('b = 1\n')
+        (wt / '.task').mkdir(exist_ok=True)
+        (wt / '.task' / 'plan.json').write_text('{"branch": true}\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'Branch: real + .task/'], cwd=wt)
+
+        # Intervening main commit adds a real file and a .task/ file
+        (git_ops.project_root / 'main_file.py').write_text('m = 1\n')
+        (git_ops.project_root / '.task').mkdir(exist_ok=True)
+        (git_ops.project_root / '.task' / 'state.json').write_text(
+            '{"main": true}\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: real + .task/'],
+            cwd=git_ops.project_root,
+        )
+        rebased_onto = await git_ops.get_main_sha()
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, fork_sha, rebased_onto, git_ops,
+        )
+        # Intersection of {branch_file.py} and {main_file.py} = {} — disjoint
+        assert overlap == [], (
+            f'task-dir exclusion: expected empty overlap, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+    async def test_fail_closed_on_bogus_ref(self, git_ops: GitOps) -> None:
+        """(d) Fail CLOSED: bogus rebased_from causes a git error; the helper
+        must return a non-empty sentinel list so the caller re-verifies.
+        """
+        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+
+        wt = (await git_ops.create_worktree('delta-failclosed')).path
+        (wt / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Branch: add file.py')
+        rebased_onto = await git_ops.get_main_sha()
+
+        # Pass a nonsense SHA as rebased_from — merge-base or diff will fail
+        bogus_sha = 'deadbeef' * 5  # 40 char hex but doesn't exist
+
+        overlap = await _rebase_delta_touched_overlap(
+            wt, bogus_sha, rebased_onto, git_ops,
+        )
+        assert len(overlap) > 0, (
+            f'Fail-closed: bogus ref must return non-empty sentinel, got {overlap!r}'
+        )
+        await git_ops.cleanup_merge_worktree(wt)
+
+
+# ---------------------------------------------------------------------------
+# TestReverifyRebasedTree — step-5 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReverifyRebasedTree:
+    """Unit tests for _reverify_rebased_tree shared gate.
+
+    The gate:
+    (a) Disjoint overlap → returns None, run_scoped_verification NOT called,
+        merge_wt still exists.
+    (b) Overlapping, green verify → returns None, run_scoped_verification
+        called exactly once, merge_wt still exists.
+    (c) Overlapping, red verify → returns blocked MergeOutcome,
+        merge_wt cleaned up.
+    """
+
+    async def _make_merge_wt(
+        self, git_ops: GitOps, branch_name: str, config: OrchestratorConfig,
+    ) -> tuple[Path, MergeRequest]:
+        """Create a branch, merge it, and return (merge_wt, req)."""
+        wt = await _make_branch_with_file(git_ops, branch_name, f'{branch_name}.py', 'x = 1\n')
+        result = await git_ops.merge_to_main(wt, branch_name)
+        assert result.success
+        assert result.merge_worktree is not None
+        req = _make_request(branch_name, branch_name, wt, config)
+        return result.merge_worktree, req
+
+    async def test_disjoint_no_reverify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a) Disjoint (overlap returns empty): gate returns None and does
+        NOT call run_scoped_verification.  merge_wt still exists.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-disjoint', config)
+        fork_sha = await git_ops.get_main_sha()
+        # Move main (so we have a rebased_onto)
+        (git_ops.project_root / 'rvrt_main.py').write_text('m = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=[]),  # disjoint
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Disjoint: expected None, got {result!r}'
+            )
+            verify_mock.assert_not_called()
+            assert merge_wt.exists(), 'merge_wt must still exist (not cleaned up)'
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_overlap_green_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(b) Overlapping + green verify: gate returns None,
+        run_scoped_verification called exactly once, merge_wt still exists.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
+        fork_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'rvrt_shared.py').write_text('s = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=['rvrt_shared.py']),  # overlapping
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Green verify: expected None, got {result!r}'
+            )
+            verify_mock.assert_called_once()
+            assert merge_wt.exists(), 'merge_wt must still exist after green verify'
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_overlap_red_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(c) Overlapping + red verify: gate returns blocked MergeOutcome,
+        merge_wt cleaned up.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
+        fork_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'rvrt_red.py').write_text('r = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+
+        verify_fail = AsyncMock(return_value=MagicMock(
+            passed=False, summary='Test failed', timed_out=False,
+            failure_report=MagicMock(return_value=None),
+        ))
+
+        with (
+            patch(
+                'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                new=AsyncMock(return_value=['rvrt_red.py']),  # overlapping
+            ),
+            patch('orchestrator.merge_queue.run_scoped_verification', verify_fail),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from=fork_sha,
+                rebased_onto=rebased_onto,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+            )
+        assert result is not None, 'Red verify: expected a MergeOutcome, got None'
+        assert isinstance(result, MergeOutcome)
+        assert result.status == 'blocked', (
+            f'Red verify: expected blocked status, got {result.status!r}'
+        )
+        # _run_post_merge_verify cleans up merge_wt on failure
+        assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeMergeWorkerGate — step-7 (RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorkerGate:
+    """End-to-end integration tests for the disjoint-delta re-verify gate.
+
+    Each test builds a SpeculativeItem via worker._remerge(req, None),
+    simulates intervening main movement by committing directly in
+    project_root, then drives worker._verify_and_advance(item) and asserts
+    the expected outcome and run_scoped_verification call count.
+
+    Scenarios
+    ---------
+    (a) GATE-on-red: overlapping shared.py churn; 1st verify (step-4) passes,
+        2nd (gate re-verify) fails → outcome blocked, main stays at moved-main
+        SHA (rebased overlapping tree never lands).
+    (b) Overlap+green: overlapping churn, both verify calls pass → outcome
+        done, branch-edit AND main-edit both on main, called twice.
+    (c) Disjoint: branch_only.py vs main_only.py → outcome done, called
+        exactly once (fast path preserved — no gate verify).
+    (d) Regression: main does NOT move → outcome done, called once.
+
+    Scenarios (a) and (b) fail BEFORE wiring because the CAS loop does not
+    pass reverify_on_rebase=True nor handle the rebased_pending_reverify
+    result (so verify is only called once and main advances unguarded).
+    """
+
+    # 20-line shared base file; edits to line1 (branch) and line18 (main)
+    # are non-adjacent so the rebase is always a clean 3-way merge.
+    _SHARED_BASE: str = ''.join(f'line{i}\n' for i in range(20))
+
+    async def _setup_overlap_branch(
+        self,
+        git_ops: GitOps,
+        branch_name: str,
+        config: OrchestratorConfig,
+    ) -> tuple[Path, MergeRequest]:
+        """Commit shared.py (20 lines) on main, then create a branch that
+        edits line1 (top).  Returns (branch_wt, req).  main is at fork_sha.
+        Does NOT call _remerge.
+        """
+        # Commit shared.py baseline on main
+        (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', f'Add shared.py for {branch_name}'],
+            cwd=git_ops.project_root,
+        )
+
+        # Branch edits line1 (top) — non-adjacent to the line18 main edit
+        branch_wt = (await git_ops.create_worktree(branch_name)).path
+        (branch_wt / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(branch_wt, f'Branch {branch_name}: edit top of shared.py')
+
+        req = _make_request(branch_name, branch_name, branch_wt, config)
+        return branch_wt, req
+
+    async def test_gate_on_red_blocks_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a) GATE-on-red: overlapping churn, 1st verify passes, 2nd fails.
+
+        Core safety property: the rebased overlapping tree must NEVER land on
+        main.  outcome must be blocked and main must stay at the moved-main SHA.
+        run_scoped_verification must be called exactly twice (initial + gate).
+        """
+        branch = 'smwg-red'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch(git_ops, branch, config)
+
+        # _remerge: merge branch into current main
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got immediate_outcome={item.immediate_outcome!r}'
+        )
+
+        # Move main: edit line18 (bottom) — produces overlapping delta
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: edit bottom of shared.py'],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = await git_ops.get_main_sha()
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            n = len(verify_calls) + 1
+            verify_calls.append(n)
+            if n == 1:
+                # Initial verify (step-4): pass
+                return MagicMock(passed=True, summary='')
+            # Gate re-verify (2nd call): fail
+            return MagicMock(
+                passed=False, summary='gate re-verify failed',
+                timed_out=False,
+                failure_report=MagicMock(return_value=None),
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert not advanced, (
+            '(a) Gate-on-red: expected _verify_and_advance to return False'
+        )
+        outcome = req.result.result()
+        assert outcome.status == 'blocked', (
+            f'(a) Gate-on-red: expected blocked, got {outcome.status!r}: {outcome}'
+        )
+        # Main must NOT have advanced to the rebased tree
+        current_main = await git_ops.get_main_sha()
+        assert current_main == moved_main_sha, (
+            f'(a) Main must not advance past moved_main_sha. '
+            f'Expected {moved_main_sha[:8]}, got {current_main[:8]}'
+        )
+        # Gate verify must have been triggered
+        assert len(verify_calls) == 2, (
+            f'(a) Expected run_scoped_verification called 2 times '
+            f'(initial + gate), got {len(verify_calls)}'
+        )
+
+    async def test_overlap_green_advances_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(b) Overlap+green: overlapping churn, both verify passes.
+
+        Both the branch edit (line1) and the main-movement edit (line18) must
+        appear on main after the advance.  run_scoped_verification called twice.
+        """
+        branch = 'smwg-green'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch(git_ops, branch, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        )
+
+        # Move main: edit line18 (bottom) — overlapping delta
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: edit bottom of shared.py (green)'],
+            cwd=git_ops.project_root,
+        )
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(b) Overlap+green: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(b) Overlap+green: expected done, got {outcome.status!r}: {outcome}'
+        )
+        # Both the branch edit and the main-movement edit must appear on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:shared.py'], cwd=git_ops.project_root,
+        )
+        assert 'branch-edit' in content, (
+            '(b) branch edit must appear on main after overlap+green advance'
+        )
+        assert 'main-edit' in content, (
+            '(b) main-movement edit must appear on main after overlap+green advance'
+        )
+        # Gate re-verify must have been called (overlap → two verify calls total)
+        assert len(verify_calls) == 2, (
+            f'(b) Expected run_scoped_verification called 2 times, '
+            f'got {len(verify_calls)}'
+        )
+
+    async def test_disjoint_no_extra_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(c) Disjoint: branch_only.py vs main_only.py — no shared files.
+
+        Fast path: the gate detects no overlap and skips re-verify.
+        run_scoped_verification called exactly once (initial verify only).
+        """
+        branch = 'smwg-disjoint'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = await _make_branch_with_file(
+            git_ops, branch, 'branch_only.py', 'branch = 1\n',
+        )
+        req = _make_request(branch, branch, branch_wt, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None
+
+        # Move main: add a DISJOINT file (no shared files touched)
+        (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: add main_only.py (disjoint)'],
+            cwd=git_ops.project_root,
+        )
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(c) Disjoint: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(c) Disjoint: expected done, got {outcome.status!r}: {outcome}'
+        )
+        # Fast path: must NOT trigger a second verify call
+        assert len(verify_calls) == 1, (
+            f'(c) Disjoint fast path: expected 1 verify call, got {len(verify_calls)}'
+        )
+
+    async def test_no_movement_regression(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(d) Regression: main does NOT move between _remerge and
+        _verify_and_advance.  No gate is triggered; outcome done, one call.
+        """
+        branch = 'smwg-noop'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = await _make_branch_with_file(
+            git_ops, branch, 'noop_branch.py', 'x = 1\n',
+        )
+        req = _make_request(branch, branch, branch_wt, config)
+
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None
+
+        # main does NOT move
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, '(d) No-movement: expected True (done)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'(d) No-movement regression: expected done, got {outcome.status!r}: {outcome}'
+        )
+        assert len(verify_calls) == 1, (
+            f'(d) No-movement: expected 1 verify call, got {len(verify_calls)}'
+        )
