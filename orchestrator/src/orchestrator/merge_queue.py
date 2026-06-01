@@ -396,6 +396,8 @@ async def _finalize_advanced_merge(
     timeouts: dict[str, int],
     enospc_retries: dict[str, int],
     log_label: str = '',
+    train_id: str | None = None,
+    member_task_ids: list[str] | None = None,
 ) -> MergeOutcome:
     """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -410,6 +412,12 @@ async def _finalize_advanced_merge(
     worker can retain its current log prefix
     (``''`` for MergeWorker, ``' (speculative)'`` for
     SpeculativeMergeWorker).
+
+    *train_id* and *member_task_ids* are optional train-correlation tags
+    forwarded to every ``_emit_merge_attempt`` call inside this function.
+    MergeWorker and SpeculativeMergeWorker pass ``None`` (no behavior
+    change); ``_do_train_merge`` passes the request's train metadata so
+    ``merge_attempt`` events stay tagged for downstream reconciliation.
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -434,6 +442,8 @@ async def _finalize_advanced_merge(
             event_store, req.task_id,
             'post_merge_equivalence_failed',
             duration_ms=_elapsed_ms(started_monotonic),
+            train_id=train_id,
+            member_task_ids=member_task_ids,
         )
         return MergeOutcome(
             'blocked',
@@ -463,6 +473,8 @@ async def _finalize_advanced_merge(
             event_store, req.task_id,
             'post_merge_pyright_broken',
             duration_ms=_elapsed_ms(started_monotonic),
+            train_id=train_id,
+            member_task_ids=member_task_ids,
         )
         return MergeOutcome(
             'blocked',
@@ -475,7 +487,12 @@ async def _finalize_advanced_merge(
         )
 
     logger.info(f'Task {req.task_id}: merged to main successfully')
-    _emit_merge_attempt(event_store, req.task_id, 'done', duration_ms=_elapsed_ms(started_monotonic))
+    _emit_merge_attempt(
+        event_store, req.task_id, 'done',
+        duration_ms=_elapsed_ms(started_monotonic),
+        train_id=train_id,
+        member_task_ids=member_task_ids,
+    )
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -2039,6 +2056,8 @@ async def _do_train_merge(
         timeouts=worker._post_merge_verify_timeouts,
         enospc_retries=worker._post_merge_verify_enospc_retries,
         log_label=' (train)',
+        train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
     )
     if outcome.status != 'done':
         # Equivalence or pyright gate fired — main landed but post-merge gates
