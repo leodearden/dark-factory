@@ -1864,7 +1864,11 @@ class TaskKnowledgeSync(BaseStage):
         # and uniqueness_token all remain in the prompt guidance.
         # Task 1574: delegated to build_summary_nonce_section() so Stage 1 and Stage 2
         # share identical section wording and cannot silently drift.
-        summary_nonce_section = build_summary_nonce_section()
+        # Task 1590: passes 'STAGE2' prefix so Stage 2 nonces always lead with 'STAGE2_',
+        # which can never collide with Stage 1's 'STAGE1_'-prefixed nonces — making stage
+        # origin explicit and further separating the two stages' summaries in Mem0's embedding
+        # space.
+        summary_nonce_section = build_summary_nonce_section('STAGE2')
 
         # Step 5 in the Your Task block below ("append=False for hint conversion")
         # is grounded in Mem0 memory 0b0eeb8d (old-wins semantics for list-format
