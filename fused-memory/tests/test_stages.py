@@ -496,11 +496,14 @@ class TestTaskKnowledgeSyncPayload:
     @pytest.mark.asyncio
     async def test_payload_contains_per_cycle_summary_nonce_section(self, mock_deps, watermark):
         """assemble_payload() must include a '### Per-Cycle Summary Nonce' section
-        with a 'summary_nonce: <8-hex>' line.
+        with a 'summary_nonce: STAGE2_<8-hex>' line.
 
         Task 1572: the nonce is generated Python-side (CSPRNG) and injected into
         the payload so the Stage 2 agent can prepend it to its per-cycle summary,
         defeating Mem0 cosine-similarity dedup (~0.92 threshold).
+        Task 1590: nonce now carries 'STAGE2_' prefix for structural distinction
+        from Stage 1 nonces.
+        RED until step-8 impl changes the assemble_payload call site to pass 'STAGE2'.
         """
         import re
 
@@ -513,18 +516,20 @@ class TestTaskKnowledgeSyncPayload:
             "assemble_payload() must include a '### Per-Cycle Summary Nonce' section "
             "so the Stage 2 agent receives the CSPRNG nonce (task 1572)."
         )
-        assert re.search(r'summary_nonce: [0-9a-f]{8}', payload), (
-            "assemble_payload() must include a 'summary_nonce: <8-hex>' line "
+        assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', payload), (
+            "assemble_payload() must include a 'summary_nonce: STAGE2_<8-hex>' line "
             f"in the payload — got payload snippet: {payload[-200:]!r}"
         )
 
     @pytest.mark.asyncio
     async def test_successive_assemble_payload_calls_yield_different_nonces(self, mock_deps, watermark):
         """Two assemble_payload calls on a freshly-configured stage yield different
-        summary_nonce values.
+        STAGE2-prefixed summary_nonce values.
 
         High-probability property of a 32-bit CSPRNG (P(collision) ~= 2.3e-10).
         Task 1572: verifies the nonce is re-generated each call, not cached.
+        Task 1590: regex updated to match 'STAGE2_<8-hex>' form.
+        RED until step-8 impl changes the assemble_payload call site to pass 'STAGE2'.
         """
         import re
 
@@ -534,10 +539,10 @@ class TestTaskKnowledgeSyncPayload:
         payload1 = await stage.assemble_payload([], watermark, [])
         payload2 = await stage.assemble_payload([], watermark, [])
 
-        match1 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload1)
-        match2 = re.search(r'summary_nonce: ([0-9a-f]{8})', payload2)
-        assert match1, f"No summary_nonce in first payload; got: {payload1[-200:]!r}"
-        assert match2, f"No summary_nonce in second payload; got: {payload2[-200:]!r}"
+        match1 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', payload1)
+        match2 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', payload2)
+        assert match1, f"No 'summary_nonce: STAGE2_<8-hex>' in first payload; got: {payload1[-200:]!r}"
+        assert match2, f"No 'summary_nonce: STAGE2_<8-hex>' in second payload; got: {payload2[-200:]!r}"
         assert match1.group(1) != match2.group(1), (
             f"Expected different summary_nonce values across successive assemble_payload() calls, "
             f"but both returned {match1.group(1)!r} — nonce must be regenerated each call."
@@ -9946,7 +9951,11 @@ class TestSummaryNonce:
     """
 
     def test_nonce_format_is_8_lowercase_hex_chars(self):
-        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$."""
+        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$.
+
+        Backward-compatibility anchor (task 1590): the no-arg call must always
+        return a bare 8-char hex token — untouched by the prefix feature.
+        """
         import re
 
         from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
@@ -9956,4 +9965,94 @@ class TestSummaryNonce:
         assert re.fullmatch(r'[0-9a-f]{8}', nonce), (
             f'Expected 8 lowercase hex chars matching ^[0-9a-f]{{8}}$, got {nonce!r}'
         )
+
+    def test_prefixed_nonce_stage1_format(self):
+        """generate_summary_nonce('STAGE1') returns a str matching ^STAGE1_[0-9a-f]{8}$.
+
+        Task 1590: stage-prefixed nonces structurally distinguish Stage 1 and Stage 2
+        summaries so their leading tokens differ, further separating them in Mem0's
+        embedding space.  RED until step-2 impl adds the prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        nonce = generate_summary_nonce('STAGE1')
+        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
+        assert re.fullmatch(r'STAGE1_[0-9a-f]{8}', nonce), (
+            f"Expected 'STAGE1_<8-hex>' matching ^STAGE1_[0-9a-f]{{8}}$, got {nonce!r}"
+        )
+
+    def test_prefixed_nonce_stage2_format(self):
+        """generate_summary_nonce('STAGE2') returns a str matching ^STAGE2_[0-9a-f]{8}$.
+
+        Task 1590: mirrors stage1 test; ensures Stage 2 nonces always lead with 'STAGE2_'.
+        RED until step-2 impl adds the prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+
+        nonce = generate_summary_nonce('STAGE2')
+        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
+        assert re.fullmatch(r'STAGE2_[0-9a-f]{8}', nonce), (
+            f"Expected 'STAGE2_<8-hex>' matching ^STAGE2_[0-9a-f]{{8}}$, got {nonce!r}"
+        )
+
+class TestBuildSummaryNonceSectionPrefix:
+    """build_summary_nonce_section() prefix forwarding tests (task 1590).
+
+    Verifies that the helper accepts an optional stage prefix and produces
+    a section line in the form 'summary_nonce: STAGE1_<8-hex>' or
+    'summary_nonce: STAGE2_<8-hex>', while keeping no-arg calls backward-compatible.
+    RED until step-4 impl adds the prefix parameter to build_summary_nonce_section.
+    """
+
+    def test_no_arg_backward_compat(self):
+        """No-arg build_summary_nonce_section() still matches 'summary_nonce: [0-9a-f]{8}'.
+
+        Backward-compat anchor: must stay GREEN across step-4 impl.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section()
+        assert re.search(r'summary_nonce: [0-9a-f]{8}', section), (
+            f"No-arg build_summary_nonce_section() must include 'summary_nonce: <8-hex>'; "
+            f"got: {section!r}"
+        )
+
+    def test_stage1_prefix_produces_prefixed_nonce(self):
+        """build_summary_nonce_section('STAGE1') must contain 'summary_nonce: STAGE1_<8-hex>'.
+
+        Task 1590: verifies the helper forwards the prefix to generate_summary_nonce.
+        RED until step-4 impl adds prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section('STAGE1')
+        assert re.search(r'summary_nonce: STAGE1_[0-9a-f]{8}', section), (
+            f"build_summary_nonce_section('STAGE1') must contain "
+            f"'summary_nonce: STAGE1_<8-hex>'; got: {section!r}"
+        )
+
+    def test_stage2_prefix_produces_prefixed_nonce(self):
+        """build_summary_nonce_section('STAGE2') must contain 'summary_nonce: STAGE2_<8-hex>'.
+
+        Task 1590: mirrors stage1 test for Stage 2.
+        RED until step-4 impl adds prefix parameter.
+        """
+        import re
+
+        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
+
+        section = build_summary_nonce_section('STAGE2')
+        assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', section), (
+            f"build_summary_nonce_section('STAGE2') must contain "
+            f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
+        )
+
 
