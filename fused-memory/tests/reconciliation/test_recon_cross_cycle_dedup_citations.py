@@ -193,3 +193,144 @@ class TestCrossProjectFindingCarriesCitedTasks:
         assert 'affected_ids' not in finding, (
             f'Finding must not contain affected_ids (post-cutover shape); keys: {list(finding)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Premise (2): Stage-1 signature path dedup across cycles (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestSignaturePathCrossCycleDedup:
+    """Premise (2) — the same null-task_id cross_project finding does NOT
+    re-appear the next cycle via the Stage-1 flag-marker path.
+
+    compute_flag_signature's cited_tasks fallback (introduced by task-1573)
+    derives a deterministic (task_id, flag_type) tuple from cited_tasks when
+    the top-level task_id is None.  dedup_flags uses this signature to key
+    the stage1_flag_marker in Mem0, so cycle 2 finds the prior marker and
+    annotates the flag with persisted_from_run instead of re-escalating.
+
+    Existing dedup_flags tests only exercise flags with a non-None top-level
+    task_id.  These tests are the first to drive the full MISS→write and
+    HIT→annotate flow for a null-task_id flag whose signature comes from
+    cited_tasks.
+    """
+
+    def test_compute_flag_signature_cited_tasks_fallback_returns_cited_task_id(self):
+        """Null top-level task_id + cited_tasks → signature derived from cited task id."""
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        flag = {
+            'flag_type': 'cross_project',
+            'task_id': None,
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+        }
+        result = compute_flag_signature(flag)
+        assert result == ('3803', 'cross_project'), (
+            f'Expected ("3803", "cross_project") via cited_tasks fallback, got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_flags_cycle1_miss_writes_marker_keyed_by_cited_task(self):
+        """Cycle 1 (no prior marker): MISS — flag not annotated; marker written with
+        cited-tasks-derived signature (task_id='3803', flag_type='cross_project')."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        memory_service = AsyncMock()
+        # All searches return empty: no suppression entries, no prior markers.
+        memory_service.search = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'description': 'cycle-1: reify/3803 needs routing',
+        }
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Flag NOT annotated — fresh finding (MISS)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0], (
+            f'Fresh flag must not have persisted_from_run; got {result[0]}'
+        )
+
+        # Marker was written (cycle-1 MISS always writes a new marker)
+        memory_service.add_memory.assert_called_once()
+        marker_kwargs = memory_service.add_memory.call_args.kwargs
+        meta = marker_kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage1_flag_marker', (
+            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
+        )
+        assert meta.get('task_id') == '3803', (
+            f'Marker task_id must be "3803" (cited-tasks signature); got {meta.get("task_id")!r}'
+        )
+        assert meta.get('flag_type') == 'cross_project', (
+            f'Marker flag_type must be "cross_project"; got {meta.get("flag_type")!r}'
+        )
+        assert meta.get('run_id') == 'r1', (
+            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_flags_cycle2_hit_annotates_persisted_from_run(self):
+        """Cycle 2 (prior marker present): HIT — flag annotated with
+        persisted_from_run='r0' and last_seen_run_id='r1'."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        prior_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '3803',
+            'flag_type': 'cross_project',
+            'run_id': 'r0',
+            'last_seen_run_id': 'r0',
+        })
+        prior_marker.id = 'prior-3803-r0'
+
+        # Confirmation search must find a marker with the CURRENT run_id='r1'
+        # (the prior has run_id='r0' and is excluded by the run_id-scoped filter).
+        new_marker_r1 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '3803',
+            'flag_type': 'cross_project',
+            'run_id': 'r1',
+            'last_seen_run_id': 'r1',
+        })
+        new_marker_r1.id = 'new-3803-r1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('3803', 'cross_project'): [[prior_marker], [new_marker_r1]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'description': 'cycle-2: reify/3803 still unrouted (prose may drift)',
+        }
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Flag annotated with persisted_from_run (HIT)
+        assert len(result) == 1
+        assert result[0].get('persisted_from_run') == 'r0', (
+            f'Expected persisted_from_run="r0", got {result[0].get("persisted_from_run")!r}'
+        )
+        assert result[0].get('last_seen_run_id') == 'r1', (
+            f'Expected last_seen_run_id="r1", got {result[0].get("last_seen_run_id")!r}'
+        )
