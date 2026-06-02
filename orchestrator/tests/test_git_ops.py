@@ -304,6 +304,162 @@ class TestWorktreeLifecycle:
         rc, _, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
         assert rc == 0, 'leftover branch must still exist'
 
+    # ── Fix: worktree-wipe race — canonical-path match + liveness gate ────
+    # esc-4146-268: reify's `.worktrees` became a symlink → a 17 TB mount on
+    # 2026-05-28.  Worktrees whose admin entry was recorded under the symlink
+    # path are listed by `git worktree list` in symlink form, but
+    # `_is_registered_worktree` compared the RESOLVED path by exact string —
+    # so a live worktree was judged unregistered and shutil.rmtree'd, losing
+    # its gitignored .task/plan.json (which git cannot restore).  The fix
+    # matches by canonical path on both sides, and the "not registered"
+    # branch now refuses to delete anything that looks live.
+
+    async def test_create_worktree_recognizes_symlink_form_registration(
+        self, git_config: GitConfig, git_repo: Path, tmp_path: Path,
+    ):
+        """A worktree whose admin entry was recorded under a SYMLINK path
+        (reify's `.worktrees`→mount migration shape) must be recognized as
+        registered and REUSED — never wiped.  Core regression for
+        esc-4146-268."""
+        # Reproduce the migration: register the worktree while `.worktrees`
+        # is a REAL dir (git records the plain path), then move that dir to
+        # an out-of-tree "mount" and replace it with a symlink so the
+        # recorded admin path now traverses a symlink (str != resolved).
+        wt_real = git_repo / '.worktrees'
+        wt_real.mkdir()
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', 'task/3546',
+             str(wt_real / '3546'), 'main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, err
+        mount = tmp_path / 'wt_mount'
+        wt_real.rename(mount)                       # move real dir (+3546)
+        (git_repo / '.worktrees').symlink_to(mount)  # swap in the symlink
+
+        # GitOps resolves worktree_base → the mount, so the path it checks is
+        # the RESOLVED form; the old exact-string compare never matched it.
+        git_ops = GitOps(git_config, git_repo)
+        resolved_path = git_ops.worktree_base / '3546'
+
+        # Guard: git must report the worktree under its SYMLINK form (distinct
+        # from the resolved form) — else the test wouldn't reproduce the
+        # path-form mismatch that the exact-string compare missed.
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=git_repo,
+        )
+        listed = [
+            ln[len('worktree '):]
+            for ln in out.splitlines() if ln.startswith('worktree ')
+        ]
+        assert any(
+            Path(p).resolve() == resolved_path and p != str(resolved_path)
+            for p in listed
+        ), f'expected a symlink-form admin entry distinct from {resolved_path}:\n{out}'
+
+        # The bug: the resolved path was judged NOT registered.
+        assert await git_ops._is_registered_worktree(resolved_path) is True
+
+        # A sentinel proves no rmtree: create_worktree must REUSE in place.
+        sentinel = resolved_path / 'plan_sentinel.txt'
+        sentinel.write_text('architect plan state\n')
+        info = await git_ops.create_worktree('3546')
+        assert info.path == resolved_path
+        assert sentinel.exists(), \
+            'symlink-form worktree must be reused, not rmtree-wiped'
+        assert sentinel.read_text() == 'architect plan state\n'
+
+    async def test_create_worktree_refuses_delinked_worktree_with_git_link(
+        self, git_ops: GitOps,
+    ):
+        """A directory holding a `.git` link + source files but NOT registered
+        (a worktree whose admin entry was lost — the 3546/3891 shape) must NOT
+        be rmtree'd: raise instead, preserving the dir and its gitignored
+        .task/ plan state."""
+        wt = git_ops.worktree_base / '3546'
+        wt.mkdir(parents=True)
+        (wt / '.git').write_text('gitdir: /some/repo/.git/worktrees/3546\n')
+        (wt / 'module.py').write_text('answer = 42\n')
+        task_dir = wt / '.task'
+        task_dir.mkdir()
+        (task_dir / 'plan.json').write_text('{"plan": "precious"}')
+
+        assert not await git_ops._is_registered_worktree(wt)
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('3546')
+
+        assert 'refus' in str(excinfo.value).lower()
+        # Nothing destroyed — the .git link, source, and plan state survive.
+        assert (wt / '.git').exists()
+        assert (wt / 'module.py').read_text() == 'answer = 42\n'
+        assert (task_dir / 'plan.json').read_text() == '{"plan": "precious"}'
+
+    async def test_create_worktree_refuses_delinked_dir_with_branch_commits(
+        self, git_ops: GitOps,
+    ):
+        """The 4146 shape: the `.git` link is gone and the directory holds
+        only .task/ residue, but the task branch still carries committed work.
+        The branch-commits discriminator (git-based) must independently gate
+        the delete → raise, preserving both the dir and the recoverable
+        branch."""
+        # Build task/4146 with a commit beyond main via a throwaway worktree,
+        # then detach it so the branch is a dangling ref carrying that commit.
+        tmp_wt = git_ops.project_root.parent / 'tmp-4146'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', 'task/4146', str(tmp_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (tmp_wt / 'recoverable.py').write_text('important = True\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'committed work on task/4146'], cwd=tmp_wt)
+        _, commit_sha, _ = await _run(
+            ['git', 'rev-parse', 'task/4146'], cwd=git_ops.project_root,
+        )
+        commit_sha = commit_sha.strip()
+        await _run(
+            ['git', 'worktree', 'remove', '--force', str(tmp_wt)],
+            cwd=git_ops.project_root,
+        )
+
+        # Leftover dir with NO .git link and only .task/ residue (so the
+        # content/`.git` discriminators are both False — branch_has_work is
+        # the sole trigger).
+        wt = git_ops.worktree_base / '4146'
+        wt.mkdir(parents=True)
+        task_dir = wt / '.task'
+        task_dir.mkdir()
+        (task_dir / 'state.json').write_text('{}')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('4146')
+
+        assert 'refus' in str(excinfo.value).lower()
+        # Dir survives, and the recoverable branch + its commit are untouched.
+        assert (task_dir / 'state.json').exists()
+        rc, sha_after, _ = await _run(
+            ['git', 'rev-parse', 'task/4146'], cwd=git_ops.project_root,
+        )
+        assert rc == 0 and sha_after.strip() == commit_sha
+
+    async def test_create_worktree_refuses_delinked_dir_with_source_content(
+        self, git_ops: GitOps,
+    ):
+        """Git-independent fail-safe: a non-registered directory holding source
+        files (beyond .task/) with no `.git` link and no task branch must still
+        raise rather than rmtree.  The content discriminator never depends on a
+        git command succeeding, so it holds even under ENOSPC / total git
+        failure (the disk-pressure condition observed on reify's mount)."""
+        wt = git_ops.worktree_base / 'orphan'
+        wt.mkdir(parents=True)
+        (wt / 'leftover_source.py').write_text('x = 1\n')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('orphan')
+
+        assert 'refus' in str(excinfo.value).lower()
+        assert (wt / 'leftover_source.py').read_text() == 'x = 1\n'
+
     async def test_commit_in_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-2')
         (worktree_info.path / 'new_file.py').write_text('print("hello")\n')
