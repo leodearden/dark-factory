@@ -8458,6 +8458,72 @@ class TestUnscopedTypecheckGate:
             f'RED tip landed on main! SHA changed from {main_sha_before!r} to {main_sha_after!r}'
         )
 
+    async def test_gate_timeout_is_fail_closed_and_bumps_counter(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """(c) Timeout in the unscoped gate → FAIL-CLOSED: blocked, timeouts counter bumped.
+
+        Patches run_scoped_verification to pass and run_verification (used inside
+        _run_unscoped_typechecks) to simulate a timed-out type-check (timed_out=True,
+        passed=False). Calls _run_post_merge_verify and asserts:
+        (a) the outcome is MergeOutcome('blocked') — fail-closed on timeout, not fail-open;
+        (b) the timeouts dict has been incremented for req.task_id.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        # Create a branch and merge it (to get a real merge_wt)
+        branch = 'gate-timeout-c'
+        wt = (await git_ops.create_worktree(branch)).path
+        (wt / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Add mod.py')
+
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success
+        assert merge_result.merge_worktree is not None
+        merge_wt = merge_result.merge_worktree
+
+        mc = ModuleConfig(
+            prefix='frontend',
+            test_command=None,
+            lint_command=None,
+            type_check_command='pyright src/',
+        )
+        req = MagicMock()
+        req.task_id = 'gate-timeout-test'
+        req.task_files = None
+        req.module_configs = [mc]
+        req.config = config
+
+        scoped_pass = MagicMock(passed=True, summary='', timed_out=False)
+        # Simulate a timed-out unscoped type-check
+        timeout_result = MagicMock(passed=False, timed_out=True)
+
+        timeouts: dict[str, int] = {}
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=scoped_pass)),
+            patch('orchestrator.merge_queue.run_verification', AsyncMock(return_value=timeout_result)),
+        ):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        # (a) fail-closed: timeout → blocked (NOT fail-open)
+        assert outcome is not None, 'Expected MergeOutcome(blocked), got None (fail-open)'
+        assert outcome.status == 'blocked', f'Expected blocked, got {outcome.status!r}'
+        assert 'Post-merge verification failed' in outcome.reason, (
+            f'Expected "Post-merge verification failed" in reason: {outcome.reason!r}'
+        )
+
+        # (b) loop-breaker counter was bumped for the task_id
+        assert timeouts.get('gate-timeout-test', 0) == 1, (
+            f'Expected timeouts["gate-timeout-test"] == 1, got: {timeouts!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestFinalizeAdvancedMerge — unit tests for the _finalize_advanced_merge helper
