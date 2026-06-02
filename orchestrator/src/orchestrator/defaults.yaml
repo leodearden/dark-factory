@@ -59,6 +59,13 @@ verify_command_timeout_secs: 1800
 # use verify_command_timeout_secs.  Default = 3× warm (90 min) to accommodate
 # cold OCCT + Tauri + full workspace builds seen in the reify escalation cluster.
 verify_cold_command_timeout_secs: 5400
+# Per-command timeout for cold merge-verify runs (is_merge_verify=True, is_cold=True).
+# Wins over verify_cold_command_timeout_secs in _resolve_verify_timeout, letting ops
+# raise the merge-path cold budget without lengthening task-phase cold verifies.
+# 7200 s = 4× warm (1800) and one step above the 90-min/5400 s general cold, giving
+# headroom for a cold full-workspace compile + frontend install (observed >30 min).
+# Task 1602's fail-closed post-merge type-check gate makes a timeout a queue stall.
+merge_verify_cold_command_timeout_secs: 7200
 verify_timeout_retries: 2
 
 # Verification execution mode + environment injection
