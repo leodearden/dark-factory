@@ -30,6 +30,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
 from dashboard.data.active_tasks import (
+    _MAX_CANCELLED_PER_PROJECT,
     _MAX_DONE_PER_PROJECT,
     collect_tasks_with_counts,
 )
@@ -536,6 +537,7 @@ async def api_tasks(request: Request) -> JSONResponse:
     active, offline_projects, done_counts = await collect_tasks_with_counts(
         http_client, config,
         max_done_per_project=_MAX_DONE_PER_PROJECT,
+        max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT,
         resolve_external=True,
     )
     return JSONResponse(
