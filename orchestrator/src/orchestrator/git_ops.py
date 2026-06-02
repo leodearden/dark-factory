@@ -369,20 +369,24 @@ class GitOps:
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
 
-        Uses ``git worktree list --porcelain`` and checks whether the
-        resolved *path* appears as a ``worktree <path>`` line.  This
-        prevents stale directories (containing only .task/ state files)
-        from being mistaken for reusable worktrees.
+        Uses ``git worktree list --porcelain`` and matches by **canonical
+        (resolved) path on both sides** — each listed ``worktree <path>``
+        is ``Path.resolve()``-d and compared against ``path.resolve()``.
+        This recognizes a registration recorded under a *symlink* path
+        (e.g. reify's ``.worktrees`` symlinked to a mount after migration,
+        esc-4146-268) that an exact-string compare would miss, while still
+        rejecting stale directories (containing only .task/ state files)
+        that were never registered.
         """
-        resolved = str(path.resolve())
+        resolved = path.resolve()
         rc, output, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'],
             cwd=self.project_root,
         )
         if rc != 0:
-            return False
+            return False  # fail-safe is provided by the destroy gate in create_worktree
         for line in output.splitlines():
-            if line.startswith('worktree ') and line[9:] == resolved:
+            if line.startswith('worktree ') and Path(line[9:]).resolve() == resolved:
                 return True
         return False
 
@@ -690,14 +694,55 @@ class GitOps:
                     stale_commits=stale_commits,
                 )
             elif worktree_path.exists():
-                # Either a stale directory that was never a registered
-                # worktree, or — if it was just quarantined above — already
-                # moved away (worktree_path.exists() is then False and this
-                # branch is skipped).  Remove the leftover stale dir so a
-                # fresh worktree can be created.
+                # The directory exists but git does not recognize it as a
+                # registered worktree.  Two very different cases share this
+                # branch, and conflating them is what destroyed live work in
+                # esc-4146-268 (the silent rmtree below):
+                #   (a) a genuinely stale leftover — only .task/ residue (and/
+                #       or empty), no .git link, no branch — safe to remove;
+                #   (b) a de-registered LIVE worktree whose admin entry was
+                #       lost (reify's symlink migration, or a stray prune) —
+                #       its .git link or source files are still on disk, or
+                #       its task branch still carries commits.  Deleting it
+                #       destroys work, including the gitignored .task/plan.json
+                #       that git cannot restore.
+                # Discriminate git-independently (so the gate still holds under
+                # ENOSPC / total git failure): a .git link present, or content
+                # beyond .task/, or a branch with commits beyond main => live.
+                # Mirror _cleanup_leftover_branch: raise rather than delete
+                # anything live (RuntimeError from create_worktree routes to
+                # blocked + L1, non-stranding via Harness Fix #1a — see below).
+                entries = {p.name for p in worktree_path.iterdir()}
+                has_git_link = '.git' in entries
+                has_substantive_content = bool(entries - {'.task', '.git'})
+                rc_v, _, _ = await _run(
+                    ['git', 'rev-parse', '--verify', full_branch],
+                    cwd=self.project_root,
+                )
+                branch_has_work = (
+                    rc_v == 0
+                    and await self._branch_has_commits_beyond_main(full_branch)
+                )
+                if has_git_link or has_substantive_content or branch_has_work:
+                    raise RuntimeError(
+                        f'create_worktree: refusing to delete directory '
+                        f'{worktree_path} — it looks like a live worktree whose '
+                        f'git registration was lost (a .git link is present, '
+                        f'source files exist, or branch {full_branch!r} carries '
+                        f'commits beyond {self.config.main_branch}). Deleting '
+                        f'would destroy work, including the gitignored .task/ '
+                        f'plan state that git cannot restore. Recover by '
+                        f're-registering it (`git worktree repair '
+                        f'{worktree_path}`) and re-dispatching, or quarantine it '
+                        f'manually once any wanted work is preserved. (fail-safe; '
+                        f'was the silent rmtree at git_ops.py:702)'
+                    )
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
-                    f'git worktree — removing stale directory and creating fresh worktree'
+                    f'git worktree, and holds no live work (no .git link, only '
+                    f'.task/ residue, branch has no commits beyond '
+                    f'{self.config.main_branch}) — removing stale directory and '
+                    f'creating fresh worktree'
                 )
                 shutil.rmtree(worktree_path)
 
