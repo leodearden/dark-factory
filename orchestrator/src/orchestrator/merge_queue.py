@@ -1166,6 +1166,80 @@ async def _reverify_rebased_tree(
 _POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
 
 
+async def _run_unscoped_typechecks(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    block_on_timeout: bool,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
+
+    This helper operates on a worktree supplied by the caller — it does **not**
+    create or clean up any worktree itself.
+
+    Args:
+        worktree: Path to the worktree to run type-checks in.  Caller owns it.
+        config: Orchestrator config (passed through to ``run_verification``).
+        module_configs: List of module configs.  Modules without a
+            ``type_check_command`` are silently skipped.
+        block_on_timeout: When ``True``, a timed-out module is appended to
+            *both* ``timed_out_subprojects`` and ``failing_subprojects``, making
+            the result ``broken`` (fail-closed, for the pre-advance gate).
+            When ``False``, a timed-out module is appended only to
+            ``timed_out_subprojects`` (fail-open, for the post-advance check).
+        task_id: Optional task identifier for log messages.
+
+    Returns:
+        :class:`PostMergePyrightResult` with the classification of each
+        module's type-check outcome.
+    """
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
+        # Run only the type-check command verbatim (unscoped).
+        # Null out test/lint so run_verification skips them (None => skip).
+        type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
+        return mc, await run_verification(
+            worktree, config, type_only_mc,
+            max_retries=0, is_merge_verify=True, role='merge',
+        )
+
+    # Run all subproject type-checks concurrently to minimise wall-clock
+    # impact on the merge queue's push_main delay.
+    pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
+
+    failing_subprojects: list[str] = []
+    timed_out_subprojects: list[str] = []
+    detail_parts: list[str] = []
+
+    for mc, verify in pairs:
+        if verify.timed_out:
+            timed_out_subprojects.append(mc.prefix)
+            if block_on_timeout:
+                failing_subprojects.append(mc.prefix)
+            continue
+
+        if not verify.passed:
+            failing_subprojects.append(mc.prefix)
+            # Collect bounded detail from the FIRST failing subproject only
+            # (matches PostMergePyrightResult.detail docstring).
+            if not detail_parts:
+                raw = verify.failure_report() or verify.type_output or ''
+                if isinstance(raw, str) and raw:
+                    detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
+
+    detail = '\n'.join(detail_parts)
+    return PostMergePyrightResult(
+        failing_subprojects=failing_subprojects,
+        timed_out_subprojects=timed_out_subprojects,
+        detail=detail,
+    )
+
+
 async def _check_post_merge_pyright(
     advanced_sha: str,
     git_ops: GitOps,
@@ -1180,6 +1254,11 @@ async def _check_post_merge_pyright(
     runs each subproject's ``type_check_command`` VERBATIM (unscoped —
     ``scope_module_config``/``_scope_command`` are NOT called) in a fresh
     detached worktree at ``advanced_sha``.
+
+    Delegates the per-module classification loop to
+    :func:`_run_unscoped_typechecks` with ``block_on_timeout=False`` —
+    the merge has already landed; we never block a landed merge on a flaky
+    hang or transient infra error (fail-open on timeout).
 
     Returns a :class:`PostMergePyrightResult` whose ``broken`` property is
     ``True`` when at least one subproject's type-check reports a genuine
@@ -1216,45 +1295,18 @@ async def _check_post_merge_pyright(
         # leading underscore) is tracked as a follow-up task.
         merge_wt, _ = await git_ops._create_merge_worktree(advanced_sha)
 
-        async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
-            # Run only the type-check command verbatim (unscoped).
-            # Null out test/lint so run_verification skips them (None => skip).
-            type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
-            return mc, await run_verification(
-                merge_wt, config, type_only_mc,
-                max_retries=0, is_merge_verify=True, role='merge',
-            )
-
-        # Run all subproject type-checks concurrently to minimise wall-clock
-        # impact on the merge queue's push_main delay.
-        pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
-
-        failing_subprojects: list[str] = []
-        detail_parts: list[str] = []
-
-        for mc, verify in pairs:
-            if verify.timed_out:
-                logger.warning(
-                    'post-merge-pyright: type-check for %r timed out on %s; '
-                    'failing open. task_id=%s',
-                    mc.prefix, advanced_sha[:12], task_id or '<unknown>',
-                )
-                continue  # fail open on timeout
-
-            if not verify.passed:
-                failing_subprojects.append(mc.prefix)
-                # Collect bounded detail from the FIRST failing subproject only
-                # (matches PostMergePyrightResult.detail docstring).
-                if not detail_parts:
-                    raw = verify.failure_report() or verify.type_output or ''
-                    if isinstance(raw, str) and raw:
-                        detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
-
-        detail = '\n'.join(detail_parts)
-        return PostMergePyrightResult(
-            failing_subprojects=failing_subprojects,
-            detail=detail,
+        result = await _run_unscoped_typechecks(
+            merge_wt, config, module_configs,
+            block_on_timeout=False, task_id=task_id,
         )
+        # Log timeouts explicitly (fail-open path: not in failing_subprojects).
+        for prefix in result.timed_out_subprojects:
+            logger.warning(
+                'post-merge-pyright: type-check for %r timed out on %s; '
+                'failing open. task_id=%s',
+                prefix, advanced_sha[:12], task_id or '<unknown>',
+            )
+        return result
 
     except Exception as exc:
         logger.warning(

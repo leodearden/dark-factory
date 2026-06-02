@@ -390,6 +390,157 @@ class TestCheckPostMergePyrightClassification:
 
 
 # ---------------------------------------------------------------------------
+# _run_unscoped_typechecks — classification tests (step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunUnscopedTypechecks:
+    """Tests for the _run_unscoped_typechecks helper.
+
+    Uses a caller-supplied fake worktree Path to confirm the helper does NOT
+    create or clean up a worktree — it operates on what the caller provides.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops._create_merge_worktree = AsyncMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        return git_ops
+
+    def _make_verify_result(
+        self, *, passed: bool, timed_out: bool = False,
+        type_output: str = 'type error output',
+    ) -> MagicMock:
+        v = MagicMock()
+        v.passed = passed
+        v.timed_out = timed_out
+        v.type_output = type_output
+        v.failure_report = MagicMock(return_value='failure report text' if not passed else '')
+        return v
+
+    @pytest.fixture
+    def config(self, tmp_path: Path) -> OrchestratorConfig:
+        from orchestrator.config import GitConfig
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+                push_after_advance=False,
+            ),
+        )
+
+    async def test_genuine_failure_is_broken(self, config: OrchestratorConfig):
+        """passed=False, timed_out=False → prefix in failing_subprojects, broken=True."""
+        from orchestrator.merge_queue import _run_unscoped_typechecks
+        fake_wt = Path('/tmp/fake-wt')
+        git_ops = self._make_git_ops()
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=False, timed_out=False)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _run_unscoped_typechecks(
+                fake_wt, config, [mc],
+                block_on_timeout=False, task_id='fail-test',
+            )
+
+        assert result.broken is True
+        assert 'pkg' in result.failing_subprojects
+        # No worktree creation/cleanup by the helper itself
+        git_ops._create_merge_worktree.assert_not_awaited()
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_timeout_with_block_on_timeout_false_fails_open(
+        self, config: OrchestratorConfig,
+    ):
+        """timed_out=True, block_on_timeout=False → fail-open: NOT in failing, IS in timed_out."""
+        from orchestrator.merge_queue import _run_unscoped_typechecks
+        fake_wt = Path('/tmp/fake-wt')
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=False, timed_out=True)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _run_unscoped_typechecks(
+                fake_wt, config, [mc],
+                block_on_timeout=False, task_id='timeout-open-test',
+            )
+
+        assert result.broken is False
+        assert 'pkg' not in result.failing_subprojects
+        assert 'pkg' in result.timed_out_subprojects
+
+    async def test_timeout_with_block_on_timeout_true_is_broken(
+        self, config: OrchestratorConfig,
+    ):
+        """timed_out=True, block_on_timeout=True → fail-closed: in BOTH failing AND timed_out."""
+        from orchestrator.merge_queue import _run_unscoped_typechecks
+        fake_wt = Path('/tmp/fake-wt')
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=False, timed_out=True)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _run_unscoped_typechecks(
+                fake_wt, config, [mc],
+                block_on_timeout=True, task_id='timeout-closed-test',
+            )
+
+        assert result.broken is True
+        assert 'pkg' in result.failing_subprojects
+        assert 'pkg' in result.timed_out_subprojects
+
+    async def test_clean_result_is_empty(self, config: OrchestratorConfig):
+        """passed=True → both lists empty, broken=False, timed_out=False."""
+        from orchestrator.merge_queue import _run_unscoped_typechecks
+        fake_wt = Path('/tmp/fake-wt')
+        mc = _make_module_config(prefix='pkg', type_check_command='pyright src/')
+        verify_result = self._make_verify_result(passed=True, timed_out=False)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(return_value=verify_result),
+        ):
+            result = await _run_unscoped_typechecks(
+                fake_wt, config, [mc],
+                block_on_timeout=True, task_id='clean-test',
+            )
+
+        assert result.broken is False
+        assert result.timed_out is False
+        assert result.failing_subprojects == []
+        assert result.timed_out_subprojects == []
+
+    async def test_no_type_check_command_skips_module(self, config: OrchestratorConfig):
+        """Modules with type_check_command=None are skipped; returns clean result."""
+        from orchestrator.merge_queue import _run_unscoped_typechecks
+        fake_wt = Path('/tmp/fake-wt')
+        mc = _make_module_config(prefix='pkg', type_check_command=None)
+
+        with patch(
+            'orchestrator.merge_queue.run_verification',
+            AsyncMock(),
+        ) as mock_run:
+            result = await _run_unscoped_typechecks(
+                fake_wt, config, [mc],
+                block_on_timeout=True, task_id='no-cmd-test',
+            )
+
+        mock_run.assert_not_awaited()
+        assert result.broken is False
+
+
+# ---------------------------------------------------------------------------
 # MergeWorker._do_merge call-site integration tests  (step-5)
 # ---------------------------------------------------------------------------
 
