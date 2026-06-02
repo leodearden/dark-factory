@@ -372,12 +372,13 @@ class TestVerifyWarmMarker:
 class TestResolveVerifyTimeout:
     """Tests for the updated _resolve_verify_timeout(config, module_config, *, is_cold) helper."""
 
-    def _make_config(self, warm=1800.0, cold=None):
+    def _make_config(self, warm=1800.0, cold=None, merge_cold=None):
         """Build a minimal OrchestratorConfig with the given timeout values."""
         from orchestrator.config import OrchestratorConfig
         return OrchestratorConfig(
             verify_command_timeout_secs=warm,
             verify_cold_command_timeout_secs=cold,
+            merge_verify_cold_command_timeout_secs=merge_cold,
         )
 
     def _make_mc(self, warm=None, cold=None):
@@ -432,6 +433,32 @@ class TestResolveVerifyTimeout:
         mc = self._make_mc(warm=2000.0, cold=None)
         # cold cascade: mc.cold=None → config.cold=None → mc.warm=2000
         assert _resolve_verify_timeout(config, mc, is_cold=True) == 2000.0
+
+    # ── is_merge_verify branch tests (step-3 RED) ────────────────────────
+
+    def test_merge_cold_wins_when_is_merge_verify_and_cold(self):
+        """is_merge_verify=True + is_cold=True + merge_cold=7200 → 7200 (merge knob wins)."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
+        assert _resolve_verify_timeout(config, None, is_cold=True, is_merge_verify=True) == 7200.0
+
+    def test_merge_cold_none_falls_back_to_config_cold(self):
+        """is_merge_verify=True + is_cold=True + merge_cold=None → falls back to config.cold (5400)."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=None)
+        assert _resolve_verify_timeout(config, None, is_cold=True, is_merge_verify=True) == 5400.0
+
+    def test_merge_cold_ignored_when_not_is_merge_verify(self):
+        """is_merge_verify=False + is_cold=True + merge_cold=7200 → config.cold (5400); merge knob ignored."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
+        assert _resolve_verify_timeout(config, None, is_cold=True, is_merge_verify=False) == 5400.0
+
+    def test_merge_cold_ignored_when_is_cold_false(self):
+        """is_merge_verify=True + is_cold=False + merge_cold=7200 → warm (1800); knob never applies."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
+        assert _resolve_verify_timeout(config, None, is_cold=False, is_merge_verify=True) == 1800.0
 
 
 class TestRunVerificationColdFirstUse:
