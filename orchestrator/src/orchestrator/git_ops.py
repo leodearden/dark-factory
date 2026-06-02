@@ -2098,6 +2098,56 @@ class GitOps:
 
         logger.info(f'Cleaned up worktree {worktree} and branch {full_branch}')
 
+    async def reclaim_worktree_build_artifacts(
+        self,
+        worktree: Path,
+        dir_names: list[str] | None = None,
+    ) -> list[Path]:
+        """Remove regenerable build-artifact directories from a done worktree.
+
+        Drops only the named build-output subdirectories (e.g. ``target/``)
+        and never touches git refs, the worktree admin entry, or any other
+        content.  This is appropriate when the task's merge commit is
+        confirmed on main but the branch tip is a pre-rebase duplicate —
+        the forensic history is preserved while the large regenerable cache
+        is reclaimed.
+
+        *dir_names* overrides which subdirectory names to reap.  When
+        ``None``, falls back to ``self.config.reap_build_artifact_dirs``
+        (default ``['target']``).
+
+        Best-effort: each removal is wrapped in try/except; failures are
+        logged as warnings but never propagated.  Mirrors the
+        never-raise contract of ``cleanup_merge_worktree`` and
+        ``prune_worktrees``.
+
+        Returns the list of directory paths that were successfully removed.
+        Returns ``[]`` when nothing was reaped (dirs absent or worktree
+        path does not exist).
+        """
+        names = dir_names if dir_names is not None else self.config.reap_build_artifact_dirs
+        removed: list[Path] = []
+
+        for name in names:
+            candidate = worktree / name
+            if not candidate.is_dir():
+                continue
+            try:
+                shutil.rmtree(candidate)
+                removed.append(candidate)
+            except Exception:
+                logger.warning(
+                    'reclaim_worktree_build_artifacts: failed to remove %s',
+                    candidate, exc_info=True,
+                )
+
+        if removed:
+            logger.info(
+                'reclaim_worktree_build_artifacts: removed %d dir(s) from %s: %s',
+                len(removed), worktree, [str(p) for p in removed],
+            )
+        return removed
+
     # ── Orphan-worktree hygiene (Fix B/C) ─────────────────────────────
 
     @property
