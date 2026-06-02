@@ -15,7 +15,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
@@ -8313,6 +8313,150 @@ class TestRunPostMergeVerify:
             )
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestUnscopedTypecheckGate — step-5 gate tests
+# ---------------------------------------------------------------------------
+
+# Hermetic type_check_command that always exits 1 (simulates a RED frontend
+# type-check).  We use a simple inline Python one-liner so no external tools
+# are required and the exit code is deterministic regardless of repo contents.
+_TYPE_CMD_ALWAYS_FAIL = 'python3 -c "import sys; sys.stderr.write(\'synthetic type error\\n\'); sys.exit(1)"'
+
+
+def _make_request_with_module_configs(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+) -> MergeRequest:
+    """Like _make_request but accepts explicit module_configs."""
+    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=module_configs,
+        config=config,
+        result=future,
+    )
+
+
+@pytest.mark.asyncio
+class TestUnscopedTypecheckGate:
+    """Tests for the pre-advance, fail-closed unscoped type-check gate wired into
+    _run_post_merge_verify (step-5 RED / step-6 GREEN).
+
+    Patches run_scoped_verification to always pass so only the new unscoped
+    gate can block the merge.
+    """
+
+    async def test_run_post_merge_verify_blocks_on_failing_typecheck(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """(a) _run_post_merge_verify with a failing type_check_command → blocked.
+
+        reason starts with 'Post-merge verification failed', names the failing
+        subproject, and merge_wt is cleaned up.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        # Create a branch and merge it (to get a real merge_wt)
+        branch = 'gate-typecheck-a'
+        wt = (await git_ops.create_worktree(branch)).path
+        (wt / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Add mod.py')
+
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success
+        assert merge_result.merge_worktree is not None
+        merge_wt = merge_result.merge_worktree
+
+        mc = ModuleConfig(
+            prefix='frontend',
+            test_command=None,
+            lint_command=None,
+            type_check_command=_TYPE_CMD_ALWAYS_FAIL,
+        )
+        req = MagicMock()
+        req.task_id = 'gate-test-a'
+        req.task_files = None
+        req.module_configs = [mc]
+        req.config = config
+
+        scoped_pass = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=scoped_pass)),
+        ):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert outcome is not None, 'Expected MergeOutcome(blocked), got None'
+        assert outcome.status == 'blocked', f'Expected blocked, got {outcome.status!r}'
+        assert outcome.reason.startswith('Post-merge verification failed'), (
+            f'Reason does not start with expected prefix: {outcome.reason!r}'
+        )
+        assert 'frontend' in outcome.reason, (
+            f'"frontend" not in reason: {outcome.reason!r}'
+        )
+        # merge_wt should have been cleaned up by _run_post_merge_verify on failure
+        assert not merge_wt.exists(), 'merge_wt should be cleaned up on blocked outcome'
+
+    async def test_mergeworker_blocks_red_tip_main_sha_unchanged(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """(b) MergeWorker end-to-end: RED type_check_command → blocked, main SHA unchanged."""
+        branch = 'gate-typecheck-b'
+        wt = (await git_ops.create_worktree(branch)).path
+        (wt / 'mod.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Add mod.py')
+
+        main_sha_before = await git_ops.get_main_sha()
+
+        mc = ModuleConfig(
+            prefix='frontend',
+            test_command=None,
+            lint_command=None,
+            type_check_command=_TYPE_CMD_ALWAYS_FAIL,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        scoped_pass = MagicMock(passed=True, summary='', timed_out=False)
+        with patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=scoped_pass)):
+            req = _make_request_with_module_configs(
+                'gate-test-b', branch, wt, config, module_configs=[mc],
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert outcome.status == 'blocked', (
+            f'Expected blocked, got {outcome.status!r}: {outcome.reason!r}'
+        )
+
+        main_sha_after = await git_ops.get_main_sha()
+        assert main_sha_before == main_sha_after, (
+            f'RED tip landed on main! SHA changed from {main_sha_before!r} to {main_sha_after!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

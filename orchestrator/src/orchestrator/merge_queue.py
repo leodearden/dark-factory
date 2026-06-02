@@ -392,6 +392,39 @@ async def _run_post_merge_verify(
                     req.task_id, new_count,
                 )
         return MergeOutcome('blocked', reason=reason)
+
+    # Pre-advance, fail-closed unscoped type-check gate.
+    # Runs ONLY type_check_command unscoped against the already-created merge_wt
+    # (before advance_main).  No-op when no module declares a type_check_command.
+    gate = await _run_unscoped_typechecks(
+        merge_wt, req.config, req.module_configs,
+        block_on_timeout=True, task_id=req.task_id,
+    )
+    if gate.broken:
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        failing = ', '.join(gate.failing_subprojects)
+        if gate.timed_out_subprojects:
+            reason = (
+                f'Post-merge verification failed: unscoped type-check timed out '
+                f'for {failing}.'
+            )
+            new_count = timeouts.get(req.task_id, 0) + 1
+            timeouts[req.task_id] = new_count
+            if new_count >= max_timeouts:
+                logger.warning(
+                    'Task %s: post-merge unscoped type-check timed out %d times in a '
+                    'row — next submission will be abandoned',
+                    req.task_id, new_count,
+                )
+        else:
+            reason = (
+                f'Post-merge verification failed: unscoped type-check failed '
+                f'for {failing}.'
+            )
+            if gate.detail:
+                reason = f'{reason}\n\n{gate.detail}'
+        return MergeOutcome('blocked', reason=reason)
+
     return None
 
 

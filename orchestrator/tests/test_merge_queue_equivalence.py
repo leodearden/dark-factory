@@ -583,6 +583,16 @@ def _mock_pyright_broken(prefix: str = 'subpkg'):
     ))
 
 
+def _mock_unscoped_gate_pass():
+    """Return a mock that makes _run_unscoped_typechecks (the pre-advance gate) always pass.
+
+    Tests for the post-advance _check_post_merge_pyright call-site patch this
+    to ensure the new pre-advance gate does not block the merge before the
+    post-advance check is reached.
+    """
+    return AsyncMock(return_value=PostMergePyrightResult())
+
+
 @pytest.mark.asyncio
 class TestMergeWorkerPyrightCallSite:
     """Integration: MergeWorker._do_merge calls _check_post_merge_pyright after equiv check."""
@@ -606,6 +616,13 @@ class TestMergeWorkerPyrightCallSite:
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
+            ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
             ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
@@ -649,6 +666,13 @@ class TestMergeWorkerPyrightCallSite:
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
             ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
+            ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
                 _mock_pyright_clean(),
@@ -688,6 +712,13 @@ class TestMergeWorkerPyrightCallSite:
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
+            ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
             ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
@@ -747,6 +778,13 @@ class TestSpeculativeMergeWorkerPyrightCallSite:
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
             ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
+            ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
                 _mock_pyright_broken('subpkg'),
@@ -788,6 +826,13 @@ class TestSpeculativeMergeWorkerPyrightCallSite:
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
             ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
+            ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
                 _mock_pyright_clean(),
@@ -827,6 +872,13 @@ class TestSpeculativeMergeWorkerPyrightCallSite:
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
                 _mock_scoped_verify_pass(),
+            ),
+            # Pre-advance gate must pass so the merge reaches advance_main and
+            # the post-advance _check_post_merge_pyright call (what this test
+            # actually exercises).
+            patch(
+                'orchestrator.merge_queue._run_unscoped_typechecks',
+                _mock_unscoped_gate_pass(),
             ),
             patch(
                 'orchestrator.merge_queue._check_post_merge_pyright',
