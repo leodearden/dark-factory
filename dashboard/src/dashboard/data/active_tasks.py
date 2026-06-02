@@ -40,7 +40,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 
-_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
+_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
 
 # Maximum done tasks to include per project when the caller opts in via
 # ``max_done_per_project``.  Kept at module level so app.py can import it.
