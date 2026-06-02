@@ -397,6 +397,17 @@ class GitConfig(BaseModel):
             "check entirely for projects without citation conventions."
         ),
     )
+    reap_build_artifact_dirs: list[str] = Field(
+        default_factory=lambda: ['target'],
+        description=(
+            'Regenerable build-output directory names reaped from a done '
+            "task's worktree once its merge commit is confirmed on main. "
+            'Defaults to [\'target\'] (Rust/Cargo build cache). Override '
+            'per project for non-Rust build systems (e.g. [\'build\', '
+            '\'dist\']). Uses default_factory to avoid a shared mutable '
+            'default across model instances.'
+        ),
+    )
 
 
 # --- Per-module overrides ---
