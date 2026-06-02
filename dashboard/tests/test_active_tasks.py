@@ -872,3 +872,74 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     assert by_id['xdeps/T-5']['external_deps'] == [{'id': 'proj:10', 'status': 'done'}]
     # Done row's dep kept 'unknown' (was not re-stamped).
     assert by_id['xdeps/T-6']['external_deps'] == [{'id': 'proj:99', 'status': 'unknown'}]
+
+
+# ---------------------------------------------------------------------------
+# deferred via active path (step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_includes_deferred_via_active_path(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """deferred tasks must flow through the ACTIVE path (with resolved deps + started).
+
+    A deferred task (id 30, deps=[31]) plus a done dep (id 31).
+    Expected:
+    (a) 'proj/T-30' appears in the returned rows — deferred survives the active filter.
+    (b) The deferred row's deps == [{'id': 'proj/T-31', 'title': ..., 'done': True}] —
+        proves it flows through the active path with resolved deps, NOT the stripped
+        bounded-bucket path.
+    (c) The row has a 'started' key and does NOT have a 'completed' key.
+
+    RED today: 'deferred' is not in _ACTIVE_STATUSES, so the task is dropped.
+    """
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='proj',
+        tasks=[
+            {
+                'id': 30,
+                'title': 'parked work',
+                'status': 'deferred',
+                'dependencies': [31],
+                'metadata': {},
+            },
+            {
+                'id': 31,
+                'title': 'finished dep',
+                'status': 'done',
+                'dependencies': [],
+                'metadata': {},
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    ids = {t['id'] for t in active}
+    assert 'proj/T-30' in ids, (
+        "deferred task T-30 was dropped by the active-status filter — "
+        "add 'deferred' to _ACTIVE_STATUSES"
+    )
+
+    by_id = {t['id']: t for t in active}
+    row = by_id['proj/T-30']
+
+    # (b) resolved deps via active path — done flag on the dep
+    assert row['deps'] == [{'id': 'proj/T-31', 'title': 'finished dep', 'done': True}], (
+        f"expected deferred row deps with done=True, got: {row.get('deps')}"
+    )
+
+    # (c) active-path fields present / absent
+    assert 'started' in row, "deferred row must have 'started' key (active path)"
+    assert 'completed' not in row, (
+        "deferred row must NOT have 'completed' key (that is the bounded-bucket sentinel)"
+    )
