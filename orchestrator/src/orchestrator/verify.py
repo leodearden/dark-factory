@@ -1566,7 +1566,7 @@ async def run_verification(
         is_cold = _is_verify_cold(worktree, module_prefix)
     else:
         is_cold = False
-    timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
+    timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold, is_merge_verify=is_merge_verify)
     if max_retries is None:
         max_retries = config.verify_timeout_retries
 
