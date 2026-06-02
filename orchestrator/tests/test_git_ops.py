@@ -3513,3 +3513,92 @@ class TestFindInflightMergeWorktree:
         assert found is None, (
             f'find_inflight_merge_worktree must ignore task worktrees, got {found}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestReclaimWorktreeBuildArtifacts — unit tests for the new helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReclaimWorktreeBuildArtifacts:
+    """GitOps.reclaim_worktree_build_artifacts removes regenerable build dirs.
+
+    These tests cover the four cases described in the plan:
+      (a) nominal reap — target/ exists, gets removed, path returned
+      (b) idempotent no-op — calling again on the same (now-clean) worktree
+      (c) dir_names override — only the named dir is reaped; 'target' survives
+      (d) never-raises — non-existent worktree path returns [] without raising
+    """
+
+    async def test_nominal_reap(self, git_ops: GitOps):
+        """(a) Creates a worktree, populates target/, reaps it via the helper."""
+        wt_info = await git_ops.create_worktree('reap-nominal')
+        wt = wt_info.path
+
+        # Simulate a Rust/Cargo build cache under the worktree.
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'cache.bin').write_bytes(b'\x00' * 1024)
+
+        removed = await git_ops.reclaim_worktree_build_artifacts(wt)
+
+        assert not target_dir.exists(), (
+            'target/ must be removed by reclaim_worktree_build_artifacts'
+        )
+        assert removed == [target_dir], (
+            f'expected [target_dir], got {removed}'
+        )
+
+    async def test_idempotent_noop(self, git_ops: GitOps):
+        """(b) Calling a second time (target/ already gone) returns [] and does not raise."""
+        wt_info = await git_ops.create_worktree('reap-idempotent')
+        wt = wt_info.path
+
+        # First call: create and reap target/
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'file.txt').write_text('data\n')
+        await git_ops.reclaim_worktree_build_artifacts(wt)
+        assert not target_dir.exists()
+
+        # Second call: target/ is absent — must return [] and not raise
+        removed = await git_ops.reclaim_worktree_build_artifacts(wt)
+        assert removed == [], (
+            f'second call must return [] when target/ is absent, got {removed}'
+        )
+
+    async def test_explicit_dir_names_override(self, git_ops: GitOps):
+        """(c) dir_names=['build'] reaps only 'build', leaves 'target' intact."""
+        wt_info = await git_ops.create_worktree('reap-override')
+        wt = wt_info.path
+
+        build_dir = wt / 'build'
+        build_dir.mkdir()
+        (build_dir / 'artifact.o').write_bytes(b'\xff')
+
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'cache.bin').write_bytes(b'\x00')
+
+        removed = await git_ops.reclaim_worktree_build_artifacts(
+            wt, dir_names=['build'],
+        )
+
+        assert not build_dir.exists(), 'build/ must be removed by override'
+        assert target_dir.exists(), (
+            'target/ must NOT be removed when dir_names=[\'build\']'
+        )
+        assert removed == [build_dir], (
+            f'expected [build_dir], got {removed}'
+        )
+
+    async def test_never_raises_for_nonexistent_worktree(self, git_ops: GitOps):
+        """(d) Non-existent worktree path returns [] without raising."""
+        bogus_path = git_ops.worktree_base / 'does-not-exist-12345'
+        assert not bogus_path.exists()
+
+        removed = await git_ops.reclaim_worktree_build_artifacts(bogus_path)
+        assert removed == [], (
+            f'expected [] for non-existent path, got {removed}'
+        )
