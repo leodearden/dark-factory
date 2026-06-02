@@ -460,6 +460,30 @@ class TestResolveVerifyTimeout:
         config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
         assert _resolve_verify_timeout(config, None, is_cold=False, is_merge_verify=True) == 1800.0
 
+    def test_merge_cold_wins_over_module_cold_when_is_merge_verify(self):
+        """Global merge budget (7200) beats a per-module cold override (3000) when is_merge_verify=True.
+
+        This exercises the documented precedence: config.merge_verify_cold_command_timeout_secs
+        wins *before* the per-module cold knob.  On the real merge path scope_module_config drops
+        per-module timeout fields anyway, but this test confirms the resolver itself honours the
+        global-beats-module invariant even when a module cold value is present.
+        """
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
+        mc = self._make_mc(cold=3000.0)
+        assert _resolve_verify_timeout(config, mc, is_cold=True, is_merge_verify=True) == 7200.0
+
+    def test_merge_cold_none_falls_back_to_module_cold(self):
+        """When merge_cold is None, the resolver falls back to mc.cold (3000) on the merge path.
+
+        Mirror of test_merge_cold_wins_over_module_cold_when_is_merge_verify: confirms that
+        clearing the global merge knob (None) still honours a per-module cold override.
+        """
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=None)
+        mc = self._make_mc(cold=3000.0)
+        assert _resolve_verify_timeout(config, mc, is_cold=True, is_merge_verify=True) == 3000.0
+
 
 class TestRunVerificationColdFirstUse:
     """Integration tests for cold-first-use timeout selection in run_verification.
