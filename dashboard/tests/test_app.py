@@ -162,6 +162,49 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
 
 
+def test_tasks_endpoint_passes_max_cancelled_per_project(client):
+    """api_tasks must call collect_tasks_with_counts with max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT.
+
+    Asserts:
+    (a) max_cancelled_per_project == _MAX_CANCELLED_PER_PROJECT is passed in call kwargs
+    (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
+        resolve_external == True
+    (c) top-level payload key-set remains exactly
+        {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+        (no new key added for cancelled)
+
+    RED today: app.py does not yet pass max_cancelled_per_project.
+    """
+    from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
+
+    mock = AsyncMock(return_value=([], [], {}))
+
+    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200
+    body = resp.json()
+
+    call_kwargs = mock.call_args.kwargs
+
+    # (a) max_cancelled_per_project
+    assert call_kwargs.get('max_cancelled_per_project') == _MAX_CANCELLED_PER_PROJECT, (
+        f'expected max_cancelled_per_project={_MAX_CANCELLED_PER_PROJECT} in call kwargs, '
+        f'got: {call_kwargs}'
+    )
+
+    # (b) existing kwargs unchanged
+    assert call_kwargs.get('max_done_per_project') == _MAX_DONE_PER_PROJECT, (
+        f'expected max_done_per_project={_MAX_DONE_PER_PROJECT} in call kwargs, got: {call_kwargs}'
+    )
+    assert call_kwargs.get('resolve_external') is True, (
+        f'expected resolve_external=True in call kwargs, got: {call_kwargs}'
+    )
+
+    # (c) payload key-set unchanged
+    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+
+
 def test_memory_returns_memory_status(client):
     """memory endpoint composes status + queue stats into a MEMORY_STATUS block."""
     with patch(

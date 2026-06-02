@@ -134,7 +134,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
     const arr = Array.from({ length: max + 1 }, () => []);
     for (const t of tasks) arr[tiers.get(t.id) || 0].push(t);
     // Within a tier, sort by status priority: blocked → in-progress → merge-deferred → pending → done
-    const order = { blocked: 0, 'in-progress': 1, 'merge-deferred': 1.5, pending: 2, deferred: 3, done: 4 };
+    const order = { blocked: 0, 'in-progress': 1, 'merge-deferred': 1.5, pending: 2, deferred: 3, done: 4, cancelled: 5 };
     arr.forEach(row => row.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9)));
     return arr;
   }, [tasks, tiers]);
@@ -204,6 +204,8 @@ function fmtAge(t) {
   if (t.status === 'done')             return t.completed ? window.DF_SHELL.timeago(t.completed) : '—';
   if (t.status === 'pending')          return 'unstarted';
   if (t.status === 'merge-deferred')   return 'parked for train';
+  if (t.status === 'deferred')         return 'deferred';
+  if (t.status === 'cancelled')        return t.completed ? window.DF_SHELL.timeago(t.completed) : 'cancelled';
   return `${t.started}m running`;
 }
 
@@ -271,7 +273,7 @@ function TaskDetail({ task, allTasks }) {
 
       <div className="kv">
         <span className="k">status</span>
-        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
+        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.loops}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.attempts}</span>
@@ -357,7 +359,7 @@ function TasksTab({ projectFilter, search }) {
 
   // Filter, default {active, pending} on
   const [filters, setFilters] = tasksPersistedState('df.tasksFilters',
-    { active: true, pending: true, complete: false, deferred: false });
+    { active: true, pending: true, complete: false, deferred: false, cancelled: false });
   const flipFilter = (k) => setFilters(f => ({ ...f, [k]: !f[k] }));
 
   const allTasks = DF_T.ACTIVE_TASKS;
@@ -372,10 +374,11 @@ function TasksTab({ projectFilter, search }) {
   const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
 
   function statusMatches(s) {
-    if (filters.active   && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
-    if (filters.pending  && s === 'pending')  return true;
-    if (filters.complete && s === 'done')     return true;
-    if (filters.deferred && s === 'deferred') return true;
+    if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
+    if (filters.pending   && s === 'pending')    return true;
+    if (filters.complete  && s === 'done')       return true;
+    if (filters.deferred  && s === 'deferred')   return true;
+    if (filters.cancelled && s === 'cancelled')  return true;
     return false;
   }
   function searchMatches(t) {
@@ -409,10 +412,11 @@ function TasksTab({ projectFilter, search }) {
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>
         <div className="seg">
-          <button className={filters.active   ? 'on' : ''} onClick={() => flipFilter('active')}>active</button>
-          <button className={filters.pending  ? 'on' : ''} onClick={() => flipFilter('pending')}>pending</button>
-          <button className={filters.complete ? 'on' : ''} onClick={() => flipFilter('complete')}>complete</button>
-          <button className={filters.deferred ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
+          <button className={filters.active    ? 'on' : ''} onClick={() => flipFilter('active')}>active</button>
+          <button className={filters.pending   ? 'on' : ''} onClick={() => flipFilter('pending')}>pending</button>
+          <button className={filters.complete  ? 'on' : ''} onClick={() => flipFilter('complete')}>complete</button>
+          <button className={filters.deferred  ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
+          <button className={filters.cancelled ? 'on' : ''} onClick={() => flipFilter('cancelled')}>cancelled</button>
         </div>
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
           click a task to inspect →

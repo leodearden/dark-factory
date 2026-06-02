@@ -40,11 +40,13 @@ from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
 
-_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred'}
+_ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
 
-# Maximum done tasks to include per project when the caller opts in via
-# ``max_done_per_project``.  Kept at module level so app.py can import it.
+# Maximum done / cancelled tasks to include per project when the caller opts in
+# via ``max_done_per_project`` / ``max_cancelled_per_project``.
+# Kept at module level so app.py can import them.
 _MAX_DONE_PER_PROJECT = 50
+_MAX_CANCELLED_PER_PROJECT = 50
 
 
 def _project_label(root: Path) -> str:
@@ -145,6 +147,7 @@ async def _shape_one_project(
     project_root: Path,
     *,
     max_done_per_project: int = 0,
+    max_cancelled_per_project: int = 0,
 ) -> tuple[list[dict], bool, int]:
     """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
@@ -162,6 +165,10 @@ async def _shape_one_project(
     appended to the returned list.  Each done row carries a ``completed``
     field (the ``updated_at`` ISO string or ``''``).  Active rows are
     unaffected.
+
+    When *max_cancelled_per_project* > 0, the most-recent N cancelled tasks
+    are similarly appended (same sort key, same ``completed`` field, same
+    ``started: 0`` / ``deps: []`` treatment as done rows).
     """
     project = _project_label(project_root)
     fetched = await fetch_tasks(client, config, project_root)
@@ -209,19 +216,26 @@ async def _shape_one_project(
         row['deps'] = deps
         active.append(row)
 
-    if max_done_per_project > 0:
-        done_tasks = [t for t in tasks if t.get('status') == 'done']
+    # Bounded terminal buckets: iterate over (status, cap) pairs so done stays
+    # byte-identical and cancelled gets the same treatment.
+    for _bkt_status, _bkt_cap in (
+        ('done', max_done_per_project),
+        ('cancelled', max_cancelled_per_project),
+    ):
+        if _bkt_cap <= 0:
+            continue
+        bucket_tasks = [t for t in tasks if t.get('status') == _bkt_status]
         # Sort by updated_at descending; id descending as tie-breaker.
-        done_tasks.sort(
+        bucket_tasks.sort(
             key=lambda t: (t.get('updated_at') or '', t.get('id') or 0),
             reverse=True,
         )
-        for task in done_tasks[:max_done_per_project]:
+        for task in bucket_tasks[:_bkt_cap]:
             task_id = task['id']
             uid = _task_uid(project, task_id)
             wt = worktrees.get(task_id) or {}
             row = _build_task_row(project, task, task_id, wt, uid)
-            # done rows: no meaningful start time; no deps surfaced.
+            # terminal rows: no meaningful start time; no deps surfaced.
             row['started'] = 0
             row['deps'] = []
             row['completed'] = task.get('updated_at') or ''
@@ -235,6 +249,7 @@ async def collect_tasks_with_counts(
     config: DashboardConfig,
     *,
     max_done_per_project: int = 0,
+    max_cancelled_per_project: int = 0,
     resolve_external: bool = False,
 ) -> tuple[list[dict], list[str], dict[str, int]]:
     """Aggregate active tasks and per-project done counts in a single MCP pass.
@@ -262,7 +277,9 @@ async def collect_tasks_with_counts(
     done_counts: dict[str, int] = {}
     for root in _all_project_roots(config):
         active, offline, done_count = await _shape_one_project(
-            client, config, root, max_done_per_project=max_done_per_project,
+            client, config, root,
+            max_done_per_project=max_done_per_project,
+            max_cancelled_per_project=max_cancelled_per_project,
         )
         label = _project_label(root)
         if offline:
@@ -300,6 +317,7 @@ async def collect_active_tasks(
     config: DashboardConfig,
     *,
     max_done_per_project: int = 0,
+    max_cancelled_per_project: int = 0,
 ) -> tuple[list[dict], list[str]]:
     """Collect active tasks across all known projects.
 
@@ -318,7 +336,9 @@ async def collect_active_tasks(
     ``collect_tasks_with_counts`` to avoid a second MCP round-trip.
     """
     active, offline, _ = await collect_tasks_with_counts(
-        client, config, max_done_per_project=max_done_per_project,
+        client, config,
+        max_done_per_project=max_done_per_project,
+        max_cancelled_per_project=max_cancelled_per_project,
     )
     return active, offline
 

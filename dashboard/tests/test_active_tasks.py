@@ -815,10 +815,12 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
 async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     tmp_path, monkeypatch, dummy_client,
 ):
-    """resolve_external=True must NOT include done rows' external dep ids in the batched call.
+    """resolve_external=True must NOT include done or cancelled rows' external dep ids.
 
-    Done tasks' external deps are no longer actionable. Their ids must not bloat the MCP
-    request, and their rows must keep the 'unknown' sentinel (not get re-stamped).
+    Done and cancelled tasks' external deps are no longer actionable. Their ids must not
+    bloat the MCP request, and their rows must keep the 'unknown' sentinel (not re-stamped).
+    This covers both the done bounded bucket and the cancelled bounded bucket, since both
+    rows carry the 'completed' sentinel key that the skip guard checks.
     """
     root, shaped = _make_done_project(
         tmp_path,
@@ -841,6 +843,14 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
                 'updated_at': '2026-05-29T10:00:00+00:00',
                 'metadata': {'external_deps': ['proj:99']},  # must NOT enter the batched call
             },
+            {
+                'id': 7,
+                'title': 'cancelled with external dep',
+                'status': 'cancelled',
+                'dependencies': [],
+                'updated_at': '2026-05-29T11:00:00+00:00',
+                'metadata': {'external_deps': ['proj:88']},  # must NOT enter the batched call
+            },
         ],
     )
 
@@ -859,12 +869,12 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     cfg = DashboardConfig(project_root=root)
     active, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg,
-        max_done_per_project=5, resolve_external=True,
+        max_done_per_project=5, max_cancelled_per_project=5, resolve_external=True,
     )
 
-    # Only the active row's dep id should be in the batched call — NOT 'proj:99'.
+    # Only the active row's dep id should be in the batched call — NOT 'proj:99' or 'proj:88'.
     assert calls == [['proj:10']], (
-        f'done row dep "proj:99" must not appear in the batched call; got {calls}'
+        f'done/cancelled row deps must not appear in the batched call; got {calls}'
     )
 
     by_id = {r['id']: r for r in active}
@@ -872,3 +882,290 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     assert by_id['xdeps/T-5']['external_deps'] == [{'id': 'proj:10', 'status': 'done'}]
     # Done row's dep kept 'unknown' (was not re-stamped).
     assert by_id['xdeps/T-6']['external_deps'] == [{'id': 'proj:99', 'status': 'unknown'}]
+    # Cancelled row's dep also kept 'unknown' (was not re-stamped).
+    assert by_id['xdeps/T-7']['external_deps'] == [{'id': 'proj:88', 'status': 'unknown'}]
+
+
+# ---------------------------------------------------------------------------
+# bounded cancelled emission (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_bounded_cancelled_appends_rows(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """max_cancelled_per_project=2 appends the 2 most-recent cancelled rows, most-recent first.
+
+    Project has 1 active task + 3 cancelled tasks (ids 60/61/62 ascending updated_at).
+    - Expected: exactly 2 cancelled rows, the 2 most-recent (T-62, T-61); T-60 excluded.
+    - Each cancelled row: status=='cancelled', started==0, deps==[], completed==its updated_at.
+
+    RED today: max_cancelled_per_project kwarg does not exist (TypeError) and no cancelled
+    emission occurs.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active one', 'status': 'in-progress', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 60, 'title': 'cancelled oldest', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+            {'id': 61, 'title': 'cancelled middle', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T11:00:00+00:00'},
+            {'id': 62, 'title': 'cancelled newest', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=cfg, max_cancelled_per_project=2,
+    )
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert len(cancelled_rows) == 2, f'expected 2 cancelled rows, got {len(cancelled_rows)}'
+
+    # Most-recent two: id 62 (12:00) and id 61 (11:00)
+    cancelled_ids = [t['id'] for t in cancelled_rows]
+    assert 'df/T-62' in cancelled_ids
+    assert 'df/T-61' in cancelled_ids
+    assert 'df/T-60' not in cancelled_ids, 'oldest cancelled task should be excluded by N=2 cap'
+
+    # Each row must have the bounded-bucket sentinel fields
+    for row in cancelled_rows:
+        assert row['started'] == 0, f"cancelled row {row['id']}: expected started==0, got {row['started']}"
+        assert row['deps'] == [], f"cancelled row {row['id']}: expected deps==[], got {row['deps']}"
+        assert 'completed' in row, f"cancelled row {row['id']}: must have 'completed' key"
+
+    # completed == updated_at for each row
+    by_id = {t['id']: t for t in cancelled_rows}
+    assert by_id['df/T-62']['completed'] == '2026-05-29T12:00:00+00:00'
+    assert by_id['df/T-61']['completed'] == '2026-05-29T11:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_default_excludes_cancelled(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Default (no max_cancelled_per_project) must return ZERO cancelled rows."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active', 'status': 'pending', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 60, 'title': 'cancelled', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    # Call with NO max_cancelled_per_project — default behaviour
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert cancelled_rows == [], (
+        'Default collect_active_tasks must NOT return cancelled rows'
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_cancelled_ordering_tie_broken_by_id(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """When updated_at is identical for cancelled tasks, higher id wins the tie-break."""
+    same_ts = '2026-05-29T10:00:00+00:00'
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[],
+        done_tasks=[
+            {'id': 10, 'title': 'cancelled low id', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': same_ts},
+            {'id': 20, 'title': 'cancelled high id', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': same_ts},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=cfg, max_cancelled_per_project=1,
+    )
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert len(cancelled_rows) == 1
+    assert cancelled_rows[0]['id'] == 'df/T-20', (
+        'tie-break: higher id (20) should win over lower id (10)'
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_both_done_and_cancelled_buckets_independent(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Done and cancelled bucket caps are applied independently and don't bleed into each other.
+
+    Project: 1 active + 2 done (T-50 older, T-51 newer) + 2 cancelled (T-60 older, T-61 newer).
+    Call with max_done_per_project=1, max_cancelled_per_project=1.
+    Expected:
+    - Exactly 1 done row: the most-recent T-51 (T-50 excluded).
+    - Exactly 1 cancelled row: the most-recent T-61 (T-60 excluded).
+    - Done rows carry status=='done' only; cancelled rows carry status=='cancelled' only.
+    - Total: 3 rows (1 active + 1 done + 1 cancelled).
+
+    A regression that mixes the two buckets or shares a single cap would surface here:
+    e.g. if the cap were 1 shared across both, only one terminal row would appear instead of two.
+    If the buckets bleed, a done row might carry status=='cancelled' or vice-versa.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active one', 'status': 'in-progress', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 50, 'title': 'done older', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+            {'id': 51, 'title': 'done newer', 'status': 'done', 'dependencies': [],
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+            {'id': 60, 'title': 'cancelled older', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T09:00:00+00:00'},
+            {'id': 61, 'title': 'cancelled newer', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T11:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=cfg,
+        max_done_per_project=1,
+        max_cancelled_per_project=1,
+    )
+
+    done_rows = [t for t in active if t['status'] == 'done']
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+
+    # Each bucket is capped independently at 1 (shared cap would leave only 1 terminal row).
+    assert len(done_rows) == 1, f'expected 1 done row, got {len(done_rows)}'
+    assert len(cancelled_rows) == 1, f'expected 1 cancelled row, got {len(cancelled_rows)}'
+    assert len(active) == 3, f'expected 3 total rows (1 active + 1 done + 1 cancelled), got {len(active)}'
+
+    # Most-recent row from each bucket wins.
+    assert done_rows[0]['id'] == 'df/T-51', (
+        f"expected most-recent done T-51, got {done_rows[0]['id']}"
+    )
+    assert cancelled_rows[0]['id'] == 'df/T-61', (
+        f"expected most-recent cancelled T-61, got {cancelled_rows[0]['id']}"
+    )
+
+    # Cross-bucket purity: done bucket contains only done rows; cancelled only cancelled.
+    assert all(r['status'] == 'done' for r in done_rows), (
+        f"done bucket contains non-done rows: {[r['status'] for r in done_rows]}"
+    )
+    assert all(r['status'] == 'cancelled' for r in cancelled_rows), (
+        f"cancelled bucket contains non-cancelled rows: {[r['status'] for r in cancelled_rows]}"
+    )
+
+    # Older rows in each bucket are excluded by the cap.
+    ids = {t['id'] for t in active}
+    assert 'df/T-50' not in ids, 'older done T-50 should be excluded by max_done_per_project=1'
+    assert 'df/T-60' not in ids, 'older cancelled T-60 should be excluded by max_cancelled_per_project=1'
+
+
+# ---------------------------------------------------------------------------
+# deferred via active path (step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_includes_deferred_via_active_path(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """deferred tasks must flow through the ACTIVE path (with resolved deps + started).
+
+    A deferred task (id 30, deps=[31]) plus a done dep (id 31).
+    Expected:
+    (a) 'proj/T-30' appears in the returned rows — deferred survives the active filter.
+    (b) The deferred row's deps == [{'id': 'proj/T-31', 'title': ..., 'done': True}] —
+        proves it flows through the active path with resolved deps, NOT the stripped
+        bounded-bucket path.
+    (c) The row has a 'started' key and does NOT have a 'completed' key.
+
+    RED today: 'deferred' is not in _ACTIVE_STATUSES, so the task is dropped.
+    """
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='proj',
+        tasks=[
+            {
+                'id': 30,
+                'title': 'parked work',
+                'status': 'deferred',
+                'dependencies': [31],
+                'metadata': {},
+            },
+            {
+                'id': 31,
+                'title': 'finished dep',
+                'status': 'done',
+                'dependencies': [],
+                'metadata': {},
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    ids = {t['id'] for t in active}
+    assert 'proj/T-30' in ids, (
+        "deferred task T-30 was dropped by the active-status filter — "
+        "add 'deferred' to _ACTIVE_STATUSES"
+    )
+
+    by_id = {t['id']: t for t in active}
+    row = by_id['proj/T-30']
+
+    # (b) resolved deps via active path — done flag on the dep
+    assert row['deps'] == [{'id': 'proj/T-31', 'title': 'finished dep', 'done': True}], (
+        f"expected deferred row deps with done=True, got: {row.get('deps')}"
+    )
+
+    # (c) active-path fields present / absent
+    assert 'started' in row, "deferred row must have 'started' key (active path)"
+    assert 'completed' not in row, (
+        "deferred row must NOT have 'completed' key (that is the bounded-bucket sentinel)"
+    )
