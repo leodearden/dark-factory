@@ -875,6 +875,141 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
 
 
 # ---------------------------------------------------------------------------
+# bounded cancelled emission (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_bounded_cancelled_appends_rows(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """max_cancelled_per_project=2 appends the 2 most-recent cancelled rows, most-recent first.
+
+    Project has 1 active task + 3 cancelled tasks (ids 60/61/62 ascending updated_at).
+    - Expected: exactly 2 cancelled rows, the 2 most-recent (T-62, T-61); T-60 excluded.
+    - Each cancelled row: status=='cancelled', started==0, deps==[], completed==its updated_at.
+
+    RED today: max_cancelled_per_project kwarg does not exist (TypeError) and no cancelled
+    emission occurs.
+    """
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active one', 'status': 'in-progress', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 60, 'title': 'cancelled oldest', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+            {'id': 61, 'title': 'cancelled middle', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T11:00:00+00:00'},
+            {'id': 62, 'title': 'cancelled newest', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T12:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=cfg, max_cancelled_per_project=2,
+    )
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert len(cancelled_rows) == 2, f'expected 2 cancelled rows, got {len(cancelled_rows)}'
+
+    # Most-recent two: id 62 (12:00) and id 61 (11:00)
+    cancelled_ids = [t['id'] for t in cancelled_rows]
+    assert 'df/T-62' in cancelled_ids
+    assert 'df/T-61' in cancelled_ids
+    assert 'df/T-60' not in cancelled_ids, 'oldest cancelled task should be excluded by N=2 cap'
+
+    # Each row must have the bounded-bucket sentinel fields
+    for row in cancelled_rows:
+        assert row['started'] == 0, f"cancelled row {row['id']}: expected started==0, got {row['started']}"
+        assert row['deps'] == [], f"cancelled row {row['id']}: expected deps==[], got {row['deps']}"
+        assert 'completed' in row, f"cancelled row {row['id']}: must have 'completed' key"
+
+    # completed == updated_at for each row
+    by_id = {t['id']: t for t in cancelled_rows}
+    assert by_id['df/T-62']['completed'] == '2026-05-29T12:00:00+00:00'
+    assert by_id['df/T-61']['completed'] == '2026-05-29T11:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_default_excludes_cancelled(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Default (no max_cancelled_per_project) must return ZERO cancelled rows."""
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[
+            {'id': 1, 'title': 'active', 'status': 'pending', 'dependencies': []},
+        ],
+        done_tasks=[
+            {'id': 60, 'title': 'cancelled', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': '2026-05-29T10:00:00+00:00'},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    # Call with NO max_cancelled_per_project — default behaviour
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert cancelled_rows == [], (
+        'Default collect_active_tasks must NOT return cancelled rows'
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_cancelled_ordering_tie_broken_by_id(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """When updated_at is identical for cancelled tasks, higher id wins the tie-break."""
+    same_ts = '2026-05-29T10:00:00+00:00'
+    root, shaped = _make_done_project(
+        tmp_path,
+        project_dir='df',
+        active_tasks=[],
+        done_tasks=[
+            {'id': 10, 'title': 'cancelled low id', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': same_ts},
+            {'id': 20, 'title': 'cancelled high id', 'status': 'cancelled', 'dependencies': [],
+             'updated_at': same_ts},
+        ],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    from dashboard.config import DashboardConfig
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=cfg, max_cancelled_per_project=1,
+    )
+
+    cancelled_rows = [t for t in active if t['status'] == 'cancelled']
+    assert len(cancelled_rows) == 1
+    assert cancelled_rows[0]['id'] == 'df/T-20', (
+        'tie-break: higher id (20) should win over lower id (10)'
+    )
+
+
+# ---------------------------------------------------------------------------
 # deferred via active path (step-1 / step-2)
 # ---------------------------------------------------------------------------
 
