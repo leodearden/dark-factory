@@ -369,20 +369,24 @@ class GitOps:
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
 
-        Uses ``git worktree list --porcelain`` and checks whether the
-        resolved *path* appears as a ``worktree <path>`` line.  This
-        prevents stale directories (containing only .task/ state files)
-        from being mistaken for reusable worktrees.
+        Uses ``git worktree list --porcelain`` and matches by **canonical
+        (resolved) path on both sides** — each listed ``worktree <path>``
+        is ``Path.resolve()``-d and compared against ``path.resolve()``.
+        This recognizes a registration recorded under a *symlink* path
+        (e.g. reify's ``.worktrees`` symlinked to a mount after migration,
+        esc-4146-268) that an exact-string compare would miss, while still
+        rejecting stale directories (containing only .task/ state files)
+        that were never registered.
         """
-        resolved = str(path.resolve())
+        resolved = path.resolve()
         rc, output, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'],
             cwd=self.project_root,
         )
         if rc != 0:
-            return False
+            return False  # fail-safe is provided by the destroy gate in create_worktree
         for line in output.splitlines():
-            if line.startswith('worktree ') and line[9:] == resolved:
+            if line.startswith('worktree ') and Path(line[9:]).resolve() == resolved:
                 return True
         return False
 
