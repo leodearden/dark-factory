@@ -174,6 +174,29 @@ class TestDefaults:
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
         assert field_info.default is None
 
+    def test_merge_verify_cold_command_timeout_secs_pydantic_default_is_none(self):
+        """Raw Pydantic field default for merge_verify_cold_command_timeout_secs is None.
+
+        The shipped 7200 value comes from defaults.yaml, not the Pydantic default.
+        This mirrors the pattern for verify_cold_command_timeout_secs (line 172-175).
+        """
+        field_info = OrchestratorConfig.model_fields['merge_verify_cold_command_timeout_secs']
+        assert field_info.default is None
+
+    def test_merge_verify_cold_command_timeout_secs_from_defaults_yaml(self, monkeypatch, tmp_path):
+        """merge_verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 7200).
+
+        7200s (2×5400, 4×1800) gives headroom for a cold full-workspace compile
+        + frontend install on a cold merge-verify worktree, where 1602's fail-closed
+        gate makes a timeout a queue-stalling block.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert config.merge_verify_cold_command_timeout_secs == defaults['merge_verify_cold_command_timeout_secs']
+        assert config.merge_verify_cold_command_timeout_secs == 7200
+
     def test_terminal_status_hard_cancel_polls_default(self, monkeypatch, tmp_path):
         """terminal_status_hard_cancel_polls defaults to 3 (ITEM 2 config, step-3 RED).
 

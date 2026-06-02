@@ -328,9 +328,11 @@ async def _run_post_merge_verify(
     # max_retries=0: post-merge verify hangs are usually deterministic
     # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
     # is_merge_verify=True: merge worktrees are freshly created per
-    # merge (no `.task/` dir and no warm cargo cache), so they need
-    # the cold timeout despite `_is_verify_cold`'s filesystem
-    # heuristic classifying them as warm.
+    # merge (no `.task/` dir and no warm cargo cache), so the cold
+    # timeout applies despite `_is_verify_cold`'s filesystem heuristic
+    # classifying them as warm.  The per-command cold timeout used here
+    # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
+    # if set, falling back to `verify_cold_command_timeout_secs` then warm.
     verify = await run_scoped_verification(
         merge_wt, req.config, req.module_configs,
         task_files=req.task_files,
@@ -1235,6 +1237,9 @@ async def _run_unscoped_typechecks(
     async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
         # Run only the type-check command verbatim (unscoped).
         # Null out test/lint so run_verification skips them (None => skip).
+        # is_merge_verify=True forces cold semantics; the per-command timeout
+        # used is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
+        # if set, falling back to `verify_cold_command_timeout_secs` then warm.
         type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
         return mc, await run_verification(
             worktree, config, type_only_mc,

@@ -751,6 +751,21 @@ class OrchestratorConfig(BaseSettings):
     # no-op and per-module fan-out across a large module set can launch N full
     # builds into one merge worktree.  Defaults False to preserve the existing
     # scoped/fan-out behaviour for multi-subproject projects.
+    # Per-command timeout for cold merge-verify runs.  Applied by
+    # _resolve_verify_timeout when is_merge_verify=True and is_cold=True,
+    # BEFORE the module.cold → config.cold → warm cascade.  When None, the
+    # resolver falls back to verify_cold_command_timeout_secs then warm
+    # (byte-identical to behaviour before task 1603).
+    #
+    # Motivation: task 1602 made the post-merge type-check gate fail-CLOSED
+    # on timeout, so a cold build that overruns the warm budget (1800 s) is
+    # now a queue-stalling block rather than a fail-open.  This knob lets ops
+    # raise the merge path's cold budget without lengthening task-phase cold
+    # verifies.  Shipped default (defaults.yaml): 7200 s (4× warm; one step
+    # above the 90-min/5400 s general cold), giving headroom for a cold
+    # full-workspace compile + frontend install.  Pydantic default is None so
+    # configs that do not merge defaults.yaml keep the old fallback behaviour.
+    merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
     # Upper bound on concurrent per-subproject ``run_verification`` calls inside
     # a single ``run_scoped_verification`` fan-out.  Caps the blast radius if the

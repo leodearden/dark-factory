@@ -1424,6 +1424,7 @@ def _resolve_verify_timeout(
     module_config: ModuleConfig | None,
     *,
     is_cold: bool,
+    is_merge_verify: bool = False,
 ) -> float:
     """Return the effective per-command verify timeout.
 
@@ -1433,11 +1434,18 @@ def _resolve_verify_timeout(
 
     When *is_cold* is True (first verify in a fresh worktree), the cold
     timeout is resolved via the cascade:
+      0. ``config.merge_verify_cold_command_timeout_secs`` (if set AND
+         *is_merge_verify* is True) — merge-verify-specific cold budget;
+         wins before the per-module and general cold knobs.
       1. ``module_config.verify_cold_command_timeout_secs`` (if set)
       2. ``config.verify_cold_command_timeout_secs`` (if set)
       3. The warm timeout computed above (fallback when cold knob is unset
          at every level — preserves existing behaviour for deployments that
          don't configure the cold window).
+
+    *is_merge_verify* only affects the cold track; for warm resolves (or
+    when ``config.merge_verify_cold_command_timeout_secs`` is None) the
+    resolver falls through to the existing cascade unchanged.
     """
     # Warm track: module override wins over top-level.
     warm: float
@@ -1449,7 +1457,9 @@ def _resolve_verify_timeout(
     if not is_cold:
         return warm
 
-    # Cold track: cascade module → top → warm fallback.
+    # Cold track: merge-verify budget wins first, then cascade module → top → warm.
+    if is_merge_verify and config.merge_verify_cold_command_timeout_secs is not None:
+        return config.merge_verify_cold_command_timeout_secs
     if module_config is not None and module_config.verify_cold_command_timeout_secs is not None:
         return module_config.verify_cold_command_timeout_secs
     if config.verify_cold_command_timeout_secs is not None:
@@ -1556,7 +1566,7 @@ async def run_verification(
         is_cold = _is_verify_cold(worktree, module_prefix)
     else:
         is_cold = False
-    timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
+    timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold, is_merge_verify=is_merge_verify)
     if max_retries is None:
         max_retries = config.verify_timeout_retries
 
