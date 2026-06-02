@@ -468,11 +468,12 @@ class TestRunVerificationColdFirstUse:
     without spawning real subprocesses.
     """
 
-    def _make_config(self, warm=1800.0, cold: float | None = 5400.0, retries=0):
+    def _make_config(self, warm=1800.0, cold: float | None = 5400.0, retries=0, merge_cold: float | None = None):
         from orchestrator.config import OrchestratorConfig
         return OrchestratorConfig(
             verify_command_timeout_secs=warm,
             verify_cold_command_timeout_secs=cold,
+            merge_verify_cold_command_timeout_secs=merge_cold,
             verify_timeout_retries=retries,
             test_command='echo test',
             lint_command='echo lint',
@@ -708,6 +709,58 @@ class TestRunVerificationColdFirstUse:
             f'Default call without .task/ must use warm timeout; got: {captured}'
         )
         assert 5400.0 not in captured
+
+    # ── merge_verify_cold_command_timeout_secs end-to-end tests (step-5 RED) ──
+
+    @pytest.mark.asyncio
+    async def test_is_merge_verify_uses_merge_cold_budget_when_set(self, tmp_path: Path):
+        """run_verification(is_merge_verify=True) threads merge_cold budget into every _run_cmd call.
+
+        Worktree has NO .task/ dir — filesystem heuristic would say "warm" — but
+        is_merge_verify=True forces is_cold=True, and the merge-verify cold budget
+        (7200) wins over the general cold (5400).  Fails until step-6 threads
+        is_merge_verify into the _resolve_verify_timeout call.
+        """
+        from orchestrator.verify import run_verification
+        # No .task/ — filesystem says warm, is_merge_verify overrides it.
+        assert not (tmp_path / '.task').exists()
+
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=7200.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config, is_merge_verify=True)
+
+        assert all(t == 7200.0 for t in captured), (
+            f'All timeouts must be 7200 (merge cold); got: {captured}'
+        )
+        assert 5400.0 not in captured, (
+            f'General cold 5400 must not appear when merge_cold=7200: {captured}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_merge_verify_falls_back_to_general_cold_when_merge_cold_none(self, tmp_path: Path):
+        """run_verification(is_merge_verify=True) falls back to general cold when merge_cold=None.
+
+        When merge_verify_cold_command_timeout_secs is None, the resolver falls
+        through to verify_cold_command_timeout_secs (5400), just as before task 1603.
+        """
+        from orchestrator.verify import run_verification
+        # No .task/ — filesystem says warm, is_merge_verify overrides it.
+        assert not (tmp_path / '.task').exists()
+
+        config = self._make_config(warm=1800.0, cold=5400.0, merge_cold=None)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config, is_merge_verify=True)
+
+        assert all(t == 5400.0 for t in captured), (
+            f'All timeouts must fall back to general cold 5400 when merge_cold=None; got: {captured}'
+        )
+        assert 1800.0 not in captured, (
+            f'Warm timeout 1800 must not appear (is_cold forced True): {captured}'
+        )
 
 
 def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
