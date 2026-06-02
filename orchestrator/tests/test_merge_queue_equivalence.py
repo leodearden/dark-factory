@@ -125,6 +125,32 @@ class TestPostMergePyrightResult:
         assert result.broken is True
         assert 'bar' in result.detail
 
+    def test_timed_out_subprojects_defaults_to_empty(self):
+        """timed_out_subprojects defaults to [] and timed_out is False for an empty result."""
+        result = PostMergePyrightResult()
+        assert result.timed_out_subprojects == []
+        assert result.timed_out is False
+
+    def test_timed_out_true_when_timed_out_subprojects_non_empty(self):
+        """timed_out is True iff timed_out_subprojects is non-empty."""
+        result = PostMergePyrightResult(timed_out_subprojects=['pkg'])
+        assert result.timed_out is True
+
+    def test_broken_reflects_only_failing_subprojects_not_timed_out(self):
+        """A result with only timed_out_subprojects (no failing_subprojects) is NOT broken."""
+        result = PostMergePyrightResult(timed_out_subprojects=['pkg'])
+        assert result.broken is False
+        assert result.failing_subprojects == []
+
+    def test_broken_and_timed_out_can_coexist(self):
+        """When a module is both failing and timed-out, broken and timed_out are both True."""
+        result = PostMergePyrightResult(
+            failing_subprojects=['pkg'],
+            timed_out_subprojects=['pkg'],
+        )
+        assert result.broken is True
+        assert result.timed_out is True
+
 
 # ---------------------------------------------------------------------------
 # _check_post_merge_pyright — real-git behavioural tests

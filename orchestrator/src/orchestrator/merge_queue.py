@@ -160,17 +160,28 @@ class PostMergePyrightResult:
         failing_subprojects: Prefixes of subprojects whose unscoped
             type-check command exited non-zero (genuine type failure, not
             a timeout or infra error).  Empty list means clean.
+        timed_out_subprojects: Prefixes of subprojects whose unscoped
+            type-check command timed out.  A subproject can appear in both
+            this list and ``failing_subprojects`` when ``block_on_timeout=True``
+            (pre-advance gate), or only here when ``block_on_timeout=False``
+            (post-advance fail-open path).  Empty list means no timeouts.
         detail: Bounded human-readable detail from the first failing
             subproject's output, for inclusion in the escalation reason.
     """
 
     failing_subprojects: list[str] = field(default_factory=list)
+    timed_out_subprojects: list[str] = field(default_factory=list)
     detail: str = ''
 
     @property
     def broken(self) -> bool:
         """True when at least one subproject's type-check genuinely failed."""
         return bool(self.failing_subprojects)
+
+    @property
+    def timed_out(self) -> bool:
+        """True when at least one subproject's type-check timed out."""
+        return bool(self.timed_out_subprojects)
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
