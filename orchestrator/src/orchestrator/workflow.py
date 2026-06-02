@@ -5299,6 +5299,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if await self.git_ops.is_ancestor(branch_head, main_sha):
             await self.git_ops.cleanup_worktree(self.worktree, branch_name)
             return
+        # Fallback: branch tip is a pre-rebase duplicate that is NOT an ancestor
+        # of main, but the recorded merge commit (_merge_sha) IS on main.  The
+        # task's work was merged via a rebase-on-merge flow.  Reclaim the
+        # regenerable build cache while preserving the worktree+branch for forensics.
+        merge_sha = self._merge_sha
+        if merge_sha and await self.git_ops.is_ancestor(merge_sha, main_sha):
+            reclaimed = await self.git_ops.reclaim_worktree_build_artifacts(
+                self.worktree,
+            )
+            logger.warning(
+                'Task %s: branch HEAD %s not on main but merge commit %s is on '
+                'main — reclaimed build artifacts %s; preserving worktree+branch',
+                self.task_id, branch_head[:12], merge_sha[:12],
+                [str(p) for p in reclaimed],
+            )
+            return
         logger.warning(
             'Task %s: state=DONE but branch HEAD %s not reachable from main %s '
             '— preserving worktree+branch for inspection',

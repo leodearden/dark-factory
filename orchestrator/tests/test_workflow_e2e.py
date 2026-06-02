@@ -6080,6 +6080,251 @@ class TestCleanupVerificationGate:
 
 
 # ---------------------------------------------------------------------------
+# TestCleanupRebaseDuplicateMerged — reap target/ when merge_sha is on main
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCleanupRebaseDuplicateMerged:
+    """Rebase-duplicate case: branch HEAD is off-main but merge commit IS on main.
+
+    The fix should reclaim the build-artifact dirs (target/) without calling
+    cleanup_worktree — worktree+branch are preserved for forensics, only the
+    regenerable cache is removed.  A distinct log phrase is asserted so the
+    new branch is observable and doesn't collide with the existing
+    'not reachable from main' warning (step-5 regression test).
+    """
+
+    async def test_reaps_build_artifacts_when_merge_sha_on_main(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        monkeypatch,
+        tmp_path: Path,
+        caplog,
+    ):
+        """branch HEAD off-main but _merge_sha == main_sha → reap target/, keep worktree."""
+        import logging as _logging
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.state = WorkflowState.DONE
+
+        # Make branch HEAD diverge from main so is_ancestor(branch_head, main) is False.
+        (wt / 'divergent_marker.txt').write_text('rebase-dup\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'divergent commit'], cwd=wt)
+
+        # _merge_sha = main HEAD — a real ancestor of main (it IS main itself).
+        main_sha = await git_ops.get_main_sha()
+        workflow._merge_sha = main_sha
+
+        # Create a target/ cache dir under the worktree.
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'cache.bin').write_bytes(b'\xca\xfe' * 512)
+
+        cleanup_called = False
+
+        async def tracking_cleanup(worktree, branch):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            await workflow._maybe_cleanup_done_worktree()
+
+        # worktree+branch must be preserved (no cleanup_worktree call)
+        assert not cleanup_called, (
+            'cleanup_worktree must NOT be called in the rebase-duplicate case'
+        )
+        assert wt.exists(), 'worktree directory must still exist'
+
+        # build-artifact dir must be gone
+        assert not target_dir.exists(), (
+            'target/ must be reclaimed when merge commit is confirmed on main'
+        )
+
+        # distinct log phrase for the new branch
+        reclaim_records = [
+            rec for rec in caplog.records
+            if 'reclaimed build artifacts' in rec.message
+            or ('merge commit' in rec.message and 'is on main' in rec.message)
+        ]
+        assert reclaim_records, (
+            'expected a log record indicating build artifacts were reclaimed, '
+            f'got: {[r.message for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestCleanupNoOverreach — regression: reap only when merge_sha confirmed on main
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCleanupNoOverreach:
+    """Pins the no-over-reach guarantee.
+
+    When _merge_sha is None (genuine off-main / bypass) OR when _merge_sha
+    is set but is NOT an ancestor of main, the helper must preserve everything
+    and emit the original 'not reachable from main' warning — identical to the
+    pre-fix behavior.
+    """
+
+    async def _make_divergent_workflow(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        """Helper: create a workflow with a divergent branch HEAD (off-main)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.state = WorkflowState.DONE
+
+        (wt / 'off_main_marker.txt').write_text('off-main\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'off-main commit'], cwd=wt)
+
+        cleanup_called = False
+
+        async def tracking_cleanup(worktree, branch):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        return workflow, wt, cleanup_called, tracking_cleanup
+
+    async def test_no_reap_when_merge_sha_is_none(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        monkeypatch,
+        tmp_path: Path,
+        caplog,
+    ):
+        """branch HEAD off-main, _merge_sha=None → preserve everything (bypass path)."""
+        import logging as _logging
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.state = WorkflowState.DONE
+
+        (wt / 'off_main.txt').write_text('off-main\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'off-main commit'], cwd=wt)
+
+        workflow._merge_sha = None  # no merge commit — genuine bypass
+
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'cache.bin').write_bytes(b'\x00' * 64)
+
+        cleanup_called = False
+
+        async def tracking_cleanup(worktree, branch):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            await workflow._maybe_cleanup_done_worktree()
+
+        assert not cleanup_called, 'cleanup_worktree must NOT be called'
+        assert target_dir.exists(), (
+            'target/ must NOT be reaped when _merge_sha is None'
+        )
+        warned = [r for r in caplog.records if 'not reachable from main' in r.message]
+        assert warned, (
+            'original "not reachable from main" warning must still be emitted'
+        )
+
+    async def test_no_reap_when_merge_sha_not_ancestor(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        monkeypatch,
+        tmp_path: Path,
+        caplog,
+    ):
+        """branch HEAD off-main, _merge_sha set but NOT an ancestor of main → preserve."""
+        import logging as _logging
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.state = WorkflowState.DONE
+
+        # Make branch HEAD diverge.
+        (wt / 'off_main.txt').write_text('off-main\n')
+        await _run(['git', 'add', '-A'], cwd=wt)
+        await _run(['git', 'commit', '-m', 'off-main commit'], cwd=wt)
+
+        # Capture the branch HEAD as a dangling sha that is NOT on main.
+        rc, branch_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        dangling_sha = branch_head_raw.strip()
+        # _merge_sha points at a commit that is NOT on main (the branch tip itself)
+        workflow._merge_sha = dangling_sha
+
+        target_dir = wt / 'target'
+        target_dir.mkdir()
+        (target_dir / 'cache.bin').write_bytes(b'\x00' * 64)
+
+        cleanup_called = False
+
+        async def tracking_cleanup(worktree, branch):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            await workflow._maybe_cleanup_done_worktree()
+
+        assert not cleanup_called, 'cleanup_worktree must NOT be called'
+        assert target_dir.exists(), (
+            'target/ must NOT be reaped when _merge_sha is not an ancestor of main'
+        )
+        warned = [r for r in caplog.records if 'not reachable from main' in r.message]
+        assert warned, (
+            'original "not reachable from main" warning must still be emitted'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestDryRunUnblockE2EGuard — pins the two modes of the file-local autouse guard
 # ---------------------------------------------------------------------------
 
