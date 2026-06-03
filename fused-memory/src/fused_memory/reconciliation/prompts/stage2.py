@@ -208,7 +208,7 @@ silently dropped (`memory_ids=[]`) in 8+ confirmed recurrences (confirmed \
 reconstructions: b5c39ab7, 2310b354, d72a0203, run e4b1ebfa; task 1572). \
 Both tokens are required: the nonce supplies structural entropy; the ISO timestamp \
 provides human-readable temporal context. \
-In addition, pass `metadata={{'kind': 'cycle_summary', 'run_id': <run_id>}}` on the \
+In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': <run_id>}}` on the \
 `add_memory` call that writes the per-cycle summary, where `<run_id>` is the exact \
 `run_id` value from the payload context (the same run_id embedded in the content). \
 This mirrors the flag-marker metadata convention (`metadata.kind='stage1_flag_marker'`, \
