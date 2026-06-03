@@ -30,8 +30,9 @@ Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/sp
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
 3. Handle each drained escalation
-4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if an
-   AFK low-risk auto-unblock is in flight — that background sub-agent completing. Handle whichever arrives.
+4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if any
+   background merge-submission / auto-unblock sub-agent is in flight — that sub-agent completing.
+   Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
 6. Go to 1 (restart watcher → confirm up → drain → handle)
@@ -132,6 +133,32 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - Periodically remind (every ~3-5 escalation cycles, not more)
 
 It is better to stall development than to bake in a significant bad decision.
+
+## Merge Submissions — NEVER in the Foreground
+
+`mcp__escalation__merge_request` blocks until the merge worker finishes rebasing, running the full
+verify suite, and CAS-advancing main. On a large/slow repo (e.g. reify) a single call can take
+**30+ minutes** — made in the foreground it freezes the entire watch loop for that long: no
+draining, no watcher re-arm, a born-at-L2 `critical` sits unseen (real incident: esc-2831-78 wedged
+a reify watcher >30 min on a direct foreground retry-land).
+
+**Hard rule: this session never calls `merge_request` at top level — no exceptions.** That covers
+the documented path (the B3 low-risk auto-unblock merges inside its sub-agent) *and* any improvised
+submission you're tempted to make yourself — e.g. retrying the land of a done-but-unmerged task once
+the verify gates that blocked it have cleared. However legitimate the merge, the submission goes
+through a NON-INTERACTIVE **background** sub-agent (`Agent` tool, general-purpose,
+`run_in_background: true`):
+
+- Give the sub-agent everything it needs up front: `task_id`, `branch` (bare name — the worker
+  prepends `task/`), the absolute `worktree` path, a `description`, and what to do on each outcome
+  (per `skills/merge-queue/SKILL.md`). It makes the blocking call in its own context and returns a
+  compact JSON result.
+- Track the launch exactly like a B3 launch: record `{task_id, escalation_id (if any),
+  background-task-id}`, and never submit a second merge for a task that already has one in flight.
+  (`merge_request` returns `status='in_flight'` for a duplicate branch as a backstop — if you see
+  it, the merge is already covered: do NOT re-queue.)
+- The sub-agent's completion is a wake signal (Main Loop step 4); the foreground stays free to
+  re-arm the watcher and keep draining while the merge grinds.
 
 ## AFK Mode (extended unattended operation)
 
@@ -479,6 +506,8 @@ window this is the difference between one durable session and repeated restarts.
   (`run_in_background: true`) so a slow merge (~30 min on big repos like reify) can't freeze the
   watch loop; it does the whole apply→verify→merge in its own context and returns only a small JSON
   result when it completes
+- ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — `merge_request`
+  only ever runs inside a background sub-agent; see "Merge Submissions — NEVER in the Foreground"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
 
 **Keep in top-level context:**
