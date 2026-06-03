@@ -30,7 +30,8 @@ Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/sp
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
 3. Handle each drained escalation
-4. Wait for the watcher to fire (it exits on the first new L2 escalation)
+4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if an
+   AFK low-risk auto-unblock is in flight — that background sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
 6. Go to 1 (restart watcher → confirm up → drain → handle)
@@ -175,19 +176,39 @@ whether the orchestrator's at-block-time dry-run investigation already found a *
 2. Gate — ALL must hold, else fall through to "leave pending + digest":
    - `latest['risk_label'] == 'low'` and `latest` has no `status` key (not a failed / budget-exhausted entry);
    - `latest` is fresh (the most-recent entry; the branch is not materially changed since `latest['timestamp']`);
-   - you have auto-merged **fewer than 3 tasks this session** — a self-imposed cap; track the count
-     in your own context, and over the cap leave pending + digest so a runaway can't merge unattended.
-3. If the gate passes, launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE sub-agent (the
-   `Agent` tool, general-purpose — NOT `/spawn`), passing `task_id`, `escalation_id`, `project_root`,
-   the `worktree` path, and the `latest` proposal, and telling it to read and follow
-   `skills/unblock-low-risk/SKILL.md`. It applies the fix scoped to `files_referenced`, runs the
-   verify suite, and merges via the queue — or aborts cleanly.
-4. On the sub-agent's return:
-   - `outcome == "merged"`: it has already set the task done and resolved the escalation. Increment
-     your session auto-merge count and add a one-line success entry to the digest.
-   - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Record the
-     abort reason in the digest and move on — do NOT retry, and do NOT spawn an interactive
-     `/unblock` in AFK mode; it waits for the human.
+   - you have launched **fewer than 3 low-risk auto-unblocks this session** (in-flight *or*
+     completed) — a self-imposed cap. Because the sub-agent now runs in the background (step 3),
+     count it at **launch**, not on completion — otherwise several concurrent background sub-agents
+     could each pass the gate before any returns and blow past the cap. Over the cap, leave pending +
+     digest so a runaway can't merge unattended.
+3. If the gate passes, launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE **background**
+   sub-agent (the `Agent` tool, general-purpose, **`run_in_background: true`** — NOT `/spawn`),
+   passing `task_id`, `escalation_id`, `project_root`, the `worktree` path, and the `latest`
+   proposal, and telling it to read and follow `skills/unblock-low-risk/SKILL.md`. It applies the fix
+   scoped to `files_referenced`, runs the verify suite, and merges via the queue — or aborts cleanly.
+
+   **Background, not foreground — why.** The sub-agent's merge step blocks on `merge_request` until
+   the merge worker finishes rebasing, verifying, and CAS-advancing main. On a large/slow repo (e.g.
+   reify) that single call can take ~30 minutes. Run in the *foreground* (`Agent` without
+   `run_in_background`), that whole window freezes the watch loop — new L2 escalations accumulate
+   undrained until the merge returns, and a born-at-L2 `critical` could sit unseen for half an hour.
+   Backgrounding keeps the foreground responsive: record the launch (below), then immediately loop
+   back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result when
+   it completes — that completion is itself a wake signal (Main Loop step 4), handled in step 4 below.
+
+   **Record the launch; don't double-launch.** Stash `{task_id, escalation_id, background-task-id}`
+   in your context and count it toward the cap (step 2). The escalation stays `pending` until the
+   background sub-agent resolves it, so the *next* drain WILL re-find it — before launching for any
+   task, skip it if that `task_id` already has an in-flight (or this-session-completed)
+   unblock-low-risk sub-agent, or you'll start a second one racing the first.
+4. On the sub-agent's **completion** (you're notified asynchronously — you did not block waiting;
+   match the result to a recorded launch by `task_id` / background-task-id):
+   - `outcome == "merged"`: it has already set the task done and resolved the escalation. It was
+     counted toward the cap at launch — don't double-count. Add a one-line success entry to the digest.
+   - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Keep the
+     `task_id` in your attempted set (do NOT re-launch it — its cap slot is spent), record the abort
+     reason in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in
+     AFK mode; it waits for the human.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative. This gate is AFK-only — when a human is present, prefer interactive
@@ -454,8 +475,10 @@ window this is the difference between one durable session and repeated restarts.
 - Researching escalation context for ANY category that needs code reading (e.g. `task_failure`,
   `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
   only a compact verdict + recommended action — not the raw material
-- The low-risk auto-unblock sub-agent (`unblock-low-risk`) — it does the whole apply→verify→merge in
-  its own context and returns only a small JSON result
+- The low-risk auto-unblock sub-agent (`unblock-low-risk`) — run it in the **background**
+  (`run_in_background: true`) so a slow merge (~30 min on big repos like reify) can't freeze the
+  watch loop; it does the whole apply→verify→merge in its own context and returns only a small JSON
+  result when it completes
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
 
 **Keep in top-level context:**

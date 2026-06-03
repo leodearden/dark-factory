@@ -56,7 +56,7 @@ Parameters:
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
 
-This call blocks until the merge worker processes your request. It may take a few seconds if other merges are queued ahead of yours.
+This call blocks until the merge worker finishes rebasing, verifying, and CAS-advancing main — plus any time spent queued behind merges ahead of yours. That can be seconds on a small repo, but **tens of minutes** on a large/slow one (e.g. reify ~30 min). If you're calling this from a context that must stay responsive (such as the escalation-watcher loop), run the submission in a background sub-agent rather than blocking the foreground on it.
 
 ### 4. Handle the outcome
 
