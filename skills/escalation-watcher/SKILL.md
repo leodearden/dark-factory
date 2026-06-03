@@ -19,7 +19,7 @@ L2 items reach this queue via two paths: (a) **born-at-L2** — severity `critic
 Before starting, verify these are in place. If anything is missing, ask the user — don't guess.
 
 1. **`DARK_FACTORY_ROOT`** env var — path to the dark-factory repository (contains the `escalation` package used by the watcher)
-2. **Running orchestrator** with escalation MCP accessible (default port 8102, configured in the project's `.mcp.json`)
+2. **Running orchestrator** with escalation MCP accessible (port `8102` for dark-factory — set in `orchestrator/config.yaml` and matching `.mcp.json`; the code default is `8100`, which other projects may use)
 3. **Escalation queue directory** at `<project_root>/data/escalations/`
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
@@ -27,24 +27,42 @@ Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/sp
 ## The Main Loop
 
 ```
-1. Drain any pending L2 escalations
-2. Start watcher (background task, filtered to L2)
-3. Wait for watcher to fire (it exits on first L2 escalation)
-4. Read escalation from watcher output
-5. Also drain any other pending L2 escalations
-6. Handle each escalation
-7. Go to 2
+1. Start the watcher (background task, filtered to L2); confirm its process is alive
+2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
+3. Handle each drained escalation
+4. Wait for the watcher to fire (it exits on the first new L2 escalation)
+5. Read the escalation from the watcher output — this is the wake signal; the drain in
+   step 2 of the next pass is the authoritative source of what to handle
+6. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
+
+The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
+re-arms the watcher first, then the drain re-finds it (still pending) plus anything new — so
+handling always happens with a live watcher in place and nothing slips through the gap.
 
 ### Draining pending escalations
 
-On startup and after each watcher fire, check for all pending L2 escalations:
+Check for all pending L2 escalations — **compact** to keep context small:
 
 ```
-mcp__escalation__get_pending_escalations(level=2)
+mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-Handle each one before (re)starting the watcher. This catches any L2 escalations that accumulated while no watcher was active.
+`compact=True` returns only the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
+`status`, `summary`, `suggested_action`, `timestamp`) and drops the heavy free-text/cluster fields
+(`detail`, `members`, `options`, `root_cause`, `train_state`, …). Triage from that; fetch the full
+record with `get_escalation(id)` **only** for the one item you're about to act on — and prefer doing
+that full read inside the handling sub-agent (see Context Conservation). During an AFK window the
+pending pile grows, and a full-dict drain every cycle is the dominant context sink — `compact=True`
+is what keeps a long-running session alive.
+
+**Drain-after-up — ordering matters.** Always (re)start the watcher and confirm its process is
+alive *before* you drain, never the other way round. A pre-start drain races inotify
+registration: an L2 file created in the gap between your drain and the watcher's `add_watch` is
+seen by neither, and sits unhandled until some *unrelated* later escalation happens to fire the
+watcher and trigger the next drain (real incident: esc-1573-8 sat 21h). Starting the watcher
+first closes the gap — anything born during startup is caught by the drain that immediately
+follows. This drain catches any L2 escalations that accumulated while no watcher was active.
 
 ### L2-only contract
 
@@ -68,13 +86,11 @@ Run as a **background task** (Bash with `run_in_background`). The `--level 2` fl
 
 ### When the watcher fires
 
-Parse the escalation JSON from the output, then fetch full details via MCP:
-
-```
-mcp__escalation__get_escalation(escalation_id="esc-XX-N")
-```
-
-Then drain any additional pending L2 escalations before restarting the watcher.
+The watcher's printed JSON is just your **wake signal** — note the `id`, but you don't need to keep
+the whole blob in context. Loop back, re-arm the watcher, and let the next compact drain be the
+authoritative list of what to handle. Fetch the full record via
+`mcp__escalation__get_escalation(escalation_id="esc-XX-N")` only for the specific item you're about
+to act on — ideally inside the handling sub-agent rather than at top level.
 
 ## Priority Hierarchy
 
@@ -115,6 +131,67 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - Periodically remind (every ~3-5 escalation cycles, not more)
 
 It is better to stall development than to bake in a significant bad decision.
+
+## AFK Mode (extended unattended operation)
+
+When the human will be away for an extended period (hours to days) and cannot adjudicate 3b
+decisions, switch posture from "stall and ask" to "keep the pipeline moving, defer the judgement,
+and leave a clean trail." Confirm AFK mode with the human if you can; otherwise infer it from an
+explicit "I'll be away" or a long silence after one. Three behavioural shifts:
+
+1. **Defer, don't wedge.** For a 3b item (ambiguous AND consequential), stalling the whole queue for
+   days helps no one. Where the decision can be safely *postponed* without baking anything in:
+   - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
+     `resolve_ticket`), and
+   - `resolve_issue(..., terminate=true)` to reschedule/abandon the blocking task so **independent**
+     work keeps flowing.
+   This is parking a decision for later review — NOT making it. Only do it when terminating the task
+   cannot itself cause harm (no half-merged state, no destructive side effect). The Priority
+   Hierarchy bar still holds: better to defer than to bake in a bad decision — when in real doubt,
+   fall back to "leave pending + digest."
+
+2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
+   a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
+   - **`task_failure` / `review_issues`:** first try the **low-risk auto-unblock gate** (below). If
+     it doesn't qualify or aborts, leave the escalation pending and add it to the digest — do NOT
+     spawn an interactive `/unblock`.
+   - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
+     `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
+     a terminal nobody attends just clutters.
+
+3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
+   reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
+   (overwrite each cycle) listing every pending item: id, task_id, category, severity, age, and a
+   one-line "why it's waiting / what decision is needed." On return the human reads one file. If
+   phone push is configured (`--ntfy-url` on the watcher command), a born-at-L2 `critical`/`urgent`
+   still pushes immediately — those are the only items worth interrupting an AFK human for.
+
+### Low-risk auto-unblock gate (B3)
+
+For `task_failure` and `review_issues` in AFK mode, before leaving the item for the human, check
+whether the orchestrator's at-block-time dry-run investigation already found a **low-risk** fix:
+
+1. `get_task(task_id)` → `latest = metadata.dry_run_proposals[-1]` (if any).
+2. Gate — ALL must hold, else fall through to "leave pending + digest":
+   - `latest['risk_label'] == 'low'` and `latest` has no `status` key (not a failed / budget-exhausted entry);
+   - `latest` is fresh (the most-recent entry; the branch is not materially changed since `latest['timestamp']`);
+   - you have auto-merged **fewer than 3 tasks this session** — a self-imposed cap; track the count
+     in your own context, and over the cap leave pending + digest so a runaway can't merge unattended.
+3. If the gate passes, launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE sub-agent (the
+   `Agent` tool, general-purpose — NOT `/spawn`), passing `task_id`, `escalation_id`, `project_root`,
+   the `worktree` path, and the `latest` proposal, and telling it to read and follow
+   `skills/unblock-low-risk/SKILL.md`. It applies the fix scoped to `files_referenced`, runs the
+   verify suite, and merges via the queue — or aborts cleanly.
+4. On the sub-agent's return:
+   - `outcome == "merged"`: it has already set the task done and resolved the escalation. Increment
+     your session auto-merge count and add a one-line success entry to the digest.
+   - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Record the
+     abort reason in the digest and move on — do NOT retry, and do NOT spawn an interactive
+     `/unblock` in AFK mode; it waits for the human.
+
+The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
+its abort as authoritative. This gate is AFK-only — when a human is present, prefer interactive
+`/unblock` so they stay in the loop.
 
 ## Handling Escalations by Category
 
@@ -250,11 +327,15 @@ This is distinct from `review_suggestions` (info-level, non-blocking). Review is
 
 **Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
 
+**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
+
 ### `task_failure` (blocking)
 
 Merge conflicts, verification failures, build breaks. The task agent is stopped and waiting.
 
 **Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
+
+**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
 
 ### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
 
@@ -358,11 +439,23 @@ Reconciliation is infrastructure that affects memory quality across the entire s
 
 ## Context Conservation
 
-You're in a long-running session — conserve your context window aggressively.
+You're in a long-running session — conserve your context window aggressively. Over a multi-day AFK
+window this is the difference between one durable session and repeated restarts.
+
+**Read compact, expand lazily:**
+- Drain with `get_pending_escalations(level=2, compact=True)` — never pull full dicts just to triage.
+- Don't keep the watcher's wake-signal JSON in context; triage from the compact drain.
+- Pull the full record (`get_escalation(id)`) for only the one item you're about to act on, and
+  prefer doing that read inside the handling sub-agent so the heavy `detail`/`evidence` never lands
+  at top level.
 
 **Delegate to sub-agents:**
 - Triaging review suggestions — use the prompt template in the `review_suggestions` section
-- Researching escalation context (reading code, checking task dependencies, understanding the issue)
+- Researching escalation context for ANY category that needs code reading (e.g. `task_failure`,
+  `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
+  only a compact verdict + recommended action — not the raw material
+- The low-risk auto-unblock sub-agent (`unblock-low-risk`) — it does the whole apply→verify→merge in
+  its own context and returns only a small JSON result
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
 
 **Keep in top-level context:**
@@ -395,20 +488,43 @@ mcp__escalation__resolve_issue(
 )
 ```
 
-The `resolution` text matters — for `terminate=false`, it's injected directly into the agent's context when the task resumes. Be specific: include file paths, function names, and concrete instructions.
+**Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
+steward-resolved path, where a workflow is still live and waiting (`_wait_for_resolution` →
+`build_resume_prompt`). That is *not* the usual L2 case. For the escalations this skill resolves:
 
-For `terminate=true` (dismiss), the resolution is recorded for audit but the task is abandoned. The task can be rescheduled later.
+- **L2 cluster (has member L1s), `terminate=false`:** the resolution cascades to each member L1,
+  flipping the member task `blocked→pending`. It re-dispatches into a **fresh** workflow that does
+  **not** read your resolution text — the harness propagates status only. Don't rely on the string
+  reaching the agent. If the agent needs specific guidance, either spawn an interactive `/unblock`
+  (drive the worktree directly) or write durable guidance into fused-memory / task metadata, which
+  the fresh workflow's briefing memory-search may surface.
+- **Born-at-L2 with no members (a direct `critical`/`urgent` blocker), `terminate=false`:** this
+  marks the record resolved but does **NOT** re-pend the task — the re-pend paths fire only for
+  `level==1`, and a directly-filed born-at-L2 has no members to cascade to. The task stays
+  `blocked`. To get it moving again use `terminate=true` (abandon → reschedulable) or drive it via
+  `/unblock`. The resolution text is recorded for audit only.
 
-**L2 cluster cascade:** when a resolved L2 represents a causal cluster (multiple member L1 escalations grouped by the auto-watcher), resolving the L2 here cascades to close its L1 members via the escalation server — this skill resolves only the L2 itself, never each member directly. For design details, see `plans/escalation-l2-tiering.md`. Note: the cascade activates once the server-side `promote_to_l2` mechanic (E2) is shipped; prior to that, only the L2 itself closes — the behaviour of this skill is unchanged either way.
+Either way, still write a clear, specific `resolution` (file paths, function names, the decision and
+why): it is the audit record and the human-readable trail even when no agent re-reads it.
 
-**Transition period (until E2 ships):** L1 clustering by the auto-watcher is not yet active. Multiple simultaneous L2 escalations may share a common root cause without being packaged as a named cluster. When you see more than one L2 pending, scan them for shared files, summaries, or task IDs — if they share a root cause, handle them together and note the relationship in your resolution text.
+**L2 cluster cascade (live).** When a resolved L2 represents a causal cluster (member L1
+escalations packaged by the auto-watcher), resolving the L2 here cascades to close its L1 members
+via the escalation server — this skill resolves only the L2 itself, never each member directly. The
+cascade is implemented in `queue.resolve()`: it recurses over `esc.members`, resolving each with
+`resolved_by='l2-cascade:<L2-id>'`, and the auto-watcher files clusters via `promote_to_l2`. For
+design details, see `plans/escalation-l2-tiering.md`.
+
+You may still occasionally see multiple *unclustered* L2s that share a root cause — the auto-watcher
+deduplicates by exact root-cause string, so near-miss hypotheses file separately. When you do, scan
+them for shared files, summaries, or task IDs and handle related ones together, noting the
+relationship in your resolution text.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
 ## Failure Modes
 
-**"Too many open files"**: After ~35 watcher restart cycles in one session, the background task fd pool can exhaust. Tell the user — they may need to start a fresh Claude Code session. The fd leak comes from accumulated background tasks.
+**"Too many open files" (historical — no longer expected)**: Early sessions could exhaust the background-task fd pool after ~35 watcher restart cycles. This is no longer observed in practice — 100+ cycle sessions are routine. The watcher exits promptly via `sys.exit(0)`, so its inotify fd is reclaimed by the kernel and the background task is reaped shortly after. If you ever do hit it, start a fresh Claude Code session.
 
 **Orchestrator not running**: If no new escalations arrive for an extended period, the orchestrator may have crashed or finished. Check with the human.
 
-**Stale escalations**: On orchestrator startup, `dismiss_all_pending()` auto-dismisses escalations from prior runs. If you encounter escalations that look stale (timestamps from a previous session, referencing tasks that are already Done), tell the human rather than dismissing them yourself — they may contain useful diagnostic information.
+**Stale escalations**: On orchestrator startup, `dismiss_all_pending()` auto-dismisses **L0** escalations from prior runs (filter: `level == 0`) — **L1 and L2 escalations are preserved across restarts**. So an L2 with a timestamp from a previous session that is still `status: pending` is legitimate carry-over, not stale; handle it normally. If an escalation genuinely looks wrong (e.g. references a task that is already Done), tell the human rather than dismissing it yourself — it may contain useful diagnostic information.

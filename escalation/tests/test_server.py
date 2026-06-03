@@ -256,6 +256,95 @@ class TestGetPendingLevelFilter:
 
 
 # ---------------------------------------------------------------------------
+# TestGetPendingCompact: get_pending_escalations(compact=True) projection
+# ---------------------------------------------------------------------------
+
+
+class TestGetPendingCompact:
+    """get_pending_escalations(compact=True) returns only the triage-relevant fields."""
+
+    _COMPACT_KEYS = {
+        'id', 'task_id', 'category', 'severity', 'level', 'status',
+        'summary', 'suggested_action', 'timestamp',
+    }
+    # Heavy fields that compact mode must omit.
+    _HEAVY_KEYS = {
+        'detail', 'members', 'options', 'root_cause', 'train_state',
+        'workflow_state', 'worktree', 'dedupe_children', 'dedupe_fingerprint',
+        'resolution',
+    }
+
+    def _seed_heavy(self, queue: EscalationQueue, task_id: str, level: int) -> Escalation:
+        """Seed a pending escalation populated with heavy fields, at the given level."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary=f'level={level} compact test',
+            detail='x' * 4000,  # large free-text — must be dropped in compact mode
+            suggested_action='manual_intervention',
+            level=level,
+            members=['esc-1-1', 'esc-1-2'],
+            root_cause='shared root cause hypothesis',
+            options=['A: rollback', 'B: fix forward'],
+            workflow_state='REVIEW',
+            worktree='/abs/path/.worktrees/1',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_compact_projects_only_light_fields(self, tmp_path: Path):
+        """compact=True returns exactly the triage keys and omits the heavy ones."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        seeded = self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 1, f"Expected 1 result, got {len(result)}: {result}"
+        keys = set(result[0].keys())
+        assert keys == self._COMPACT_KEYS, f"Unexpected compact key set: {keys}"
+        assert not (keys & self._HEAVY_KEYS), f"Heavy fields leaked: {keys & self._HEAVY_KEYS}"
+        # Values that ARE projected must be faithful.
+        assert result[0]['id'] == seeded.id
+        assert result[0]['suggested_action'] == 'manual_intervention'
+
+    @pytest.mark.asyncio
+    async def test_compact_false_is_default_full_dict(self, tmp_path: Path):
+        """Default (compact omitted) preserves the full to_dict() shape — back-compat."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_pending(server, level=2)
+
+        assert len(result) == 1
+        # Heavy fields present in the full shape.
+        assert result[0]['detail'].startswith('x')
+        assert result[0]['members'] == ['esc-1-1', 'esc-1-2']
+        assert result[0]['root_cause'] == 'shared root cause hypothesis'
+
+    @pytest.mark.asyncio
+    async def test_compact_preserves_filter_and_count(self, tmp_path: Path):
+        """compact=True still honours the level filter and returns one row per match."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=0)
+        self._seed_heavy(queue, 'task-A', level=1)
+        self._seed_heavy(queue, 'task-A', level=2)
+        self._seed_heavy(queue, 'task-B', level=2)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 2, f"Expected 2 L2 rows, got {len(result)}: {result}"
+        assert all(r['level'] == 2 for r in result)
+        assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
+
+
+# ---------------------------------------------------------------------------
 # TestL2DedupeBypass: born-at-L2 escalations bypass deduplication
 # ---------------------------------------------------------------------------
 

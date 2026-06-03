@@ -34,6 +34,16 @@ CATEGORIES = [
     'review_suggestions',
 ]
 
+# Fields returned by get_pending_escalations(compact=True) — the triage-relevant
+# subset a long-running L2 watcher needs to decide whether to pull a full record.
+# The heavy fields (detail, members, options, root_cause, train_state,
+# workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
+# small as the pending pile grows during an AFK window.
+_COMPACT_ESCALATION_FIELDS = (
+    'id', 'task_id', 'category', 'severity', 'level', 'status',
+    'summary', 'suggested_action', 'timestamp',
+)
+
 
 def create_server(
     queue: EscalationQueue,
@@ -344,6 +354,7 @@ def create_server(
     def get_pending_escalations(
         task_id: str | None = None,
         level: int | None = None,
+        compact: bool = False,
     ) -> list[dict[str, Any]]:
         """List all pending escalations, optionally filtered by task ID and/or level.
 
@@ -354,6 +365,16 @@ def create_server(
 
         *task_id* — when set, restricts the search to escalations for that task.
         Both filters can be combined.
+
+        *compact* — when True, each returned dict is projected to only the
+        triage-relevant fields (``id``, ``task_id``, ``category``, ``severity``,
+        ``level``, ``status``, ``summary``, ``suggested_action``, ``timestamp``);
+        the heavy free-text/cluster fields (``detail``, ``members``, ``options``,
+        ``root_cause``, ``train_state``, ``workflow_state``, ``worktree``,
+        ``dedupe_*``) are omitted.  Use this from a long-running watcher to keep
+        context small as the pending pile grows; fetch the full record for a
+        specific id via ``get_escalation`` only when you are about to act on it.
+        Default False preserves the full-dict shape for existing callers.
         """
         if task_id:
             escalations = queue.get_by_task(task_id, status='pending', level=level)
@@ -361,6 +382,11 @@ def create_server(
             escalations = queue.get_pending()
             if level is not None:
                 escalations = [e for e in escalations if e.level == level]
+        if compact:
+            return [
+                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                for d in (e.to_dict() for e in escalations)
+            ]
         return [e.to_dict() for e in escalations]
 
     @mcp.tool()
