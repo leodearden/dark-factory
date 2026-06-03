@@ -9,9 +9,37 @@ A one-shot helper that opens a new terminal window and launches an independent `
 
 Use this whenever a skill needs to hand a task off to a fresh interactive Claude — most commonly, escalation-watcher spawning `/unblock <task_id>` so a human can drive resolution in a dedicated window.
 
+## Resolving the prompt for a fresh context
+
+The spawned session begins with an **empty conversation**. Whatever prompt you pass becomes its first and only context. So the prompt must **stand on its own there** — anything that only means something *here* (in this conversation) is meaningless once it lands in the fresh session.
+
+Before you build the script invocation, run this decision procedure on the prompt. **Default to the least transformation** — resolve only when there is a genuine unresolved reference:
+
+1. **Already self-contained → pass verbatim.** A slash command whose argument fully specifies the work: `/unblock 8888`, `/review`, an absolute path, a quoted literal. Change *nothing*. This is the common case, and the only case programmatic callers (e.g. escalation-watcher) ever hit. **Never "enrich" a self-contained command** — doing so risks corrupting a prompt that was already correct.
+
+2. **Contains a contextual reference → resolve, then rewrite, keeping the command.** Deixis or anaphora (`that`, `this`, `it`, `above`, `the fix`, `the approach we discussed`) or a bare instruction that only parses given this conversation. Replace each reference with the concrete thing it denotes — drawn from *this* conversation, rendered unambiguously — and keep any leading slash command so the target skill still runs in the fresh session. `/do that` → resolve `that`; `/prd that feature` → resolve `that feature`.
+
+For two commands the resolution is richer than swapping a pronoun, because the fresh session is **autonomous** and cannot ask you the questions it would normally ask:
+
+### `/do` — distill here, execute autonomously there
+
+`/do`'s real work is compressing this session into a self-contained plan. The spawned session can't do that (the session is gone), so **do it here**, then hand the spawned session pure execution:
+
+- Produce the plan exactly as the `/do` skill body prescribes: **Objective**, **Decisions & rationale** (including the alternatives you rejected and *why*, so the executor doesn't relitigate them), **Implementation** (name real files/functions), **Verification**, and the **Execution protocol** (worktree → `/merge-queue` → `/reflect`, work autonomously).
+- **Do not spawn `/do <plan>`.** A fresh `/do` would enter plan mode and stall forever waiting for a human to choose *"Clear Context and Follow Plan."* Instead spawn a plain execution prompt: hand over the plan and tell the session to carry it out end-to-end without pausing. This is the autonomous-executor path.
+- If the plan is more than a few lines, **write it to a file** (Write tool, to an absolute path *outside* the repo working tree — e.g. under `~/.claude/spawn-briefs/` or a `mktemp` path — so the worktree the spawned session creates can't shadow it and it can't be accidentally git-staged) and spawn a short prompt pointing at it. Passing a multi-paragraph plan as one shell-quoted CLI arg is fragile. e.g. prompt → `Read the plan at <abs-path> and execute it end-to-end, autonomously. It is the contract — don't pause for confirmation unless you hit something genuinely blocking the plan doesn't cover.` with `skip_permissions=true`.
+
+### `/prd` — resolve the subject and pre-answer the gates
+
+- Resolve the contextual subject (`that feature`, `the thing we discussed`) into a concrete PRD subject.
+- `/prd`'s value is its G1–G6 gates, and a fresh autonomous session can't ask you the questions those gates raise. So **fold in everything from this conversation that bears on them** — the named consumer (G1), the user-observable leaf signal (G2), substrate assumptions (G3), cross-PRD seams (G4), the premise (G6) — so the gates can be satisfied without interrogating an absent human.
+- **Keep the `/prd` wrapper** (unlike `/do`): spawn `/prd <concrete subject + folded-in context>` so the gates run in the fresh session (file-spill as above if long). `/prd` is high-stakes and may still legitimately pause at a gate it genuinely can't resolve from the brief — that's acceptable.
+
+When in doubt about whether a prompt is self-contained, prefer leaving it untouched and noting the ambiguity, rather than rewriting and risking corruption.
+
 ## Arguments
 
-- **`prompt`** (required) — the literal string passed as the first positional argument to `claude`. May be a slash command (e.g. `/unblock 123`) or natural language. The caller is responsible for ensuring the prompt contains no unescaped single quotes; if it must, escape each one as `'\''` (close-single, escaped-single, open-single — the standard Bourne idiom). Example: `it'\''s fine` becomes a valid payload.
+- **`prompt`** (required) — the string passed as the first positional argument to `claude`. May be a slash command (e.g. `/unblock 123`) or natural language. **First resolve it per [Resolving the prompt for a fresh context](#resolving-the-prompt-for-a-fresh-context) above** — a contextual prompt typed in an interactive session must be rewritten to stand alone *before* it becomes this argument. The caller is responsible for ensuring the final string contains no unescaped single quotes; if it must, escape each one as `'\''` (close-single, escaped-single, open-single — the standard Bourne idiom). Example: `it'\''s fine` becomes a valid payload.
 - **`cwd`** (required) — directory to `cd` into before invoking `claude`. Usually the project root. Must be an absolute path that exists on the host.
 - **`skip_permissions`** (default `true`) — when `true`, passes `--dangerously-skip-permissions` so the spawned session runs without permission prompts. Set `false` when the spawned session should prompt for permissions normally (e.g. interactive exploration where the human wants oversight).
 - **`terminal_title`** (optional) — passed via `--title` to emulators that support it (`gnome-terminal`, `konsole`, `xterm`; `kitty` ignores it harmlessly). Useful for distinguishing multiple spawned sessions in the window manager.
