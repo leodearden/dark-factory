@@ -3848,6 +3848,43 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
 
     # ------------------------------------------------------------------
+    # Out-of-band delivery helper
+    # ------------------------------------------------------------------
+
+    def _oob_deliver(
+        self,
+        req: MergeRequest,
+        outcome: MergeOutcome,
+        *,
+        speculative: bool,
+    ) -> bool:
+        """Resolve req.result out-of-band at detection time when safe.
+
+        PREDICATE: not GroupMergeRequest AND not speculative AND
+        outcome.status not in {'done','already_merged'}.
+
+        Speculative items can be discarded and re-merged by the verifier
+        (which may flip 'conflict' → 'done'), so they must never be
+        early-delivered.  Trains are excluded by the isinstance guard.
+        'done'/'already_merged' are excluded because they are either never
+        produced here or are already handled at the door.
+
+        Returns True (already_delivered flag) only when the precondition
+        holds and set_result was called.  The caller passes the return value
+        as already_delivered on the SpeculativeItem ordering token so the
+        verifier skips set_result but still runs n_failed/slot bookkeeping.
+        """
+        if (
+            isinstance(req, GroupMergeRequest)
+            or speculative
+            or outcome.status in ('done', 'already_merged')
+        ):
+            return False
+        if not req.result.done():
+            req.result.set_result(outcome)
+        return True
+
+    # ------------------------------------------------------------------
     # Merger coroutine
     # ------------------------------------------------------------------
 
@@ -3958,13 +3995,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             'abandoned_verify_timeouts',
                             attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
                         )
+                        _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
+                        _already = self._oob_deliver(req, _abandon, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=self._abandon_outcome(
-                                req.task_id, prior_timeouts,
-                            ),
+                            immediate_outcome=_abandon,
+                            already_delivered=_already,
                             started_monotonic=t0,
                         ))
                         spec_base = None
@@ -3985,10 +4023,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.branch, t0,
                     )
                     if guard is not None:
+                        _already = self._oob_deliver(req, guard, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False, immediate_outcome=guard,
+                            already_delivered=_already,
                             started_monotonic=t0,
                         ))
                         spec_base = None
@@ -4009,14 +4049,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # (base_sha, branch_ref_in_worktree, etc.) are meaningless.
                         # failure_diagnostic is only set on genuine merge_to_main
                         # non-conflict failures downstream.
+                        _revparse_fail = MergeOutcome(
+                            'blocked',
+                            reason=f'rev-parse HEAD failed: {err.strip()}',
+                        )
+                        _already = self._oob_deliver(req, _revparse_fail, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome(
-                                'blocked',
-                                reason=f'rev-parse HEAD failed: {err.strip()}',
-                            ),
+                            immediate_outcome=_revparse_fail,
+                            already_delivered=_already,
                             started_monotonic=t0,
                         ))
                         spec_base = None
@@ -4058,13 +4101,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
                             )
+                        _conflict = MergeOutcome(
+                            'conflict', conflict_details=merge_result.details,
+                        )
+                        _already = self._oob_deliver(req, _conflict, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome(
-                                'conflict', conflict_details=merge_result.details,
-                            ),
+                            immediate_outcome=_conflict,
+                            already_delivered=_already,
                             started_monotonic=t0,
                         ))
                         spec_base = None
@@ -4083,15 +4129,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             git_stderr=merge_result.details,
                         )
                         _rendered = self._render_failure_diagnostic(_diag)
+                        _merge_fail = MergeOutcome(
+                            'blocked',
+                            reason=f'{merge_result.details}\n{_rendered}',
+                            failure_diagnostic=_diag,
+                        )
+                        _already = self._oob_deliver(req, _merge_fail, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome(
-                                'blocked',
-                                reason=f'{merge_result.details}\n{_rendered}',
-                                failure_diagnostic=_diag,
-                            ),
+                            immediate_outcome=_merge_fail,
+                            already_delivered=_already,
                             failure_diagnostic=_diag,
                             started_monotonic=t0,
                         ))
@@ -4130,11 +4179,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'planned work. Review the merge commit '
                             f'and restore missing files.'
                         )
+                        _drop = MergeOutcome('blocked', reason=reason)
+                        _already = self._oob_deliver(req, _drop, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome('blocked', reason=reason),
+                            immediate_outcome=_drop,
+                            already_delivered=_already,
                             started_monotonic=t0,
                         ))
                         spec_base = None
