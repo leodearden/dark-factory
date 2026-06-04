@@ -1373,3 +1373,81 @@ class TestMergeRequestDurableIntent:
         # The entry is still usable: the worker can resolve it normally.
         req.result.set_result(MergeOutcome('done', reason='late resolve'))
         assert req.result.done() and not req.result.cancelled()
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_cancel tests (β2)
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_cancel MCP tool directly."""
+    tool = await server.get_tool('merge_cancel')
+    return await tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Step-1 RED test: success path — pending waiter → cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeCancel:
+    """β2 merge_cancel MCP tool — cancels a pending waiter future."""
+
+    async def test_cancel_pending_waiter_returns_cancelled_true(self, tmp_path: Path):
+        """Cancelling a live pending waiter returns cancelled=True, state='abandoned'.
+
+        Setup: server with merge_queue + orch_config + injected registry, NO harness.
+        Submit merge_request(wait_secs=0) on a free branch to register a durable-intent
+        waiter and enqueue the MergeRequest.  Capture request_id.  Call merge_cancel
+        with that request_id and assert the success shape.  Then drain mq and assert
+        the underlying future was actually cancelled.
+
+        RED until step-2 impl: server.get_tool('merge_cancel') fails because the tool
+        does not exist yet.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Submit via merge_request(wait_secs=0) — registers a WaiterRecord in _waiters
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c1',
+            branch='c1',
+            worktree=str(tmp_path / 'wt-c1'),
+            wait_secs=0,
+        )
+        assert result_mr['status'] == 'queued', f'Unexpected merge_request status: {result_mr}'
+        rid = result_mr['request_id']
+        assert rid, 'Expected non-empty request_id from merge_request'
+
+        # Cancel the in-flight waiter
+        result_cancel = await _call_merge_cancel(server, request_id=rid)
+
+        assert result_cancel.get('cancelled') is True, (
+            f"Expected cancelled=True, got: {result_cancel}"
+        )
+        assert result_cancel.get('state') == 'abandoned', (
+            f"Expected state='abandoned', got: {result_cancel}"
+        )
+        assert 'reason' in result_cancel, f"Expected 'reason' key, got: {result_cancel}"
+        assert result_cancel.get('reason') is None, (
+            f"Expected reason=None on success, got: {result_cancel['reason']}"
+        )
+
+        # Drain mq and assert the underlying future was actually cancelled
+        req = mq.get_nowait()
+        assert req.result.cancelled(), (
+            f'Expected future to be cancelled after merge_cancel, got: '
+            f'done={req.result.done()} cancelled={req.result.cancelled()}'
+        )
