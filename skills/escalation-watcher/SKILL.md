@@ -81,7 +81,7 @@ cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watche
   --queue-dir <project_root>/data/escalations --level 2 2>&1
 ```
 
-Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout.
+Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2 escalation is already pending when the watcher starts, it may fire immediately at launch — this is expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain re-finds it).
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
@@ -193,12 +193,11 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., terminate=true)` to reschedule/abandon the blocking task so **independent**
-     work keeps flowing.
-   This is parking a decision for later review — NOT making it. Only do it when terminating the task
-   cannot itself cause harm (no half-merged state, no destructive side effect). The Priority
-   Hierarchy bar still holds: better to defer than to bake in a bad decision — when in real doubt,
-   fall back to "leave pending + digest."
+   - `resolve_issue(..., action='park')` so the blocking task lands `deferred` (D2: invisible to the
+     scheduler and to the stranded-blocked sweep; never circularly re-asked).
+   This is parking a decision for later human review — NOT making it. Only park when the task has no
+   half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
+   bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
 
 2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
    a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
@@ -375,116 +374,11 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 
 ### `review_suggestions` (info)
 
-Non-blocking suggestions from code review. The task is already on its way to Done, so these become follow-up work.
-
-**Delegate triage to a sub-agent** to conserve context. Use this prompt template:
-
-```
-Agent(
-  description="Triage review suggestions",
-  prompt="""
-Triage these review suggestions from escalation <escalation_id> (task <task_id>).
-
-## Escalation detail
-<paste the full escalation JSON here>
-
-## Classification rules
-
-**ACCEPT** if the suggestion has genuine merit:
-- Real bugs or correctness issues
-- Missing tests for important code paths (especially error paths, edge cases)
-- Code duplication across 3+ sites with maintenance risk
-- Violations of project conventions
-- Stale comments that would mislead future readers
-
-**SKIP** only if genuinely meritless:
-- Duplicates work already tracked in another task
-- Proposes deleting code an upcoming task depends on
-- Refactors that would pessimize the design or impede planned work
-- Renames that don't actually improve semantic transparency
-- Pre-existing issues not introduced by the diff
-
-When in doubt, ACCEPT. The cost of a small unnecessary task is low;
-the cost of missing a real issue compounds.
-
-## Output format
-
-Return a JSON object:
-{
-  "accepted": [
-    {
-      "suggestion": "brief description",
-      "reason": "why it has merit",
-      "files": ["affected/file/paths"],
-      "proposed_task_title": "concise task title"
-    }
-  ],
-  "skipped": [
-    {
-      "suggestion": "brief description",
-      "reason": "why it's meritless"
-    }
-  ],
-  "proposed_task_groups": [
-    {
-      "title": "task title grouping related accepted items",
-      "description": "what needs to be done, with file paths and specifics",
-      "items": [0, 2]  // indices into accepted array
-    }
-  ]
-}
-""",
-  subagent_type="general-purpose"
-)
-```
-
-After the sub-agent returns:
-1. Review the groupings (sanity check — don't re-triage, just confirm the groupings make sense)
-2. Create follow-up tasks using the two-phase pattern for each task group:
-
-   ```
-   # Phase 1: submit — returns immediately with a ticket id
-   submit_result = mcp__fused-memory__submit_task(
-       project_root="<project_root>",
-       title="<task group title>",
-       description="<task group description with file paths and specifics>",
-       priority="medium",
-       metadata={
-           "source": "review-suggestions",
-           "escalation_id": escalation_id,
-           "suggestion_hash": hash,          # (escalation_id, suggestion_hash) is the idempotency key
-           "spawn_context": "steward-triage",
-           "modules": ["<path/to/module>"],
-       },
-   )
-   ticket = submit_result["ticket"]
-
-   # Phase 2: block until the curator decides
-   resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>", timeout_seconds=<see _shared/ticket-failure-handling.md>)
-
-   if resolve["status"] == "created":
-       task_id = resolve["task_id"]           # new task
-   elif resolve["status"] == "combined":
-       task_id = resolve["task_id"]           # merged into existing task — normal, not an error
-   elif resolve["status"] == "failed":
-       # On `failed`: record the reason in the escalation resolution note and skip this
-       # suggestion group. This caller DOES set (escalation_id, suggestion_hash), so the
-       # R4 gate fires natively.
-       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
-       handle_failure(resolve["reason"])
-   ```
-
-3. Resolve the escalation using the **escalation** MCP — `mcp__escalation__resolve_issue` closes the
-   escalation record on the escalation server. This is distinct from `mcp__fused-memory__resolve_ticket`
-   above, which waits for the task curator on the fused-memory server. Despite the name overlap, the two
-   calls operate on different systems:
-   ```
-   mcp__escalation__resolve_issue(
-     escalation_id="...",
-     resolution="Triaged: N items queued as tasks [IDs], M items skipped [brief reasons]",
-     resolved_by="escalation-watcher"
-   )
-   ```
+> **This handler is unreachable at L2.** Review suggestions reach live workflows as curator tickets
+> via `_route_review_suggestions_to_curator` in workflow.py (call site ~line 3064), with no
+> escalation file written; they fall back to level-0 steward escalations filed around
+> workflow.py:6272 and consumed by `_next_escalation` in steward.py. They do not reach this
+> queue. This stub is kept only to document why `review_suggestions` must not be re-added here.
 
 ### `review_issues` (blocking)
 
@@ -494,7 +388,7 @@ This is distinct from `review_suggestions` (info-level, non-blocking). Review is
 
 **Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
 
-**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
+If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
 ### `task_failure` (blocking)
 
@@ -502,7 +396,7 @@ Merge conflicts, verification failures, build breaks. The task agent is stopped 
 
 **Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
 
-**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
+If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
 ### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
 
@@ -528,12 +422,12 @@ Two flavours:
 Agent discovered it needs modules beyond its assigned scope.
 
 1. Extend the required modules in task metadata via `mcp__fused-memory__update_task`
-2. Dismiss and terminate — the task will be rescheduled with the expanded module lock set:
+2. Re-pend the task — it will be dispatched with the expanded module lock set:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Scope expanded to include [modules]. Task will be rescheduled with updated module locks.",
-     terminate=true,
+     resolution="Scope expanded to include [modules]. Task re-pends with updated module locks.",
+     action='resume',   # flips blocked→pending; task redispatches with expanded scope
      resolved_by="escalation-watcher"
    )
    ```
@@ -543,12 +437,13 @@ Agent discovered it needs modules beyond its assigned scope.
 Agent found it depends on work that isn't done yet.
 
 1. Check if the prerequisite is an **existing task** that isn't Done yet.
-2. **If yes**: add the dependency via `mcp__fused-memory__add_dependency`, then dismiss and terminate:
+2. **If yes**: add the dependency via `mcp__fused-memory__add_dependency`, then re-pend — the
+   dependency gate will hold the task until the prerequisite completes:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Added dependency on task <dep_id>. Task rescheduled after dependency completes.",
-     terminate=true,
+     resolution="Added dependency on task <dep_id>. Task re-pends; held by dependency gate until dep completes.",
+     action='resume',   # flips blocked→pending; dependency gate holds dispatch until dep is done
      resolved_by="escalation-watcher"
    )
    ```
@@ -574,16 +469,42 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting the snippet:
-  1. Substitute `"source": "escalation-info"` (only this field changes).
-  2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
-  3. For the `suggestion_hash` / `escalation_id` synthesis recipe and R4 gate details, see
-     [`skills/_shared/ticket-failure-handling.md`](../_shared/ticket-failure-handling.md).
-     At this callsite (Case A — the escalation's id is already in scope), the concrete
-     synthesis is:
-     ```python
-     suggestion_hash = hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]
-     ```
+- **Info**: queue as a follow-up task using the two-phase pattern:
+
+  ```python
+  suggestion_hash = hashlib.sha256(
+      (escalation['detail'] or escalation['summary'] or escalation['id']).encode()
+  ).hexdigest()[:16]   # Case A — escalation id already in scope; see _shared/ticket-failure-handling.md
+
+  # Phase 1: submit — returns immediately with a ticket id
+  submit_result = mcp__fused-memory__submit_task(
+      project_root="<project_root>",
+      title="<cleanup description>",
+      description="<what needs cleaning up, with file paths and specifics>",
+      priority="medium",
+      metadata={
+          "source": "escalation-info",
+          "escalation_id": escalation_id,
+          "suggestion_hash": suggestion_hash,   # (escalation_id, suggestion_hash) is the idempotency key
+          "spawn_context": "steward-triage",
+          "modules": ["<path/to/module>"],
+      },
+  )
+  ticket = submit_result["ticket"]
+
+  # Phase 2: block until the curator decides
+  resolve = mcp__fused-memory__resolve_ticket(
+      ticket=ticket, project_root="<project_root>",
+      timeout_seconds=<see skills/_shared/ticket-failure-handling.md>
+  )
+
+  if resolve["status"] in ("created", "combined"):
+      task_id = resolve["task_id"]
+  elif resolve["status"] == "failed":
+      # Record reason in escalation resolution note; skip this item.
+      # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
+      handle_failure(resolve["reason"])
+  ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
@@ -617,7 +538,6 @@ window this is the difference between one durable session and repeated restarts.
   at top level.
 
 **Delegate to sub-agents:**
-- Triaging review suggestions — use the prompt template in the `review_suggestions` section
 - Researching escalation context for ANY category that needs code reading (e.g. `task_failure`,
   `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
   only a compact verdict + recommended action — not the raw material
@@ -653,26 +573,44 @@ Remind about unresolved items roughly every 3-5 escalation handling cycles — e
 mcp__escalation__resolve_issue(
   escalation_id="esc-XX-N",
   resolution="<text injected into the agent's briefing when it resumes>",
-  terminate=false,        # true to dismiss and abandon the task
+  action='resume',   # default least-destructive intent; see C1 table below
   resolved_by="escalation-watcher"
 )
 ```
+
+### C1 — `action` semantics (single source of truth)
+
+| `action` | Record disposition | Live workflow | Task status effect | Intent |
+|---|---|---|---|---|
+| `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
+| `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
+| `park` | `dismissed` | killed | → `deferred` (from any non-terminal status) | "Stop; human decides later; machine must not touch." |
+| `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
+| `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
+
+**C1 notes:**
+- Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
+- The removed `terminate` parameter now raises a hard error naming the five actions above.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API.
+- Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
 steward-resolved path, where a workflow is still live and waiting (`_wait_for_resolution` →
 `build_resume_prompt`). That is *not* the usual L2 case. For the escalations this skill resolves:
 
-- **L2 cluster (has member L1s), `terminate=false`:** the resolution cascades to each member L1,
+- **L2 cluster (has member L1s), `action='resume'`:** the resolution cascades to each member L1,
   flipping the member task `blocked→pending`. It re-dispatches into a **fresh** workflow that does
   **not** read your resolution text — the harness propagates status only. Don't rely on the string
   reaching the agent. If the agent needs specific guidance, either spawn an interactive `/unblock`
   (drive the worktree directly) or write durable guidance into fused-memory / task metadata, which
   the fresh workflow's briefing memory-search may surface.
-- **Born-at-L2 with no members (a direct `critical`/`urgent` blocker), `terminate=false`:** this
-  marks the record resolved but does **NOT** re-pend the task — the re-pend paths fire only for
-  `level==1`, and a directly-filed born-at-L2 has no members to cascade to. The task stays
-  `blocked`. To get it moving again use `terminate=true` (abandon → reschedulable) or drive it via
-  `/unblock`. The resolution text is recorded for audit only.
+- **Memberless born-at-L2 (a direct `critical`/`urgent` blocker with no L1 members):** under D7
+  (task β), `action='resume'` on a memberless born-at-L2 now flips `blocked→pending` — the orphan
+  flip accepts any task-attached `level >= 1`. The resolution text is recorded for audit only and
+  does not reach the agent (no live workflow); write durable guidance into fused-memory / task
+  metadata instead. To re-run fresh use `action='restart'` (→ `pending` from scratch); to park for
+  later use `action='park'` (→ `deferred`); to abandon permanently use `action='abandon'`
+  (→ `cancelled`); to close the record without touching the task use `action='close_only'`.
 
 Either way, still write a clear, specific `resolution` (file paths, function names, the decision and
 why): it is the audit record and the human-readable trail even when no agent re-reads it.
@@ -680,9 +618,10 @@ why): it is the audit record and the human-readable trail even when no agent re-
 **L2 cluster cascade (live).** When a resolved L2 represents a causal cluster (member L1
 escalations packaged by the auto-watcher), resolving the L2 here cascades to close its L1 members
 via the escalation server — this skill resolves only the L2 itself, never each member directly. The
-cascade is implemented in `queue.resolve()`: it recurses over `esc.members`, resolving each with
-`resolved_by='l2-cascade:<L2-id>'`, and the auto-watcher files clusters via `promote_to_l2`. For
-design details, see `plans/escalation-l2-tiering.md`.
+action applies uniformly across the cluster. The cascade is implemented in `queue.resolve()`: it
+recurses over `esc.members`, resolving each with `resolved_by='l2-cascade:<L2-id>'`, and the
+auto-watcher files clusters via `promote_to_l2`. For design details, see
+`plans/escalation-l2-tiering.md`.
 
 You may still occasionally see multiple *unclustered* L2s that share a root cause — the auto-watcher
 deduplicates by exact root-cause string, so near-miss hypotheses file separately. When you do, scan
