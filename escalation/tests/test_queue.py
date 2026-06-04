@@ -2287,3 +2287,78 @@ class TestEscalationIdLock:
         assert lock_path not in matched, (
             f'Lock sidecar must not match esc-*.json glob; matched={matched}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-3: Two-OS-process data-loss test for add_members_to_l2 (RED)
+# ---------------------------------------------------------------------------
+
+_CHILD_SCRIPT = Path(__file__).parent / '_concurrent_queue_child.py'
+
+
+class TestAddMembersToL2Concurrency:
+    """Two-OS-process test: concurrent add_members_to_l2 must not lose any members."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_appends_preserve_all_members(self, tmp_path: Path):
+        """N=50 appends from two concurrent processes must produce exactly 100 distinct members.
+
+        Without the sidecar lock, each process reads the same pre-mutation snapshot,
+        appends one element, and rewrites — the second write clobbers the first's addition.
+        With the lock, appends serialize per-id and the union is complete.
+        """
+        # Set up the queue and seed the L2 escalation
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        l2 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent member test',
+            level=2,
+            root_cause='Test root cause',
+            members=[],
+        )
+        queue.submit(l2)
+        l2_id = l2.id
+
+        # Build env with worktree src on PYTHONPATH so child imports in-tree escalation
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently
+        proc_a = subprocess.Popen(
+            child_args + ['add_members', l2_id, 'a', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['add_members', l2_id, 'b', str(count)],
+            env=env,
+        )
+
+        # Wait for both to complete
+        rc_a = proc_a.wait(timeout=25)
+        rc_b = proc_b.wait(timeout=25)
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert all 100 members are present
+        result = queue.get(l2_id)
+        assert result is not None, 'L2 escalation disappeared after concurrent appends'
+        members_set = set(result.members)
+        expected = {f'a-{i}' for i in range(count)} | {f'b-{i}' for i in range(count)}
+        missing = expected - members_set
+        assert not missing, (
+            f'Lost {len(missing)} member(s) to concurrent RMW clobber: '
+            f'{sorted(missing)[:10]}...'
+        )
+        assert len(result.members) == count * 2, (
+            f'Expected {count * 2} total members, got {len(result.members)}'
+        )
