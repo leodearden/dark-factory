@@ -339,8 +339,10 @@ class TestTimeout:
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
 
-        # Fixed monotonic sequence: start=0.0, check after read=2.001 (past deadline)
-        monotonic_values = iter([0.0, 2.001])
+        # Fixed monotonic sequence: start=0.0 sets deadline=2.0; loop check=0.0
+        # so remaining_ms = max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000)
+        # read returns [] -> exit 124 (empty events with deadline set)
+        monotonic_values = iter([0.0, 0.0])
 
         with (
             patch('escalation.watcher.INotify') as MockINotify,

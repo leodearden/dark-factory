@@ -108,6 +108,10 @@ def main() -> None:
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
     parser.add_argument('--level', type=int, default=None, help='Filter to a specific escalation level')
     parser.add_argument('--ntfy-url', default=None, help='ntfy.sh topic URL for push notifications')
+    parser.add_argument(
+        '--timeout', type=float, default=None,
+        help='max blocking wait in seconds; on expiry exit 124',
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
@@ -124,9 +128,25 @@ def main() -> None:
         _emit(match, args.ntfy_url)
         sys.exit(0)
 
+    # Compute monotonic deadline (None = block indefinitely).
+    deadline: Optional[float] = (
+        None if args.timeout is None else time.monotonic() + args.timeout
+    )
+
     # Event loop: wait for new files.
     while True:
-        for event in inotify.read():
+        if deadline is not None:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms == 0:
+                sys.exit(124)
+            events = list(inotify.read(timeout=remaining_ms))
+        else:
+            events = list(inotify.read(timeout=None))
+
+        if deadline is not None and not events:
+            sys.exit(124)
+
+        for event in events:
             name = event.name
             if not name or not name.endswith('.json'):
                 continue
