@@ -150,7 +150,14 @@ In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'memory_consolid
 This mirrors Stage 2's cycle-summary metadata convention \
 (`stage='task_knowledge_sync'`, fixed in task 9af436fe) and makes the summary \
 deterministically findable by a metadata-keyed lookup. \
-The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string.
+The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string. \
+After writing the per-cycle summary, you MUST call \
+`mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}})` — \
+the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
+key persisted. A return of 0 means the stage key did not persist (the same failure that \
+makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing") and \
+should be noted in the cycle report.
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
