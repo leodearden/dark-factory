@@ -2644,6 +2644,7 @@ class SpeculativeItem:
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
+    merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
 
 
 class _TrainMergeHost(Protocol):
@@ -3564,6 +3565,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Persists across
         # submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # γ2 per-branch generation auto-chain counter (mirrors MergeWorker).
+        # Incremented on each consecutive tip-advance equivalence failure;
+        # popped on a clean 'done' landing or bound-exceeded escalation.
+        self._generation_chain_counts: dict[str, int] = {}
         # Depth-1 cap: cleared when a speculative merge is in flight,
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
@@ -4105,6 +4110,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         base_sha=base_for_merge, speculative=speculative,
                         skip_verify=skip_verify,
                         started_monotonic=t0,
+                        merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                     ))
                     self._inflight_req = None  # item is now owned by verifier
 
@@ -4645,6 +4651,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     timeouts=self._post_merge_verify_timeouts,
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     log_label=' (speculative)',
+                    chain_ctx=_GenerationChainContext(
+                        queue=self._queue,
+                        counts=self._generation_chain_counts,
+                        max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                    ),
+                    merged_branch_tip=item.merged_branch_tip,
                 )
                 if not req.result.done():
                     req.result.set_result(outcome)
