@@ -1747,6 +1747,10 @@ class TerminalOutcomeRecord:
     snapshot_tip: str | None = None
     merge_sha: str | None = None
     finished_at: float = field(default_factory=time.time, kw_only=True)
+    superseded_by: str | None = field(default=None, kw_only=True)
+    """request_id of the gen-(n+1) request that supersedes this one (α1/γ2 provenance)."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation of the merge request that produced this record (γ2 provenance)."""
 
 
 class TerminalOutcomeRetention:

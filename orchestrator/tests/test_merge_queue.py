@@ -4920,6 +4920,52 @@ class TestTerminalOutcomeRetention:
         assert stored.snapshot_tip == 'sha-tip'
         assert stored.merge_sha == 'deadbeef'
 
+    # γ2 step-03/04 — supersession provenance fields
+    def test_superseded_by_and_generation_stored_and_retrieved(self) -> None:
+        """TerminalOutcomeRecord with superseded_by + generation round-trips the ring."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-alpha1',
+            task_id='t1',
+            branch='task/t1',
+            state='superseded',
+            snapshot_tip=None,
+            merge_sha='sha-adv',
+            superseded_by='mr-alpha2',
+            generation=1,
+        )
+        ring.record(rec)
+        stored = ring.get('mr-alpha1')
+        assert stored is not None
+        assert stored.superseded_by == 'mr-alpha2'
+        assert stored.generation == 1
+
+    def test_superseded_by_defaults_none_generation_defaults_1(self) -> None:
+        """Defaults: superseded_by is None, generation is 1 when omitted."""
+        rec = TerminalOutcomeRecord(
+            request_id='mr-defaults',
+            task_id='t2',
+            branch='task/t2',
+            state='done',
+        )
+        assert rec.superseded_by is None  # type: ignore[attr-defined]
+        assert rec.generation == 1  # type: ignore[attr-defined]
+
+    def test_generation_2_stored_correctly(self) -> None:
+        """Generation=2 is preserved through record/get."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-gen2',
+            task_id='t3',
+            branch='task/t3',
+            state='done',
+            generation=2,
+        )
+        ring.record(rec)
+        stored = ring.get('mr-gen2')
+        assert stored is not None
+        assert stored.generation == 2
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
