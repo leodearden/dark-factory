@@ -251,6 +251,23 @@ def test_merge_queue_returns_merge_queue(client):
     assert isinstance(body['MERGE_QUEUE'], dict)
 
 
+def test_merge_queue_uses_24h_recent_window(client):
+    """The /api/v2/dashboard/merge-queue endpoint must pass recent_window_minutes=1440
+    to build_per_project_merge_queue.  Asserted via call-site kwargs because the
+    test fixture carries no per-project DBs, so the window is not observable in
+    the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
+    mock_build = AsyncMock(return_value={})
+    with (
+        patch('dashboard.app.build_per_project_merge_queue', new=mock_build),
+        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value=None)),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+    assert resp.status_code == 200
+    assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
+        f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
+    )
+
+
 def test_costs_returns_full_costs_block(client):
     resp = client.get('/api/v2/dashboard/costs?window=7d')
     assert resp.status_code == 200
