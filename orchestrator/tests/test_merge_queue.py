@@ -11463,3 +11463,90 @@ class TestMaybeAutoChainGeneration:
 
         assert result is None
         assert queue.empty()
+
+    # γ2 step-09/10 — bound enforcement
+    async def test_bound_exceeded_returns_blocked_and_resets_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """counts already at MAX_AUTO_CHAINED_GENERATIONS → escalate, reset counter."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t-bound')
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        # Pre-populate counter at max
+        counts: dict[str, int] = {'task/t-bound': 2}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead777\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert '2' in result.reason  # mentions the bound
+        assert queue.empty()  # NO new request enqueued
+        # Counter reset (popped)
+        assert 'task/t-bound' not in counts
+
+    async def test_consecutive_sequence_first_two_chain_third_escalates(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Sequence: advance-1 → counts=1, advance-2 → counts=2, advance-3 → escalate + reset."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t-seq')
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        counts: dict[str, int] = {}
+        heads = iter(['head1\n', 'head2\n', 'head3\n'])
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=lambda *a, **kw: (0, next(heads), ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            # First advance → chain
+            r1 = await _maybe_auto_chain_generation(
+                req, 'sha1', git_ops, event_store,
+                merged_branch_tip='old0', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r1 is not None and r1.status == 'superseded'
+            assert counts.get('task/t-seq') == 1
+            _ = queue.get_nowait()  # drain
+
+            # Second advance → chain
+            r2 = await _maybe_auto_chain_generation(
+                req, 'sha2', git_ops, event_store,
+                merged_branch_tip='head1', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r2 is not None and r2.status == 'superseded'
+            assert counts.get('task/t-seq') == 2
+            _ = queue.get_nowait()  # drain
+
+            # Third advance → escalate
+            r3 = await _maybe_auto_chain_generation(
+                req, 'sha3', git_ops, event_store,
+                merged_branch_tip='head2', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r3 is not None and r3.status == 'blocked'
+            assert queue.empty()
+            assert 'task/t-seq' not in counts  # reset
