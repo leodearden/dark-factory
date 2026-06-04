@@ -19,6 +19,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from escalation import archive
@@ -193,7 +194,7 @@ def run_startup_sweep(
     *,
     retention_days: int = archive.DEFAULT_RETENTION_DAYS,
     apply: bool = True,
-    now: object = None,
+    now: datetime | None = None,
 ) -> StartupSweepReport:
     """Orchestrate sweep + loose-reap + prune at escalation server start.
 
