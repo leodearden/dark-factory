@@ -2997,6 +2997,15 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
+                if self._inherited_break_info is not None:
+                    info = self._inherited_break_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info['detail'],
+                        category=info['category'],
+                        dedupe_fingerprint=info['fingerprint'],
+                        suggested_action='await_preexisting_main_hotfix',
+                    )
                 detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
                 return await self._mark_blocked('Verification attempts exhausted', detail=detail)
 
@@ -5457,6 +5466,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         escalate_to_human: bool = False,
         suggested_action: str = 'investigate_and_retry',
         category: str = 'task_failure',
+        dedupe_fingerprint: str | None = None,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5473,6 +5483,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         a confirmed loop / unresolvable failure that the steward cannot
         meaningfully un-stick (e.g. ≥2 consecutive no-plan failures on
         the same main SHA).
+        *dedupe_fingerprint* when provided stamps the escalation and routes
+        submission through submit_or_dedupe so N tasks seeing the same
+        inherited-from-main break collapse to a single parent escalation.
+        All existing callers (no fingerprint) keep the raw-submit path.
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -5556,15 +5570,45 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
                 )
-                self.escalation_queue.submit(esc)
-
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.escalation_created,
-                        task_id=self.task_id, phase=self.state.value,
-                        data={'escalation_id': esc.id, 'category': category,
-                              'severity': 'blocking', 'summary': reason[:200]},
+                if dedupe_fingerprint:
+                    # Cross-task N->1 dedup: stamp the fingerprint and route
+                    # through submit_or_dedupe so sibling tasks seeing the same
+                    # inherited-from-main break collapse to a single parent.
+                    # All callers without a fingerprint keep raw-submit behaviour.
+                    from escalation.dedupe import (
+                        DedupeConfig,
+                        content_fingerprint_key,
+                        submit_or_dedupe,
                     )
+                    esc.dedupe_fingerprint = dedupe_fingerprint
+                    result = submit_or_dedupe(
+                        self.escalation_queue,
+                        esc,
+                        DedupeConfig(
+                            infra_dedupe_enabled=True,
+                            infra_dedupe_window_secs=float('inf'),
+                            infra_dedupe_categories=(category,),
+                            key_fn=content_fingerprint_key,
+                        ),
+                    )
+                    # Emit escalation_created only when this task is the parent
+                    # (status='queued' means a new parent was filed, not a child fold).
+                    if result.get('status') == 'queued' and self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_created,
+                            task_id=self.task_id, phase=self.state.value,
+                            data={'escalation_id': esc.id, 'category': category,
+                                  'severity': 'blocking', 'summary': reason[:200]},
+                        )
+                else:
+                    self.escalation_queue.submit(esc)
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_created,
+                            task_id=self.task_id, phase=self.state.value,
+                            data={'escalation_id': esc.id, 'category': category,
+                                  'severity': 'blocking', 'summary': reason[:200]},
+                        )
 
             # Capture window-start for the broadened dismiss-with-terminate
             # guard below.  Any L0 whose resolved_at falls inside this window
