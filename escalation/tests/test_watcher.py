@@ -39,6 +39,31 @@ def info_escalation() -> Escalation:
     )
 
 
+@pytest.fixture
+def critical_escalation() -> Escalation:
+    return Escalation(
+        id='esc-99-1',
+        task_id='99',
+        agent_role='orchestrator',
+        severity='critical',
+        category='infra_issue',
+        summary='Production database unreachable',
+        detail='Connection refused on all replicas',
+    )
+
+
+@pytest.fixture
+def urgent_escalation() -> Escalation:
+    return Escalation(
+        id='esc-99-2',
+        task_id='99',
+        agent_role='steward',
+        severity='urgent',
+        category='risk_identified',
+        summary='Data loss imminent',
+    )
+
+
 class TestSendNtfy:
     """_send_ntfy sends POST with correct headers/body."""
 
@@ -91,6 +116,26 @@ class TestSendNtfy:
             body = mock_urlopen.call_args[0][0].data.decode('utf-8')
             # Should appear once (the summary), not twice
             assert body == 'Planning failed'
+
+    def test_critical_escalation_sends_urgent(self, critical_escalation: Escalation):
+        """critical severity -> [CRITICAL] title, Priority=urgent, Tags=rotating_light."""
+        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
+            _send_ntfy('https://ntfy.sh/test-topic', critical_escalation)
+
+            req = mock_urlopen.call_args[0][0]
+            assert req.get_header('Title') == '[CRITICAL] Task 99: infra_issue'
+            assert req.get_header('Priority') == 'urgent'
+            assert req.get_header('Tags') == 'rotating_light'
+
+    def test_urgent_escalation_sends_urgent(self, urgent_escalation: Escalation):
+        """urgent severity -> [URGENT] title, Priority=urgent, Tags=rotating_light."""
+        with patch('escalation.watcher.urllib.request.urlopen') as mock_urlopen:
+            _send_ntfy('https://ntfy.sh/test-topic', urgent_escalation)
+
+            req = mock_urlopen.call_args[0][0]
+            assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
+            assert req.get_header('Priority') == 'urgent'
+            assert req.get_header('Tags') == 'rotating_light'
 
 
 class TestMainLoop:
