@@ -9356,8 +9356,8 @@ class TestFinalizeAdvancedMerge:
         from orchestrator.merge_queue import (
             MergeRequest,
             TipRelation,
-            _GenerationChainContext,
             _finalize_advanced_merge,
+            _GenerationChainContext,
         )
 
         git_ops = self._make_git_ops()
@@ -9409,8 +9409,8 @@ class TestFinalizeAdvancedMerge:
     ) -> None:
         """(c) on 'done' path with chain_ctx, counts[branch] is popped."""
         from orchestrator.merge_queue import (
-            _GenerationChainContext,
             _finalize_advanced_merge,
+            _GenerationChainContext,
         )
 
         git_ops = self._make_git_ops()
@@ -11913,6 +11913,7 @@ class TestTrainEquivalenceNeverAutoChains:
         ):
             outcome = await worker._do_merge(req)
 
+        assert outcome is not None, 'expected a MergeOutcome, got None'
         # (a) Outcome is 'blocked', not 'superseded' — trains never auto-chain
         assert outcome.status == 'blocked', (
             f'train equiv-failure must return blocked, got: {outcome!r}'
