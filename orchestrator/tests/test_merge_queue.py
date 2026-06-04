@@ -10201,3 +10201,41 @@ class TestRegisterAndEnqueue:
         assert registry.is_inflight('B') is False
         # The queue must be empty — the patched enqueue_merge_request never put.
         assert queue.qsize() == 0
+
+    async def test_retention_forwarded_through_register_and_enqueue(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """register_and_enqueue_merge_request forwards retention to the chokepoint.
+
+        After the dispatched request's future resolves, the retention ring must
+        contain a TerminalOutcomeRecord keyed by request_id, and a
+        merge_finalized row must exist in the event store.  Mirrors the
+        coalesce-path test (TestCoalesceOrEnqueueRegistryOnly) for the dominant
+        workflow path.
+        """
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+        req = _make_request('rae-ret', 'rae-ret', tmp_path, config)
+
+        await register_and_enqueue_merge_request(
+            queue, req, event_store, registry, retention=retention,
+        )
+
+        # Resolve the future → done-callback fires
+        req.result.set_result(MergeOutcome(status='done', merge_sha='rae1'))
+        await asyncio.sleep(0)
+
+        # Ring must have the record
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'rae1'
+        assert stored.branch == req.branch
+        assert stored.task_id == req.task_id
+
+        # merge_finalized row must exist in the event store
+        assert _count_events(event_store.db_path, 'merge_finalized') == 1
