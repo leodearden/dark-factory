@@ -1296,3 +1296,80 @@ class TestMergeRequestWaitSecsPositive:
         )
         # Clean up
         req.result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-13 RED: legacy (wait_secs=None) — client disconnect doesn't cancel entry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDurableIntent:
+    """β1 step-13: durable intent — client disconnect (Task cancel) does NOT cancel entry.
+
+    Originally RED: without asyncio.shield the Task cancel propagates to
+    req.result.  Step-12 pre-implemented the shield on the legacy path, so
+    this test is GREEN on write.  Step-14 updates the docstring and runs the
+    full suite.
+    """
+
+    async def test_legacy_disconnect_does_not_cancel_entry(self, tmp_path: Path):
+        """Legacy path (wait_secs=None): cancelling the merge_request Task does not
+        cancel the enqueued entry's future (durable intent, PRD D2/I5).
+
+        Start merge_request (no wait_secs) as a Task.  Advance the loop until
+        it blocks on the await.  Retrieve the enqueued req.  Cancel the Task
+        and await its cancellation (CancelledError suppressed).  Assert that:
+        - req.result.cancelled() is False (future survived the disconnect)
+        - req.result.set_result(MergeOutcome('done')) succeeds (entry is usable)
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Start the merge_request call as a Task (simulates an MCP session lifetime)
+        merge_task = asyncio.create_task(
+            _call_merge_request(
+                server,
+                task_id='task-di',
+                branch='task-di',
+                worktree=str(tmp_path / 'wt'),
+            )
+        )
+
+        # Advance the event loop until the task blocks on the shielded await.
+        # All stubs return synchronously, so a few sleep(0) rounds are enough.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # The entry must be in the queue at this point.
+        assert mq.qsize() == 1, (
+            f'Expected entry enqueued before cancel, qsize={mq.qsize()}'
+        )
+        # Retrieve the enqueued entry without consuming it permanently.
+        req = mq.get_nowait()
+
+        # Simulate client disconnect: cancel the merge_request Task.
+        merge_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await merge_task
+
+        # Durable intent: the entry's future must NOT be cancelled.
+        assert not req.result.cancelled(), (
+            'Entry future must NOT be cancelled after Task cancel — '
+            'asyncio.shield should protect req.result from the disconnect'
+        )
+
+        # The entry is still usable: the worker can resolve it normally.
+        req.result.set_result(MergeOutcome('done', reason='late resolve'))
+        assert req.result.done() and not req.result.cancelled()
