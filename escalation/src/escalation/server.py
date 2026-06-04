@@ -1219,6 +1219,31 @@ def create_server(
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
+    def _terminal_state_for_request(req_id: str) -> str | None:
+        """Consult durable terminal tiers for a request absent from _waiters.
+
+        Mirrors merge_status Tiers 2–3 (retention ring → event store).  Returns
+        the coarse terminal state (via _map_terminal_state) if found, else None.
+
+        The live tier (Tier 1 worker snapshot) is intentionally omitted: a request
+        absent from _waiters cannot be a live waiter of this server — a live entry's
+        future is still pending and thus still in _waiters.
+        """
+        # Tier 2: retention ring (request_id only)
+        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
+        if ring is not None:
+            ring_rec = ring.get(req_id)
+            if ring_rec is not None:
+                return _map_terminal_state(ring_rec.state)
+
+        # Tier 3: event store
+        if event_store is not None:
+            row = event_store.latest_merge_finalized(request_id=req_id)
+            if row is not None:
+                return _map_terminal_state(row['state'])
+
+        return None
+
     @mcp.tool()
     async def merge_cancel(request_id: str) -> dict[str, Any]:
         """Cancel an in-flight merge request by cancelling its waiter future.
@@ -1238,7 +1263,14 @@ def create_server(
 
         if rec is None:
             # No live waiter — finalized+popped, never submitted, or server restarted.
-            # Durable-tier consult added in step-10; for now return unknown.
+            # Consult durable tiers to distinguish 'already-terminal' from truly 'unknown'.
+            terminal = _terminal_state_for_request(request_id)
+            if terminal is not None:
+                return {
+                    'cancelled': False,
+                    'state': terminal,
+                    'reason': 'Request already finalized; cannot cancel.',
+                }
             return {
                 'cancelled': False,
                 'state': 'unknown',
