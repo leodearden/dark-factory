@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import re
 import uuid
@@ -23,6 +24,17 @@ from graphiti_core.errors import EdgeNotFoundError
 from fused_memory.services.memory_service import MemoryNotFoundError
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_description(description: str) -> str:
+    """Collapse whitespace and casefold for description dedup."""
+    return ' '.join(description.split()).casefold()
+
+
+def _description_hash(description: str) -> str:
+    """SHA-256 hex digest of the normalized description."""
+    return hashlib.sha256(_normalize_description(description).encode('utf-8')).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Internal data model
@@ -60,6 +72,8 @@ class _ReportEntry:
     _signature_to_finding: dict[tuple[str | None, str | None], str] = field(
         default_factory=dict
     )
+    # in-run dedup: description_hash → finding_id (null-null findings only)
+    _deschash_to_finding: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +203,7 @@ class ReconReportState:
         # add_finding; cleaned up by tick() when entries are evicted.
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
+        self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -256,13 +271,21 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
-        # In-run dedup: skip when both are None (informational findings).
-        # _run_sig_index gives O(1) cross-stage lookup scoped to this run_id,
-        # replacing an O(N) scan over all live entries.  Cross-run isolation is
-        # preserved because the index is keyed by run_id.
+        # In-run dedup: two separate namespaces.
+        # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
+        #     _run_sig_index, scoped to this run_id across ALL stages.
+        # (2) Null-null path: both are None — dedup by normalized description hash
+        #     in _run_desc_index so identical informational observations collapse.
+        # The two namespaces are kept separate so a null-null finding with description
+        # 'd' never collides with a real-signature finding that shares description 'd'.
         sig = (task_id, flag_type)
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
+            if existing_id is not None:
+                return _duplicate_finding_error(existing_id)
+        else:
+            desc_hash = _description_hash(description)
+            existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
             if existing_id is not None:
                 return _duplicate_finding_error(existing_id)
 
@@ -281,6 +304,9 @@ class ReconReportState:
         if sig != (None, None):
             entry._signature_to_finding[sig] = finding_id
             self._run_sig_index.setdefault(run_id, {})[sig] = finding_id
+        else:
+            entry._deschash_to_finding[desc_hash] = finding_id
+            self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
 
         return {'finding_id': finding_id}
