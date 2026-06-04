@@ -665,6 +665,12 @@ class ReconReportState:
                     self._run_finding_index[rid].pop(f.finding_id, None)
                 if not self._run_finding_index[rid]:
                     del self._run_finding_index[rid]
+            if rid in self._run_desc_index:
+                for dhash, fid in evicted._deschash_to_finding.items():
+                    if self._run_desc_index[rid].get(dhash) == fid:
+                        del self._run_desc_index[rid][dhash]
+                if not self._run_desc_index[rid]:
+                    del self._run_desc_index[rid]
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
