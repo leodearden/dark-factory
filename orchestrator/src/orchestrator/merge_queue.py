@@ -1636,6 +1636,48 @@ async def enqueue_merge_request(
     _emit_merge_queued(event_store, req)
 
 
+async def register_and_enqueue_merge_request(
+    queue: asyncio.Queue,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    registry: InFlightMergeRegistry | None,
+) -> bool:
+    """Workflow-path enqueue that registers the branch in the in-flight registry.
+
+    Unlike the MCP path (``coalesce_or_enqueue_merge_request``), the workflow
+    MUST always enqueue — it blocks on ``req.result`` for its outcome, so
+    skipping the enqueue when the slot is already held would leave the future
+    unresolved and deadlock the caller.
+
+    When *registry* is not None and the slot is free, ``registry.acquire`` is
+    called with ``req.result`` before enqueuing.  The existing
+    ``Future.add_done_callback`` registered inside ``acquire`` releases the
+    slot automatically on result, exception, or cancellation.  If the enqueue
+    itself raises (e.g. queue closed or cancellation), the slot is released
+    explicitly to avoid a leak — mirroring the guard in
+    ``coalesce_or_enqueue_merge_request`` (merge_queue.py:1794-1803).
+
+    Returns True if the registry slot was newly acquired (caller's branch was
+    free); False if the slot was already held by another task or *registry* is
+    None.  The return value is informational — the request is always enqueued.
+    """
+    acquired = (
+        registry.acquire(req.branch, req.task_id, req.result)
+        if registry is not None
+        else False
+    )
+    try:
+        await enqueue_merge_request(queue, req, event_store)
+    except BaseException:
+        # Slot-leak guard: if the enqueue raises before the worker can ever
+        # resolve req.result, the done_callback will never fire.  Release the
+        # slot explicitly so a future merge for this branch can proceed.
+        if acquired:
+            registry._release(req.branch)  # type: ignore[union-attr]
+        raise
+    return acquired
+
+
 @dataclass
 class MergeDispatchResult:
     """Structured return value from :func:`coalesce_or_enqueue_merge_request`.
