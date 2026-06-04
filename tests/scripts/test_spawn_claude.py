@@ -276,12 +276,24 @@ def test_genuine_launcher_failure_yields_127(
 )
 def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     """When no emulator is found, spawn-claude.sh must exit 126."""
+    import shutil as _shutil
+
     bin_dir = _make_bin_dir(tmp_path)
     _write_fake_claude(bin_dir, exit_code=0)
 
+    # Build a minimal system-bin that has only the utilities the script needs
+    # but NOT any terminal emulator (gnome-terminal/konsole/kitty/xterm).
+    # We look up each utility by its absolute path using the full system PATH
+    # so we get the real binary, then symlink it in our minimal dir.
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = _shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
     env = dict(os.environ)
-    # Only our bin_dir (has claude but no known terminal binary) is on PATH.
-    env["PATH"] = str(bin_dir)
+    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
     env.pop("ESCALATION_TERMINAL_CMD", None)
 
