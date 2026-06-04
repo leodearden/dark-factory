@@ -177,7 +177,13 @@ def create_server(
         if esc.severity in BORN_AT_L2_SEVERITIES and not _is_harness_sentinel_role(esc.agent_role):
             _original_severity = esc.severity
             esc.severity = 'blocking'
-            esc.summary = f'[downgraded:{_original_severity}] {esc.summary}'
+            # Marker appended (not prepended) so summary_dedupe_key's first-three-token
+            # slice stays equal to the original summary's key.  Downgraded criticals
+            # then fold into the equivalent normally-filed 'blocking' parent, and
+            # unrelated issues with the same first two words don't false-merge on a
+            # constant leading '[downgraded:...]' token (PRD C4 — marker on the
+            # summary line, placed at the suffix to preserve the key).
+            esc.summary = f'{esc.summary} [downgraded:{_original_severity}]'
             logger.warning(
                 'Downgraded severity %r → blocking for agent_role=%r task_id=%r (C4/D3)',
                 _original_severity, esc.agent_role, esc.task_id,

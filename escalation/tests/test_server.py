@@ -624,12 +624,13 @@ class TestChokepointSeverityDowngrade:
     (A) AGENT-ROLE DOWNGRADE — agent_role='implementer', severity in critical/urgent:
         - result['status'] == 'queued'
         - on-disk record: severity=='blocking', level==0
-        - summary prefixed '[downgraded:critical] ' / '[downgraded:urgent] '
+        - summary has '[downgraded:critical]' / '[downgraded:urgent]' appended as suffix
+          (appended so summary_dedupe_key's first-three-token slice is preserved)
         - a WARNING is emitted on logger 'escalation.server'
 
     (B) SENTINEL EXEMPTION — harness-/orchestrator- prefixed roles keep born-at-L2:
         - on-disk record: severity unchanged, level==2
-        - summary NOT prefixed
+        - summary NOT modified (no marker appended)
         - NO WARNING logged
     """
 
@@ -686,10 +687,15 @@ class TestChokepointSeverityDowngrade:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
-    async def test_blocker_agent_role_downgrade_summary_prefixed(
+    async def test_blocker_agent_role_downgrade_summary_suffixed(
         self, tmp_path: Path, severity: str,
     ):
-        """escalate_blocker agent downgrade: summary prefixed '[downgraded:<original>] '."""
+        """escalate_blocker agent downgrade: summary has '[downgraded:<original>]' appended as suffix.
+
+        The marker is appended (not prepended) so summary_dedupe_key's first-three-token
+        slice stays equal to the original summary's key (PRD C4 — marker visible on the
+        summary line, placed at the suffix to preserve the dedupe key).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         original_summary = f'original {severity} summary'
@@ -705,12 +711,15 @@ class TestChokepointSeverityDowngrade:
 
         esc = queue.get(result['id'])
         assert esc is not None
-        expected_prefix = f'[downgraded:{severity}] '
-        assert esc.summary.startswith(expected_prefix), (
-            f"severity={severity!r}: expected summary prefixed {expected_prefix!r}, got: {esc.summary!r}"
+        expected_suffix = f' [downgraded:{severity}]'
+        assert esc.summary.startswith(original_summary), (
+            f"severity={severity!r}: expected summary to start with original text, got: {esc.summary!r}"
         )
-        assert original_summary in esc.summary, (
-            f"severity={severity!r}: original summary text must be preserved after prefix"
+        assert esc.summary.endswith(expected_suffix), (
+            f"severity={severity!r}: expected summary to end with {expected_suffix!r}, got: {esc.summary!r}"
+        )
+        assert summary_dedupe_key(esc.summary) == summary_dedupe_key(original_summary), (
+            f"severity={severity!r}: dedupe key must be preserved after appending marker"
         )
 
     @pytest.mark.asyncio
@@ -773,10 +782,15 @@ class TestChokepointSeverityDowngrade:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
-    async def test_info_agent_role_downgrade_summary_prefixed(
+    async def test_info_agent_role_downgrade_summary_suffixed(
         self, tmp_path: Path, severity: str,
     ):
-        """escalate_info agent downgrade: summary prefixed '[downgraded:<original>] '."""
+        """escalate_info agent downgrade: summary has '[downgraded:<original>]' appended as suffix.
+
+        The marker is appended (not prepended) so summary_dedupe_key's first-three-token
+        slice stays equal to the original summary's key (PRD C4 — marker visible on the
+        summary line, placed at the suffix to preserve the dedupe key).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         original_summary = f'original {severity} info summary'
@@ -792,8 +806,12 @@ class TestChokepointSeverityDowngrade:
 
         esc = queue.get(result['id'])
         assert esc is not None
-        assert esc.summary.startswith(f'[downgraded:{severity}] '), (
-            f"severity={severity!r}: expected '[downgraded:{severity}] ' prefix, got: {esc.summary!r}"
+        expected_suffix = f' [downgraded:{severity}]'
+        assert esc.summary.startswith(original_summary), (
+            f"severity={severity!r}: expected summary to start with original text, got: {esc.summary!r}"
+        )
+        assert esc.summary.endswith(expected_suffix), (
+            f"severity={severity!r}: expected summary to end with {expected_suffix!r}, got: {esc.summary!r}"
         )
 
     # --- (B) Sentinel exemption (harness- and orchestrator- prefixes) ---
