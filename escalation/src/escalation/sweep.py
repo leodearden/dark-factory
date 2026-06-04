@@ -180,6 +180,78 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     return report
 
 
+def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
+    """Relocate loose archive-top-level esc-*.json files into dated subdirs.
+
+    A "loose" file is one that sits directly under ``archive/`` (not inside
+    a ``YYYY-MM-DD`` dated subdir).  These accumulate when the queue's
+    ``_archive_resolved`` fast-path is bypassed or when a prior sweep run
+    wrote files without the dated-subdir structure.
+
+    Each relocation is serialized per-id by ``escalation_id_lock`` so it
+    does not race concurrent queue writers that hold the same id lock.
+
+    Args:
+        queue_dir: Root queue directory (parent of ``archive/``).
+        apply: If True (default), actually move files.  If False, only count
+               how many would be moved (dry-run).
+
+    Returns:
+        Number of files moved (or would-move when apply=False).
+
+    Skips (with WARNING):
+        - Files whose JSON cannot be parsed
+        - Files whose status is not resolved/dismissed
+        - Files missing ``resolved_at``
+        - Files where a same-name file already exists in the target dated dir
+          (never overwrite / lose data)
+    """
+    queue_dir = Path(queue_dir)
+    archive_root = queue_dir / archive.ARCHIVE_SUBDIR
+    if not archive_root.exists():
+        return 0
+
+    moved = 0
+    # Only glob the archive top level — non-recursive, so dated-subdir files
+    # are excluded (the glob `esc-*.json` does not recurse into subdirs).
+    for path in archive_root.glob('esc-*.json'):
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning('reap_loose: skipping unparsable %s: %s', path.name, e)
+            continue
+
+        if esc.status not in ('resolved', 'dismissed'):
+            logger.warning(
+                'reap_loose: skipping %s: non-terminal status %r', path.name, esc.status
+            )
+            continue
+
+        if not esc.resolved_at:
+            logger.warning(
+                'reap_loose: skipping %s: resolved_at is missing', path.name
+            )
+            continue
+
+        target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
+        target_path = target_dir / path.name
+
+        if target_path.exists():
+            logger.warning(
+                'reap_loose: skipping %s: target already exists at %s (not overwriting)',
+                path.name, target_path,
+            )
+            continue
+
+        if apply:
+            with escalation_id_lock(queue_dir, path.stem):
+                target_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_move(path, target_path)
+        moved += 1
+
+    return moved
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: python -m escalation.sweep."""
     parser = argparse.ArgumentParser(
