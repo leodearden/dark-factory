@@ -4076,6 +4076,165 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── Guard: chain-invalidation + cap balance (task 1646 step-7) ───────────
+
+    async def test_chain_invalidation_with_cap_no_leak(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Guard (step-7): cap is balanced when a counted item is discarded via
+        chain-invalidation (N fails verify, N+1 counted, re-merged, M completes).
+
+        Scenario:
+          N  — non-speculative, counted (counts_against_cap=True)
+             — verify is gated then fails → n_failed=True
+          N+1 — non-speculative, counted (submitted after N's spec window closed)
+              — chain-invalidated → discard + _remerge → resolves 'done'
+          M  — submitted after N+1 → proves cap is balanced (no deadlock)
+
+        Cap invariant: ON-DRAIN release fires before chain-invalidation body, so
+        every counted item releases the cap exactly once regardless of re-merge.
+
+        Assertions:
+          (1) N resolves 'blocked' (verify failure); N+1 resolves 'done' (re-merged).
+          (2) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND after all three complete.
+          (3) M resolves 'done' (cap balanced — merger never stuck at acquire).
+        """
+        from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+
+        wt_n = await _make_branch_with_file(git_ops, 'ci-n', 'file_ci_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'ci-n1', 'file_ci_n1.py', 'n1 = 2\n')
+        wt_m = await _make_branch_with_file(git_ops, 'ci-m', 'file_ci_m.py', 'm = 3\n')
+
+        # Gate N's verify then make it fail
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+
+        async def gated_failing_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            if (merge_wt / 'file_ci_n.py').exists() and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
+                # Fail N's verify
+                return MagicMock(passed=False, summary='intentional failure')
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=gated_failing_verify):
+            req_n = _make_request('ci-n', 'ci-n', wt_n, config)
+            req_n1 = _make_request('ci-n1', 'ci-n1', wt_n1, config)
+            req_m = _make_request('ci-m', 'ci-m', wt_m, config)
+
+            # Submit N and wait for it to be mid-verify
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            # Submit N+1 on the non-speculative blocking-get path (spec window closed)
+            await queue.put(req_n1)
+
+            # Wait for N+1 to land in the verifier queue before releasing the gate
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 1:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail('N+1 never appeared in verifier queue within 15 s')
+
+            # Release N's gate — N fails verify → n_failed=True → N+1 is chain-invalidated
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        assert outcome_n.status == 'blocked', f'N must be blocked (verify fail): {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1 must be done after re-merge: {outcome_n1}'
+
+        # (2) Cap must be balanced after N and N+1 complete
+        cap_value = worker._merge_ahead_cap._value
+        assert cap_value == _MERGE_AHEAD_BOUND, (
+            f'cap._value={cap_value} after N+N+1; expected {_MERGE_AHEAD_BOUND}. '
+            'Counted item discarded/re-merged must still release cap exactly once.'
+        )
+
+        # (3) Submit M — proves cap is balanced (merger can acquire again)
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req_m)
+            outcome_m = await asyncio.wait_for(req_m.result, timeout=30)
+
+        assert outcome_m.status == 'done', f'M: {outcome_m}'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_abandoned_counted_item_releases_cap(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Guard (step-7): cap is released when a counted item is abandoned.
+
+        N is a counted item whose future is cancelled before the verifier drains it.
+        The ON-DRAIN cap release fires before the abandoned check, so the cap is
+        still released even when the abandoned early-continue is taken.
+
+        Assertions:
+          (1) N+1 submitted after N's abandon resolves 'done' (no deadlock —
+              cap balanced after N's abandoned drain).
+          (2) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND after all complete.
+        """
+        from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+
+        wt_n = await _make_branch_with_file(git_ops, 'ab-n', 'file_ab_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'ab-n1', 'file_ab_n1.py', 'n1 = 2\n')
+
+        # Gate N's merger-phase merge so we can cancel the future before drain
+        n_merge_done = asyncio.Event()
+        original_merge = git_ops.merge_to_main
+
+        async def tracking_merge(worktree, branch, **kwargs):
+            result = await original_merge(worktree, branch, **kwargs)
+            if branch == 'ab-n' and result.success:
+                n_merge_done.set()
+            return result
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch.object(git_ops, 'merge_to_main', new=tracking_merge),
+        ):
+            req_n = _make_request('ab-n', 'ab-n', wt_n, config)
+            req_n1 = _make_request('ab-n1', 'ab-n1', wt_n1, config)
+
+            await queue.put(req_n)
+            # Wait for N's merger-phase merge to complete, so N is in the verifier
+            # queue with counts_against_cap=True but not yet drained
+            await asyncio.wait_for(n_merge_done.wait(), timeout=30)
+
+            # Cancel N's future before the verifier drains it → abandonment path
+            req_n.result.cancel()
+
+            # Submit N+1 and wait for it to complete
+            await queue.put(req_n1)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        assert outcome_n1.status == 'done', (
+            f'N+1 must complete after N abandoned; got: {outcome_n1}. '
+            'Cap leak would cause merger to deadlock at acquire().'
+        )
+
+        # (2) Cap must be at BOUND (released on N's abandoned drain)
+        cap_value = worker._merge_ahead_cap._value
+        assert cap_value == _MERGE_AHEAD_BOUND, (
+            f'cap._value={cap_value} after abandoned N + completed N+1; '
+            f'expected {_MERGE_AHEAD_BOUND}. '
+            'ON-DRAIN release must fire even on the abandoned early-continue path.'
+        )
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
