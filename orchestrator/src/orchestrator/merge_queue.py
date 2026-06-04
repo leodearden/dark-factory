@@ -15,7 +15,6 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
-from enum import Enum
 import logging
 import posixpath
 import shutil
@@ -23,6 +22,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -1902,8 +1902,8 @@ class InFlightMergeRegistry:
                     return  # guard: pre-resolved / detached future — skip
                 if pf.cancelled():
                     target.cancel()
-                elif pf.exception() is not None:
-                    target.set_exception(pf.exception())
+                elif (exc := pf.exception()) is not None:
+                    target.set_exception(exc)
                 else:
                     target.set_result(pf.result())
 

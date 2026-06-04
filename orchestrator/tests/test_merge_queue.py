@@ -10512,7 +10512,6 @@ class TestMultiWaiterEntry:
 
     async def test_acquire_seeds_entry_fields(self):
         """acquire with new kw-args seeds all extended fields correctly."""
-        from orchestrator.merge_queue import WaiterRecord
         registry = InFlightMergeRegistry()
         fut = self._make_future()
 
@@ -10716,7 +10715,6 @@ class TestDetachProceedDrop:
 
     async def test_detach_last_abandoned_check(self):
         """_request_abandoned returns True when primary is cancelled (drop at checkpoint)."""
-        from orchestrator.merge_queue import MergeWorker, WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -10732,7 +10730,6 @@ class TestDetachProceedDrop:
 
     async def test_detach_unknown_request_id_is_noop(self):
         """Detach with an unknown request_id returns unchanged count."""
-        from orchestrator.merge_queue import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -10905,7 +10902,6 @@ class TestPatchContentContained:
         branch_tip = await self._head_sha(wt)
 
         # Cherry-pick the branch commit onto main
-        main_sha_before = await git_ops.get_main_sha()
         rc, _, err = await _run(
             ['git', 'cherry-pick', branch_tip],
             cwd=git_ops.project_root,
@@ -11012,14 +11008,16 @@ class TestDecideAttachAction:
 
     async def test_divergent_raises_value_error(self):
         """DIVERGENT → ValueError (must resolve via resolve_divergent first)."""
-        from orchestrator.merge_queue import TipRelation, decide_attach_action
         import pytest
+
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=False)
 
     async def test_divergent_verifying_also_raises(self):
         """DIVERGENT + verifying → ValueError (same constraint)."""
-        from orchestrator.merge_queue import TipRelation, decide_attach_action
         import pytest
+
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=True)
