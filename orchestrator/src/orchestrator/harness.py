@@ -4547,10 +4547,15 @@ Output JSON matching the schema. Every task must appear in the output.
         else:
             new_count = 1
 
-        # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5)
+        # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5).
+        # append=True → recursive-merge: only the 'reblock_guard' key is written;
+        # sibling metadata keys (files, memory_hints, …) are preserved, and the
+        # flip's own set_task_status reopen_reason audit-merge cannot clobber the
+        # counter (C3.4 hazard).
         await self.scheduler.update_task(
             task_id,
             {'reblock_guard': {'count': new_count, 'signature': new_sig}},
+            append=True,
         )
 
         return True
