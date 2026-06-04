@@ -188,6 +188,14 @@ def create_server(
             # unrelated issues with the same first two words don't false-merge on a
             # constant leading '[downgraded:...]' token (PRD C4 — marker on the
             # summary line, placed at the suffix to preserve the key).
+            # Known edge case: summaries with fewer than 3 real tokens have the
+            # marker leak into the dedupe key (e.g. 'lost link' → key becomes
+            # ('lost','link','downgradedcritical') vs. ('lost','link')), so a
+            # downgraded short-summary won't fold into its blocking parent.
+            # Impact: missed dedupe for short one-line summaries only (no data
+            # corruption).  A marker-aware fix in summary_dedupe_key (dedupe.py)
+            # — stripping a trailing '[downgraded:...]' before the 3-token slice —
+            # would close this gap; out of scope for α2.
             esc.summary = f'{esc.summary} [downgraded:{_original_severity}]'
             logger.warning(
                 'Downgraded severity %r → blocking for agent_role=%r task_id=%r (C4/D3)',

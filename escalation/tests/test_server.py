@@ -2416,3 +2416,65 @@ class TestDowngradeDedupeCorrectness:
         assert second['id'] != first['id'], (
             'SUMMARY_A and SUMMARY_B must produce separate records'
         )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "<3-token summaries: appended '[downgraded:...]' marker leaks into the "
+            "dedupe key, so the downgraded record won't fold into its blocking parent. "
+            "Fix requires stripping the trailing marker inside summary_dedupe_key "
+            "(dedupe.py) before taking the 3-token slice — outside α2 scope."
+        ),
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('summary', ['merge', 'lost link'])
+    async def test_short_summary_folds_into_blocking_parent(
+        self, tmp_path: Path, summary: str,
+    ):
+        """KNOWN LIMITATION: <3-token summaries don't fold into equivalently-worded parents.
+
+        summary_dedupe_key() takes the first 3 normalised tokens.  For a summary
+        with fewer than 3 real tokens (e.g. 'merge' or 'lost link'), the appended
+        '[downgraded:critical]' marker becomes a key token:
+          'merge'      → key ('merge',)                  (original)
+          'merge [downgraded:critical]' → key ('merge','downgradedcritical')  (downgraded)
+          'lost link'  → key ('lost','link')              (original)
+          'lost link [downgraded:critical]' → key ('lost','link','downgradedcritical')
+
+        These keys differ, so the downgraded record is filed as a new escalation
+        instead of folding into the existing blocking parent.
+
+        To make these tests green, strip a trailing '[downgraded:...]' inside
+        summary_dedupe_key (or use a dedicated severity field) — see dedupe.py.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        # Pre-seed a pending blocking parent with the short summary
+        parent = Escalation(
+            id=queue.make_id('task-100'),
+            task_id='task-100',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+        queue.submit(parent)
+
+        # File an agent critical with the same summary — should fold into parent
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=summary,
+            severity='critical',
+        )
+
+        assert result['status'] == 'dedup_skipped', (
+            f'summary={summary!r}: expected dedup_skipped (short-summary fold), got: {result}'
+        )
+        assert result.get('parent_id') == parent.id, (
+            f'summary={summary!r}: expected parent_id={parent.id!r}, '
+            f'got parent_id={result.get("parent_id")!r}'
+        )
