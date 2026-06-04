@@ -1709,6 +1709,7 @@ async def enqueue_merge_request(
     warning and never propagates.
     """
     def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
+        # --- derive terminal state -------------------------------------------
         try:
             if fut.cancelled():
                 state: str = 'abandoned'
@@ -1720,7 +1721,34 @@ async def enqueue_merge_request(
                 outcome: MergeOutcome = fut.result()
                 state = outcome.status
                 merge_sha = outcome.merge_sha
-            if event_store is not None:
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'enqueue_merge_request: _on_finalized could not derive terminal '
+                'state for request_id=%s task_id=%s',
+                req.request_id, req.task_id, exc_info=True,
+            )
+            return
+        # --- in-memory hot tier (recorded before durable tier so a DB failure
+        #     does not also degrade the O(1) lookup ring) --------------------
+        if retention is not None:
+            try:
+                retention.record(TerminalOutcomeRecord(
+                    request_id=req.request_id,
+                    task_id=req.task_id,
+                    branch=req.branch,
+                    state=state,
+                    snapshot_tip=req.snapshot_tip,
+                    merge_sha=merge_sha,
+                ))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'enqueue_merge_request: _on_finalized retention.record failed '
+                    'for request_id=%s task_id=%s',
+                    req.request_id, req.task_id, exc_info=True,
+                )
+        # --- durable tier ----------------------------------------------------
+        if event_store is not None:
+            try:
                 event_store.emit(
                     EventType.merge_finalized,
                     task_id=req.task_id,
@@ -1733,21 +1761,12 @@ async def enqueue_merge_request(
                         'merge_sha': merge_sha,
                     },
                 )
-            if retention is not None:
-                retention.record(TerminalOutcomeRecord(
-                    request_id=req.request_id,
-                    task_id=req.task_id,
-                    branch=req.branch,
-                    state=state,
-                    snapshot_tip=req.snapshot_tip,
-                    merge_sha=merge_sha,
-                ))
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                'enqueue_merge_request: _on_finalized callback failed for '
-                'request_id=%s task_id=%s',
-                req.request_id, req.task_id, exc_info=True,
-            )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'enqueue_merge_request: _on_finalized event_store.emit failed '
+                    'for request_id=%s task_id=%s',
+                    req.request_id, req.task_id, exc_info=True,
+                )
 
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)

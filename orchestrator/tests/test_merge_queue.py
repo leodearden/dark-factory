@@ -4623,6 +4623,60 @@ class TestEnqueueMergeRequest:
         assert stored.state == 'abandoned'
         assert stored.merge_sha is None
 
+    @pytest.mark.asyncio
+    async def test_exception_future_is_recorded_as_error(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A future resolved with set_exception() is finalized as state=='error'.
+
+        Covers the elif fut.exception() branch of _on_finalized.  Verifies:
+        - merge_finalized row with state=='error' and merge_sha IS NULL
+        - retention record (when provided) also carries state=='error', merge_sha=None
+        - fut.exception() is called inside the callback so asyncio never emits
+          an 'exception was never retrieved' warning
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_exc.db'
+        event_store = EventStore(db_path, 'run-exc-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt_exc'
+        wt.mkdir()
+        req = _make_request('55', 'task/55', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        # Resolve with an exception — the callback must handle it without
+        # raising into the event loop
+        req.result.set_exception(RuntimeError('worker blew up'))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        # --- durable tier assertion ------------------------------------------
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == '55'            # task_id
+        assert rows[0][2] == req.request_id  # data.request_id
+        assert rows[0][3] == 'error'         # data.state
+        assert rows[0][4] is None            # data.merge_sha must be NULL
+
+        # --- in-memory hot tier assertion ------------------------------------
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'error'
+        assert stored.merge_sha is None
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
