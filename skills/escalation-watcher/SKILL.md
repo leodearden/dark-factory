@@ -78,10 +78,13 @@ Never process L0 or L1 from this skill, even if explicitly asked — doing so wo
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir <project_root>/data/escalations --level 2 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 \
+  [--exclude-id <esc-id>] [...] 2>&1
 ```
 
 Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2 escalation is already pending when the watcher starts, it may fire immediately at launch — this is expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain re-finds it).
+
+**Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue and causes every subsequent watcher start to instantly re-fire on it — degenerating into a busy-loop. Pass `--exclude-id <esc-id>` (repeatable) for each such item so the initial scan and event loop skip it. `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those files (MOVED_TO events on the excluded file are silently ignored). Both the bare id form (`esc-42-1`) and the `.json`-suffixed form are accepted.
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
@@ -130,6 +133,7 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - Create a local task/todo to track the need for resolution
 - Continue handling other escalations while you wait
 - Periodically remind (every ~3-5 escalation cycles, not more)
+- **Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start** while the item is deliberately pending, so the initial scan does not instantly re-fire on it and busy-loop. The flag also suppresses event-loop wakes from dedupe rewrites of that file.
 
 It is better to stall development than to bake in a significant bad decision.
 
@@ -208,7 +212,8 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
-     a terminal nobody attends just clutters.
+     a terminal nobody attends just clutters. Pass `--exclude-id <esc-id>` on the next watcher
+     (re)start for each item left pending so the initial scan does not busy-loop on it.
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -458,12 +463,14 @@ Architectural or design questions. These already failed steward auto-resolution 
 2. Leave the escalation pending
 3. Create a local task/todo to track it
 4. Continue handling other escalations while waiting
+5. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
 
 ### `risk_identified` (info)
 
 An agent flagged a risk during development. Risk assessment requires human judgment.
 
-**Escalate to the human.** Tell them, track as todo, continue with other work.
+**Escalate to the human.** Tell them, track as todo, continue with other work. Pass
+`--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending.
 
 ### `cleanup_needed` (info, rarely blocking)
 
@@ -518,6 +525,7 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 2. Leave the escalation pending
 3. Do NOT attempt automated infrastructure fixes
 4. Wait for human instructions
+5. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
 
 ### `recon_*` categories
 

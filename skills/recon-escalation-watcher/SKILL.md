@@ -88,12 +88,23 @@ a severity, highest **`dedupe_count`** first (recurrence = persistence = signal)
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations 2>&1
+  --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
+  [--exclude-id <esc-id>] [...] 2>&1
 ```
 
 Run as a **background task** (`run_in_background`). **No `--level`** — recon
 escalations have no level field worth filtering. The watcher uses inotify and
 exits after the first new escalation file, printing its JSON to stdout.
+
+**Re-arming over deliberately-pending items:** the watcher's initial scan emits
+the oldest matching pending escalation and exits immediately. Any item you
+deliberately left pending (Priority 3 "leave pending, tell the human") sits in
+the queue and causes every subsequent watcher start to instantly re-fire on it,
+degenerating into a busy-loop. Pass `--exclude-id <esc-id>` (repeatable) for
+each item deliberately left pending so the initial scan and event loop skip it.
+`--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those
+files (MOVED_TO events on the excluded file are silently ignored). Pass both the
+bare id (`esc-recon-abc-1`) and `.json`-suffixed forms — both are accepted.
 
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern.
@@ -174,7 +185,9 @@ Both archive the record. Be specific in the note — it is the only audit trail.
    When a direct fix is ambiguous or risky, file a task or ask, rather than
    guessing at a graph mutation.
 3. **Throughput** — clear-cut closures: act decisively. Ambiguous-and-consequential:
-   leave pending, tell the human, track it, move on.
+   leave pending, tell the human, track it, move on. For each item deliberately
+   left pending, pass `--exclude-id <esc-id>` on the next watcher (re)start so
+   the initial scan does not instantly re-fire on it and busy-loop.
 
 ## Caveat: recon re-files until the go-forward fix lands
 
