@@ -5042,6 +5042,339 @@ class TestStaleL1DoesNotSinkRun:
         assert len(still_pending) == 1
 
 
+# ---------------------------------------------------------------------------
+# Tests: Born-at-L2 / level≥2 escalation gates (task γ — C7/D4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('severity,level,expected', [
+    # Plain blocking L0 — primary gate
+    ('blocking', 0, True),
+    # Plain blocking L1 — stale from a prior run; must NOT gate (B3)
+    ('blocking', 1, False),
+    # Blocking at level≥2 — gated by level disjunct
+    ('blocking', 2, True),
+    # Born-at-L2 critical, isolated at level 0 — gated by severity disjunct alone
+    ('critical', 0, True),
+    # Born-at-L2 urgent, isolated at level 0 — gated by severity disjunct alone
+    ('urgent', 0, True),
+    # Born-at-L2 critical at level 2 — both severity AND level disjuncts true
+    ('critical', 2, True),
+    # Urgent at level 1 — gated by severity disjunct alone (level<2 does not fire)
+    ('urgent', 1, True),
+    # info at level 0 — neither blocking nor born-at-L2 nor level≥2
+    ('info', 0, False),
+    # info at level 1 — same
+    ('info', 1, False),
+    # info at level 2 — gated by the level≥2 catch-all (D4: any L2+ is stop-the-line)
+    ('info', 2, True),
+])
+class TestIsGatingEscalation:
+    """Unit test of ``_is_gating_escalation`` (truth table over severity×level).
+
+    Pins full PRD C7/D4 semantics including B3 (plain blocking L1 → False)
+    and disjunct isolation (critical at level 0 hits severity branch only;
+    blocking at level 2 hits level branch only; info at level 2 hits level≥2
+    catch-all regardless of severity).
+    """
+
+    def test_predicate(self, severity, level, expected):
+        from escalation.models import Escalation
+
+        from orchestrator.workflow import _is_gating_escalation
+
+        e = Escalation(
+            id=f'esc-42-{level}',
+            task_id='42',
+            agent_role='implementer',
+            severity=severity,
+            category='task_failure',
+            summary=f'test {severity}/{level}',
+            level=level,
+        )
+        assert _is_gating_escalation(e) is expected
+
+
+@pytest.mark.asyncio
+class TestBornAtL2GatesPostImplementer:
+    """task γ / C7: A born-at-L2 escalation (critical, level=2) pending when
+    ``_execute_iterations`` checks the gate must cause it to return ESCALATED.
+
+    RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
+    ignores critical/level-2, so the run completes with DONE instead.
+    """
+
+    async def test_critical_l2_blocks_execute_iterations(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        from orchestrator.artifacts import TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Submit a born-at-L2 (critical, level=2) escalation BEFORE running
+        # _execute_iterations.  The post-implementer gate must intercept it.
+        queue.submit(Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='Critical risk surfaced during implementation (born at L2)',
+            detail='Pending from a prior or concurrent escalation path',
+            level=2,
+        ))
+
+        # Wire up artifacts and worktree identically to TestStaleL1DoesNotSinkRun.
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [
+            {**s, 'status': 'pending'} for s in plan['steps']
+        ]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        await _init_repo(wt)
+        workflow.config.inter_iteration_rebase = False
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending — the gate does not consume it.
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(still_pending) == 1
+
+
+@pytest.mark.asyncio
+class TestBornAtL2GatesPostDebugger:
+    """task γ / C7: A born-at-L2 escalation (critical, level=2) pending when
+    ``_verify_debugfix_loop`` checks the post-debugger gate must cause it to
+    return ESCALATED.
+
+    RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
+    ignores critical/level-2, so the loop returns DONE instead of ESCALATED
+    after the debugger runs.
+    """
+
+    async def test_critical_l2_blocks_verify_debugfix_loop(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        from orchestrator.artifacts import TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Submit a born-at-L2 (critical, level=2) escalation BEFORE running the
+        # loop.  The post-debugger gate must intercept it.
+        queue.submit(Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='Critical risk surfaced during debug phase (born at L2)',
+            detail='Pending from a prior escalation path',
+            level=2,
+        ))
+
+        # Wire up artifacts and worktree so _verify_debugfix_loop can read plan.
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [{**s, 'status': 'pending'} for s in plan['steps']]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        await _init_repo(wt)
+
+        # Mock run_scoped_verification to return a failing result (non-infra_timeout
+        # so the opaque-timeout fast-fail does not trigger before the debugger runs).
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=False,
+                test_output='FAILED test_lib.py::test_farewell',
+                lint_output='',
+                type_output='',
+                summary='test_farewell failed',
+                category='test_failure',
+            )),
+        )
+
+        # Disable rebase so no main-branch lookups are needed.
+        workflow.config.rebase_before_verify = False
+        # Raise sig-repeat cap so the guard cannot trip before the debugger gate.
+        workflow.config.max_failure_signature_repeat = 99
+
+        outcome = await workflow._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending — the gate does not consume it.
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(still_pending) == 1
+
+
+@pytest.mark.asyncio
+class TestBornAtL2GatesMergeEntry:
+    """task γ / C7: A born-at-L2 escalation (critical, level=2) pending at
+    MERGE entry must cause ``run()`` to return ESCALATED before merge starts.
+
+    RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
+    ignores critical/level-2, so run() proceeds past the gate and the stubbed
+    _execute_verify_review_loop returns DONE.
+    """
+
+    async def test_critical_l2_blocks_merge_entry(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Stub _execute_verify_review_loop to submit a born-at-L2 escalation
+        # as a side effect then return DONE — simulates any code path that files
+        # a critical/level-2 escalation mid-run, before MERGE entry.
+        async def _exec_and_escalate():
+            queue.submit(Escalation(
+                id=queue.make_id(task_assignment.task_id),
+                task_id=task_assignment.task_id,
+                agent_role='implementer',
+                severity='critical',
+                category='risk_identified',
+                summary='Critical risk requiring human review before merge',
+                detail='Born at L2 — routes straight to human',
+                level=2,
+            ))
+            return WorkflowOutcome.DONE
+        workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
+
+        outcome = await workflow.run()
+
+        # MERGE-phase gate must intercept before merge is attempted.
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending — the gate does not consume it.
+        pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(pending) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestBornAtL2HaltsRunViaWaitForResolution:
+    """task γ amendment: A born-at-L2 escalation that trips an inner gate
+    (post-implementer / post-debugger) returns ESCALATED to run(), which then
+    calls _wait_for_resolution().  Without the fix _wait_for_resolution finds
+    no pending L0, returns '' immediately, and run() falls through the
+    already-on-main branch-check (fresh worktree HEAD == main SHA → break),
+    then reaches the MERGE gate which returns ESCALATED — so the outcome is
+    ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
+    _StewardReescalated for level≥2/born-at-L2, causing run() to call
+    _mark_blocked and return BLOCKED.
+
+    This tests the wait/gate handshake at the run() level, not just the
+    inner-gate predicate covered by TestBornAtL2GatesPostImplementer et al.
+    """
+
+    async def test_critical_l2_halts_run_not_spin(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Track invocation count to detect resume-spin: with the fix the stub
+        # should be called exactly once before _wait_for_resolution halts the run.
+        call_count = 0
+
+        async def _escalate_and_return_escalated():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate a post-implementer/post-debugger gate firing:
+                # the inner loop submitted a critical/level-2 escalation and
+                # returned ESCALATED — which bubbles up to run().
+                queue.submit(Escalation(
+                    id=queue.make_id(task_assignment.task_id),
+                    task_id=task_assignment.task_id,
+                    agent_role='implementer',
+                    severity='critical',
+                    category='risk_identified',
+                    summary='Stop-the-line: critical risk needing human review',
+                    detail='Born at L2 — cannot be auto-resolved by steward',
+                    level=2,
+                ))
+            return WorkflowOutcome.ESCALATED
+
+        workflow._execute_verify_review_loop = _escalate_and_return_escalated  # type: ignore[method-assign]
+
+        outcome = await workflow.run()
+
+        # With the fix: _wait_for_resolution raises _StewardReescalated for the
+        # pending level-2 escalation → _mark_blocked → BLOCKED.
+        # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
+        # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
+        # fires → ESCALATED.  So BLOCKED vs ESCALATED distinguishes the fix.
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Exactly one call — no resume-spin.
+        assert call_count == 1, (
+            f'_execute_verify_review_loop called {call_count} time(s); '
+            f'expected 1 — the fix must halt via _wait_for_resolution before any resume'
+        )
+        # The escalation is still pending — _wait_for_resolution must not consume it.
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(still_pending) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:

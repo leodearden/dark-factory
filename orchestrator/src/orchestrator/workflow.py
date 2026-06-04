@@ -15,6 +15,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
+# Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
+# escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
+# type annotation; a separate runtime import is needed here because
+# _is_gating_escalation evaluates the set at call time, not just for type hints.
+# This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
+# nothing in it imports orchestrator.
+from escalation.models import BORN_AT_L2_SEVERITIES
 from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
@@ -66,6 +73,35 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
     if any(t in _ESCALATION_TOOLS for t in (role.allowed_tools or []))
     and name not in {'steward', 'deep_reviewer'}
 )
+
+
+def _is_gating_escalation(e: Escalation) -> bool:
+    """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
+
+    Gating policy — an escalation gates when ANY disjunct fires:
+    1. Plain blocking L0: ``severity == 'blocking' and level == 0``
+       (fresh agent-filed blocker awaiting steward triage).
+    2. Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``
+       i.e. 'critical' or 'urgent' — these bypass the auto-watcher and route
+       straight to a human regardless of level.
+    3. Any level ≥ 2: ``level >= 2``
+       (escalation-watcher promoted to L2; a human must decide before the
+       workflow proceeds — applies to any severity, including 'info').
+
+    Deliberately NOT gating:
+    - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
+      steward hand-off from a *prior* run that is still awaiting human triage.
+      Sinking the current run on a stale L1 caused the run-2 false-blocked
+      outcome (esc-2911-22).  The B3 constraint preserves this property; note
+      that a *prior-run* critical/urgent (``severity in BORN_AT_L2_SEVERITIES``)
+      DOES gate the current run — that is the intended stop-the-line semantics
+      for high-severity escalations (D4 accepted consequence).
+    """
+    return (
+        (e.severity == 'blocking' and e.level == 0)
+        or e.severity in BORN_AT_L2_SEVERITIES
+        or e.level >= 2
+    )
 
 
 class _StewardReescalated(Exception):
@@ -1189,21 +1225,22 @@ class TaskWorkflow:
 
                     self._enter_phase(WorkflowState.MERGE)
 
-                    # Defense-in-depth: any blocking L0 escalation created
-                    # during execute/verify/review (e.g. plan-overwrite from
-                    # _amend, or any future code path that escalates outside
-                    # the implementer/debugger callsites) must gate the
-                    # merge.  Without this, an escalation queued mid-run
-                    # would sit invisible while a merge proceeded.
-                    pending_blocking_l0 = [
-                        e for e in self._check_escalations()
-                        if e.severity == 'blocking' and e.level == 0
-                    ]
-                    if pending_blocking_l0:
+                    # Defense-in-depth: any blocking L0 escalation, or any
+                    # born-at-L2 (critical/urgent), or any level≥2 escalation
+                    # created during execute/verify/review (e.g. plan-overwrite
+                    # from _amend, or any future code path that escalates outside
+                    # the implementer/debugger callsites) must gate the merge.
+                    # Without this, an escalation queued mid-run would sit
+                    # invisible while a merge proceeded.
+                    # D4 accepted consequence: a pending critical/urgent from a
+                    # prior incarnation DOES gate a fresh run — stop-the-line
+                    # semantics.  See _is_gating_escalation for the full policy.
+                    gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
+                    if gating:
                         logger.warning(
-                            'Task %s: %d pending L0 blocking escalation(s) '
-                            'at MERGE entry — bailing to ESCALATED',
-                            self.task_id, len(pending_blocking_l0),
+                            'Task %s: %d gating escalation(s) at MERGE entry '
+                            '— bailing to ESCALATED',
+                            self.task_id, len(gating),
                         )
                         return WorkflowOutcome.ESCALATED
 
@@ -3097,15 +3134,15 @@ class TaskWorkflow:
 
             self.metrics.execute_iterations += 1
 
-            # Check for escalations.  L1 (already-escalated-to-human) issues
-            # from prior runs of this same task stay in the queue until a
+            # Check for escalations.  Plain blocking L1 (already-escalated-to-human)
+            # issues from prior runs of this same task stay in the queue until a
             # human or escalation-watcher resolves them; we must not let them
-            # sink the current run.  Only fresh L0 blocking escalations
-            # gate progress here.
-            blocking = [
-                e for e in self._check_escalations()
-                if e.severity == 'blocking' and e.level == 0
-            ]
+            # sink the current run.  Fresh L0 blocking escalations gate progress
+            # here, AND born-at-L2 (critical/urgent) escalations AND any level≥2
+            # escalations also gate regardless of severity — D4 accepted consequence:
+            # a pending critical/urgent from a prior incarnation DOES sink a fresh
+            # run (intended stop-the-line semantics).  See _is_gating_escalation.
+            blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
@@ -3448,13 +3485,13 @@ class TaskWorkflow:
                 'source': 'orchestrator',
             })
 
-            # Check for escalations from debugger.  Same L0-only filter as
-            # the post-implementer check — a stale L1 from a prior run must
-            # not sink a successful debug pass.
-            blocking = [
-                e for e in self._check_escalations()
-                if e.severity == 'blocking' and e.level == 0
-            ]
+            # Check for escalations from debugger.  Same filter as the post-implementer
+            # check — a stale plain blocking L1 from a prior run must not sink a
+            # successful debug pass.  Born-at-L2 (critical/urgent) AND any level≥2
+            # escalations also gate here — D4 accepted consequence: a pending
+            # critical/urgent from a prior incarnation DOES sink a fresh run
+            # (intended stop-the-line semantics).  See _is_gating_escalation.
+            blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
@@ -4751,8 +4788,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _wait_for_resolution(self) -> str:
         """Wait for all level-0 pending escalations to be resolved.
 
-        Raises ``_StewardReescalated`` if the steward re-escalated to
-        level-1 (consumed by the auto-watcher), indicating the task should be blocked.
+        Born-at-L2 (critical/urgent severity) and any level≥2 pending
+        escalations are stop-the-line events — they cannot be resolved by
+        the auto-watcher/steward and require immediate human intervention.
+        Rather than waiting (which would either spin or block forever with
+        no resolver), they immediately raise ``_StewardReescalated`` so
+        that ``run()`` calls ``_mark_blocked`` and halts.
+
+        Raises ``_StewardReescalated`` if:
+        - A pending escalation with ``severity in BORN_AT_L2_SEVERITIES``
+          or ``level >= 2`` exists — immediate terminal, stop the line; OR
+        - The steward re-escalated to level-1 (consumed by auto-watcher).
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -4769,6 +4815,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
+
+        # Born-at-L2 (critical/urgent) and any level≥2 escalations are
+        # stop-the-line: no auto-watcher can resolve them, so waiting for the
+        # L0 loop to clear makes no sense and risks a busy resume-spin (gate
+        # fires → _wait_for_resolution returns '' → resume → gate fires again).
+        # Treat identically to _StewardReescalated so run() calls _mark_blocked
+        # and halts for human intervention rather than looping.
+        pending_high_sev = [
+            e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
+            if e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2
+        ]
+        if pending_high_sev:
+            raise _StewardReescalated(pending_high_sev)
 
         # Wait for level-0 pending escalations to clear
         while True:
