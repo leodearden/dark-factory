@@ -1759,6 +1759,8 @@ async def register_and_enqueue_merge_request(
     req: MergeRequest,
     event_store: EventStore | None,
     registry: InFlightMergeRegistry | None,
+    *,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> bool:
     """Workflow-path enqueue that registers the branch in the in-flight registry.
 
@@ -1775,6 +1777,13 @@ async def register_and_enqueue_merge_request(
     explicitly to avoid a leak — mirroring the guard in
     ``coalesce_or_enqueue_merge_request`` (merge_queue.py:1794-1803).
 
+    When *retention* is provided it is forwarded to the single
+    :func:`enqueue_merge_request` chokepoint so the dominant workflow path
+    populates the in-memory ring alongside the MCP path (see
+    :func:`coalesce_or_enqueue_merge_request`).  Existing call sites in
+    workflow.py pass only positional args so this keyword-only param is
+    backwards-compatible.
+
     Returns True if the registry slot was newly acquired (caller's branch was
     free); False if the slot was already held by another task or *registry* is
     None.  The return value is informational — the request is always enqueued.
@@ -1785,7 +1794,7 @@ async def register_and_enqueue_merge_request(
         else False
     )
     try:
-        await enqueue_merge_request(queue, req, event_store)
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
     except BaseException:
         # Slot-leak guard: if the enqueue raises before the worker can ever
         # resolve req.result, the done_callback will never fire.  Release the

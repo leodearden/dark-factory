@@ -5045,7 +5045,7 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         merge_queue_mock.put.side_effect = _put_resolves_future
 
         # After step-12: enqueue_merge_request is called → resolve future via mock.
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
@@ -5096,7 +5096,7 @@ class TestEscalationServerUsesEnqueueHelper:
         stub_config._module_configs = {}
 
         # Mock resolves the future so the tool doesn't hang
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
@@ -5161,7 +5161,7 @@ class TestEscalationServerMergeRequestModuleConfigsNone:
         stub_config = OrchestratorConfig(project_root=tmp_path)
 
         # Mock resolves the future so the tool doesn't hang
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
