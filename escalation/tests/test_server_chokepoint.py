@@ -1662,3 +1662,83 @@ class TestMergeCancel:
         assert result_never.get('state') == 'unknown', (
             f"Expected state='unknown' for truly unknown id, got: {result_never}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 regression guard: cancellation releases the branch slot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeCancelSlotRelease:
+    """β2 regression guard — cancel unwinds in-flight state at MCP boundary.
+
+    Confirms that merge_cancel releases the branch slot via the α1/β1 done-callbacks
+    so a subsequent dispatch on the same branch returns 'queued' (fresh dispatch)
+    rather than blocking on a stuck/leaked slot.
+
+    This is a regression guard over the α1/β1 done-callback wiring only.
+    Worker-drop-without-halt (_request_abandoned) and retention-records-abandoned
+    consequences are covered by test_merge_queue.py:4520 / :4601 and are NOT
+    re-tested here.
+    """
+
+    async def test_cancel_releases_branch_slot_for_resubmit(self, tmp_path: Path):
+        """After merge_cancel, re-submitting the same branch dispatches fresh ('queued').
+
+        Build server with merge_queue + orch_config + injected registry (no harness).
+        Submit merge_request(branch='re', wait_secs=0) — dispatches and acquires the
+        registry slot; capture request_id.  Cancel via merge_cancel (assert cancelled=True).
+        Yield the event loop (await asyncio.sleep(0)) enough times for the acquire-time
+        _release done-callback (merge_queue.py:1633) to fire.  Re-submit merge_request
+        on the same branch and assert status=='queued' — proves the slot was released and
+        the dispatch path runs cleanly without a stuck/halted slot.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # First dispatch: acquires the registry slot for branch 're'
+        result1 = await _call_merge_request(
+            server,
+            task_id='re',
+            branch='re',
+            worktree=str(tmp_path / 'wt-re'),
+            wait_secs=0,
+        )
+        assert result1['status'] == 'queued', f'First dispatch must be queued: {result1}'
+        rid = result1['request_id']
+
+        # Cancel the in-flight waiter
+        cancel_result = await _call_merge_cancel(server, request_id=rid)
+        assert cancel_result.get('cancelled') is True, (
+            f'merge_cancel must succeed: {cancel_result}'
+        )
+
+        # Yield the event loop so the acquire-time _release done-callback fires
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Re-submit on the same branch — must dispatch fresh (not 'in_flight'/'attached')
+        result2 = await _call_merge_request(
+            server,
+            task_id='re',
+            branch='re',
+            worktree=str(tmp_path / 'wt-re2'),
+            wait_secs=0,
+        )
+        assert result2['status'] == 'queued', (
+            f"Expected 'queued' after slot release, got: {result2}"
+        )
+
+        # Clean up enqueued future from second submission
+        req2 = mq.get_nowait()
+        req2.result.cancel()
