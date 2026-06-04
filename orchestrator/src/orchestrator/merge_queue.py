@@ -3507,6 +3507,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     n_failed = item.immediate_outcome.status not in ('done', 'already_merged')
                     continue  # finally will call _speculation_slot.set()
 
+                self._verify_item = item
                 n_succeeded = await self._verify_and_advance(item)
                 n_failed = not n_succeeded
 
@@ -3535,6 +3536,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Propagate chain-invalidation state BEFORE releasing the slot
                 # so the Merger's next speculative item sees the updated flag.
                 remerge_occurred = iteration_did_remerge
+                self._verify_item = None
+                self._verify_phase = None
                 self._speculation_slot.set()
 
     async def _build_merge_failure_diagnostic(
@@ -3769,6 +3772,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
+            self._verify_phase = 'verifying'
             logger.info(
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
@@ -3826,6 +3830,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # current_sha tracks the merge SHA to pass to advance_main.  After a
         # clean rebase (rebased_pending_reverify), the gate clears it to the
         # post-rebase SHA so the next advance_main call lands the verified tree.
+        self._verify_phase = 'finalizing'
         current_sha = merge_commit
         retries = 0
         while True:
@@ -3902,6 +3907,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'_rebased_onto={rebased_onto!r}'
                     )
 
+                self._verify_phase = 'gate_reverify'
                 gate = await _reverify_rebased_tree(
                     self._git_ops, req, merge_wt,
                     rebased_from=rebased_from,

@@ -1555,3 +1555,98 @@ class TestGetMergeQueue:
         # WIP halt state
         assert result['is_wip_halted'] is True
         assert result['halt_owner_esc_id'] == 'esc-9'
+
+    # ── step-11: pipeline instrumentation sets/clears verify_phase ────────
+
+    async def test_pipeline_sets_and_clears_verify_phase(self, tmp_path: Path):
+        """_verify_and_advance sets _verify_phase='verifying' before verify and
+        'finalizing' before advance_main; worker._verify_item is None after.
+        """
+        import asyncio
+        import types
+
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest, SpeculativeItem, SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        # Tracking lists so we can record the phase at call time
+        captured_phases: list[str | None] = []
+
+        async def fake_run_scoped_verification(*args, **kwargs):
+            captured_phases.append(worker._verify_phase)
+            return types.SimpleNamespace(passed=True, timed_out=False, enospc=False)
+
+        async def fake_advance_main(*args, **kwargs):
+            captured_phases.append(worker._verify_phase)
+            # Return 'not_descendant' — terminal non-advanced path
+            return 'not_descendant'
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+
+        req = MergeRequest(
+            task_id='P',
+            branch='P',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(success=True, merge_commit='deadbeef0000000', merge_worktree=merge_wt)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base000',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        original_rsv = mq_module.run_scoped_verification
+        mq_module.run_scoped_verification = fake_run_scoped_verification
+        try:
+            await worker._verify_and_advance(item)
+        finally:
+            mq_module.run_scoped_verification = original_rsv
+
+        # Phases: first call (verify) should be 'verifying', second (advance_main) 'finalizing'
+        assert len(captured_phases) >= 2, (
+            f'Expected at least 2 phase captures, got: {captured_phases}'
+        )
+        assert captured_phases[0] == 'verifying', (
+            f'Expected verifying before verify, got: {captured_phases[0]!r}'
+        )
+        assert captured_phases[1] == 'finalizing', (
+            f'Expected finalizing before advance_main, got: {captured_phases[1]!r}'
+        )
+
+        # Request future should be resolved (not_descendant → blocked)
+        assert req.result.done(), 'request future should be resolved after terminal advance_main'
+
+        # _verify_item is None — _verify_and_advance doesn't set it
+        # (that's _verifier_loop's job); just confirm it was never set
+        assert worker._verify_item is None
+
+        # snapshot has no verifying/finalizing entries
+        snap = worker.snapshot()
+        bad_states = {e['state'] for e in snap['entries']} & {'verifying', 'finalizing', 'gate_reverify'}
+        assert not bad_states, f'Snapshot should have no active verifier states, got: {bad_states}'
