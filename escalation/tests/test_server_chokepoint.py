@@ -13,6 +13,9 @@ and the same tmp_path isolation as test_server_dedupe.py.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import types
 from pathlib import Path
 from typing import Any
 
@@ -607,3 +610,417 @@ class TestAutoResolveSingleNotification:
 # tests would mislead future readers into thinking the fallback is covered.
 # See design decision: "Remove TestResolveNoneFallback … in the impl step that
 # switches the server to submit_resolved."
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_request tests
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_request MCP tool directly."""
+    tool = await server.get_tool('merge_request')
+    return await tool.fn(**kwargs)
+
+
+def _make_orch_config(tmp_path: Path):
+    """Create a minimal OrchestratorConfig without a git remote."""
+    from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+    return OrchestratorConfig(project_root=tmp_path)
+
+
+def _make_registry():
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        InFlightMergeRegistry,
+    )
+    return InFlightMergeRegistry()
+
+
+# ---------------------------------------------------------------------------
+# Step-1 RED test: dispatched response includes request_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestRequestId:
+    """merge_request dispatched and in_flight responses include request_id."""
+
+    async def test_dispatched_response_includes_request_id(self, tmp_path: Path):
+        """Dispatched (terminal) response includes request_id from the MergeRequest.
+
+        RED until step-2 impl: the current dispatched path returns only
+        {status, reason, conflict_details, push_status} — no request_id key.
+
+        Setup: server with merge_queue + orch_config + injected registry and
+        NO harness (git_ops=None — also proves the fast-path is skipped
+        gracefully when git_ops is absent).  A background worker dequeues the
+        MergeRequest, captures req.request_id, and resolves req.result with
+        MergeOutcome('done').
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            # no harness → git_ops=None → fast-path skipped
+        )
+
+        captured_request_id: list[str] = []
+
+        async def _worker():
+            """Dequeue the MergeRequest, capture its request_id, resolve done."""
+            req = await mq.get()
+            captured_request_id.append(req.request_id)
+            req.result.set_result(MergeOutcome('done', reason='test done'))
+
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=5.0,
+        )
+
+        await worker_task
+
+        assert result['status'] == 'done', (
+            f"Expected status 'done', got: {result}"
+        )
+        assert len(captured_request_id) == 1, (
+            f"Worker did not capture request_id: {captured_request_id}"
+        )
+        assert 'request_id' in result, (
+            f"Expected 'request_id' key in dispatched result, got keys: {set(result.keys())}"
+        )
+        assert result['request_id'] == captured_request_id[0], (
+            f"Expected request_id={captured_request_id[0]!r}, got: {result.get('request_id')!r}"
+        )
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+
+    async def test_in_flight_response_includes_request_id(self, tmp_path: Path):
+        """In-flight (coalesced) response includes request_id from the MergeRequest.
+
+        RED until step-4 impl: the current in_flight branch returns only
+        {status, branch, inflight_task_id, eta_seconds, reason,
+        conflict_details, push_status} — no request_id key.
+
+        Setup: registry pre-seeded with branch 'X' via a never-resolving
+        future; server with injected registry and NO harness.  The call
+        returns immediately (no blocking await on the coalesced future).
+
+        Note: the request_id in the in_flight response is the SUBMITTING
+        request's own id (D8 substrate); it is NOT the in-flight entry's id.
+        The existing inflight_task_id remains the authoritative poll handle.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        # Pre-seed the registry: acquire branch 'X' with a never-resolving future
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future)
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            # no harness → git_ops=None → fast-path skipped
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Existing keys must be preserved
+        assert result.get('status') == 'in_flight', (
+            f"Expected status 'in_flight', got: {result}"
+        )
+        assert result.get('inflight_task_id') == 'existing-task', (
+            f"Expected inflight_task_id='existing-task', got: {result.get('inflight_task_id')!r}"
+        )
+        # New key: request_id of the submitting request (D8 substrate)
+        assert 'request_id' in result, (
+            f"Expected 'request_id' key in in_flight result, got keys: {set(result.keys())}"
+        )
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        never_future.cancel()
+
+    async def test_submit_time_already_merged_fast_path(self, tmp_path: Path):
+        """When branch tip is already an ancestor of main, merge_request returns
+        {status:'already_merged', commit} immediately — no enqueue, no merge_queued.
+
+        RED until step-6 impl: without the fast-path, the code proceeds to
+        coalesce+enqueue (emits merge_queued, mq non-empty) then blocks on the
+        future → asyncio.wait_for raises TimeoutError.
+
+        Verifies PRD invariant I4: guaranteed-redundant submission is killed at
+        the door.  Also verifies that resolve_branch_sha is called with the
+        prefixed ref 'task/591' (not bare '591') per the worker convention.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        FAKE_TIP = 'deadbeef12345678'
+
+        # Recording event_store stub
+        class _RecordingEventStore:
+            def __init__(self):
+                self.events: list = []
+
+            def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+                self.events.append(event_type)
+
+        recording_event_store = _RecordingEventStore()
+
+        # git_ops stub recording calls
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str:
+            resolve_calls.append(name)
+            return FAKE_TIP
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return True
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        git_ops_stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            event_store=recording_event_store,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Fast-path result: {status, commit, reason, conflict_details, push_status}.
+        # request_id is absent: fast-path fires before any MergeRequest entry exists.
+        assert result == {
+            'status': 'already_merged',
+            'commit': FAKE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, (
+            f"Expected converged already_merged fast-path result, got: {result}"
+        )
+        assert mq.empty(), (
+            f"Expected empty queue (no enqueue on already_merged), qsize={mq.qsize()}"
+        )
+        assert EventType.merge_queued not in recording_event_store.events, (
+            f"Expected no merge_queued event, got: {recording_event_store.events}"
+        )
+        # resolve_branch_sha must be called with the prefixed ref 'task/591'
+        assert resolve_calls == ['task/591'], (
+            f"Expected resolve_branch_sha('task/591'), got: {resolve_calls}"
+        )
+        # is_ancestor must be called with (tip, main_branch)
+        assert len(ancestor_calls) == 1, (
+            f"Expected is_ancestor called once, got: {ancestor_calls}"
+        )
+        assert ancestor_calls[0] == (FAKE_TIP, 'main'), (
+            f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fast-path fall-through tests (suggestion 2 — test_coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestFastPathFallThrough:
+    """Fast-path fall-throughs: missing branch and non-ancestor branch both enqueue."""
+
+    @staticmethod
+    def _make_git_ops_stub(tip_sha: str | None, is_anc: bool):
+        """Build a minimal git_ops stub recording resolve/ancestor calls."""
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str | None:
+            resolve_calls.append(name)
+            return tip_sha
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return is_anc
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        return stub, resolve_calls, ancestor_calls
+
+    async def _run_until_blocked(self, server, tmp_path: Path, branch: str = '591'):
+        """Start a merge_request call and yield control until it blocks on await future.
+
+        Returns the asyncio.Task; caller must cancel it when done.
+        """
+        task = asyncio.create_task(
+            _call_merge_request(
+                server,
+                task_id=branch,
+                branch=branch,
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            )
+        )
+        # All stub coroutines complete without yielding, so a few sleep(0) rounds
+        # are enough to advance the task to the blocking `await future`.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return task
+
+    async def test_tip_none_falls_through_to_enqueue(self, tmp_path: Path):
+        """resolve_branch_sha returns None → fast-path skipped; request enqueues.
+
+        When the branch ref is absent, tip=None makes the fast-path condition
+        False (short-circuit `tip is not None and ...`), so is_ancestor is never
+        called and the normal coalesce/enqueue path runs instead.
+
+        This preserves existing semantics: the worker will detect the missing
+        branch and emit its unknown_branch outcome.
+        """
+        git_ops_stub, resolve_calls, ancestor_calls = self._make_git_ops_stub(
+            tip_sha=None, is_anc=False  # is_anc value irrelevant — never called
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        task = await self._run_until_blocked(server, tmp_path)
+
+        try:
+            # Branch tip was None → must have enqueued
+            assert mq.qsize() == 1, (
+                f"Expected one item enqueued (tip=None falls through), qsize={mq.qsize()}"
+            )
+            # resolve_branch_sha still called with prefixed ref
+            assert resolve_calls == ['task/591'], (
+                f"Expected resolve_branch_sha('task/591'), got: {resolve_calls}"
+            )
+            # is_ancestor must NOT be called when tip is None (short-circuit)
+            assert ancestor_calls == [], (
+                f"is_ancestor must not be called when tip=None, got: {ancestor_calls}"
+            )
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def test_non_ancestor_tip_falls_through_to_enqueue(self, tmp_path: Path):
+        """resolve_branch_sha returns a SHA but is_ancestor returns False → enqueues.
+
+        When the branch exists but its tip is NOT yet an ancestor of main
+        (i.e. the branch has not been merged), is_ancestor returns False and
+        the fast-path condition is False, so the request proceeds to the normal
+        coalesce/enqueue path rather than returning already_merged.
+
+        A regression that skipped enqueue on any non-None tip would violate this.
+        """
+        FAKE_TIP = 'aabbccdd11223344'
+        git_ops_stub, resolve_calls, ancestor_calls = self._make_git_ops_stub(
+            tip_sha=FAKE_TIP, is_anc=False
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        task = await self._run_until_blocked(server, tmp_path)
+
+        try:
+            # Non-ancestor tip → must enqueue rather than fast-path return
+            assert mq.qsize() == 1, (
+                f"Expected one item enqueued (non-ancestor falls through), qsize={mq.qsize()}"
+            )
+            # is_ancestor WAS called (the check ran, returned False, fell through)
+            assert len(ancestor_calls) == 1, (
+                f"Expected is_ancestor called once, got: {ancestor_calls}"
+            )
+            assert ancestor_calls[0] == (FAKE_TIP, 'main'), (
+                f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
+            )
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task

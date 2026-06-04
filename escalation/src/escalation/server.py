@@ -664,18 +664,27 @@ def create_server(
         handles verification, conflict detection, and atomic ref advancement.
 
         Response shapes:
-        - Normal outcome: ``{status, reason, conflict_details, push_status}``
-          (plus optional ``failure_diagnostic`` on failure).
+        - Normal outcome: ``{status, request_id, reason, conflict_details,
+          push_status}`` (plus optional ``failure_diagnostic`` on failure).
           ``status`` is one of: ``done``, ``conflict``, ``blocked``,
           ``already_merged``, ``unknown_branch``, ``failed``.
           ``unknown_branch`` means the requested branch has no ref in the
           target repo — usually a merge_request mis-routed to the wrong
           repo's escalation MCP; check that the branch belongs here.
-        - Already in flight: ``{status='in_flight', branch, inflight_task_id,
-          eta_seconds, reason, conflict_details=None, push_status=None}``.
-          A merge for *branch* is already running; the caller should poll
-          rather than re-queuing.  ``eta_seconds`` is a best-effort hint
-          (``None`` once the estimate window is exceeded).
+          ``request_id`` is the stable per-entry identity of this request
+          (e.g. ``'mr-a1b2c3d4'``).
+        - Already in flight: ``{status='in_flight', request_id, branch,
+          inflight_task_id, eta_seconds, reason, conflict_details=None,
+          push_status=None}``.  A merge for *branch* is already running;
+          the caller should poll rather than re-queuing.  ``eta_seconds`` is
+          a best-effort hint (``None`` once the estimate window is exceeded).
+        - Already merged: ``{status='already_merged', commit, reason='',
+          conflict_details='', push_status=None}``.  Either the branch tip is
+          already an ancestor of main (fast-path — no enqueue, no request_id)
+          or the worker detected the branch was already merged via merge marker
+          (worker-path — also carries request_id and a None commit from
+          outcome.merge_sha).  All keys are present in both paths; callers
+          can safely read reason/conflict_details/push_status without KeyError.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -692,6 +701,38 @@ def create_server(
             MergeRequest,
             coalesce_or_enqueue_merge_request,
         )
+
+        # Single git_ops handle reused for both the already_merged fast-path
+        # (below) and the coalesce-gate disk-scan (coalesce_or_enqueue call).
+        # git_ops=None means no harness is wired (standalone / tests without
+        # orchestrator) — both paths degrade gracefully to no-op.
+        git_ops_for_scan = getattr(harness, 'git_ops', None)
+
+        # PRD I4 — already_merged fast-path: if the branch tip is already an
+        # ancestor of main, the submission is guaranteed-redundant.  Return
+        # {status:'already_merged', commit} immediately — NO enqueue, NO
+        # merge_queued event, NO asyncio.Future created (avoids an orphan future).
+        # resolve_branch_sha uses the full ref 'task/<branch>' per the worker
+        # convention (merge_queue.py:3796, git_ops.py:1461).  A missing branch
+        # (tip=None) falls through to the normal enqueue so the worker still
+        # emits its unknown_branch outcome, preserving existing semantics.
+        # git_ops=None (standalone) skips the fast-path entirely.
+        if git_ops_for_scan is not None:
+            full_branch = f'{orch_config.git.branch_prefix}{branch}'
+            tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
+            if tip is not None and await git_ops_for_scan.is_ancestor(
+                tip, orch_config.git.main_branch
+            ):
+                # Shape converged with worker-path already_merged (suggestion 1).
+                # request_id is absent: the fast-path short-circuits before any
+                # MergeRequest entry is constructed (no entry → no id).
+                return {
+                    'status': 'already_merged',
+                    'commit': tip,
+                    'reason': '',
+                    'conflict_details': '',
+                    'push_status': None,
+                }
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
@@ -714,7 +755,6 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
-        git_ops_for_scan = getattr(harness, 'git_ops', None)
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -730,8 +770,13 @@ def create_server(
             # conflict_details / push_status are included with None for shape
             # stability: callers that access result['conflict_details'] or
             # result['push_status'] must not KeyError on a coalesced response.
+            # request_id is the D8 SUBSTRATE: the SUBMITTING request's own id.
+            # β1 re-sources this to the in-flight entry's request_id and renames
+            # status to 'attached'; inflight_task_id remains the authoritative
+            # poll handle (merge_status accepts task_id per D10) in the interim.
             return {
                 'status': 'in_flight',
+                'request_id': merge_req.request_id,
                 'branch': branch,
                 'inflight_task_id': dispatch.inflight_task_id,
                 'eta_seconds': dispatch.eta_seconds,
@@ -744,11 +789,17 @@ def create_server(
             }
 
         outcome = await future
+        # 'commit' (outcome.merge_sha) is included for shape convergence with the
+        # fast-path already_merged response.  It is None for most statuses and for
+        # the worker-produced already_merged case (merge marker path returns no SHA);
+        # it is non-None for 'done' and 'done_wip_recovery' where main was advanced.
         result: dict[str, Any] = {
             'status': outcome.status,
+            'request_id': merge_req.request_id,
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
             'push_status': outcome.push_status,
+            'commit': outcome.merge_sha,
         }
         if outcome.failure_diagnostic is not None:
             result['failure_diagnostic'] = outcome.failure_diagnostic
