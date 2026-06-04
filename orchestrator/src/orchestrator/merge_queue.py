@@ -2833,8 +2833,99 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
+        # Verifier sub-state: current item and its phase within _verify_and_advance.
+        # Set by _verifier_loop after abandoned check; cleared in the loop's finally.
+        self._verify_item: SpeculativeItem | None = None
+        self._verify_phase: str | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
+
+    def snapshot(self) -> dict:
+        """Return a synchronous read-only snapshot of the merge worker pipeline state.
+
+        Safe to call from any context (no await, no lock) because asyncio's
+        single-loop model ensures in-memory reads are non-interleaved.
+
+        Returns a dict with:
+          entries: list of entry dicts, head-of-line first.
+          depth: total number of entries.
+          head_of_line: task_id of the first entry, or None.
+          verify_in_progress: {task_id, age_secs} when verifier is active, else None.
+          is_wip_halted: bool.
+          halt_owner_esc_id: str or None.
+
+        Each entry dict contains:
+          task_id, branch, state, enqueued_at, age_secs, position,
+          waiter_alive, worktree, pre_rebased.
+        State values: queued, merging, awaiting_verify, verifying,
+          gate_reverify, finalizing.
+        """
+        entries: list[dict] = []
+        now = time.time()
+
+        def _entry(req: MergeRequest, state: str, worktree_path=None, position: int = 0) -> dict:
+            return {
+                'task_id': req.task_id,
+                'branch': req.branch,
+                'state': state,
+                'enqueued_at': req.enqueued_at,
+                'age_secs': max(0.0, now - req.enqueued_at),
+                'position': position,
+                'waiter_alive': not req.result.cancelled(),
+                'worktree': str(worktree_path) if worktree_path is not None else None,
+                'pre_rebased': req.pre_rebased,
+            }
+
+        # 1. Verifier-current item (head-of-line)
+        if self._verify_item is not None:
+            item = self._verify_item
+            state = self._verify_phase or 'verifying'
+            entries.append(_entry(
+                item.request, state,
+                worktree_path=item.merge_wt,
+                position=len(entries),
+            ))
+
+        # 2. Awaiting-verify items from the verifier queue (skip None sentinel)
+        for item in list(self._verifier_queue._queue):  # type: ignore[attr-defined]
+            if item is None:
+                continue
+            entries.append(_entry(
+                item.request, 'awaiting_verify',
+                worktree_path=item.merge_wt,
+                position=len(entries),
+            ))
+
+        # 3. Merging (in-flight with the merger)
+        if self._inflight_req is not None:
+            entries.append(_entry(
+                self._inflight_req, 'merging',
+                worktree_path=None,
+                position=len(entries),
+            ))
+
+        # 4. Queued (waiting for the merger; the incident blind spot)
+        for req in list(self._queue._queue):  # type: ignore[attr-defined]
+            if req is None:
+                continue
+            entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
+
+        verify_in_progress = None
+        if self._verify_item is not None:
+            vi = self._verify_item
+            verify_in_progress = {
+                'task_id': vi.request.task_id,
+                'age_secs': max(0.0, now - vi.request.enqueued_at),
+            }
+
+        return {
+            'entries': entries,
+            'depth': len(entries),
+            'head_of_line': entries[0]['task_id'] if entries else None,
+            'verify_in_progress': verify_in_progress,
+            'is_wip_halted': self.is_wip_halted,
+            'halt_owner_esc_id': self.halt_owner_esc_id,
+        }
 
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""

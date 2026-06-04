@@ -1356,3 +1356,55 @@ class TestGetMergeQueue:
             mark_member_done=_noop_done,
         )
         assert isinstance(grq.enqueued_at, float)
+
+    # ── step-5: queued blind-spot entry visible ───────────────────────────
+
+    async def test_queued_entry_is_visible(self, tmp_path: Path):
+        """A queued MergeRequest (no merge worktree) appears in snapshot — incident blind spot."""
+        import asyncio
+        import types
+
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest, SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+
+        req = MergeRequest(
+            task_id='Q',
+            branch='Q',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        # Stub harness exposing _merge_worker
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+
+        assert isinstance(result, dict), f'Expected dict, got: {result}'
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result.get('depth', 0) >= 1, f'Expected depth >= 1, got: {result}'
+
+        entries = result.get('entries', [])
+        q_entries = [e for e in entries if e.get('task_id') == 'Q']
+        assert q_entries, f'Entry for task_id Q not found in entries: {entries}'
+        entry = q_entries[0]
+        assert entry['state'] == 'queued', f'Expected queued, got: {entry["state"]}'
+        assert entry['worktree'] is None, f'Expected worktree=None, got: {entry["worktree"]}'
+        assert entry['pre_rebased'] is False
+        assert isinstance(entry['age_secs'], (int, float))
+        assert entry['age_secs'] >= 0
