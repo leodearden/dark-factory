@@ -689,6 +689,7 @@ class TestMergeRequestRequestId:
                 branch='591',
                 worktree=str(tmp_path / 'wt'),
                 description='',
+                wait_secs=100,
             ),
             timeout=5.0,
         )
@@ -711,67 +712,11 @@ class TestMergeRequestRequestId:
             f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
         )
 
-    async def test_in_flight_response_includes_request_id(self, tmp_path: Path):
-        """In-flight (coalesced) response includes request_id from the MergeRequest.
-
-        RED until step-4 impl: the current in_flight branch returns only
-        {status, branch, inflight_task_id, eta_seconds, reason,
-        conflict_details, push_status} — no request_id key.
-
-        Setup: registry pre-seeded with branch 'X' via a never-resolving
-        future; server with injected registry and NO harness.  The call
-        returns immediately (no blocking await on the coalesced future).
-
-        Note: the request_id in the in_flight response is the SUBMITTING
-        request's own id (D8 substrate); it is NOT the in-flight entry's id.
-        The existing inflight_task_id remains the authoritative poll handle.
-        """
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        mq: asyncio.Queue = asyncio.Queue()
-        orch_config = _make_orch_config(tmp_path / 'repo')
-        registry = _make_registry()
-
-        # Pre-seed the registry: acquire branch 'X' with a never-resolving future
-        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
-        acquired = registry.acquire('X', 'existing-task', never_future)
-        assert acquired, 'Prerequisite: registry must accept first acquire'
-
-        server = create_server(
-            esc_queue,
-            merge_queue=mq,
-            orch_config=orch_config,
-            merge_inflight_registry=registry,
-            # no harness → git_ops=None → fast-path skipped
-        )
-
-        result = await asyncio.wait_for(
-            _call_merge_request(
-                server,
-                task_id='X',
-                branch='X',
-                worktree=str(tmp_path / 'wt'),
-                description='',
-            ),
-            timeout=2.0,
-        )
-
-        # Existing keys must be preserved
-        assert result.get('status') == 'in_flight', (
-            f"Expected status 'in_flight', got: {result}"
-        )
-        assert result.get('inflight_task_id') == 'existing-task', (
-            f"Expected inflight_task_id='existing-task', got: {result.get('inflight_task_id')!r}"
-        )
-        # New key: request_id of the submitting request (D8 substrate)
-        assert 'request_id' in result, (
-            f"Expected 'request_id' key in in_flight result, got keys: {set(result.keys())}"
-        )
-        assert result['request_id'].startswith('mr-'), (
-            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
-        )
-
-        # Clean up the never-resolving future to avoid ResourceWarning
-        never_future.cancel()
+    # test_in_flight_response_includes_request_id was removed at β8 (default flip).
+    # The legacy in_flight response (status='in_flight' + submitting request's id) is
+    # retired; coalesce now always returns 'attached' with the existing entry's id.
+    # Attached coverage lives in TestMergeRequestWaitSecsZeroAttached and
+    # TestMergeRequestDefaultFlip.test_default_call_inflight_branch_returns_attached.
 
     async def test_submit_time_already_merged_fast_path(self, tmp_path: Path):
         """When branch tip is already an ancestor of main, merge_request returns
@@ -1173,6 +1118,121 @@ class TestMergeRequestWaitSecsZeroAttached:
 
 
 # ---------------------------------------------------------------------------
+# β8 Step-1 RED: default call (no wait_secs) must return immediately
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDefaultFlip:
+    """β8 step-1 RED: merge_request with NO wait_secs must return immediately.
+
+    RED today: the None default blocks unboundedly → (a) wait_for raises
+    TimeoutError; (b) routes through the legacy 'in_flight' shape → status
+    mismatch.  GREEN after step-2 impl flips the default to 0.
+    """
+
+    async def test_default_call_free_branch_returns_queued(self, tmp_path: Path):
+        """Default call on a free branch returns 'queued' without blocking.
+
+        Setup: server with merge_queue + orch_config + injected registry, NO
+        worker.  Call merge_request with NO wait_secs under
+        asyncio.wait_for(timeout=2.0).  Must return before the timeout with
+        status=='queued' and the non-blocking shape keys.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='def-free',
+                branch='def-free',
+                worktree=str(tmp_path / 'wt'),
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued', got: {result}"
+        )
+        assert 'request_id' in result, f'Missing request_id: {result}'
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+        for key in ('snapshot_tip', 'generation', 'position', 'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+        assert result['generation'] == 0, f"Expected generation=0, got: {result['generation']}"
+        assert isinstance(result['position'], int), (
+            f"Expected position to be int, got: {type(result['position'])}"
+        )
+        assert result['queue_depth'] >= 1, (
+            f"Expected queue_depth >= 1, got: {result['queue_depth']}"
+        )
+        assert mq.qsize() == 1, f'Expected mq.qsize()==1, got: {mq.qsize()}'
+
+        # Clean up enqueued future to avoid ResourceWarning
+        req = mq.get_nowait()
+        req.result.cancel()
+
+    async def test_default_call_inflight_branch_returns_attached(self, tmp_path: Path):
+        """Default call on an already-in-flight branch returns 'attached' with existing id.
+
+        Pre-seed the registry with branch 'X' and request_id='mr-existing'.
+        Call merge_request with NO wait_secs for branch 'X'.  Must return
+        immediately (no blocking), status=='attached', and request_id must be
+        the existing entry's id ('mr-existing'), NOT the submitting request's id.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        # Pre-seed the registry: acquire branch 'X' with a known request_id
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future, request_id='mr-existing')
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', (
+            f"Expected status='attached', got: {result}"
+        )
+        assert result.get('request_id') == 'mr-existing', (
+            f"Expected request_id='mr-existing', got: {result.get('request_id')!r}"
+        )
+        assert result['generation'] == 0, f"Expected generation=0, got: {result['generation']}"
+        for key in ('snapshot_tip', 'generation', 'eta_seconds', 'position', 'queue_depth'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        never_future.cancel()
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-11 RED: wait_secs>0 bounded wait — happy path + clamp/timeout/shield
 # ---------------------------------------------------------------------------
 
@@ -1299,6 +1359,125 @@ class TestMergeRequestWaitSecsPositive:
 
 
 # ---------------------------------------------------------------------------
+# β8 Step-3 RED: explicit None treated as 'queued' (I1 regression guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestExplicitNoneQueued:
+    """β8 step-3 RED: explicit wait_secs=None must NOT block (PRD invariant I1).
+
+    RED after step-2: explicit None still falls into the legacy
+    `else: outcome = await asyncio.shield(future)` unbounded branch → blocks
+    → wait_for raises TimeoutError.
+    GREEN after step-4 impl deletes the unbounded branch.
+    """
+
+    async def test_explicit_none_wait_secs_does_not_block(self, tmp_path: Path):
+        """Passing wait_secs=None explicitly returns 'queued' without blocking.
+
+        Setup: server with merge_queue + orch_config + injected registry,
+        NO worker.  Call merge_request(wait_secs=None) (type: ignore intentional —
+        exercises the retired sentinel) under asyncio.wait_for(timeout=2.0).
+        Must return before the timeout with status=='queued'.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='none-free',
+                branch='none-free',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=None,  # type: ignore[reportArgumentType]
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued' for explicit None, got: {result}"
+        )
+        assert 'request_id' in result, f'Missing request_id: {result}'
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+
+        # Clean up
+        req = mq.get_nowait()
+        req.result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# β8 Step-5 RED: explicit None on coalesced branch must return 'attached'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestExplicitNoneAttached:
+    """β8 step-5 RED: explicit wait_secs=None on an in-flight branch must
+    return 'attached' (not the legacy 'in_flight' shape).
+
+    RED after step-4: explicit None no longer blocks (step-4 greened that),
+    but the `if wait_secs is None:` sub-branch inside dispatch.in_flight
+    still returns status=='in_flight' with the submitting request's id.
+    GREEN after step-6 impl deletes that sub-branch.
+    """
+
+    async def test_explicit_none_wait_secs_coalesce_returns_attached(self, tmp_path: Path):
+        """Explicit None on an already-in-flight branch returns 'attached' with existing id.
+
+        Pre-seed the registry with branch 'X' and request_id='mr-existing'.
+        Call merge_request(wait_secs=None) (type: ignore intentional).
+        Must return status=='attached' and request_id=='mr-existing'.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future, request_id='mr-existing')
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=None,  # type: ignore[reportArgumentType]
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', (
+            f"Expected status='attached' for explicit None on coalesced branch, got: {result}"
+        )
+        assert result.get('request_id') == 'mr-existing', (
+            f"Expected request_id='mr-existing', got: {result.get('request_id')!r}"
+        )
+
+        never_future.cancel()
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-13 RED: legacy (wait_secs=None) — client disconnect doesn't cancel entry
 # ---------------------------------------------------------------------------
 
@@ -1313,15 +1492,14 @@ class TestMergeRequestDurableIntent:
     full suite.
     """
 
-    async def test_legacy_disconnect_does_not_cancel_entry(self, tmp_path: Path):
-        """Legacy path (wait_secs=None): cancelling the merge_request Task does not
+    async def test_bounded_wait_disconnect_does_not_cancel_entry(self, tmp_path: Path):
+        """Bounded-wait path (wait_secs>0): cancelling the Task mid-wait does not
         cancel the enqueued entry's future (durable intent, PRD D2/I5).
 
-        Start merge_request (no wait_secs) as a Task.  Advance the loop until
-        it blocks on the await.  Retrieve the enqueued req.  Cancel the Task
-        and await its cancellation (CancelledError suppressed).  Assert that:
-        - req.result.cancelled() is False (future survived the disconnect)
-        - req.result.set_result(MergeOutcome('done')) succeeds (entry is usable)
+        Start merge_request(wait_secs=30) as a Task (no worker → blocks on the
+        bounded asyncio.wait_for).  Advance the loop until it blocks.
+        Retrieve the enqueued req.  Cancel the Task.  Assert that req.result is
+        NOT cancelled (asyncio.shield protects it from the outer cancellation).
         """
         from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
 
@@ -1337,18 +1515,19 @@ class TestMergeRequestDurableIntent:
             merge_inflight_registry=registry,
         )
 
-        # Start the merge_request call as a Task (simulates an MCP session lifetime)
+        # Start the merge_request call as a Task (simulates an MCP session lifetime).
+        # wait_secs=30 → bounded wait; no worker → blocks inside wait_for.
         merge_task = asyncio.create_task(
             _call_merge_request(
                 server,
                 task_id='task-di',
                 branch='task-di',
                 worktree=str(tmp_path / 'wt'),
+                wait_secs=30,
             )
         )
 
         # Advance the event loop until the task blocks on the shielded await.
-        # All stubs return synchronously, so a few sleep(0) rounds are enough.
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -1356,7 +1535,7 @@ class TestMergeRequestDurableIntent:
         assert mq.qsize() == 1, (
             f'Expected entry enqueued before cancel, qsize={mq.qsize()}'
         )
-        # Retrieve the enqueued entry without consuming it permanently.
+        # Retrieve the enqueued entry.
         req = mq.get_nowait()
 
         # Simulate client disconnect: cancel the merge_request Task.

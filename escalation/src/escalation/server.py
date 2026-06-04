@@ -690,20 +690,18 @@ def create_server(
         branch: str,
         worktree: str,
         description: str = '',
-        wait_secs: int | None = None,
+        wait_secs: int = 0,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
         Use this instead of directly merging into main.  The merge worker
         handles verification, conflict detection, and atomic ref advancement.
 
+        Invariant I1: no merge_request code path awaits longer than
+        ``_MAX_WAIT_SECS`` (100 s).  The unbounded blocking path is deleted.
+
         *wait_secs* controls how long the call blocks:
-        - ``None`` (default — legacy compat): block indefinitely until the
-          merge completes; coalesced branch returns ``status='in_flight'``.
-          The legacy path is retained during the compat ladder (β1–β7).
-          ``'in_flight'`` is a deprecated alias whose removal is scheduled
-          for β8 (Open Q5).
-        - ``0``: return immediately — dispatched branch returns
+        - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
           queue_depth, eta_seconds}``.
@@ -723,12 +721,14 @@ def create_server(
           repo's escalation MCP; check that the branch belongs here.
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
-        - Already in flight (legacy, wait_secs=None): ``{status='in_flight',
-          request_id, branch, inflight_task_id, eta_seconds, reason,
-          conflict_details=None, push_status=None}``.
-        - Queued / attached (wait_secs not None): ``{status='queued'|'attached',
-          request_id, snapshot_tip, generation, position, queue_depth,
-          eta_seconds}``.
+        - Queued: ``{status='queued', request_id, snapshot_tip, generation,
+          position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
+          (or wait_secs timeout expired).
+        - Attached: ``{status='attached', request_id, snapshot_tip, generation,
+          position, queue_depth, eta_seconds, inflight_task_id}``.  Branch is
+          already in-flight; request_id is the *existing* entry's id (D8), not
+          the submitting call's id.  ``inflight_task_id`` is the authoritative
+          poll handle (merge_status accepts task_id per D10).
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main (fast-path — no enqueue, no request_id)
@@ -864,35 +864,10 @@ def create_server(
             }
 
         if dispatch.in_flight:
-            # Branch already being merged.
-            if wait_secs is None:
-                # Legacy (compat default): return in_flight immediately so the
-                # caller can poll rather than block.  ETA is a best-effort heuristic
-                # (None once the estimate window is exceeded).
-                # conflict_details / push_status are included with None for shape
-                # stability: callers that access result['conflict_details'] or
-                # result['push_status'] must not KeyError on a coalesced response.
-                # request_id is the submitting request's own id (legacy D8 shape).
-                # The opt-in path (wait_secs not None, above) re-sources to the
-                # existing entry's id and renames status to 'attached'.
-                # inflight_task_id remains the authoritative poll handle (merge_status
-                # accepts task_id per D10) on both paths.
-                return {
-                    'status': 'in_flight',
-                    'request_id': merge_req.request_id,
-                    'branch': branch,
-                    'inflight_task_id': dispatch.inflight_task_id,
-                    'eta_seconds': dispatch.eta_seconds,
-                    'reason': (
-                        f'A merge for branch {branch!r} is already in flight '
-                        f'(source={dispatch.source!r}). Poll for completion.'
-                    ),
-                    'conflict_details': None,
-                    'push_status': None,
-                }
-            # wait_secs not None → opt-in path: 'attached' with existing entry's id
-            # Re-source request_id from the in-flight entry (D8) so the caller
-            # can correlate with the existing entry, not the coalesced submission.
+            # Branch already being merged — return 'attached' with the existing
+            # entry's request_id (D8) so the caller can correlate with the entry,
+            # not the coalesced submission.  The 'in_flight' response is retired
+            # (β8 Open Q5): no skill or surviving test reads status=='in_flight'.
             base = _nonblocking_state_response(
                 'attached', merge_req,
                 req_id_override=dispatch.inflight_request_id,
@@ -914,8 +889,9 @@ def create_server(
             lambda _f: _waiters.pop(merge_req.request_id, None)
         )
 
-        # wait_secs == 0: immediate non-blocking return — 'queued' shape.
-        if wait_secs == 0:
+        # Non-positive / None → immediate non-blocking return — 'queued' shape.
+        # Handles: wait_secs==0 (default), and the retired None sentinel.
+        if not wait_secs:
             return _nonblocking_state_response('queued', merge_req)
 
         # wait_secs > 0: bounded wait — clamp to _MAX_WAIT_SECS (module constant,
@@ -924,17 +900,12 @@ def create_server(
         # cancellation: a wait_for timeout cancels only the outer shield wrapper,
         # leaving req.result alive.  On timeout return the non-terminal 'queued'
         # shape so the caller can poll (PRD I1/Open Q4).
-        if wait_secs is not None:
-            clamp = min(wait_secs, _MAX_WAIT_SECS)
-            try:
-                outcome = await asyncio.wait_for(asyncio.shield(future), clamp)
-            except TimeoutError:
-                return _nonblocking_state_response('queued', merge_req)
-            # Resolved within clamp → fall through to terminal outcome shape below.
-        else:
-            # Legacy (wait_secs=None): unbounded blocking await — shielded so that
-            # MCP client disconnect (Task cancel) does not cancel req.result (PRD D2/I5).
-            outcome = await asyncio.shield(future)
+        clamp = min(max(wait_secs, 0), _MAX_WAIT_SECS)
+        try:
+            outcome = await asyncio.wait_for(asyncio.shield(future), clamp)
+        except TimeoutError:
+            return _nonblocking_state_response('queued', merge_req)
+        # Resolved within clamp → fall through to terminal outcome shape below.
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
         # the worker-produced already_merged case (merge marker path returns no SHA);

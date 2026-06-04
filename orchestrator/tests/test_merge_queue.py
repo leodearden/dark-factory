@@ -7339,7 +7339,7 @@ class TestMergeFailureDiagnostic:
         wt_ghost = await _make_branch_with_file(git_ops, 'e2e-phantom', 'phantom.py', 'x = 1\n')
 
         resp = await asyncio.wait_for(
-            tool.fn(task_id='ghost-e2e', branch='ghost-e2e', worktree=str(wt_ghost)),
+            tool.fn(task_id='ghost-e2e', branch='ghost-e2e', worktree=str(wt_ghost), wait_secs=100),
             timeout=30,
         )
         assert resp['status'] == 'unknown_branch', f'got {resp}'
@@ -7351,7 +7351,7 @@ class TestMergeFailureDiagnostic:
         wt = await _make_branch_with_file(git_ops, 'e2e-valid', 'e2e.py', 'x = 1\n')
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
             resp_ok = await asyncio.wait_for(
-                tool.fn(task_id='e2e-valid', branch='e2e-valid', worktree=str(wt)),
+                tool.fn(task_id='e2e-valid', branch='e2e-valid', worktree=str(wt), wait_secs=100),
                 timeout=30,
             )
         assert resp_ok['status'] == 'done', f'expected done: {resp_ok}'

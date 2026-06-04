@@ -1905,11 +1905,11 @@ class TestMergeRequestDedup:
             timeout=2.0,
         )
 
-        assert result.get('status') == 'in_flight', (
-            f'Expected status in_flight, got: {result}'
+        assert result.get('status') == 'attached', (
+            f'Expected status attached, got: {result}'
         )
         assert mq.empty(), (
-            f'Queue should be empty (no enqueue on in_flight), qsize={mq.qsize()}'
+            f'Queue should be empty (no enqueue on attached/coalesce), qsize={mq.qsize()}'
         )
         # Clean up the never-resolving future to avoid ResourceWarning
         never_future.cancel()
@@ -1955,6 +1955,7 @@ class TestMergeRequestDedup:
                 branch='Y',
                 worktree=str(tmp_path / 'wt'),
                 description='',
+                wait_secs=100,
             ),
             timeout=5.0,
         )
@@ -1977,8 +1978,9 @@ class TestMergeRequestDedup:
         Simulates the dedup blind-spot fix: the workflow enqueues via
         register_and_enqueue_merge_request (which registers in the shared
         registry), then a subsequent MCP merge_request call for the same
-        branch returns status='in_flight' (coalesced from registry) with
-        inflight_task_id='workflow-task' and NO duplicate queue entry.
+        branch returns status='attached' (coalesced from registry, existing
+        entry's id) with inflight_task_id='workflow-task' and NO duplicate
+        queue entry.
         """
         import asyncio
         from pathlib import Path as _Path
@@ -2030,8 +2032,8 @@ class TestMergeRequestDedup:
         )
 
         # Acceptance assertions
-        assert result.get('status') == 'in_flight', (
-            f'Expected status in_flight (coalesced from registry), got: {result}'
+        assert result.get('status') == 'attached', (
+            f'Expected status attached (coalesced from registry), got: {result}'
         )
         assert result.get('inflight_task_id') == 'workflow-task', (
             f'Expected inflight_task_id=workflow-task (from registry entry), got: {result}'
