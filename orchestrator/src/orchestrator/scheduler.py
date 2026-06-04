@@ -760,6 +760,15 @@ class Scheduler:
         # category) → block the task + submit L1.  Default None so bare-Harness
         # unit tests (and park_gc) are unaffected.
         self._on_external_dep_block: Callable[..., Any] | None = None
+        # --- Action-teardown suppression (task 1620, β Pair E / C3.2) ---
+        # Predicate installed by the Harness: when set, set_task_status('blocked',
+        # ...) returns early (before dispatch_tool) if the predicate returns True
+        # for that task_id.  Absorbs racing 'blocked' writes emitted by a workflow
+        # being killed during action teardown (park→deferred / restart→pending) so
+        # the action's target status is not clobbered.  Mirrors the
+        # _on_park_stop_trip / _on_external_dep_block callback-install pattern:
+        # declared here, installed by Harness.__init__.
+        self._suppress_blocked_write: Callable[[str], bool] | None = None
         # Per-(task_id, dep_string) count of consecutive ticks where the dep
         # resolved to a sentinel (unknown_project/unknown_task/malformed).
         # Process-local — a scheduler restart is an acceptable implicit reset,
@@ -1164,6 +1173,25 @@ class Scheduler:
             arguments['done_provenance'] = done_provenance
         if reopen_reason is not None:
             arguments['reopen_reason'] = reopen_reason
+
+        # C3.2 (task 1620, β Pair E): action-teardown suppression guard.
+        # When the Harness stamps _action_teardown_tasks for a task being killed
+        # (park→deferred / restart→pending), absorb any racing 'blocked' write the
+        # workflow may emit before the kill completes.  This guard MUST sit BEFORE
+        # dispatch_tool so the write never reaches fused-memory — _record_blocked_transition
+        # and _maybe_fire_park_stop_trip are then necessarily skipped for free.
+        # (A guard placed at the post-write success branch :1190 would still let the
+        # write reach fused-memory, defeating C3.2.)
+        if (
+            status == 'blocked'
+            and self._suppress_blocked_write is not None
+            and self._suppress_blocked_write(task_id)
+        ):
+            logger.info(
+                'set_task_status(%s, blocked): suppressed by action-teardown — skipping write',
+                task_id,
+            )
+            return
 
         last_rejection: str | None = None
         for attempt in range(_TRANSIENT_RETRIES):
