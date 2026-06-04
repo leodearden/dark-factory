@@ -99,17 +99,16 @@ class TestSignatureDerivation:
 
     def test_mixed_case_and_whitespace_normalized(self):
         """(b) Mixed case + runs of whitespace/newlines → collapsed & lowercased."""
-        esc = _make_l1_esc(
-            category='task_failure',
-            summary='  Worker  CRASHED\n\twith   error  CODE 42  ',
-        )
+        raw_summary = '  Worker  CRASHED\n\twith   error  CODE 42  '
+        esc = _make_l1_esc(category='task_failure', summary=raw_summary)
         sig = Harness._reblock_signature(esc)
-        assert sig == 'task_failure:worker crashed\n\twith   error  code 42'.replace(
-            '\n\t', ' '
-        ).replace('  ', ' ')
-        # More precisely: normalize means join(split()) + lower
-        expected_norm = ' '.join('  Worker  CRASHED\n\twith   error  CODE 42  '.split()).lower()
+        # normalize = ' '.join(s.split()).lower() → all whitespace runs collapsed to
+        # a single space and the result lowercased.
+        expected_norm = ' '.join(raw_summary.split()).lower()
         assert sig == f'task_failure:{expected_norm}'
+        # Confirm the whitespace really was collapsed (no double-spaces in result)
+        suffix = sig[len('task_failure:'):]
+        assert '  ' not in suffix, 'Consecutive spaces should have been collapsed'
 
     def test_long_summary_truncated_to_120_chars_of_summary(self):
         """(c) >120-char summary → normalized summary truncated to 120 chars (category not counted)."""

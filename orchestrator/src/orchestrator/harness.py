@@ -66,6 +66,12 @@ logger = logging.getLogger(__name__)
 # branch-resolution races should clear well before this threshold fires.
 MAX_RECONCILE_FAILURES: int = 5
 
+# Maximum number of same-signature blocked→pending re-pends allowed before the
+# 4th flip is withheld and a born-at-L2 human escalation is filed.
+# Mirrors MAX_RECONCILE_FAILURES shape — a module constant so the value stays
+# inside the declared module scope without touching config.py / defaults.yaml.
+_REBLOCK_GUARD_THRESHOLD: int = 3
+
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
 #   'done' / 'cancelled'   — terminal-by-decision; nothing to recover
@@ -4494,6 +4500,25 @@ Output JSON matching the schema. Every task must appear in the output.
         if escalation.status == 'dismissed':
             return 'close_only'
         return 'resume'  # status == 'resolved'
+
+    @staticmethod
+    def _reblock_signature(escalation) -> str:
+        """Derive the re-block guard signature from an escalation.
+
+        Signature = ``category + ':' + normalize(summary)[:120]``, where
+        normalize = whitespace-collapse (``' '.join(s.split())``) + lowercase.
+
+        This makes the signature robust to trivial formatting differences
+        (extra spaces, newlines, capitalisation) across incarnations while
+        keeping it specific enough to distinguish genuinely different failure
+        modes (different category or substantially different summary).
+
+        The 120-char truncation is applied to the *normalised* summary only;
+        the category prefix is not counted toward the 120.
+        """
+        raw = escalation.summary or ''
+        normalized = ' '.join(raw.split()).lower()
+        return f'{escalation.category}:{normalized[:120]}'
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
