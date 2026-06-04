@@ -488,3 +488,184 @@ class TestDedupAndHumanReset:
         assert 'pending' in set_status_calls, (
             'set_task_status(pending) should be called after human reset'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 / Step-12: Metadata-clobber boundary (C3.4)
+# ---------------------------------------------------------------------------
+
+
+def _make_clobber_fake_scheduler(harness, initial_metadata: dict):
+    """Wire harness.scheduler with a fake backend that distinguishes append semantics.
+
+    This backend simulates real database behaviour:
+      - update_task(tid, md, append=False)  → REPLACE whole metadata blob with md
+        (shallow replace — siblings are clobbered; this is the bad path that
+        step-11 must catch when append=True is absent).
+      - update_task(tid, md, append=True)   → RECURSIVE MERGE: only the keys in
+        md are merged into the existing blob; siblings survive.
+      - set_task_status                     → AUDIT MERGE: merges in an extra
+        'reopen_reason' key (like the real interceptor) and updates status,
+        preserving all other existing keys.
+
+    Returns (task_state, call_order) where task_state is a mutable dict holding
+    ``{'metadata': {...}, 'status': 'blocked'}`` so tests can inspect both.
+    """
+
+    def _deep_merge(base: dict, overlay: dict) -> dict:
+        """Recursive merge: overlay keys replace / extend base keys."""
+        result = dict(base)
+        for k, v in overlay.items():
+            if isinstance(v, dict) and isinstance(result.get(k), dict):
+                result[k] = _deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
+
+    task_state: dict = {
+        'id': '42',
+        'status': 'blocked',
+        'metadata': dict(initial_metadata),
+    }
+    call_order: list[str] = []
+
+    async def fake_get_task(tid):
+        return {
+            'id': tid,
+            'status': task_state['status'],
+            'metadata': dict(task_state['metadata']),
+        }
+
+    async def fake_get_status(tid):
+        return task_state['status']
+
+    async def fake_update_task(tid, md, *, append=False):
+        """append=True → recursive merge; append=False → replace whole blob."""
+        if append:
+            task_state['metadata'] = _deep_merge(task_state['metadata'], md)
+        else:
+            # Simulate the clobber hazard: replace the entire metadata blob.
+            task_state['metadata'] = dict(md)
+        call_order.append('update_task')
+        return True
+
+    async def fake_set_task_status(tid, status, **kwargs):
+        # Simulate the reopen_reason audit-merge the real interceptor performs.
+        # It merges extra audit keys into the existing metadata (preserves siblings).
+        existing = dict(task_state['metadata'])
+        if status == 'pending' and task_state['status'] == 'blocked':
+            existing.setdefault('reopen_reason', 'guard-test')
+        task_state['metadata'] = existing
+        task_state['status'] = status
+        call_order.append('set_task_status')
+
+    harness.scheduler.get_task = fake_get_task
+    harness.scheduler.get_status = fake_get_status
+    harness.scheduler.update_task = fake_update_task
+    harness.scheduler.set_task_status = fake_set_task_status
+
+    return task_state, call_order
+
+
+@pytest.mark.asyncio
+class TestMetadataClobberBoundary:
+    """C3.4: counter survives a full blocked→pending→in-progress→blocked cycle.
+
+    This test FAILS if _check_reblock_guard calls update_task WITHOUT append=True
+    because the fake backend then replaces the whole metadata blob with just
+    {'reblock_guard': {...}}, clobbering sibling keys ('files', 'memory_hints').
+
+    After step-12 adds append=True the recursive-merge path preserves siblings
+    and the test passes.
+    """
+
+    async def test_counter_survives_full_cycle_and_siblings_preserved(
+        self, harness: Harness
+    ):
+        """Counter continues 1→2 across incarnations; sibling metadata not clobbered.
+
+        Scenario:
+          1. Seed: metadata={'files':['foo.py'], 'memory_hints':['hint1']}
+          2. 1st flip (blocked→pending): counter persisted as count=1
+          3. Simulate workflow cycle: status in-progress → blocked
+             (the flip's set_task_status + subsequent in-progress/blocked writes
+              must not clobber reblock_guard or sibling keys)
+          4. 2nd flip (blocked→pending): counter persisted as count=2
+
+        Asserts:
+          - reblock_guard.count == 2 (counter continues, not reset/lost)
+          - sibling keys 'files' and 'memory_hints' still present
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        expected_sig = Harness._reblock_signature(esc)
+
+        task_state, call_order = _make_clobber_fake_scheduler(
+            harness,
+            initial_metadata={
+                'files': ['foo.py', 'bar.py'],
+                'memory_hints': ['hint1', 'hint2'],
+            },
+        )
+
+        # ── 1st flip: blocked → pending ──────────────────────────────────────
+        call_order.clear()
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Counter persisted
+        guard = task_state['metadata'].get('reblock_guard')
+        assert guard is not None, '1st flip: reblock_guard not persisted'
+        assert guard['count'] == 1, f'1st flip: expected count=1, got {guard["count"]}'
+        assert guard['signature'] == expected_sig, '1st flip: signature mismatch'
+
+        # Flip proceeded
+        assert task_state['status'] == 'pending', (
+            f'1st flip: expected status=pending, got {task_state["status"]}'
+        )
+
+        # ── Simulate workflow cycle: pending → in-progress → blocked ─────────
+        # The harness/workflow engine would call set_task_status to mark progress
+        # and then re-block when a new failure occurs.
+        task_state['status'] = 'in-progress'
+        # Simulate a new blocking event: status goes back to blocked.
+        task_state['status'] = 'blocked'
+        # The scheduler's get_status must reflect the new blocked status.
+        # (fake_get_status already reads from task_state)
+
+        # ── 2nd flip: blocked → pending ──────────────────────────────────────
+        call_order.clear()
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        guard = task_state['metadata'].get('reblock_guard')
+        assert guard is not None, '2nd flip: reblock_guard missing after cycle'
+        assert guard['count'] == 2, (
+            f'2nd flip: expected count=2 (counter continues), got {guard["count"]}'
+        )
+        assert guard['signature'] == expected_sig, '2nd flip: signature mismatch'
+
+        # Flip proceeded again
+        assert task_state['status'] == 'pending', (
+            f'2nd flip: expected status=pending, got {task_state["status"]}'
+        )
+
+        # ── Critical: sibling metadata keys must survive the full cycle ───────
+        meta = task_state['metadata']
+        assert 'files' in meta, (
+            "Sibling key 'files' was clobbered — update_task must use append=True"
+        )
+        assert meta['files'] == ['foo.py', 'bar.py'], (
+            f"'files' value corrupted: {meta['files']!r}"
+        )
+        assert 'memory_hints' in meta, (
+            "Sibling key 'memory_hints' was clobbered — update_task must use append=True"
+        )
+        assert meta['memory_hints'] == ['hint1', 'hint2'], (
+            f"'memory_hints' value corrupted: {meta['memory_hints']!r}"
+        )
