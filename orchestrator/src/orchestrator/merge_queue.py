@@ -1524,6 +1524,60 @@ guaranteed bound — cold npm+cargo builds vary widely.  Tests must NOT
 assert a specific numeric value for ETA."""
 
 
+@dataclass
+class TerminalOutcomeRecord:
+    """Immutable record of a MergeRequest's terminal outcome.
+
+    Stored in the TerminalOutcomeRetention ring for O(1) hot-path lookups.
+    The event store (merge_finalized rows) is the durable tier, so ring
+    eviction is lossless — evicted ids fall through to event-store queries.
+    """
+
+    request_id: str
+    task_id: str
+    branch: str
+    state: str
+    """Terminal state: MergeOutcome.status value, 'abandoned' (cancelled), or 'error'."""
+    snapshot_tip: str | None = None
+    merge_sha: str | None = None
+    finished_at: float = field(default_factory=time.time, kw_only=True)
+
+
+class TerminalOutcomeRetention:
+    """Bounded in-memory ring of recent terminal merge outcomes.
+
+    Backed by a ``collections.deque(maxlen=maxlen)`` for eviction and a
+    ``dict`` index keyed by ``request_id`` for O(1) lookups.  When the ring
+    is full, the oldest entry is evicted from both structures atomically.
+
+    The event store is the durable tier so eviction is lossless — α3's
+    merge_status falls through to event-store queries for evicted ids.
+    """
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._ring: collections.deque[TerminalOutcomeRecord] = collections.deque(maxlen=maxlen)
+        self._index: dict[str, TerminalOutcomeRecord] = {}
+
+    def record(self, rec: TerminalOutcomeRecord) -> None:
+        """Append *rec* to the ring, evicting the oldest entry from the index if full."""
+        if len(self._ring) == self._ring.maxlen:
+            # Capture the about-to-be-evicted entry before appending.
+            evicted = self._ring[0]
+            self._ring.append(rec)
+            # Only remove the index entry if it still points to *evicted* — a
+            # duplicate request_id (pathological case) should not evict the
+            # newer entry.
+            if self._index.get(evicted.request_id) is evicted:
+                del self._index[evicted.request_id]
+        else:
+            self._ring.append(rec)
+        self._index[rec.request_id] = rec
+
+    def get(self, request_id: str) -> TerminalOutcomeRecord | None:
+        """Return the record for *request_id*, or None if evicted / not yet recorded."""
+        return self._index.get(request_id)
+
+
 class InFlightMergeRegistry:
     """Per-branch in-flight de-dup registry for the merge-request chokepoint.
 

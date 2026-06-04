@@ -33,6 +33,8 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    TerminalOutcomeRecord,
+    TerminalOutcomeRetention,
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
@@ -41,6 +43,7 @@ from orchestrator.merge_queue import (
     _is_speculation_race,
     _verify_hit_enospc,
     coalesce_or_enqueue_merge_request,
+    register_and_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
 
@@ -4550,6 +4553,74 @@ class TestMergeRequestIdentity:
         )
         assert re.fullmatch(r'^mr-[0-9a-f]{8}$', greq.request_id)
         assert greq.snapshot_tip is None
+
+
+# ---------------------------------------------------------------------------
+# TestTerminalOutcomeRetention — step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalOutcomeRetention:
+    """Unit tests for the TerminalOutcomeRecord + TerminalOutcomeRetention ring."""
+
+    def _make_record(self, request_id: str, state: str = 'done') -> TerminalOutcomeRecord:
+        return TerminalOutcomeRecord(
+            request_id=request_id,
+            task_id=f'task-{request_id}',
+            branch=f'task/{request_id}',
+            state=state,
+            snapshot_tip=None,
+            merge_sha=None,
+        )
+
+    def test_record_and_get(self) -> None:
+        """record(rec) then get(req_id) returns the same record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = self._make_record('mr-aabbccdd')
+        ring.record(rec)
+        result = ring.get('mr-aabbccdd')
+        assert result is rec
+        assert result.state == 'done'
+        assert result.task_id == 'task-mr-aabbccdd'
+
+    def test_get_missing_returns_none(self) -> None:
+        """get() on an unknown request_id returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get('mr-doesnotexist') is None
+
+    def test_eviction_syncs_index(self) -> None:
+        """Oldest entry is evicted from both ring and dict index when ring is full."""
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = self._make_record('mr-aaaaaaaa')
+        rec_b = self._make_record('mr-bbbbbbbb')
+        rec_c = self._make_record('mr-cccccccc')
+
+        ring.record(rec_a)
+        ring.record(rec_b)
+        ring.record(rec_c)  # evicts rec_a
+
+        # Oldest (a) is evicted
+        assert ring.get('mr-aaaaaaaa') is None
+        # Two newest remain
+        assert ring.get('mr-bbbbbbbb') is rec_b
+        assert ring.get('mr-cccccccc') is rec_c
+
+    def test_snapshot_tip_and_merge_sha_are_stored(self) -> None:
+        """Fields snapshot_tip and merge_sha are preserved on the record."""
+        ring = TerminalOutcomeRetention(maxlen=5)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-12345678',
+            task_id='42',
+            branch='task/42',
+            state='done',
+            snapshot_tip='sha-tip',
+            merge_sha='deadbeef',
+        )
+        ring.record(rec)
+        stored = ring.get('mr-12345678')
+        assert stored is not None
+        assert stored.snapshot_tip == 'sha-tip'
+        assert stored.merge_sha == 'deadbeef'
 
 
 # ---------------------------------------------------------------------------
