@@ -664,7 +664,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             project_dbs,
             hours=hours,
             now=effective_now,
-            recent_window_minutes=15,
+            recent_window_minutes=1440,
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
     )
