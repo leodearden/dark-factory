@@ -151,6 +151,3 @@ Return ONLY this JSON object (no prose):
 - Merge ONLY through `merge_request`; never a direct `git merge`; never `--no-verify`.
 - One attempt. No retry loops. ABORT on the first sign of doubt.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
-- Future hardening (not yet available): the proposal has no recorded HEAD sha, so the freshness gate
-  is heuristic. If a `head_sha` field is later added to dry-run proposals, treat a mismatch against
-  the current worktree HEAD as a hard ABORT.
