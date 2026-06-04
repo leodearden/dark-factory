@@ -78,7 +78,7 @@ Call `merge_status(request_id)` on a backoff schedule until the state is termina
 mcp__escalation__merge_status(request_id="<request_id from submit>")
 ```
 
-**Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field, use that value as the sleep duration instead (capped at 60 s).
+**Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field whose value is a **positive number**, use that value as the sleep duration (capped at 60 s); if `eta_seconds` is absent or `null`, fall back to the 15 s→60 s backoff schedule.
 
 **Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
 
@@ -117,6 +117,12 @@ The outcome arrives from either the submit call (terminal at submit time) or the
   - Verification failure (tests/lint broke after merge) — fix in your worktree, resubmit.
   - CAS retry limit — main was moving too fast (rare at normal concurrency). Wait a moment and retry.
   - `.task/` contamination detected — check that `.task/` isn't committed on your branch.
+
+**`failed`** — The merge worker encountered an unexpected error (surfaces from the submit call only; `merge_status` collapses this into `blocked`). Treat it the same as `blocked`: read any `failure_diagnostic` or `reason` field, fix the underlying problem, and resubmit.
+
+**`unknown_branch`** — The branch ref does not exist in the target repository (surfaces from the submit call only). Likely causes: the branch name is wrong, the branch was deleted before submission, or the request was routed to the wrong repo's escalation MCP. Verify the branch exists locally (`git branch -a`) and that you're submitting to the correct escalation server.
+
+**`abandoned`** — The submission was cancelled via `merge_cancel` before it finished (surfaces from the poll loop). If the merge is still wanted, resubmit (go back to step 3); otherwise, no further action is needed.
 
 ### 5. Abandoning a submission (merge_cancel)
 
