@@ -137,6 +137,30 @@ def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
     return ' '.join(cmd.split())
 
 
+def _strip_leading_cd(cmd: str | None) -> str | None:
+    """Strip a single leading ``cd <dir> &&`` segment from *cmd*.
+
+    The project's per-subproject lint/type commands begin with
+    ``cd <subproject> && <tool> …`` so each tool runs against that subproject's
+    config (e.g. ``cd fused-memory && npx pyright``).  In the fallback path
+    (:func:`_build_fallback_config`) the touched files live *outside* any
+    module — e.g. a root-level ``tests/scripts/test_spawn_claude.py`` — and the
+    scoped command targets a worktree-root-relative path.  A leading
+    ``cd <subproject> &&`` would then resolve that path inside the wrong
+    directory (``cd fused-memory && npx pyright tests/scripts/…`` → "File or
+    directory does not exist", rc 4).  Removing the leading ``cd … &&`` makes
+    the scoped command run from the worktree root where the path is valid.
+
+    Only the *leading* segment is stripped; any later ``cd`` in the original
+    chain has already been dropped by :func:`_scope_command`, which truncates
+    the command at the first tool keyword.  Commands without a leading ``cd``
+    (the common case) are returned unchanged.
+    """
+    if cmd is None:
+        return None
+    return re.sub(r'^\s*cd\s+\S+\s*&&\s*', '', cmd, count=1)
+
+
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
 # cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
 _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
@@ -1017,8 +1041,16 @@ def _build_fallback_config(
     # _scope_command narrows to the touched files when the standard tool keyword
     # appears in the command, and returns unchanged when it doesn't.
     if config is not None:
-        lint_cmd = _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
-        type_cmd = _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+        # _strip_leading_cd drops a ``cd <subproject> &&`` prefix that the
+        # per-subproject lint/type commands carry: the fallback runs from the
+        # worktree root, so a module-cd would misresolve the root-relative file
+        # path the scoper just inserted.
+        lint_cmd = _strip_leading_cd(
+            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+        )
+        type_cmd = _strip_leading_cd(
+            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+        )
     else:
         lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_cmd = 'pyright ' + ' '.join(py_files)

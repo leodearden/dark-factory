@@ -3746,6 +3746,43 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert result is not None
         assert result.test_command == "uv run --extra dev pytest -m 'not slow'"
 
+    def test_chained_type_command_strips_leading_cd_for_root_file(self, tmp_path: Path) -> None:
+        """A ``cd <subproject> && npx pyright`` chain is rebased to the worktree root.
+
+        Regression for task 1643 / esc-1643-4: the dark-factory
+        ``type_check_command`` runs pyright per-subproject via
+        ``cd fused-memory && npx pyright && cd ../orchestrator && npx pyright``.
+        Scoping it to a root-level test file kept the leading ``cd fused-memory
+        &&``, so pyright resolved the root-relative path inside fused-memory and
+        exited 4 ("File or directory does not exist"). The leading ``cd`` must be
+        stripped so the scoped command runs from the worktree root.
+        """
+        cfg = self._make_config(
+            tmp_path,
+            type_check_command='cd fused-memory && npx pyright && cd ../orchestrator && npx pyright',
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_spawn_claude.py'], cfg)
+        assert result is not None
+        assert result.type_check_command == 'npx pyright tests/scripts/test_spawn_claude.py'
+        assert not result.type_check_command.startswith('cd ')
+
+    def test_uv_run_lint_command_scopes_to_root_file(self, tmp_path: Path) -> None:
+        """``uv run ruff check <dirs>`` scopes to the touched root-level file, runner intact.
+
+        Regression for task 1643 / esc-1643-4: a bare ``ruff check`` scoped to
+        ``ruff check <file>`` exited 127 (ruff not on PATH). With the ``uv run``
+        prefix the scoped command keeps the runner: ``uv run ruff check <file>``.
+        """
+        cfg = self._make_config(
+            tmp_path,
+            lint_command='uv run ruff check shared escalation fused-memory orchestrator dashboard',
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_spawn_claude.py'], cfg)
+        assert result is not None
+        assert result.lint_command == 'uv run ruff check tests/scripts/test_spawn_claude.py'
+
 
 class TestPruneArchiveDedupedAtAggregateSite:
     """Tests ensuring ``_prune_archive`` is called exactly once per

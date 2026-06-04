@@ -12,7 +12,12 @@ max_concurrent_tasks: 24
 # fan-out for non-prefixed source, this command rarely fires; when it does
 # (root conftest.py changes), the fan-out keeps it safe.
 test_command: "cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ && cd ../dashboard && uv run pytest tests/"
-lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
+# ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
+# (only inside each member venv). Without it the fallback scoper (which narrows
+# this to a single touched file for root-level changes) emits a bare ``ruff
+# check <file>`` that exits 127 (command not found). ``uv run ruff`` resolves
+# the workspace venv from root in both the full and scoped forms.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
 # Verification timeouts — dark-factory is Python-only (no cargo builds), so the
