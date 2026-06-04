@@ -228,6 +228,11 @@ unblock_auto:
   max_turns: 50
   effort: "high"
   backend: "claude"
+  # SKILL-FACING: orchestrator code never reads attended_b3_enabled.
+  # Consumed by the unblock-low-risk / escalation-watcher skills (PRD §4.3).
+  attended_b3_enabled: false
+  b3_merge_cap_per_24h: 6
+  b3_proposal_keep_last: 5
 
 # Usage cap handling — multi-account failover
 usage_cap:
