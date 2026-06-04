@@ -52,22 +52,20 @@ def _clear_malformed_metadata_warning_dedup():
 
 
 @pytest.mark.parametrize(
-    'raw,expected_id,expected_parent',
+    'raw,expected_id',
     [
-        ('5', 5, None),
-        ('  10 ', 10, None),
-        (7, 7, None),
-        ('292.1', 1, 292),
-        ('100.42', 42, 100),
+        ('5', 5),
+        ('  10 ', 10),
+        (7, 7),
     ],
 )
-def test_parse_task_id_accepts_dotted_and_bare(raw, expected_id, expected_parent):
-    tid, parent = _parse_task_id(raw)
-    assert tid == expected_id
-    assert parent == expected_parent
+def test_parse_task_id_bare_only(raw, expected_id):
+    """_parse_task_id returns a bare int; dotted ids raise after DF-D step-6."""
+    result = _parse_task_id(raw)
+    assert result == expected_id
 
 
-@pytest.mark.parametrize('raw', ['', 'abc', '1.2.3', '5.x', 'x.5'])
+@pytest.mark.parametrize('raw', ['', 'abc', '1.2.3', '5.x', 'x.5', '292.1', '1.1'])
 def test_parse_task_id_rejects_malformed(raw):
     with pytest.raises(TaskmasterError) as exc:
         _parse_task_id(raw)
@@ -75,8 +73,8 @@ def test_parse_task_id_rejects_malformed(raw):
 
 
 def test_format_task_id_round_trips():
-    assert _format_task_id(7, None) == '7'
-    assert _format_task_id(2, 7) == '7.2'
+    assert _format_task_id(7) == '7'
+    assert _format_task_id(2) == '2'
 
 
 # ── _parse_qualified_dep ───────────────────────────────────────────
@@ -160,10 +158,13 @@ async def test_add_task_then_get_returns_dto(backend, project_root):
     assert one['priority'] == 'high'
     assert one['status'] == 'pending'
     assert one['subtasks'] == []
+    assert 'parentTaskId' not in one
+    assert 'parentId' not in one
 
     listing = await backend.get_tasks(project_root=project_root)
     assert isinstance(listing['tasks'], list)
     assert listing['tasks'][0]['id'] == '1'  # plural get_tasks returns string
+    assert all(t['subtasks'] == [] for t in listing['tasks'])
 
 
 @pytest.mark.asyncio
@@ -666,15 +667,14 @@ async def test_row_to_task_warning_deduplicated_per_id_per_process(
 
     `_get_tasks_internal` invokes `_row_to_task` on every row of every `get_tasks`
     call. A project DB with many corrupted rows would otherwise flood the log
-    with one WARNING per row per call. The dedup gate caches `(tag, parent_id,
+    with one WARNING per row per call. The dedup gate caches `(project_root, tag,
     id)` triples already warned about and skips subsequent emissions for the
     lifetime of the process.
     """
     await backend.add_task(project_root=project_root, title='parent')
     conn = await backend._get_connection(project_root)
     await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_DEDUP' "
-        "WHERE parent_id = 0 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_DEDUP' WHERE id = 1"
     )
     await conn.commit()
 
@@ -742,7 +742,7 @@ async def test_row_to_task_warning_dedup_key_distinguishes_distinct_ids(
 async def test_row_to_task_warning_dedup_distinguishes_project_roots(
     backend, tmp_path, caplog,
 ):
-    """Two project_roots sharing the same (tag, parent_id, id) row emit distinct WARNs.
+    """Two project_roots sharing the same (tag, id) row emit distinct WARNs.
 
     A single SqliteTaskBackend instance services all project_roots.  Before the
     fix, the dedup key was (tag, parent_id, id), so both project_roots' corrupted
@@ -754,20 +754,20 @@ async def test_row_to_task_warning_dedup_distinguishes_project_roots(
     proj_a = str(tmp_path / 'proj_a')
     proj_b = str(tmp_path / 'proj_b')
 
-    # Each project_root gets a canonical (tag=master, parent_id=0, id=1) row.
+    # Each project_root gets a canonical (tag=master, id=1) row.
     await backend.add_task(project_root=proj_a, title='parent_a')
     await backend.add_task(project_root=proj_b, title='parent_b')
 
     # Corrupt both DBs' metadata column with a non-JSON string.
     conn_a = await backend._get_connection(proj_a)
     await conn_a.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE parent_id = 0 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE id = 1"
     )
     await conn_a.commit()
 
     conn_b = await backend._get_connection(proj_b)
     await conn_b.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE parent_id = 0 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE id = 1"
     )
     await conn_b.commit()
 
@@ -783,7 +783,7 @@ async def test_row_to_task_warning_dedup_distinguishes_project_roots(
     assert task_b['metadata'] == {}
 
     # Both project_roots must produce their own WARNING — the dedup tuple
-    # now distinguishes (proj_a, master, 0, 1) from (proj_b, master, 0, 1).
+    # now distinguishes (proj_a, master, 1) from (proj_b, master, 1).
     malformed_msgs = [
         r.message for r in caplog.records
         if r.levelno >= logging.WARNING
@@ -860,26 +860,23 @@ async def test_remove_tasks_atomicity_on_malformed_id(backend, project_root):
 
 @pytest.mark.asyncio
 async def test_remove_tasks_rejects_nested_subtask_id_atomically(backend, project_root):
-    """remove_tasks raises INVALID_TASK_ID for 3+-level nested ids and rolls back.
+    """remove_tasks raises INVALID_TASK_ID for any dotted id and rolls back.
 
-    Regression contract: the nested-subtask-id path propagates through the
-    public ``remove_tasks`` API surface (not just the private ``_parse_task_id``
-    helper) and the entire batch is aborted — no rows are deleted.
+    After DF-D step-6, _parse_task_id rejects ALL dotted ids — not only
+    3+-level nested ones. The whole batch must fail before any delete runs.
     """
     await backend.add_task(project_root=project_root, title='alpha')
     await backend.add_task(project_root=project_root, title='beta')
 
     with pytest.raises(TaskmasterError) as exc_info:
-        # '1.2.3' is a 3-level nested id — not supported; the whole batch
-        # must fail before any delete runs.
+        # '1.1' is a single-level dotted id — all dotted ids are now invalid.
         await backend.remove_tasks(
-            ['1', '1.2.3', '2'], project_root=project_root,
+            ['1', '1.1', '2'], project_root=project_root,
         )
 
     assert exc_info.value.code == 'INVALID_TASK_ID'
-    # Key off the offending id repr rather than pinning the prose — proves the
-    # right path fired without coupling to exact wording in _parse_task_id.
-    assert "'1.2.3'" in exc_info.value.message
+    # Key off the offending id repr rather than pinning the prose.
+    assert "'1.1'" in exc_info.value.message
 
     # State must be unchanged — both tasks still present.
     listing = await backend.get_tasks(project_root=project_root)
@@ -1048,6 +1045,27 @@ async def test_qualified_dep_self_raises_mixed_case(backend, project_root):
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'cannot depend on itself' in str(exc.value)
 
+
+@pytest.mark.asyncio
+async def test_add_dependency_rejects_dotted_dependent_id(backend, project_root):
+    """add_dependency raises INVALID_TASK_ID when the dependent task id is dotted.
+
+    After DF-D step-6, _parse_task_id rejects all dotted ids, so '1.1' as the
+    dependent (first) arg must raise — not silently route to a subtask row.
+    """
+    await backend.add_task(project_root=project_root, title='a')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_dependency('1.1', 'dark_factory:5', project_root=project_root)
+    assert exc.value.code == 'INVALID_TASK_ID'
+
+
+@pytest.mark.asyncio
+async def test_remove_dependency_rejects_dotted_dependent_id(backend, project_root):
+    """remove_dependency raises INVALID_TASK_ID when the dependent task id is dotted."""
+    await backend.add_task(project_root=project_root, title='a')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.remove_dependency('1.1', 'dark_factory:5', project_root=project_root)
+    assert exc.value.code == 'INVALID_TASK_ID'
 
 
 # ── remove_dependency — qualified (cross-project) tests ────────────
