@@ -4508,15 +4508,15 @@ Output JSON matching the schema. Every task must appear in the output.
         Returns False → withhold the flip (threshold reached).
 
         Counter logic (C5):
-          - Read fresh metadata via scheduler.get_task.
+          - Read fresh metadata via scheduler.get_task (fresh each incarnation).
           - Compute new signature via _reblock_signature.
-          - If prev_signature == new_sig: new_count = prev_count + 1 (step-6 adds this branch).
-          - Otherwise: new_count = 1 (signature reset — step-6 adds this branch).
-          - Persist via scheduler.update_task(append=True) BEFORE the flip (crash-safe:
-            a crash over-counts, never under-counts — C5 ordering).
-          - At threshold (step-8 adds threshold check): withhold + file L2.
-
-        Steps 4 (initial scaffold): always increment (no reset branch yet), always return True.
+          - Same-sig → prev_count + 1; different-sig → reset to 1.
+          - Withhold iff same-sig AND prev_count >= _REBLOCK_GUARD_THRESHOLD
+            (check BEFORE incrementing — so 3 same-sig flips proceed and the
+            4th is withheld; this matches the "4th flip withheld" contract).
+          - Otherwise: increment/reset, persist via update_task(append=True)
+            BEFORE the flip (crash-safe: over-count never under-count — C5),
+            then return True.
         """
         new_sig = self._reblock_signature(escalation)
 
@@ -4531,10 +4531,18 @@ Output JSON matching the schema. Every task must appear in the output.
             prev_count = 0
             prev_signature = None
 
+        same_sig = (prev_signature is not None and prev_signature == new_sig)
+
+        # Threshold check (check-before-flip ordering — see design decision):
+        # same-sig AND prev_count >= threshold → withhold + file L2.
+        if same_sig and prev_count >= _REBLOCK_GUARD_THRESHOLD:
+            self._file_reblock_guard_l2(task_id, prev_count, new_sig)
+            return False
+
         # Same signature → increment; different signature → reset to 1.
         # Mirrors _check_*_thrash shape: same-sig +1, different-sig reset to 1
         # (reset to 1 = "we just saw one"; reset to 0 would lose the current flip).
-        if prev_signature is not None and prev_signature == new_sig:
+        if same_sig:
             new_count = prev_count + 1
         else:
             new_count = 1
@@ -4546,6 +4554,62 @@ Output JSON matching the schema. Every task must appear in the output.
         )
 
         return True
+
+    def _file_reblock_guard_l2(self, task_id: str, prev_count: int, sig: str) -> None:
+        """File a born-at-L2 human escalation when the re-block guard threshold is hit.
+
+        Mirrors _file_watcher_outage_l2:
+          - No-op when _escalation_queue is None (bare-Harness unit tests).
+          - Deduped via find_pending_l2_by_root_cause(root_cause) so repeated
+            trips for the same stuck task file exactly one L2.
+          - Best-effort: all exceptions are swallowed (same pattern as
+            _file_watcher_outage_l2) so this never breaks the re-pend path.
+          - agent_role='harness-reblock-guard' — a harness-sentinel that stays
+            born-at-L2 under the C4 allowlist (severity='urgent').
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
+            return
+        try:
+            root_cause = f'reblock-guard:{task_id}'
+            if queue.find_pending_l2_by_root_cause(root_cause) is not None:
+                return  # dedup: one open L2 per stuck task
+            from escalation.models import Escalation
+            summary = (
+                f'persistent re-block: {prev_count} redispatches, signature {sig}'
+            )[:200]
+            detail = (
+                f'Task {task_id} has been re-blocked {prev_count} time(s) with the '
+                f'same failure signature, reaching the _REBLOCK_GUARD_THRESHOLD.\n\n'
+                f'Signature: {sig}\n\n'
+                f'The automatic blocked→pending flip is now suppressed for this '
+                f'signature.  Investigate the root cause, fix the underlying issue, '
+                f'and clear metadata.reblock_guard on the task to allow future '
+                f're-pends to proceed.'
+            )
+            esc = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='harness-reblock-guard',
+                severity='urgent',
+                category='task_failure',
+                level=2,
+                root_cause=root_cause,
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_reblock_loop',
+            )
+            queue.submit(esc)
+            logger.warning(
+                'reblock-guard: task %s hit threshold (count=%d, sig=%r); '
+                'flip withheld, L2 filed %s',
+                task_id, prev_count, sig, esc.id,
+            )
+        except Exception:
+            logger.warning(
+                'reblock-guard: failed to file L2 for task %s', task_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _reblock_signature(escalation) -> str:
