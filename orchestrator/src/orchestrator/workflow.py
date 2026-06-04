@@ -316,7 +316,7 @@ class TaskWorkflow:
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
         merge_worker=None,
-        merge_inflight_registry: 'InFlightMergeRegistry | None' = None,
+        merge_inflight_registry: InFlightMergeRegistry | None = None,
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
         cancel_event: asyncio.Event | None = None,

@@ -9,6 +9,7 @@ Verifies that:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,7 +19,6 @@ from _orch_helpers import _init_harness_state_for_test
 from orchestrator.harness import Harness
 from orchestrator.merge_queue import InFlightMergeRegistry
 from orchestrator.scheduler import TaskAssignment
-
 
 # ---------------------------------------------------------------------------
 # Shared harness builder (mirrors test_harness_startup_get_statuses)
@@ -96,12 +96,11 @@ class TestStartEscalationServerInjectsRegistry:
         )
 
         # Clean up the escalation background task if it's still running
-        if hasattr(h, '_escalation_task') and not h._escalation_task.done():
-            h._escalation_task.cancel()
-            try:
-                await h._escalation_task
-            except asyncio.CancelledError:
-                pass
+        task = getattr(h, '_escalation_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +193,5 @@ class TestRunSlotInjectsRegistryIntoWorkflow:
             if tid in h._workflow_slot_tasks:
                 h.hard_cancel_workflow(tid)
             wrapper_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await wrapper_task
-            except (asyncio.CancelledError, Exception):
-                pass

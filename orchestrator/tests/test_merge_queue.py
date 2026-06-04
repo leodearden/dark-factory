@@ -9744,7 +9744,9 @@ class TestRegisterAndEnqueue:
 
         assert acquired is True
         assert registry.is_inflight('B') is True
-        assert registry.entry('B').task_id == 'B'
+        entry_b = registry.entry('B')
+        assert entry_b is not None
+        assert entry_b.task_id == 'B'
         assert queue.qsize() == 1
 
     async def test_release_on_resolve_allows_redispatch(
@@ -9815,7 +9817,9 @@ class TestRegisterAndEnqueue:
         # Still enqueued — workflow must not deadlock
         assert queue.qsize() == 1
         # Slot is still owned by the original holder
-        assert registry.entry('B').task_id == 'other'
+        entry_b = registry.entry('B')
+        assert entry_b is not None
+        assert entry_b.task_id == 'other'
 
         # Cleanup
         other_future.cancel()

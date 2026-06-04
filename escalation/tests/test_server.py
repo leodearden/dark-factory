@@ -1278,9 +1278,7 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeOutcome,
             MergeRequest,
             register_and_enqueue_merge_request,
         )

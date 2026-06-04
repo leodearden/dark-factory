@@ -521,8 +521,9 @@ class TestWorkflowMergeInflightRegistry:
 
     def test_registry_stored_when_provided(self, tmp_path: Path):
         """Constructor stores the injected registry on self.merge_inflight_registry."""
-        sentinel = object()
-        wf = _make_workflow(tmp_path=tmp_path)
+        from orchestrator.merge_queue import InFlightMergeRegistry
+        sentinel = InFlightMergeRegistry()
+        _make_workflow(tmp_path=tmp_path)
         # Directly re-construct with the kwarg to check storage
         assignment = MagicMock()
         assignment.task_id = '999'
