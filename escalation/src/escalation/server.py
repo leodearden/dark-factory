@@ -1248,6 +1248,14 @@ def create_server(
                 ),
             }
 
+        if rec.future.cancelled():
+            # Idempotent double-cancel: future is already cancelled.
+            return {
+                'cancelled': False,
+                'state': 'abandoned',
+                'reason': 'Request was already cancelled.',
+            }
+
         # Pending waiter — cancel the future.
         rec.future.cancel()
         return {'cancelled': True, 'state': 'abandoned', 'reason': None}
