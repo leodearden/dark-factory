@@ -102,9 +102,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    risk axis — so every ABORT before this step (preconditions, scope check, rebase conflict, verify
    failure) spends no slot and is free by design.
 
-   Note: once `charged: true` is returned the slot is consumed even if the subsequent `merge_request`
-   returns an error or a non-success outcome (`conflict`, `blocked`, `failed`) — those post-charge
-   aborts cost a slot. This is the accepted §4.2 tradeoff.
+   Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
+   Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
+   slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
+   `abandoned`, `superseded`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
+   post-charge aborts cost a slot. This is the accepted §4.2 tradeoff.
 
 8. **Merge via the queue — never directly.** Submit:
 
@@ -209,6 +211,12 @@ Return ONLY this JSON object (no prose):
   any `drift` or `abort` verdict → ABORT with the gate's `reason` verbatim.
 - **Rolling-24h merge cap enforced by `b3_gate charge`** (step 7, immediately before `merge_request`):
   a refused charge (`charged: false`) → ABORT. All aborts before this step cost no slot.
-- Merge ONLY through `merge_request`; never a direct `git merge`; never `--no-verify`.
+- Merge ONLY through `merge_request` with explicit `wait_secs=100`; completion is awaited ONLY via
+  `merge_status` polling (15 s→60 s backoff using `eta_seconds`); never a direct `git merge`;
+  never `--no-verify`.
+- **Cancel on abort:** any ABORT after a successful submission (a `request_id` was returned) MUST
+  call `merge_cancel(request_id)` first — so no durable-intent entry outlives the aborted run.
+  Skip only when `already_merged` (no `request_id` exists). The call is a safe no-op on terminal
+  entries.
 - One attempt. No retry loops. ABORT on the first sign of doubt.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
