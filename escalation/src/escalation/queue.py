@@ -578,16 +578,14 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``,
-        ``dedupe_children``, and ``severity`` is *not* atomic: two concurrent
-        callers for the same parent each read the same pre-mutation snapshot,
-        both append once and both write with the same incremented count, and
-        the second rewrite silently clobbers the first — losing a child and
-        potentially reverting a severity promotion.  The caller must serialize
-        concurrent attaches against the same parent.  Today this invariant
-        holds because the MCP server is single-writer; any multi-writer
-        migration must add explicit serialization for all three fields before
-        calling this function.
+        **Concurrency contract (sidecar flock).**  All three mutations —
+        ``dedupe_count``, ``dedupe_children``, and ``severity`` — are serialized
+        per-id by ``escalation_id_lock``.  Concurrent attaches from multiple
+        processes are therefore safe: no child is lost, no count is reverted,
+        and no severity promotion is undone.  The lock target is the stable
+        sidecar ``{parent_id}.json.lock`` (see ``escalation_id_lock`` for the
+        PRD-D3 rationale; different parent ids take different sidecars —
+        no cross-id contention).
 
         Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
         NOT fall back to the archive.  This ensures that resolved / dismissed
@@ -621,18 +619,19 @@ class EscalationQueue:
            to the same canonical parent by fingerprint without the parent ever
            losing its fingerprint identity after the first write.
         """
-        path = self.queue_dir / f'{parent_id}.json'
-        if not path.exists():
-            return None
-        try:
-            parent = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
-            return None
-        parent.dedupe_children.append(child_id)
-        parent.dedupe_count += 1
-        parent.severity = _max_severity(parent.severity, child_severity)
-        self._rewrite(parent_id, parent)
+        with escalation_id_lock(self.queue_dir, parent_id):
+            path = self.queue_dir / f'{parent_id}.json'
+            if not path.exists():
+                return None
+            try:
+                parent = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
+                return None
+            parent.dedupe_children.append(child_id)
+            parent.dedupe_count += 1
+            parent.severity = _max_severity(parent.severity, child_severity)
+            self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
             f'(dedupe_count={parent.dedupe_count}, severity={parent.severity})'
