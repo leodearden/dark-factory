@@ -37,7 +37,7 @@ mcp__escalation__get_pending_escalations()
 ```
 
 - **If it responds:** proceed to step 3 (use the merge queue).
-- **If it errors or times out:** the orchestrator isn't running. Fall back to direct merge (step 5).
+- **If it errors or times out:** the orchestrator isn't running. Fall back to direct merge (step 6).
 
 ### 3. Submit the merge request
 
@@ -114,7 +114,24 @@ The outcome arrives from either the submit call (terminal at submit time) or the
   - CAS retry limit — main was moving too fast (rare at normal concurrency). Wait a moment and retry.
   - `.task/` contamination detected — check that `.task/` isn't committed on your branch.
 
-### 5. Fallback: direct merge
+### 5. Abandoning a submission (merge_cancel)
+
+To abandon a submitted merge — for example, the work was superseded, the wrong branch was submitted, or the queued entry is redundant — call:
+
+```
+mcp__escalation__merge_cancel(request_id="<request_id from submit>")
+```
+
+The response is `{ cancelled, state, reason }`:
+
+- **`cancelled: true`** with `state: "abandoned"` — a pending waiter was dropped. The merge will not proceed.
+- **`cancelled: false`** — the request was already finalized (terminal), unknown, or already cancelled. The `state` and `reason` fields explain why.
+
+**Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
+
+If your submit returned `status: "attached"`, your submission was coalesced with an in-flight entry. Cancel using the `request_id` returned with that `attached` response — it points to the shared in-flight entry.
+
+### 6. Fallback: direct merge
 
 If the escalation MCP is down (orchestrator not running), merge directly. There's no queue to race with.
 
