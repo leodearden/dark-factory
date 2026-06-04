@@ -19,6 +19,7 @@ import logging
 import posixpath
 import shutil
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1523,6 +1524,60 @@ guaranteed bound — cold npm+cargo builds vary widely.  Tests must NOT
 assert a specific numeric value for ETA."""
 
 
+@dataclass
+class TerminalOutcomeRecord:
+    """Immutable record of a MergeRequest's terminal outcome.
+
+    Stored in the TerminalOutcomeRetention ring for O(1) hot-path lookups.
+    The event store (merge_finalized rows) is the durable tier, so ring
+    eviction is lossless — evicted ids fall through to event-store queries.
+    """
+
+    request_id: str
+    task_id: str
+    branch: str
+    state: str
+    """Terminal state: MergeOutcome.status value, 'abandoned' (cancelled), or 'error'."""
+    snapshot_tip: str | None = None
+    merge_sha: str | None = None
+    finished_at: float = field(default_factory=time.time, kw_only=True)
+
+
+class TerminalOutcomeRetention:
+    """Bounded in-memory ring of recent terminal merge outcomes.
+
+    Backed by a ``collections.deque(maxlen=maxlen)`` for eviction and a
+    ``dict`` index keyed by ``request_id`` for O(1) lookups.  When the ring
+    is full, the oldest entry is evicted from both structures atomically.
+
+    The event store is the durable tier so eviction is lossless — α3's
+    merge_status falls through to event-store queries for evicted ids.
+    """
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._ring: collections.deque[TerminalOutcomeRecord] = collections.deque(maxlen=maxlen)
+        self._index: dict[str, TerminalOutcomeRecord] = {}
+
+    def record(self, rec: TerminalOutcomeRecord) -> None:
+        """Append *rec* to the ring, evicting the oldest entry from the index if full."""
+        if len(self._ring) == self._ring.maxlen:
+            # Capture the about-to-be-evicted entry before appending.
+            evicted = self._ring[0]
+            self._ring.append(rec)
+            # Only remove the index entry if it still points to *evicted* — a
+            # duplicate request_id (pathological case) should not evict the
+            # newer entry.
+            if self._index.get(evicted.request_id) is evicted:
+                del self._index[evicted.request_id]
+        else:
+            self._ring.append(rec)
+        self._index[rec.request_id] = rec
+
+    def get(self, request_id: str) -> TerminalOutcomeRecord | None:
+        """Return the record for *request_id*, or None if evicted / not yet recorded."""
+        return self._index.get(request_id)
+
+
 class InFlightMergeRegistry:
     """Per-branch in-flight de-dup registry for the merge-request chokepoint.
 
@@ -1633,6 +1688,8 @@ async def enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
     event_store: EventStore | None,
+    *,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
 
@@ -1644,7 +1701,74 @@ async def enqueue_merge_request(
     If ``event_store`` is None the request is still enqueued; emission is
     silently skipped (mirrors the None-safe pattern used by
     ``_emit_merge_attempt``).
+
+    Registers a single ``req.result.add_done_callback`` that, when the future
+    reaches its terminal state (resolved, cancelled, or exception), emits a
+    ``merge_finalized`` event and records the outcome into *retention* (when
+    provided).  The callback is fire-and-forget: any exception is logged as a
+    warning and never propagates.
     """
+    def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
+        # --- derive terminal state -------------------------------------------
+        try:
+            if fut.cancelled():
+                state: str = 'abandoned'
+                merge_sha: str | None = None
+            elif fut.exception() is not None:
+                state = 'error'
+                merge_sha = None
+            else:
+                outcome: MergeOutcome = fut.result()
+                state = outcome.status
+                merge_sha = outcome.merge_sha
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'enqueue_merge_request: _on_finalized could not derive terminal '
+                'state for request_id=%s task_id=%s',
+                req.request_id, req.task_id, exc_info=True,
+            )
+            return
+        # --- in-memory hot tier (recorded before durable tier so a DB failure
+        #     does not also degrade the O(1) lookup ring) --------------------
+        if retention is not None:
+            try:
+                retention.record(TerminalOutcomeRecord(
+                    request_id=req.request_id,
+                    task_id=req.task_id,
+                    branch=req.branch,
+                    state=state,
+                    snapshot_tip=req.snapshot_tip,
+                    merge_sha=merge_sha,
+                ))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'enqueue_merge_request: _on_finalized retention.record failed '
+                    'for request_id=%s task_id=%s',
+                    req.request_id, req.task_id, exc_info=True,
+                )
+        # --- durable tier ----------------------------------------------------
+        if event_store is not None:
+            try:
+                event_store.emit(
+                    EventType.merge_finalized,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={
+                        'request_id': req.request_id,
+                        'branch': req.branch,
+                        'state': state,
+                        'snapshot_tip': req.snapshot_tip,
+                        'merge_sha': merge_sha,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'enqueue_merge_request: _on_finalized event_store.emit failed '
+                    'for request_id=%s task_id=%s',
+                    req.request_id, req.task_id, exc_info=True,
+                )
+
+    req.result.add_done_callback(_on_finalized)
     await queue.put(req)
     _emit_merge_queued(event_store, req)
 
@@ -1654,6 +1778,8 @@ async def register_and_enqueue_merge_request(
     req: MergeRequest,
     event_store: EventStore | None,
     registry: InFlightMergeRegistry | None,
+    *,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> bool:
     """Workflow-path enqueue that registers the branch in the in-flight registry.
 
@@ -1670,6 +1796,13 @@ async def register_and_enqueue_merge_request(
     explicitly to avoid a leak — mirroring the guard in
     ``coalesce_or_enqueue_merge_request`` (merge_queue.py:1794-1803).
 
+    When *retention* is provided it is forwarded to the single
+    :func:`enqueue_merge_request` chokepoint so the dominant workflow path
+    populates the in-memory ring alongside the MCP path (see
+    :func:`coalesce_or_enqueue_merge_request`).  Existing call sites in
+    workflow.py pass only positional args so this keyword-only param is
+    backwards-compatible.
+
     Returns True if the registry slot was newly acquired (caller's branch was
     free); False if the slot was already held by another task or *registry* is
     None.  The return value is informational — the request is always enqueued.
@@ -1680,7 +1813,7 @@ async def register_and_enqueue_merge_request(
         else False
     )
     try:
-        await enqueue_merge_request(queue, req, event_store)
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
     except BaseException:
         # Slot-leak guard: if the enqueue raises before the worker can ever
         # resolve req.result, the done_callback will never fire.  Release the
@@ -1766,6 +1899,7 @@ async def coalesce_or_enqueue_merge_request(
     git_ops: _FindInflightWorktreeP | None = None,
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
@@ -1789,6 +1923,13 @@ async def coalesce_or_enqueue_merge_request(
     **NOT** used by workflow.py's single-task or train paths — those call
     :func:`enqueue_merge_request` directly.  This function is the
     ``merge_request`` MCP tool's entry point only.
+
+    When *retention* is provided it is forwarded to the single
+    :func:`enqueue_merge_request` chokepoint so the MCP path populates
+    the ring alongside the workflow path (see
+    :func:`register_and_enqueue_merge_request`).  Coalesced requests
+    are NOT recorded — their terminal outcome is owned by the in-flight
+    entry's callback.
     """
     branch = req.branch
 
@@ -1848,7 +1989,7 @@ async def coalesce_or_enqueue_merge_request(
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result):
         try:
-            await enqueue_merge_request(queue, req, event_store)
+            await enqueue_merge_request(queue, req, event_store, retention=retention)
         except BaseException:
             # Slot leak guard: if the enqueue raises (e.g. queue closed,
             # cancellation) before the worker can ever resolve req.result,
@@ -1889,6 +2030,13 @@ class MergeRequest:
     config: OrchestratorConfig
     result: asyncio.Future[MergeOutcome] = field(repr=False)
     enqueued_at: float = field(default_factory=time.time, kw_only=True)
+    request_id: str = field(
+        default_factory=lambda: f'mr-{uuid.uuid4().hex[:8]}',
+        kw_only=True,
+    )
+    """Stable per-instance identity for this merge request (e.g. 'mr-a1b2c3d4')."""
+    snapshot_tip: str | None = field(default=None, kw_only=True)
+    """Optional git ref / SHA of the snapshot tip used by α3 merge-status lookups."""
 
 
 @dataclass

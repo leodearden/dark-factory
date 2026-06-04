@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -32,6 +33,8 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    TerminalOutcomeRecord,
+    TerminalOutcomeRetention,
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
@@ -40,6 +43,7 @@ from orchestrator.merge_queue import (
     _is_speculation_race,
     _verify_hit_enospc,
     coalesce_or_enqueue_merge_request,
+    register_and_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
 
@@ -4468,6 +4472,362 @@ class TestEnqueueMergeRequest:
         dequeued = queue.get_nowait()
         assert dequeued is req
 
+    @pytest.mark.asyncio
+    async def test_enqueue_registers_terminal_callback_emitting_merge_finalized(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """enqueue_merge_request registers a done-callback that emits merge_finalized.
+
+        Resolving req.result triggers the callback; one merge_finalized row
+        must appear with the correct request_id, state, branch, and merge_sha.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-mf-test')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Resolve the future — the done-callback should fire
+        req.result.set_result(MergeOutcome(status='done', merge_sha='abc123'))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.branch') AS branch, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == '42'           # task_id
+        assert rows[0][2] == req.request_id  # data.request_id
+        assert rows[0][3] == 'done'          # data.state
+        assert rows[0][4] == 'task/42'       # data.branch
+        assert rows[0][5] == 'abc123'        # data.merge_sha
+
+    @pytest.mark.asyncio
+    async def test_cancelled_future_is_recorded_as_abandoned(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A cancelled future triggers a merge_finalized row with state=='abandoned'.
+
+        Covers PRD D7 — cancelled futures must be finalized, not silently dropped.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_cancel.db'
+        event_store = EventStore(db_path, 'run-cancel-test')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('99', 'task/99', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Cancel the future — the done-callback must handle it
+        req.result.cancel()
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == req.request_id
+        assert rows[0][2] == 'abandoned'
+        assert rows[0][3] is None  # no merge_sha for abandoned
+
+    @pytest.mark.asyncio
+    async def test_retention_records_resolved_outcome(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When retention is passed, resolving the future populates the ring."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_ret.db'
+        event_store = EventStore(db_path, 'run-retention')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        # Build request with snapshot_tip so we can verify it is captured
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='77',
+            branch='task/77',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            snapshot_tip='tip-sha-0077',
+        )
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.set_result(MergeOutcome(status='done', merge_sha='sha9'))
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'sha9'
+        assert stored.snapshot_tip == 'tip-sha-0077'
+        assert stored.branch == 'task/77'
+        assert stored.task_id == '77'
+
+    @pytest.mark.asyncio
+    async def test_retention_records_abandoned_outcome(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When retention is passed, cancelling the future records state=='abandoned'."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_ret2.db'
+        event_store = EventStore(db_path, 'run-retention2')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt2'
+        wt.mkdir()
+        req = _make_request('88', 'task/88', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.cancel()
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'abandoned'
+        assert stored.merge_sha is None
+
+    @pytest.mark.asyncio
+    async def test_exception_future_is_recorded_as_error(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A future resolved with set_exception() is finalized as state=='error'.
+
+        Covers the elif fut.exception() branch of _on_finalized.  Verifies:
+        - merge_finalized row with state=='error' and merge_sha IS NULL
+        - retention record (when provided) also carries state=='error', merge_sha=None
+        - fut.exception() is called inside the callback so asyncio never emits
+          an 'exception was never retrieved' warning
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_exc.db'
+        event_store = EventStore(db_path, 'run-exc-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt_exc'
+        wt.mkdir()
+        req = _make_request('55', 'task/55', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        # Resolve with an exception — the callback must handle it without
+        # raising into the event loop
+        req.result.set_exception(RuntimeError('worker blew up'))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        # --- durable tier assertion ------------------------------------------
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == '55'            # task_id
+        assert rows[0][2] == req.request_id  # data.request_id
+        assert rows[0][3] == 'error'         # data.state
+        assert rows[0][4] is None            # data.merge_sha must be NULL
+
+        # --- in-memory hot tier assertion ------------------------------------
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'error'
+        assert stored.merge_sha is None
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestIdentity — step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestIdentity:
+    """MergeRequest.request_id and .snapshot_tip identity field contract."""
+
+    @pytest.mark.asyncio
+    async def test_request_id_format(self, config: OrchestratorConfig, tmp_path: Path) -> None:
+        """(a) request_id matches ^mr-[0-9a-f]{8}$."""
+        req = _make_request('1', 'task/1', tmp_path, config)
+        assert re.fullmatch(r'^mr-[0-9a-f]{8}$', req.request_id), (
+            f'request_id {req.request_id!r} does not match ^mr-[0-9a-f]{{8}}$'
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_id_is_unique_per_instance(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(b) Two independently-built requests have different request_id."""
+        req1 = _make_request('1', 'task/1', tmp_path, config)
+        req2 = _make_request('2', 'task/2', tmp_path, config)
+        assert req1.request_id != req2.request_id
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tip_defaults_to_none(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(c) snapshot_tip defaults to None."""
+        req = _make_request('1', 'task/1', tmp_path, config)
+        assert req.snapshot_tip is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tip_accepts_explicit_value(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(d) snapshot_tip carries an explicitly-set value."""
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='1',
+            branch='task/1',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            snapshot_tip='abc123def',
+        )
+        assert req.snapshot_tip == 'abc123def'
+
+    def test_group_merge_request_still_constructs(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(e) GroupMergeRequest still constructs; exposes auto request_id + snapshot_tip=None.
+
+        Uses MagicMock for the Future so this test runs outside an event loop.
+        """
+        future: asyncio.Future[MergeOutcome] = MagicMock(spec=asyncio.Future)
+        status_check_mock = AsyncMock(return_value={})
+        mark_done_mock = AsyncMock()
+        greq = GroupMergeRequest(
+            task_id='tip',
+            branch='task/tip',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-1',
+            member_task_ids=['tip'],
+            tip_branch='task/tip',
+            tip_task_id='tip',
+            status_check=status_check_mock,
+            mark_member_done=mark_done_mock,
+        )
+        assert re.fullmatch(r'^mr-[0-9a-f]{8}$', greq.request_id)
+        assert greq.snapshot_tip is None
+
+
+# ---------------------------------------------------------------------------
+# TestTerminalOutcomeRetention — step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalOutcomeRetention:
+    """Unit tests for the TerminalOutcomeRecord + TerminalOutcomeRetention ring."""
+
+    def _make_record(self, request_id: str, state: str = 'done') -> TerminalOutcomeRecord:
+        return TerminalOutcomeRecord(
+            request_id=request_id,
+            task_id=f'task-{request_id}',
+            branch=f'task/{request_id}',
+            state=state,
+            snapshot_tip=None,
+            merge_sha=None,
+        )
+
+    def test_record_and_get(self) -> None:
+        """record(rec) then get(req_id) returns the same record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = self._make_record('mr-aabbccdd')
+        ring.record(rec)
+        result = ring.get('mr-aabbccdd')
+        assert result is not None
+        assert result is rec
+        assert result.state == 'done'
+        assert result.task_id == 'task-mr-aabbccdd'
+
+    def test_get_missing_returns_none(self) -> None:
+        """get() on an unknown request_id returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get('mr-doesnotexist') is None
+
+    def test_eviction_syncs_index(self) -> None:
+        """Oldest entry is evicted from both ring and dict index when ring is full."""
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = self._make_record('mr-aaaaaaaa')
+        rec_b = self._make_record('mr-bbbbbbbb')
+        rec_c = self._make_record('mr-cccccccc')
+
+        ring.record(rec_a)
+        ring.record(rec_b)
+        ring.record(rec_c)  # evicts rec_a
+
+        # Oldest (a) is evicted
+        assert ring.get('mr-aaaaaaaa') is None
+        # Two newest remain
+        assert ring.get('mr-bbbbbbbb') is rec_b
+        assert ring.get('mr-cccccccc') is rec_c
+
+    def test_snapshot_tip_and_merge_sha_are_stored(self) -> None:
+        """Fields snapshot_tip and merge_sha are preserved on the record."""
+        ring = TerminalOutcomeRetention(maxlen=5)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-12345678',
+            task_id='42',
+            branch='task/42',
+            state='done',
+            snapshot_tip='sha-tip',
+            merge_sha='deadbeef',
+        )
+        ring.record(rec)
+        stored = ring.get('mr-12345678')
+        assert stored is not None
+        assert stored.snapshot_tip == 'sha-tip'
+        assert stored.merge_sha == 'deadbeef'
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
@@ -4740,7 +5100,7 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         merge_queue_mock.put.side_effect = _put_resolves_future
 
         # After step-12: enqueue_merge_request is called → resolve future via mock.
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
@@ -4791,7 +5151,7 @@ class TestEscalationServerUsesEnqueueHelper:
         stub_config._module_configs = {}
 
         # Mock resolves the future so the tool doesn't hang
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
@@ -4856,7 +5216,7 @@ class TestEscalationServerMergeRequestModuleConfigsNone:
         stub_config = OrchestratorConfig(project_root=tmp_path)
 
         # Mock resolves the future so the tool doesn't hang
-        async def _mock_enqueue(queue, req, es):
+        async def _mock_enqueue(queue, req, es, **kwargs):
             if not req.result.done():
                 req.result.set_result(MergeOutcome('done'))
 
@@ -7302,6 +7662,39 @@ class TestCoalesceOrEnqueueRegistryOnly:
 
         # Clean up the never-resolving future to avoid ResourceWarning
         other_future.cancel()
+
+    async def test_retention_forwarded_through_coalesce(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """coalesce_or_enqueue_merge_request forwards retention to enqueue chokepoint.
+
+        After a dispatched request's future resolves, the retention ring must
+        contain a record and a merge_finalized row must exist in the event store.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        req = _make_request('777', '777', tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result.dispatched is True
+
+        # Resolve the future → done-callback fires
+        req.result.set_result(MergeOutcome(status='done', merge_sha='cf1'))
+        await asyncio.sleep(0)
+
+        # Ring must have the record
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'cf1'
+
+        # merge_finalized row must exist in the event store
+        assert _count_events(event_store.db_path, 'merge_finalized') == 1
 
 
 # ---------------------------------------------------------------------------
@@ -9844,8 +10237,6 @@ class TestRegisterAndEnqueue:
     ):
         """(e) slot-leak guard: if enqueue_merge_request raises after acquire,
         the slot is released and the exception propagates."""
-        from orchestrator.merge_queue import register_and_enqueue_merge_request
-
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
         req = _make_request('B', 'B', tmp_path, config)
@@ -9863,3 +10254,39 @@ class TestRegisterAndEnqueue:
         assert registry.is_inflight('B') is False
         # The queue must be empty — the patched enqueue_merge_request never put.
         assert queue.qsize() == 0
+
+    async def test_retention_forwarded_through_register_and_enqueue(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """register_and_enqueue_merge_request forwards retention to the chokepoint.
+
+        After the dispatched request's future resolves, the retention ring must
+        contain a TerminalOutcomeRecord keyed by request_id, and a
+        merge_finalized row must exist in the event store.  Mirrors the
+        coalesce-path test (TestCoalesceOrEnqueueRegistryOnly) for the dominant
+        workflow path.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+        req = _make_request('rae-ret', 'rae-ret', tmp_path, config)
+
+        await register_and_enqueue_merge_request(
+            queue, req, event_store, registry, retention=retention,
+        )
+
+        # Resolve the future → done-callback fires
+        req.result.set_result(MergeOutcome(status='done', merge_sha='rae1'))
+        await asyncio.sleep(0)
+
+        # Ring must have the record
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'rae1'
+        assert stored.branch == req.branch
+        assert stored.task_id == req.task_id
+
+        # merge_finalized row must exist in the event store
+        assert _count_events(event_store.db_path, 'merge_finalized') == 1
