@@ -2823,3 +2823,75 @@ class TestFetchLiveMergeQueuesFailure:
 
         assert result['proj8313']['entries'] == []
         assert result['proj8313']['reachable'] is False
+
+
+# ---------------------------------------------------------------------------
+# TestResolveActive (task-1606 step-7)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveActive:
+    """Tests for resolve_active(label, live_map, fallback_active) -> dict."""
+
+    def test_live_reachable_non_empty_uses_live_approximate_false(self):
+        """(a) live_map[label].reachable=True with entries → {entries: live, approximate: False}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        live_entries = [
+            {'task_id': '99', 'branch': 'task/99', 'state': 'queued',
+             'age_secs': 120.0, 'position': 1, 'waiter_alive': True},
+        ]
+        live_map = {'myproj': {'reachable': True, 'entries': live_entries}}
+        fallback = [{'task_id': 'fallback', 'state': 'queued'}]
+
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is False
+        assert result['entries'] == live_entries
+
+    def test_live_reachable_empty_uses_empty_not_fallback(self):
+        """(b) Authoritative empty queue → {entries: [], approximate: False} — no fallback.
+
+        AC3 (no-fabrication): if the live orchestrator says nothing is queued,
+        we must show empty, not fall back to the event-derived approximation.
+        """
+        from dashboard.data.merge_queue import resolve_active
+
+        live_map = {'myproj': {'reachable': True, 'entries': []}}
+        fallback = [{'task_id': 'should-not-appear', 'state': 'queued'}]
+
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is False
+        assert result['entries'] == []   # authoritative empty — not the fallback
+
+    def test_label_missing_from_live_map_uses_fallback_approximate_true(self):
+        """(c) label not in live_map → {entries: fallback, approximate: True}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        fallback = [{'task_id': 'fb1', 'state': 'in_flight'}]
+        result = resolve_active('unknown-proj', {}, fallback)
+
+        assert result['approximate'] is True
+        assert result['entries'] == fallback
+
+    def test_label_unreachable_uses_fallback_approximate_true(self):
+        """reachable=False → fallback with approximate=True."""
+        from dashboard.data.merge_queue import resolve_active
+
+        fallback = [{'task_id': 'fb2', 'state': 'queued'}]
+        live_map = {'myproj': {'reachable': False, 'entries': [], 'error': 'timeout'}}
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is True
+        assert result['entries'] == fallback
+
+    def test_empty_fallback_when_unreachable_stays_empty(self):
+        """Unreachable with empty fallback → {entries: [], approximate: True}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        live_map = {'myproj': {'reachable': False, 'entries': []}}
+        result = resolve_active('myproj', live_map, [])
+
+        assert result['approximate'] is True
+        assert result['entries'] == []

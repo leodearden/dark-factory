@@ -907,6 +907,30 @@ async def fetch_live_merge_queues(
     return dict(zip(labels, results, strict=True))
 
 
+def resolve_active(
+    label: str,
+    live_map: dict[str, dict],
+    fallback_active: list[dict],
+) -> dict:
+    """Choose between the live queue snapshot and the event-derived fallback.
+
+    Returns ``{entries, approximate}`` where:
+      - ``entries``     is the chosen list of active-queue entries.
+      - ``approximate`` is True when the entries come from the event-derived
+                        fallback (orchestrator unreachable / not running).
+
+    Selection logic:
+      - If ``live_map[label]`` exists and ``reachable`` is True → use live
+        entries (may be empty) with ``approximate=False``.
+      - Otherwise (label absent or reachable=False) → use ``fallback_active``
+        with ``approximate=True``.
+    """
+    live = live_map.get(label)
+    if live is not None and live.get('reachable'):
+        return {'entries': live['entries'], 'approximate': False}
+    return {'entries': fallback_active, 'approximate': True}
+
+
 def _normalize_entry(raw: dict) -> dict:
     """Project a raw get_merge_queue snapshot entry to the display shape.
 
