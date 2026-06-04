@@ -855,6 +855,15 @@ class TipRelation(Enum):
     - SUBSET: *new_tip* is an ancestor of *old_tip* (new is strictly behind).
     - DIVERGENT: neither tip is an ancestor of the other; must be resolved via
       :func:`resolve_divergent` before passing to :func:`decide_attach_action`.
+
+    Consumer wiring (pending as of γ1):
+    - γ2 (task 1640): wires :func:`classify_tip_relation` /
+      :func:`decide_attach_action` into the worker's post-merge-equivalence
+      path to trigger generation auto-chaining; flips ``entry.verifying`` via
+      :meth:`InFlightMergeRegistry.set_verifying`.
+    - γ3 (task 1641): wires :func:`classify_tip_relation` /
+      :func:`decide_attach_action` at the workflow merge-phase submission
+      site to attach as a peer waiter.
     """
 
     SAME = 'same'
@@ -907,8 +916,9 @@ async def patch_content_contained(
 
     This is also the α2/D6 submit-time fast-path machinery: a branch whose
     content is fully cherry-picked/rebased into main is "already merged" even
-    when its tip is not a literal ancestor.  The consumer wiring in
-    escalation/server.py is deferred to a downstream task.
+    when its tip is not a literal ancestor.  The ``is_ancestor``-only
+    fast-path was wired in task 1629; the patch-id extension (this helper)
+    for escalation/server.py is not yet scheduled as a separate task.
     """
     rc, out, _ = await _run(
         ['git', 'cherry', upstream, head],
@@ -956,6 +966,9 @@ class AttachAction(Enum):
       attach as peer and set up gen-2 chaining (γ2 worker wiring).
     - ATTACH_CONTAINMENT: new tip is a subset — attach as peer; at finalize
       time the worker resolves via containment logic (boundary test 13).
+
+    Consumer wiring (pending as of γ1): γ2 (task 1640) and γ3 (task 1641).
+    See :class:`TipRelation` for per-phase details.
     """
 
     COALESCE = 'coalesce'
@@ -1927,6 +1940,22 @@ class InFlightMergeRegistry:
 
         Returns 0 for a branch not in-flight (no-op, safe to call).
         Unknown *request_id* is a no-op returning the unchanged count.
+
+        **Resolution race guard (γ2/task 1640 wiring invariant):**
+        ``primary_future`` may be cancelled by ``detach()`` while the worker
+        has already passed an ``_request_abandoned`` checkpoint (returning
+        False) but has not yet called ``req.result.set_result()`` /
+        ``set_exception()``.  Calling either on a cancelled future raises
+        ``InvalidStateError``.
+
+        The established codebase convention — ``if not req.result.done():
+        req.result.set_result(...)`` — is already present at every
+        production resolution site (e.g. lines 3054-3055, 3065-3066,
+        4456-4457) and degrades a detach-cancel race to a safe no-op.
+        **All new worker resolution paths introduced by γ2 (task 1640) MUST
+        use the same guard.**  No ``await`` may appear between an
+        ``_request_abandoned`` checkpoint returning False and the subsequent
+        resolution call.
         """
         entry = self._slots.get(branch)
         if entry is None:
