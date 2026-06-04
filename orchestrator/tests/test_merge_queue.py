@@ -3181,6 +3181,98 @@ class TestMergeOutcomeDataclass:
 
 
 # ---------------------------------------------------------------------------
+# TestGenerationFieldsIdentity — γ2 step-01 RED: 'superseded' status +
+# superseded_by field on MergeOutcome; generation field on MergeRequest.
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationFieldsIdentity:
+    """γ2 step-01/02: MergeOutcome gains 'superseded' status + superseded_by;
+    MergeRequest and GroupMergeRequest gain generation field."""
+
+    def test_merge_outcome_superseded_status_and_superseded_by(self) -> None:
+        """(a) MergeOutcome('superseded', superseded_by='mr-x') constructs and exposes superseded_by."""
+        outcome = MergeOutcome(status='superseded', superseded_by='mr-x')  # type: ignore[call-arg]
+        assert outcome.status == 'superseded'
+        assert outcome.superseded_by == 'mr-x'  # type: ignore[attr-defined]
+
+    def test_merge_outcome_blocked_superseded_by_default_none(self) -> None:
+        """(b) MergeOutcome('blocked') has superseded_by default None."""
+        outcome = MergeOutcome('blocked')
+        assert outcome.superseded_by is None  # type: ignore[attr-defined]
+
+    def test_merge_request_generation_defaults_to_1(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) MergeRequest(...) defaults generation==1."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = MergeRequest(
+                task_id='t-gen1',
+                branch='task/t-gen1',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+            )
+            assert req.generation == 1  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+    def test_merge_request_generation_can_be_set(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(d) MergeRequest(..., generation=2) carries 2."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = MergeRequest(
+                task_id='t-gen2',
+                branch='task/t-gen2',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+                generation=2,
+            )
+            assert req.generation == 2  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+    def test_group_merge_request_generation_defaults_to_1(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(e) GroupMergeRequest still constructs and exposes generation default 1."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = GroupMergeRequest(
+                task_id='t-grp',
+                branch='task/t-grp',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+                train_id='train-1',
+                member_task_ids=['t-grp'],
+                tip_branch='task/t-grp',
+                tip_task_id='t-grp',
+                status_check=AsyncMock(),
+                mark_member_done=AsyncMock(),
+            )
+            assert req.generation == 1  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeItemDefaults — unit tests for SpeculativeItem field defaults
 # ---------------------------------------------------------------------------
 

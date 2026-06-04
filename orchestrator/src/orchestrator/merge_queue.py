@@ -2420,6 +2420,9 @@ class MergeRequest:
     """Stable per-instance identity for this merge request (e.g. 'mr-a1b2c3d4')."""
     snapshot_tip: str | None = field(default=None, kw_only=True)
     """Optional git ref / SHA of the snapshot tip used by α3 merge-status lookups."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation counter for auto-chained merges (γ2).  Gen-1 is the original;
+    each auto-chain increments by 1.  Bounded by MAX_AUTO_CHAINED_GENERATIONS."""
 
 
 @dataclass
@@ -2459,7 +2462,7 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
@@ -2471,6 +2474,8 @@ class MergeOutcome:
     """True when the disk guard fired and ``run_scoped_verification`` was never
     called.  Lets callers distinguish a disk-guard short-circuit from an actual
     verification failure in log messages."""
+    superseded_by: str | None = None
+    """request_id of the gen-(n+1) request that supersedes this one (γ2)."""
 
 
 @dataclass
