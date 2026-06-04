@@ -255,6 +255,45 @@ class TestInitialScan:
         assert result.id == 'esc-6-1'
 
 
+class TestInitialScanMain:
+    """main() emits a pre-existing pending escalation without any inotify event."""
+
+    def test_emits_pre_existing_pending_without_inotify_event(
+        self, tmp_path, blocking_escalation: Escalation, capsys
+    ):
+        """Pre-existing pending file is emitted at startup; inotify.read never called."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc_path = queue_dir / f'{blocking_escalation.id}.json'
+        esc_path.write_text(blocking_escalation.to_json())
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            # read must NOT be called — if it is, something is wrong
+            mock_inotify.read.side_effect = AssertionError('inotify.read should not be called')
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 0
+
+        # add_watch was armed before the scan
+        mock_inotify.add_watch.assert_called_once()
+
+        # stdout contains the escalation JSON
+        captured = capsys.readouterr()
+        assert blocking_escalation.id in captured.out
+        data = json.loads(captured.out)
+        assert data['id'] == blocking_escalation.id
+
+
 class TestMainLoop:
     """CLI exit behavior after first match."""
 
