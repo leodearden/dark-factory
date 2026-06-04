@@ -563,6 +563,27 @@ class TestSeverityValidation:
 
 
 # ---------------------------------------------------------------------------
+# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# ---------------------------------------------------------------------------
+
+
+class TestStrandedBlockedCategory:
+    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+
+    def test_stranded_blocked_in_categories(self):
+        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+
+        This is a data-contract assertion on a runtime constant — not a prose
+        test.  CATEGORIES is the canonical list downstream consumers (task ε,
+        task ι, task ζ) rely on to recognise the category.
+        """
+        from escalation.server import CATEGORIES
+        assert 'stranded_blocked' in CATEGORIES, (
+            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers for promote_to_l2 tests
 # ---------------------------------------------------------------------------
 
