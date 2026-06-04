@@ -1226,21 +1226,22 @@ class TaskWorkflow:
 
                     self._enter_phase(WorkflowState.MERGE)
 
-                    # Defense-in-depth: any blocking L0 escalation created
-                    # during execute/verify/review (e.g. plan-overwrite from
-                    # _amend, or any future code path that escalates outside
-                    # the implementer/debugger callsites) must gate the
-                    # merge.  Without this, an escalation queued mid-run
-                    # would sit invisible while a merge proceeded.
-                    pending_blocking_l0 = [
-                        e for e in self._check_escalations()
-                        if e.severity == 'blocking' and e.level == 0
-                    ]
-                    if pending_blocking_l0:
+                    # Defense-in-depth: any blocking L0 escalation, or any
+                    # born-at-L2 (critical/urgent), or any level≥2 escalation
+                    # created during execute/verify/review (e.g. plan-overwrite
+                    # from _amend, or any future code path that escalates outside
+                    # the implementer/debugger callsites) must gate the merge.
+                    # Without this, an escalation queued mid-run would sit
+                    # invisible while a merge proceeded.
+                    # D4 accepted consequence: a pending critical/urgent from a
+                    # prior incarnation DOES gate a fresh run — stop-the-line
+                    # semantics.  See _is_gating_escalation for the full policy.
+                    gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
+                    if gating:
                         logger.warning(
-                            'Task %s: %d pending L0 blocking escalation(s) '
-                            'at MERGE entry — bailing to ESCALATED',
-                            self.task_id, len(pending_blocking_l0),
+                            'Task %s: %d gating escalation(s) at MERGE entry '
+                            '— bailing to ESCALATED',
+                            self.task_id, len(gating),
                         )
                         return WorkflowOutcome.ESCALATED
 
