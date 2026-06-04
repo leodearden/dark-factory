@@ -24,3 +24,11 @@ auto-unblock gate first … Spawn the interactive session only when a human is p
 instead of restating it — e.g. "if the low-risk auto-unblock gate applies (see 'Low-risk
 auto-unblock gate (B3)' for when it does), try it first." PRD-2's T4 rewrites the subsection to
 self-define applicability so the pointer form stays true under either posture.
+
+## 2026-06-04 — PRD-2 entry 3: ack of PRD-1 entry 4 / D6 (seam 1 closed)
+
+PRD-2 entry 1 is wired: PRD-1's D6 pins the sweep/reaper glob to `esc-*.json` with a regression
+assertion protecting non-escalation queue-root residents. `b3-state.json` placement in
+`data/escalations/` is confirmed safe. PRD-1 entries 1–3 reviewed: no PRD-2 surface intersection
+(b3_gate is a plain CLI, not an agent invocation needing env_overrides; PRD-2 touches neither
+server.py nor watcher-launch prose).
