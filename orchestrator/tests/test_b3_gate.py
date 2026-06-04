@@ -605,3 +605,26 @@ class TestReadLatestProposal:
         _seed_tasks_db(tmp_path, 42, [entry])
         result = _read_latest_proposal('42', tmp_path)
         assert result == entry
+
+
+# ---------------------------------------------------------------------------
+# step-15: _resolve_cap
+# ---------------------------------------------------------------------------
+
+class TestResolveCap:
+    def test_none_returns_default(self):
+        from orchestrator.b3_gate import DEFAULT_CAP, _resolve_cap
+        assert _resolve_cap(None) == DEFAULT_CAP
+        assert _resolve_cap(None) == 6
+
+    def test_config_path_returns_configured_cap(self, tmp_path):
+        from orchestrator.b3_gate import _resolve_cap
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 2\n')
+        assert _resolve_cap(str(cfg_file)) == 2
+
+    def test_config_path_different_cap(self, tmp_path):
+        from orchestrator.b3_gate import _resolve_cap
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 10\n')
+        assert _resolve_cap(str(cfg_file)) == 10
