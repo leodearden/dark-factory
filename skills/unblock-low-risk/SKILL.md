@@ -126,9 +126,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    The response shape determines the next action:
 
    - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict` | `blocked`
-     | `already_merged` | `unknown_branch` | `failed`. The call also returns a `request_id` in
-     all cases except `already_merged`, which short-circuits before entry construction and returns
-     no `request_id`. Proceed to step 9.
+     | `already_merged` | `unknown_branch` | `failed`. The call returns a `request_id` in all
+     cases except the `already_merged` ancestor fast-path, which short-circuits before entry
+     construction (no `request_id`, `commit` is the ancestor sha). The `already_merged`
+     worker-path (entry was constructed, merge found already done) does carry a `request_id`
+     but may have `commit: null`. Proceed to step 9.
 
    - **NON-TERMINAL — `status` ∈ `queued` | `attached`:** This is a **successful submission**, not
      a failure. `queued` means the entry is waiting in the merge queue; `attached` means it was
@@ -150,10 +152,17 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
    `merge_request` never returns; `unknown` is a polled-only fallback state.
 
-   - **`done` (polled state) or `already_merged` (submit-time fast-path):** success.
-     `already_merged` carries no `request_id` — nothing to poll or cancel.
+   - **`done` (polled state) or `already_merged` (submit-time):** success.
+     `already_merged` comes in two sub-cases:
+     - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
+       use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
+     - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
+       but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
+       confirm the landed sha and use `done_provenance={"kind": "found_on_main"}`.
+       `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
-        done_provenance={"kind": "merged", "commit": "<merge sha>"})`.
+        done_provenance={"kind": "merged", "commit": "<merge sha>"})` (or `found_on_main`
+        when `commit` is null).
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
         `dry_run_proposals` / `memory_hints` / `files`. Immediately
         `update_task(..., append=true)` to restore them.
