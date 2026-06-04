@@ -56,6 +56,14 @@ const fmtMs = ms => {
   return `${(m/60).toFixed(1)}h`;
 };
 
+const fmtAgeSecs = secs => {
+  if (secs == null || secs <= 0) return '—';
+  if (secs < 60) return `${Math.round(secs)}s`;
+  const m = secs / 60;
+  if (m < 60) return `${m.toFixed(0)}m`;
+  return `${(m/60).toFixed(1)}h`;
+};
+
 // ── Cross-project aggregation helpers (no synthetic fallbacks) ──
 // PERFORMANCE is keyed by project; each entry has paths/escalation/hist/ttc.
 // These helpers return null when there's no data so the UI can render '—'.
@@ -907,9 +915,12 @@ function MergeTab({ projectFilter }) {
 
                 {d.active.length > 0 && (
                   <div className="col-span-6 panel">
-                    <div className="panel-head"><span className="title">Currently queued</span></div>
+                    <div className="panel-head">
+                      <span className="title">Currently queued</span>
+                      {d.active_approximate && <span className="meta" style={{ color: 'var(--warn,#fbbf24)' }}>approx · event-derived</span>}
+                    </div>
                     <div className="panel-body flush">
-                      <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">When</th></tr></thead>
+                      <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
                         <tbody>
                           {d.active.map((row, i) => (
                             <tr key={i}>
@@ -917,7 +928,10 @@ function MergeTab({ projectFilter }) {
                               <td>{row.title}</td>
                               <td><span className={`badge ${row.state === 'in_flight' ? 'warn' : 'info'}`}>{row.state}</span></td>
                               <td className="mono" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{row.branch}</td>
-                              <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(row.timestamp)}</td>
+                              <td className="num" style={{ color: 'var(--fg-3)' }}>{row.age_secs != null ? fmtAgeSecs(row.age_secs) : '—'}</td>
+                              <td className="num">{row.position != null ? row.position : '—'}</td>
+                              <td>{row.waiter_alive != null ? (row.waiter_alive ? <span className="badge ok">alive</span> : <span className="badge bad">dead</span>) : '—'}</td>
+                              <td className="num" style={{ color: 'var(--fg-3)' }}>{row.timestamp ? window.DF_SHELL.fmtDateTime(row.timestamp) : '—'}</td>
                             </tr>
                           ))}
                         </tbody>
