@@ -4371,14 +4371,32 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return
 
-        # Kill sequence for live workflow — steps 8/12 wire this.
-        # Guard exists now so the no-kill path is exercised by step-5 tests.
+        # Kill sequence for a live workflow (C3.1, D9).
+        # Status write is already done above — kill strictly follows.
         if self.is_workflow_active(task_id):
+            self.cancel_workflow(task_id)
             logger.info(
-                'action-teardown %s: task %s has active workflow — kill wired '
-                'in step-8', action, task_id,
+                'action-teardown %s: soft-cancelled workflow for task %s',
+                action, task_id,
             )
-            # TODO (step-8): cancel_workflow → poll → hard_cancel_workflow
+            # Poll for slot to clear.  _action_teardown_tasks suppression
+            # (step-12) ensures a racing _mark_blocked write is absorbed while
+            # the kill is in flight.  Use the terminal-status hard-cancel
+            # budget as the poll ceiling — consistent with the existing cancel
+            # scan discipline (harness.py:_mark_terminal_status_cancel_scan).
+            _POLL_SLEEP_S = 0.05
+            max_polls = getattr(self.config, 'terminal_status_hard_cancel_polls', 10)
+            polls = 0
+            while self.is_workflow_active(task_id) and polls < max_polls:
+                await asyncio.sleep(_POLL_SLEEP_S)
+                polls += 1
+            if self.is_workflow_active(task_id):
+                logger.warning(
+                    'action-teardown %s: workflow for task %s did not clear '
+                    'within %d polls — escalating to hard_cancel_workflow',
+                    action, task_id, max_polls,
+                )
+                self.hard_cancel_workflow(task_id)
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
