@@ -290,3 +290,71 @@ class TestVerifyDebugfixLoopSiblingFix:
             '_inherited_break_info must stay None when verify passes'
         )
         workflow._invoke.assert_not_called()  # debugger must not run
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — call-site routing: _inherited_break_info -> _mark_blocked with
+#           dedupe_fingerprint; escalation has correct fields
+# ---------------------------------------------------------------------------
+
+
+class TestInheritedBreakEscalationFiling:
+    """Step-13 / test-expectation #5 + invariant d: escalation has right severity/category."""
+
+    def test_call_site_routes_inherited_break_to_mark_blocked(
+        self, tmp_path: Path,
+    ) -> None:
+        """_mark_blocked(dedupe_fingerprint=...) produces severity='blocking', level=0,
+        category='preexisting_main_break', non-empty dedupe_fingerprint.
+        scheduler.set_task_status called exactly once with 'blocked'.
+        """
+        from escalation.models import BORN_AT_L2_SEVERITIES
+        from escalation.queue import EscalationQueue
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_workflow(config, worktree)
+
+        # Wire real EscalationQueue
+        eq = EscalationQueue(tmp_path / 'escalations')
+        workflow.escalation_queue = eq
+
+        fp = 'sha256-deadbeef' * 2
+
+        async def _drive():
+            # The call site will read _inherited_break_info and pass dedupe_fingerprint
+            # to _mark_blocked.  Until step-14 wires this, _mark_blocked lacks the param.
+            return await workflow._mark_blocked(
+                f'Verify failure is preexisting on main (category=\'compile_error\'): ...',
+                detail='type error detail',
+                category='preexisting_main_break',
+                suggested_action='await_preexisting_main_hotfix',
+                dedupe_fingerprint=fp,
+            )
+
+        asyncio.run(_drive())
+
+        # Scheduler.set_task_status must have been called with 'blocked'
+        workflow.scheduler.set_task_status.assert_called()  # type: ignore[union-attr]
+        call_args = workflow.scheduler.set_task_status.call_args  # type: ignore[union-attr]
+        assert 'blocked' in str(call_args), (
+            f'set_task_status should be called with blocked; got {call_args}'
+        )
+
+        # Exactly one escalation filed
+        filed = eq.get_by_task(workflow.task_id, status='pending')
+        assert len(filed) == 1, f'Expected 1 escalation; got {len(filed)}: {filed}'
+        esc = filed[0]
+
+        assert esc.severity == 'blocking', f'severity must be blocking; got {esc.severity}'
+        assert esc.severity not in BORN_AT_L2_SEVERITIES, (
+            f'Must NOT be born-at-L2; got severity={esc.severity!r}'
+        )
+        assert getattr(esc, 'level', 0) == 0, f'level must be 0; got {esc.level}'
+        assert esc.category == 'preexisting_main_break', (
+            f'category must be preexisting_main_break; got {esc.category!r}'
+        )
+        assert esc.dedupe_fingerprint == fp, (
+            f'dedupe_fingerprint must be {fp!r}; got {esc.dedupe_fingerprint!r}'
+        )
