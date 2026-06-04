@@ -411,6 +411,60 @@ class TestRunWatcherRotation:
         assert 'Edit' in disallowed, 'Edit must be in disallowed_tools (no code edits)'
         assert 'Write' in disallowed, 'Write must be in disallowed_tools (no code edits)'
 
+    @pytest.mark.asyncio
+    async def test_env_overrides_injects_bash_max_timeout_ms(self, tmp_path: Path) -> None:
+        """invoke_with_cap_retry receives env_overrides == {'BASH_MAX_TIMEOUT_MS': '<ms>'}.
+
+        Exact-dict equality:
+          - pins the injected value against the known literal for the default config
+          - also asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
+        Default: rotation_hours=4.0, grace=300.0 → 14700 s → '14700000' ms.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        # Assert against the known literal for the default config to catch formula drift.
+        # Derivation: rotation_hours=4.0, grace=300.0 → 14700 s → 14700000 ms.
+        assert captured.get('env_overrides') == {'BASH_MAX_TIMEOUT_MS': '14700000'}, (
+            f'env_overrides must be exactly {{"BASH_MAX_TIMEOUT_MS": "14700000"}}; '
+            f'got {captured.get("env_overrides")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rotation_start_logs_bash_max_timeout_ms(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An INFO record is emitted on orchestrator.harness during rotation start.
+
+        Proves the operator-visible dispatch log fires; the exact wording is not
+        pinned so benign log-message rewording does not break this test.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            return AgentResult(success=True, output='')
+
+        caplog.set_level(logging.INFO, logger='orchestrator.harness')
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert info_records, (
+            f'Expected at least one INFO record on logger orchestrator.harness during rotation; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-9: Supervisor loop classification — clean/unclean backoff
