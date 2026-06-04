@@ -1117,6 +1117,60 @@ def create_server(
             return 'finalizing'
         return raw  # pass through unknown states unchanged
 
+    def _durable_terminal_state(
+        request_id: str | None,
+        branch: str | None = None,
+        task_id: str | None = None,
+    ) -> tuple[str, dict] | None:
+        """Consult durable terminal tiers (retention ring → event store).
+
+        Shared implementation of merge_status Tiers 2–3 and merge_cancel's
+        waiter-absent resolution — keeps both tools' tier ordering and state
+        vocabulary in sync.
+
+        Returns ``(coarse_state, meta)`` when a durable record is found, else
+        ``None``.  *meta* is a dict with keys:
+            request_id  — the id from the resolved record (may differ from the
+                          input request_id when resolved via branch/task_id).
+            outcome     — raw state string from the record.
+            finished_at — ISO-8601 string (ring records are normalised from their
+                          epoch-float via _epoch_to_iso8601; event-store rows are
+                          already strings).
+
+        Tier 1 (live snapshot) is intentionally omitted — callers that need it
+        handle it themselves.  merge_cancel intentionally skips Tier 1 because a
+        request absent from _waiters cannot be a live waiter of this server (a
+        live entry's future is still pending and thus still registered).
+        """
+        # Tier 2: retention ring (request_id-keyed lookup only).
+        # finished_at is stored as epoch float; normalise to ISO-8601 so the
+        # same logical merge returns the same type regardless of which tier serves it.
+        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
+        if ring is not None and request_id is not None:
+            rec = ring.get(request_id)
+            if rec is not None:
+                return _map_terminal_state(rec.state), {
+                    'request_id': rec.request_id,
+                    'outcome': rec.state,
+                    'finished_at': _epoch_to_iso8601(rec.finished_at),
+                }
+
+        # Tier 3: event store (supports all three lookup keys).
+        if event_store is not None:
+            row = event_store.latest_merge_finalized(
+                request_id=request_id,
+                branch=branch,
+                task_id=task_id,
+            )
+            if row is not None:
+                return _map_terminal_state(row['state']), {
+                    'request_id': row['request_id'],
+                    'outcome': row['state'],
+                    'finished_at': row['finished_at'],
+                }
+
+        return None
+
     @mcp.tool()
     async def merge_status(
         request_id: str | None = None,
@@ -1178,36 +1232,18 @@ def create_server(
                 logger.warning('merge_status: snapshot() failed, falling through to durable tiers',
                                exc_info=True)
 
-        # Tier 2: retention ring (request_id only)
-        # finished_at is stored as epoch float; normalise to ISO-8601 string so the
-        # same logical merge returns the same type regardless of which tier serves it.
-        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
-        if ring is not None and request_id is not None:
-            rec = ring.get(request_id)
-            if rec is not None:
-                return {
-                    'state': _map_terminal_state(rec.state),
-                    'request_id': rec.request_id,
-                    'generation': 1,
-                    'outcome': rec.state,
-                    'finished_at': _epoch_to_iso8601(rec.finished_at),
-                }
-
-        # Tier 3: event store
-        if event_store is not None:
-            row = event_store.latest_merge_finalized(
-                request_id=request_id,
-                branch=branch,
-                task_id=task_id,
-            )
-            if row is not None:
-                return {
-                    'state': _map_terminal_state(row['state']),
-                    'request_id': row['request_id'],
-                    'generation': 1,
-                    'outcome': row['state'],
-                    'finished_at': row['finished_at'],
-                }
+        # Tiers 2–3: durable tiers (retention ring → event store).
+        # _durable_terminal_state owns the tier logic shared with merge_cancel.
+        durable = _durable_terminal_state(request_id, branch, task_id)
+        if durable is not None:
+            coarse_state, meta = durable
+            return {
+                'state': coarse_state,
+                'request_id': meta['request_id'],
+                'generation': 1,
+                'outcome': meta['outcome'],
+                'finished_at': meta['finished_at'],
+            }
 
         # Tier 4: honest unknown
         return {
@@ -1216,5 +1252,97 @@ def create_server(
             'generation': 1,
             'hint': _MERGE_STATUS_UNKNOWN_HINT,
         }
+
+    # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
+
+    @mcp.tool()
+    async def merge_cancel(request_id: str) -> dict[str, Any]:
+        """Cancel an in-flight merge request by its request_id.
+
+        Accepts a single *request_id* parameter (authoritative merge-request identifier
+        returned by merge_request).  Returns a dict with three fields:
+
+            cancelled (bool)  — True only when a pending waiter was successfully cancelled.
+            state     (str)   — Coarse terminal state in the same vocabulary as merge_status:
+                                'abandoned' | 'done' | 'conflict' | 'blocked' | 'unknown'
+            reason    (str|None) — None on success; non-None string on every other path.
+
+        Branch order (all paths return — never raises):
+          1. Waiter absent from _waiters (finalized+popped, never submitted, or server
+             restarted): consult durable tiers via _durable_terminal_state (shared with
+             merge_status Tiers 2–3: retention ring → event_store) to distinguish
+             'already-terminal' from truly 'unknown'.  Note: coalesced submissions
+             (in_flight / attached paths in merge_request) do not register a separate
+             waiter — callers holding a coalesced id will resolve to 'unknown' here;
+             use the in-flight request_id (inflight_task_id / merge_status) to cancel.
+          2. Waiter present, future already cancelled (idempotent double-cancel):
+             {cancelled: False, state: 'abandoned', reason: ...}.
+          3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
+             worker delivered an outcome but the _waiters.pop done-callback hasn't run yet):
+             {cancelled: False, state: <coarse terminal via _map_terminal_state>, reason: ...}.
+             Excepted futures (abnormal) map to state='blocked'.
+          4. Waiter present, future pending: cancel the future, return
+             {cancelled: True, state: 'abandoned', reason: None}.
+
+        AUTOMATIC CONSEQUENCES of cancelling the future (NOT implemented here — covered by
+        α1/β1 callbacks and tested in test_merge_queue.py:4520/:4601):
+          - MergeWorker._request_abandoned: drops the request without halting the queue
+          - InFlightMergeRegistry: releases the branch slot via the acquire-time done-cb
+          - _on_finalized: records terminal state 'abandoned' to retention/event-store
+
+        The tool is async so that future mutation runs on the event loop (not a FastMCP
+        threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
+        contains no await, preserving loop-synchronous race-freedom (I10).
+        """
+        rec = _waiters.get(request_id)
+
+        if rec is None:
+            # No live waiter — finalized+popped, never submitted, or server restarted.
+            # Consult durable tiers to distinguish 'already-terminal' from truly 'unknown'.
+            durable = _durable_terminal_state(request_id)
+            if durable is not None:
+                coarse_state, _ = durable
+                return {
+                    'cancelled': False,
+                    'state': coarse_state,
+                    'reason': 'Request already finalized; cannot cancel.',
+                }
+            return {
+                'cancelled': False,
+                'state': 'unknown',
+                'reason': (
+                    f'No in-flight waiter for request_id {request_id!r} '
+                    '(already finalized, never submitted, server restarted, or this id '
+                    'was coalesced onto an in-flight request — coalesced requests share '
+                    "the in-flight entry's request_id and do not register a separate "
+                    'waiter; use the in-flight request_id to cancel).'
+                ),
+            }
+
+        if rec.future.cancelled():
+            # Idempotent double-cancel: future is already cancelled.
+            return {
+                'cancelled': False,
+                'state': 'abandoned',
+                'reason': 'Request was already cancelled.',
+            }
+
+        if rec.future.done():
+            # Mid-finalize window: the future resolved (not cancelled) but the
+            # call_soon-scheduled _waiters.pop done-callback hasn't run yet.
+            # Defensive: excepted futures are abnormal; treat as 'blocked'.
+            if rec.future.exception() is not None:
+                state: str = 'blocked'
+            else:
+                state = _map_terminal_state(rec.future.result().status)
+            return {
+                'cancelled': False,
+                'state': state,
+                'reason': 'Request already finalized; cannot cancel.',
+            }
+
+        # Pending waiter — cancel the future.
+        rec.future.cancel()
+        return {'cancelled': True, 'state': 'abandoned', 'reason': None}
 
     return mcp

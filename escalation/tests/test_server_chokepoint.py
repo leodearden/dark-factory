@@ -1373,3 +1373,525 @@ class TestMergeRequestDurableIntent:
         # The entry is still usable: the worker can resolve it normally.
         req.result.set_result(MergeOutcome('done', reason='late resolve'))
         assert req.result.done() and not req.result.cancelled()
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_cancel tests (β2)
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_cancel MCP tool directly."""
+    tool = await server.get_tool('merge_cancel')
+    return await tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Step-1 RED test: success path — pending waiter → cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeCancel:
+    """β2 merge_cancel MCP tool — cancels a pending waiter future."""
+
+    async def test_cancel_pending_waiter_returns_cancelled_true(self, tmp_path: Path):
+        """Cancelling a live pending waiter returns cancelled=True, state='abandoned'.
+
+        Setup: server with merge_queue + orch_config + injected registry, NO harness.
+        Submit merge_request(wait_secs=0) on a free branch to register a durable-intent
+        waiter and enqueue the MergeRequest.  Capture request_id.  Call merge_cancel
+        with that request_id and assert the success shape.  Then drain mq and assert
+        the underlying future was actually cancelled.
+
+        RED until step-2 impl: server.get_tool('merge_cancel') fails because the tool
+        does not exist yet.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Submit via merge_request(wait_secs=0) — registers a WaiterRecord in _waiters
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c1',
+            branch='c1',
+            worktree=str(tmp_path / 'wt-c1'),
+            wait_secs=0,
+        )
+        assert result_mr['status'] == 'queued', f'Unexpected merge_request status: {result_mr}'
+        rid = result_mr['request_id']
+        assert rid, 'Expected non-empty request_id from merge_request'
+
+        # Cancel the in-flight waiter
+        result_cancel = await _call_merge_cancel(server, request_id=rid)
+
+        assert result_cancel.get('cancelled') is True, (
+            f"Expected cancelled=True, got: {result_cancel}"
+        )
+        assert result_cancel.get('state') == 'abandoned', (
+            f"Expected state='abandoned', got: {result_cancel}"
+        )
+        assert 'reason' in result_cancel, f"Expected 'reason' key, got: {result_cancel}"
+        assert result_cancel.get('reason') is None, (
+            f"Expected reason=None on success, got: {result_cancel['reason']}"
+        )
+
+        # Drain mq and assert the underlying future was actually cancelled
+        req = mq.get_nowait()
+        assert req.result.cancelled(), (
+            f'Expected future to be cancelled after merge_cancel, got: '
+            f'done={req.result.done()} cancelled={req.result.cancelled()}'
+        )
+
+    async def test_cancel_unknown_request_id_returns_unknown(self, tmp_path: Path):
+        """Cancelling a request_id with no live waiter returns cancelled=False, state='unknown'.
+
+        Fresh server with no submissions.  Call merge_cancel with a random id.
+        Must return a dict (no raise) with cancelled=False, state='unknown', and
+        a non-empty reason string.
+
+        RED until step-4 impl: the current minimal body calls rec.future on a None rec,
+        raising AttributeError.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await _call_merge_cancel(server, request_id='mr-doesnotexist')
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for unknown id, got: {result}"
+        )
+        assert result.get('state') == 'unknown', (
+            f"Expected state='unknown' for unknown id, got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason string for unknown id, got: {result}"
+        )
+
+    async def test_idempotent_double_cancel_returns_already_cancelled(self, tmp_path: Path):
+        """Calling merge_cancel twice on the same request_id returns cancelled=False on the second call.
+
+        Acquires the merge_cancel tool up front (single tool lookup).  Submits
+        merge_request(wait_secs=0) to register a waiter; first cancel → {cancelled: True, ...}.
+        Immediately (no awaited suspension) calls merge_cancel again — the
+        _waiters.pop done-callback is call_soon-scheduled and has not run yet, so
+        the waiter is still present with future.cancelled()==True.  Second call must
+        return {cancelled: False, state: 'abandoned', reason: <non-empty>} and not raise.
+
+        RED until step-6 impl: the current body has no future.cancelled() branch.
+        It falls into the pending path, calls fut.cancel() on an already-cancelled
+        future (returns False), and still reports cancelled=True (incorrect).
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension between here and .fn() calls
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c2',
+            branch='c2',
+            worktree=str(tmp_path / 'wt-c2'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # First cancel — must succeed
+        first = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        assert first.get('cancelled') is True, f'First cancel must succeed: {first}'
+
+        # Second cancel — no awaited suspension here, so _waiters.pop callback hasn't run
+        second = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+
+        assert second.get('cancelled') is False, (
+            f"Expected cancelled=False on double-cancel, got: {second}"
+        )
+        assert second.get('state') == 'abandoned', (
+            f"Expected state='abandoned' on double-cancel, got: {second}"
+        )
+        assert second.get('reason'), (
+            f"Expected non-empty reason on double-cancel, got: {second}"
+        )
+
+        # Clean up the drained-not-consumed entry
+        req = mq.get_nowait()
+        assert req.result.cancelled()
+
+    async def test_cancel_mid_finalize_window_returns_coarse_terminal(self, tmp_path: Path):
+        """Cancelling a waiter whose future is resolved-but-not-yet-popped returns cancelled=False.
+
+        Simulates the mid-finalize window: merge_request has resolved the future (e.g.
+        the worker delivered MergeOutcome('done')) but the call_soon-scheduled _waiters.pop
+        done-callback has not run yet (the loop has not regained control).
+
+        Steps: acquire merge_cancel tool up front; submit merge_request(wait_secs=0);
+        drain mq; resolve req.result.set_result(MergeOutcome('done', reason='late resolve'));
+        immediately call merge_cancel (no intervening awaited suspension).  The waiter is
+        still present (future.done()==True, not cancelled()), so the call must return
+        {cancelled: False, state: 'done', reason: <non-empty>}.
+
+        RED until step-8 impl: current body has no future.done() (non-cancelled terminal)
+        branch; falls into the pending path, calls fut.cancel() on a done future (returns
+        False), and mis-reports cancelled=True.
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension until .fn() call
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c3',
+            branch='c3',
+            worktree=str(tmp_path / 'wt-c3'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # Drain the queue and resolve the future (simulate worker delivering outcome)
+        req = mq.get_nowait()
+        req.result.set_result(MergeOutcome('done', reason='late resolve'))
+        # Confirm we're in the mid-finalize window: done but not cancelled
+        assert req.result.done() and not req.result.cancelled(), (
+            'Prerequisite: future must be done and not cancelled for mid-finalize test'
+        )
+
+        # Immediately cancel (no intervening awaited suspension)
+        result = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for mid-finalize window, got: {result}"
+        )
+        assert result.get('state') == 'done', (
+            f"Expected state='done' (via _map_terminal_state), got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason for mid-finalize window, got: {result}"
+        )
+
+    async def test_cancel_mid_finalize_window_excepted_future_returns_blocked(
+        self, tmp_path: Path
+    ):
+        """Mid-finalize window: excepted future (abnormal) returns state='blocked'.
+
+        Exercises the defensive sub-path in the mid-finalize branch:
+        ``rec.future.exception() is not None → state='blocked'``.  This case
+        cannot arise via the normal MergeWorker path, but the branch exists to
+        keep the tool exception-free when a future is resolved with an exception
+        rather than a MergeOutcome result.
+
+        Steps: acquire merge_cancel tool up front; submit merge_request(wait_secs=0);
+        drain mq; call req.result.set_exception(RuntimeError(...)); immediately call
+        merge_cancel (no awaited suspension).  Must return
+        {cancelled: False, state: 'blocked', reason: <non-empty>}.
+
+        Previously untested: the existing test only covers set_result(MergeOutcome)
+        (the normal-outcome sub-path).  This test exercises the excepted-future branch.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension until .fn() call
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c4',
+            branch='c4',
+            worktree=str(tmp_path / 'wt-c4'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # Drain and set an exception on the future (abnormal mid-finalize window)
+        req = mq.get_nowait()
+        req.result.set_exception(RuntimeError('worker exploded'))
+        assert req.result.done() and not req.result.cancelled(), (
+            'Prerequisite: future must be done (excepted) for this test'
+        )
+
+        # Immediately cancel (no awaited suspension between set_exception and .fn())
+        result = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for excepted-future mid-finalize, got: {result}"
+        )
+        assert result.get('state') == 'blocked', (
+            f"Expected state='blocked' for excepted future, got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason for excepted-future mid-finalize, got: {result}"
+        )
+
+    async def test_cancel_finalized_popped_id_resolves_via_durable_tier(self, tmp_path: Path):
+        """Cancelling a finalized+popped request_id returns the durable terminal state.
+
+        Injects a tiny fake event_store that returns a finalized row for 'mr-finalized'
+        and None for other ids.  No waiter is registered (simulating finalized+popped).
+        merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
+        <non-empty>} — not 'unknown'.  merge_cancel('mr-never') must still return state='unknown'.
+
+        RED until step-10 impl: the None-rec branch always returns 'unknown' and never
+        consults event_store.
+        """
+
+        class FakeEventStore:
+            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
+                if request_id == 'mr-finalized':
+                    return {
+                        'request_id': request_id,
+                        'state': 'done',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                return None
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            event_store=FakeEventStore(),
+        )
+
+        # No waiter registered for 'mr-finalized' (simulates finalized+popped)
+        result_finalized = await _call_merge_cancel(server, request_id='mr-finalized')
+
+        assert result_finalized.get('cancelled') is False, (
+            f"Expected cancelled=False for finalized id, got: {result_finalized}"
+        )
+        assert result_finalized.get('state') == 'done', (
+            f"Expected state='done' from durable tier, got: {result_finalized}"
+        )
+        assert result_finalized.get('reason'), (
+            f"Expected non-empty reason for finalized id, got: {result_finalized}"
+        )
+
+        # An id not in the event_store must still return 'unknown'
+        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        assert result_never.get('state') == 'unknown', (
+            f"Expected state='unknown' for truly unknown id, got: {result_never}"
+        )
+
+    async def test_cancel_finalized_popped_id_resolves_via_retention_ring(
+        self, tmp_path: Path
+    ):
+        """Cancelling a finalized+popped id resolves via the retention ring (Tier 2).
+
+        Injects a fake harness whose ``_terminal_retention`` ring returns a record for
+        'mr-ring-hit' (state='done') and a fake event_store that would return 'conflict'
+        for the same id.  The ring (Tier 2) must take precedence over the event_store
+        (Tier 3).
+
+        Also asserts:
+          - 'mr-store-only' (ring miss, event_store hit) returns state='conflict'.
+          - 'mr-never' (both miss) returns state='unknown'.
+
+        Previously untested: test_cancel_finalized_popped_id_resolves_via_durable_tier
+        covers the event_store-only path but not the retention-ring path.  A regression
+        in the ring branch (e.g. wrong attribute name, wrong precedence) would go
+        undetected without this test.
+        """
+
+        class FakeRetentionRecord:
+            def __init__(self, request_id: str, state: str) -> None:
+                self.request_id = request_id
+                self.state = state
+                self.finished_at = 1_700_000_000.0  # epoch float — normalised by _epoch_to_iso8601
+
+        class FakeRetentionRing:
+            def get(self, request_id: str):
+                if request_id == 'mr-ring-hit':
+                    return FakeRetentionRecord('mr-ring-hit', 'done')
+                return None
+
+        class FakeHarness:
+            _terminal_retention = FakeRetentionRing()
+
+        class FakeEventStore:
+            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
+                if request_id == 'mr-ring-hit':
+                    # Ring takes precedence — this row must NOT be returned
+                    return {
+                        'request_id': request_id,
+                        'state': 'conflict',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                if request_id == 'mr-store-only':
+                    return {
+                        'request_id': request_id,
+                        'state': 'conflict',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                return None
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            harness=FakeHarness(),
+            event_store=FakeEventStore(),
+        )
+
+        # Ring hit: returns state='done' from ring (not 'conflict' from event_store)
+        result_ring = await _call_merge_cancel(server, request_id='mr-ring-hit')
+        assert result_ring.get('cancelled') is False, (
+            f"Expected cancelled=False for finalized ring-hit id, got: {result_ring}"
+        )
+        assert result_ring.get('state') == 'done', (
+            f"Expected state='done' from retention ring (Tier 2), got: {result_ring}"
+        )
+        assert result_ring.get('reason'), (
+            f"Expected non-empty reason for finalized ring-hit id, got: {result_ring}"
+        )
+
+        # Event-store only: ring misses, falls through to event_store
+        result_store = await _call_merge_cancel(server, request_id='mr-store-only')
+        assert result_store.get('state') == 'conflict', (
+            f"Expected state='conflict' from event_store (Tier 3), got: {result_store}"
+        )
+
+        # Truly unknown: both tiers miss
+        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        assert result_never.get('state') == 'unknown', (
+            f"Expected state='unknown' when both durable tiers miss, got: {result_never}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 regression guard: cancellation releases the branch slot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeCancelSlotRelease:
+    """β2 regression guard — cancel unwinds in-flight state at MCP boundary.
+
+    Confirms that merge_cancel releases the branch slot via the α1/β1 done-callbacks
+    so a subsequent dispatch on the same branch returns 'queued' (fresh dispatch)
+    rather than blocking on a stuck/leaked slot.
+
+    This is a regression guard over the α1/β1 done-callback wiring only.
+    Worker-drop-without-halt (_request_abandoned) and retention-records-abandoned
+    consequences are covered by test_merge_queue.py:4520 / :4601 and are NOT
+    re-tested here.
+    """
+
+    async def test_cancel_releases_branch_slot_for_resubmit(self, tmp_path: Path):
+        """After merge_cancel, re-submitting the same branch dispatches fresh ('queued').
+
+        Build server with merge_queue + orch_config + injected registry (no harness).
+        Submit merge_request(branch='re', wait_secs=0) — dispatches and acquires the
+        registry slot; capture request_id.  Cancel via merge_cancel (assert cancelled=True).
+        Yield the event loop (await asyncio.sleep(0)) enough times for the acquire-time
+        _release done-callback (merge_queue.py:1633) to fire.  Re-submit merge_request
+        on the same branch and assert status=='queued' — proves the slot was released and
+        the dispatch path runs cleanly without a stuck/halted slot.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # First dispatch: acquires the registry slot for branch 're'
+        result1 = await _call_merge_request(
+            server,
+            task_id='re',
+            branch='re',
+            worktree=str(tmp_path / 'wt-re'),
+            wait_secs=0,
+        )
+        assert result1['status'] == 'queued', f'First dispatch must be queued: {result1}'
+        rid = result1['request_id']
+
+        # Cancel the in-flight waiter
+        cancel_result = await _call_merge_cancel(server, request_id=rid)
+        assert cancel_result.get('cancelled') is True, (
+            f'merge_cancel must succeed: {cancel_result}'
+        )
+
+        # Yield the event loop so the acquire-time _release done-callback fires
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Re-submit on the same branch — must dispatch fresh (not 'in_flight'/'attached')
+        result2 = await _call_merge_request(
+            server,
+            task_id='re',
+            branch='re',
+            worktree=str(tmp_path / 'wt-re2'),
+            wait_secs=0,
+        )
+        assert result2['status'] == 'queued', (
+            f"Expected 'queued' after slot release, got: {result2}"
+        )
+
+        # Clean up enqueued future from second submission
+        req2 = mq.get_nowait()
+        req2.result.cancel()
