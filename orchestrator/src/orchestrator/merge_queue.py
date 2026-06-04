@@ -4255,6 +4255,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # put() failed — the verifier will never drain this item
                         # and release the cap.  Release it here to prevent the
                         # merger from deadlocking at the next acquire.
+                        #
+                        # Double-release edge case: if CancelledError is raised
+                        # at the `await` boundary AFTER put() already enqueued
+                        # the item (a narrow asyncio race), this release fires
+                        # AND the verifier releases again on drain — two releases
+                        # for one acquire.  This is intentionally tolerated:
+                        # asyncio.Semaphore allows over-release (its counter
+                        # simply increments past the original bound).
+                        # Do NOT replace with asyncio.BoundedSemaphore, which
+                        # raises ValueError on over-release and would crash here.
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise

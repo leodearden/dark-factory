@@ -1576,6 +1576,20 @@ async def _make_branch_with_file(
     return worktree
 
 
+def _cap_is_full(cap: asyncio.Semaphore, bound: int = 1) -> bool:
+    """Return True if ``cap`` has all ``bound`` slots free.
+
+    Uses the public ``locked()`` API rather than the CPython-internal
+    ``._value``.  For ``_MERGE_AHEAD_BOUND=1``, ``not locked()`` is exact:
+    it means one free slot, which equals BOUND.  For BOUND>1 it proves ≥1
+    slot free — still a meaningful leak guard.
+
+    Centralised here so a single location needs updating if asyncio internals
+    change.
+    """
+    return not cap.locked()
+
+
 # ---------------------------------------------------------------------------
 # TestSpeculativeMergeWorker
 # ---------------------------------------------------------------------------
@@ -3970,6 +3984,152 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── Mechanism 2 × chain-invalidation: speculative follower (task 1646 amend) ─
+
+    async def test_speculative_follower_chain_invalidated_after_pickup_rebase(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Mechanism 2 × chain-invalidation: iteration_did_remerge propagates.
+
+        When a REAL item N+1 is re-merged for 'main_advanced', the finally block
+        sets remerge_occurred=True for the next verifier iteration.  A speculative
+        N+2 that was prefetched against N+1's stale commit is then chain-invalidated
+        (reason='chain_invalidated') in that next iteration.
+
+        This covers the interaction introduced by Mechanism 2: a pickup re-base of
+        a non-speculative item correctly invalidates its speculative descendant, just
+        as any other re-merge does.
+
+        Scenario:
+          N   — non-speculative, gated mid-verify, passes → main M0→M1
+          N+1 — non-speculative (blocking path), built against M0 (stale);
+                when picked up: base_sha=M0 ≠ M1 → Mechanism 2 fires
+                → main_advanced discard, re-merge against M1
+                → iteration_did_remerge=True → remerge_occurred=True for N+2
+          N+2 — SPECULATIVE prefetch, built against N+1's stale M0-based commit;
+                speculative=True AND remerge_occurred=True
+                → chain_invalidated discard, re-merge against actual main (M2)
+
+        Assertions:
+          (1) speculative_discard(reason='main_advanced') emitted for N+1.
+          (2) speculative_discard(reason='chain_invalidated') emitted for N+2.
+          (3) All three files land on main.
+          (4) N+2's re-verify sees both N's and N+1's files (proves re-merge
+              against final main M2, not the original stale base).
+        """
+        db_path = tmp_path / 'events_follower.db'
+        event_store = EventStore(db_path=db_path, run_id='test-follower')
+
+        wt_n = await _make_branch_with_file(git_ops, 'sf-n', 'file_sf_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'sf-n1', 'file_sf_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'sf-n2', 'file_sf_n2.py', 'n2 = 3\n')
+
+        # Gate N's verify; record which files each verify call sees.
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+        verify_worktrees: list[frozenset] = []
+
+        async def tracking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            files = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
+            verify_worktrees.append(files)
+            # Gate only N's first verify (only its file present, gate not yet open)
+            if 'file_sf_n.py' in files and 'file_sf_n1.py' not in files and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
+            req_n = _make_request('sf-n', 'sf-n', wt_n, config)
+            req_n1 = _make_request('sf-n1', 'sf-n1', wt_n1, config)
+            req_n2 = _make_request('sf-n2', 'sf-n2', wt_n2, config)
+
+            # Submit N and wait for it to be mid-verify.  Main is still M0 at
+            # this point; the merger's speculative look-ahead missed N+1 (queue
+            # empty then).
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            # Put N+1 and N+2 into the queue atomically so the merger sees both:
+            #   - dequeues N+1 (blocking get, non-speculative), builds it against M0,
+            #     acquires cap, enqueues it
+            #   - speculative look-ahead get_nowait() → sees N+2 → builds it
+            #     speculatively against N+1's stale (M0-based) commit
+            queue.put_nowait(req_n1)
+            queue.put_nowait(req_n2)
+
+            # Wait for both N+1 (counted) and N+2 (speculative) to sit in the
+            # verifier queue — proves the speculative prefetch ran.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail(
+                    'N+1 and N+2 did not both appear in the verifier queue within '
+                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                )
+
+            # Release gate → N passes verify → main M0→M1.
+            # Verifier then picks up N+1 (base_sha=M0 ≠ M1 → main_advanced discard
+            # → re-merge → iteration_did_remerge=True → remerge_occurred=True for N+2)
+            # and N+2 (speculative + remerge_occurred → chain_invalidated → re-merge).
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+        assert outcome_n2.status == 'done', f'N+2: {outcome_n2}'
+
+        # (3) All three files must be on main
+        for fname in ('file_sf_n.py', 'file_sf_n1.py', 'file_sf_n2.py'):
+            _, out, _ = await _run(
+                ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
+            )
+            assert out.strip(), f'{fname} not found on main'
+
+        # (1) speculative_discard(reason='main_advanced') for N+1
+        # (2) speculative_discard(reason='chain_invalidated') for N+2
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
+        assert 'main_advanced' in discard_reasons, (
+            f'Expected speculative_discard(reason=main_advanced) for N+1; '
+            f'got discard reasons: {discard_reasons}  (all events: {rows})'
+        )
+        assert 'chain_invalidated' in discard_reasons, (
+            f'Expected speculative_discard(reason=chain_invalidated) for N+2; '
+            f'got discard reasons: {discard_reasons}  (all events: {rows})'
+        )
+
+        # (4) N+2's re-verify (after re-merge against final main M2) sees both
+        #     N's and N+1's files, proving it was merged against the fresh tree.
+        n2_verify_calls = [fs for fs in verify_worktrees if 'file_sf_n2.py' in fs]
+        assert len(n2_verify_calls) == 1, (
+            f'N+2 must be verified exactly once (only the post-re-merge verify); '
+            f'got {len(n2_verify_calls)} verify call(s) with file_sf_n2.py'
+        )
+        assert 'file_sf_n.py' in n2_verify_calls[0], (
+            f"N+2 re-verify must see N's file (fresh final-main tree); "
+            f'got files: {n2_verify_calls[0]}'
+        )
+        assert 'file_sf_n1.py' in n2_verify_calls[0], (
+            f"N+2 re-verify must see N+1's file (fresh final-main tree); "
+            f'got files: {n2_verify_calls[0]}'
+        )
+
+        await worker.stop()
+        await worker_task
+
     # ── Guard: train path exempt from both mechanisms (task 1646) ────────────
 
     async def test_train_exempt_from_cap_and_pickup_rebase(
@@ -4064,11 +4224,11 @@ class TestSpeculativeMergeWorker:
             f'got: {main_advanced_discards}  (all events: {rows})'
         )
 
-        # (3) merge-ahead cap must be untouched — trains never call acquire
-        cap_value = worker._merge_ahead_cap._value
-        assert cap_value == _MERGE_AHEAD_BOUND, (
-            f'_merge_ahead_cap._value={cap_value} after train; '
-            f'expected {_MERGE_AHEAD_BOUND}.  '
+        # (3) merge-ahead cap must be untouched — trains never call acquire.
+        #     Uses the public locked() API; locked() ↔ no free slots.
+        assert _cap_is_full(worker._merge_ahead_cap, _MERGE_AHEAD_BOUND), (
+            f'merge-ahead cap has no free slots after train; '
+            f'expected BOUND={_MERGE_AHEAD_BOUND} slots free.  '
             'Train must not consume the merge-ahead cap (Mechanism 1 exempt).'
         )
 
@@ -4080,23 +4240,29 @@ class TestSpeculativeMergeWorker:
     async def test_chain_invalidation_with_cap_no_leak(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """Guard (step-7): cap is balanced when a counted item is discarded via
-        chain-invalidation (N fails verify, N+1 counted, re-merged, M completes).
+        """Guard (step-7): cap is balanced when N fails verify and counted N+1
+        verifies normally afterward.
+
+        N+1 is non-speculative (item.speculative=False), so the chain-invalidation
+        branch ('previous_failed'/'chain_invalidated') never fires for it.  N's
+        failure does NOT advance main, so N+1.base_sha == current_main and
+        Mechanism 2 ('main_advanced') also does not fire.  N+1 passes through the
+        normal verify path.
+
+        The test confirms the ON-DRAIN cap release fires before any branching, so
+        the cap is balanced regardless.  M completing is the primary non-deadlock
+        proof; the _cap_is_full check is an independent early signal.
 
         Scenario:
-          N  — non-speculative, counted (counts_against_cap=True)
-             — verify is gated then fails → n_failed=True
+          N   — non-speculative, counted (counts_against_cap=True)
+                — verify gated then FAILS → n_failed=True, main NOT advanced
           N+1 — non-speculative, counted (submitted after N's spec window closed)
-              — chain-invalidated → discard + _remerge → resolves 'done'
-          M  — submitted after N+1 → proves cap is balanced (no deadlock)
-
-        Cap invariant: ON-DRAIN release fires before chain-invalidation body, so
-        every counted item releases the cap exactly once regardless of re-merge.
+                — verifies NORMALLY (no chain-invalidation, no main_advanced)
+          M   — submitted after N+1 → primary proof cap is balanced (no deadlock)
 
         Assertions:
-          (1) N resolves 'blocked' (verify failure); N+1 resolves 'done' (re-merged).
-          (2) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND after all three complete.
-          (3) M resolves 'done' (cap balanced — merger never stuck at acquire).
+          (1) N resolves 'blocked' (verify failure); N+1 resolves 'done' (normal verify).
+          (2) M resolves 'done' (cap balanced — merger not stuck at acquire).
         """
         from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
 
@@ -4147,16 +4313,18 @@ class TestSpeculativeMergeWorker:
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
 
         assert outcome_n.status == 'blocked', f'N must be blocked (verify fail): {outcome_n}'
-        assert outcome_n1.status == 'done', f'N+1 must be done after re-merge: {outcome_n1}'
-
-        # (2) Cap must be balanced after N and N+1 complete
-        cap_value = worker._merge_ahead_cap._value
-        assert cap_value == _MERGE_AHEAD_BOUND, (
-            f'cap._value={cap_value} after N+N+1; expected {_MERGE_AHEAD_BOUND}. '
-            'Counted item discarded/re-merged must still release cap exactly once.'
+        assert outcome_n1.status == 'done', (
+            f'N+1 must be done (normal verify after N failed): {outcome_n1}'
         )
 
-        # (3) Submit M — proves cap is balanced (merger can acquire again)
+        # Early cap check via the public locked() API
+        assert _cap_is_full(worker._merge_ahead_cap, _MERGE_AHEAD_BOUND), (
+            f'merge-ahead cap has no free slots after N+N+1; '
+            f'expected BOUND={_MERGE_AHEAD_BOUND} slots free. '
+            'ON-DRAIN release must fire for each counted item.'
+        )
+
+        # (2) Submit M — primary proof: cap balanced (merger can acquire again)
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
             await queue.put(req_m)
             outcome_m = await asyncio.wait_for(req_m.result, timeout=30)
@@ -4223,11 +4391,12 @@ class TestSpeculativeMergeWorker:
             'Cap leak would cause merger to deadlock at acquire().'
         )
 
-        # (2) Cap must be at BOUND (released on N's abandoned drain)
-        cap_value = worker._merge_ahead_cap._value
-        assert cap_value == _MERGE_AHEAD_BOUND, (
-            f'cap._value={cap_value} after abandoned N + completed N+1; '
-            f'expected {_MERGE_AHEAD_BOUND}. '
+        # (2) Cap must be fully free after abandoned N + completed N+1.
+        #     N+1 completing above is the primary non-deadlock proof;
+        #     this uses the public locked() API as an independent check.
+        assert _cap_is_full(worker._merge_ahead_cap, _MERGE_AHEAD_BOUND), (
+            f'merge-ahead cap has no free slots after abandoned N + completed N+1; '
+            f'expected BOUND={_MERGE_AHEAD_BOUND} slots free. '
             'ON-DRAIN release must fire even on the abandoned early-continue path.'
         )
 
