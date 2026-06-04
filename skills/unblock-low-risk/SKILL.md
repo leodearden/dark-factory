@@ -105,7 +105,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
    Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
    slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
-   `abandoned`, `superseded`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
+   `abandoned`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
    post-charge aborts cost a slot. This is the accepted §4.2 tradeoff.
 
 8. **Merge via the queue — never directly.** Submit:
@@ -145,9 +145,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
      60 s]. Proceed to step 9 with the final `result.state`.
 
-9. **Handle the outcome** (use the polled `merge_status` `state` from step 8's polling loop, or the
-   `status` returned directly by the bounded `merge_request` call if it resolved in-window — treat
-   them uniformly):
+9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
+   overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
+   collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
+   `merge_request` never returns; `unknown` is a polled-only fallback state.
 
    - **`done` (polled state) or `already_merged` (submit-time fast-path):** success.
      `already_merged` carries no `request_id` — nothing to poll or cancel.
@@ -160,9 +161,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
 
-   - **`conflict` | `blocked` | `abandoned` | `superseded` | `failed` | `unknown_branch`:**
+   - **`conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch`:**
      call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
-     retry, do not direct-merge.
+     retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
+     `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
