@@ -80,6 +80,10 @@ class Escalation:
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
     train_state: TrainState | None = None
+    # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
+    # None for records resolved before α1 or for L2 cascade members (β derives theirs
+    # from the parent via resolved_by='l2-cascade:<id>' attribution).
+    resolution_action: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

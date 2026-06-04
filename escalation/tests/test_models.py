@@ -320,3 +320,110 @@ class TestEscalationTrainState:
         assert restored.train_state is None, (
             f"Expected train_state=None for legacy JSON, got {restored.train_state!r}"
         )
+
+
+class TestEscalationResolutionAction:
+    """Escalation dataclass has a resolution_action field (C1 § action enum for resolve_issue)."""
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-200-0001',
+            task_id='200',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test escalation for resolution_action',
+        )
+
+    # --- (a) default is None ---
+
+    def test_resolution_action_default_is_none(self):
+        """Escalation constructed without resolution_action has resolution_action=None."""
+        esc = self._make_base_esc()
+        assert esc.resolution_action is None
+
+    # --- (b) round-trip to_dict / from_dict ---
+
+    def test_resolution_action_round_trip_via_to_dict_from_dict(self):
+        """resolution_action='park' is preserved through to_dict() / from_dict()."""
+        esc = Escalation(
+            id='esc-task-200-0001',
+            task_id='200',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_action round-trip',
+            resolution_action='park',
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.resolution_action == 'park'
+
+    # --- (c) round-trip to_json / from_json ---
+
+    def test_resolution_action_round_trip_via_to_json_from_json(self):
+        """resolution_action='abandon' is preserved through to_json() / from_json()."""
+        esc = Escalation(
+            id='esc-task-200-0001',
+            task_id='200',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_action json round-trip',
+            resolution_action='abandon',
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.resolution_action == 'abandon'
+
+    # --- (d) appears in serialised JSON ---
+
+    def test_resolution_action_appears_in_to_json_output(self):
+        """resolution_action is serialised (not silently dropped) when set."""
+        esc = Escalation(
+            id='esc-task-200-0001',
+            task_id='200',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='scope_violation',
+            summary='test resolution_action in json',
+            resolution_action='resume',
+        )
+        d = json.loads(esc.to_json())
+        assert 'resolution_action' in d
+        assert d['resolution_action'] == 'resume'
+
+    # --- (e) legacy JSON backward compat ---
+
+    def test_from_dict_legacy_json_omits_resolution_action(self):
+        """from_json() on JSON without resolution_action key returns resolution_action=None (backward compat)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without resolution_action',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: resolution_action is intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.resolution_action is None, (
+            f"Expected resolution_action=None for legacy JSON, got {restored.resolution_action!r}"
+        )

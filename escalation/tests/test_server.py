@@ -614,6 +614,307 @@ class TestStrandedBlockedCategory:
 
 
 # ---------------------------------------------------------------------------
+# TestResolveIssueActionEnum: C1/C2 action enum contract + terminate= migration guard
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueActionEnum:
+    """resolve_issue action enum: C1 semantics table + terminate= migration guard (C2)."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-t1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-1',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='action enum test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) terminate= sentinel ---
+
+    @pytest.mark.asyncio
+    async def test_terminate_true_returns_migration_error(self, tmp_path: Path):
+        """terminate=True returns {'error': ...} naming all five actions; record stays pending."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', terminate=True,
+        )
+
+        assert 'error' in result, f"Expected error dict, got: {result}"
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, f"Migration error must name '{action}'; got: {msg!r}"
+        # Record must be unchanged
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+    @pytest.mark.asyncio
+    async def test_terminate_false_returns_migration_error(self, tmp_path: Path):
+        """terminate=False also returns {'error': ...} (any non-None value triggers guard)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', terminate=False,
+        )
+
+        assert 'error' in result, f"Expected error dict for terminate=False, got: {result}"
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, f"Migration error must name '{action}'; got: {msg!r}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+    # --- (b) default + 'resume' → resolved ---
+
+    @pytest.mark.asyncio
+    async def test_default_action_resolves(self, tmp_path: Path):
+        """Default call (no action kwarg) resolves the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(server, escalation_id=esc.id, resolution='fixed')
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_resume_resolves(self, tmp_path: Path):
+        """action='resume' resolves the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    # --- (c) restart → resolved ---
+
+    @pytest.mark.asyncio
+    async def test_action_restart_resolves(self, tmp_path: Path):
+        """action='restart' resolves the escalation (dismiss=False path)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='restart approved', action='restart',
+        )
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    # --- (d) park / abandon / close_only → dismissed ---
+
+    @pytest.mark.asyncio
+    async def test_action_park_dismisses(self, tmp_path: Path):
+        """action='park' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_abandon_dismisses(self, tmp_path: Path):
+        """action='abandon' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='abandoned', action='abandon',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_close_only_dismisses(self, tmp_path: Path):
+        """action='close_only' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    # --- (e) invalid action → error, record unchanged ---
+
+    @pytest.mark.asyncio
+    async def test_action_bogus_returns_error_record_unchanged(self, tmp_path: Path):
+        """action='bogus' returns {'error': ...} and record remains pending."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='bogus',
+        )
+
+        assert 'error' in result, f"Expected error dict for invalid action; got: {result}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+
+# ---------------------------------------------------------------------------
+# TestResolveIssueResolutionActionPersisted: C1 resolution_action persisted to disk
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueResolutionActionPersisted:
+    """resolve_issue stamps resolution_action on the resolved record (C1 persistence)."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-p1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-persist',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='persistence test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_park_resolution_action_persisted(self, tmp_path: Path):
+        """action='park' → queue.get(id).resolution_action == 'park' with status 'dismissed'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'dismissed', f"Expected dismissed; got {record.status!r}"
+        assert record.resolution_action == 'park', (
+            f"Expected resolution_action='park'; got {record.resolution_action!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_resolution_action_persisted(self, tmp_path: Path):
+        """action='resume' → queue.get(id).resolution_action == 'resume' with status 'resolved'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved', f"Expected resolved; got {record.status!r}"
+        assert record.resolution_action == 'resume', (
+            f"Expected resolution_action='resume'; got {record.resolution_action!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_return_dict_includes_resolution_action(self, tmp_path: Path):
+        """resolve_issue return dict includes resolution_action key with the chosen action."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        assert 'resolution_action' in result, f"Return dict missing resolution_action; got: {result}"
+        assert result['resolution_action'] == 'close_only', (
+            f"Expected resolution_action='close_only'; got {result['resolution_action']!r}"
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# TestResolveIssueTerminateMcpPath: terminate= guard reachable via MCP dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueTerminateMcpPath:
+    """terminate= migration guard is reachable through server.call_tool() (MCP dispatch path).
+
+    The terminate parameter is annotated Any so FastMCP's pydantic validation
+    does NOT reject non-null values at the schema layer.  Without this the
+    caller would get an opaque ValidationError instead of the friendly
+    migration error naming the five replacement actions.
+    """
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-mcp-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-mcp',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='mcp path terminate test',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_terminate_true_via_call_tool_returns_friendly_error(self, tmp_path: Path):
+        """terminate=True through server.call_tool() returns the migration error, not a ValidationError.
+
+        This exercises the full MCP dispatch path (pydantic schema validation +
+        middleware) rather than the bare tool.fn() shortcut, confirming the
+        guard is actually reachable end-to-end.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        tool_result = await server.call_tool('resolve_issue', {
+            'escalation_id': esc.id,
+            'resolution': 'done',
+            'terminate': True,
+        })
+
+        result = tool_result.structured_content
+        assert result is not None, (
+            "call_tool returned no structured_content — "
+            "terminate=True may have been rejected at the schema layer"
+        )
+        assert 'error' in result, (
+            f"Expected friendly migration error dict via MCP path, got: {result}"
+        )
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, (
+                f"Migration error must name '{action}'; got: {msg!r}"
+            )
+        # Record must be unchanged
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', (
+            f"Record must stay pending after migration error; got {record.status!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
 # ---------------------------------------------------------------------------
 
@@ -1471,7 +1772,7 @@ class TestPromoteToL2Cascade:
 
     @pytest.mark.asyncio
     async def test_dismiss_l2_cascades_dismiss_to_members(self, tmp_path: Path):
-        """(f) Dismiss the L2 (terminate=True) → members are dismissed."""
+        """(f) Dismiss the L2 (action='abandon') → members are dismissed."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -1486,7 +1787,7 @@ class TestPromoteToL2Cascade:
             server,
             escalation_id=l2_result['id'],
             resolution='Not actionable',
-            terminate=True,
+            action='abandon',
         )
 
         m1 = queue.get('esc-l1-1')

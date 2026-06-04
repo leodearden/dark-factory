@@ -42,6 +42,10 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
+# C1 action enum for resolve_issue — five valid values, two disposition buckets.
+RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
+_DISMISS_ACTIONS: frozenset[str] = frozenset({'park', 'abandon', 'close_only'})
+
 CATEGORIES = [
     'scope_violation',
     'design_concern',
@@ -387,19 +391,80 @@ def create_server(
     def resolve_issue(
         escalation_id: str,
         resolution: str,
-        terminate: bool = False,
+        action: str = 'resume',
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
+        terminate: Any = None,
     ) -> dict[str, Any]:
-        """Resolve or dismiss an escalation. The resolution text is injected into the
-        agent's briefing when the task resumes.
+        """Resolve or dismiss an escalation.
 
-        Set terminate=true to abandon the task rather than resume it.
-        Use resolved_by to attribute the resolver (e.g. "steward", "interactive").
-        Use resolution_turns to record how many conversation turns resolution took.
+        ``action`` selects the resolution intent (default: ``'resume'``):
+
+        +--------------+------------+----------------------------+------------------------+
+        | action       | record     | live-workflow effect       | task-status effect     |
+        +==============+============+============================+========================+
+        | resume       | resolved   | resume from pause point;   | stays in-progress      |
+        |              |            | resolution text injected   |                        |
+        |              |            | into agent briefing (L0    |                        |
+        |              |            | path only)                 |                        |
+        +--------------+------------+----------------------------+------------------------+
+        | restart      | resolved   | restart task from scratch  | reset to pending       |
+        |              |            | (harness β handles)        | (harness β handles)    |
+        +--------------+------------+----------------------------+------------------------+
+        | park         | dismissed  | task left paused; no       | stays blocked/deferred |
+        |              |            | immediate workflow action  |                        |
+        +--------------+------------+----------------------------+------------------------+
+        | abandon      | dismissed  | task cancelled outright    | cancelled              |
+        |              |            | (harness β handles)        | (harness β handles)    |
+        +--------------+------------+----------------------------+------------------------+
+        | close_only   | dismissed  | escalation closed with no  | unchanged              |
+        |              |            | workflow effect            |                        |
+        +--------------+------------+----------------------------+------------------------+
+
+        **Note — task-status effects are not yet wired (pending harness β).**
+        Currently park, abandon, and close_only are indistinguishable at the
+        harness layer: all three produce ``status='dismissed'`` on the escalation
+        record.  The per-action task-status transitions described above will be
+        realised when harness β lands.
+
+        **Resolution text** reaches the agent only on the L0 live-resume path
+        (``action='resume'``).  For all other actions the text is stored on the
+        record for audit purposes but is not injected into any agent briefing.
+
+        **Legacy mapping** (D10): callers that resolve without ``resolution_action``
+        (i.e. records where ``resolution_action`` is ``None`` after the fact) are
+        interpreted as follows — ``dismiss=False`` (old ``terminate=False``) maps
+        to ``resume``; ``dismiss=True`` (old ``terminate=True``) maps to
+        ``close_only``.
+
+        ``terminate`` has been removed.  Passing any value raises a migration error
+        naming the five replacement actions.
+
+        ``resolved_by`` attributes the resolver (e.g. ``"steward"``, ``"interactive"``).
+        ``resolution_turns`` records how many conversation turns resolution took.
         """
+        if terminate is not None:
+            return {
+                'error': (
+                    "'terminate' was removed; state your intent: "
+                    "action='resume'|'restart'|'park'|'abandon'|'close_only' "
+                    "— see resolve_issue docstring."
+                )
+            }
+        if action not in RESOLVE_ACTIONS:
+            return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
+        # Pre-stamp resolution_action on the pending record so resolve()'s
+        # read-modify-write carries it into the archived JSON (C1 persistence).
+        # Guard: only rewrite pending records — archived records must not be resurrected.
+        pending = queue.get(escalation_id)
+        if pending is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        if pending.status == 'pending':
+            pending.resolution_action = action
+            queue._rewrite(escalation_id, pending)
+        dismiss = action in _DISMISS_ACTIONS
         esc = queue.resolve(
-            escalation_id, resolution, dismiss=terminate,
+            escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
         )
         if esc is None:
