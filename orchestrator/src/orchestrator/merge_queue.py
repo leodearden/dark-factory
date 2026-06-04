@@ -4395,11 +4395,38 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
 
             try:
-                # ── Discard stale speculative merge when chain is invalidated ─
-                # Two cases: (1) N failed directly (n_failed=True); (2) a prior
-                # iteration re-merged, meaning the Merger's spec_base for this
-                # item descended from a commit that never reached main.
+                # ── Unified re-merge site (Mechanism 2 + existing chain-invalidation) ─
+                #
+                # remerge_reason is set when the item must be re-merged:
+                #   'previous_failed'    — N failed verify (n_failed=True)
+                #   'chain_invalidated'  — a prior iteration re-merged; this item's
+                #                          spec_base descends from a stale commit
+                #   'main_advanced'      — real (non-speculative, non-train) item whose
+                #                          base_sha != current main (Mechanism 2,
+                #                          task 1646: freshness re-base at verify-pickup)
+                #
+                # The elif ordering guarantees:
+                #   • chain-invalidation is evaluated first so a speculative item that
+                #     is ALSO stale-base is not double-re-merged;
+                #   • 'main_advanced' only fires for real items (immediate_outcome is
+                #     None, merge_result is not None, not a train) that are not already
+                #     covered by chain-invalidation above.
+                remerge_reason: str | None = None
                 if item.speculative and (n_failed or remerge_occurred):
+                    remerge_reason = 'previous_failed' if n_failed else 'chain_invalidated'
+                elif (
+                    item.immediate_outcome is None
+                    and item.merge_result is not None
+                    and not isinstance(req, GroupMergeRequest)
+                ):
+                    # Mechanism 2: check staleness at pickup for real items.
+                    # Reading main once per non-speculative pickup adds one git
+                    # rev-parse per item — negligible vs. the merge/verify cost.
+                    current_main = await self._git_ops.get_main_sha()
+                    if item.base_sha != current_main:
+                        remerge_reason = 'main_advanced'
+
+                if remerge_reason is not None:
                     # Set flag early so an exception during cleanup/_remerge still
                     # propagates chain invalidation to the next iteration.
                     iteration_did_remerge = True
@@ -4412,18 +4439,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # operators can distinguish it from normal verification.
                     self._verify_item = item
                     self._verify_phase = 'remerging'
-                    # Clean up the stale merge worktree (merged against a commit
-                    # that never reached main).
+                    # Clean up the stale merge worktree.
                     if item.merge_wt:
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
-                    discard_reason = 'previous_failed' if n_failed else 'chain_invalidated'
                     self._emit_speculative(
                         EventType.speculative_discard, req.task_id,
-                        reason=discard_reason,
+                        reason=remerge_reason,
                     )
                     logger.info(
-                        f'Task {req.task_id}: discarding stale speculative merge '
-                        f'({discard_reason}), re-merging against actual main'
+                        f'Task {req.task_id}: discarding stale merge '
+                        f'({remerge_reason}), re-merging against actual main'
                     )
                     item = await self._remerge(req, item.started_monotonic)
                     # Update _verify_item to the freshly re-merged item; phase stays
