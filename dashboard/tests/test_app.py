@@ -263,6 +263,7 @@ def test_merge_queue_uses_24h_recent_window(client):
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
     assert resp.status_code == 200
+    assert mock_build.await_args is not None, "build_per_project_merge_queue was never awaited"
     assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
         f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
     )
