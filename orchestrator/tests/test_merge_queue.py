@@ -10553,3 +10553,111 @@ class TestMultiWaiterEntry:
         assert w.source == 'mcp'         # default
         assert w.submitted_tip is None   # default
         assert w.future is fut
+
+
+# ---------------------------------------------------------------------------
+# TestAttachFanOut — γ1 step-3 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAttachFanOut:
+    """γ1 step-3 RED: attach + fan-out (boundary test 9 substrate).
+
+    RED until step-4 impl: InFlightMergeRegistry has no attach() method.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_attach_appends_waiter_returns_true(self):
+        """attach() on a held branch appends waiter, returns True."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+
+        result = registry.attach('B', WaiterRecord(
+            request_id='mr-2', future=f2, source='mcp',
+        ))
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+
+    async def test_attach_free_branch_returns_false(self):
+        """attach() on a branch not in-flight returns False."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f = self._make_future()
+
+        result = registry.attach('free', WaiterRecord(
+            request_id='mr-x', future=f, source='mcp',
+        ))
+
+        assert result is False
+
+    async def test_fanout_result_mirrors_to_attached_future(self):
+        """Resolving primary future mirrors result onto attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        outcome = MergeOutcome(status='done', merge_sha='abc123')
+        f1.set_result(outcome)
+        await asyncio.sleep(0)
+
+        assert f2.done()
+        assert f2.result() is outcome
+
+    async def test_fanout_cancel_mirrors_to_attached_future(self):
+        """Cancelling primary future also cancels attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        f1.cancel()
+        await asyncio.sleep(0)
+
+        assert f2.cancelled()
+
+    async def test_fanout_exception_mirrors_to_attached_future(self):
+        """Setting exception on primary mirrors exception onto attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        exc = RuntimeError('merge failed')
+        f1.set_exception(exc)
+        await asyncio.sleep(0)
+
+        assert f2.done()
+        assert f2.exception() is exc
+
+    async def test_fanout_skips_pre_resolved_attached_future(self):
+        """Fan-out callback skips an attached future that is already done."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+        # Pre-cancel f2 (simulate soft-cancel / detach)
+        f2.cancel()
+        await asyncio.sleep(0)
+
+        # Resolving primary should NOT raise — the guard skips done f2
+        outcome = MergeOutcome(status='done')
+        f1.set_result(outcome)
+        await asyncio.sleep(0)  # callback runs; f2 already done, guard fires

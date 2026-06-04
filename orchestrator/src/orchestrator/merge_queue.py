@@ -1713,6 +1713,92 @@ class InFlightMergeRegistry:
             return None
         return int(remaining)
 
+    def attach(self, branch: str, waiter: WaiterRecord) -> bool:
+        """Attach *waiter* as a peer on the in-flight entry for *branch*.
+
+        Returns True if the branch is in-flight and the waiter was appended;
+        False if the branch is free (caller must dispatch independently).
+
+        Fan-out: registers a guarded done-callback on ``entry.primary_future``
+        that mirrors its terminal outcome (result / exception / cancel) onto
+        ``waiter.future``.  The guard skips ``waiter.future`` when it is
+        already done (soft-cancel / detach race), so the callback never raises
+        ``InvalidStateError``.
+
+        Synchronous (no ``await``) — I10 race-freedom guaranteed within a
+        single asyncio event loop tick.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.waiters.append(waiter)
+        primary = entry.primary_future
+        if primary is not None and primary is not waiter.future:
+            target = waiter.future
+
+            def _mirror(pf: asyncio.Future) -> None:
+                if target.done():
+                    return  # guard: pre-resolved / detached future — skip
+                if pf.cancelled():
+                    target.cancel()
+                elif pf.exception() is not None:
+                    target.set_exception(pf.exception())
+                else:
+                    target.set_result(pf.result())
+
+            primary.add_done_callback(_mirror)
+        return True
+
+    def detach(self, branch: str, request_id: str) -> int:
+        """Remove the waiter identified by *request_id* from *branch*.
+
+        Returns the remaining waiter count (0 when the last waiter detaches).
+
+        When the count reaches zero the entry is considered abandoned:
+        ``primary_future`` is cancelled (if not already done), which fires
+        the existing acquire-time release done-callback (slot freed) and
+        makes the existing ``_request_abandoned`` checkpoint return True at
+        the next worker poll — dropping the queued work with ZERO worker code
+        change.
+
+        While ≥ 1 waiter remains the entry proceeds normally (boundary test
+        10 substrate).
+
+        Returns 0 for a branch not in-flight (no-op, safe to call).
+        Unknown *request_id* is a no-op returning the unchanged count.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return 0
+        entry.waiters = [w for w in entry.waiters if w.request_id != request_id]
+        if not entry.waiters:
+            pf = entry.primary_future
+            if pf is not None and not pf.done():
+                pf.cancel()
+        return len(entry.waiters)
+
+    def re_snapshot(self, branch: str, new_tip: str) -> bool:
+        """Update the snapshot tip for *branch* to *new_tip*.
+
+        Returns True on success; False if *branch* is not in-flight.
+        The generation counter is NOT incremented here — the caller (γ2
+        worker wiring) increments it when triggering a new merge attempt.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.snapshot_tip = new_tip
+        return True
+
+    def set_verifying(self, branch: str, verifying: bool = True) -> None:
+        """Set the ``verifying`` flag on the in-flight entry for *branch*.
+
+        No-op when *branch* is not in-flight (safe to call on release race).
+        """
+        entry = self._slots.get(branch)
+        if entry is not None:
+            entry.verifying = verifying
+
     def release(self, branch: str) -> None:
         """Remove *branch* from the in-flight registry.
 
