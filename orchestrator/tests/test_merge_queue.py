@@ -9348,11 +9348,74 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
 
+    async def test_feature_gate_default_off_blocks_not_supersedes(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(b-gate) AUTO_CHAIN_GENERATIONS_ENABLED defaults to False; with kill-switch
+        OFF, _finalize_advanced_merge returns 'blocked' (not 'superseded') even when
+        chain_ctx is wired and tip is a SUPERSET advance, and the queue stays empty."""
+        import orchestrator.merge_queue as mq
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TipRelation,
+            _GenerationChainContext,
+            _finalize_advanced_merge,
+        )
+
+        # Verify the kill-switch is False by default.
+        assert mq.AUTO_CHAIN_GENERATIONS_ENABLED is False
+
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='task-gate',
+            branch='task/t-gate',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        # Kill-switch is OFF (default) — no patch needed.
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'blocked', (
+            f'kill-switch OFF should block, got {outcome.status!r}'
+        )
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert queue.empty(), 'no gen-(n+1) request should be enqueued while kill-switch is OFF'
+
     async def test_chain_ctx_superset_advance_returns_superseded_and_enqueues(
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """(b) chain_ctx + merged_branch_tip + SUPERSET advance → returns superseded,
-        enqueues gen-(n+1) request."""
+        enqueues gen-(n+1) request (tested with AUTO_CHAIN_GENERATIONS_ENABLED=True)."""
         from orchestrator.merge_queue import (
             MergeRequest,
             TipRelation,
@@ -9383,6 +9446,7 @@ class TestFinalizeAdvancedMerge:
         )
 
         with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
             patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
             patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
             patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
