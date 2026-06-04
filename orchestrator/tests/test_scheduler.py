@@ -6658,3 +6658,106 @@ class TestAcquireNextExternalDepGate:
         assert result is None, (
             f'Local deps done but external dep in-progress → must NOT dispatch; got {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Pair E — Scheduler._suppress_blocked_write hook (task 1620, step-9)
+# RED until step-10 declares the hook attr and inserts the pre-dispatch guard.
+# ---------------------------------------------------------------------------
+
+class TestSuppressBlockedWrite:
+    """Scheduler._suppress_blocked_write: pre-dispatch suppression guard for 'blocked' writes.
+
+    Pair E (task 1620), step-9.  RED until step-10 adds:
+      1. ``self._suppress_blocked_write: Callable[[str], bool] | None = None`` in __init__
+         alongside the existing _on_park_stop_trip / _on_external_dep_block declarations.
+      2. A guard at the TOP of ``set_task_status`` — BEFORE the
+         ``for attempt in range(_TRANSIENT_RETRIES)`` retry loop — that returns
+         early when ``status == 'blocked'`` and the predicate flags that task_id.
+         (Inserting it at the post-write success branch :1190 would still let the
+         write reach fused-memory, defeating C3.2 — see plan design decision 7.)
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_baseline_blocked_calls_dispatch_and_records_transition(
+        self, scheduler: Scheduler
+    ):
+        """(a) Without any suppression hook, set_task_status(tid, 'blocked') calls
+        dispatch_tool and records the blocked transition in the rolling window.
+
+        Baseline / regression anchor — must stay GREEN before and after step-10.
+        """
+        scheduler.dispatch_tool = AsyncMock(return_value={})  # empty dict → success
+        tid = 'task-baseline'
+
+        await scheduler.set_task_status(tid, 'blocked')
+
+        scheduler.dispatch_tool.assert_called_once()
+        # Blocked transition should be recorded (parked_live_count tracks unique tids in window).
+        assert scheduler.parked_live_count == 1, (
+            f'Expected blocked transition recorded; parked_live_count={scheduler.parked_live_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_suppressed_blocked_skips_dispatch_and_transition(
+        self, scheduler: Scheduler
+    ):
+        """(b) With ``_suppress_blocked_write = lambda t: t == tid`` installed,
+        ``set_task_status(tid, 'blocked')`` must NOT call dispatch_tool and must NOT
+        record a blocked transition.
+
+        RED until step-10 inserts the pre-dispatch guard.  The RED assertion is that
+        dispatch_tool is NOT called — a guard placed at :1190 (post-write success
+        branch) would still fail this because the write reaches dispatch_tool first.
+        """
+        scheduler.dispatch_tool = AsyncMock(return_value={})
+        tid = 'task-suppress'
+        # Install the suppression predicate: suppress only this specific tid.
+        scheduler._suppress_blocked_write = lambda t: t == tid
+
+        await scheduler.set_task_status(tid, 'blocked')
+
+        # RED: guard does not exist yet → dispatch_tool IS called → assertion fails.
+        scheduler.dispatch_tool.assert_not_called()
+        # No blocked transition recorded either.
+        assert scheduler.parked_live_count == 0, (
+            f'Suppressed write must not record a transition; got {scheduler.parked_live_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_suppression_applies_only_to_blocked_status(
+        self, scheduler: Scheduler
+    ):
+        """(c) Suppression is status-specific: a 'pending' write for the same tid
+        still calls dispatch_tool even when the hook returns True for that tid.
+        """
+        scheduler.dispatch_tool = AsyncMock(return_value={})
+        tid = 'task-pending-not-suppressed'
+        # Suppress blocked writes for this tid.
+        scheduler._suppress_blocked_write = lambda t: t == tid
+
+        # A 'pending' write must still dispatch.
+        await scheduler.set_task_status(tid, 'pending')
+
+        scheduler.dispatch_tool.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_suppression_does_not_affect_other_task_ids(
+        self, scheduler: Scheduler
+    ):
+        """With hook suppressing only 'task-A', a 'blocked' write for 'task-B'
+        still dispatches normally and records the transition.
+        """
+        scheduler.dispatch_tool = AsyncMock(return_value={})
+        # Only 'task-A' is suppressed.
+        scheduler._suppress_blocked_write = lambda t: t == 'task-A'
+
+        await scheduler.set_task_status('task-B', 'blocked')
+
+        scheduler.dispatch_tool.assert_called_once()
+        assert scheduler.parked_live_count == 1

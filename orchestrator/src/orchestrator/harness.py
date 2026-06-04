@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -312,6 +312,21 @@ class Harness:
         # Mirrors the _on_park_stop_trip pattern (declared in scheduler.py, installed
         # here so the harness EscalationQueue and set_task_status are available).
         self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
+        # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
+        # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
+        # Stamped (incremented) before the status write + kill; decremented in the
+        # finally block once the kill window closes.  A Counter (vs plain set) ensures
+        # overlapping teardown coros for the SAME task_id — low probability but possible
+        # with concurrent escalation resolutions — do not prematurely clear each other's
+        # suppression window.  Mirrors _workflow_cancel_at's grace lifecycle so a
+        # re-dispatched (restart→pending) workflow can write 'blocked' legitimately in
+        # its next incarnation rather than being permanently suppressed.
+        self._action_teardown_tasks: Counter[str] = Counter()
+        # Wire to the scheduler's suppression predicate so that 'blocked' writes emitted
+        # by a workflow being killed cannot clobber the action's target status
+        # (pending/deferred).  Declared in scheduler.py, installed here alongside the
+        # other callback installs — same pattern as _on_park_stop_trip / _on_external_dep_block.
+        self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -4254,65 +4269,231 @@ Output JSON matching the schema. Every task must appear in the output.
                 label=f'auto-resume-scheduler (via {escalation.id})',
             )
 
-        # Auto-flip cascade-resolved L1 member task from blocked→pending.
-        # Guarded by level==1 + status=='resolved' + resolved_by startswith 'l2-cascade:'
-        # so it only fires for members of a resolved (not dismissed) L2 cluster.
-        # The wake event.set() above runs synchronously (criterion 8 regression guard);
-        # the flip is scheduled as a separate async task so it never blocks the callback.
-        if (
-            escalation.level == 1
-            and escalation.status == 'resolved'
-            and isinstance(escalation.resolved_by, str)
-            and escalation.resolved_by.startswith('l2-cascade:')
-        ):
-            # Scheduled via _schedule_coro_threadsafe so it works whether this
-            # callback fires on the orchestrator loop (watcher supervisor, unit
-            # tests) or off it (sync MCP resolve_issue on a FastMCP worker —
-            # where a bare asyncio.create_task raised "no running event loop").
+        # Unified action dispatch — β (task 1620).
+        # _resolve_escalation_action maps the escalation to a canonical action
+        # string (resume/close_only/restart/park/abandon) using the explicit
+        # resolution_action field first, then the parent L2's action for cascade
+        # members, then the legacy dismiss→close_only / resolve→resume mapping
+        # (D10) so all existing in-process tests stay green.
+        #
+        # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
+        # dedicated auto-resume handling above and is not a real task; skip it.
+        if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        action = self._resolve_escalation_action(escalation)
+
+        if action == 'close_only':
+            # Operator closed the escalation without a re-pend — leave the task
+            # in its current state (dismissed means "abandon; stay blocked").
+            logger.info(
+                'escalation %s resolved with close_only — no status change '
+                'for task %s', escalation.id, escalation.task_id,
+            )
+            return
+
+        if action == 'resume':
+            # Re-pend the blocked task.  Still gated level==1 here (step-2);
+            # D7: level>=1 gate — covers L1 members and born-at-L2 orphans alike.
+            # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
+            # fired _resolve_callback for the L2 first, then each member with
+            # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
+            # NOT in _escalation_events (a live workflow owns its own re-pend).
+            if escalation.level >= 1:
+                is_l2_cascade = (
+                    isinstance(escalation.resolved_by, str)
+                    and escalation.resolved_by.startswith('l2-cascade:')
+                )
+                if is_l2_cascade:
+                    # Scheduled via _schedule_coro_threadsafe so it works whether
+                    # this callback fires on the orchestrator loop or off it (sync
+                    # MCP resolve_issue on a FastMCP worker — where a bare
+                    # asyncio.create_task raised "no running event loop").
+                    self._schedule_coro_threadsafe(
+                        self._cascade_unblock_member(escalation),
+                        label=(
+                            f'cascade-unblock task {escalation.task_id} '
+                            f'(via {escalation.resolved_by})'
+                        ),
+                    )
+                elif escalation.task_id not in self._escalation_events:
+                    # Fix #1a — direct/orphan re-pend.  A live workflow owns its
+                    # own re-pend (woken by event.set()); only flip when orphaned.
+                    self._schedule_coro_threadsafe(
+                        self._cascade_unblock_member(escalation),
+                        label=(
+                            f'orphan-unblock task {escalation.task_id} '
+                            f'(via {escalation.resolved_by})'
+                        ),
+                    )
+            return
+
+        # restart / park / abandon → teardown + status write.
+        _ACTION_TARGETS = {'restart': 'pending', 'park': 'deferred', 'abandon': 'cancelled'}
+        target = _ACTION_TARGETS.get(action)
+        if target is not None:
             self._schedule_coro_threadsafe(
-                self._cascade_unblock_member(escalation),
-                label=(
-                    f'cascade-unblock task {escalation.task_id} '
-                    f'(via {escalation.resolved_by})'
+                self._action_teardown_and_set_status(
+                    escalation.task_id, target, action,
                 ),
+                label=(
+                    f'action-teardown task {escalation.task_id} '
+                    f'action={action} target={target}'
+                ),
+            )
+        else:
+            logger.warning(
+                'escalation %s: unrecognised action %r for task %s — ignored',
+                escalation.id, action, escalation.task_id,
             )
 
-        # Fix #1a — event-driven re-pend on DIRECT resolution of an orphan L1.
-        # The root cause of the 3576 strand (2026-05-29): an L1 resolved
-        # directly (resolved_by='escalation-watcher-auto', not 'l2-cascade:')
-        # while NO workflow owned the task.  The wake event.set() above woke
-        # nothing (no active workflow); the cascade flip above did not match
-        # (no l2-cascade prefix).  So the blocked→pending flip never happened
-        # and the task stayed stranded.  This is the precise inverse: when the
-        # task has no active workflow slot (task_id not in _escalation_events),
-        # WE perform the flip — reusing _cascade_unblock_member, which rechecks
-        # status=='blocked' and TOCTOU-guards via SetTaskStatusRejected.
-        #
-        # Gates:
-        #   - level==1, status=='resolved' (NOT 'dismissed' — a dismissed
-        #     escalation means "abandon the task"; leave it blocked).
-        #   - NOT l2-cascade (the block above already scheduled that flip).
-        #   - task_id NOT in _escalation_events: a live workflow owns its own
-        #     re-pend (woken by event.set()); only flip when orphaned.  This is
-        #     the precise inverse of the root cause and avoids racing the rare
-        #     active-workflow re-pend (idempotent anyway via the blocked recheck).
+    async def _action_teardown_and_set_status(
+        self,
+        task_id: str,
+        target_status: str,
+        action: str,
+    ) -> None:
+        """Async helper: execute a non-resume resolution action on a task.
+
+        Implements C3.1 (status-precedes-kill) ordering:
+          1. Terminal recheck — skip if the task is already done/cancelled.
+          2. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
+          3. Write ``target_status`` via scheduler.
+          4. Kill live workflow if active (soft → grace → hard).
+          5. Clear the stamp (in finally block) once the kill window closes.
+
+        Preconditions per action:
+          - restart: task must be non-terminal (checked at step 1); target='pending'.
+            Any non-terminal current status is intentionally overwritten — restart is
+            a forced re-pend.  SetTaskStatusRejected handles the terminal-exit gate
+            if the task transitions terminally between the recheck and the write.
+          - park:    task must be non-terminal; target='deferred'.  Same TOCTOU note.
+          - abandon: task must be non-terminal; target='cancelled'.  SetTaskStatusRejected
+            is redundant here (cancelled is terminal and the scheduler's terminal-exit
+            gate would also catch it), but the recheck still avoids a no-op write.
+
+        Suppression scope — why suppressing only 'blocked' writes is correct (C3.2):
+          A workflow paused at an escalation-event wait has already written 'in-progress'
+          at task-start (``_setup_worktree_and_artifacts``).  After ``event.set()`` wakes
+          it, it continues mid-task execution and does NOT re-write 'in-progress' — that
+          write happens only once, at task dispatch time.  On cancellation the workflow's
+          cleanup path calls ``_mark_blocked``, which emits exactly one 'blocked' write.
+          That 'blocked' write is the racing write suppression must intercept; suppressing
+          'blocked' alone is therefore sufficient for this code path.
+
+        The stamp in step 2 activates the scheduler's _suppress_blocked_write predicate,
+        so any racing 'blocked' write emitted by the workflow before the kill lands is
+        absorbed without reaching fused-memory.  The stamp is cleared in the finally
+        block whether the status write succeeded, was rejected, or the kill completed —
+        ensuring a re-dispatched (restart→pending) workflow can write 'blocked'
+        legitimately in its next incarnation rather than being permanently suppressed.
+
+        Concurrency note: ``_action_teardown_tasks`` uses a Counter so that overlapping
+        teardown coros for the same task_id (low probability — each L2 cascade member is
+        a distinct task_id) do not prematurely clear each other's suppression windows.
+        """
+        current = await self.scheduler.get_status(task_id)
+        if current in TERMINAL_STATUSES:
+            logger.debug(
+                'action-teardown %s: task %s is already %s (terminal) — skip',
+                action, task_id, current,
+            )
+            return
+
+        logger.info(
+            'action-teardown %s: writing task %s → %s',
+            action, task_id, target_status,
+        )
+        # Stamp suppression window BEFORE the status write (C3.2 / D9, task 1620 step-12).
+        # Must be set prior to set_task_status so that a racing workflow 'blocked' write
+        # (concurrent with our status write or arriving before the kill lands) is
+        # absorbed by the scheduler guard and cannot clobber the action's target status.
+        # Counter increment (not set.add) so overlapping teardowns for the same task_id
+        # don't prematurely clear each other's suppression window (step-12 amend).
+        self._action_teardown_tasks[task_id] += 1
+        try:
+            try:
+                await self.scheduler.set_task_status(task_id, target_status)
+            except SetTaskStatusRejected as e:
+                logger.warning(
+                    'action-teardown %s: set_task_status(%s, %s) rejected: %s',
+                    action, task_id, target_status, e,
+                )
+                return
+
+            # Kill sequence for a live workflow (C3.1, D9).
+            # Status write is already done above — kill strictly follows.
+            if self.is_workflow_active(task_id):
+                self.cancel_workflow(task_id)
+                logger.info(
+                    'action-teardown %s: soft-cancelled workflow for task %s',
+                    action, task_id,
+                )
+                # Poll for slot to clear.  The _action_teardown_tasks suppression
+                # (still active in the stamp) ensures a racing _mark_blocked write is
+                # absorbed while the kill is in flight.  Use the terminal-status
+                # hard-cancel budget as the poll ceiling — consistent with the existing
+                # cancel scan discipline (harness.py:_mark_terminal_status_cancel_scan).
+                _POLL_SLEEP_S = 0.05
+                max_polls = getattr(self.config, 'terminal_status_hard_cancel_polls', 10)
+                polls = 0
+                while self.is_workflow_active(task_id) and polls < max_polls:
+                    await asyncio.sleep(_POLL_SLEEP_S)
+                    polls += 1
+                if self.is_workflow_active(task_id):
+                    logger.warning(
+                        'action-teardown %s: workflow for task %s did not clear '
+                        'within %d polls — escalating to hard_cancel_workflow',
+                        action, task_id, max_polls,
+                    )
+                    self.hard_cancel_workflow(task_id)
+        finally:
+            # Decrement the suppression refcount once the kill window closes (step-12).
+            # Delete the key when it reaches zero so Counter.__contains__ returns False
+            # and a re-dispatched (restart→pending) workflow can write 'blocked'
+            # legitimately in its next incarnation.
+            self._action_teardown_tasks[task_id] -= 1
+            if self._action_teardown_tasks[task_id] <= 0:
+                del self._action_teardown_tasks[task_id]
+
+    def _resolve_escalation_action(self, escalation) -> str:
+        """Resolve the canonical action for a resolved/dismissed escalation.
+
+        Priority:
+          1. The explicit ``resolution_action`` on the record (set by the MCP
+             server at resolve_issue time — α1 path).
+          2. For cascade members (``resolved_by='l2-cascade:<parent_id>'``):
+             read the parent L2's ``resolution_action`` (already archived by
+             the time the member callback fires).  Falls through if absent.
+          3. Legacy mapping (D10): ``status=='dismissed'`` → ``'close_only'``;
+             ``status=='resolved'`` → ``'resume'``.
+
+        The legacy path ensures all in-process flows and existing tests that
+        carry no ``resolution_action`` continue to behave as before.
+        """
+        # 1) Explicit action on this record.
+        if escalation.resolution_action is not None:
+            return escalation.resolution_action
+
+        # 2) Cascade member: inherit parent L2's action.
         if (
-            escalation.level == 1
-            and escalation.status == 'resolved'
-            and escalation.task_id != self._SCHEDULER_PAUSE_SENTINEL
-            and not (
-                isinstance(escalation.resolved_by, str)
-                and escalation.resolved_by.startswith('l2-cascade:')
-            )
-            and escalation.task_id not in self._escalation_events
+            isinstance(escalation.resolved_by, str)
+            and escalation.resolved_by.startswith('l2-cascade:')
         ):
-            self._schedule_coro_threadsafe(
-                self._cascade_unblock_member(escalation),
-                label=(
-                    f'orphan-unblock task {escalation.task_id} '
-                    f'(via {escalation.resolved_by})'
-                ),
+            parent_id = escalation.resolved_by.split(':', 1)[1]
+            parent = (
+                self._escalation_queue.get(parent_id)
+                if self._escalation_queue is not None
+                else None
             )
+            if parent is not None and parent.resolution_action is not None:
+                return parent.resolution_action
+            # Fall through to legacy map (parent also lacks resolution_action).
+
+        # 3) Legacy mapping.
+        if escalation.status == 'dismissed':
+            return 'close_only'
+        return 'resume'  # status == 'resolved'
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
