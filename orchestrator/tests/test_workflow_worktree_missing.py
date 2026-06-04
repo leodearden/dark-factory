@@ -74,7 +74,7 @@ def _patch_enqueue_with_outcome(monkeypatch, outcome: MergeOutcome) -> None:
     """Replace ``enqueue_merge_request`` so the request's future resolves
     immediately with ``outcome``.  Skips the real merge worker.
     """
-    async def fake_enqueue(queue, req: MergeRequest, event_store):
+    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
         req.result.set_result(outcome)
 
     monkeypatch.setattr(
@@ -186,7 +186,7 @@ async def test_cancel_event_during_merge_returns_done_when_terminal(
 
     # enqueue without resolving the future, then set cancel_event so the
     # _await_cancellable race picks the cancel.
-    async def fake_enqueue(queue, req: MergeRequest, event_store):
+    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
         # Schedule the cancel after a moment so the race is real
         async def _do_cancel():
             await asyncio.sleep(0.01)
@@ -212,7 +212,7 @@ async def test_cancel_event_during_merge_requeues_when_nonterminal(
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='in-progress')
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store):
+    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
         async def _do_cancel():
             await asyncio.sleep(0.01)
             wf._cancel_event.set()
