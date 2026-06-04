@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from escalation import sweep
@@ -350,6 +351,65 @@ class TestSweepIdempotency:
         assert report2.reconciled_archive_wins == 0
         assert report2.untouched_pending == 1
         assert self._disk_snapshot(tmp_path) == snapshot
+
+
+class TestRunStartupSweep:
+    """Tests for sweep.run_startup_sweep and StartupSweepReport."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+    _RESOLVED_AT_RECENT = '2026-05-20T10:00:00+00:00'
+    _RESOLVED_AT_LOOSE = '2026-05-21T12:00:00+00:00'
+    _RESOLVED_AT_STALE = '2026-01-01T00:00:00+00:00'
+
+    def test_run_startup_sweep_archives_and_reaps_and_prunes(self, tmp_path: Path, caplog):
+        """Full integration: root esc archived, loose esc relocated, stale dir pruned."""
+        # One resolved root esc
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at=self._RESOLVED_AT_RECENT
+        )
+        # One loose archive esc (sits at archive top-level)
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-2-1.json'
+        loose_esc = Escalation(
+            id='esc-2-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose',
+            status='resolved',
+            resolved_at=self._RESOLVED_AT_LOOSE,
+        )
+        loose_path.write_text(loose_esc.to_json())
+        # One stale dated dir (older than 30 days relative to _NOW)
+        stale_dir = archive_root / '2026-01-01'
+        stale_dir.mkdir(parents=True)
+        stale_file = stale_dir / 'esc-9-1.json'
+        stale_file.write_text(loose_esc.to_json())
+
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        # Root esc archived
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+        # Loose esc relocated
+        assert (archive_root / '2026-05-21' / 'esc-2-1.json').exists()
+        assert not loose_path.exists()
+        # Stale dir pruned (2026-01-01 is >30 days before 2026-06-04)
+        assert not stale_dir.exists()
+
+        # StartupSweepReport fields
+        assert report.sweep.archived >= 1
+        assert report.loose_reaped == 1
+        assert report.pruned_dirs == 1
+
+        # INFO log line emitted on escalation.sweep logger
+        assert any(
+            r.name == 'escalation.sweep' and r.levelno == logging.INFO
+            for r in caplog.records
+        ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
 
 
 class TestReapLooseArchiveFiles:
