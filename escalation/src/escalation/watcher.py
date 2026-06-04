@@ -21,21 +21,21 @@ from pathlib import Path
 
 from inotify_simple import INotify, flags
 
-from escalation.models import Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 
 
 def _send_ntfy(url: str, escalation: Escalation) -> None:
     """POST an escalation as a push notification to an ntfy.sh endpoint."""
-    is_blocking = escalation.severity == 'blocking'
-    title = f'[{"BLOCKING" if is_blocking else "INFO"}] Task {escalation.task_id}: {escalation.category}'
+    is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
+    title = f'[{escalation.severity.upper()}] Task {escalation.task_id}: {escalation.category}'
     body = escalation.summary
     if escalation.detail and escalation.detail != escalation.summary:
         body += f'\n\n{escalation.detail[:500]}'
 
     req = urllib.request.Request(url, data=body.encode('utf-8'), method='POST')
     req.add_header('Title', title)
-    req.add_header('Priority', 'urgent' if is_blocking else 'default')
-    req.add_header('Tags', 'rotating_light' if is_blocking else 'information_source')
+    req.add_header('Priority', 'urgent' if is_urgent else 'default')
+    req.add_header('Tags', 'rotating_light' if is_urgent else 'information_source')
     urllib.request.urlopen(req)
 
 
