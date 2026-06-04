@@ -5042,6 +5042,58 @@ class TestStaleL1DoesNotSinkRun:
         assert len(still_pending) == 1
 
 
+# ---------------------------------------------------------------------------
+# Tests: Born-at-L2 / level≥2 escalation gates (task γ — C7/D4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('severity,level,expected', [
+    # Plain blocking L0 — primary gate
+    ('blocking', 0, True),
+    # Plain blocking L1 — stale from a prior run; must NOT gate (B3)
+    ('blocking', 1, False),
+    # Blocking at level≥2 — gated by level disjunct
+    ('blocking', 2, True),
+    # Born-at-L2 critical, isolated at level 0 — gated by severity disjunct alone
+    ('critical', 0, True),
+    # Born-at-L2 urgent, isolated at level 0 — gated by severity disjunct alone
+    ('urgent', 0, True),
+    # Born-at-L2 critical at level 2 — both severity AND level disjuncts true
+    ('critical', 2, True),
+    # Urgent at level 1 — gated by severity disjunct alone (level<2 does not fire)
+    ('urgent', 1, True),
+    # info at level 0 — neither blocking nor born-at-L2 nor level≥2
+    ('info', 0, False),
+    # info at level 1 — same
+    ('info', 1, False),
+    # info at level 2 — gated by the level≥2 catch-all (D4: any L2+ is stop-the-line)
+    ('info', 2, True),
+])
+class TestIsGatingEscalation:
+    """Unit test of ``_is_gating_escalation`` (truth table over severity×level).
+
+    Pins full PRD C7/D4 semantics including B3 (plain blocking L1 → False)
+    and disjunct isolation (critical at level 0 hits severity branch only;
+    blocking at level 2 hits level branch only; info at level 2 hits level≥2
+    catch-all regardless of severity).
+    """
+
+    def test_predicate(self, severity, level, expected):
+        from escalation.models import Escalation
+        from orchestrator.workflow import _is_gating_escalation
+
+        e = Escalation(
+            id=f'esc-42-{level}',
+            task_id='42',
+            agent_role='implementer',
+            severity=severity,
+            category='task_failure',
+            summary=f'test {severity}/{level}',
+            level=level,
+        )
+        assert _is_gating_escalation(e) is expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
