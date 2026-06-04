@@ -2779,3 +2779,51 @@ class TestDowngradeDedupeCorrectness:
             f'summary={summary!r}: expected parent_id={parent.id!r}, '
             f'got parent_id={result.get("parent_id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeStatus — merge_status MCP tool (task 1630 α3)
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_status(server, **kwargs) -> dict:
+    """Invoke the merge_status MCP tool (async tool)."""
+    tool = await server.get_tool('merge_status')
+    return await tool.fn(**kwargs)
+
+
+@pytest.mark.asyncio
+class TestMergeStatus:
+    """Tests for the merge_status escalation MCP tool (α3)."""
+
+    # ── step-5a: no key returns error ────────────────────────────────────────
+
+    async def test_no_key_returns_error(self, tmp_path: Path) -> None:
+        """Calling merge_status with no request_id/branch/task_id returns {'error': ...}."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)
+
+        result = await _call_merge_status(server)
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert 'error' in result, f'Expected error key, got: {result}'
+
+    # ── step-5b: standalone unknown + hint ───────────────────────────────────
+
+    async def test_standalone_returns_unknown_with_hint(self, tmp_path: Path) -> None:
+        """On a server with no event_store/harness, merge_status returns unknown + hint."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)  # standalone: no event_store, no harness
+
+        result = await _call_merge_status(server, request_id='mr-deadbeef')
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
+        assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
+        assert result.get('request_id') == 'mr-deadbeef', (
+            f'Expected request_id echoed, got: {result}'
+        )
+        assert 'hint' in result, f'Expected hint key in result: {result}'
+        assert 'git log' in result['hint'].lower() or 'git' in result['hint'], (
+            f'Expected hint to mention git, got: {result["hint"]!r}'
+        )
