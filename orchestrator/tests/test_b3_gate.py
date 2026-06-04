@@ -336,6 +336,14 @@ def _fake_git_never_called(args, cwd):
     raise AssertionError(f'git should not have been called; args={args}')
 
 
+def _fake_git_diff_fails(args, cwd):
+    """Fake git runner: rev-parse HEAD succeeds (P1 passes), but diff returns non-zero rc."""
+    if 'rev-parse' in args:
+        return (0, 'aaabbbccc')
+    # diff call fails (e.g. bad revision, transient error)
+    return (128, 'fatal: bad revision dddeeefff..main')
+
+
 _LOW_RISK_ENTRY = {
     'proposal_text': 'Fix it',
     'risk_label': 'low',
@@ -434,6 +442,27 @@ class TestCheckProposalMechanical:
         result = check_proposal(entry, worktree='/tmp', category=None,
                                 run_git=_fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
+
+    # step-21: P2 diff failure must not fall through to fresh (fail-closed)
+    def test_p2_diff_failure_does_not_fall_through_to_fresh(self):
+        """When the footprint git-diff returns a non-zero rc, verdict must be DRIFT.
+
+        Pin the fail-closed contract: a git failure (unreachable main_sha, missing
+        'main' ref, transient git error) must never fall through to a merge-authorizing
+        FRESH verdict.  _LOW_RISK_ENTRY has files_referenced=['foo.py'] so the diff IS
+        invoked; _fake_git_diff_fails returns rc=128 for the diff call.
+        """
+        from orchestrator.b3_gate import DRIFT, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_diff_fails, now=self._NOW,
+        )
+        assert result['verdict'] == DRIFT, (
+            f'expected DRIFT when git diff fails, got {result["verdict"]!r}: {result}'
+        )
+        reason = result['reason'].lower()
+        assert 'footprint' in reason, f'expected "footprint" in reason: {result["reason"]!r}'
+        assert '128' in reason, f'expected rc 128 in reason: {result["reason"]!r}'
 
 
 # ---------------------------------------------------------------------------
