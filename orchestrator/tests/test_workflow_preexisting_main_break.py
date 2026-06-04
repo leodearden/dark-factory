@@ -361,3 +361,132 @@ class TestInheritedBreakEscalationFiling:
         assert esc.dedupe_fingerprint == fp, (
             f'dedupe_fingerprint must be {fp!r}; got {esc.dedupe_fingerprint!r}'
         )
+
+
+class TestCrossTaskInheritedBreakDedup:
+    """Step-15 / test-expectation #4: N tasks with same (category, cause_hint, main_sha)
+    signature -> ONE parent escalation; different main_sha -> distinct fingerprint,
+    no fold into the first parent.
+
+    Tests the fingerprint composition (`compute_content_fingerprint`) plus the
+    `submit_or_dedupe` routing from `_mark_blocked` directly — bypassing the
+    steward/cleanup path so the parent L0 is still pending when the second task
+    submits, mirroring the concurrent real-world scenario.
+    """
+
+    def test_same_signature_folds_to_one_parent(self, tmp_path: Path) -> None:
+        """Two tasks (A, B) with identical (category, cause_hint, main_sha) dedupe to one parent.
+
+        Asserts:
+        - Task A's submission: status='queued', exactly 1 file in queue_dir.
+        - Task B's submission: status='dedup_skipped', still 1 file in queue_dir.
+        - Parent (A) has dedupe_count == 1 and B's escalation id in dedupe_children.
+        Contrast:
+        - Task C uses a DIFFERENT main_sha -> different fingerprint -> status='queued',
+          now 2 files in queue_dir (no fold into A's parent).
+        """
+        from escalation.dedupe import (
+            DedupeConfig,
+            compute_content_fingerprint,
+            content_fingerprint_key,
+            submit_or_dedupe,
+        )
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.workflow import _normalize_cause_hint
+
+        eq = EscalationQueue(tmp_path / 'escalations')
+
+        category = 'compile_error'
+        cause_hint = 'error TS2769: foo.tsx:12'
+        main_sha = MAIN_SHA
+        different_main_sha = 'cafebabe1234567890'
+
+        # Fingerprint for tasks A and B (same signature, same main_sha)
+        fp_ab = compute_content_fingerprint(
+            'preexisting_main_break',
+            category,
+            [],
+            description=_normalize_cause_hint(cause_hint) + '|' + main_sha,
+        )
+        # Fingerprint for task C (same signature, different main_sha — hotfix landed)
+        fp_c = compute_content_fingerprint(
+            'preexisting_main_break',
+            category,
+            [],
+            description=_normalize_cause_hint(cause_hint) + '|' + different_main_sha,
+        )
+        assert fp_ab != fp_c, (
+            'Fingerprint must differ when main_sha differs; '
+            f'fp_ab={fp_ab!r}, fp_c={fp_c!r}'
+        )
+
+        dedup_config = DedupeConfig(
+            infra_dedupe_enabled=True,
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('preexisting_main_break',),
+            key_fn=content_fingerprint_key,
+        )
+
+        def _make_esc(task_id: str, fp: str) -> Escalation:
+            esc = Escalation(
+                id=eq.make_id(task_id),
+                task_id=task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='preexisting_main_break',
+                summary='Verify failure is preexisting on main',
+                detail='TS2769 type error',
+                suggested_action='await_preexisting_main_hotfix',
+            )
+            esc.dedupe_fingerprint = fp
+            return esc
+
+        # --- Task A: first parent (no existing parent) ---
+        esc_a = _make_esc('A', fp_ab)
+        result_a = submit_or_dedupe(eq, esc_a, dedup_config)
+        assert result_a.get('status') == 'queued', (
+            f'Task A should be queued as parent; got {result_a}'
+        )
+        queue_files_after_a = sorted(eq.queue_dir.glob('esc-*.json'))
+        assert len(queue_files_after_a) == 1, (
+            f'Expected 1 file after task A submits; got {queue_files_after_a}'
+        )
+
+        # --- Task B: same fingerprint -> folds into A's parent ---
+        esc_b = _make_esc('B', fp_ab)
+        result_b = submit_or_dedupe(eq, esc_b, dedup_config)
+        assert result_b.get('status') == 'dedup_skipped', (
+            f'Task B (same fingerprint) must fold into A; got {result_b}'
+        )
+        assert result_b.get('parent_id') == esc_a.id, (
+            f'B must fold under A (id={esc_a.id!r}); got parent_id={result_b.get("parent_id")!r}'
+        )
+        queue_files_after_b = sorted(eq.queue_dir.glob('esc-*.json'))
+        assert len(queue_files_after_b) == 1, (
+            f'Expected still 1 file after task B folds; got {queue_files_after_b}'
+        )
+
+        # Parent (A) dedupe accounting: dedupe_count == 1, B's id in dedupe_children
+        parent_esc = eq.get(esc_a.id)
+        assert parent_esc is not None, f'Parent escalation {esc_a.id!r} must exist'
+        assert parent_esc.dedupe_count == 1, (
+            f'dedupe_count must be 1 after one child fold; got {parent_esc.dedupe_count}'
+        )
+        assert esc_b.id in parent_esc.dedupe_children, (
+            f'B id {esc_b.id!r} must be in dedupe_children; '
+            f'got {parent_esc.dedupe_children!r}'
+        )
+
+        # --- Task C: different main_sha -> different fingerprint -> NEW parent ---
+        esc_c = _make_esc('C', fp_c)
+        result_c = submit_or_dedupe(eq, esc_c, dedup_config)
+        assert result_c.get('status') == 'queued', (
+            f'Task C (different main_sha, fp={fp_c!r}) must NOT fold into A; got {result_c}'
+        )
+        queue_files_after_c = sorted(eq.queue_dir.glob('esc-*.json'))
+        assert len(queue_files_after_c) == 2, (
+            f'Expected 2 files after task C (different main_sha) queues a new parent; '
+            f'got {queue_files_after_c}'
+        )
