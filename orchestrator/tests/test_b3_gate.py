@@ -148,3 +148,75 @@ class TestStateLoadSave:
         _save_state(path, {'launches': [], 'charges': []})
         tmp_files = list(tmp_path.glob('*.tmp'))
         assert tmp_files == [], f'leftover tmp files: {tmp_files}'
+
+
+# ---------------------------------------------------------------------------
+# step-3: record_launch durable + idempotent
+# ---------------------------------------------------------------------------
+
+class TestRecordLaunch:
+    _NOW = datetime(2026, 6, 4, 10, 0, 0, tzinfo=UTC)
+
+    def test_first_call_records_and_persists(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _state_path, record_launch
+        sp = _state_path(tmp_path)
+        result = record_launch(
+            '42', 'aabbcc', '2026-06-04T09:00:00+00:00',
+            state_path=sp, now=self._NOW,
+        )
+        assert result == {'recorded': True, 'already_attempted': False}
+        # Durability: reload from disk
+        state = _load_state(sp)
+        assert len(state['launches']) == 1
+        entry = state['launches'][0]
+        assert entry['task_id'] == '42'
+        assert entry['head_sha'] == 'aabbcc'
+        assert entry['investigated_at'] == '2026-06-04T09:00:00+00:00'
+        assert 'recorded_at' in entry
+
+    def test_second_call_same_key_is_idempotent(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _state_path, record_launch
+        sp = _state_path(tmp_path)
+        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
+                      state_path=sp, now=self._NOW)
+        # Second call with same (task_id, head_sha, investigated_at)
+        result2 = record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
+                                state_path=sp, now=self._NOW)
+        assert result2 == {'recorded': False, 'already_attempted': True}
+        state = _load_state(sp)
+        assert len(state['launches']) == 1, 'spent key must not be re-added'
+
+    def test_different_investigated_at_rearms(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _state_path, record_launch
+        sp = _state_path(tmp_path)
+        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
+                      state_path=sp, now=self._NOW)
+        # New investigated_at == fresh investigation -> re-armed
+        result = record_launch('42', 'aabbcc', '2026-06-04T09:30:00+00:00',
+                               state_path=sp, now=self._NOW)
+        assert result == {'recorded': True, 'already_attempted': False}
+        state = _load_state(sp)
+        assert len(state['launches']) == 2
+
+    def test_different_head_sha_rearms(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _state_path, record_launch
+        sp = _state_path(tmp_path)
+        record_launch('42', 'aabbcc', '2026-06-04T09:00:00+00:00',
+                      state_path=sp, now=self._NOW)
+        result = record_launch('42', 'deadbeef', '2026-06-04T09:00:00+00:00',
+                               state_path=sp, now=self._NOW)
+        assert result == {'recorded': True, 'already_attempted': False}
+        state = _load_state(sp)
+        assert len(state['launches']) == 2
+
+    def test_durability_across_restart(self, tmp_path):
+        """Simulate restart: re-import and reload from disk confirms persistence."""
+        from orchestrator.b3_gate import _load_state, _state_path, record_launch
+        sp = _state_path(tmp_path)
+        record_launch('7', 'sha1', 'ts1', state_path=sp, now=self._NOW)
+        # Simulate restart: load fresh state from disk (no in-memory cache)
+        state_after = _load_state(sp)
+        assert len(state_after['launches']) == 1
+        # Now call again — should see the spent key
+        result = record_launch('7', 'sha1', 'ts1', state_path=sp, now=self._NOW)
+        assert result['already_attempted'] is True
