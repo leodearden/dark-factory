@@ -1472,6 +1472,26 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Orphan reaper: %d reaped, %d quarantined', reaped, quarantined,
             )
 
+    def _workflow_cancel_recent(self, tid: str) -> bool:
+        """Return True if *tid* has a workflow-cancel stamp within the grace window.
+
+        Replaces the membership check ``tid not in _workflow_cancel_at`` in the
+        Fix #1b re-file gate and in the sweep loop's R3 race guard.
+
+        Semantics:
+          - No stamp (never cancelled / already pruned) → False.
+          - Stamp exists AND now - stamp < _RECONCILE_CANCEL_GRACE_S → True
+            (workflow's finally-block may still be writing state; skip).
+          - Stamp exists AND now - stamp >= grace → False (stale; re-filing
+            is safe — the stamp will be lazily pruned by the sweep loop on the
+            next mid-run cycle via the existing pop() call).
+        """
+        cancelled_at = self._workflow_cancel_at.get(tid)
+        return (
+            cancelled_at is not None
+            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+        )
+
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
 
@@ -1559,14 +1579,12 @@ Output JSON matching the schema. Every task must appear in the output.
             # grace period elapses so we don't revert work the workflow
             # is still finishing.
             if mid_run:
-                cancelled_at = self._workflow_cancel_at.get(tid)
-                if cancelled_at is not None:
-                    if now - cancelled_at < self._RECONCILE_CANCEL_GRACE_S:
-                        continue
-                    # Grace window elapsed — lazily prune so the dict stays
-                    # bounded for tasks that exit terminal and are never
-                    # re-dispatched (re-dispatch otherwise clears the stamp).
-                    self._workflow_cancel_at.pop(tid, None)
+                if self._workflow_cancel_recent(tid):
+                    continue
+                # Grace window elapsed (or never set) — lazily prune so the
+                # dict stays bounded for tasks that exit terminal and are never
+                # re-dispatched (re-dispatch otherwise clears the stamp).
+                self._workflow_cancel_at.pop(tid, None)
 
             try:
                 outcome = await self._reconcile_one_stranded(
@@ -1823,7 +1841,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
                 and tid not in self._escalation_events       # no active workflow
-                and tid not in self._workflow_cancel_at       # not a recent cancel/park
+                and not self._workflow_cancel_recent(tid)     # not a recent cancel/park
                 and not self._escalation_queue.get_by_task(tid, status='pending')
             ):
                 from escalation.models import Escalation

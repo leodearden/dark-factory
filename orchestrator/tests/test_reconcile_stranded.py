@@ -2442,7 +2442,7 @@ async def test_stranded_blocked_refiles_single_l1_without_status_change(
     pending = _pending(harness._escalation_queue, '601')
     assert len(pending) == 1, f'expected exactly one re-filed escalation, got {pending}'
     assert pending[0].level == 1
-    assert pending[0].category == 'task_failure'
+    assert pending[0].category == 'stranded_blocked'
 
 
 @pytest.mark.asyncio
