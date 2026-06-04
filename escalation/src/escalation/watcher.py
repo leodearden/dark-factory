@@ -43,37 +43,34 @@ import time
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 from inotify_simple import INotify, flags
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 
 
-def _matches(esc: Escalation, task_id: Optional[str], level: Optional[int]) -> bool:
+def _matches(esc: Escalation, task_id: str | None, level: int | None) -> bool:
     """Return True iff esc is pending and satisfies the optional filters."""
     if esc.status != 'pending':
         return False
     if task_id and esc.task_id != task_id:
         return False
-    if level is not None and esc.level != level:
-        return False
-    return True
+    return not (level is not None and esc.level != level)
 
 
 def _initial_scan(
     queue_dir: Path,
-    task_id: Optional[str],
-    level: Optional[int],
-) -> Optional[Escalation]:
+    task_id: str | None,
+    level: int | None,
+) -> Escalation | None:
     """Scan the queue directory for already-pending matching escalations.
 
     Returns the OLDEST by timestamp, or None if no match found.
     Malformed / unreadable JSON files are skipped (never silently dropped).
     Mirrors the get_pending + find_pending_l2_by_root_cause idiom in queue.py.
     """
-    best: Optional[Escalation] = None
-    best_ts: Optional[datetime] = None
+    best: Escalation | None = None
+    best_ts: datetime | None = None
 
     for path in queue_dir.glob('esc-*.json'):
         try:
@@ -113,7 +110,7 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     urllib.request.urlopen(req)
 
 
-def _emit(esc: Escalation, ntfy_url: Optional[str]) -> None:
+def _emit(esc: Escalation, ntfy_url: str | None) -> None:
     """Print escalation JSON to stdout and optionally send an ntfy push notification."""
     print(json.dumps(esc.to_dict(), indent=2))
     if ntfy_url:
@@ -152,7 +149,7 @@ def main() -> None:
         sys.exit(0)
 
     # Compute monotonic deadline (None = block indefinitely).
-    deadline: Optional[float] = (
+    deadline: float | None = (
         None if args.timeout is None else time.monotonic() + args.timeout
     )
 
