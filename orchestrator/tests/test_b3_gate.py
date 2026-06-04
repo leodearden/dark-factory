@@ -790,3 +790,153 @@ class TestCLIMain:
             # stdout must not have stray lines
             assert '\n' not in out.strip() or out.strip().count('\n') == 0, \
                 f'multiple lines in stdout for {argv[0]}'
+
+
+# ---------------------------------------------------------------------------
+# step-19: TWO-WAY BOUNDARY — authentic _build_entry output → check_proposal
+# ---------------------------------------------------------------------------
+
+class TestTwoWayBoundary:
+    """Prove the producer (_build_entry + T1 sha-stamping) and consumer
+    (check_proposal) agree on field names and shape.
+
+    Uses the REAL dry_run_unblock._build_entry and real git fixtures.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _setup_boundary_repo(self, tmp_path):
+        """Create git repo: main with foo.py, feature branch diverges.
+
+        Returns (repo_path, head_sha, main_sha).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        p = str(repo)
+        # Add foo.py on main so it exists in the diff history
+        (repo / 'foo.py').write_text('original content')
+        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'add foo.py'],
+                       check=True, capture_output=True)
+        main_sha = subprocess.run(
+            ['git', '-C', p, 'rev-parse', 'main'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Diverge feature branch from main
+        head_sha = _diverge_feature_branch(repo)
+        assert head_sha != main_sha
+        return repo, head_sha, main_sha
+
+    def _make_success_entry(self, head_sha, main_sha, files=None):
+        """Build a genuine _build_entry output then mirror T1 sha-stamping."""
+        from orchestrator.dry_run_unblock import _build_entry
+        agent_result = _make_agent_result(
+            success=True,
+            structured_output={
+                'proposal_text': 'Fix the bug in foo.py',
+                'risk_label': 'low',
+                'files_referenced': files if files is not None else ['foo.py'],
+            },
+        )
+        entry = _build_entry(agent_result, reason='blocked', budget_usd=5.0)
+        # Mirror T1 stamping (dry_run_unblock.py :237-238)
+        entry['head_sha'] = head_sha
+        entry['main_sha'] = main_sha
+        return entry
+
+    def test_a_clean_repo_is_fresh(self, tmp_path):
+        """(a) Clean repo (HEAD == head_sha, main unchanged) -> fresh."""
+        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        entry = self._make_success_entry(head_sha, main_sha)
+        verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                 run_git=_run_git, now=self._NOW)
+        assert verdict['verdict'] == FRESH, f'expected fresh: {verdict}'
+
+    def test_b_head_moved_aborts_with_git_anchored_reason(self, tmp_path):
+        """(b) Extra commit on feature branch -> abort, reason contains both shas."""
+        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        entry = self._make_success_entry(head_sha, main_sha)
+        # Add extra commit — HEAD moves
+        p = str(repo)
+        (repo / 'extra2.txt').write_text('more work')
+        subprocess.run(['git', '-C', p, 'add', 'extra2.txt'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'extra feature commit'],
+                       check=True, capture_output=True)
+        verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                 run_git=_run_git, now=self._NOW)
+        assert verdict['verdict'] == ABORT, f'expected abort: {verdict}'
+        # Both shas must appear in the reason
+        assert head_sha in verdict['reason'], (
+            f'recorded sha {head_sha!r} must be in reason: {verdict["reason"]}'
+        )
+
+    def test_c_footprint_file_changed_on_main_drifts(self, tmp_path):
+        """(c) foo.py changed on main -> drift."""
+        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        entry = self._make_success_entry(head_sha, main_sha, files=['foo.py'])
+        # Change foo.py on main
+        p = str(repo)
+        subprocess.run(['git', '-C', p, 'checkout', 'main'], check=True, capture_output=True)
+        (repo / 'foo.py').write_text('modified on main')
+        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'update foo.py on main'],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'checkout', 'feature'], check=True, capture_output=True)
+        verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                 run_git=_run_git, now=self._NOW)
+        assert verdict['verdict'] == DRIFT, f'expected drift: {verdict}'
+
+    def test_d_no_sha_stamping_drifts_with_no_sha_anchor(self, tmp_path):
+        """(d) Entry without T1 sha-stamping -> drift 'no sha anchor'."""
+        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        from orchestrator.dry_run_unblock import _build_entry
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        agent_result = _make_agent_result(
+            success=True,
+            structured_output={
+                'proposal_text': 'Fix the bug',
+                'risk_label': 'low',
+                'files_referenced': ['foo.py'],
+            },
+        )
+        # Raw _build_entry output — NO sha stamping
+        entry = _build_entry(agent_result, reason='blocked', budget_usd=5.0)
+        assert 'head_sha' not in entry, f'entry should have no head_sha before stamping: {entry}'
+        assert 'main_sha' not in entry, f'entry should have no main_sha before stamping: {entry}'
+        verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                 run_git=_run_git, now=self._NOW)
+        assert verdict['verdict'] == DRIFT, f'expected drift: {verdict}'
+        assert 'sha anchor' in verdict['reason'].lower(), (
+            f'expected "sha anchor" in reason: {verdict["reason"]}'
+        )
+
+    def test_failure_entry_has_status_key_and_is_aborted(self, tmp_path):
+        """Failure _build_entry carries a 'status' key; check_proposal aborts."""
+        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        from orchestrator.dry_run_unblock import _build_entry
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        # Build a failure entry
+        fail_agent = _make_agent_result(success=False, subtype='error', output='boom')
+        fail_entry = _build_entry(fail_agent, reason='blocked', budget_usd=5.0)
+        # Mirror T1 stamping (failure entries also get stamped)
+        fail_entry['head_sha'] = head_sha
+        fail_entry['main_sha'] = main_sha
+        # Failure entries must carry a 'status' key
+        assert 'status' in fail_entry, f'failure entry must have status key: {fail_entry}'
+        # check_proposal must abort on seeing 'status'
+        verdict = check_proposal(fail_entry, worktree=str(repo), category='task_failure',
+                                 run_git=_run_git, now=self._NOW)
+        assert verdict['verdict'] == ABORT, f'expected abort for failure entry: {verdict}'
+
+    def test_success_entry_has_no_status_key(self, tmp_path):
+        """Success _build_entry must NOT have a 'status' key (contract invariant)."""
+        from orchestrator.dry_run_unblock import _build_entry
+        _, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+        entry = self._make_success_entry(head_sha, main_sha)
+        assert 'status' not in entry, (
+            f'success entry must not carry status key: {entry.keys()}'
+        )
