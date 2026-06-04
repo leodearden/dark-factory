@@ -1895,6 +1895,13 @@ async def coalesce_or_enqueue_merge_request(
     **NOT** used by workflow.py's single-task or train paths — those call
     :func:`enqueue_merge_request` directly.  This function is the
     ``merge_request`` MCP tool's entry point only.
+
+    When *retention* is provided it is forwarded to the single
+    :func:`enqueue_merge_request` chokepoint so the MCP path populates
+    the ring alongside the workflow path (see
+    :func:`register_and_enqueue_merge_request`).  Coalesced requests
+    are NOT recorded — their terminal outcome is owned by the in-flight
+    entry's callback.
     """
     branch = req.branch
 
@@ -1954,7 +1961,7 @@ async def coalesce_or_enqueue_merge_request(
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result):
         try:
-            await enqueue_merge_request(queue, req, event_store)
+            await enqueue_merge_request(queue, req, event_store, retention=retention)
         except BaseException:
             # Slot leak guard: if the enqueue raises (e.g. queue closed,
             # cancellation) before the worker can ever resolve req.result,
