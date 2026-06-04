@@ -139,12 +139,12 @@ It is better to stall development than to bake in a significant bad decision.
 
 ## Merge Submissions — Bounded Submit, Then Poll
 
-`mcp__escalation__merge_request` with `wait_secs=None` (the legacy default) blocks until the merge
-worker finishes rebasing, running the full verify suite, and CAS-advancing main. On a large/slow
-repo (e.g. reify) a single legacy call could take **30+ minutes** — made in the foreground it would
-freeze the entire watch loop for that long: no draining, no watcher re-arm, a born-at-L2 `critical`
-sits unseen (real incident: esc-2831-78 wedged a reify watcher >30 min on a direct foreground
-retry-land). The watch loop's latency budget must stay bounded.
+An unbounded foreground `mcp__escalation__merge_request` blocks until the merge worker finishes
+rebasing, running the full verify suite, and CAS-advancing main. On a large/slow repo (e.g. reify)
+such a call could take **30+ minutes** — made in the foreground it would freeze the entire watch
+loop for that long: no draining, no watcher re-arm, a born-at-L2 `critical` sits unseen (real
+incident: esc-2831-78 wedged a reify watcher >30 min on a direct foreground retry-land). The watch
+loop's latency budget must stay bounded.
 
 **Protocol invariant:** every `merge_request` call passes an explicit bounded `wait_secs`;
 completion is awaited only via `merge_status` polling (15 s → 60 s backoff using `eta_seconds`).
