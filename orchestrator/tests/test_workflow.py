@@ -627,6 +627,108 @@ class TestSubmitToMergeQueueRegistersInRegistry:
 
 
 @pytest.mark.asyncio
+class TestSubmitToMergeQueueAttachesAsPeer:
+    """_submit_to_merge_queue attaches as a peer waiter when an entry is in-flight."""
+
+    def _make_attach_workflow(self, tmp_path, real_queue, registry):
+        """Build a workflow wired to real_queue + registry (no plan gate)."""
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+        return wf
+
+    async def test_peer_completion_no_duplicate_enqueue(
+        self, tmp_path, monkeypatch,
+    ):
+        """Workflow attaches as peer, primary resolve flows through, no enqueue."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'abc123def456abc1'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+
+        # Stub _run so rev-parse returns TIP (same as snapshot → SAME relation)
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        coalesced_calls: list[int] = []
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: coalesced_calls.append(1),
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        # Let the task run to its blocking await
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # (1) No duplicate enqueue
+        assert real_queue.qsize() == 0, (
+            f'workflow must not enqueue a duplicate; qsize={real_queue.qsize()}'
+        )
+
+        # (2) Two waiters; 2nd belongs to the workflow
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+        assert entry.waiters[1].source == 'workflow'
+
+        # (3) Resolving the primary fans the outcome to the workflow's waiter
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        outcome = await submit_task
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # (4) merge_coalesced event emitted
+        assert len(coalesced_calls) == 1
+
+
+@pytest.mark.asyncio
 class TestAwaitCancellableSoftCancelHook:
     """_await_cancellable on_soft_cancel hook: detach instead of cancel."""
 

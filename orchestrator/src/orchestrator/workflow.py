@@ -3862,8 +3862,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             MergeOutcome,
             MergeRequest,
+            WaiterRecord,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
+            _emit_merge_coalesced,
             register_and_enqueue_merge_request,
         )
 
@@ -3949,9 +3951,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
         )
-        await register_and_enqueue_merge_request(
-            self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
-        )
+
+        attached = False
+        _registry = self.merge_inflight_registry
+        if _registry is not None and _registry.entry(branch_name) is not None:
+            rc_tip, tip_out, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+            )
+            new_tip = tip_out.strip() if rc_tip == 0 and tip_out.strip() else None
+            waiter = WaiterRecord(
+                request_id=merge_request.request_id,
+                future=merge_request.result,
+                source='workflow',
+                submitted_tip=new_tip,
+            )
+            attached = _registry.attach(branch_name, waiter)
+            if attached:
+                _emit_merge_coalesced(
+                    self.event_store, merge_request, 'workflow',
+                    _registry.eta_seconds(branch_name),
+                )
+
+        if not attached:
+            await register_and_enqueue_merge_request(
+                self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+            )
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
