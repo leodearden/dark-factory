@@ -191,13 +191,16 @@ def main() -> None:
             if not name or not (name.startswith('esc-') and name.endswith('.json')):
                 continue
 
+            if name[:-5] in exclude_ids:
+                continue
+
             path = queue_dir / name
             try:
                 esc = Escalation.from_json(path.read_text())
             except (json.JSONDecodeError, KeyError, OSError, TypeError):
                 continue
 
-            if not _matches(esc, args.task_id, args.level):
+            if not _matches(esc, args.task_id, args.level, exclude_ids):
                 continue
 
             _emit(esc, args.ntfy_url)

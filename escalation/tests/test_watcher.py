@@ -383,6 +383,77 @@ class TestExcludeId:
         assert captured.out == ''
         mock_inotify.read.assert_called_once()
 
+    def test_event_loop_suppresses_excluded_event(self, tmp_path, capsys):
+        """Event for an excluded file (e.g. dedupe MOVED_TO rewrite) is silently ignored."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-21-1', task_id='21', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='deliberately-pending',
+        )
+        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{esc.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', esc.id,
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_not_called()
+        assert capsys.readouterr().out == ''
+
+    def test_event_loop_fires_on_non_excluded_event(self, tmp_path, capsys):
+        """Event for a different (non-excluded) file fires normally."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        excluded_esc = Escalation(
+            id='esc-22-1', task_id='22', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='excluded',
+        )
+        live_esc = Escalation(
+            id='esc-22-2', task_id='22', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='live',
+        )
+        (queue_dir / f'{excluded_esc.id}.json').write_text(excluded_esc.to_json())
+        (queue_dir / f'{live_esc.id}.json').write_text(live_esc.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{live_esc.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', excluded_esc.id,
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_called_once_with(0)
+        assert live_esc.id in capsys.readouterr().out
+
 
 class TestMainLoop:
     """CLI exit behavior after first match."""
