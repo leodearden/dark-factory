@@ -1,7 +1,8 @@
-"""One-time sweep tool: relocate resolved/dismissed escalations from queue root to archive.
+"""Sweep tool: relocate resolved/dismissed escalations from queue root to archive.
 
-IMPORTANT: This tool is intended for a single manual deploy run only.
-Do NOT run against live escalation queues from an autonomous agent.
+Relocates resolved/dismissed escalations from queue root to archive.
+Run at the escalation server-start single-writer window (pre-serving) —
+the one window with no concurrent queue writers.
 
 Usage:
   python -m escalation.sweep --queue-dir <path>          # dry-run (default)
