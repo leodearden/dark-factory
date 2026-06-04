@@ -2216,3 +2216,115 @@ async def run_scoped_verification(
         )
     finally:
         _maybe_prune_archive(archive_root)
+
+
+async def verify_failure_is_preexisting_on_main(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    task_files: 'list[str] | None',
+    failing_result: VerifyResult,
+    git_ops: object,
+) -> bool:
+    """Detect whether *failing_result* is inherited from the current main HEAD.
+
+    Returns True iff:
+      - The same (category, normalised cause_hint) signature reproduces on main.
+
+    Returns False (fail-safe) for any of:
+      - Main probe passes (break is task-own).
+      - Different signature (break is task-own or different inherited break).
+      - ``git_ops.get_main_sha()`` fails or returns empty.
+      - ``git worktree add --detach`` fails (rc != 0).
+      - Any unexpected exception during probing.
+
+    The task worktree is NEVER mutated — all git ops target *config.project_root*
+    (for worktree-level commands) and the detached temp path (for probe verify).
+    Cleanup (worktree remove --force + shutil.rmtree + worktree prune) always
+    runs in a ``finally`` block.
+    """
+    import shutil
+    import tempfile
+
+    from orchestrator.git_ops import _run
+
+    # Lazy-import normalisation helper from workflow to avoid the
+    # verify<->workflow import cycle (workflow imports verify at module level).
+    # Using the same normaliser as the loop-guard ensures the comparison is
+    # apples-to-apples.
+    def _normalize(hint: str | None) -> str:
+        try:
+            from orchestrator.workflow import _normalize_cause_hint
+            return _normalize_cause_hint(hint)
+        except Exception:
+            return (hint or '').strip().lower()
+
+    tmp_path: Path | None = None
+    try:
+        # Resolve the current main SHA.
+        try:
+            main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
+        except Exception:
+            logger.debug('verify_failure_is_preexisting_on_main: get_main_sha failed', exc_info=True)
+            return False
+        if not main_sha:
+            return False
+
+        # Create the temp probe worktree at main's HEAD.
+        tmp_dir = tempfile.mkdtemp(prefix='df-mainprobe-')
+        tmp_path = Path(tmp_dir)
+
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
+            cwd=config.project_root,
+        )
+        if rc != 0:
+            logger.debug(
+                'verify_failure_is_preexisting_on_main: worktree add failed (rc=%d): %s',
+                rc, err,
+            )
+            return False
+
+        # Probe main with the same scoped commands, no retries.
+        try:
+            main_result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=task_files,
+                max_retries=0,
+                role='task',
+            )
+        except Exception:
+            logger.debug(
+                'verify_failure_is_preexisting_on_main: probe verify raised', exc_info=True,
+            )
+            return False
+
+        if main_result.passed:
+            # Main is clean — the break is task-own.
+            return False
+
+        # Compare (category, normalised cause_hint).
+        branch_sig = (failing_result.category or '', _normalize(failing_result.cause_hint))
+        main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
+        return branch_sig == main_sig
+
+    except Exception:
+        logger.debug('verify_failure_is_preexisting_on_main: unexpected error', exc_info=True)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                await _run(
+                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                    cwd=config.project_root,
+                )
+            except Exception:
+                logger.debug('verify_failure_is_preexisting_on_main: worktree remove failed', exc_info=True)
+            try:
+                shutil.rmtree(tmp_path, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                await _run(['git', 'worktree', 'prune'], cwd=config.project_root)
+            except Exception:
+                pass
