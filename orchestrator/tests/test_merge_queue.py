@@ -11675,3 +11675,91 @@ class TestMaybeAutoChainGeneration:
             assert r3 is not None and r3.status == 'blocked'
             assert queue.empty()
             assert 'task/t-seq' not in counts  # reset
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerGenerationChain — γ2 step-13/14: MergeWorker wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeWorkerGenerationChain:
+    """Unit tests for MergeWorker γ2 generation-chain wiring (step-13 RED / step-14 GREEN)."""
+
+    async def test_init_has_generation_chain_counts(self) -> None:
+        """MergeWorker.__init__ initialises self._generation_chain_counts == {}."""
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(MagicMock(), queue)
+        assert hasattr(worker, '_generation_chain_counts')
+        assert worker._generation_chain_counts == {}
+
+    async def test_do_merge_passes_chain_ctx_and_merged_branch_tip(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """_do_merge passes chain_ctx(queue=worker._queue, counts=_generation_chain_counts,
+        max=MAX_AUTO_CHAINED_GENERATIONS) and merged_branch_tip=branch HEAD to
+        _finalize_advanced_merge on the 'advanced' path."""
+        from orchestrator.merge_queue import (
+            MAX_AUTO_CHAINED_GENERATIONS,
+            _GenerationChainContext,
+        )
+
+        # Set up a real MergeRequest so the worker can process it
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(MagicMock(), queue)
+
+        branch_head_sha = 'branch-head-abc123'
+        merge_commit_sha = 'merge-commit-xyz'
+
+        # Mock git_ops methods needed by _do_merge
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value='main-sha')
+        git_ops.is_ancestor = AsyncMock(return_value=False)  # not already on main
+        git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+        git_ops.merge_to_main = AsyncMock(return_value=MagicMock(
+            success=True,
+            conflicts=False,
+            merge_commit=merge_commit_sha,
+            merge_worktree=tmp_path / 'merge-wt',
+            pre_merge_sha='main-sha',
+        ))
+        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        worker._git_ops = git_ops
+
+        # rev-parse HEAD → branch_head_sha for the branch tip snapshot
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='wt-1',
+            branch='task/wt-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+        )
+
+        with (
+            patch('orchestrator.merge_queue._run',
+                  AsyncMock(return_value=(0, branch_head_sha + '\n', ''))),
+            patch('orchestrator.merge_queue._classify_branch_presence', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._check_plan_targets_in_tree',
+                  AsyncMock(return_value=MagicMock(dropped=[]))),
+            patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None and outcome.status == 'done'
+        finalize_mock.assert_awaited_once()
+        _call_kwargs = finalize_mock.call_args.kwargs
+        assert 'chain_ctx' in _call_kwargs, 'chain_ctx not passed to _finalize_advanced_merge'
+        ctx: _GenerationChainContext = _call_kwargs['chain_ctx']
+        assert ctx.queue is worker._queue
+        assert ctx.counts is worker._generation_chain_counts
+        assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
+        assert _call_kwargs.get('merged_branch_tip') == branch_head_sha
