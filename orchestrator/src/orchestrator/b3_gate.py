@@ -86,9 +86,22 @@ def _locked_state(state_path: Path) -> Iterator[None]:
     """Context manager: acquire an exclusive flock on *state_path*, yield, release.
 
     The lock serializes the full read-modify-write for concurrent callers.
+    Modelled on harness.py:189-223 (_acquire_project_lock).
+
+    We lock a sidecar `.lock` file so the lock file is never the state file
+    itself (which gets replaced atomically). fcntl.flock is per open-file-
+    description, so two independent open()+flock() calls in the same process
+    serialize correctly.
     """
-    raise NotImplementedError
-    yield  # pragma: no cover — unreachable; keeps type-checkers happy
+    lock_path = state_path.with_suffix('.lock')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, 'w')  # noqa: SIM115
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -108,21 +121,22 @@ def record_launch(
     Idempotent: same (task_id, head_sha, investigated_at) triple is not re-added.
     Returns ``{'recorded': bool, 'already_attempted': bool}``.
     """
-    state = _load_state(state_path)
-    # Check for existing entry with the same key
-    for entry in state['launches']:
-        if (entry.get('task_id') == task_id
-                and entry.get('head_sha') == head_sha
-                and entry.get('investigated_at') == investigated_at):
-            return {'recorded': False, 'already_attempted': True}
-    # Not found — append new launch record
-    state['launches'].append({
-        'task_id': task_id,
-        'head_sha': head_sha,
-        'investigated_at': investigated_at,
-        'recorded_at': now.isoformat(),
-    })
-    _save_state(state_path, state)
+    with _locked_state(state_path):
+        state = _load_state(state_path)
+        # Check for existing entry with the same key
+        for entry in state['launches']:
+            if (entry.get('task_id') == task_id
+                    and entry.get('head_sha') == head_sha
+                    and entry.get('investigated_at') == investigated_at):
+                return {'recorded': False, 'already_attempted': True}
+        # Not found — append new launch record
+        state['launches'].append({
+            'task_id': task_id,
+            'head_sha': head_sha,
+            'investigated_at': investigated_at,
+            'recorded_at': now.isoformat(),
+        })
+        _save_state(state_path, state)
     return {'recorded': True, 'already_attempted': False}
 
 
@@ -161,16 +175,17 @@ def charge(
     Returns ``{'charged': bool, 'remaining': int}`` (plus 'reason' on refusal).
     Over-cap calls return ``{'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}``.
     """
-    state = _load_state(state_path)
-    cutoff = now - timedelta(hours=24)
-    in_window = [c for c in state.get('charges', [])
-                 if _ts_in_window(c.get('charged_at', ''), cutoff)]
-    remaining_before = cap - len(in_window)
-    if remaining_before <= 0:
-        return {'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}
-    # Prune out-of-window charges to bound file growth, then append new one
-    state['charges'] = in_window + [{'task_id': task_id, 'charged_at': now.isoformat()}]
-    _save_state(state_path, state)
+    with _locked_state(state_path):
+        state = _load_state(state_path)
+        cutoff = now - timedelta(hours=24)
+        in_window = [c for c in state.get('charges', [])
+                     if _ts_in_window(c.get('charged_at', ''), cutoff)]
+        remaining_before = cap - len(in_window)
+        if remaining_before <= 0:
+            return {'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}
+        # Prune out-of-window charges to bound file growth, then append new one
+        state['charges'] = in_window + [{'task_id': task_id, 'charged_at': now.isoformat()}]
+        _save_state(state_path, state)
     return {'charged': True, 'remaining': remaining_before - 1}
 
 
