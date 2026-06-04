@@ -893,6 +893,12 @@ class Harness:
 
                 await sem.acquire()
                 self._task_modules[assignment.task_id] = list(assignment.modules)
+                # Register escalation wake-event BEFORE create_task so Fix #1a
+                # (_on_escalation_resolved orphan-flip gate) sees task_id in
+                # _escalation_events immediately — closing the sub-second race
+                # where a resolving escalation would mis-classify a just-
+                # dispatched task as an orphan and double-flip it.
+                self._register_escalation_event(assignment.task_id)
                 task = asyncio.create_task(
                     self._run_slot(assignment, sem),
                     name=f'workflow-{assignment.task_id}',
@@ -1491,6 +1497,34 @@ Output JSON matching the schema. Every task must appear in the output.
             cancelled_at is not None
             and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
         )
+
+    def _register_escalation_event(self, task_id: str) -> asyncio.Event | None:
+        """Register an escalation wake-event for *task_id* at dispatch time.
+
+        Calling this BEFORE ``asyncio.create_task(_run_slot(...))`` closes the
+        sub-second race in Fix #1a (``_on_escalation_resolved``):
+
+          dispatch → create_task(_run_slot)
+                          ↑
+                     [gap: _run_slot hasn't run yet; task_id not in
+                      _escalation_events → Fix #1a sees it as an orphan
+                      and double-flips blocked→pending, racing the
+                      workflow's own re-pend]
+
+        With dispatch-time registration, ``task_id in _escalation_events`` is
+        True the instant the slot is created, so Fix #1a's orphan-flip gate
+        always sees an active workflow and skips the orphan path.
+
+        Returns:
+            The newly-created ``asyncio.Event`` stored at
+            ``_escalation_events[task_id]``, or ``None`` when
+            ``_escalation_queue`` is falsy (no escalation wiring — no-op).
+        """
+        if not self._escalation_queue:
+            return None
+        esc_event = asyncio.Event()
+        self._escalation_events[task_id] = esc_event
+        return esc_event
 
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
@@ -2384,11 +2418,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Starting workflow for task {assignment.task_id}: '
                 f'{assignment.task.get("title", "")}'
             )
-            # Create escalation event for this task
-            esc_event = None
-            if self._escalation_queue:
-                esc_event = asyncio.Event()
-                self._escalation_events[assignment.task_id] = esc_event
+            # Retrieve the escalation wake-event registered at dispatch time.
+            # _register_escalation_event was called at the dispatch point
+            # (before create_task) so _escalation_events already has an entry.
+            # The defensive create-if-missing branch handles direct _run_slot
+            # invocations (e.g. unit tests) that bypass the dispatch path.
+            esc_event = self._escalation_events.get(assignment.task_id)
+            if esc_event is None and self._escalation_queue:
+                esc_event = self._register_escalation_event(assignment.task_id)
 
             # Soft-cancel event — exposed so external code (reconciliation
             # subscriber, release_workflow MCP tool) can interrupt long
