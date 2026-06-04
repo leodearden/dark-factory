@@ -927,7 +927,7 @@ function MergeTab({ projectFilter }) {
                 )}
 
                 <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
-                  <div className="panel-head"><span className="title">Recent merges</span></div>
+                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{d.recent.length} matching</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>
                       <tbody>
