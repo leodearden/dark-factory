@@ -9356,11 +9356,11 @@ class TestFinalizeAdvancedMerge:
         chain_ctx is wired and tip is a SUPERSET advance, and the queue stays empty."""
         import orchestrator.merge_queue as mq
         from orchestrator.merge_queue import (
-            MergeRequest,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            MergeRequest,
             TipRelation,
-            _GenerationChainContext,
             _finalize_advanced_merge,
+            _GenerationChainContext,
         )
 
         # Verify the kill-switch is False by default.
@@ -11748,9 +11748,9 @@ class TestMaybeAutoChainGeneration:
         terminal outcome is recorded (superseded_by pointer resolves)."""
         from orchestrator.merge_queue import (
             MergeOutcome,
-            TipRelation,
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
+            TipRelation,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
         )
