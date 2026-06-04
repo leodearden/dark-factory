@@ -58,7 +58,12 @@ from orchestrator.scheduler import (
 )
 from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify import (
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
+    VerifyResult,
+    run_scoped_verification,
+    verify_failure_is_preexisting_on_main,
+)
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -419,6 +424,10 @@ class TaskWorkflow:
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Set by _verify_debugfix_loop when a failure is classified as inherited
+        # from main (preexisting break).  Read at the call site (run()) to route
+        # _mark_blocked with dedupe_fingerprint instead of the generic reason.
+        self._inherited_break_info: dict | None = None
         # Per-run history of (category, normalised cause_hint) tuples for the
         # signature-repetition guard.  Ephemeral — intentionally not persisted
         # in task metadata because the verify loop is wholly within one
@@ -2988,6 +2997,15 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
+                if self._inherited_break_info is not None:
+                    info = self._inherited_break_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info['detail'],
+                        category=info['category'],
+                        dedupe_fingerprint=info['fingerprint'],
+                        suggested_action='await_preexisting_main_hotfix',
+                    )
                 detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
                 return await self._mark_blocked('Verification attempts exhausted', detail=detail)
 
@@ -3412,6 +3430,65 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             verify_attempt += 1
+
+            # Broken-main contagion guard: detect whether this failure was
+            # inherited from main (preexisting break) rather than introduced by
+            # this task.  If so, block WITHOUT self-patching or advancing the
+            # signature-repeat counter — the stashed _inherited_break_info is
+            # read at the call site to route a single deduped escalation.
+            # Skips flaky/env categories (infra_timeout, flock_error) that are
+            # non-deterministic to re-check on main.
+            self._inherited_break_info = None
+            if (
+                self.config.escalate_preexisting_main_break
+                and not result.timed_out
+                and (result.category or '') not in PREEXISTING_BREAK_SKIP_CATEGORIES
+            ):
+                # Helper returns (is_preexisting, probe_main_sha); we reuse probe_main_sha
+                # for fingerprint composition so probe and fingerprint reference the SAME
+                # main SHA — avoids the TOCTOU window of a second get_main_sha() call.
+                _is_inherited, _probe_sha = await verify_failure_is_preexisting_on_main(
+                    self.worktree, self.config, self._module_configs,
+                    self._task_files, result, self.git_ops,
+                )
+            else:
+                _is_inherited, _probe_sha = False, ''
+            if _is_inherited:
+                try:
+                    from escalation.dedupe import compute_content_fingerprint
+                    # Fingerprint encodes (category, normalized-cause_hint, main_sha).
+                    # Fold key: same triple -> identical fp -> submit_or_dedupe collapses
+                    # N sibling tasks to ONE parent escalation.  Once the hotfix lands,
+                    # main_sha changes AND the break disappears from main, so a post-fix
+                    # failure gets a distinct fp and is never mis-attributed to the old
+                    # parent (design_decision #3 / step-16 verified by
+                    # TestCrossTaskInheritedBreakDedup.test_same_signature_folds_to_one_parent).
+                    fp = compute_content_fingerprint(
+                        'preexisting_main_break',
+                        result.category or '',
+                        [],
+                        description=(
+                            _normalize_cause_hint(result.cause_hint) + '|' + _probe_sha
+                        ),
+                    )
+                except Exception:
+                    fp = ''
+                self._inherited_break_info = {
+                    'reason': (
+                        f'Verify failure is preexisting on main '
+                        f'(category={result.category!r}): {result.cause_hint[:120]}'
+                    ),
+                    'detail': result.failure_report(),
+                    'category': 'preexisting_main_break',
+                    'fingerprint': fp,
+                }
+                logger.warning(
+                    'Task %s: verify failure classified as inherited from main '
+                    '(category=%r, fp=%s) — blocking without self-patch',
+                    self.task_id, result.category, fp[:16] if fp else '',
+                )
+                return WorkflowOutcome.BLOCKED
+
             # Fast-fail: when the verifier's own injected ``Command timed out
             # after Ns: …`` wrapper string is the only signal, retrying gives
             # the debugger nothing actionable.  Escalate to L1 after
@@ -5401,6 +5478,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         escalate_to_human: bool = False,
         suggested_action: str = 'investigate_and_retry',
         category: str = 'task_failure',
+        dedupe_fingerprint: str | None = None,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5417,6 +5495,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         a confirmed loop / unresolvable failure that the steward cannot
         meaningfully un-stick (e.g. ≥2 consecutive no-plan failures on
         the same main SHA).
+        *dedupe_fingerprint* when provided stamps the escalation and routes
+        submission through submit_or_dedupe so N tasks seeing the same
+        inherited-from-main break collapse to a single parent escalation.
+        All existing callers (no fingerprint) keep the raw-submit path.
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -5500,15 +5582,53 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
                 )
-                self.escalation_queue.submit(esc)
-
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.escalation_created,
-                        task_id=self.task_id, phase=self.state.value,
-                        data={'escalation_id': esc.id, 'category': category,
-                              'severity': 'blocking', 'summary': reason[:200]},
+                if dedupe_fingerprint:
+                    # Cross-task N->1 dedup: stamp the fingerprint and route
+                    # through submit_or_dedupe so sibling tasks seeing the same
+                    # inherited-from-main break collapse to a single parent.
+                    # All callers without a fingerprint keep raw-submit behaviour.
+                    from escalation.dedupe import (
+                        DedupeConfig,
+                        content_fingerprint_key,
+                        submit_or_dedupe,
                     )
+                    esc.dedupe_fingerprint = dedupe_fingerprint
+                    result = submit_or_dedupe(
+                        self.escalation_queue,
+                        esc,
+                        DedupeConfig(
+                            infra_dedupe_enabled=True,
+                            infra_dedupe_window_secs=float('inf'),
+                            infra_dedupe_categories=(category,),
+                            key_fn=content_fingerprint_key,
+                        ),
+                    )
+                    # Emit escalation_created only when this task is the parent
+                    # (status='queued' means a new parent was filed, not a child fold).
+                    if result.get('status') == 'queued' and self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_created,
+                            task_id=self.task_id, phase=self.state.value,
+                            data={'escalation_id': esc.id, 'category': category,
+                                  'severity': 'blocking', 'summary': reason[:200]},
+                        )
+                    # Per-task stewards for child folds: dedup collapses ESCALATION
+                    # ENTRIES to one parent (N-1 siblings don't each add a queue file),
+                    # but each sibling task still spins up its own steward below.  This
+                    # is intentional — each blocked task needs its own steward to watch
+                    # for resolution and unblock the task when the hotfix lands.  The
+                    # single-hotfix goal is achieved by collapsing notification/queue
+                    # entries, not by preventing individual tasks from monitoring their
+                    # own blocked state.
+                else:
+                    self.escalation_queue.submit(esc)
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_created,
+                            task_id=self.task_id, phase=self.state.value,
+                            data={'escalation_id': esc.id, 'category': category,
+                                  'severity': 'blocking', 'summary': reason[:200]},
+                        )
 
             # Capture window-start for the broadened dismiss-with-terminate
             # guard below.  Any L0 whose resolved_at falls inside this window

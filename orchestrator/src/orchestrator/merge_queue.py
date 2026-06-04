@@ -1515,6 +1515,10 @@ class _InFlightEntry:
 
     task_id: str
     enqueued_monotonic: float  # time.monotonic() at acquire time
+    request_id: str | None = None
+    """Stable identity of the dispatched MergeRequest (e.g. 'mr-a1b2c3d4').
+    Set at acquire time from the MergeRequest.request_id; None for legacy
+    callers that don't pass a request_id (back-compat)."""
 
 
 _INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
@@ -1595,7 +1599,14 @@ class InFlightMergeRegistry:
     def __init__(self) -> None:
         self._slots: dict[str, _InFlightEntry] = {}
 
-    def acquire(self, branch: str, task_id: str, future: asyncio.Future) -> bool:
+    def acquire(
+        self,
+        branch: str,
+        task_id: str,
+        future: asyncio.Future,
+        *,
+        request_id: str | None = None,
+    ) -> bool:
         """Atomic check-and-set: claim *branch* for *task_id*.
 
         Returns True if the slot was free and has been claimed; False if
@@ -1604,12 +1615,20 @@ class InFlightMergeRegistry:
         On success, registers a ``done_callback`` on *future* so that
         ``_release(branch)`` fires automatically on every terminal path
         (result set, exception set, or cancellation).
+
+        *request_id* is the stable per-instance identity of the dispatched
+        :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
+        :class:`_InFlightEntry` so β1 can re-source the ``'attached'``
+        response from the existing entry's id rather than the submitting
+        request's id (PRD D8).  Keyword-only; defaults to ``None`` so
+        existing 3-positional-arg callers remain valid.
         """
         if branch in self._slots:
             return False
         self._slots[branch] = _InFlightEntry(
             task_id=task_id,
             enqueued_monotonic=time.monotonic(),
+            request_id=request_id,
         )
         future.add_done_callback(lambda _: self._release(branch))
         return True
@@ -1808,7 +1827,7 @@ async def register_and_enqueue_merge_request(
     None.  The return value is informational — the request is always enqueued.
     """
     acquired = (
-        registry.acquire(req.branch, req.task_id, req.result)
+        registry.acquire(req.branch, req.task_id, req.result, request_id=req.request_id)
         if registry is not None
         else False
     )
@@ -1848,6 +1867,40 @@ class MergeDispatchResult:
     inflight_task_id: str | None = None
     eta_seconds: int | None = None
     source: str | None = None
+    inflight_request_id: str | None = None
+    """request_id of the already-in-flight MergeRequest for *branch* (D8).
+    Set on coalesce from the _InFlightEntry's stored request_id; None when
+    dispatched=True or the entry predates request_id tracking."""
+
+
+@dataclass
+class WaiterRecord:
+    """Server-side durable-intent waiter record keyed by request_id.
+
+    Registered in the ``merge_request`` MCP tool's closure dict
+    ``_waiters[request_id]`` at dispatch time, and cleaned up via a
+    ``future.add_done_callback``.  The ``asyncio.shield`` on every awaiting
+    path (β1) ensures that cancelling the tool coroutine (MCP client
+    disconnect) does NOT cancel ``future`` — only an explicit
+    ``merge_cancel`` call (β2) may do so, by looking up this record and
+    cancelling ``future`` directly.
+
+    Lifecycle:
+      - Created in the dispatched-path of ``merge_request``.
+      - Cleaned up automatically when the future resolves/errors/cancels
+        (done_callback removes it from ``_waiters``).
+      - Consumed by β2 (``merge_cancel``) which looks up ``request_id``
+        here to cancel the future explicitly.
+    """
+
+    request_id: str
+    """Stable per-instance identity of the MergeRequest (e.g. 'mr-a1b2c3d4')."""
+    future: asyncio.Future = field(repr=False)
+    """The MergeRequest.result future — the one shielded from MCP disconnect."""
+    source: str = 'mcp'
+    """Origin of the waiter: 'mcp' (via merge_request tool) or 'workflow'."""
+    submitted_tip: str | None = None
+    """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
 
 
 def _emit_merge_coalesced(
@@ -1945,6 +1998,7 @@ async def coalesce_or_enqueue_merge_request(
             inflight_task_id=entry.task_id if entry else None,
             eta_seconds=eta,
             source='registry',
+            inflight_request_id=entry.request_id if entry else None,
         )
 
     # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
@@ -1987,7 +2041,7 @@ async def coalesce_or_enqueue_merge_request(
                 # Fall through to acquire-and-enqueue below
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
-    if registry.acquire(branch, req.task_id, req.result):
+    if registry.acquire(branch, req.task_id, req.result, request_id=req.request_id):
         try:
             await enqueue_merge_request(queue, req, event_store, retention=retention)
         except BaseException:
@@ -2014,6 +2068,7 @@ async def coalesce_or_enqueue_merge_request(
         inflight_task_id=entry.task_id if entry else None,
         eta_seconds=eta,
         source='registry',
+        inflight_request_id=entry.request_id if entry else None,
     )
 
 

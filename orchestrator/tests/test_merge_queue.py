@@ -10336,3 +10336,159 @@ class TestSnapshotEntryRequestId:
         assert entry['request_id'] == req.request_id, (
             f"entry['request_id']={entry['request_id']!r} != req.request_id={req.request_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-1 RED: _InFlightEntry.request_id + MergeDispatchResult.inflight_request_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightRegistryRequestId:
+    """β1 step-1 RED: InFlightMergeRegistry tracks request_id; coalesce surfaces it.
+
+    Tests are RED until step-2 impl:
+    - acquire() does not yet accept a request_id keyword argument (TypeError)
+    - _InFlightEntry has no request_id field (AttributeError)
+    - MergeDispatchResult has no inflight_request_id attribute (AttributeError)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_acquire_with_request_id_stores_it(self):
+        """(a) acquire(..., request_id='mr-x') → entry.request_id == 'mr-x'."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('X', 'task-X', fut, request_id='mr-x')
+
+        entry = registry.entry('X')
+        assert entry is not None
+        assert entry.request_id == 'mr-x'
+
+    async def test_acquire_without_request_id_is_none(self):
+        """(b) acquire(branch, task_id, future) without request_id → entry.request_id is None.
+
+        Back-compat: the existing 3-arg positional call still works unchanged.
+        """
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('Y', 'task-Y', fut)
+
+        entry = registry.entry('Y')
+        assert entry is not None
+        assert entry.request_id is None
+
+    async def test_coalesce_surfaces_inflight_request_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) Second coalesce returns inflight_request_id == first req's request_id."""
+        from orchestrator.merge_queue import MergeDispatchResult  # noqa: F401
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        req1 = _make_request('C', 'branchC', tmp_path, config)
+        req2 = _make_request('C', 'branchC', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, None, registry, git_ops=None,
+        )
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, None, registry, git_ops=None,
+        )
+
+        assert result2.in_flight is True
+        assert result2.inflight_request_id == req1.request_id
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-3 RED: SpeculativeMergeWorker.snapshot() exposes request_id per entry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotExposesRequestId:
+    """β1 step-3 RED: snapshot() must include request_id in each entry dict.
+
+    RED until step-4 impl: _entry() does not yet include a 'request_id' key
+    (KeyError when test asserts entry['request_id']).
+    """
+
+    async def test_snapshot_queued_entry_includes_request_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A queued MergeRequest appears in snapshot with its request_id."""
+        import types
+
+        queue: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=queue,
+        )
+
+        req = _make_request('snap-req', 'snap-req', tmp_path, config)
+        await queue.put(req)
+
+        snap = worker.snapshot()
+
+        entries = snap['entries']
+        matching = [e for e in entries if e.get('task_id') == 'snap-req']
+        assert matching, f'Entry for snap-req not found in snapshot: {entries}'
+
+        entry = matching[0]
+        assert 'request_id' in entry, (
+            f'snapshot entry missing request_id key; keys present: {list(entry.keys())}'
+        )
+        assert entry['request_id'] == req.request_id, (
+            f"snapshot entry['request_id']={entry['request_id']!r} "
+            f"!= req.request_id={req.request_id!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-5 RED: WaiterRecord dataclass contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWaiterRecordContract:
+    """β1 step-5 RED: WaiterRecord dataclass contract.
+
+    RED until step-6 impl: WaiterRecord does not exist (ImportError).
+    """
+
+    async def test_waiter_record_fields(self):
+        """Construct WaiterRecord and verify all field contracts."""
+        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        wr = WaiterRecord(request_id='mr-x', future=fut)
+
+        assert wr.request_id == 'mr-x'
+        assert wr.future is fut
+        assert wr.source == 'mcp'          # default
+        assert wr.submitted_tip is None    # default
+
+    async def test_waiter_record_explicit_source_and_tip(self):
+        """Explicit source and submitted_tip are stored correctly."""
+        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        wr = WaiterRecord(
+            request_id='mr-y',
+            future=fut,
+            source='workflow',
+            submitted_tip='abc123def456',
+        )
+
+        assert wr.request_id == 'mr-y'
+        assert wr.future is fut
+        assert wr.source == 'workflow'
+        assert wr.submitted_tip == 'abc123def456'
