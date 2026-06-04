@@ -17,6 +17,26 @@ from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Sentinel role allowlist — resolves PRD Open question 2 (C4/D3)
+# ---------------------------------------------------------------------------
+# All harness-internal sentinels use one of these prefixes:
+#   harness-*      → harness-stranded-blocked-reaper, harness-reconcile,
+#                    harness-orphan-reaper (harness.py)
+#   orchestrator-* → orchestrator-scheduler, orchestrator-watcher-supervisor
+#                    (the watcher-outage L2 named in the user-observable signal)
+# Verified against orchestrator/src/orchestrator/agents/roles.py: NO LLM agent
+# role (architect, implementer, debugger, merger, steward, deep_reviewer,
+# reviewer_comprehensive, judge, simple_task) uses either prefix.
+# A prefix check is forward-compatible: new harness sentinels are auto-exempt.
+_HARNESS_SENTINEL_ROLE_PREFIXES = ('harness-', 'orchestrator-')
+
+
+def _is_harness_sentinel_role(agent_role: str) -> bool:
+    """Return True if *agent_role* belongs to the harness sentinel namespace."""
+    return any(agent_role.startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
 CATEGORIES = [
     'scope_violation',
     'design_concern',
@@ -149,12 +169,27 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
+        # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
+        # both naturally observe 'blocking' and route the downgraded record through
+        # the normal L0 + dedupe path.  Harness sentinel roles (harness-* /
+        # orchestrator-*) are exempt and keep their born-at-L2 routing.
+        if esc.severity in BORN_AT_L2_SEVERITIES and not _is_harness_sentinel_role(esc.agent_role):
+            _original_severity = esc.severity
+            esc.severity = 'blocking'
+            esc.summary = f'[downgraded:{_original_severity}] {esc.summary}'
+            logger.warning(
+                'Downgraded severity %r → blocking for agent_role=%r task_id=%r (C4/D3)',
+                _original_severity, esc.agent_role, esc.task_id,
+            )
+
         # Severity gate: critical/urgent escalations are born at L2, bypassing
         # the auto-watcher and routing straight to a human (BORN_AT_L2_SEVERITIES).
         # This runs before all other gates so the on-disk record is stamped level=2
         # on every path: queued normally, auto-resolved via submit_resolved, or any
         # gate bypass.  L2 escalations also skip deduplication in _submit_or_dedupe
         # so they are never silently folded into a lower-level parent.
+        # After the downgrade above, only sentinel-filed criticals/urgents reach here.
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc.level = 2
 

@@ -67,11 +67,18 @@ class TestBornAtL2:
 
     @pytest.mark.asyncio
     async def test_blocker_critical_severity_on_disk_level2(self, tmp_path: Path):
-        """escalate_blocker(severity='critical') → on-disk escalation has level==2."""
+        """escalate_blocker(severity='critical') → on-disk escalation has level==2.
+
+        Uses sentinel agent_role ('orchestrator-watcher-supervisor') so the
+        C4/D3 downgrade is bypassed and born-at-L2 stamping is still covered.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -80,11 +87,18 @@ class TestBornAtL2:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
     async def test_blocker_l2_severities_yield_level2(self, tmp_path: Path, severity: str):
-        """escalate_blocker with critical/urgent severity → on-disk level==2."""
+        """escalate_blocker with critical/urgent severity → on-disk level==2.
+
+        Uses sentinel agent_role so the C4/D3 downgrade is bypassed — this
+        test covers born-at-L2 stamping AND the sentinel exemption regression.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity=severity, **_COMMON_KWARGS)
+        result = await _blocker(
+            server, severity=severity,
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -93,11 +107,18 @@ class TestBornAtL2:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
     async def test_info_l2_severities_yield_level2(self, tmp_path: Path, severity: str):
-        """escalate_info with critical/urgent severity → on-disk level==2."""
+        """escalate_info with critical/urgent severity → on-disk level==2.
+
+        Uses sentinel agent_role so the C4/D3 downgrade is bypassed — this
+        test covers born-at-L2 stamping AND the sentinel exemption regression.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity=severity, **_COMMON_KWARGS)
+        result = await _info(
+            server, severity=severity,
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -374,11 +395,13 @@ class TestL2DedupeBypass:
         )
         queue.submit(parent)
 
-        # Child call: same category, overlapping summary, but born-at-L2
+        # Child call: same category, overlapping summary, but born-at-L2.
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
+        # dedupe-bypass coverage requires level==2 on the child record.
         result = await _info(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='critical',
@@ -413,7 +436,7 @@ class TestL2DedupeBypass:
         await _info(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='critical',
@@ -441,7 +464,12 @@ class TestL2DedupeBypass:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, task_status_lookup=_lookup)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed and
+        # the born-at-L2 + terminal-task auto-resolve combination is covered.
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         assert result['status'] == 'resolved', (
             f"Expected 'resolved' (terminal task auto-resolve), got: {result['status']}"
@@ -470,10 +498,12 @@ class TestL2DedupeBypass:
         )
         queue.submit(parent)
 
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
+        # dedupe-bypass coverage requires the urgent escalation to stay at L2.
         result = await _blocker(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='urgent',
