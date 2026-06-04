@@ -32,10 +32,28 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
 4. The escalation `category` is `task_failure` or `review_issues` → else **ABORT**.
 5. The `worktree` directory exists and `git -C <worktree> status` is clean-or-sane (a task branch,
    not detached, not mid-rebase/merge) → else **ABORT**.
-6. **Freshness:** `latest` is genuinely the last entry, its `timestamp` is the most recent, and the
-   branch has no commits you can't account for since it was investigated. The proposal carries no
-   HEAD sha, so this is heuristic — if the branch state looks materially different from what the
-   proposal describes (referenced files gone, unexpected commits), **ABORT**.
+6. **Freshness gate (mechanical).** From the **primary dark-factory checkout** (where `.venv/` and
+   `orchestrator/` live — NOT the worktree, which has no `.venv`), run:
+
+   ```
+   .venv/bin/python -m orchestrator.b3_gate check \
+     --task-id <task_id> \
+     --worktree <worktree> \
+     --project-root <project_root> \
+     --category <category> \
+     --config <project_root>/orchestrator/config.yaml
+   ```
+
+   `<category>` is the escalation category already asserted in precondition 4. The gate reads
+   `metadata.dry_run_proposals[-1]` itself — do **not** hardcode any sha.
+
+   Parse JSON stdout; `verdict` is one of `fresh | drift | abort`. **ONLY `verdict == "fresh"`
+   proceeds.** Any other verdict (both `drift` and `abort`) → **ABORT**, copying the gate's `reason`
+   field verbatim into the return value's `reason`:
+   `"freshness gate (b3_gate check): <gate reason>"`.
+
+   This mechanically enforces what was previously heuristic: the recorded `head_sha` hard-stop (P1:
+   HEAD moved → `abort`) and file-scoped main drift (P2 → `drift`).
 
 ## Procedure
 
@@ -66,14 +84,36 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 6. **Commit.** `git -C <worktree> add <only the files you changed>` then commit on `task/<task_id>`
    with a clear message. Never `git add -A` (avoids `.task/` contamination); never `--no-verify`.
 
-7. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
+7. **Charge the merge slot.** From the **primary dark-factory checkout**, run:
+
+   ```
+   .venv/bin/python -m orchestrator.b3_gate charge \
+     --task-id <task_id> \
+     --project-root <project_root> \
+     --config <project_root>/orchestrator/config.yaml
+   ```
+
+   Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
+
+   Parse JSON stdout; if `charged` is `false` (rolling-24h cap exceeded), **ABORT**, carrying the
+   gate's `reason` verbatim into the return value's `reason`. Only `charged: true` proceeds.
+
+   Rationale (PRD §4.2): the charge sits at the merge-submit choke point — the actual unattended-merge
+   risk axis — so every ABORT before this step (preconditions, scope check, rebase conflict, verify
+   failure) spends no slot and is free by design.
+
+   Note: once `charged: true` is returned the slot is consumed even if the subsequent `merge_request`
+   returns an error or a non-success outcome (`conflict`, `blocked`, `failed`) — those post-charge
+   aborts cost a slot. This is the accepted §4.2 tradeoff.
+
+8. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
    branch=task_id, worktree=<abs path>, description="unblock-low-risk: <one-line summary>")`. `branch`
    is the **bare task id** — the worker prepends `task/`. This blocks until the merge worker (which
    re-rebases and runs authoritative post-merge verification) finishes. **If it returns `{'error':
    ...}` (orchestrator not running) → ABORT.** Do NOT fall back to a direct `git merge` — an
    unattended direct merge to main is exactly the risk this skill refuses to take.
 
-8. **Handle the outcome:**
+9. **Handle the outcome:**
    - **`done` / `already_merged`:** success.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance={"kind": "merged", "commit": "<merge sha>"})`.
@@ -114,9 +154,10 @@ Return ONLY this JSON object (no prose):
 
 - Only `risk_label == 'low'`; only `task_failure` / `review_issues`.
 - Edits scoped to `files_referenced`; never main-only / CI / infra / config.
+- **Freshness enforced by `b3_gate check`** (precondition 6): proceed only on `verdict == "fresh"`;
+  any `drift` or `abort` verdict → ABORT with the gate's `reason` verbatim.
+- **Rolling-24h merge cap enforced by `b3_gate charge`** (step 7, immediately before `merge_request`):
+  a refused charge (`charged: false`) → ABORT. All aborts before this step cost no slot.
 - Merge ONLY through `merge_request`; never a direct `git merge`; never `--no-verify`.
 - One attempt. No retry loops. ABORT on the first sign of doubt.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
-- Future hardening (not yet available): the proposal has no recorded HEAD sha, so the freshness gate
-  is heuristic. If a `head_sha` field is later added to dry-run proposals, treat a mismatch against
-  the current worktree HEAD as a hard ABORT.
