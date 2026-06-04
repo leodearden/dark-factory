@@ -216,10 +216,88 @@ def check_proposal(
 ) -> dict[str, Any]:
     """Classify a proposal entry and return a verdict dict.
 
-    Keys: verdict (fresh|drift|abort), reason, head_sha, main_sha, age_seconds.
+    Precedence:
+      1. entry falsy -> abort 'no proposal to gate'
+      2. risk_label != 'low' -> abort
+      3. 'status' key present (failure entry) -> abort
+      4. category not in B3_CATEGORIES (when not None) -> abort
+      5. head_sha or main_sha missing/None -> drift 'no sha anchor'
+      6. HEAD != head_sha -> abort (git-anchored; P1)
+      7. diff main_sha..main -- files_referenced non-empty -> drift (P2)
+      8. else fresh
+
+    Keys: verdict, reason, head_sha, main_sha, age_seconds.
     The 'run_git' parameter defaults to _run_git; tests inject a fake.
     """
-    raise NotImplementedError
+    if run_git is None:
+        run_git = _run_git
+
+    # --- (1) No proposal ---
+    if not entry:
+        return {
+            'verdict': ABORT,
+            'reason': 'no proposal to gate',
+            'head_sha': None,
+            'main_sha': None,
+            'age_seconds': None,
+        }
+
+    head_sha = entry.get('head_sha')
+    main_sha = entry.get('main_sha')
+
+    def _result(verdict, reason):
+        age = None
+        try:
+            investigated_at = entry.get('investigated_at')
+            if investigated_at and now is not None:
+                ts = datetime.fromisoformat(investigated_at)
+                age = (now - ts).total_seconds()
+        except Exception:
+            pass
+        return {
+            'verdict': verdict,
+            'reason': reason,
+            'head_sha': head_sha,
+            'main_sha': main_sha,
+            'age_seconds': age,
+        }
+
+    # --- (2) Risk label ---
+    if entry.get('risk_label') != 'low':
+        return _result(ABORT, f'risk_label is not low: {entry.get("risk_label")!r}')
+
+    # --- (3) Status key (failure entry) ---
+    if 'status' in entry:
+        return _result(ABORT, f'proposal is a failure entry (status={entry["status"]!r})')
+
+    # --- (4) Category check ---
+    if category is not None and category not in B3_CATEGORIES:
+        return _result(ABORT, f'category {category!r} not in B3_CATEGORIES')
+
+    # --- (5) SHA anchor ---
+    if not head_sha or not main_sha:
+        return _result(DRIFT, 'no sha anchor — re-investigate to refresh shas')
+
+    # --- (6) P1: HEAD must not have moved ---
+    rc, current_head = run_git(['rev-parse', 'HEAD'], worktree)
+    if rc != 0:
+        return _result(ABORT, f'git rev-parse HEAD failed (rc={rc})')
+    if current_head != head_sha:
+        return _result(
+            ABORT,
+            f'HEAD has moved: recorded={head_sha!r} current={current_head!r}',
+        )
+
+    # --- (7) P2: file-scoped main drift ---
+    files = entry.get('files_referenced', [])
+    if files:
+        diff_args = ['diff', f'{main_sha}..main', '--'] + list(files)
+        rc, diff_out = run_git(diff_args, worktree)
+        if rc == 0 and diff_out.strip():
+            return _result(DRIFT, 'main moved within proposal footprint (files_referenced)')
+
+    # --- (8) Fresh ---
+    return _result(FRESH, 'sha anchors valid and footprint unchanged')
 
 
 # ---------------------------------------------------------------------------
