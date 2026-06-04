@@ -1461,3 +1461,97 @@ class TestGetMergeQueue:
         assert dead_entry['waiter_alive'] is False, (
             f'Expected waiter_alive=False for cancelled future, got: {dead_entry}'
         )
+
+    # ── step-9: verifier/queue-level state mapping ────────────────────────
+
+    @pytest.mark.parametrize('verify_phase', ['verifying', 'gate_reverify', 'finalizing'])
+    async def test_verifier_and_queue_level_state_mapping(
+        self, tmp_path: Path, verify_phase: str
+    ):
+        """snapshot() maps _verify_item/_inflight_req/_verifier_queue to correct states."""
+        import asyncio
+        import types
+
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest, SpeculativeItem, SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+
+        def _req(tid: str) -> MergeRequest:
+            return MergeRequest(
+                task_id=tid, branch=tid,
+                worktree=tmp_path / f'wt-{tid}',
+                pre_rebased=False, task_files=None, module_configs=[],
+                config=config, result=loop.create_future(),
+            )
+
+        # M — in the merger (merging)
+        req_M = _req('M')
+        worker._inflight_req = req_M
+
+        # A — in the verifier queue (awaiting_verify)
+        merge_wt_A = tmp_path / 'mergeA'
+        merge_wt_A.mkdir()
+        item_A = SpeculativeItem(
+            request=_req('A'),
+            merge_result=None, merge_wt=merge_wt_A,
+            base_sha='base', speculative=False, skip_verify=False,
+        )
+        await worker._verifier_queue.put(item_A)
+
+        # V — currently being verified (phase = verify_phase param)
+        merge_wt_V = tmp_path / 'mergeV'
+        merge_wt_V.mkdir()
+        item_V = SpeculativeItem(
+            request=_req('V'),
+            merge_result=None, merge_wt=merge_wt_V,
+            base_sha='base', speculative=False, skip_verify=False,
+        )
+        worker._verify_item = item_V
+        worker._verify_phase = verify_phase
+
+        # WIP halt
+        worker.halt_for_wip('test-wip')
+        worker.set_halt_owner('esc-9')
+
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        entries = result['entries']
+
+        # find entries by task_id
+        by_id = {e['task_id']: e for e in entries}
+        assert 'M' in by_id, f'merging entry missing: {by_id}'
+        assert 'A' in by_id, f'awaiting_verify entry missing: {by_id}'
+        assert 'V' in by_id, f'verifying entry missing: {by_id}'
+
+        assert by_id['M']['state'] == 'merging'
+        assert by_id['A']['state'] == 'awaiting_verify'
+        assert by_id['A']['worktree'] == str(merge_wt_A)
+        assert by_id['V']['state'] == verify_phase
+        assert by_id['V']['worktree'] == str(merge_wt_V)
+
+        # head-of-line = V (verifier-current has lowest position)
+        assert result['head_of_line'] == 'V', (
+            f'Expected head_of_line=V, got: {result["head_of_line"]}'
+        )
+        assert by_id['V']['position'] == 0
+
+        # verify_in_progress reflects the current item
+        vip = result.get('verify_in_progress')
+        assert vip is not None, 'verify_in_progress should be set'
+        assert vip['task_id'] == 'V'
+
+        # WIP halt state
+        assert result['is_wip_halted'] is True
+        assert result['halt_owner_esc_id'] == 'esc-9'
