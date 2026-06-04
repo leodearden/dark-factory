@@ -753,3 +753,80 @@ class TestShapeEscalations:
         queues = {'subsections': [], 'summary': top_summary}
         body = redux_api.shape_escalations(queues=queues, task_maps={})
         assert body['ESCALATIONS']['summary'] == top_summary
+
+
+# ---------------------------------------------------------------------------
+# shape_merge_queue — active_approximate pass-through (task-1606 step-9)
+# ---------------------------------------------------------------------------
+
+
+def _mq_raw(label: str, active_approximate: bool | None = None) -> dict:
+    """Build a minimal per_project entry keyed by absolute path matching label."""
+    data: dict = {
+        'depth_timeseries': {'labels': [], 'values': []},
+        'outcomes': {'labels': [], 'values': []},
+        'latency': {},
+        'recent': [],
+        'speculative': {},
+        'active': [{'task_id': '1', 'branch': 'task/1', 'state': 'queued'}],
+        'train_events': [],
+    }
+    if active_approximate is not None:
+        data['active_approximate'] = active_approximate
+    # Key by a fake abs-path whose basename == label
+    return {f'/proj/{label}': data}
+
+
+class TestShapeMergeQueueActiveApproximate:
+    """Tests that shape_merge_queue surfaces active_approximate per project."""
+
+    def test_active_approximate_true_surfaces_in_output(self):
+        """active_approximate=True in per_project → MERGE_QUEUE[label]['active_approximate'] is True."""
+        raw = _mq_raw('myproj', active_approximate=True)
+        body = redux_api.shape_merge_queue(raw)
+        mq = body['MERGE_QUEUE']
+        assert 'myproj' in mq
+        assert mq['myproj']['active_approximate'] is True
+
+    def test_active_approximate_false_surfaces_in_output(self):
+        """active_approximate=False explicitly set → surfaces as False."""
+        raw = _mq_raw('myproj', active_approximate=False)
+        body = redux_api.shape_merge_queue(raw)
+        assert body['MERGE_QUEUE']['myproj']['active_approximate'] is False
+
+    def test_active_approximate_absent_defaults_false(self):
+        """active_approximate absent from per_project data → defaults to False."""
+        raw = _mq_raw('myproj', active_approximate=None)
+        body = redux_api.shape_merge_queue(raw)
+        assert body['MERGE_QUEUE']['myproj']['active_approximate'] is False
+
+    def test_active_approximate_per_project_isolated(self):
+        """Two projects with different active_approximate values are kept isolated."""
+        per_project = {
+            '/proj/alpha': {
+                'depth_timeseries': {'labels': [], 'values': []},
+                'outcomes': {'labels': [], 'values': []}, 'latency': {},
+                'recent': [], 'speculative': {}, 'train_events': [],
+                'active': [], 'active_approximate': True,
+            },
+            '/proj/beta': {
+                'depth_timeseries': {'labels': [], 'values': []},
+                'outcomes': {'labels': [], 'values': []}, 'latency': {},
+                'recent': [], 'speculative': {}, 'train_events': [],
+                'active': [],
+                # active_approximate absent → defaults False
+            },
+        }
+        body = redux_api.shape_merge_queue(per_project)
+        mq = body['MERGE_QUEUE']
+        assert mq['alpha']['active_approximate'] is True
+        assert mq['beta']['active_approximate'] is False
+
+    def test_existing_active_list_unchanged(self):
+        """shape_merge_queue adding active_approximate does not break the active list."""
+        raw = _mq_raw('myproj', active_approximate=True)
+        body = redux_api.shape_merge_queue(raw)
+        active = body['MERGE_QUEUE']['myproj']['active']
+        assert isinstance(active, list)
+        assert len(active) == 1
+        assert active[0]['task_id'] == '1'
