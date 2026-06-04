@@ -2737,6 +2737,88 @@ class TestBoundaryTableMcpSurface:
         req = mq.get_nowait()
         req.result.cancel()
 
+    async def test_scenario_14_submit_then_poll_protocol(
+        self, tmp_path: Path,
+    ) -> None:
+        """Row 14: submit-then-poll protocol exercised end-to-end on the MCP surface.
+
+        §7.3 runtime invariant — the four merge-calling skills document that
+        completion is awaited only via merge_status (not via a blocking wait on
+        the merge_request return).  This test exercises that pattern:
+
+        (a) SUBMIT half: merge_request(branch=B, wait_secs=0) returns promptly
+            with status=='queued' and a valid 'mr-' request_id R.
+        (b) POLL half: set the fake worker snapshot so it echoes the submitted
+            entry, then call merge_status(request_id=R) (and merge_status(branch=B));
+            assert both resolve to a coherent non-'unknown' state whose
+            request_id and branch match the submission.
+
+        This is the runtime analogue of the §7.3 invariant — exercised end-to-end
+        through the real MCP tool layer rather than via prose-pinning assertions.
+        Reuses _build_merge_server + _FakeMergeWorker + _call_merge_request +
+        _call_merge_status from pre-1.
+        """
+        worker = _FakeMergeWorker()
+        server, mq, _, _, _ = _build_merge_server(tmp_path, worker=worker)
+
+        # (a) SUBMIT: non-blocking, must return promptly with 'queued' + valid R
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='sc14',
+                branch='sc14',
+                worktree=str(tmp_path / 'wt-sc14'),
+                wait_secs=0,
+            ),
+            timeout=3.0,
+        )
+        assert result.get('status') == 'queued', (
+            f"SUBMIT half: expected status='queued', got: {result}"
+        )
+        R = result.get('request_id', '')
+        assert R.startswith('mr-'), (
+            f"SUBMIT half: expected 'mr-' request_id, got: {R!r}"
+        )
+
+        # (b) POLL: set the worker snapshot to echo the submitted entry, then
+        # call merge_status(request_id=R) and merge_status(branch='sc14')
+        worker.set_entries([{
+            'request_id': R,
+            'branch': 'sc14',
+            'task_id': 'sc14',
+            'state': 'queued',
+            'position': 0,
+            'enqueued_at': 0,
+        }])
+
+        # Poll by request_id
+        status_by_rid = await asyncio.wait_for(
+            _call_merge_status(server, request_id=R),
+            timeout=2.0,
+        )
+        assert status_by_rid.get('state') != 'unknown', (
+            f"POLL by request_id: expected non-'unknown' state, got: {status_by_rid}"
+        )
+        assert status_by_rid.get('request_id') == R, (
+            f"POLL by request_id: expected request_id={R!r}, got: {status_by_rid.get('request_id')!r}"
+        )
+
+        # Poll by branch
+        status_by_branch = await asyncio.wait_for(
+            _call_merge_status(server, branch='sc14'),
+            timeout=2.0,
+        )
+        assert status_by_branch.get('state') != 'unknown', (
+            f"POLL by branch: expected non-'unknown' state, got: {status_by_branch}"
+        )
+        assert status_by_branch.get('request_id') == R, (
+            f"POLL by branch: expected request_id={R!r}, got: {status_by_branch.get('request_id')!r}"
+        )
+
+        # Cleanup
+        req = mq.get_nowait()
+        req.result.cancel()
+
 
 # ---------------------------------------------------------------------------
 # TestBoundaryTableSkillProtocol — §8 row 14 (skill protocol conformance)
