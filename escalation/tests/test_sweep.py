@@ -352,6 +352,86 @@ class TestSweepIdempotency:
         assert self._disk_snapshot(tmp_path) == snapshot
 
 
+class TestReapLooseArchiveFiles:
+    """Tests for sweep.reap_loose_archive_files."""
+
+    def test_loose_resolved_file_moved_to_dated_subdir_with_lock(self, tmp_path: Path):
+        """(a) Loose resolved file at archive top-level is moved to dated subdir."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-1-1.json'
+        esc = Escalation(
+            id='esc-1-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose test',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Moved to dated subdir
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        # Loose copy gone
+        assert not loose_path.exists()
+        # Returns 1
+        assert count == 1
+        # Per-id sidecar lock was created in queue root
+        assert (tmp_path / 'esc-1-1.json.lock').exists()
+
+    def test_loose_file_without_resolved_at_left_in_place(self, tmp_path: Path):
+        """(b) Loose file with resolved_at=None is left in place and NOT counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-2-1.json'
+        esc = Escalation(
+            id='esc-2-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='no resolved_at',
+            status='resolved',
+            resolved_at=None,
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Left untouched
+        assert loose_path.exists()
+        # Not counted
+        assert count == 0
+
+    def test_apply_false_reports_count_without_moving(self, tmp_path: Path):
+        """(c) apply=False leaves loose file untouched but reports would-move count."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-3-1.json'
+        esc = Escalation(
+            id='esc-3-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='dry run loose',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=False)
+
+        # File still in place
+        assert loose_path.exists()
+        # But count is 1 (would-move)
+        assert count == 1
+
+
 class TestSweepRelocationLock:
     """sweep.sweep relocations must take the per-id sidecar lock."""
 
