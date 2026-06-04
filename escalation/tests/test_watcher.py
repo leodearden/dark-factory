@@ -298,7 +298,7 @@ class TestMainLoop:
     """CLI exit behavior after first match."""
 
     def test_exits_after_first(self, tmp_path, blocking_escalation: Escalation):
-        """main() calls sys.exit(0) after first match."""
+        """main() calls sys.exit(0) after first match (via inotify event loop)."""
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
 
@@ -316,6 +316,8 @@ class TestMainLoop:
             patch('escalation.watcher.sys.argv', [
                 'watcher', '--queue-dir', str(queue_dir),
             ]),
+            # Neutralise initial scan so we test the event loop path
+            patch('escalation.watcher._initial_scan', return_value=None),
         ):
             mock_inotify = MockINotify.return_value
             # read() returns events once, then raises to break the loop
@@ -351,6 +353,8 @@ class TestLevelFilter:
             patch('escalation.watcher.INotify') as MockINotify,
             patch('escalation.watcher.sys.exit') as mock_exit,
             patch('escalation.watcher.sys.argv', argv),
+            # Neutralise initial scan so we test the event loop path
+            patch('escalation.watcher._initial_scan', return_value=None),
         ):
             mock_inotify = MockINotify.return_value
             mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]

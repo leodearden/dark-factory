@@ -90,6 +90,16 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     urllib.request.urlopen(req)
 
 
+def _emit(esc: Escalation, ntfy_url: Optional[str]) -> None:
+    """Print escalation JSON to stdout and optionally send an ntfy push notification."""
+    print(json.dumps(esc.to_dict(), indent=2))
+    if ntfy_url:
+        try:
+            _send_ntfy(ntfy_url, esc)
+        except Exception as e:
+            print(f'ntfy send failed: {e}', file=sys.stderr)
+
+
 def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -103,10 +113,18 @@ def main() -> None:
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
 
+    # ARM inotify first so no events are missed between scan and watch.
     inotify = INotify()
     watch_flags = flags.CREATE | flags.MOVED_TO
     inotify.add_watch(str(queue_dir), watch_flags)
 
+    # Initial scan: emit any already-pending escalation and exit immediately.
+    match = _initial_scan(queue_dir, args.task_id, args.level)
+    if match is not None:
+        _emit(match, args.ntfy_url)
+        sys.exit(0)
+
+    # Event loop: wait for new files.
     while True:
         for event in inotify.read():
             name = event.name
@@ -119,23 +137,10 @@ def main() -> None:
             except (json.JSONDecodeError, KeyError, OSError):
                 continue
 
-            if esc.status != 'pending':
+            if not _matches(esc, args.task_id, args.level):
                 continue
 
-            if args.task_id and esc.task_id != args.task_id:
-                continue
-
-            if args.level is not None and esc.level != args.level:
-                continue
-
-            print(json.dumps(esc.to_dict(), indent=2))
-
-            if args.ntfy_url:
-                try:
-                    _send_ntfy(args.ntfy_url, esc)
-                except Exception as e:
-                    print(f'ntfy send failed: {e}', file=sys.stderr)
-
+            _emit(esc, args.ntfy_url)
             sys.exit(0)
 
 
