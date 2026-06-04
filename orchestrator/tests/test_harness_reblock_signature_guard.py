@@ -1,0 +1,140 @@
+"""Tests for Harness signature-aware re-block guard (task δ / PRD contract C5).
+
+Guard summary
+-------------
+Placed inside ``_cascade_unblock_member`` (after the ``status != 'blocked'``
+early-exit, before ``set_task_status('pending')``), the guard counts
+same-signature re-pends cross-incarnation.  After 3 same-signature flips the
+4th is WITHHELD and a born-at-L2 human escalation is filed.
+
+Tests are grouped by plan step:
+  TestSignatureDerivation     — step-1 (RED) / step-2 (GREEN)
+  TestBelowThresholdFlips     — step-3 (RED) / step-4 (GREEN)
+  TestSignatureReset          — step-5 (RED) / step-6 (GREEN)
+  TestThresholdTrip           — step-7 (RED) / step-8 (GREEN)
+  TestDedupAndHumanReset      — step-9 (RED) / step-10 (GREEN)
+  TestMetadataClobberBoundary — step-11 (RED) / step-12 (GREEN)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import pytest
+from escalation.models import Escalation
+
+from orchestrator.harness import Harness
+
+# ---------------------------------------------------------------------------
+# Fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def harness(mock_orch_config) -> Harness:
+    """Harness with mocked internals for reblock-guard unit testing."""
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(mock_orch_config)
+
+    # Replace scheduler with async mocks
+    h.scheduler = MagicMock()
+    h.scheduler.get_status = AsyncMock(return_value='blocked')
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    h.scheduler.update_task = AsyncMock(return_value=True)
+
+    # No escalation queue by default (bare-harness style)
+    h._escalation_queue = None
+
+    return h
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_l1_esc(
+    task_id: str = '42',
+    category: str = 'infra_issue',
+    summary: str = 'something went wrong',
+    status: str = 'resolved',
+    resolved_by: str = 'l2-cascade:esc-100-1',
+    level: int = 1,
+) -> Escalation:
+    return Escalation(
+        id=f'esc-{task_id}-1',
+        task_id=task_id,
+        agent_role='workflow',
+        severity='blocking',
+        category=category,
+        summary=summary,
+        level=level,
+        status=status,
+        resolved_by=resolved_by,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-1 / Step-2: Signature derivation
+# ---------------------------------------------------------------------------
+
+
+class TestSignatureDerivation:
+    """Harness._reblock_signature derives category:normalize(summary)[:120]."""
+
+    def test_simple_category_and_summary(self):
+        """(a) Simple category + summary — expected format."""
+        esc = _make_l1_esc(category='infra_issue', summary='disk full')
+        sig = Harness._reblock_signature(esc)
+        assert sig == 'infra_issue:disk full'
+
+    def test_mixed_case_and_whitespace_normalized(self):
+        """(b) Mixed case + runs of whitespace/newlines → collapsed & lowercased."""
+        esc = _make_l1_esc(
+            category='task_failure',
+            summary='  Worker  CRASHED\n\twith   error  CODE 42  ',
+        )
+        sig = Harness._reblock_signature(esc)
+        assert sig == 'task_failure:worker crashed\n\twith   error  code 42'.replace(
+            '\n\t', ' '
+        ).replace('  ', ' ')
+        # More precisely: normalize means join(split()) + lower
+        expected_norm = ' '.join('  Worker  CRASHED\n\twith   error  CODE 42  '.split()).lower()
+        assert sig == f'task_failure:{expected_norm}'
+
+    def test_long_summary_truncated_to_120_chars_of_summary(self):
+        """(c) >120-char summary → normalized summary truncated to 120 chars (category not counted)."""
+        long_summary = 'A' * 50 + ' ' + 'B' * 80  # 131 chars total; after collapse: 131
+        esc = _make_l1_esc(category='infra_issue', summary=long_summary)
+        sig = Harness._reblock_signature(esc)
+        normalized = ' '.join(long_summary.split()).lower()
+        # The summary part must be truncated to 120 chars
+        assert sig == f'infra_issue:{normalized[:120]}'
+        # Sanity: the suffix part (after 'infra_issue:') is exactly 120 chars
+        suffix = sig[len('infra_issue:'):]
+        assert len(suffix) == 120
+
+    def test_none_summary_treated_as_empty(self):
+        """Edge case: summary=None → treat as empty string (no crash)."""
+        esc = _make_l1_esc(category='infra_issue', summary='x')
+        # Monkeypatch summary to None to simulate missing field
+        esc_no_summary = Escalation(
+            id='esc-1-1',
+            task_id='1',
+            agent_role='workflow',
+            severity='blocking',
+            category='infra_issue',
+            summary=None,  # type: ignore[arg-type]
+            level=1,
+        )
+        sig = Harness._reblock_signature(esc_no_summary)
+        assert sig == 'infra_issue:'
