@@ -193,12 +193,11 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., terminate=true)` to reschedule/abandon the blocking task so **independent**
-     work keeps flowing.
-   This is parking a decision for later review — NOT making it. Only do it when terminating the task
-   cannot itself cause harm (no half-merged state, no destructive side effect). The Priority
-   Hierarchy bar still holds: better to defer than to bake in a bad decision — when in real doubt,
-   fall back to "leave pending + digest."
+   - `resolve_issue(..., action='park')` so the blocking task lands `deferred` (D2: invisible to the
+     scheduler and to the stranded-blocked sweep; never circularly re-asked).
+   This is parking a decision for later human review — NOT making it. Only park when the task has no
+   half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
+   bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
 
 2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
    a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
