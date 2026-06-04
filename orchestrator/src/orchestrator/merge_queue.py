@@ -95,6 +95,22 @@ auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
 advances the chain is broken and the request is escalated to humans via a 'blocked'
 outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
 
+AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
+"""Kill-switch for the γ2 generation auto-chaining producer.
+
+MUST remain False until γ3 lands BOTH:
+  1. The workflow.py 'superseded' consumer handler (so the workflow.py:3963-4071
+     single-task merge consumer has a branch for 'superseded' outcomes instead of
+     falling through to _mark_blocked with an empty reason).
+  2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
+     branch slot in InFlightMergeRegistry for the chained request without tripping
+     the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
+     from the harness into the workers — harness.py:3238 omits both today).
+
+While False, _finalize_advanced_merge ignores chain_ctx on equivalence failures
+and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reach
+the workflow consumer."""
+
 
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
@@ -495,11 +511,13 @@ async def _finalize_advanced_merge(
     change); ``_do_train_merge`` passes the request's train metadata so
     ``merge_attempt`` events stay tagged for downstream reconciliation.
 
-    *chain_ctx* + *merged_branch_tip* enable γ2 generation auto-chaining.
-    When *chain_ctx* is not None and an equivalence failure is detected,
-    :func:`_maybe_auto_chain_generation` is consulted: if the branch tip
-    advanced during verify a gen-(n+1) request is enqueued and a
-    ``'superseded'`` outcome is returned instead of ``'blocked'``.
+    *chain_ctx* + *merged_branch_tip* enable γ2 generation auto-chaining
+    when :data:`AUTO_CHAIN_GENERATIONS_ENABLED` is ``True``.  While the
+    kill-switch is ``False`` (the default, pending γ3), equivalence failures
+    always return ``'blocked'`` and no ``'superseded'`` outcome is produced.
+    When enabled and *chain_ctx* is not None, :func:`_maybe_auto_chain_generation`
+    is consulted: if the branch tip advanced during verify a gen-(n+1) request
+    is enqueued and a ``'superseded'`` outcome is returned instead of ``'blocked'``.
     On a clean ``'done'`` landing, chain_ctx.counts pops the branch key
     (resetting the lineage counter).  Passing ``None`` (the default)
     preserves all existing behaviour — trains pass ``None`` (PRD D9).
@@ -530,9 +548,11 @@ async def _finalize_advanced_merge(
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
-        # γ2: if chain_ctx is wired, try to discriminate whether the
-        # branch tip advanced mid-verify and auto-chain gen-(n+1).
-        if chain_ctx is not None:
+        # γ2: if chain_ctx is wired AND the kill-switch is on, try to
+        # discriminate whether the branch tip advanced mid-verify and
+        # auto-chain gen-(n+1).  The switch is OFF by default until γ3
+        # lands the workflow 'superseded' consumer handler + slot handoff.
+        if chain_ctx is not None and AUTO_CHAIN_GENERATIONS_ENABLED:
             chained = await _maybe_auto_chain_generation(
                 req, advanced_sha, git_ops, event_store,
                 merged_branch_tip=merged_branch_tip,
@@ -2122,6 +2142,14 @@ async def _maybe_auto_chain_generation(
     The *counts* dict is mutated in-place: incremented on a chain, reset on
     bound-exceeded.  A clean 'done' landing pops the branch key (handled by
     the caller: _finalize_advanced_merge).
+
+    NOTE: this function is only reachable when :data:`AUTO_CHAIN_GENERATIONS_ENABLED`
+    is ``True`` (the kill-switch in _finalize_advanced_merge gates the call site).
+    The in-flight-registry SLOT HANDOFF for gen-(n+1) (re-acquiring the branch
+    slot without tripping the gen-1 done-callback double-release, plus threading
+    InFlightMergeRegistry and TerminalOutcomeRetention from the harness into the
+    workers — harness.py:3238 omits both) belongs to γ3's ATTACH_AND_CHAIN scope
+    and is the second precondition guarded by the kill-switch.
     """
     if not merged_branch_tip:
         return None
