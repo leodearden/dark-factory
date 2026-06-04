@@ -302,3 +302,81 @@ class TestAgeGateSweepIntegration:
             f'Expected no L1 for recent-stamp task; got {len(filed)} — '
             'age-based gate must suppress re-filing within grace window'
         )
+
+
+# ---------------------------------------------------------------------------
+# Event-at-dispatch — _register_escalation_event helper + orphan-flip suppression
+# ---------------------------------------------------------------------------
+
+class TestRegisterEscalationEventHelper:
+    """Unit tests for _register_escalation_event(task_id)."""
+
+    def test_with_queue_returns_event_and_stores_it(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """With a truthy _escalation_queue → returns asyncio.Event, stores in _escalation_events."""
+        queue = EscalationQueue(tmp_path / 'esc_reg')
+        harness._escalation_queue = queue
+        harness._escalation_events.clear()
+
+        event = harness._register_escalation_event('T-reg')  # type: ignore[attr-defined]
+
+        assert isinstance(event, asyncio.Event), (
+            '_register_escalation_event must return an asyncio.Event when queue is set'
+        )
+        assert harness._escalation_events.get('T-reg') is event, (
+            'Event must be stored in _escalation_events under the task_id'
+        )
+
+    def test_without_queue_returns_none_and_does_not_register(
+        self, harness: Harness
+    ):
+        """With _escalation_queue=None → returns None, no entry in _escalation_events."""
+        harness._escalation_queue = None
+        harness._escalation_events.clear()
+
+        result = harness._register_escalation_event('T-no-queue')  # type: ignore[attr-defined]
+
+        assert result is None
+        assert 'T-no-queue' not in harness._escalation_events
+
+
+@pytest.mark.asyncio
+class TestEventAtDispatchOrphanFlipSuppression:
+    """After dispatch-time registration, _on_escalation_resolved must NOT orphan-flip."""
+
+    async def test_dispatch_registered_event_suppresses_orphan_flip(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """[Event-at-dispatch] A task registered at dispatch (event in _escalation_events)
+        is treated as having an active workflow — Fix #1a orphan-flip gate sees
+        task_id IN _escalation_events and skips the orphan path.
+        """
+        queue = EscalationQueue(tmp_path / 'esc_dispatch')
+        harness._escalation_queue = queue
+        task_id = 'T-dispatch'
+
+        # Simulate dispatch-time registration (as would happen in the dispatch path)
+        harness._register_escalation_event(task_id)  # type: ignore[attr-defined]
+        assert task_id in harness._escalation_events, 'Pre-condition: event registered'
+
+        # Build a resolved non-cascade L1 as would come from the auto-watcher
+        esc = Escalation(
+            id=f'esc-{task_id}-1',
+            task_id=task_id,
+            agent_role='harness-stranded-blocked-reaper',
+            severity='blocking',
+            category='stranded_blocked',
+            summary='stranded blocked re-file',
+            level=1,
+            status='resolved',
+            resolved_by='escalation-watcher-auto',
+        )
+
+        harness._loop = asyncio.get_running_loop()
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # The registered event means Fix #1a sees task_id in _escalation_events
+        # → orphan-flip path is skipped → set_task_status NOT called
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
