@@ -30,9 +30,8 @@ Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/sp
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
 3. Handle each drained escalation
-4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if any
-   background merge-submission / auto-unblock sub-agent is in flight — that sub-agent completing.
-   Handle whichever arrives.
+4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
+   an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
 6. Go to 1 (restart watcher → confirm up → drain → handle)
@@ -134,31 +133,54 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 It is better to stall development than to bake in a significant bad decision.
 
-## Merge Submissions — NEVER in the Foreground
+## Merge Submissions — Bounded Submit, Then Poll
 
-`mcp__escalation__merge_request` blocks until the merge worker finishes rebasing, running the full
-verify suite, and CAS-advancing main. On a large/slow repo (e.g. reify) a single call can take
-**30+ minutes** — made in the foreground it freezes the entire watch loop for that long: no
-draining, no watcher re-arm, a born-at-L2 `critical` sits unseen (real incident: esc-2831-78 wedged
-a reify watcher >30 min on a direct foreground retry-land).
+`mcp__escalation__merge_request` with `wait_secs=None` (the legacy default) blocks until the merge
+worker finishes rebasing, running the full verify suite, and CAS-advancing main. On a large/slow
+repo (e.g. reify) a single legacy call could take **30+ minutes** — made in the foreground it would
+freeze the entire watch loop for that long: no draining, no watcher re-arm, a born-at-L2 `critical`
+sits unseen (real incident: esc-2831-78 wedged a reify watcher >30 min on a direct foreground
+retry-land). The watch loop's latency budget must stay bounded.
 
-**Hard rule: this session never calls `merge_request` at top level — no exceptions.** That covers
-the documented path (the B3 low-risk auto-unblock merges inside its sub-agent) *and* any improvised
-submission you're tempted to make yourself — e.g. retrying the land of a done-but-unmerged task once
-the verify gates that blocked it have cleared. However legitimate the merge, the submission goes
-through a NON-INTERACTIVE **background** sub-agent (`Agent` tool, general-purpose,
-`run_in_background: true`):
+**Protocol invariant:** every `merge_request` call passes an explicit bounded `wait_secs`;
+completion is awaited only via `merge_status` polling (15 s → 60 s backoff using `eta_seconds`).
+Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
 
-- Give the sub-agent everything it needs up front: `task_id`, `branch` (bare name — the worker
-  prepends `task/`), the absolute `worktree` path, a `description`, and what to do on each outcome
-  (per `skills/merge-queue/SKILL.md`). It makes the blocking call in its own context and returns a
-  compact JSON result.
-- Track the launch exactly like a B3 launch: record `{task_id, escalation_id (if any),
-  background-task-id}`, and never submit a second merge for a task that already has one in flight.
-  (`merge_request` returns `status='in_flight'` for a duplicate branch as a backstop — if you see
-  it, the merge is already covered: do NOT re-queue.)
-- The sub-agent's completion is a wake signal (Main Loop step 4); the foreground stays free to
-  re-arm the watcher and keep draining while the merge grinds.
+**§7.3 Submit → poll mechanics:**
+
+1. **Submit** with an explicit bounded `wait_secs` (use `100`):
+   ```
+   mcp__escalation__merge_request(
+     task_id=..., branch=..., worktree=..., description=..., wait_secs=100
+   )
+   ```
+   A return within the window yields a terminal outcome shape (`status` ∈
+   `done | conflict | blocked | already_merged | unknown_branch | failed`).
+   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
+   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
+   intent persists even if the MCP session drops mid-bounded-wait.
+   - `status='attached'` on a coalesced submission means the merge is already queued under the
+     existing entry's `request_id` — already covered; do **not** re-submit.
+
+2. **If non-terminal**, poll until resolution:
+   ```
+   mcp__escalation__merge_status(request_id=...)
+   ```
+   Back off 15 s → 60 s, using `eta_seconds` as the hint when present. Terminal states:
+   `done | conflict | blocked | already_merged`. After an orchestrator restart,
+   `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
+
+3. **To abandon** a queued entry before it is picked up:
+   ```
+   mcp__escalation__merge_cancel(request_id=...)
+   ```
+   Returns `{cancelled: bool, state, reason?}`. On success (`cancelled: true`) the entry is
+   dropped without halting the queue; `merge_status` subsequently returns `state: 'abandoned'`.
+
+**Tracking in-flight merges:** record `{task_id, escalation_id (if any), request_id}` and
+never submit a second merge for a `task_id` that already has one in flight. The coalesced
+`status='attached'` response is the backstop — if you see it, the merge is already covered.
 
 ## AFK Mode (extended unattended operation)
 
@@ -253,14 +275,13 @@ Then launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE **background**
 to read and follow `skills/unblock-low-risk/SKILL.md`. It applies the fix scoped to
 `files_referenced`, runs the verify suite, and merges via the queue — or aborts cleanly.
 
-**Background, not foreground — why.** The sub-agent's merge step blocks on `merge_request` until
-the merge worker finishes rebasing, verifying, and CAS-advancing main. On a large/slow repo (e.g.
-reify) that single call can take ~30 minutes. Run in the *foreground* (`Agent` without
-`run_in_background`), that whole window freezes the watch loop — new L2 escalations accumulate
-undrained until the merge returns, and a born-at-L2 `critical` could sit unseen for half an hour.
-Backgrounding keeps the foreground responsive: record the launch (above), then immediately loop
-back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result when
-it completes — that completion is itself a wake signal (Main Loop step 4), handled below.
+**Background, not foreground — why.** The unblock-low-risk sub-agent runs a full
+apply → verify → submit → poll cycle in its own context — verify alone can take several minutes on
+a large repo. Run in the *foreground* (`Agent` without `run_in_background`), that entire cycle
+occupies the watch loop's context, making it unresponsive to incoming L2 escalations throughout.
+Backgrounding keeps the foreground lean and responsive: record the launch (above), then immediately
+loop back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result
+when it completes — that completion is itself a wake signal (Main Loop step 4), handled below.
 
 **Record the launch; don't double-launch.** The durable `b3_gate record-launch` call above
 serializes concurrent and restart races. Stash `{task_id, escalation_id, background-task-id}` in
@@ -601,11 +622,10 @@ window this is the difference between one durable session and repeated restarts.
   `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
   only a compact verdict + recommended action — not the raw material
 - The low-risk auto-unblock sub-agent (`unblock-low-risk`) — run it in the **background**
-  (`run_in_background: true`) so a slow merge (~30 min on big repos like reify) can't freeze the
-  watch loop; it does the whole apply→verify→merge in its own context and returns only a small JSON
-  result when it completes
-- ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — `merge_request`
-  only ever runs inside a background sub-agent; see "Merge Submissions — NEVER in the Foreground"
+  (`run_in_background: true`) so its full apply→verify→submit→poll cycle stays in its own context,
+  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes
+- ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
+  top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
 
 **Keep in top-level context:**
