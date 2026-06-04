@@ -3860,13 +3860,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            AttachAction,
             MergeOutcome,
             MergeRequest,
+            TipRelation,
             WaiterRecord,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
             _emit_merge_coalesced,
+            classify_tip_relation,
+            decide_attach_action,
             register_and_enqueue_merge_request,
+            resolve_divergent,
         )
 
         assert self.worktree is not None
@@ -3955,16 +3960,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         attached = False
         _registry = self.merge_inflight_registry
         if _registry is not None and _registry.entry(branch_name) is not None:
+            # Synchronously capture entry state before any await (I10 await-gap).
+            _entry = _registry.entry(branch_name)
+            old_tip = _entry.snapshot_tip if _entry is not None else None
+            verifying = _entry.verifying if _entry is not None else False
+
             rc_tip, tip_out, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             new_tip = tip_out.strip() if rc_tip == 0 and tip_out.strip() else None
+
+            # Tip-relation classification: only when both tips are available.
+            if old_tip and new_tip:
+                relation = await classify_tip_relation(new_tip, old_tip, self.git_ops)
+                if relation is TipRelation.DIVERGENT:
+                    relation = await resolve_divergent(new_tip, old_tip, self.git_ops)
+                action = decide_attach_action(relation, verifying=verifying)
+                if action is AttachAction.RESNAPSHOT:
+                    _registry.re_snapshot(branch_name, new_tip)
+
             waiter = WaiterRecord(
                 request_id=merge_request.request_id,
                 future=merge_request.result,
                 source='workflow',
                 submitted_tip=new_tip,
             )
+            # attach() may return False if the entry was released during the
+            # classify await (I10 await-gap).  Fall through to enqueue in that case.
             attached = _registry.attach(branch_name, waiter)
             if attached:
                 _emit_merge_coalesced(

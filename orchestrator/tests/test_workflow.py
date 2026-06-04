@@ -727,6 +727,170 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         # (4) merge_coalesced event emitted
         assert len(coalesced_calls) == 1
 
+    async def test_superset_tip_resnapshots_before_attach(
+        self, tmp_path, monkeypatch,
+    ):
+        """SUPERSET new tip → re_snapshot before attach; no classify → RED."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        OLD = 'oldtip000000000001'
+        NEW = 'newtip000000000001'
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=OLD, snapshot_tip=OLD,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        # Stub is_ancestor: OLD is ancestor of NEW → NEW is SUPERSET
+        wf.git_ops.is_ancestor = AsyncMock(side_effect=lambda a, b: a == OLD and b == NEW)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, NEW + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        re_snapshot_calls: list[tuple] = []
+        real_re_snapshot = registry.re_snapshot
+        registry.re_snapshot = lambda branch, tip: (  # type: ignore[method-assign]
+            re_snapshot_calls.append((branch, tip)) or real_re_snapshot(branch, tip)
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # re_snapshot must be called before attach
+        assert ('B', NEW) in re_snapshot_calls, (
+            f're_snapshot not called with (B, {NEW!r}); calls={re_snapshot_calls}'
+        )
+        # Waiter is still attached
+        assert len(registry.entry('B').waiters) == 2
+
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        await submit_task
+
+    async def test_divergent_tip_resolves_and_attaches(
+        self, tmp_path, monkeypatch,
+    ):
+        """DIVERGENT tip → resolve_divergent yields SUBSET → attach without re_snapshot."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        OLD = 'divold000000000001'
+        NEW = 'divnew000000000001'
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=OLD, snapshot_tip=OLD,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        # Neither is ancestor → DIVERGENT
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        wf.git_ops.project_root = tmp_path
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, NEW + '\n', ''
+            if 'cherry' in cmd:
+                # no '+' lines → all commits in NEW are in OLD → SUBSET
+                return 0, '- abc\n- def\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Attached (ATTACH_CONTAINMENT action for SUBSET); no ValueError escaped
+        assert real_queue.qsize() == 0
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        await submit_task
+
+    async def test_attach_race_fallback_enqueues(
+        self, tmp_path, monkeypatch,
+    ):
+        """attach() returning False (entry released mid-await) → enqueue fallback."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        TIP = 'racetip00000000001'
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            if 'cherry' in cmd:
+                return 0, '- abc\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # Force attach() to return False (entry released during classify await)
+        registry.attach = lambda branch, waiter: False  # type: ignore[method-assign]
+
+        async def _worker():
+            req = await real_queue.get()
+            req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
+
+        worker_task = asyncio.create_task(_worker())
+        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+        await worker_task
+
+        assert outcome == WorkflowOutcome.DONE
+        assert real_queue.qsize() == 0  # worker consumed it
+
 
 @pytest.mark.asyncio
 class TestSubmitToMergeQueueSoftCancelDetaches:
