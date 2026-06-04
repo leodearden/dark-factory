@@ -4254,65 +4254,109 @@ Output JSON matching the schema. Every task must appear in the output.
                 label=f'auto-resume-scheduler (via {escalation.id})',
             )
 
-        # Auto-flip cascade-resolved L1 member task from blocked→pending.
-        # Guarded by level==1 + status=='resolved' + resolved_by startswith 'l2-cascade:'
-        # so it only fires for members of a resolved (not dismissed) L2 cluster.
-        # The wake event.set() above runs synchronously (criterion 8 regression guard);
-        # the flip is scheduled as a separate async task so it never blocks the callback.
+        # Unified action dispatch — β (task 1620).
+        # _resolve_escalation_action maps the escalation to a canonical action
+        # string (resume/close_only/restart/park/abandon) using the explicit
+        # resolution_action field first, then the parent L2's action for cascade
+        # members, then the legacy dismiss→close_only / resolve→resume mapping
+        # (D10) so all existing in-process tests stay green.
+        #
+        # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
+        # dedicated auto-resume handling above and is not a real task; skip it.
+        if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        action = self._resolve_escalation_action(escalation)
+
+        if action == 'close_only':
+            # Operator closed the escalation without a re-pend — leave the task
+            # in its current state (dismissed means "abandon; stay blocked").
+            logger.info(
+                'escalation %s resolved with close_only — no status change '
+                'for task %s', escalation.id, escalation.task_id,
+            )
+            return
+
+        if action == 'resume':
+            # Re-pend the blocked task.  Still gated level==1 here (step-2);
+            # step-4 generalises to level>=1 so born-at-L2 tasks also flip.
+            # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
+            # fired _resolve_callback for the L2 first, then each member with
+            # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
+            # NOT in _escalation_events (a live workflow owns its own re-pend).
+            if escalation.level == 1:
+                is_l2_cascade = (
+                    isinstance(escalation.resolved_by, str)
+                    and escalation.resolved_by.startswith('l2-cascade:')
+                )
+                if is_l2_cascade:
+                    # Scheduled via _schedule_coro_threadsafe so it works whether
+                    # this callback fires on the orchestrator loop or off it (sync
+                    # MCP resolve_issue on a FastMCP worker — where a bare
+                    # asyncio.create_task raised "no running event loop").
+                    self._schedule_coro_threadsafe(
+                        self._cascade_unblock_member(escalation),
+                        label=(
+                            f'cascade-unblock task {escalation.task_id} '
+                            f'(via {escalation.resolved_by})'
+                        ),
+                    )
+                elif escalation.task_id not in self._escalation_events:
+                    # Fix #1a — direct/orphan re-pend.  A live workflow owns its
+                    # own re-pend (woken by event.set()); only flip when orphaned.
+                    self._schedule_coro_threadsafe(
+                        self._cascade_unblock_member(escalation),
+                        label=(
+                            f'orphan-unblock task {escalation.task_id} '
+                            f'(via {escalation.resolved_by})'
+                        ),
+                    )
+            return
+
+        # restart / park / abandon → _action_teardown_and_set_status (step-6/8/12)
+        logger.debug(
+            'escalation %s action %r for task %s — teardown not yet wired '
+            '(step-6)', escalation.id, action, escalation.task_id,
+        )
+
+    def _resolve_escalation_action(self, escalation) -> str:
+        """Resolve the canonical action for a resolved/dismissed escalation.
+
+        Priority:
+          1. The explicit ``resolution_action`` on the record (set by the MCP
+             server at resolve_issue time — α1 path).
+          2. For cascade members (``resolved_by='l2-cascade:<parent_id>'``):
+             read the parent L2's ``resolution_action`` (already archived by
+             the time the member callback fires).  Falls through if absent.
+          3. Legacy mapping (D10): ``status=='dismissed'`` → ``'close_only'``;
+             ``status=='resolved'`` → ``'resume'``.
+
+        The legacy path ensures all in-process flows and existing tests that
+        carry no ``resolution_action`` continue to behave as before.
+        """
+        # 1) Explicit action on this record.
+        if escalation.resolution_action is not None:
+            return escalation.resolution_action
+
+        # 2) Cascade member: inherit parent L2's action.
         if (
-            escalation.level == 1
-            and escalation.status == 'resolved'
-            and isinstance(escalation.resolved_by, str)
+            isinstance(escalation.resolved_by, str)
             and escalation.resolved_by.startswith('l2-cascade:')
         ):
-            # Scheduled via _schedule_coro_threadsafe so it works whether this
-            # callback fires on the orchestrator loop (watcher supervisor, unit
-            # tests) or off it (sync MCP resolve_issue on a FastMCP worker —
-            # where a bare asyncio.create_task raised "no running event loop").
-            self._schedule_coro_threadsafe(
-                self._cascade_unblock_member(escalation),
-                label=(
-                    f'cascade-unblock task {escalation.task_id} '
-                    f'(via {escalation.resolved_by})'
-                ),
+            parent_id = escalation.resolved_by.split(':', 1)[1]
+            parent = (
+                self._escalation_queue.get(parent_id)
+                if self._escalation_queue is not None
+                else None
             )
+            if parent is not None and parent.resolution_action is not None:
+                return parent.resolution_action
+            # Fall through to legacy map (parent also lacks resolution_action).
 
-        # Fix #1a — event-driven re-pend on DIRECT resolution of an orphan L1.
-        # The root cause of the 3576 strand (2026-05-29): an L1 resolved
-        # directly (resolved_by='escalation-watcher-auto', not 'l2-cascade:')
-        # while NO workflow owned the task.  The wake event.set() above woke
-        # nothing (no active workflow); the cascade flip above did not match
-        # (no l2-cascade prefix).  So the blocked→pending flip never happened
-        # and the task stayed stranded.  This is the precise inverse: when the
-        # task has no active workflow slot (task_id not in _escalation_events),
-        # WE perform the flip — reusing _cascade_unblock_member, which rechecks
-        # status=='blocked' and TOCTOU-guards via SetTaskStatusRejected.
-        #
-        # Gates:
-        #   - level==1, status=='resolved' (NOT 'dismissed' — a dismissed
-        #     escalation means "abandon the task"; leave it blocked).
-        #   - NOT l2-cascade (the block above already scheduled that flip).
-        #   - task_id NOT in _escalation_events: a live workflow owns its own
-        #     re-pend (woken by event.set()); only flip when orphaned.  This is
-        #     the precise inverse of the root cause and avoids racing the rare
-        #     active-workflow re-pend (idempotent anyway via the blocked recheck).
-        if (
-            escalation.level == 1
-            and escalation.status == 'resolved'
-            and escalation.task_id != self._SCHEDULER_PAUSE_SENTINEL
-            and not (
-                isinstance(escalation.resolved_by, str)
-                and escalation.resolved_by.startswith('l2-cascade:')
-            )
-            and escalation.task_id not in self._escalation_events
-        ):
-            self._schedule_coro_threadsafe(
-                self._cascade_unblock_member(escalation),
-                label=(
-                    f'orphan-unblock task {escalation.task_id} '
-                    f'(via {escalation.resolved_by})'
-                ),
-            )
+        # 3) Legacy mapping.
+        if escalation.status == 'dismissed':
+            return 'close_only'
+        return 'resume'  # status == 'resolved'
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
