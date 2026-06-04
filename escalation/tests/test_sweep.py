@@ -353,6 +353,43 @@ class TestSweepIdempotency:
         assert self._disk_snapshot(tmp_path) == snapshot
 
 
+class TestD6GlobInvariant:
+    """D6 HARD-INVARIANT regression: non-esc-* root files are NEVER touched by a sweep pass."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+    _RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_non_esc_files_untouched_by_run_startup_sweep(self, tmp_path: Path):
+        """b3-state.json (PRD-2) and afk-digest.md in root survive a full startup sweep."""
+        # Non-esc residents
+        b3_state = tmp_path / 'b3-state.json'
+        afk_digest = tmp_path / 'afk-digest.md'
+        b3_state.write_bytes(b'{"state": "active"}')
+        afk_digest.write_bytes(b'# AFK digest\n\nSome content here.')
+
+        b3_bytes = b3_state.read_bytes()
+        afk_bytes = afk_digest.read_bytes()
+        b3_mtime = b3_state.stat().st_mtime
+        afk_mtime = afk_digest.stat().st_mtime
+
+        # One resolved esc that SHOULD be relocated
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self._RESOLVED_AT)
+
+        sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        # Non-esc files completely unchanged
+        assert b3_state.exists(), 'b3-state.json was deleted by sweep — glob widened!'
+        assert afk_digest.exists(), 'afk-digest.md was deleted by sweep — glob widened!'
+        assert b3_state.read_bytes() == b3_bytes, 'b3-state.json content changed'
+        assert afk_digest.read_bytes() == afk_bytes, 'afk-digest.md content changed'
+        assert b3_state.stat().st_mtime == b3_mtime, 'b3-state.json mtime changed'
+        assert afk_digest.stat().st_mtime == afk_mtime, 'afk-digest.md mtime changed'
+
+        # The resolved esc WAS relocated
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+
+
 class TestRunStartupSweep:
     """Tests for sweep.run_startup_sweep and StartupSweepReport."""
 
