@@ -323,7 +323,33 @@ def _read_latest_proposal(
     Returns None on any error (missing db, missing row, empty proposals list).
     Uses stdlib sqlite3 only — no fused_memory dependency.
     """
-    raise NotImplementedError
+    try:
+        db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+        if not db_path.exists():
+            return None
+        # Open read-only via URI
+        uri = f'file:{db_path}?mode=ro'
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError:
+            return None
+        try:
+            cursor = conn.execute(
+                'SELECT metadata FROM tasks WHERE tag=? AND id=?',
+                (tag, int(task_id)),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        data = json.loads(row[0])
+        proposals = data.get('dry_run_proposals', [])
+        if not proposals:
+            return None
+        return proposals[-1]
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
