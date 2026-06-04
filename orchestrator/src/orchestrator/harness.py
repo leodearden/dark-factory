@@ -1595,8 +1595,6 @@ Output JSON matching the schema. Every task must appear in the output.
         # blocked tasks (manual `git merge` while task was blocked) get
         # marked done by the next sweep cycle.  See _RECONCILE_SWEEP_STATUSES
         # for the full list of intentionally excluded statuses.
-        now = time.monotonic()
-
         for tid, status in statuses.items():
             if status not in _RECONCILE_SWEEP_STATUSES:
                 continue

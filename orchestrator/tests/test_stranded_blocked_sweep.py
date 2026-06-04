@@ -20,7 +20,6 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
