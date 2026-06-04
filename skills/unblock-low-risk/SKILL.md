@@ -32,10 +32,27 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
 4. The escalation `category` is `task_failure` or `review_issues` → else **ABORT**.
 5. The `worktree` directory exists and `git -C <worktree> status` is clean-or-sane (a task branch,
    not detached, not mid-rebase/merge) → else **ABORT**.
-6. **Freshness:** `latest` is genuinely the last entry, its `timestamp` is the most recent, and the
-   branch has no commits you can't account for since it was investigated. The proposal carries no
-   HEAD sha, so this is heuristic — if the branch state looks materially different from what the
-   proposal describes (referenced files gone, unexpected commits), **ABORT**.
+6. **Freshness gate (mechanical).** From the **primary dark-factory checkout** (where `.venv/` and
+   `orchestrator/` live — NOT the worktree, which has no `.venv`), run:
+
+   ```
+   .venv/bin/python -m orchestrator.b3_gate check \
+     --task-id <task_id> \
+     --worktree <worktree> \
+     --project-root <project_root> \
+     --category <category>
+   ```
+
+   `<category>` is the escalation category already asserted in precondition 4. The gate reads
+   `metadata.dry_run_proposals[-1]` itself — do **not** hardcode any sha.
+
+   Parse JSON stdout; `verdict` is one of `fresh | drift | abort`. **ONLY `verdict == "fresh"`
+   proceeds.** Any other verdict (both `drift` and `abort`) → **ABORT**, copying the gate's `reason`
+   field verbatim into the return value's `reason`:
+   `"freshness gate (b3_gate check): <gate reason>"`.
+
+   This mechanically enforces what was previously heuristic: the recorded `head_sha` hard-stop (P1:
+   HEAD moved → `abort`) and file-scoped main drift (P2 → `drift`).
 
 ## Procedure
 
