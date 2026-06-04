@@ -3284,3 +3284,77 @@ class TestMergeStatus:
         assert result.get('request_id') == 'mr-snapfail'
         assert result.get('outcome') == 'done'
         assert 'finished_at' in result
+
+
+# ---------------------------------------------------------------------------
+# TestCreateServerStartupSweep: startup_sweep wiring in create_server
+# ---------------------------------------------------------------------------
+
+
+class TestCreateServerStartupSweep:
+    """create_server runs run_startup_sweep on construction when startup_sweep=True."""
+
+    def test_startup_sweep_true_archives_orphan_at_construction(
+        self, tmp_path: Path, caplog
+    ):
+        """(a) create_server() with startup_sweep=True (default) archives a resolved orphan."""
+        import logging
+
+        from escalation.models import Escalation
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        # Seed a resolved orphan DIRECTLY — NOT via queue.submit_resolved (which
+        # would auto-archive the file itself via _archive_resolved, defeating this test).
+        esc = Escalation(
+            id='esc-9-9',
+            task_id='9',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='orphan',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        (queue.queue_dir / 'esc-9-9.json').write_text(esc.to_json())
+
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            create_server(queue)  # default startup_sweep=True
+
+        # Orphan was archived
+        archive_path = queue.queue_dir / 'archive' / '2026-05-20' / 'esc-9-9.json'
+        assert archive_path.exists(), (
+            f'Expected orphan archived at {archive_path}; '
+            f'still in root: {(queue.queue_dir / "esc-9-9.json").exists()}'
+        )
+        assert not (queue.queue_dir / 'esc-9-9.json').exists()
+
+        # INFO report line logged on escalation.sweep logger
+        assert any(
+            r.name == 'escalation.sweep' and r.levelno == logging.INFO
+            for r in caplog.records
+        ), f'Expected INFO sweep report; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_startup_sweep_false_leaves_orphan_untouched(self, tmp_path: Path):
+        """(b) create_server(startup_sweep=False) leaves a pre-seeded orphan in root."""
+        from escalation.models import Escalation
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id='esc-9-9',
+            task_id='9',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='orphan',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        (queue.queue_dir / 'esc-9-9.json').write_text(esc.to_json())
+
+        create_server(queue, startup_sweep=False)
+
+        # File still in root — startup sweep was skipped
+        assert (queue.queue_dir / 'esc-9-9.json').exists(), (
+            'Orphan was archived even with startup_sweep=False'
+        )
+        assert not (queue.queue_dir / 'archive').exists()
