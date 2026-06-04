@@ -10,6 +10,7 @@ producer from dry_run_unblock.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -100,3 +101,50 @@ def _seed_tasks_db(project_root: Path, task_id: int, proposals: list) -> None:
     )
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# step-1: state load/save round-trip + atomicity
+# ---------------------------------------------------------------------------
+
+class TestStateLoadSave:
+    def test_load_missing_returns_empty(self, tmp_path):
+        from orchestrator.b3_gate import _load_state
+        path = tmp_path / 'b3-state.json'
+        state = _load_state(path)
+        assert state == {'launches': [], 'charges': []}
+
+    def test_save_creates_parents_and_roundtrips(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _save_state
+        path = tmp_path / 'deep' / 'nested' / 'b3-state.json'
+        state = {'launches': [{'task_id': '1', 'head_sha': 'abc'}], 'charges': []}
+        _save_state(path, state)
+        assert path.exists()
+        loaded = _load_state(path)
+        assert loaded == state
+
+    def test_save_uses_atomic_replace(self, tmp_path, monkeypatch):
+        """Verify os.replace is called (atomic swap), not a direct write."""
+        from orchestrator import b3_gate
+        replaced = []
+        real_replace = os.replace
+
+        def mock_replace(src, dst):
+            replaced.append((src, dst))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, 'replace', mock_replace)
+        path = tmp_path / 'b3-state.json'
+        b3_gate._save_state(path, {'launches': [], 'charges': []})
+        assert len(replaced) == 1, 'expected exactly one os.replace call'
+        src, dst = replaced[0]
+        assert dst == str(path) or Path(dst) == path
+        assert src != dst  # tmp != final
+
+    def test_no_leftover_tmp(self, tmp_path):
+        """No leftover .tmp file after a successful save."""
+        from orchestrator.b3_gate import _save_state
+        path = tmp_path / 'b3-state.json'
+        _save_state(path, {'launches': [], 'charges': []})
+        tmp_files = list(tmp_path.glob('*.tmp'))
+        assert tmp_files == [], f'leftover tmp files: {tmp_files}'
