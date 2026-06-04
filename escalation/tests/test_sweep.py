@@ -353,6 +353,72 @@ class TestSweepIdempotency:
         assert self._disk_snapshot(tmp_path) == snapshot
 
 
+class TestStartupSweepIdempotency:
+    """run_startup_sweep is idempotent: first run clears the backlog, second is a no-op."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+
+    def _disk_snapshot(self, root: Path) -> dict[str, bytes]:
+        """Return {relative_path_str: content_bytes} for every regular file under root."""
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob('*'))
+            if p.is_file()
+        }
+
+    def test_first_run_clears_backlog_second_run_is_noop(self, tmp_path: Path):
+        """Seed a mix: resolved + dismissed root escs, loose archive esc, pending esc."""
+        # Resolved root esc
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00'
+        )
+        # Dismissed root esc
+        _write_root_esc(
+            tmp_path, 'esc-2-1', 'dismissed', resolved_at='2026-05-21T08:00:00+00:00'
+        )
+        # Pending esc (must remain in root)
+        _write_root_esc(tmp_path, 'esc-3-1', 'pending')
+        # Loose archive esc
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose = archive_root / 'esc-4-1.json'
+        loose_esc = Escalation(
+            id='esc-4-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose',
+            status='resolved',
+            resolved_at='2026-05-22T06:00:00+00:00',
+        )
+        loose.write_text(loose_esc.to_json())
+
+        # Run 1: should clean up the backlog
+        report1 = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+        assert report1.sweep.archived >= 2, 'resolved + dismissed should be archived'
+        assert report1.loose_reaped == 1, 'loose archive esc should be reaped'
+
+        # After run 1: only the pending esc remains in queue root (+ lock sidecars)
+        root_escs = list(tmp_path.glob('esc-*.json'))
+        assert len(root_escs) == 1, f'Only pending esc should remain: {root_escs}'
+        assert root_escs[0].name == 'esc-3-1.json'
+
+        # Capture disk state after run 1
+        snapshot_after_run1 = self._disk_snapshot(tmp_path)
+
+        # Run 2: should be a complete no-op
+        report2 = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+        assert report2.sweep.archived == 0, 'no new root escs to archive'
+        assert report2.loose_reaped == 0, 'no loose archive escs to reap'
+        assert report2.pruned_dirs == 0, 'no dirs to prune (all recent)'
+
+        # Disk state byte-stable between the two post-run states
+        assert self._disk_snapshot(tmp_path) == snapshot_after_run1, (
+            'Disk state changed on second run_startup_sweep — not idempotent!'
+        )
+
+
 class TestD6GlobInvariant:
     """D6 HARD-INVARIANT regression: non-esc-* root files are NEVER touched by a sweep pass."""
 
