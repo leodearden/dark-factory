@@ -900,7 +900,7 @@ def create_server(
         # cancellation: a wait_for timeout cancels only the outer shield wrapper,
         # leaving req.result alive.  On timeout return the non-terminal 'queued'
         # shape so the caller can poll (PRD I1/Open Q4).
-        clamp = min(wait_secs, _MAX_WAIT_SECS)
+        clamp = min(max(wait_secs, 0), _MAX_WAIT_SECS)
         try:
             outcome = await asyncio.wait_for(asyncio.shield(future), clamp)
         except TimeoutError:

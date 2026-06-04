@@ -1978,8 +1978,9 @@ class TestMergeRequestDedup:
         Simulates the dedup blind-spot fix: the workflow enqueues via
         register_and_enqueue_merge_request (which registers in the shared
         registry), then a subsequent MCP merge_request call for the same
-        branch returns status='in_flight' (coalesced from registry) with
-        inflight_task_id='workflow-task' and NO duplicate queue entry.
+        branch returns status='attached' (coalesced from registry, existing
+        entry's id) with inflight_task_id='workflow-task' and NO duplicate
+        queue entry.
         """
         import asyncio
         from pathlib import Path as _Path
