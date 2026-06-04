@@ -776,6 +776,79 @@ class TestResolveIssueActionEnum:
 
 
 # ---------------------------------------------------------------------------
+# TestResolveIssueResolutionActionPersisted: C1 resolution_action persisted to disk
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueResolutionActionPersisted:
+    """resolve_issue stamps resolution_action on the resolved record (C1 persistence)."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-p1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-persist',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='persistence test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_park_resolution_action_persisted(self, tmp_path: Path):
+        """action='park' → queue.get(id).resolution_action == 'park' with status 'dismissed'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'dismissed', f"Expected dismissed; got {record.status!r}"
+        assert record.resolution_action == 'park', (
+            f"Expected resolution_action='park'; got {record.resolution_action!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_resolution_action_persisted(self, tmp_path: Path):
+        """action='resume' → queue.get(id).resolution_action == 'resume' with status 'resolved'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved', f"Expected resolved; got {record.status!r}"
+        assert record.resolution_action == 'resume', (
+            f"Expected resolution_action='resume'; got {record.resolution_action!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_return_dict_includes_resolution_action(self, tmp_path: Path):
+        """resolve_issue return dict includes resolution_action key with the chosen action."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        assert 'resolution_action' in result, f"Return dict missing resolution_action; got: {result}"
+        assert result['resolution_action'] == 'close_only', (
+            f"Expected resolution_action='close_only'; got {result['resolution_action']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
 # ---------------------------------------------------------------------------
 
