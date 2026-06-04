@@ -6,7 +6,7 @@
 - Subprocess under fused-memory cgroup: PID 2258925 `git show HEAD:.taskmaster/tasks/tasks.json` **has been running for 4d06h** — almost certainly the reason the SQLite writer lock has been held. Restart will kill it.
 - `/home/leo/src/reify/.taskmaster/tasks/tasks.json`: 1950 tasks, max id 1955; metadata.taskCount=1947 (off by 3); 1953/1954/1955 identical ("Tighten handleSave errorSpy assertion…"), no deps. 1959 absent.
 - `reconciliation.db.event_buffer`: reify=803 buffered, dark_factory=31, autopilot_video=5.
-- No other task depends on 1953/1954/1955/1959 (scanned all tasks + subtasks). Dedupe and 1959 restore need no dependency rewrites.
+- No other task depends on 1953/1954/1955/1959 (scanned all tasks). Dedupe and 1959 restore need no dependency rewrites.
 - Task 1959 original content preserved in `/home/leo/src/reify/data/escalations/esc-1959-52.json`.
 
 ## Step-by-step procedure

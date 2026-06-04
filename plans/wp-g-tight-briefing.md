@@ -21,7 +21,7 @@ Write:
 3. `fused-memory/tests/test_canonical_tasks_json.py` — end-to-end redirection tests (one real temp-repo fixture with a worktree, then exercise add_task with worktree path, assert write lands in main).
 
 Edit:
-4. `fused-memory/src/fused_memory/server/tools.py` — at the top of every task tool function (`add_task`, `add_subtask`, `get_tasks`, `get_task`, `set_task_status`, `update_task`, `remove_task`, `add_dependency`, `remove_dependency`, `expand_task`, `parse_prd`, `move_task`, and any others you find in the file — grep `project_root` inside this one file to be thorough): after the existing `validate_project_root(...)` check, `project_root = resolve_main_checkout(project_root)`. If resolution fails, return the validation error.
+4. `fused-memory/src/fused_memory/server/tools.py` — at the top of every task tool function (`add_task`, `get_tasks`, `get_task`, `set_task_status`, `update_task`, `remove_task`, `add_dependency`, `remove_dependency`, `expand_task`, `parse_prd`, `move_task`, and any others you find in the file — grep `project_root` inside this one file to be thorough): after the existing `validate_project_root(...)` check, `project_root = resolve_main_checkout(project_root)`. (add_subtask removed — DF-D) If resolution fails, return the validation error.
 5. `fused-memory/src/fused_memory/middleware/task_file_committer.py` — if the method signature receives `project_root`, normalize it via `resolve_main_checkout` before running git commands. Quick one-liner near the top of `_do_commit`.
 
 ## `resolve_main_checkout` spec

@@ -65,7 +65,7 @@ PYTHONPATH=$PWD/src:$PWD/../shared/src \
 Expected output (per project):
 
 ```
-INFO OK <project_root> — tasks=N subtasks=M deps=K → <path>/tasks.db
+INFO OK <project_root> — tasks=N deps=K → <path>/tasks.db
 INFO VALIDATE OK <project_root>
 ```
 
@@ -138,7 +138,7 @@ before comparing — anything that fires is a real semantic disagreement.
 - Zero `dual_compare.divergence` lines after ~2 hours of active
   orchestrator traffic, OR
 - Counting principle: ~hundreds of write operations across every
-  method (`set_task_status`, `add_task`, `add_subtask`, etc.). With the
+  method (`set_task_status`, `add_task`, etc.). With the
   orchestrator's normal cadence this is ~1–2 hours.
 
 A passive soak (orchestrator idle) doesn't count — there's nothing to

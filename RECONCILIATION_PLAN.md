@@ -473,7 +473,7 @@ class TaskmasterBackend:
     async def set_task_status(self, task_id: str, status: str, project_root: str, ...) -> dict
     async def add_task(self, prompt: str | None = None, title: str | None = None, ...) -> dict
     async def update_task(self, task_id: str, prompt: str, project_root: str, ...) -> dict
-    async def add_subtask(self, parent_id: str, title: str, ...) -> dict
+    # add_subtask removed — DF-D; all tasks are top-level
     async def remove_task(self, task_id: str, project_root: str, ...) -> dict
     async def add_dependency(self, task_id: str, depends_on: str, ...) -> dict
     async def remove_dependency(self, task_id: str, depends_on: str, ...) -> dict
@@ -595,7 +595,7 @@ def create_mcp_server(
                 task_id=id, status=status, project_root=project_root, ...
             )
 
-        # ... add_task, update_task, add_subtask, remove_task,
+        # ... add_task, update_task, remove_task,
         #     add_dependency, remove_dependency, expand_task, parse_prd ...
 ```
 
@@ -946,7 +946,6 @@ Tools available:
 - `set_task_status(id, status, project_root)` — modify task status
 - `add_task(prompt, project_root, ...)` — create task
 - `update_task(id, prompt, project_root, ...)` — modify task
-- `add_subtask(parent_id, title, ...)` — create subtask
 - `remove_task(id, project_root)` — delete task
 - `add_dependency(id, depends_on, project_root)` — add dependency
 - `remove_dependency(id, depends_on, project_root)` — remove dependency
@@ -1345,8 +1344,8 @@ class TargetedReconciler:
         return result
 
     async def _on_task_cancelled(self, task_id, project_id, task_before, run_id) -> dict:
-        """Task cancelled. Flag subtasks and dependents for review."""
-        # Check for subtasks/dependents that may need status changes
+        """Task cancelled. Flag dependents for review."""
+        # Check for dependents that may need status changes (subtasks removed — DF-D)
         ...
 
     async def _on_task_deferred(self, task_id, project_id, task_before, run_id) -> dict:
@@ -1356,7 +1355,7 @@ class TargetedReconciler:
 
     async def reconcile_bulk_tasks(self, parent_task_id, project_id) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
-        # 1. Get newly created subtasks/tasks
+        # 1. Get newly created tasks
         # 2. For each, search knowledge graph for contradictions
         # 3. Flag tasks whose assumptions contradict known facts
         # 4. Attach memory hints where relevant knowledge exists
