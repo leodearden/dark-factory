@@ -9367,7 +9367,7 @@ class TestFinalizeAdvancedMerge:
         assert mq.AUTO_CHAIN_GENERATIONS_ENABLED is False
 
         git_ops = self._make_git_ops()
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-gate',
             branch='task/t-gate',
@@ -9426,7 +9426,7 @@ class TestFinalizeAdvancedMerge:
         git_ops = self._make_git_ops()
         # _maybe_auto_chain_generation calls dataclasses.replace(req, ...) so
         # we need a real MergeRequest (not MagicMock) for the chaining path.
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-chain',
             branch='task/t-chain',
@@ -9467,6 +9467,89 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'superseded'
         assert outcome.superseded_by is not None
         assert queue.qsize() == 1
+
+    async def test_chain_ctx_superseded_emits_generation_chained_event(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When AUTO_CHAIN_GENERATIONS_ENABLED=True and _maybe_auto_chain_generation
+        returns a chained outcome, _finalize_advanced_merge emits a
+        'post_merge_generation_chained' merge_attempt event to the event_store.
+        This is the observable contract for reconciliation provenance."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        event_store = MagicMock()
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-event',
+            branch='task/t-event',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, event_store,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded', (
+            f'expected superseded, got {outcome.status!r}'
+        )
+        # Assert that the 'post_merge_generation_chained' merge_attempt event was emitted.
+        # Note: event_store.emit is also called for merge_queued events (from
+        # enqueue_merge_request → _emit_merge_queued_event) whose data dict has
+        # no 'outcome' key — guard with .get() to skip those.
+        emitted_outcomes = [
+            call.kwargs['data'].get('outcome')
+            for call in event_store.emit.call_args_list
+            if 'data' in call.kwargs
+        ]
+        assert 'post_merge_generation_chained' in emitted_outcomes, (
+            f'expected post_merge_generation_chained event; got: {emitted_outcomes!r}'
+        )
+        # The 'post_merge_equivalence_failed' event should also have been emitted first.
+        assert 'post_merge_equivalence_failed' in emitted_outcomes, (
+            f'expected post_merge_equivalence_failed event; got: {emitted_outcomes!r}'
+        )
+        # Event was emitted with the correct task_id.
+        chained_call = next(
+            c for c in event_store.emit.call_args_list
+            if 'data' in c.kwargs
+            and c.kwargs['data'].get('outcome') == 'post_merge_generation_chained'
+        )
+        assert chained_call.args[0] == EventType.merge_attempt
+        assert chained_call.kwargs['task_id'] == req.task_id
 
     async def test_chain_ctx_done_pops_branch_counter(
         self, tmp_path: Path, config: OrchestratorConfig,
@@ -11472,14 +11555,8 @@ class TestMaybeAutoChainGeneration:
         branch: str = 'task/t1',
         generation: int = 1,
     ) -> MergeRequest:
-        loop = asyncio.new_event_loop()
-        try:
-            fut: asyncio.Future[MergeOutcome] = loop.create_future()
-        finally:
-            loop.close()
-        import asyncio as _asyncio
-        # Use a detached future (we won't resolve it in these tests)
-        fut = _asyncio.get_event_loop().create_future()
+        # Called from @pytest.mark.asyncio tests — get_running_loop() is always valid here.
+        fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         return MergeRequest(
             task_id='t1',
             branch=branch,
@@ -11854,7 +11931,7 @@ class TestMergeWorkerGenerationChain:
         # rev-parse HEAD → branch_head_sha for the branch tip snapshot
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='wt-1',
             branch='task/wt-branch',
@@ -11947,7 +12024,7 @@ class TestSMWGenerationChain:
 
         worker = SpeculativeMergeWorker(git_ops, queue)
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='smw-wt',
             branch='task/smw-branch',

@@ -2198,7 +2198,7 @@ async def _maybe_auto_chain_generation(
     # Within bound — build the gen-(n+1) request and enqueue it.
     gen_next = dataclasses.replace(
         req,
-        result=asyncio.get_event_loop().create_future(),
+        result=asyncio.get_running_loop().create_future(),
         request_id=f'mr-{uuid.uuid4().hex[:8]}',
         generation=req.generation + 1,
         snapshot_tip=current_head,
