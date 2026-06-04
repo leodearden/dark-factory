@@ -4422,6 +4422,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Mechanism 2: check staleness at pickup for real items.
                     # Reading main once per non-speculative pickup adds one git
                     # rev-parse per item — negligible vs. the merge/verify cost.
+                    #
+                    # Train exemption (D9/I6, boundary test 12):
+                    # GroupMergeRequest trains are exempt via two independent guards:
+                    #   1. `item.immediate_outcome is None` — trains always set
+                    #      immediate_outcome from _do_train_merge, so this is False
+                    #      and the elif is skipped for every train.
+                    #   2. `not isinstance(req, GroupMergeRequest)` — explicit
+                    #      defense-in-depth so the exemption is clear at the
+                    #      call site independent of the immediate_outcome contract.
+                    # Trains are also structurally exempt from Mechanism 1: the
+                    # GroupMergeRequest `continue` in _merger_loop executes before
+                    # the _merge_ahead_cap.acquire() site, so trains never acquire
+                    # the cap (counts_against_cap defaults to False).
                     current_main = await self._git_ops.get_main_sha()
                     if item.base_sha != current_main:
                         remerge_reason = 'main_advanced'
