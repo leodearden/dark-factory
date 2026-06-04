@@ -134,31 +134,54 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 It is better to stall development than to bake in a significant bad decision.
 
-## Merge Submissions — NEVER in the Foreground
+## Merge Submissions — Bounded Submit, Then Poll
 
-`mcp__escalation__merge_request` blocks until the merge worker finishes rebasing, running the full
-verify suite, and CAS-advancing main. On a large/slow repo (e.g. reify) a single call can take
-**30+ minutes** — made in the foreground it freezes the entire watch loop for that long: no
-draining, no watcher re-arm, a born-at-L2 `critical` sits unseen (real incident: esc-2831-78 wedged
-a reify watcher >30 min on a direct foreground retry-land).
+`mcp__escalation__merge_request` with `wait_secs=None` (the legacy default) blocks until the merge
+worker finishes rebasing, running the full verify suite, and CAS-advancing main. On a large/slow
+repo (e.g. reify) a single legacy call could take **30+ minutes** — made in the foreground it would
+freeze the entire watch loop for that long: no draining, no watcher re-arm, a born-at-L2 `critical`
+sits unseen (real incident: esc-2831-78 wedged a reify watcher >30 min on a direct foreground
+retry-land). The watch loop's latency budget must stay bounded.
 
-**Hard rule: this session never calls `merge_request` at top level — no exceptions.** That covers
-the documented path (the B3 low-risk auto-unblock merges inside its sub-agent) *and* any improvised
-submission you're tempted to make yourself — e.g. retrying the land of a done-but-unmerged task once
-the verify gates that blocked it have cleared. However legitimate the merge, the submission goes
-through a NON-INTERACTIVE **background** sub-agent (`Agent` tool, general-purpose,
-`run_in_background: true`):
+**Protocol invariant:** every `merge_request` call passes an explicit bounded `wait_secs`;
+completion is awaited only via `merge_status` polling (15 s → 60 s backoff using `eta_seconds`).
+Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
 
-- Give the sub-agent everything it needs up front: `task_id`, `branch` (bare name — the worker
-  prepends `task/`), the absolute `worktree` path, a `description`, and what to do on each outcome
-  (per `skills/merge-queue/SKILL.md`). It makes the blocking call in its own context and returns a
-  compact JSON result.
-- Track the launch exactly like a B3 launch: record `{task_id, escalation_id (if any),
-  background-task-id}`, and never submit a second merge for a task that already has one in flight.
-  (`merge_request` returns `status='in_flight'` for a duplicate branch as a backstop — if you see
-  it, the merge is already covered: do NOT re-queue.)
-- The sub-agent's completion is a wake signal (Main Loop step 4); the foreground stays free to
-  re-arm the watcher and keep draining while the merge grinds.
+**§7.3 Submit → poll mechanics:**
+
+1. **Submit** with an explicit bounded `wait_secs` (use `100`):
+   ```
+   mcp__escalation__merge_request(
+     task_id=..., branch=..., worktree=..., description=..., wait_secs=100
+   )
+   ```
+   A return within the window yields a terminal outcome shape (`status` ∈
+   `done | conflict | blocked | already_merged | unknown_branch | failed`).
+   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
+   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
+   intent persists even if the MCP session drops mid-bounded-wait.
+   - `status='attached'` on a coalesced submission means the merge is already queued under the
+     existing entry's `request_id` — already covered; do **not** re-submit.
+
+2. **If non-terminal**, poll until resolution:
+   ```
+   mcp__escalation__merge_status(request_id=...)
+   ```
+   Back off 15 s → 60 s, using `eta_seconds` as the hint when present. Terminal states:
+   `done | conflict | blocked | already_merged`. After an orchestrator restart,
+   `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
+
+3. **To abandon** a queued entry before it is picked up:
+   ```
+   mcp__escalation__merge_cancel(request_id=...)
+   ```
+   Returns `{cancelled: bool, state, reason?}`. On success (`cancelled: true`) the entry is
+   dropped without halting the queue; `merge_status` subsequently returns `state: 'abandoned'`.
+
+**Tracking in-flight merges:** record `{task_id, escalation_id (if any), request_id}` and
+never submit a second merge for a `task_id` that already has one in flight. The coalesced
+`status='attached'` response is the backstop — if you see it, the merge is already covered.
 
 ## AFK Mode (extended unattended operation)
 
