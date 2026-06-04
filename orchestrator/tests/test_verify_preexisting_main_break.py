@@ -135,7 +135,7 @@ class TestVerifyFailureIsPreexistingFalseCases:
 
     def _run_helper(
         self, tmp_path: Path, failing_result: VerifyResult, main_result: VerifyResult,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
