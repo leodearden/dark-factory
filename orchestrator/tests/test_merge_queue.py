@@ -12804,8 +12804,8 @@ class TestBoundaryTableWorkerEntry:
 
     @pytest.mark.timeout(60)
     async def test_scenario_9_multi_waiter_peer_completion(
-        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
-        tmp_path: 'Path',  # type: ignore[name-defined]
+        self, git_ops: GitOps, config: OrchestratorConfig,  # type: ignore[name-defined]
+        tmp_path: Path,  # type: ignore[name-defined]
     ) -> None:
         """Row 9: multi-waiter peer completion (mcp+workflow, one merge).
 
@@ -12856,7 +12856,9 @@ class TestBoundaryTableWorkerEntry:
             WaiterRecord(request_id='mr-bt9-wf', future=wf_future, source='workflow'),
         )
 
-        assert len(registry.entry(bt9_branch).waiters) == 2, 'must have 2 waiters'
+        _bt9_entry = registry.entry(bt9_branch)
+        assert _bt9_entry is not None, 'entry must exist after acquire+attach'
+        assert len(_bt9_entry.waiters) == 2, 'must have 2 waiters'
 
         # Drive the real MergeWorker
         queue: asyncio.Queue = asyncio.Queue()
@@ -12899,12 +12901,12 @@ class TestBoundaryTableWorkerEntry:
             ['git', 'log', '--merges', '--oneline', 'main'],
             cwd=git_ops.project_root,
         )
-        merge_lines = [l for l in merge_log.splitlines() if l.strip()]
+        merge_lines = [ln for ln in merge_log.splitlines() if ln.strip()]
         assert len(merge_lines) >= 1, 'at least one merge commit must exist on main'
 
     @pytest.mark.timeout(90)
     async def test_scenario_11_generation_chain_escalation(
-        self, tmp_path: 'Path', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+        self, tmp_path: Path, config: OrchestratorConfig,  # type: ignore[name-defined]
         monkeypatch,
     ) -> None:
         """Row 11: generation chain + 3rd-advance escalation.
@@ -12919,11 +12921,9 @@ class TestBoundaryTableWorkerEntry:
         import orchestrator.merge_queue as mq_mod
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MAX_AUTO_CHAINED_GENERATIONS,
-            MergeRequest,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            MergeRequest,
             TipRelation,
-            _GenerationChainContext,
-            _finalize_advanced_merge,
             _maybe_auto_chain_generation,
         )
 
@@ -13022,7 +13022,7 @@ class TestBoundaryTableWorkerEntry:
 
     @pytest.mark.timeout(60)
     async def test_scenario_12_train_non_regression(
-        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+        self, git_ops: GitOps, config: OrchestratorConfig,  # type: ignore[name-defined]
     ) -> None:
         """Row 12: train path unchanged — merges green, no multi-waiter, no auto-chain.
 
@@ -13034,15 +13034,15 @@ class TestBoundaryTableWorkerEntry:
         """
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeWorker,
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
         )
 
         req = await _make_stacked_train(git_ops, config, train_id='bt12-train')
 
         # Spy on _finalize_advanced_merge to assert chain_ctx=None — capture the
         # real function BEFORE patching so the spy doesn't recurse into itself.
-        from orchestrator.merge_queue import _finalize_advanced_merge as _real_finalize  # type: ignore
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge as _real_finalize,  # type: ignore
+        )
 
         finalize_calls: list[dict] = []
 
@@ -13078,14 +13078,12 @@ class TestBoundaryTableWorkerEntry:
                 f'got chain_ctx={call_kwargs.get("chain_ctx")!r}'
             )
 
-        # No multi-waiter registry entry for the train branch
-        assert not isinstance(registry := InFlightMergeRegistry(), type(None)), (
-            'InFlightMergeRegistry must be importable'
-        )
+        # No multi-waiter registry entry for the train branch — smoke-test importability
+        assert isinstance(InFlightMergeRegistry(), object)
 
     @pytest.mark.timeout(60)
     async def test_scenario_13_subset_waiter_containment(
-        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+        self, git_ops: GitOps, config: OrchestratorConfig,  # type: ignore[name-defined]
     ) -> None:
         """Row 13: subset-waiter containment — attach as peer, no duplicate enqueue.
 

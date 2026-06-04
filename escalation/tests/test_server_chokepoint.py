@@ -2172,7 +2172,6 @@ class TestBoundaryTableMcpSurface:
         Extends TestMergeRequestWaitSecsZeroFree with the full §8-row-1 postcondition.
         """
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeOutcome,
             MergeRequest,
         )
 
@@ -2316,7 +2315,10 @@ class TestBoundaryTableMcpSurface:
         )
         # Override harness.git_ops on the already-built harness
         # We need to re-build with git_ops wired; use the full-form harness
-        from orchestrator.merge_queue import InFlightMergeRegistry  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (
+            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        )
+
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
 
         esc_q = EscalationQueue(tmp_path / 'esc3')
@@ -2370,11 +2372,12 @@ class TestBoundaryTableMcpSurface:
         Records a terminal TerminalOutcomeRecord into harness._terminal_retention
         for the 'done' transition.
         """
+        import time
+
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
-        import time
 
         worker = _FakeMergeWorker()
         retention = TerminalOutcomeRetention()
@@ -2460,8 +2463,13 @@ class TestBoundaryTableMcpSurface:
         returns the terminal state from the event store.
         (b) merge_status('mr-doesnotexist') → {state:'unknown', hint:'check git log main'}.
         """
-        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import TerminalOutcomeRetention  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
+        from orchestrator.merge_queue import (
+            TerminalOutcomeRetention,  # type: ignore[reportMissingImports]
+        )
 
         db_path = tmp_path / 'events-sc5.db'
         event_store = EventStore(db_path=db_path, run_id='sc5')
@@ -2486,7 +2494,10 @@ class TestBoundaryTableMcpSurface:
 
         # Build a FRESH server with empty retention (simulating restart)
         # but the same event_store
-        from orchestrator.merge_queue import InFlightMergeRegistry  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (
+            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        )
+
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
 
         fresh_retention = TerminalOutcomeRetention()
@@ -2600,11 +2611,12 @@ class TestBoundaryTableMcpSurface:
         new-session merge_status cross-check.
         """
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
             MergeOutcome,
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
-        from orchestrator.merge_queue import InFlightMergeRegistry  # type: ignore[reportMissingImports]
+
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
 
         retention = TerminalOutcomeRetention()
