@@ -270,3 +270,73 @@ class TestVerifyFailureIsPreexistingLifecycle:
         assert len(remove_calls) == 1, (
             f'Cleanup must run even when probe raises; remove calls: {remove_calls}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — step-17: probe worktree is created under git_ops.worktree_base,
+#           NOT the system temp dir (environment-parity invariant)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureProbeWorktreePlacement:
+    """Step-17 / review-fix: probe worktree must be under git_ops.worktree_base.
+
+    A /tmp probe cannot resolve node_modules / repo-root shared installs by
+    upward directory traversal, so an inherited TS/compile break would surface
+    a DIFFERENT signature ('Cannot find module' / 'tsc not found') — branch_sig
+    != main_sig — and the contagion guard would silently never fire.
+
+    Placement under worktree_base restores identical upward resolution to task
+    worktrees.  Prune-safety is achieved via the '_mainprobe-' prefix (the disk-
+    pressure prune targets '_merge-*' only).
+    """
+
+    def test_probe_path_is_under_worktree_base_not_tmp(self, tmp_path: Path) -> None:
+        """The 'git worktree add --detach' target must be a child of git_ops.worktree_base."""
+        import tempfile
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        # worktree_base must be a real Path (not auto-MagicMock) so is_relative_to() works.
+        worktree_base = config.project_root / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        mock_git_ops.worktree_base = worktree_base  # real Path — pins the placement invariant
+
+        probe_paths: list[str] = []
+
+        async def _spy_run(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd and '--detach' in cmd:
+                detach_idx = cmd.index('--detach')
+                probe_paths.append(cmd[detach_idx + 1])
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=SAME_RESULT)),
+            patch('orchestrator.git_ops._run', side_effect=_spy_run),
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert len(probe_paths) == 1, f'Expected exactly 1 worktree add call; got: {probe_paths}'
+        probe_path = Path(probe_paths[0])
+
+        # MUST be under worktree_base — not in /tmp or any system temp dir
+        assert probe_path.is_relative_to(worktree_base), (
+            f'Probe path {probe_path!r} must be under worktree_base={worktree_base} '
+            f'for environment parity (upward dependency resolution). '
+            f'Current parent: {probe_path.parent}'
+        )
+        assert not probe_path.is_relative_to(Path(tempfile.gettempdir())), (
+            f'Probe path {probe_path!r} must NOT be under system temp dir '
+            f'{tempfile.gettempdir()} — /tmp probes fail to resolve node_modules upward'
+        )
