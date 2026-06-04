@@ -138,14 +138,21 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      terminal state:
 
      ```
-     while state ∈ {queued, verifying, gate, finalizing}:
+     deadline = now() + 1200 s          # 20-minute hard ceiling
+     while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
          sleep(wait)
          result = mcp__escalation__merge_status(request_id)
+     if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
+         mcp__escalation__merge_cancel(request_id)
+         ABORT   # leave escalation pending; 'one attempt, abort on doubt'
      ```
 
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
-     60 s]. Proceed to step 9 with the final `result.state`.
+     60 s]. Cap total polling at 20 minutes: if the entry is still live at the deadline, call
+     `merge_cancel(request_id)` and ABORT — leaving the escalation pending for a human,
+     consistent with the skill's bounded-operation ethos and 'one attempt, abort on doubt'
+     principle. Proceed to step 9 with the final `result.state` if the deadline is not reached.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
    overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
