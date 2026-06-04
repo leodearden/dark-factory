@@ -1418,6 +1418,66 @@ class TestMergeRequestExplicitNoneQueued:
 
 
 # ---------------------------------------------------------------------------
+# β8 Step-5 RED: explicit None on coalesced branch must return 'attached'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestExplicitNoneAttached:
+    """β8 step-5 RED: explicit wait_secs=None on an in-flight branch must
+    return 'attached' (not the legacy 'in_flight' shape).
+
+    RED after step-4: explicit None no longer blocks (step-4 greened that),
+    but the `if wait_secs is None:` sub-branch inside dispatch.in_flight
+    still returns status=='in_flight' with the submitting request's id.
+    GREEN after step-6 impl deletes that sub-branch.
+    """
+
+    async def test_explicit_none_wait_secs_coalesce_returns_attached(self, tmp_path: Path):
+        """Explicit None on an already-in-flight branch returns 'attached' with existing id.
+
+        Pre-seed the registry with branch 'X' and request_id='mr-existing'.
+        Call merge_request(wait_secs=None) (type: ignore intentional).
+        Must return status=='attached' and request_id=='mr-existing'.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future, request_id='mr-existing')
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=None,  # type: ignore[reportArgumentType]
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', (
+            f"Expected status='attached' for explicit None on coalesced branch, got: {result}"
+        )
+        assert result.get('request_id') == 'mr-existing', (
+            f"Expected request_id='mr-existing', got: {result.get('request_id')!r}"
+        )
+
+        never_future.cancel()
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-13 RED: legacy (wait_secs=None) — client disconnect doesn't cancel entry
 # ---------------------------------------------------------------------------
 
