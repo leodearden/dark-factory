@@ -331,6 +331,67 @@ class TestMainLoop:
             mock_exit.assert_called_once_with(0)
 
 
+class TestTimeout:
+    """--timeout arg: exit 124 on expiry; no timeout -> block indefinitely."""
+
+    def test_timeout_exits_124_on_expiry(self, tmp_path, capsys):
+        """--timeout 2 -> exit 124 when read returns empty (no events); stdout empty."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        # Fixed monotonic sequence: start=0.0, check after read=2.001 (past deadline)
+        monotonic_values = iter([0.0, 2.001])
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir), '--timeout', '2',
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+        ):
+            mock_inotify = MockINotify.return_value
+            # read returns empty list -> no events -> timeout path
+            mock_inotify.read.return_value = []
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 124
+
+        # stdout must be empty (no escalation emitted)
+        captured = capsys.readouterr()
+        assert captured.out == ''
+
+        # read was called with timeout=2000ms
+        mock_inotify.read.assert_called_once_with(timeout=2000)
+
+    def test_no_timeout_blocks_indefinitely(self, tmp_path):
+        """Without --timeout, read is called with timeout=None (block forever)."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            # No timeout -> read blocks; we break out with KeyboardInterrupt
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_inotify.read.assert_called_once_with(timeout=None)
+
+
 class TestLevelFilter:
     """--level argument filters by escalation level."""
 
