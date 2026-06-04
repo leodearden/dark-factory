@@ -573,193 +573,36 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
     }
 
 
-# ── add_subtask / nested IDs ───────────────────────────────────────
-
-
 @pytest.mark.asyncio
-async def test_add_subtask_returns_dotted_id(backend, project_root):
-    await backend.add_task(project_root=project_root, title='parent')
-    dto = await backend.add_subtask(
-        '1', project_root=project_root, title='Sub one',
-    )
-    assert dto['id'] == '1.1'
-    assert dto['parent_id'] == '1'
-    assert 'created' in dto['message']
-    assert dto['subtask']['title'] == 'Sub one'
+async def test_sqlite_task_backend_has_no_add_subtask_method():
+    """SqliteTaskBackend must NOT have an add_subtask method after DF-D (task 1543).
 
-
-@pytest.mark.asyncio
-async def test_add_subtask_increments_local_id(backend, project_root):
-    await backend.add_task(project_root=project_root, title='parent')
-    a = await backend.add_subtask('1', project_root=project_root, title='A')
-    b = await backend.add_subtask('1', project_root=project_root, title='B')
-    assert (a['id'], b['id']) == ('1.1', '1.2')
-
-    parent = await backend.get_task('1', project_root=project_root)
-    assert [s['id'] for s in parent['subtasks']] == [1, 2]
-
-
-@pytest.mark.asyncio
-async def test_add_subtask_unknown_parent_raises(backend, project_root):
-    with pytest.raises(TaskmasterError) as exc:
-        await backend.add_subtask('99', project_root=project_root, title='x')
-    assert 'Parent task not found' in exc.value.message
-
-
-@pytest.mark.asyncio
-async def test_set_status_on_subtask_via_dotted_id(backend, project_root):
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='S')
-    result = await backend.set_task_status(
-        '1.1', 'done', project_root=project_root,
-    )
-    assert result['tasks'][0]['taskId'] == '1.1'
-    parent = await backend.get_task('1', project_root=project_root)
-    assert parent['subtasks'][0]['status'] == 'done'
-
-
-# ── update_task on subtasks ───────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_update_task_persists_metadata_on_dotted_subtask_id(backend, project_root):
-    """metadata written to a subtask via update_task round-trips through get_task.
-
-    Regression: _row_to_task's subtask branch previously dropped the metadata
-    column. Both the direct get_task('1.1') path and the parent['subtasks'][0]
-    path must now return the persisted metadata dict.
+    RED assertion: fails while add_subtask is still present, passes once step-4
+    removes it.
     """
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='Sub')
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
-        append=True,
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    assert not hasattr(SqliteTaskBackend, 'add_subtask'), (
+        'SqliteTaskBackend.add_subtask still exists; '
+        'DF-D (task 1543) step-4 must delete it.'
     )
-
-    # (a) Direct get_task on the subtask must carry the metadata.
-    sub = await backend.get_task('1.1', project_root=project_root)
-    assert sub['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
-
-    # (b) Parent's subtasks[0] must also carry the metadata.
-    parent = await backend.get_task('1', project_root=project_root)
-    assert parent['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
-
-
-@pytest.mark.asyncio
-async def test_get_tasks_listing_surfaces_subtask_metadata(backend, project_root):
-    """get_tasks listing also surfaces metadata on subtask dicts.
-
-    Locks both the populated-metadata path and the None→{} default so
-    the reconciliation context_assembler (which reads via get_tasks) sees
-    the same metadata as the direct get_task path.
-    """
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='Sub')
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': {'entities': ['X']}}),
-        append=False,
-    )
-
-    listing = await backend.get_tasks(project_root=project_root)
-
-    # (a) Populated-metadata path: get_tasks listing carries the persisted value.
-    assert listing['tasks'][0]['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['X']}}
-
-    # (b) Empty-default path: a freshly added subtask (no update_task) has metadata={}.
-    await backend.add_subtask('1', project_root=project_root, title='Fresh')
-    listing2 = await backend.get_tasks(project_root=project_root)
-    fresh_sub = next(s for s in listing2['tasks'][0]['subtasks'] if s['title'] == 'Fresh')
-    assert 'metadata' in fresh_sub
-    assert fresh_sub['metadata'] == {}
-
-
-@pytest.mark.asyncio
-async def test_update_task_memory_hints_union_on_subtask(backend, project_root):
-    """memory_hints union semantics (append=True) work end-to-end on subtasks.
-
-    Models the top-level test_update_task_memory_hints_union but for the
-    dotted-id subtask path. Locks the reconciliation behavior: stage2 attaches
-    hints across multiple cycles and the lists grow via union (no duplicates).
-    """
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='hinted')
-
-    # First cycle: write initial hints.
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
-        append=True,
-    )
-    # Second cycle: union new hints.
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': {'entities': ['B'], 'queries': ['q2']}}),
-        append=True,
-    )
-
-    sub = await backend.get_task('1.1', project_root=project_root)
-    hints = sub['metadata']['memory_hints']
-    assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
-
-
-@pytest.mark.asyncio
-async def test_update_task_legacy_hints_coerce_on_subtask_dotted_id(backend, project_root):
-    """Legacy list-shape memory_hints is coerced on the dotted-id subtask path.
-
-    Stage-2 attaches hints to subtasks via the dotted-id path; this locks parity
-    with the top-level test_update_task_legacy_list_hints_coerce_under_append_true.
-    Both the direct get_task('1.1') and the parent['subtasks'][0] paths must
-    return the unioned dict-shape after the migration write.
-    """
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='hinted')
-
-    # Seed the subtask with the legacy list-of-dicts shape.
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': [{'entity': 'E1', 'query': 'q1'}]}),
-        append=False,
-    )
-    # Stage-2 writes canonical dict shape with append=True.
-    await backend.update_task(
-        '1.1', project_root=project_root,
-        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
-        append=True,
-    )
-
-    expected = {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']}
-
-    # (a) Direct get_task on the subtask.
-    sub = await backend.get_task('1.1', project_root=project_root)
-    assert sub['metadata']['memory_hints'] == expected
-
-    # (b) Parent's subtasks[0] also reflects the migration.
-    parent = await backend.get_task('1', project_root=project_root)
-    assert parent['subtasks'][0]['metadata']['memory_hints'] == expected
 
 
 @pytest.mark.asyncio
 async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, project_root):
-    """_row_to_task coerces malformed metadata JSON to {} for both top-level and subtask rows.
+    """_row_to_task coerces malformed metadata JSON to {} for top-level rows.
 
     Regression guard: if a legacy row holds a non-JSON string in the metadata
     column, the except branch in _row_to_task must surface {} rather than the
     raw string, so downstream `(task.get('metadata') or {}).get(...)` callers
     never receive a str and raise AttributeError.
     """
-    # Set up a parent task and a subtask via the normal API.
+    # Set up a top-level task.
     await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='child')
 
-    # Directly corrupt both rows' metadata column with a non-JSON string.
+    # Directly corrupt the row's metadata column with a non-JSON string.
     conn = await backend._get_connection(project_root)
     await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON' WHERE parent_id = 0 AND id = 1"
-    )
-    await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON' WHERE parent_id = 1 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON' WHERE id = 1"
     )
     await conn.commit()
 
@@ -767,72 +610,45 @@ async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, pr
     parent = await backend.get_task('1', project_root=project_root)
     assert parent['metadata'] == {}
 
-    # Subtask (via direct get_task): same contract.
-    sub = await backend.get_task('1.1', project_root=project_root)
-    assert sub['metadata'] == {}
-
-    # Subtask (via parent['subtasks']): same contract.
-    assert parent['subtasks'][0]['metadata'] == {}
-
 
 @pytest.mark.asyncio
 async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, caplog):
     """_row_to_task emits a WARNING when it coerces malformed metadata JSON to {}.
 
-    The warning must include the row's tag, id, parent_id (raw DB int), and a
-    truncated preview of the bad metadata_raw value so an operator can locate
-    and repair the offending row.  The {}-coercion contract must also hold.
-
-    Both the top-level and subtask paths are exercised — _row_to_task is the
-    shared converter for both shapes, so the warning must fire regardless of
-    whether the corrupted row is a root task or a child.
+    The warning must include the row's tag, id, and a truncated preview of the
+    bad metadata_raw value so an operator can locate and repair the offending row.
+    The {}-coercion contract must also hold.
     """
-    # Create a top-level task and a subtask so both row shapes exist.
+    # Create a top-level task.
     await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='child')
 
-    # Directly corrupt both rows' metadata column with a non-JSON string.
+    # Directly corrupt the row's metadata column with a non-JSON string.
     conn = await backend._get_connection(project_root)
     await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE parent_id = 0 AND id = 1"
-    )
-    await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE parent_id = 1 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE id = 1"
     )
     await conn.commit()
 
-    # Capture WARNING-level records for both top-level and subtask reads.
+    # Capture WARNING-level records.
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
         task = await backend.get_task('1', project_root=project_root)
-        sub = await backend.get_task('1.1', project_root=project_root)
 
-    # The {}-coercion contract still holds for both shapes.
+    # The {}-coercion contract holds.
     assert task['metadata'] == {}
-    assert sub['metadata'] == {}
 
-    # At least one WARNING record must mention tag, id, parent_id, and the payload preview.
-    # Use labeled tokens (e.g. 'id=1') rather than bare digits to prevent false positives
-    # from incidental numeric matches elsewhere in the log text.
+    # At least one WARNING record must mention tag, id, and the payload preview.
+    # Use labeled tokens (e.g. 'id=1') rather than bare digits to prevent false positives.
     warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_msgs, 'Expected at least one WARNING log record; got none'
     combined = ' '.join(warning_msgs)
 
-    # Top-level row: tag=master, id=1, parent_id=0 (the top-level sentinel).
+    # Top-level row: tag=master, id=1.
     assert 'master' in combined, f'Expected tag "master" in warning; got: {combined!r}'
     assert re.search(r'\bid=1\b', combined), (
-        f'Expected word-bounded labeled token "id=1" in warning (not the substring '
-        f'inside "parent_id=1"); got: {combined!r}'
-    )
-    assert 'parent_id=0' in combined, (
-        f'Expected labeled token "parent_id=0" in warning; got: {combined!r}'
+        f'Expected word-bounded labeled token "id=1" in warning; got: {combined!r}'
     )
     assert 'NOT_JSON_GARBAGE' in combined, (
         f'Expected metadata_raw preview in warning; got: {combined!r}'
-    )
-
-    # Subtask row: parent_id=1 (the DB int of the parent, not the sentinel).
-    assert 'parent_id=1' in combined, (
-        f'Expected labeled token "parent_id=1" for subtask warning; got: {combined!r}'
     )
 
     # The warning must carry a labeled project_root= token so an operator can
@@ -886,24 +702,22 @@ async def test_row_to_task_warning_deduplicated_per_id_per_process(
 
 
 @pytest.mark.asyncio
-async def test_row_to_task_warning_dedup_key_includes_parent_id(
+async def test_row_to_task_warning_dedup_key_distinguishes_distinct_ids(
     backend, project_root, caplog,
 ):
-    """Top-level (parent_id=0, id=1) and subtask (parent_id=1, id=1) dedup independently.
+    """Two distinct top-level task ids (id=1 and id=2) dedup independently.
 
-    They share the short int id but represent different rows; the WARNING gate
-    must key on the full (tag, parent_id, id) triple so both surface once.
+    The WARNING gate must key on the full (project_root, tag, id) triple so
+    both rows surface their own WARNING once (not collapsed into one).
     """
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='child')
+    await backend.add_task(project_root=project_root, title='task_one')
+    await backend.add_task(project_root=project_root, title='task_two')
     conn = await backend._get_connection(project_root)
     await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' "
-        "WHERE parent_id = 0 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' WHERE id = 1"
     )
     await conn.execute(
-        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' "
-        "WHERE parent_id = 1 AND id = 1"
+        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' WHERE id = 2"
     )
     await conn.commit()
 
@@ -911,7 +725,7 @@ async def test_row_to_task_warning_dedup_key_includes_parent_id(
         logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
     ):
         await backend.get_task('1', project_root=project_root)
-        await backend.get_task('1.1', project_root=project_root)
+        await backend.get_task('2', project_root=project_root)
 
     malformed_msgs = [
         r.message for r in caplog.records
@@ -919,7 +733,7 @@ async def test_row_to_task_warning_dedup_key_includes_parent_id(
         and 'malformed metadata' in r.message
     ]
     assert len(malformed_msgs) == 2, (
-        f'Expected two distinct dedup keys (top-level vs subtask); got '
+        f'Expected two distinct dedup keys (id=1 vs id=2); got '
         f'{len(malformed_msgs)}: {malformed_msgs}'
     )
 
@@ -1001,22 +815,6 @@ async def test_row_to_task_warning_dedup_distinguishes_project_roots(
 
 
 @pytest.mark.asyncio
-async def test_remove_tasks_cascades_to_subtasks(backend, project_root):
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='A')
-    await backend.add_subtask('1', project_root=project_root, title='B')
-
-    dto = await backend.remove_tasks(['1'], project_root=project_root)
-
-    assert dto['successful'] == 3
-    assert dto['failed'] == 0
-    assert sorted(dto['removed_ids']) == ['1', '1.1', '1.2']
-
-    listing = await backend.get_tasks(project_root=project_root)
-    assert listing['tasks'] == []
-
-
-@pytest.mark.asyncio
 async def test_remove_tasks_unknown_id_returns_failure_dto(backend, project_root):
     dto = await backend.remove_tasks(['99'], project_root=project_root)
     assert dto['successful'] == 0
@@ -1042,25 +840,6 @@ async def test_remove_tasks_batch_mixed_existing_missing(backend, project_root):
 
     listing = await backend.get_tasks(project_root=project_root)
     assert listing['tasks'] == []
-
-
-@pytest.mark.asyncio
-async def test_remove_tasks_cascades_with_explicit_subtask(backend, project_root):
-    # Caller asks to remove parent 1 AND its subtask 1.1; cascade naturally
-    # pulls in 1.1 as well — must report once, not twice.
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='A')
-    await backend.add_subtask('1', project_root=project_root, title='B')
-
-    dto = await backend.remove_tasks(
-        ['1', '1.1'], project_root=project_root,
-    )
-
-    # 1, 1.1, 1.2 — three rows actually deleted; no double-count of 1.1.
-    assert dto['successful'] == 3
-    assert dto['failed'] == 0
-    assert sorted(dto['removed_ids']) == ['1', '1.1', '1.2']
-    assert dto['removed_ids'].count('1.1') == 1
 
 
 @pytest.mark.asyncio
@@ -1270,16 +1049,6 @@ async def test_qualified_dep_self_raises_mixed_case(backend, project_root):
     assert 'cannot depend on itself' in str(exc.value)
 
 
-@pytest.mark.asyncio
-async def test_qualified_add_dep_subtask_dependent_raises(backend, project_root):
-    """Qualified add_dependency with a dotted (subtask) task_id raises TaskmasterError."""
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='child')
-    with pytest.raises(TaskmasterError) as exc:
-        await backend.add_dependency('1.1', 'dark_factory:13', project_root=project_root)
-    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
-    assert 'subtask dependencies are not supported' in str(exc.value)
-
 
 # ── remove_dependency — qualified (cross-project) tests ────────────
 
@@ -1341,17 +1110,6 @@ async def test_qualified_remove_dep_integer_table_unaffected(backend, project_ro
     task = await backend.get_task('2', project_root)
     assert task['dependencies'] == [1]
     assert task['metadata'].get('external_deps', []) == []
-
-
-@pytest.mark.asyncio
-async def test_qualified_remove_dep_subtask_dependent_raises(backend, project_root):
-    """Qualified remove_dependency with a dotted (subtask) task_id raises TaskmasterError."""
-    await backend.add_task(project_root=project_root, title='parent')
-    await backend.add_subtask('1', project_root=project_root, title='child')
-    with pytest.raises(TaskmasterError) as exc:
-        await backend.remove_dependency('1.1', 'dark_factory:13', project_root=project_root)
-    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
-    assert 'subtask dependencies are not supported' in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -1464,11 +1222,10 @@ async def test_concurrent_add_task_yields_unique_ids(backend, project_root):
 
 # ── Monotonic id allocation (id-recycling regression) ───────────────
 #
-# Fix A: ``add_task`` / ``add_subtask`` allocate
-# ``max(MAX(tasks.id), id_counters.max_id) + 1`` so a deleted id is NEVER
-# reissued.  Without this, deleting the top task frees its id, the next
-# ``add_task`` re-mints it, and an orphaned worktree keyed on that numeric id
-# gets misadopted for unrelated work (reify task 3770).
+# ``add_task`` allocates ``max(MAX(tasks.id), id_counters.max_id) + 1`` so a
+# deleted id is NEVER reissued.  Without this, deleting the top task frees its
+# id, the next ``add_task`` re-mints it, and an orphaned worktree keyed on that
+# numeric id gets misadopted for unrelated work (reify task 3770).
 
 
 @pytest.mark.asyncio
@@ -1479,17 +1236,6 @@ async def test_top_level_id_not_reused_after_delete(backend, project_root):
     await backend.remove_tasks(['1'], project_root=project_root)
     two = await backend.add_task(project_root=project_root, title='second')
     assert two['id'] == '2'  # NOT '1'
-
-
-@pytest.mark.asyncio
-async def test_subtask_id_not_reused_after_delete(backend, project_root):
-    """A deleted subtask id is not reissued within the same parent."""
-    await backend.add_task(project_root=project_root, title='parent')
-    a = await backend.add_subtask('1', project_root=project_root, title='A')
-    assert a['id'] == '1.1'
-    await backend.remove_tasks(['1.1'], project_root=project_root)
-    b = await backend.add_subtask('1', project_root=project_root, title='B')
-    assert b['id'] == '1.2'  # NOT '1.1'
 
 
 @pytest.mark.asyncio

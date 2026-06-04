@@ -338,7 +338,6 @@ def _taskmaster_mock():
     tm.get_tasks = AsyncMock(return_value={'tasks': []})
     tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New'})
     tm.update_task = AsyncMock(return_value={'success': True})
-    tm.add_subtask = AsyncMock(return_value={'id': '1.1'})
     tm.remove_tasks = AsyncMock(return_value={'success': True})
     tm.add_dependency = AsyncMock(return_value={'success': True})
     tm.remove_dependency = AsyncMock(return_value={'success': True})

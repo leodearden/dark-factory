@@ -319,7 +319,7 @@ def test_task_tools_registered_without_interceptor():
     server = create_mcp_server(mock_service)  # No task_interceptor
     tool_names = [t.name for t in server._tool_manager.list_tools()]
     for name in ['get_tasks', 'get_task', 'set_task_status',
-                 'update_task', 'add_subtask', 'remove_task', 'add_dependency',
+                 'update_task', 'remove_task', 'add_dependency',
                  'remove_dependency']:
         assert name in tool_names, f'{name} should be registered'
     for name in ['expand_task', 'parse_prd']:
@@ -334,6 +334,48 @@ def test_add_task_mcp_tool_not_registered():
     server = create_mcp_server(mock_service)
     tool_names = [t.name for t in server._tool_manager.list_tools()]
     assert 'add_task' not in tool_names, 'add_task MCP tool must be removed'
+
+
+def test_add_subtask_mcp_tool_not_registered():
+    """add_subtask MCP tool must not be registered after DF-D (task 1543).
+
+    RED assertion: fails while add_subtask is still in server/tools.py,
+    passes once step-4 removes it.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
+
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
+    tool_names = [t.name for t in server._tool_manager.list_tools()]
+    assert 'add_subtask' not in tool_names, (
+        "'add_subtask' is still registered as an MCP tool; "
+        'DF-D (task 1543) step-4 must delete it from server/tools.py.'
+    )
+    assert not hasattr(SqliteTaskBackend, 'add_subtask'), (
+        'SqliteTaskBackend.add_subtask still exists; step-4 must delete it.'
+    )
+    assert not hasattr(TaskInterceptor, 'add_subtask'), (
+        'TaskInterceptor.add_subtask still exists; step-4 must delete it.'
+    )
+
+
+def test_add_subtask_result_not_importable():
+    """AddSubtaskResult must not be importable after DF-D (task 1543).
+
+    RED assertion: fails while AddSubtaskResult is still defined in
+    task_backend_types.py, passes once step-4 removes it.
+    """
+    import importlib
+    import sys
+
+    # If already in sys.modules (cached), reload to re-check the symbol.
+    module_name = 'fused_memory.backends.task_backend_types'
+    mod = importlib.import_module(module_name)
+    assert not hasattr(mod, 'AddSubtaskResult'), (
+        'AddSubtaskResult is still exported from fused_memory.backends.task_backend_types; '
+        'DF-D step-4 must delete it.'
+    )
 
 
 @pytest.mark.asyncio
@@ -557,7 +599,6 @@ async def test_set_task_status_mcp_tool_surfaces_pre_done_hook_error(
 @pytest.mark.parametrize('tool_name,extra_kwargs', [
     ('set_task_status', {'status': 'done'}),
     ('update_task', {'title': 'new title'}),
-    ('add_subtask', {'title': 'sub'}),
     ('remove_task', {}),
     ('add_dependency', {'depends_on': '5'}),
     ('remove_dependency', {'depends_on': '5'}),
@@ -568,7 +609,6 @@ async def test_id_accepting_tools_reject_ticket_shaped_ids(
     """Tools that accept an ``id`` arg must reject tkt_-prefixed ids with a ValidationError."""
     task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
     task_interceptor.update_task = AsyncMock(return_value={'success': True})
-    task_interceptor.add_subtask = AsyncMock(return_value={'success': True})
     task_interceptor.remove_tasks = AsyncMock(return_value={'success': True})
     task_interceptor.add_dependency = AsyncMock(return_value={'success': True})
     task_interceptor.remove_dependency = AsyncMock(return_value={'success': True})
