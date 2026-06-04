@@ -1024,3 +1024,77 @@ class TestMergeRequestFastPathFallThrough:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-7 RED: merge_request(wait_secs=0) free branch → 'queued' immediately
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestWaitSecsZeroFree:
+    """β1 step-7 RED: wait_secs=0 on a free branch returns 'queued' without blocking.
+
+    RED until step-8 impl: wait_secs param does not exist yet → TypeError,
+    and with no wait_secs the call blocks on `await future` with no worker
+    → asyncio.wait_for raises TimeoutError.
+    """
+
+    async def test_wait_secs_zero_dispatched_returns_queued(self, tmp_path: Path):
+        """wait_secs=0 on a free branch: immediate return, status='queued'.
+
+        Setup: server with merge_queue + orch_config + injected registry,
+        NO worker resolving the future.  Call merge_request(wait_secs=0)
+        under wait_for(timeout=2).  The call must return before the timeout.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='free-b',
+                branch='free-b',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+
+        # Status must be 'queued'
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued', got: {result}"
+        )
+        # request_id present and well-formed
+        assert 'request_id' in result, f'Missing request_id: {result}'
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+        # Required non-blocking shape keys
+        for key in ('snapshot_tip', 'generation', 'position', 'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+        # generation is always 0 in β1
+        assert result['generation'] == 0, f"Expected generation=0, got: {result['generation']}"
+        # position is an int
+        assert isinstance(result['position'], int), (
+            f"Expected position to be int, got: {type(result['position'])}"
+        )
+        # queue_depth >= 1 (the request was enqueued)
+        assert result['queue_depth'] >= 1, (
+            f"Expected queue_depth >= 1, got: {result['queue_depth']}"
+        )
+        # The request must actually be enqueued
+        assert mq.qsize() == 1, f'Expected mq.qsize()==1, got: {mq.qsize()}'
+
+        # Clean up enqueued future to avoid ResourceWarning
+        req = mq.get_nowait()
+        req.result.cancel()
