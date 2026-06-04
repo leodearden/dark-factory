@@ -106,11 +106,11 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
 1. **verify-fixed** — Check current state via `mcp__fused-memory__search`,
    `get_entity`, `get_task`. If the finding is already true-resolved (the edge
    exists, the task is in the expected state, the contamination is gone), close
-   it: `resolve_issue(..., terminate=false, resolution="Verified fixed: <what you checked>")`.
+   it: `resolve_issue(..., action='resume', resolution="Verified fixed: <what you checked>")`.
 
 2. **accept-as-known** — The finding is non-actionable or an accepted state (e.g.
    a deliberately-deferred task, a known intractable item, an auto-recovered
-   stale run). Dismiss it: `resolve_issue(..., terminate=true, resolution="Accepted as known: <why>")`.
+   stale run). Dismiss it: `resolve_issue(..., action='close_only', resolution="Accepted as known: <why>")`.
 
 3. **file-a-real-task** — The finding is genuinely actionable dev work. File it,
    then resolve the escalation. Two-phase pattern:
@@ -125,7 +125,7 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
                                            timeout_seconds=<see _shared/ticket-failure-handling.md>)
    # status created|combined -> task_id ; failed -> record reason, leave escalation pending
    ```
-   Then `resolve_issue(..., terminate=false, resolution="Filed task <id>: <title>")`.
+   Then `resolve_issue(..., action='resume', resolution="Filed task <id>: <title>")`.
 
 4. **fix-directly via fused-memory** — For memory-integrity findings you can
    safely repair yourself, use the fused-memory write tools, then resolve:
@@ -133,14 +133,14 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
    - `mcp__fused-memory__delete_memory` — remove a duplicate/incorrect memory
    - `mcp__fused-memory__merge_entities` — consolidate duplicate entity nodes
    - `mcp__fused-memory__refresh_entity_summary` — rebuild a stale summary
-   Then `resolve_issue(..., terminate=false, resolution="Fixed directly: <tool + what changed>")`.
+   Then `resolve_issue(..., action='resume', resolution="Fixed directly: <tool + what changed>")`.
 
    **Caution:** fixing directly mutates the knowledge graph. When the right
    repair is ambiguous or wide-reaching, prefer file-a-real-task or ask the
    human — quality over speed.
 
-**Resolution-text convention:** `terminate=false` → status `resolved` (you took
-action). `terminate=true` → status `dismissed` (accepted-as-known, no action).
+**Resolution-text convention:** `action='resume'` → status `resolved` (you took
+action). `action='close_only'` → status `dismissed` (accepted-as-known, no action).
 Both archive the record. Be specific in the note — it is the only audit trail.
 
 ## Per-Category Playbook
