@@ -2384,8 +2384,12 @@ async def verify_failure_is_preexisting_on_main(
         logger.debug('verify_failure_is_preexisting_on_main: unexpected error', exc_info=True)
         return False, ''
     finally:
-        # Scoped cleanup: remove only the specific probe worktree (not a broad prune
-        # that could deregister concurrently-active sibling probes).
+        # Scoped cleanup: remove only this specific probe worktree.
+        # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee): a broad prune
+        # would deregister ANY concurrently-active sibling probe (other tasks running
+        # verify_failure_is_preexisting_on_main in parallel), causing their git
+        # worktree add to succeed but probe path to vanish mid-verify.  Scoped
+        # 'git worktree remove --force <tmp_path>' deregisters ONLY this probe.
         if worktree_added and tmp_path is not None:
             try:
                 await _run(
