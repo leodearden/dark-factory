@@ -220,3 +220,59 @@ class TestRecordLaunch:
         # Now call again — should see the spent key
         result = record_launch('7', 'sha1', 'ts1', state_path=sp, now=self._NOW)
         assert result['already_attempted'] is True
+
+
+# ---------------------------------------------------------------------------
+# step-5: charge rolling-24h cap
+# ---------------------------------------------------------------------------
+
+class TestCharge:
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def test_two_charges_succeed_third_refused(self, tmp_path):
+        from orchestrator.b3_gate import _state_path, charge
+        sp = _state_path(tmp_path)
+        r1 = charge('42', state_path=sp, cap=2, now=self._NOW)
+        assert r1['charged'] is True
+        assert r1['remaining'] == 1
+        r2 = charge('42', state_path=sp, cap=2, now=self._NOW)
+        assert r2['charged'] is True
+        assert r2['remaining'] == 0
+        r3 = charge('42', state_path=sp, cap=2, now=self._NOW)
+        assert r3['charged'] is False
+        assert r3['remaining'] == 0
+
+    def test_old_charge_outside_window_not_counted(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _save_state, _state_path, charge
+        sp = _state_path(tmp_path)
+        # Seed an old charge older than 24h
+        old_ts = (self._NOW - timedelta(hours=25)).isoformat()
+        state = {'launches': [], 'charges': [{'task_id': '42', 'charged_at': old_ts}]}
+        _save_state(sp, state)
+        # With cap=1, the old charge must NOT count -> remaining=1 -> charge succeeds
+        r = charge('42', state_path=sp, cap=1, now=self._NOW)
+        assert r['charged'] is True
+        assert r['remaining'] == 0
+
+    def test_in_window_charge_counted(self, tmp_path):
+        from orchestrator.b3_gate import _load_state, _save_state, _state_path, charge
+        sp = _state_path(tmp_path)
+        # Seed an in-window charge (12h ago)
+        recent_ts = (self._NOW - timedelta(hours=12)).isoformat()
+        state = {'launches': [], 'charges': [{'task_id': '42', 'charged_at': recent_ts}]}
+        _save_state(sp, state)
+        # With cap=1, in-window charge exhausts cap
+        r = charge('42', state_path=sp, cap=1, now=self._NOW)
+        assert r['charged'] is False
+        assert r['remaining'] == 0
+
+    def test_durability_in_window_persists_across_reload(self, tmp_path):
+        """Charges survive disk reload — count resets only when window expires."""
+        from orchestrator.b3_gate import _cap_remaining, _load_state, _state_path, charge
+        sp = _state_path(tmp_path)
+        charge('42', state_path=sp, cap=3, now=self._NOW)
+        charge('42', state_path=sp, cap=3, now=self._NOW)
+        # Reload state from disk
+        state = _load_state(sp)
+        rem = _cap_remaining(state, 3, self._NOW)
+        assert rem == 1
