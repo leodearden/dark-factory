@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import aiosqlite
+import httpx
 import pytest
 from _dt_helpers import make_fixed_datetime_cls
 
@@ -2448,3 +2449,449 @@ class TestRecentWindow1440AcceptanceLock:
         assert 'task-old' not in recent_task_ids, (
             f'Expected task-old (25h old) absent from recent list at window=1440; got {recent_task_ids}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeLiveEntry (task-1606 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeLiveEntry:
+    """Tests for merge_queue._normalize_entry — snapshot entry → display shape."""
+
+    def test_full_entry_preserved(self):
+        """A fully-populated snapshot entry maps 1-to-1 onto the display shape."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {
+            'task_id': '3112',
+            'branch': 'task/3112',
+            'state': 'queued',
+            'age_secs': 14400.0,
+            'position': 1,
+            'waiter_alive': True,
+            'enqueued_at': '2026-06-04T08:00:00+00:00',
+            'worktree': '/tmp/wt',
+            'pre_rebased': False,
+        }
+        result = _normalize_entry(raw)
+        assert result['task_id'] == '3112'
+        assert result['branch'] == 'task/3112'
+        assert result['state'] == 'queued'
+        assert result['age_secs'] == 14400.0      # AC1: 4h entry must NOT be dropped
+        assert result['position'] == 1
+        assert result['waiter_alive'] is True
+
+    def test_ac1_long_queued_entry_preserved(self):
+        """AC1 lock: an entry queued 4h ago (age_secs=14400) survives normalization.
+
+        The event-derived fallback's 30-min TTL would drop this entry; the live
+        path must not apply any TTL, so a >30min entry must pass through intact.
+        """
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '3112', 'branch': 'task/3112', 'state': 'queued', 'age_secs': 14400.0,
+               'position': 1, 'waiter_alive': True}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] == 14400.0
+        assert result['state'] == 'queued'
+
+    def test_missing_optional_fields_get_safe_defaults(self):
+        """Missing waiter_alive and position get safe defaults (True and 0)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '42', 'branch': 'task/42', 'state': 'merging', 'age_secs': 5.0}
+        result = _normalize_entry(raw)
+        assert result['waiter_alive'] is True    # safe default: assume waiter alive
+        assert result['position'] == 0           # safe default: unknown position → 0
+        assert result['age_secs'] == 5.0
+
+    def test_none_optional_fields_get_safe_defaults(self):
+        """None waiter_alive and None position get the same safe defaults."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '7', 'branch': 'task/7', 'state': 'verifying',
+               'age_secs': 120.0, 'position': None, 'waiter_alive': None}
+        result = _normalize_entry(raw)
+        assert result['waiter_alive'] is True
+        assert result['position'] == 0
+
+    def test_only_display_keys_returned(self):
+        """Result contains exactly the six display keys (no internal snapshot fields)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '1', 'branch': 'b', 'state': 'queued', 'age_secs': 1.0,
+               'position': 0, 'waiter_alive': True,
+               'worktree': '/tmp/wt', 'pre_rebased': False, 'enqueued_at': 'ts'}
+        result = _normalize_entry(raw)
+        assert set(result.keys()) == {'task_id', 'branch', 'state', 'age_secs', 'position', 'waiter_alive'}
+
+    def test_missing_age_secs_defaults_zero(self):
+        """Missing age_secs defaults to 0.0 (defensive)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '5', 'branch': 'b', 'state': 'queued'}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestFetchLiveMergeQueues — success path (task-1606 step-3)
+# ---------------------------------------------------------------------------
+
+# Shared MCP mock helpers (mirrored from test_merge_halt.py)
+
+def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps(inner)}],
+            },
+        },
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+def _init_response(request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'protocolVersion': '2025-03-26',
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'test', 'version': '0.1'},
+            },
+        },
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+class _PerPortHandler:
+    """Mock httpx handler dispatching per-port behaviour for MCP calls.
+
+    ``snapshot_responses`` maps port → snapshot dict (the inner result of get_merge_queue).
+    ``fail_ports`` raise httpx.ConnectError.
+    ``slow_ports`` sleep before responding (drives the timeout path).
+    """
+
+    def __init__(
+        self,
+        snapshot_responses: dict[int, dict] | None = None,
+        *,
+        fail_ports: set[int] | None = None,
+        slow_ports: dict[int, float] | None = None,
+    ):
+        self.snapshot_responses = snapshot_responses or {}
+        self.fail_ports = fail_ports or set()
+        self.slow_ports = slow_ports or {}
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:  # type: ignore[name-defined]
+        port = request.url.port
+        assert port is not None
+        if port in self.fail_ports:
+            raise httpx.ConnectError('refused')
+        if port in self.slow_ports:
+            await asyncio.sleep(self.slow_ports[port])
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if method == 'initialize':
+            return _init_response(request_id)
+        if method.startswith('notifications/'):
+            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+        # tools/call → return snapshot
+        inner = self.snapshot_responses.get(port, {'entries': [], 'depth': 0})
+        return _mcp_response(inner, request_id)
+
+
+@pytest.fixture(autouse=False)
+def _clean_live_sessions():
+    """Reset mcp_tool_call session cache before/after live-queue tests."""
+    from dashboard.data.memory import reset_sessions
+    reset_sessions()
+    yield
+    reset_sessions()
+
+
+def _live_urls(*ports: int) -> dict[str, str]:
+    return {f'proj{p}': f'http://127.0.0.1:{p}/mcp' for p in ports}
+
+
+def _snapshot(entries: list) -> dict:
+    """Build a minimal get_merge_queue snapshot dict."""
+    return {
+        'entries': entries,
+        'depth': len(entries),
+        'head_of_line': entries[0]['task_id'] if entries else None,
+        'verify_in_progress': False,
+        'is_wip_halted': False,
+        'halt_owner_esc_id': None,
+    }
+
+
+class TestFetchLiveMergeQueues:
+    """Tests for fetch_live_merge_queues — success paths."""
+
+    @pytest.mark.asyncio
+    async def test_empty_urls_returns_empty(self, _clean_live_sessions):
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+        async with httpx.AsyncClient() as client:
+            result = await fetch_live_merge_queues(client, {})
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_single_project_reachable(self, _clean_live_sessions):
+        """One project reachable → {label: {reachable: True, entries: [...]}}."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        entries = [
+            {'task_id': '99', 'branch': 'task/99', 'state': 'queued', 'age_secs': 30.0,
+             'position': 1, 'waiter_alive': True},
+        ]
+        handler = _PerPortHandler({8200: _snapshot(entries)})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8200))
+
+        assert 'proj8200' in result
+        proj = result['proj8200']
+        assert proj['reachable'] is True
+        assert len(proj['entries']) == 1
+        assert proj['entries'][0]['task_id'] == '99'
+        assert 'error' not in proj
+
+    @pytest.mark.asyncio
+    async def test_ac2_two_same_task_entries_both_preserved(self, _clean_live_sessions):
+        """AC2 lock: two entries with the same task_id must both appear in the result.
+
+        The event-derived fallback's ROW_NUMBER PARTITION BY task_id keeps only
+        one event per task; the live path must return ALL queue entries as-is.
+        """
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        # Two queue entries for the same task_id (e.g. a task queued twice)
+        entries = [
+            {'task_id': '3112', 'branch': 'task/3112', 'state': 'queued',
+             'age_secs': 14400.0, 'position': 1, 'waiter_alive': True},
+            {'task_id': '3112', 'branch': 'task/3112-retry', 'state': 'queued',
+             'age_secs': 300.0, 'position': 2, 'waiter_alive': True},
+        ]
+        handler = _PerPortHandler({8201: _snapshot(entries)})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8201))
+
+        proj = result['proj8201']
+        assert proj['reachable'] is True
+        assert len(proj['entries']) == 2, (
+            'AC2: both entries for task_id=3112 must be present; '
+            f"got {len(proj['entries'])}"
+        )
+        assert proj['entries'][0]['age_secs'] == 14400.0
+        assert proj['entries'][1]['age_secs'] == 300.0
+
+    @pytest.mark.asyncio
+    async def test_authoritative_empty_queue_reachable_true(self, _clean_live_sessions):
+        """An authoritative empty queue (entries=[], no error) → reachable=True, entries=[].
+
+        Hard no-synthetic-data rule: if the orchestrator says 'nothing queued'
+        we must show empty, not fall back to the event-derived approximation.
+        """
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        handler = _PerPortHandler({8202: _snapshot([])})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8202))
+
+        proj = result['proj8202']
+        assert proj['reachable'] is True
+        assert proj['entries'] == []
+
+    @pytest.mark.asyncio
+    async def test_multi_project_all_keys_present(self, _clean_live_sessions):
+        """All configured project labels appear in the result even with diverse data."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        entries_8210 = [
+            {'task_id': '10', 'branch': 'task/10', 'state': 'merging',
+             'age_secs': 5.0, 'position': 0, 'waiter_alive': True},
+        ]
+        entries_8211 = []  # authoritative empty
+        handler = _PerPortHandler({8210: _snapshot(entries_8210), 8211: _snapshot(entries_8211)})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8210, 8211))
+
+        assert set(result) == {'proj8210', 'proj8211'}
+        assert result['proj8210']['reachable'] is True
+        assert len(result['proj8210']['entries']) == 1
+        assert result['proj8211']['reachable'] is True
+        assert result['proj8211']['entries'] == []
+
+
+# ---------------------------------------------------------------------------
+# TestFetchLiveMergeQueuesFailure — degraded paths (task-1606 step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchLiveMergeQueuesFailure:
+    """Failure / degraded-path tests for fetch_live_merge_queues."""
+
+    @pytest.mark.asyncio
+    async def test_connect_error_yields_unreachable(self, _clean_live_sessions):
+        """(a) Connect error → {reachable: False, entries: [], error present}."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        handler = _PerPortHandler(
+            {8300: _snapshot([])},
+            fail_ports={8301},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8300, 8301))
+
+        assert result['proj8300']['reachable'] is True   # control: this one is up
+        assert result['proj8301']['reachable'] is False
+        assert result['proj8301']['entries'] == []
+        assert 'error' in result['proj8301']
+
+    @pytest.mark.asyncio
+    async def test_timeout_yields_unreachable(self, _clean_live_sessions):
+        """(b) Slow port with small per_call_timeout → {reachable: False}."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        handler = _PerPortHandler(
+            {8300: _snapshot([])},
+            slow_ports={8302: 0.5},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(
+                client, _live_urls(8300, 8302), per_call_timeout=0.05,
+            )
+
+        assert result['proj8300']['reachable'] is True
+        assert result['proj8302']['reachable'] is False
+        assert 'error' in result['proj8302']
+
+    @pytest.mark.asyncio
+    async def test_error_result_yields_unreachable(self, _clean_live_sessions):
+        """(c) get_merge_queue {'error': ...} result → {reachable: False, entries: []}."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        error_result = {'error': 'Merge queue not available — orchestrator not running'}
+        handler = _PerPortHandler({8303: error_result})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8303))
+
+        proj = result['proj8303']
+        assert proj['reachable'] is False
+        assert proj['entries'] == []    # AC3: no fabricated rows
+        assert 'error' in proj
+
+    @pytest.mark.asyncio
+    async def test_all_known_labels_present_on_mixed_failures(self, _clean_live_sessions):
+        """All project labels appear in the result regardless of per-call failure."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        handler = _PerPortHandler(
+            {8310: _snapshot([])},
+            fail_ports={8311, 8312},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8310, 8311, 8312))
+
+        assert set(result) == {'proj8310', 'proj8311', 'proj8312'}
+
+    @pytest.mark.asyncio
+    async def test_no_fabricated_rows_on_unreachable(self, _clean_live_sessions):
+        """AC3: unreachable orchestrator → entries=[], NOT the fallback approximation rows."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        handler = _PerPortHandler({}, fail_ports={8313})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8313))
+
+        assert result['proj8313']['entries'] == []
+        assert result['proj8313']['reachable'] is False
+
+
+# ---------------------------------------------------------------------------
+# TestResolveActive (task-1606 step-7)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveActive:
+    """Tests for resolve_active(label, live_map, fallback_active) -> dict."""
+
+    def test_live_reachable_non_empty_uses_live_approximate_false(self):
+        """(a) live_map[label].reachable=True with entries → {entries: live, approximate: False}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        live_entries = [
+            {'task_id': '99', 'branch': 'task/99', 'state': 'queued',
+             'age_secs': 120.0, 'position': 1, 'waiter_alive': True},
+        ]
+        live_map = {'myproj': {'reachable': True, 'entries': live_entries}}
+        fallback = [{'task_id': 'fallback', 'state': 'queued'}]
+
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is False
+        assert result['entries'] == live_entries
+
+    def test_live_reachable_empty_uses_empty_not_fallback(self):
+        """(b) Authoritative empty queue → {entries: [], approximate: False} — no fallback.
+
+        AC3 (no-fabrication): if the live orchestrator says nothing is queued,
+        we must show empty, not fall back to the event-derived approximation.
+        """
+        from dashboard.data.merge_queue import resolve_active
+
+        live_map = {'myproj': {'reachable': True, 'entries': []}}
+        fallback = [{'task_id': 'should-not-appear', 'state': 'queued'}]
+
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is False
+        assert result['entries'] == []   # authoritative empty — not the fallback
+
+    def test_label_missing_from_live_map_uses_fallback_approximate_true(self):
+        """(c) label not in live_map → {entries: fallback, approximate: True}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        fallback = [{'task_id': 'fb1', 'state': 'in_flight'}]
+        result = resolve_active('unknown-proj', {}, fallback)
+
+        assert result['approximate'] is True
+        assert result['entries'] == fallback
+
+    def test_label_unreachable_uses_fallback_approximate_true(self):
+        """reachable=False → fallback with approximate=True."""
+        from dashboard.data.merge_queue import resolve_active
+
+        fallback = [{'task_id': 'fb2', 'state': 'queued'}]
+        live_map = {'myproj': {'reachable': False, 'entries': [], 'error': 'timeout'}}
+        result = resolve_active('myproj', live_map, fallback)
+
+        assert result['approximate'] is True
+        assert result['entries'] == fallback
+
+    def test_empty_fallback_when_unreachable_stays_empty(self):
+        """Unreachable with empty fallback → {entries: [], approximate: True}."""
+        from dashboard.data.merge_queue import resolve_active
+
+        live_map = {'myproj': {'reachable': False, 'entries': []}}
+        result = resolve_active('myproj', live_map, [])
+
+        assert result['approximate'] is True
+        assert result['entries'] == []

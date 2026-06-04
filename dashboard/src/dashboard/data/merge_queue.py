@@ -28,6 +28,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import parse_utc, safe_gather_result
@@ -840,4 +841,119 @@ async def build_per_project_merge_queue(
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
     return dict(results)
+
+
+# ---------------------------------------------------------------------------
+# 9. Live merge-queue fan-out (task-1606)
+# ---------------------------------------------------------------------------
+
+_LIVE_DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+
+async def _probe_live_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    timeout: float,
+) -> dict:
+    """Probe one orchestrator's get_merge_queue tool; return a result dict.
+
+    On transport/timeout failure (or when the tool result itself contains an
+    'error' key, meaning the orchestrator/worker is not running), returns
+    {entries: [], reachable: False, error: <message>}.  An authoritative empty
+    queue (entries=[], no error) returns {entries: [], reachable: True}.
+    """
+    try:
+        result = await asyncio.wait_for(
+            mcp_tool_call(client, base_url, 'get_merge_queue', {}),
+            timeout=timeout,
+        )
+    except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
+        logger.debug('get_merge_queue failed for %s: %s', base_url, exc)
+        return {'entries': [], 'reachable': False, 'error': str(exc)}
+    # Guard against unexpected non-dict results (e.g. a list)
+    if not isinstance(result, dict):
+        return {'entries': [], 'reachable': False, 'error': 'unexpected result type'}
+    # Orchestrator/worker not running → result dict has an 'error' key
+    if 'error' in result:
+        return {'entries': [], 'reachable': False, 'error': result['error']}
+    raw_entries = result.get('entries') or []
+    return {
+        'entries': [_normalize_entry(e) for e in raw_entries],
+        'reachable': True,
+    }
+
+
+async def fetch_live_merge_queues(
+    client: httpx.AsyncClient,
+    escalation_urls: dict[str, str],
+    *,
+    per_call_timeout: float = _LIVE_DEFAULT_PER_CALL_TIMEOUT,
+) -> dict[str, dict]:
+    """Fan out get_merge_queue to every escalation URL concurrently.
+
+    Returns ``{project_label: {entries, reachable, [error]}}``.  Keys match
+    the labels from ``config.escalation_urls`` (project basenames).  Failures
+    (transport errors, timeouts, or orchestrator/worker down) produce
+    ``{entries: [], reachable: False, error: ...}`` — an authoritative empty
+    queue produces ``{entries: [], reachable: True}``.
+    """
+    if not escalation_urls:
+        return {}
+    labels = list(escalation_urls.keys())
+    urls = [escalation_urls[lbl] for lbl in labels]
+    base_urls = [u.removesuffix('/mcp').rstrip('/') for u in urls]
+    results = await asyncio.gather(
+        *(_probe_live_one(client, base, per_call_timeout) for base in base_urls),
+        return_exceptions=False,
+    )
+    return dict(zip(labels, results, strict=True))
+
+
+def resolve_active(
+    label: str,
+    live_map: dict[str, dict],
+    fallback_active: list[dict],
+) -> dict:
+    """Choose between the live queue snapshot and the event-derived fallback.
+
+    Returns ``{entries, approximate}`` where:
+      - ``entries``     is the chosen list of active-queue entries.
+      - ``approximate`` is True when the entries come from the event-derived
+                        fallback (orchestrator unreachable / not running).
+
+    Selection logic:
+      - If ``live_map[label]`` exists and ``reachable`` is True → use live
+        entries (may be empty) with ``approximate=False``.
+      - Otherwise (label absent or reachable=False) → use ``fallback_active``
+        with ``approximate=True``.
+    """
+    live = live_map.get(label)
+    if live is not None and live.get('reachable'):
+        return {'entries': live['entries'], 'approximate': False}
+    return {'entries': fallback_active, 'approximate': True}
+
+
+def _normalize_entry(raw: dict) -> dict:
+    """Project a raw get_merge_queue snapshot entry to the display shape.
+
+    Returns a dict with exactly six keys:
+      task_id, branch, state, age_secs, position, waiter_alive.
+
+    All fields are mandatory in the display contract; optional snapshot fields
+    (worktree, pre_rebased, enqueued_at) are dropped.  Safe defaults prevent
+    KeyError on partially-populated entries:
+      - position  defaults to 0   (unknown position)
+      - waiter_alive defaults to True  (assume waiter alive when unknown)
+      - age_secs  defaults to 0.0
+    """
+    waiter_alive = raw.get('waiter_alive')
+    position = raw.get('position')
+    return {
+        'task_id': raw.get('task_id'),
+        'branch': raw.get('branch'),
+        'state': raw.get('state'),
+        'age_secs': float(raw.get('age_secs') or 0.0),
+        'position': int(position) if position is not None else 0,
+        'waiter_alive': bool(waiter_alive) if waiter_alive is not None else True,
+    }
 

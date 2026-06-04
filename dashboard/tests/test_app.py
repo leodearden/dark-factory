@@ -587,3 +587,121 @@ def test_load_endpoint_returns_known_metric_shape(client) -> None:
     assert oq['sparkline'] == []
     assert oq['window_mean'] is None
     assert oq['window_max'] is None
+
+
+# ---------------------------------------------------------------------------
+# api_merge_queue — live fetch integration (task-1606 step-11)
+# ---------------------------------------------------------------------------
+
+# Fake project root; label = basename('proj-a') = 'proj-a'
+_PROJ_ROOT = '/home/test/proj-a'
+_PROJ_LABEL = 'proj-a'
+
+# A live entry that would be TTL-dropped by the event-derived fallback (4h old)
+_LIVE_ENTRY_4H = {
+    'task_id': '3112', 'branch': 'task/3112', 'state': 'queued',
+    'age_secs': 14400.0, 'position': 1, 'waiter_alive': True,
+}
+# A second entry for the same task_id (AC2: two rows same task)
+_LIVE_ENTRY_RETRY = {
+    'task_id': '3112', 'branch': 'task/3112-retry', 'state': 'queued',
+    'age_secs': 300.0, 'position': 2, 'waiter_alive': True,
+}
+# Event-derived fallback entry
+_EVENT_ENTRY = {
+    'task_id': '7', 'branch': 'task/7', 'state': 'queued',
+    'timestamp': '2026-06-04T10:00:00+00:00',
+}
+
+
+def _proj_raw(active: list, *, active_approximate: bool = False) -> dict:
+    """Build a minimal build_per_project_merge_queue output for one project."""
+    return {
+        _PROJ_ROOT: {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {},
+            'active': active,
+            'active_approximate': active_approximate,
+            'train_events': [],
+        },
+    }
+
+
+def test_merge_queue_live_path_uses_live_entries(client):
+    """Case A: fetch_live_merge_queues reachable → active reflects LIVE entries.
+
+    AC1: 4h-old entry visible (not TTL-dropped).
+    AC2: two same-task entries both appear.
+    active_approximate is False (live data).
+    """
+    live_map = {
+        _PROJ_LABEL: {
+            'reachable': True,
+            'entries': [_LIVE_ENTRY_4H, _LIVE_ENTRY_RETRY],
+        },
+    }
+    with (
+        patch('dashboard.app.build_per_project_merge_queue',
+              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
+        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+
+    assert resp.status_code == 200
+    mq = resp.json()['MERGE_QUEUE']
+    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing from MERGE_QUEUE; got {list(mq)}'
+    proj = mq[_PROJ_LABEL]
+
+    active = proj['active']
+    task_ids = [e['task_id'] for e in active]
+    # AC1: long-queued entry is visible
+    assert '3112' in task_ids, (
+        f'AC1: expected task 3112 (4h old) in active; got {task_ids}'
+    )
+    # AC2: two entries for the same task_id
+    assert task_ids.count('3112') == 2, (
+        f'AC2: expected 2 entries for task_id=3112; got {task_ids}'
+    )
+    # Event-derived fallback entry must NOT appear (live path supersedes it)
+    assert '7' not in task_ids, (
+        f'Expected event-derived task 7 absent when live path is active; got {task_ids}'
+    )
+    assert proj['active_approximate'] is False
+
+
+def test_merge_queue_fallback_path_when_unreachable(client):
+    """Case B: fetch_live_merge_queues unreachable → fallback with active_approximate=True.
+
+    AC3: no fabricated rows; the event-derived list is used and labelled approximate.
+    """
+    # fetch_live_merge_queues returns {} (no live data) → resolve_active falls back
+    with (
+        patch('dashboard.app.build_per_project_merge_queue',
+              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
+        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+
+    assert resp.status_code == 200
+    mq = resp.json()['MERGE_QUEUE']
+    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing; got {list(mq)}'
+    proj = mq[_PROJ_LABEL]
+
+    active = proj['active']
+    task_ids = [e['task_id'] for e in active]
+    # Event-derived entry appears
+    assert '7' in task_ids, (
+        f'Expected event-derived task 7 in fallback active; got {task_ids}'
+    )
+    # AC3: no fabricated live entries
+    assert '3112' not in task_ids, (
+        f'AC3: live entry 3112 must not appear in fallback path; got {task_ids}'
+    )
+    assert proj['active_approximate'] is True

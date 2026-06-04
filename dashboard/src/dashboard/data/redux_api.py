@@ -425,6 +425,7 @@ def shape_merge_queue(
             'recent': [dict(r) for r in (data.get('recent') or [])],
             'speculative': dict(data.get('speculative') or {}),
             'active': [dict(a) for a in (data.get('active') or [])],
+            'active_approximate': bool(data.get('active_approximate', False)),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),

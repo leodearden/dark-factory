@@ -65,7 +65,9 @@ from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
     enrich_merges_with_titles,
+    fetch_live_merge_queues,
     load_task_titles,
+    resolve_active,
 )
 from dashboard.data.metrics import (
     METRICS_SCHEMA,
@@ -96,6 +98,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
+from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
@@ -659,7 +662,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
         Path('data/orchestrator/runs.db'),
     )
     http_client: httpx.AsyncClient = request.app.state.http_client
-    projects_raw, halt_status = await asyncio.gather(
+    projects_raw, halt_status, live_map = await asyncio.gather(
         build_per_project_merge_queue(
             project_dbs,
             hours=hours,
@@ -667,18 +670,22 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             recent_window_minutes=1440,
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
+        fetch_live_merge_queues(http_client, config.escalation_urls),
     )
     pids = list(projects_raw.keys())
     title_maps = await asyncio.gather(*(load_task_titles(http_client, config, pid) for pid in pids))
     enriched: dict[str, dict] = {}
     for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
+        label = _project_label(pid)
+        resolved = resolve_active(label, live_map, data.get('active', []))
         enriched[pid] = {
             **data,
             'depth_timeseries': trim_leading_zero_buckets(
                 cast(ChartData, data['depth_timeseries'])
             ),
             'recent': enrich_merges_with_titles(data['recent'], titles),
-            'active': enrich_merges_with_titles(data.get('active', []), titles),
+            'active': enrich_merges_with_titles(resolved['entries'], titles),
+            'active_approximate': resolved['approximate'],
         }
     metrics_db = await pool.get(config.metrics_db)
     active_sparks: dict[str, dict] = {}
