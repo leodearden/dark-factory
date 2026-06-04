@@ -66,6 +66,12 @@ class EventType(StrEnum):
     merge_queued = 'merge_queued'
     merge_dequeued = 'merge_dequeued'
     merge_coalesced = 'merge_coalesced'
+    # Emitted from enqueue_merge_request's terminal done-callback when a
+    # MergeRequest future reaches its final state (resolved, cancelled, or
+    # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
+    # merge_sha}.  state is one of MergeOutcome.status values, 'abandoned'
+    # (cancelled future), or 'error' (unexpected exception).
+    merge_finalized = 'merge_finalized'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
 

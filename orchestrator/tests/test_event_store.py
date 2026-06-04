@@ -166,6 +166,48 @@ class TestEventStore:
         assert rows[0][1] == 0.50
 
 
+class TestMergeFinalizedEventType:
+    """EventType.merge_finalized must exist and round-trip through the event store."""
+
+    def test_merge_finalized_member_exists_and_name_equals_value(self) -> None:
+        """merge_finalized must exist with value == name (project convention)."""
+        assert EventType.merge_finalized == 'merge_finalized'
+        assert EventType.merge_finalized.value == EventType.merge_finalized.name
+
+    def test_merge_finalized_round_trip(self, tmp_path: Path) -> None:
+        """Emitting merge_finalized writes a row whose data round-trips key fields."""
+        db_path = tmp_path / 'mf_test.db'
+        store = EventStore(db_path, 'run-mf')
+        store.emit(
+            EventType.merge_finalized,
+            task_id='42',
+            phase='merge',
+            data={
+                'request_id': 'mr-abcd1234',
+                'branch': 'task/42',
+                'state': 'done',
+                'merge_sha': 'deadbeef',
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.branch') AS branch, "
+            "json_extract(data, '$.state') AS state "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'mr-abcd1234'
+        assert rows[0][3] == 'task/42'
+        assert rows[0][4] == 'done'
+
+
 class TestSchedulerOverrideEventTypes:
     """Assert the five priority-override event types exist on EventType.
 
