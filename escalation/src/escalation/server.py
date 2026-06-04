@@ -858,35 +858,10 @@ def create_server(
             }
 
         if dispatch.in_flight:
-            # Branch already being merged.
-            if wait_secs is None:
-                # Legacy (compat default): return in_flight immediately so the
-                # caller can poll rather than block.  ETA is a best-effort heuristic
-                # (None once the estimate window is exceeded).
-                # conflict_details / push_status are included with None for shape
-                # stability: callers that access result['conflict_details'] or
-                # result['push_status'] must not KeyError on a coalesced response.
-                # request_id is the submitting request's own id (legacy D8 shape).
-                # The opt-in path (wait_secs not None, above) re-sources to the
-                # existing entry's id and renames status to 'attached'.
-                # inflight_task_id remains the authoritative poll handle (merge_status
-                # accepts task_id per D10) on both paths.
-                return {
-                    'status': 'in_flight',
-                    'request_id': merge_req.request_id,
-                    'branch': branch,
-                    'inflight_task_id': dispatch.inflight_task_id,
-                    'eta_seconds': dispatch.eta_seconds,
-                    'reason': (
-                        f'A merge for branch {branch!r} is already in flight '
-                        f'(source={dispatch.source!r}). Poll for completion.'
-                    ),
-                    'conflict_details': None,
-                    'push_status': None,
-                }
-            # wait_secs not None → opt-in path: 'attached' with existing entry's id
-            # Re-source request_id from the in-flight entry (D8) so the caller
-            # can correlate with the existing entry, not the coalesced submission.
+            # Branch already being merged — return 'attached' with the existing
+            # entry's request_id (D8) so the caller can correlate with the entry,
+            # not the coalesced submission.  The 'in_flight' response is retired
+            # (β8 Open Q5): no skill or surviving test reads status=='in_flight'.
             base = _nonblocking_state_response(
                 'attached', merge_req,
                 req_id_override=dispatch.inflight_request_id,
