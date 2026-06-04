@@ -21,8 +21,17 @@ dev = [
     "pyright>=1.1.404",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
-    "ruff>=0.4",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.4.0",
 ]
+
+[tool.pytest.ini_options]
+# Default per-test timeout. Catches deadlocked lock implementations and
+# accidental hangs. signal method is load-bearing: thread method can't
+# interrupt a blocking syscall in the main thread. escalation runs no
+# pytest-xdist so signal is always safe here.
+timeout = 60
+timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2216,3 +2221,382 @@ class TestResolveCascade:
         assert result.status == 'resolved'
         assert result.resolution == 'Fixed; no members'
 
+
+# ---------------------------------------------------------------------------
+# Step-1: Unit tests for the escalation_id_lock exported helper
+# ---------------------------------------------------------------------------
+
+class TestEscalationIdLock:
+    """Unit tests for the escalation_id_lock(queue_dir, escalation_id) context manager."""
+
+    def test_importable_from_escalation_queue(self):
+        """(a) escalation_id_lock is importable from escalation.queue at module level."""
+        from escalation.queue import escalation_id_lock  # noqa: F401
+
+    def test_entering_context_creates_sidecar_file(self, tmp_path: Path):
+        """(b) Entering the context creates the sidecar .lock file at the expected path."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+
+        assert not lock_path.exists(), 'Sidecar must not exist before context entry'
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            assert lock_path.exists(), 'Sidecar must exist while context is held'
+        # File persists after release (stable inode — never deleted)
+        assert lock_path.exists(), 'Sidecar must persist after context exit (stable inode)'
+
+    def test_held_lock_blocks_second_acquire_nonblocking(self, tmp_path: Path):
+        """(c) While the context is held, a non-blocking flock on the same path raises BlockingIOError."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            # Open a second fd on the same sidecar file
+            fd2 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd2)
+
+        # After context exits the lock is released — non-blocking acquire succeeds
+        fd3 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            # Must NOT raise — lock has been released
+            fcntl.flock(fd3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd3, fcntl.LOCK_UN)
+        finally:
+            os.close(fd3)
+
+    def test_lock_file_invisible_to_esc_json_glob(self, tmp_path: Path):
+        """(d) The .lock sidecar does NOT appear in Path.glob('esc-*.json')."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            pass
+
+        matched = list(queue_dir.glob('esc-*.json'))
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+        assert lock_path not in matched, (
+            f'Lock sidecar must not match esc-*.json glob; matched={matched}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-3: Two-OS-process data-loss test for add_members_to_l2 (RED)
+# ---------------------------------------------------------------------------
+
+_CHILD_SCRIPT = Path(__file__).parent / '_concurrent_queue_child.py'
+
+
+class TestAddMembersToL2Concurrency:
+    """Two-OS-process test: concurrent add_members_to_l2 must not lose any members."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_appends_preserve_all_members(self, tmp_path: Path):
+        """N=50 appends from two concurrent processes must produce exactly 100 distinct members.
+
+        Without the sidecar lock, each process reads the same pre-mutation snapshot,
+        appends one element, and rewrites — the second write clobbers the first's addition.
+        With the lock, appends serialize per-id and the union is complete.
+        """
+        # Set up the queue and seed the L2 escalation
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        l2 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent member test',
+            level=2,
+            root_cause='Test root cause',
+            members=[],
+        )
+        queue.submit(l2)
+        l2_id = l2.id
+
+        # Build env with worktree src on PYTHONPATH so child imports in-tree escalation
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently
+        proc_a = subprocess.Popen(
+            child_args + ['add_members', l2_id, 'a', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['add_members', l2_id, 'b', str(count)],
+            env=env,
+        )
+
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert all 100 members are present
+        result = queue.get(l2_id)
+        assert result is not None, 'L2 escalation disappeared after concurrent appends'
+        members_set = set(result.members)
+        expected = {f'a-{i}' for i in range(count)} | {f'b-{i}' for i in range(count)}
+        missing = expected - members_set
+        assert not missing, (
+            f'Lost {len(missing)} member(s) to concurrent RMW clobber: '
+            f'{sorted(missing)[:10]}...'
+        )
+        assert len(result.members) == count * 2, (
+            f'Expected {count * 2} total members, got {len(result.members)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: Two-OS-process data-loss test for attach_dedupe_child (RED)
+# ---------------------------------------------------------------------------
+
+class TestAttachDedupeChildConcurrency:
+    """Two-OS-process test: concurrent attach_dedupe_child must not lose any children."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_attaches_preserve_all_children(self, tmp_path: Path):
+        """N=50 attaches from two concurrent processes must produce exactly 100 children and dedupe_count==100.
+
+        Without the sidecar lock, each process reads the same pre-mutation snapshot,
+        appends one child and increments count by 1, then rewrites — the second write
+        clobbers the first, losing children and reverting the count.
+        """
+        # Seed a pending parent escalation
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        parent = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='orchestrator',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent dedupe test',
+            level=0,
+        )
+        queue.submit(parent)
+        parent_id = parent.id
+
+        # Build env with worktree src on PYTHONPATH
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently
+        proc_a = subprocess.Popen(
+            child_args + ['attach', parent_id, 'a', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['attach', parent_id, 'b', str(count)],
+            env=env,
+        )
+
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert all 100 children are present
+        result = queue.get(parent_id)
+        assert result is not None, 'Parent escalation disappeared after concurrent attaches'
+        children_set = set(result.dedupe_children)
+        expected = {f'a-{i}' for i in range(count)} | {f'b-{i}' for i in range(count)}
+        missing = expected - children_set
+        assert not missing, (
+            f'Lost {len(missing)} child(ren) to concurrent RMW clobber: '
+            f'{sorted(missing)[:10]}...'
+        )
+        assert result.dedupe_count == count * 2, (
+            f'Expected dedupe_count={count * 2}, got {result.dedupe_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Concurrent resolve: exactly-one-archive-copy invariant
+# ---------------------------------------------------------------------------
+
+class TestConcurrentResolveExactlyOneArchive:
+    """Two-OS-process test: two concurrent resolve() calls for the same id produce exactly one archive copy."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_resolves_produce_exactly_one_archive(self, tmp_path: Path):
+        """Two concurrent resolve() calls for the same pending escalation must leave exactly one archive file.
+
+        Without the sidecar lock the idempotency check (status != 'pending') can race:
+        both processes read 'pending', mutate, write, and archive — producing two archive
+        copies.  With the lock the second resolve() serializes after the first, sees
+        status != 'pending', and returns early without archiving again.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        esc = Escalation(
+            id=queue.make_id('task-5'),
+            task_id='task-5',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='Concurrent resolve test',
+            level=0,
+        )
+        queue.submit(esc)
+        esc_id = esc.id
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        proc_a = subprocess.Popen(child_args + ['resolve', esc_id, 'a', '1'], env=env)
+        proc_b = subprocess.Popen(child_args + ['resolve', esc_id, 'b', '1'], env=env)
+
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Queue root file must be absent — archived by the winning resolve()
+        assert not (queue_dir / f'{esc_id}.json').exists(), (
+            f'Queue root file {esc_id}.json was not archived after concurrent resolves'
+        )
+
+        # Exactly one archive copy must exist — the losing resolve() is a no-op
+        archive_files = list((queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        assert len(archive_files) == 1, (
+            f'Expected exactly 1 archive copy, found {len(archive_files)}: {archive_files}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
+# ---------------------------------------------------------------------------
+
+class TestSubmitResolveAdoptLock:
+    """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
+
+    def _make_pending_escalation(self, esc_id: str, task_id: str = '1') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='Lock adoption test',
+            level=0,
+        )
+
+    def test_submit_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) queue.submit(esc) records a lock acquisition for esc.id."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-1-1')
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.submit(esc)
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    def test_submit_resolved_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(b) queue.submit_resolved(esc, ...) records a lock acquisition for esc.id."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-2-1', task_id='2')
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.submit_resolved(esc, resolution='Auto-resolved at submit')
+
+        assert any(eid == 'esc-2-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-2-1; got {acquired}'
+        )
+
+    def test_resolve_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(c) queue.resolve('esc-3-1', ...) on a pending escalation records a lock for 'esc-3-1'."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-3-1', task_id='3')
+        queue.submit(esc)  # seed without spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.resolve('esc-3-1', resolution='Fixed')
+
+        assert any(eid == 'esc-3-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-3-1; got {acquired}'
+        )

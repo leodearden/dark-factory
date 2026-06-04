@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -16,6 +17,54 @@ from escalation import archive
 from escalation.models import Escalation
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
+    """Per-escalation-id exclusive advisory lock using a stable sidecar file.
+
+    WHY A SIDECAR (PRD D3 rationale):
+    The queue's writers are atomic tmp+rename (_atomic_write_path).  After a
+    tmp+rename replace, the data file ``{escalation_id}.json`` is a NEW inode.
+    A second writer that flock()s the (new) data-file path binds to a different
+    inode and races anyway — the lock is defeated.  The fix is a STABLE lock
+    target: ``{escalation_id}.json.lock``, created once via os.open(O_CREAT)
+    and NEVER renamed or replaced, so all writers flock the same inode and
+    actually serialize.
+
+    EXPORT CONTRACT:
+    This helper is module-level and exported so task ε (server-start sweep /
+    reaper) can import it as::
+
+        from escalation.queue import escalation_id_lock
+
+    and take the same lock around its root↔archive relocations without
+    instantiating an EscalationQueue.
+
+    GLOB INVISIBILITY:
+    The sidecar ends in ``.lock`` and does NOT match the ``esc-*.json`` glob
+    used by get_pending / get_by_task / make_id / iter_all_escalation_paths.
+    Lock files are intentionally never deleted or renamed (stable inode);
+    accumulation at current queue volumes is acceptable.
+
+    Usage::
+
+        with escalation_id_lock(queue_dir, escalation_id):
+            data = read(); data = mutate(data); atomic_write(data)
+    """
+    lock_path = Path(queue_dir) / f'{escalation_id}.json.lock'
+    # Defensively create queue_dir so standalone callers (e.g. task ε sweep/reaper)
+    # can take the lock without having first instantiated an EscalationQueue.
+    Path(queue_dir).mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 # Severity rank map for promotion logic.  Alphabetical comparison is wrong
 # ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
@@ -117,8 +166,16 @@ class EscalationQueue:
             yield from archive_root.rglob(pattern)
 
     def submit(self, escalation: Escalation) -> str:
-        """Atomic write: {id}.tmp -> rename to {id}.json."""
-        self._atomic_write(escalation.id, escalation.to_json())
+        """Atomic write: {id}.tmp -> rename to {id}.json.
+
+        The write is serialized per-id by ``escalation_id_lock`` to prevent a
+        concurrent same-id submit from clobbering an in-progress RMW mutator
+        (add_members_to_l2, attach_dedupe_child, resolve).  The notify callback
+        fires OUTSIDE the lock so a callback that re-enters the queue for the
+        same id does not deadlock.
+        """
+        with escalation_id_lock(self.queue_dir, escalation.id):
+            self._atomic_write(escalation.id, escalation.to_json())
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
 
         if self._notify_callback:
@@ -299,9 +356,18 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
-        Idempotent: if the escalation is already resolved or dismissed, this
-        method returns the existing escalation unchanged without re-archiving
-        or re-firing the _resolve_callback.
+        Concurrency: the get → status-check → mutate → _atomic_write →
+        _archive_resolved critical section is serialized under
+        ``escalation_id_lock``.  Moving the idempotency status-check INSIDE
+        the lock ensures that two concurrent resolves for the same id
+        serialize and produce exactly one archive copy.
+
+        Callbacks and cascade run AFTER releasing the lock:
+        - ``_resolve_callback`` fires after the lock is released, preventing
+          re-entrant callback → resolve deadlocks.
+        - The member cascade calls ``self.resolve(member_id, …)`` for each L1
+          member; each cascaded call takes its OWN distinct sidecar lock
+          (different file → different inode → no same-fd re-entrancy/deadlock).
 
         Cascade: if the escalation is an L2 with a non-empty ``members`` list,
         after archiving the L2 each member id is resolved recursively with the
@@ -324,26 +390,28 @@ class EscalationQueue:
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
         """
-        esc = self.get(escalation_id)
-        if esc is None:
-            return None
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self.get(escalation_id)
+            if esc is None:
+                return None
 
-        if esc.status != 'pending':
-            logger.info(
-                f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
-            )
-            return esc
+            if esc.status != 'pending':
+                logger.info(
+                    f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
+                )
+                return esc
 
-        esc.status = 'dismissed' if dismiss else 'resolved'
-        esc.resolution = resolution
-        esc.resolved_at = datetime.now(UTC).isoformat()
-        if resolved_by is not None:
-            esc.resolved_by = resolved_by
-        if resolution_turns is not None:
-            esc.resolution_turns = resolution_turns
+            esc.status = 'dismissed' if dismiss else 'resolved'
+            esc.resolution = resolution
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            if resolved_by is not None:
+                esc.resolved_by = resolved_by
+            if resolution_turns is not None:
+                esc.resolution_turns = resolution_turns
 
-        self._atomic_write(escalation_id, esc.to_json())
-        self._archive_resolved(escalation_id, esc.resolved_at)
+            self._atomic_write(escalation_id, esc.to_json())
+            self._archive_resolved(escalation_id, esc.resolved_at)
+
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
 
         if self._resolve_callback:
@@ -407,10 +475,13 @@ class EscalationQueue:
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
 
-        # Step 2: atomic write then best-effort archive (delegates to shared helpers)
-        self._atomic_write(escalation.id, escalation.to_json())
-        # Step 3: best-effort archive move
-        self._archive_resolved(escalation.id, escalation.resolved_at)
+        # Step 2: atomic write + best-effort archive under the per-id lock.
+        # The lock prevents a concurrent same-id RMW from clobbering this write.
+        # The resolve callback fires OUTSIDE the lock (see lock-scope design decision).
+        with escalation_id_lock(self.queue_dir, escalation.id):
+            self._atomic_write(escalation.id, escalation.to_json())
+            # Step 3: best-effort archive move
+            self._archive_resolved(escalation.id, escalation.resolved_at)
 
         # Step 4: log
         logger.info(
@@ -475,11 +546,12 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``members`` is not
-        atomic: two concurrent callers for the same parent each read the same
-        pre-mutation snapshot, both append and both write — the second rewrite
-        clobbers the first's additions.  Single-writer invariant matches the
-        rest of the queue; see ``attach_dedupe_child`` for a full discussion.
+        **Concurrency contract (sidecar flock).**  The entire read-modify-write
+        of ``members`` is serialized per-id by ``escalation_id_lock``, so
+        concurrent appends from multiple processes are union-preserving — no
+        write clobbers another's additions.  The lock target is the stable
+        sidecar ``{escalation_id}.json.lock`` (see ``escalation_id_lock`` for
+        the PRD-D3 rationale).
 
         Loads the L2 directly from ``queue_dir/{escalation_id}.json`` (queue root
         only).  This refuses archived L2s — they were already adjudicated by a
@@ -502,44 +574,43 @@ class EscalationQueue:
         ``None`` when *escalation_id* is not found in the queue root (unknown id
         or archived).
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        if not path.exists():
-            return None
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
-            return None
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
+                return None
 
-        if not new_member_ids:
-            return esc  # no-op
+            if not new_member_ids:
+                return esc  # no-op
 
-        existing = set(esc.members)
-        appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
-        if appended:
-            esc.members.extend(appended)
-            self._rewrite(escalation_id, esc)
-            logger.info(
-                'add_members_to_l2: added %d new member(s) to %s (total=%d)',
-                len(appended), escalation_id, len(esc.members),
-            )
-        return esc
+            existing = set(esc.members)
+            appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
+            if appended:
+                esc.members.extend(appended)
+                self._rewrite(escalation_id, esc)
+                logger.info(
+                    'add_members_to_l2: added %d new member(s) to %s (total=%d)',
+                    len(appended), escalation_id, len(esc.members),
+                )
+            return esc
 
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``,
-        ``dedupe_children``, and ``severity`` is *not* atomic: two concurrent
-        callers for the same parent each read the same pre-mutation snapshot,
-        both append once and both write with the same incremented count, and
-        the second rewrite silently clobbers the first — losing a child and
-        potentially reverting a severity promotion.  The caller must serialize
-        concurrent attaches against the same parent.  Today this invariant
-        holds because the MCP server is single-writer; any multi-writer
-        migration must add explicit serialization for all three fields before
-        calling this function.
+        **Concurrency contract (sidecar flock).**  All three mutations —
+        ``dedupe_count``, ``dedupe_children``, and ``severity`` — are serialized
+        per-id by ``escalation_id_lock``.  Concurrent attaches from multiple
+        processes are therefore safe: no child is lost, no count is reverted,
+        and no severity promotion is undone.  The lock target is the stable
+        sidecar ``{parent_id}.json.lock`` (see ``escalation_id_lock`` for the
+        PRD-D3 rationale; different parent ids take different sidecars —
+        no cross-id contention).
 
         Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
         NOT fall back to the archive.  This ensures that resolved / dismissed
@@ -573,18 +644,19 @@ class EscalationQueue:
            to the same canonical parent by fingerprint without the parent ever
            losing its fingerprint identity after the first write.
         """
-        path = self.queue_dir / f'{parent_id}.json'
-        if not path.exists():
-            return None
-        try:
-            parent = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
-            return None
-        parent.dedupe_children.append(child_id)
-        parent.dedupe_count += 1
-        parent.severity = _max_severity(parent.severity, child_severity)
-        self._rewrite(parent_id, parent)
+        with escalation_id_lock(self.queue_dir, parent_id):
+            path = self.queue_dir / f'{parent_id}.json'
+            if not path.exists():
+                return None
+            try:
+                parent = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
+                return None
+            parent.dedupe_children.append(child_id)
+            parent.dedupe_count += 1
+            parent.severity = _max_severity(parent.severity, child_severity)
+            self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
             f'(dedupe_count={parent.dedupe_count}, severity={parent.severity})'
