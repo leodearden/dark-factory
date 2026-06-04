@@ -165,11 +165,25 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
      - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
        but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
-       confirm the landed sha and use `done_provenance={"kind": "found_on_main"}`.
+       confirm the landed sha and use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from git log main --oneline -20>",
+       "note": "merge found already done by worker; sha confirmed via git log"}`.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
-        done_provenance={"kind": "merged", "commit": "<merge sha>"})` (or `found_on_main`
-        when `commit` is null).
+        done_provenance=<shape>)`. Choose by HOW `done` was observed:
+        - **In-window** (`merge_request` returned terminal `done`): the response contains a
+          `commit` field (the merge sha) — use
+          `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
+        - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
+          carries **no `commit` field** — never assume one is present. Run
+          `git log main --oneline -20` to recover the landed sha, then use
+          `done_provenance={"kind": "merged", "commit": "<recovered sha>"}` (the server
+          ancestor-checks it) or `done_provenance={"kind": "found_on_main",
+          "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
+          sha recovered from git log"}`. A polled-done sha MUST be recovered from git log;
+          it is never present in the merge_status response.
+        - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
+          above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
         `dry_run_proposals` / `memory_hints` / `files`. Immediately
         `update_task(..., append=true)` to restore them.
@@ -185,7 +199,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
      the task's commit landed on main.
-     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main"}` and proceed
+     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha confirmed on main via git log main --oneline -20>",
+       "note": "confirmed on main after unknown merge_status; sha from git log"}` and proceed
        with sub-steps a–d above.
      - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
 
