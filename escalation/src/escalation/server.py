@@ -42,6 +42,10 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
+# C1 action enum for resolve_issue — five valid values, two disposition buckets.
+RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
+_DISMISS_ACTIONS: frozenset[str] = frozenset({'park', 'abandon', 'close_only'})
+
 CATEGORIES = [
     'scope_violation',
     'design_concern',
@@ -387,19 +391,28 @@ def create_server(
     def resolve_issue(
         escalation_id: str,
         resolution: str,
-        terminate: bool = False,
+        action: str = 'resume',
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
+        terminate: None = None,
     ) -> dict[str, Any]:
-        """Resolve or dismiss an escalation. The resolution text is injected into the
-        agent's briefing when the task resumes.
+        """Resolve or dismiss an escalation (see full semantics table in docstring).
 
-        Set terminate=true to abandon the task rather than resume it.
-        Use resolved_by to attribute the resolver (e.g. "steward", "interactive").
-        Use resolution_turns to record how many conversation turns resolution took.
+        Placeholder docstring — replaced in step-7.
         """
+        if terminate is not None:
+            return {
+                'error': (
+                    "'terminate' was removed; state your intent: "
+                    "action='resume'|'restart'|'park'|'abandon'|'close_only' "
+                    "— see resolve_issue docstring."
+                )
+            }
+        if action not in RESOLVE_ACTIONS:
+            return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
+        dismiss = action in _DISMISS_ACTIONS
         esc = queue.resolve(
-            escalation_id, resolution, dismiss=terminate,
+            escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
         )
         if esc is None:

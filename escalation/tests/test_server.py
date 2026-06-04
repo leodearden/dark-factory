@@ -1633,7 +1633,7 @@ class TestPromoteToL2Cascade:
 
     @pytest.mark.asyncio
     async def test_dismiss_l2_cascades_dismiss_to_members(self, tmp_path: Path):
-        """(f) Dismiss the L2 (terminate=True) → members are dismissed."""
+        """(f) Dismiss the L2 (action='abandon') → members are dismissed."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -1648,7 +1648,7 @@ class TestPromoteToL2Cascade:
             server,
             escalation_id=l2_result['id'],
             resolution='Not actionable',
-            terminate=True,
+            action='abandon',
         )
 
         m1 = queue.get('esc-l1-1')
