@@ -956,4 +956,127 @@ def create_server(
             return {'resumed': False, 'error': 'reason is required for audit'}
         return await harness.force_resume_scheduler(reason.strip())
 
+    # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
+
+    _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
+
+    def _map_terminal_state(raw: str) -> str:
+        """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary."""
+        if raw in ('done', 'done_wip_recovery', 'already_merged'):
+            return 'done'
+        if raw == 'conflict':
+            return 'conflict'
+        if raw == 'abandoned':
+            return 'abandoned'
+        # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
+        # unknown_branch / error → blocked
+        return 'blocked'
+
+    def _map_live_state(raw: str) -> str:
+        """Map a live snapshot state to the public merge_status vocabulary."""
+        if raw == 'queued':
+            return 'queued'
+        if raw in ('merging', 'awaiting_verify', 'verifying'):
+            return 'verifying'
+        if raw == 'gate_reverify':
+            return 'gate'
+        if raw == 'finalizing':
+            return 'finalizing'
+        return raw  # pass through unknown states unchanged
+
+    @mcp.tool()
+    async def merge_status(
+        request_id: str | None = None,
+        branch: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the current merge state for a merge request.
+
+        Accepts one of: request_id (authoritative), branch (most-recent), or
+        task_id (most-recent).  Lookup order: live snapshot → retention ring →
+        event store → {state:'unknown', hint}.
+
+        Returns a dict with at minimum:
+            state, request_id, generation (always 1 in α3).
+
+        Live entries also carry: position, started_at, eta_seconds.
+        Terminal entries carry: outcome (raw state), finished_at.
+        Unknown carries: hint.
+        """
+        # Validation — at least one key required
+        if request_id is None and branch is None and task_id is None:
+            return {'error': 'At least one of request_id, branch, or task_id is required'}
+
+        # Tier 1: live snapshot
+        worker = getattr(harness, '_merge_worker', None) if harness is not None else None
+        if worker is not None and hasattr(worker, 'snapshot'):
+            snap = worker.snapshot()
+            entries = snap.get('entries', [])
+            entry = None
+            if request_id is not None:
+                entry = next(
+                    (e for e in entries if e.get('request_id') == request_id), None
+                )
+            else:
+                # Most-recent by enqueued_at for branch / task_id
+                candidates = [
+                    e for e in entries
+                    if (branch is not None and e.get('branch') == branch)
+                    or (task_id is not None and e.get('task_id') == task_id)
+                ]
+                if candidates:
+                    entry = max(candidates, key=lambda e: e.get('enqueued_at', 0))
+            if entry is not None:
+                eta = None
+                if merge_inflight_registry is not None:
+                    try:
+                        eta = merge_inflight_registry.eta_seconds(entry['branch'])
+                    except Exception:
+                        pass
+                return {
+                    'state': _map_live_state(entry['state']),
+                    'request_id': entry.get('request_id'),
+                    'generation': 1,
+                    'position': entry.get('position'),
+                    'started_at': entry.get('enqueued_at'),
+                    'eta_seconds': eta,
+                }
+
+        # Tier 2: retention ring (request_id only)
+        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
+        if ring is not None and request_id is not None:
+            rec = ring.get(request_id)
+            if rec is not None:
+                return {
+                    'state': _map_terminal_state(rec.state),
+                    'request_id': rec.request_id,
+                    'generation': 1,
+                    'outcome': rec.state,
+                    'finished_at': rec.finished_at,
+                }
+
+        # Tier 3: event store
+        if event_store is not None:
+            row = event_store.latest_merge_finalized(
+                request_id=request_id,
+                branch=branch,
+                task_id=task_id,
+            )
+            if row is not None:
+                return {
+                    'state': _map_terminal_state(row['state']),
+                    'request_id': row['request_id'],
+                    'generation': 1,
+                    'outcome': row['state'],
+                    'finished_at': row['finished_at'],
+                }
+
+        # Tier 4: honest unknown
+        return {
+            'state': 'unknown',
+            'request_id': request_id,
+            'generation': 1,
+            'hint': _MERGE_STATUS_UNKNOWN_HINT,
+        }
+
     return mcp
