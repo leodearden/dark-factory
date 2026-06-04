@@ -140,6 +140,42 @@ class TestSignatureDerivation:
 
 
 # ---------------------------------------------------------------------------
+# Shared state helpers for fake in-memory task backend
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_scheduler(harness, initial_metadata: dict | None = None):
+    """Wire harness.scheduler with a simple in-memory task backend.
+
+    Returns (persisted_metadata, call_order) so tests can inspect state.
+    The backend simulates:
+      - get_task: returns the current persisted_metadata
+      - update_task: applies update (with optional append/merge semantics)
+      - set_task_status: records the call in call_order
+    """
+    persisted_metadata: dict = dict(initial_metadata or {})
+    call_order: list[str] = []
+
+    async def fake_get_task(tid):
+        return {'id': tid, 'metadata': dict(persisted_metadata)}
+
+    async def fake_update_task(tid, md, *, append=False):
+        if isinstance(md, dict):
+            persisted_metadata.update(md)
+        call_order.append('update_task')
+        return True
+
+    async def fake_set_task_status(tid, status, **kwargs):
+        call_order.append('set_task_status')
+
+    harness.scheduler.get_task = fake_get_task
+    harness.scheduler.update_task = fake_update_task
+    harness.scheduler.set_task_status = fake_set_task_status
+
+    return persisted_metadata, call_order
+
+
+# ---------------------------------------------------------------------------
 # Step-3 / Step-4: Below-threshold flips increment counter and proceed
 # ---------------------------------------------------------------------------
 
@@ -167,29 +203,7 @@ class TestBelowThresholdFlips:
         )
         expected_sig = Harness._reblock_signature(esc)
 
-        # Simulate a fake in-memory metadata store that tracks the latest
-        # reblock_guard after each update_task call.
-        persisted_metadata: dict = {}
-        call_order: list[str] = []
-
-        async def fake_get_task(tid):
-            return {'id': tid, 'metadata': dict(persisted_metadata)}
-
-        async def fake_update_task(tid, md, *, append=False):
-            if append and isinstance(md, dict):
-                # Recursive-merge (step-12 semantics; for now just update)
-                persisted_metadata.update(md)
-            else:
-                persisted_metadata.update(md)
-            call_order.append('update_task')
-            return True
-
-        async def fake_set_task_status(tid, status, **kwargs):
-            call_order.append('set_task_status')
-
-        harness.scheduler.get_task = fake_get_task
-        harness.scheduler.update_task = fake_update_task
-        harness.scheduler.set_task_status = fake_set_task_status
+        persisted_metadata, call_order = _make_fake_scheduler(harness)
 
         # Drive three flips via _on_escalation_resolved
         for expected_count in range(1, 4):
@@ -212,3 +226,62 @@ class TestBelowThresholdFlips:
                 f'flip {expected_count}: expected update_task before set_task_status, '
                 f'got {call_order}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Step-5 / Step-6: Signature change resets counter to 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSignatureReset:
+    """A different-signature escalation resets the counter to 1 (not 0, not 3)."""
+
+    async def test_signature_change_resets_count_to_1_and_proceeds(
+        self, harness: Harness
+    ):
+        """Seed count=2 with old signature; drive with a different-signature esc.
+
+        Assert: persisted count becomes 1 (reset, NOT 3) with the NEW signature,
+        and set_task_status('pending') is awaited (flip proceeds).
+        """
+        task_id = '42'
+        old_sig = 'infra_issue:old error'
+        new_esc = _make_l1_esc(
+            task_id=task_id,
+            category='task_failure',  # different category → different signature
+            summary='completely different failure',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        new_sig = Harness._reblock_signature(new_esc)
+        assert new_sig != old_sig, 'test requires signatures to differ'
+
+        # Seed persisted state: count=2 with OLD signature
+        persisted_metadata, call_order = _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 2, 'signature': old_sig}},
+        )
+        set_task_status_calls: list[str] = []
+
+        original_fake_set = harness.scheduler.set_task_status
+
+        async def recording_set_task_status(tid, status, **kwargs):
+            set_task_status_calls.append(status)
+            await original_fake_set(tid, status, **kwargs)
+
+        harness.scheduler.set_task_status = recording_set_task_status
+
+        harness._on_escalation_resolved(new_esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        guard = persisted_metadata.get('reblock_guard')
+        assert guard is not None, 'reblock_guard should be persisted'
+        assert guard['count'] == 1, (
+            f'Expected count=1 (reset on signature change), got {guard["count"]}'
+        )
+        assert guard['signature'] == new_sig, 'Signature should be updated to new_sig'
+
+        # Flip must proceed (different signature → always proceed)
+        assert 'pending' in set_task_status_calls, (
+            'set_task_status(pending) should have been called (flip proceeds on reset)'
+        )
