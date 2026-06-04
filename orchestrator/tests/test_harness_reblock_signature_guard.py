@@ -709,9 +709,9 @@ class TestOrphanBranchGuard:
         set_status_calls: list[str] = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
         harness.scheduler.set_task_status = spy_set
 
@@ -755,7 +755,7 @@ class TestOrphanBranchGuard:
         )
         set_status_calls: list = []
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
 
         harness.scheduler.set_task_status = spy_set
@@ -808,9 +808,9 @@ class TestCorruptMetadataRobustness:
         set_status_calls: list[str] = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
         harness.scheduler.set_task_status = spy_set
 
@@ -851,9 +851,9 @@ class TestCorruptMetadataRobustness:
         set_status_calls: list[str] = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
         harness.scheduler.set_task_status = spy_set
 
