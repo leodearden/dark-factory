@@ -17,6 +17,31 @@ from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Sentinel role allowlist — resolves PRD Open question 2 (C4/D3)
+# ---------------------------------------------------------------------------
+# All harness-internal sentinels use one of these prefixes:
+#   harness-*      → harness-stranded-blocked-reaper, harness-reconcile,
+#                    harness-orphan-reaper (harness.py)
+#   orchestrator-* → orchestrator-scheduler, orchestrator-watcher-supervisor
+#                    (the watcher-outage L2 named in the user-observable signal)
+# Verified against orchestrator/src/orchestrator/agents/roles.py: NO LLM agent
+# role (architect, implementer, debugger, merger, steward, deep_reviewer,
+# reviewer_comprehensive, judge, simple_task) uses either prefix.
+# A prefix check is forward-compatible: new harness sentinels are auto-exempt.
+_HARNESS_SENTINEL_ROLE_PREFIXES = ('harness-', 'orchestrator-')
+
+
+def _is_harness_sentinel_role(agent_role: str) -> bool:
+    """Return True if *agent_role* belongs to the harness sentinel namespace.
+
+    Defensively coerces *agent_role* via ``(agent_role or '')`` so that
+    ``None`` or empty strings (possible on legacy/deserialized records) fall
+    through to the downgrade path instead of raising ``AttributeError``.
+    """
+    return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
 CATEGORIES = [
     'scope_violation',
     'design_concern',
@@ -32,6 +57,8 @@ CATEGORIES = [
     'recon_integrity_issue',
     # Review triage
     'review_suggestions',
+    # Stranded-blocked recovery (PRD-3 D5 / C6)
+    'stranded_blocked',
 ]
 
 # Fields returned by get_pending_escalations(compact=True) — the triage-relevant
@@ -147,12 +174,41 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
+        # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
+        # both naturally observe 'blocking' and route the downgraded record through
+        # the normal L0 + dedupe path.  Harness sentinel roles (harness-* /
+        # orchestrator-*) are exempt and keep their born-at-L2 routing.
+        if esc.severity in BORN_AT_L2_SEVERITIES and not _is_harness_sentinel_role(esc.agent_role):
+            _original_severity = esc.severity
+            esc.severity = 'blocking'
+            # Marker appended (not prepended) so summary_dedupe_key's first-three-token
+            # slice stays equal to the original summary's key.  Downgraded criticals
+            # then fold into the equivalent normally-filed 'blocking' parent, and
+            # unrelated issues with the same first two words don't false-merge on a
+            # constant leading '[downgraded:...]' token (PRD C4 — marker on the
+            # summary line, placed at the suffix to preserve the key).
+            # Known edge case: summaries with fewer than 3 real tokens have the
+            # marker leak into the dedupe key (e.g. 'lost link' → key becomes
+            # ('lost','link','downgradedcritical') vs. ('lost','link')), so a
+            # downgraded short-summary won't fold into its blocking parent.
+            # Impact: missed dedupe for short one-line summaries only (no data
+            # corruption).  A marker-aware fix in summary_dedupe_key (dedupe.py)
+            # — stripping a trailing '[downgraded:...]' before the 3-token slice —
+            # would close this gap; out of scope for α2.
+            esc.summary = f'{esc.summary} [downgraded:{_original_severity}]'
+            logger.warning(
+                'Downgraded severity %r → blocking for agent_role=%r task_id=%r (C4/D3)',
+                _original_severity, esc.agent_role, esc.task_id,
+            )
+
         # Severity gate: critical/urgent escalations are born at L2, bypassing
         # the auto-watcher and routing straight to a human (BORN_AT_L2_SEVERITIES).
         # This runs before all other gates so the on-disk record is stamped level=2
         # on every path: queued normally, auto-resolved via submit_resolved, or any
         # gate bypass.  L2 escalations also skip deduplication in _submit_or_dedupe
         # so they are never silently folded into a lower-level parent.
+        # After the downgrade above, only sentinel-filed criticals/urgents reach here.
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc.level = 2
 

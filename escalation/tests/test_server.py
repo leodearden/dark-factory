@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from escalation.dedupe import DedupeConfig
+from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -67,11 +67,18 @@ class TestBornAtL2:
 
     @pytest.mark.asyncio
     async def test_blocker_critical_severity_on_disk_level2(self, tmp_path: Path):
-        """escalate_blocker(severity='critical') → on-disk escalation has level==2."""
+        """escalate_blocker(severity='critical') → on-disk escalation has level==2.
+
+        Uses sentinel agent_role ('orchestrator-watcher-supervisor') so the
+        C4/D3 downgrade is bypassed and born-at-L2 stamping is still covered.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -80,11 +87,18 @@ class TestBornAtL2:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
     async def test_blocker_l2_severities_yield_level2(self, tmp_path: Path, severity: str):
-        """escalate_blocker with critical/urgent severity → on-disk level==2."""
+        """escalate_blocker with critical/urgent severity → on-disk level==2.
+
+        Uses sentinel agent_role so the C4/D3 downgrade is bypassed — this
+        test covers born-at-L2 stamping AND the sentinel exemption regression.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity=severity, **_COMMON_KWARGS)
+        result = await _blocker(
+            server, severity=severity,
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -93,11 +107,18 @@ class TestBornAtL2:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('severity', ['critical', 'urgent'])
     async def test_info_l2_severities_yield_level2(self, tmp_path: Path, severity: str):
-        """escalate_info with critical/urgent severity → on-disk level==2."""
+        """escalate_info with critical/urgent severity → on-disk level==2.
+
+        Uses sentinel agent_role so the C4/D3 downgrade is bypassed — this
+        test covers born-at-L2 stamping AND the sentinel exemption regression.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity=severity, **_COMMON_KWARGS)
+        result = await _info(
+            server, severity=severity,
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -374,11 +395,13 @@ class TestL2DedupeBypass:
         )
         queue.submit(parent)
 
-        # Child call: same category, overlapping summary, but born-at-L2
+        # Child call: same category, overlapping summary, but born-at-L2.
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
+        # dedupe-bypass coverage requires level==2 on the child record.
         result = await _info(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='critical',
@@ -413,7 +436,7 @@ class TestL2DedupeBypass:
         await _info(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='critical',
@@ -441,7 +464,12 @@ class TestL2DedupeBypass:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, task_status_lookup=_lookup)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed and
+        # the born-at-L2 + terminal-task auto-resolve combination is covered.
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
 
         assert result['status'] == 'resolved', (
             f"Expected 'resolved' (terminal task auto-resolve), got: {result['status']}"
@@ -470,10 +498,12 @@ class TestL2DedupeBypass:
         )
         queue.submit(parent)
 
+        # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
+        # dedupe-bypass coverage requires the urgent escalation to stay at L2.
         result = await _blocker(
             server,
             task_id='task-999',
-            agent_role='implementer',
+            agent_role='orchestrator-watcher-supervisor',
             category='infra_issue',
             summary='infra connection timeout on port 8002',
             severity='urgent',
@@ -560,6 +590,346 @@ class TestSeverityValidation:
             assert 'error' not in result, (
                 f"Known severity {sev!r} should be accepted, got error: {result}"
             )
+
+
+# ---------------------------------------------------------------------------
+# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# ---------------------------------------------------------------------------
+
+
+class TestStrandedBlockedCategory:
+    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+
+    def test_stranded_blocked_in_categories(self):
+        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+
+        This is a data-contract assertion on a runtime constant — not a prose
+        test.  CATEGORIES is the canonical list downstream consumers (task ε,
+        task ι, task ζ) rely on to recognise the category.
+        """
+        from escalation.server import CATEGORIES
+        assert 'stranded_blocked' in CATEGORIES, (
+            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
+# ---------------------------------------------------------------------------
+
+
+class TestChokepointSeverityDowngrade:
+    """Critical/urgent escalations from AGENT roles are downgraded to 'blocking' (C4/D3).
+
+    (A) AGENT-ROLE DOWNGRADE — agent_role='implementer', severity in critical/urgent:
+        - result['status'] == 'queued'
+        - on-disk record: severity=='blocking', level==0
+        - summary has '[downgraded:critical]' / '[downgraded:urgent]' appended as suffix
+          (appended so summary_dedupe_key's first-three-token slice is preserved)
+        - a WARNING is emitted on logger 'escalation.server'
+
+    (B) SENTINEL EXEMPTION — harness-/orchestrator- prefixed roles keep born-at-L2:
+        - on-disk record: severity unchanged, level==2
+        - summary NOT modified (no marker appended)
+        - NO WARNING logged
+    """
+
+    # --- (A) Agent-role downgrade via escalate_blocker ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_returns_queued(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker(severity='critical'/'urgent', agent_role='implementer') → status=='queued'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} summary',
+            severity=severity,
+        )
+
+        assert result['status'] == 'queued', (
+            f"severity={severity!r}: expected 'queued' after downgrade, got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_on_disk_severity_blocking_level0(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker agent downgrade: on-disk record has severity=='blocking', level==0."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} summary',
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking', (
+            f"severity={severity!r}: expected on-disk severity=='blocking', got: {esc.severity!r}"
+        )
+        assert esc.level == 0, (
+            f"severity={severity!r}: expected on-disk level==0, got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_summary_suffixed(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker agent downgrade: summary has '[downgraded:<original>]' appended as suffix.
+
+        The marker is appended (not prepended) so summary_dedupe_key's first-three-token
+        slice stays equal to the original summary's key (PRD C4 — marker visible on the
+        summary line, placed at the suffix to preserve the dedupe key).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = f'original {severity} summary'
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=original_summary,
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        expected_suffix = f' [downgraded:{severity}]'
+        assert esc.summary.startswith(original_summary), (
+            f"severity={severity!r}: expected summary to start with original text, got: {esc.summary!r}"
+        )
+        assert esc.summary.endswith(expected_suffix), (
+            f"severity={severity!r}: expected summary to end with {expected_suffix!r}, got: {esc.summary!r}"
+        )
+        assert summary_dedupe_key(esc.summary) == summary_dedupe_key(original_summary), (
+            f"severity={severity!r}: dedupe key must be preserved after appending marker"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_emits_warning(
+        self, tmp_path: Path, severity: str, caplog,
+    ):
+        """escalate_blocker agent downgrade: WARNING emitted on logger 'escalation.server'."""
+        import logging
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            await _blocker(
+                server,
+                task_id='task-999',
+                agent_role='implementer',
+                category='scope_violation',
+                summary=f'original {severity} summary',
+                severity=severity,
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'escalation.server']
+        assert warnings, (
+            f"severity={severity!r}: expected a WARNING on logger 'escalation.server', got: {caplog.records}"
+        )
+
+    # --- (A) Agent-role downgrade via escalate_info ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_info_agent_role_downgrade_on_disk_severity_blocking_level0(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_info agent downgrade: on-disk record has severity=='blocking', level==0."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} info summary',
+            severity=severity,
+        )
+
+        assert result['status'] == 'queued', (
+            f"severity={severity!r}: expected 'queued', got: {result}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking', (
+            f"severity={severity!r}: expected severity=='blocking', got: {esc.severity!r}"
+        )
+        assert esc.level == 0, (
+            f"severity={severity!r}: expected level==0, got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_info_agent_role_downgrade_summary_suffixed(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_info agent downgrade: summary has '[downgraded:<original>]' appended as suffix.
+
+        The marker is appended (not prepended) so summary_dedupe_key's first-three-token
+        slice stays equal to the original summary's key (PRD C4 — marker visible on the
+        summary line, placed at the suffix to preserve the dedupe key).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = f'original {severity} info summary'
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=original_summary,
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        expected_suffix = f' [downgraded:{severity}]'
+        assert esc.summary.startswith(original_summary), (
+            f"severity={severity!r}: expected summary to start with original text, got: {esc.summary!r}"
+        )
+        assert esc.summary.endswith(expected_suffix), (
+            f"severity={severity!r}: expected summary to end with {expected_suffix!r}, got: {esc.summary!r}"
+        )
+
+    # --- (B) Sentinel exemption (harness- and orchestrator- prefixes) ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_keeps_level2_severity_unchanged(
+        self, tmp_path: Path, sentinel_role: str,
+    ):
+        """Sentinel roles are exempt from downgrade: severity stays 'critical', level stays 2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role=sentinel_role,
+            category='scope_violation',
+            summary='sentinel critical escalation',
+            severity='critical',
+        )
+
+        assert result['status'] == 'queued', (
+            f"sentinel_role={sentinel_role!r}: expected 'queued', got: {result}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'critical', (
+            f"sentinel_role={sentinel_role!r}: severity must NOT be downgraded, got: {esc.severity!r}"
+        )
+        assert esc.level == 2, (
+            f"sentinel_role={sentinel_role!r}: level must stay 2 (born-at-L2), got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_summary_not_prefixed(
+        self, tmp_path: Path, sentinel_role: str,
+    ):
+        """Sentinel roles are exempt: summary is NOT prefixed with '[downgraded:...]'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = 'sentinel critical escalation'
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role=sentinel_role,
+            category='scope_violation',
+            summary=original_summary,
+            severity='critical',
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert not esc.summary.startswith('[downgraded:'), (
+            f"sentinel_role={sentinel_role!r}: summary must NOT be prefixed, got: {esc.summary!r}"
+        )
+        assert esc.summary == original_summary, (
+            f"sentinel_role={sentinel_role!r}: summary must be unchanged, got: {esc.summary!r}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_no_warning_logged(
+        self, tmp_path: Path, sentinel_role: str, caplog,
+    ):
+        """Sentinel roles are exempt: NO downgrade WARNING is logged."""
+        import logging
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            await _blocker(
+                server,
+                task_id='task-999',
+                agent_role=sentinel_role,
+                category='scope_violation',
+                summary='sentinel critical escalation',
+                severity='critical',
+            )
+
+        # Filter out the task_status_lookup warning (not present here); only
+        # check that no "downgrad" warning was emitted.
+        downgrade_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'downgrad' in r.message.lower()
+        ]
+        assert not downgrade_warnings, (
+            f"sentinel_role={sentinel_role!r}: expected NO downgrade WARNING, got: {downgrade_warnings}"
+        )
+
+    # --- (C) Robustness: None/empty agent_role falls through to downgrade ---
+
+    @pytest.mark.parametrize('agent_role', [None, ''])
+    def test_none_or_empty_agent_role_is_not_sentinel(self, agent_role):
+        """_is_harness_sentinel_role(None/'') returns False, not AttributeError.
+
+        The MCP tool validates agent_role as str, but legacy/deserialized records
+        may carry None or empty strings.  The defensive ``(agent_role or '')``
+        guard ensures these fall through to the downgrade (non-sentinel) path
+        rather than crashing with AttributeError inside the hot submit path.
+        """
+        from escalation.server import _is_harness_sentinel_role
+        # Must not raise, must return False (non-sentinel → downgrade path)
+        result = _is_harness_sentinel_role(agent_role)
+        assert result is False, (
+            f"agent_role={agent_role!r}: expected False (non-sentinel), got: {result!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1842,3 +2212,269 @@ class TestGetMergeQueue:
 
         # Request future is resolved (not_descendant → blocked)
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
+
+
+# ---------------------------------------------------------------------------
+# TestDowngradeDedupeCorrectness — C4/D3 review fix: appended marker vs. dedupe key
+# ---------------------------------------------------------------------------
+
+
+class TestDowngradeDedupeCorrectness:
+    """Downgraded marker must not corrupt the summary_dedupe_key.
+
+    summary_dedupe_key() keys on the FIRST three whitespace tokens.  When the
+    marker was PREPENDED ('[downgraded:critical] {summary}'), every token
+    shifted: downgraded criticals never matched equivalent normally-filed
+    'blocking' parents (defeating dedupe), and unrelated criticals whose first
+    two words matched could false-merge on the constant leading token.
+
+    The fix (step-6) APPENDS the marker so the leading tokens are unchanged.
+    All four tests below fail on current (prepend) code and pass once the
+    marker is appended:
+
+    (1) PRISTINE KEY — key(esc.summary) == key(original)
+    (2) FOLDS INTO BLOCKING PARENT — downgraded critical matches blocking parent
+    (3) TWO AGENT-CRITICALS DEDUPE — second downgraded critical folds into first
+    (4) DISTINCT SUMMARIES DO NOT MERGE — different 3rd token keeps them separate
+    """
+
+    # IMPORTANT: DedupeConfig() folds only category='infra_issue' (default
+    # infra_dedupe_categories=('infra_issue',)).  The downgrade tests above use
+    # category='scope_violation' which never dedupes.  These tests use
+    # category='infra_issue' so submit_or_dedupe actually attempts a fold.
+
+    _SUMMARY_A = 'fused memory connection timeout'
+    _SUMMARY_B = 'fused memory disk full'
+
+    @pytest.mark.asyncio
+    async def test_pristine_key_equals_original_summary_key(self, tmp_path: Path):
+        """(1) PRISTINE KEY — downgraded record key == original summary key.
+
+        After downgrade, summary_dedupe_key(esc.summary) must equal
+        summary_dedupe_key(original_summary) so the record can fold into a
+        normally-filed 'blocking' parent with the same summary.
+
+        On current (prepend) code this FAILS because the key shifts to
+        ('downgradedcritical', first, second) instead of (first, second, third).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+
+        assert result['status'] == 'queued', f'Expected queued, got: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        # The marker must be present somewhere in the summary (not stripped)
+        assert '[downgraded:critical]' in esc.summary, (
+            f'Expected downgrade marker in summary, got: {esc.summary!r}'
+        )
+        # KEY INVARIANT: downgraded summary's key must equal the original key
+        assert summary_dedupe_key(esc.summary) == summary_dedupe_key(S), (
+            f'summary_dedupe_key mismatch after downgrade:\n'
+            f'  downgraded key: {summary_dedupe_key(esc.summary)}\n'
+            f'  original key:   {summary_dedupe_key(S)}\n'
+            f'  esc.summary: {esc.summary!r}'
+        )
+        # The original text must appear FIRST (not after the marker)
+        assert esc.summary.startswith(S), (
+            f'Expected summary to start with original text {S!r}, got: {esc.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_downgraded_critical_folds_into_blocking_parent(self, tmp_path: Path):
+        """(2) FOLDS INTO BLOCKING PARENT — downgraded critical matches blocking parent.
+
+        Pre-seed a pending severity='blocking', category='infra_issue' parent
+        with summary S; then file an agent critical infra_issue with the SAME
+        summary S via escalate_blocker; assert result['status']=='dedup_skipped'.
+
+        On current (prepend) code this FAILS because the downgraded key
+        ('downgradedcritical', ...) never matches the parent's ('fused', ...).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        # Pre-seed a blocking parent directly via queue.submit()
+        parent = Escalation(
+            id=queue.make_id('task-100'),
+            task_id='task-100',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=S,
+        )
+        queue.submit(parent)
+
+        # File an agent critical with the SAME summary — should fold into parent
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+
+        assert result['status'] == 'dedup_skipped', (
+            f'Expected dedup_skipped (downgraded key should match blocking parent), got: {result}'
+        )
+        assert result.get('parent_id') == parent.id, (
+            f'Expected parent_id={parent.id!r}, got parent_id={result.get("parent_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_agent_criticals_dedupe(self, tmp_path: Path):
+        """(3) TWO AGENT-CRITICALS DEDUPE — second folds into first (regression guard).
+
+        File two agent critical infra_issue escalations with the same summary S:
+        first must be 'queued', second must be 'dedup_skipped' with parent_id
+        pointing at the first.
+
+        This passes on BOTH current (prepend) and fixed (append) code because
+        both records get the same marker → same key.  It locks the invariant
+        so any future change that breaks the folding fails this test.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        first = await _blocker(
+            server,
+            task_id='task-1',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+        assert first['status'] == 'queued', f'Expected first to be queued, got: {first}'
+
+        second = await _blocker(
+            server,
+            task_id='task-2',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+        assert second['status'] == 'dedup_skipped', (
+            f'Expected second agent-critical to fold into first, got: {second}'
+        )
+        assert second.get('parent_id') == first['id'], (
+            f'Expected parent_id={first["id"]!r}, got: {second.get("parent_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_distinct_summaries_do_not_merge(self, tmp_path: Path):
+        """(4) DISTINCT SUMMARIES DO NOT MERGE — different 3rd token keeps them separate.
+
+        File two agent critical infra_issue escalations whose summaries share
+        the first two real tokens but differ on the third:
+          _SUMMARY_A = 'fused memory connection timeout'
+          _SUMMARY_B = 'fused memory disk full'
+        Both must be 'queued' — their keys differ at the 3rd token.
+
+        On current (prepend) code this FAILS because both summaries collapse
+        to ('downgradedcritical', 'fused', 'memory'), causing the second to
+        return 'dedup_skipped' instead of 'queued'.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        first = await _blocker(
+            server,
+            task_id='task-1',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=self._SUMMARY_A,
+            severity='critical',
+        )
+        assert first['status'] == 'queued', (
+            f'Expected first (SUMMARY_A) to be queued, got: {first}'
+        )
+
+        second = await _blocker(
+            server,
+            task_id='task-2',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=self._SUMMARY_B,
+            severity='critical',
+        )
+        assert second['status'] == 'queued', (
+            f'Expected second (SUMMARY_B) to be queued (distinct 3rd token), got: {second}'
+        )
+        assert second['id'] != first['id'], (
+            'SUMMARY_A and SUMMARY_B must produce separate records'
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "<3-token summaries: appended '[downgraded:...]' marker leaks into the "
+            "dedupe key, so the downgraded record won't fold into its blocking parent. "
+            "Fix requires stripping the trailing marker inside summary_dedupe_key "
+            "(dedupe.py) before taking the 3-token slice — outside α2 scope."
+        ),
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('summary', ['merge', 'lost link'])
+    async def test_short_summary_folds_into_blocking_parent(
+        self, tmp_path: Path, summary: str,
+    ):
+        """KNOWN LIMITATION: <3-token summaries don't fold into equivalently-worded parents.
+
+        summary_dedupe_key() takes the first 3 normalised tokens.  For a summary
+        with fewer than 3 real tokens (e.g. 'merge' or 'lost link'), the appended
+        '[downgraded:critical]' marker becomes a key token:
+          'merge'      → key ('merge',)                  (original)
+          'merge [downgraded:critical]' → key ('merge','downgradedcritical')  (downgraded)
+          'lost link'  → key ('lost','link')              (original)
+          'lost link [downgraded:critical]' → key ('lost','link','downgradedcritical')
+
+        These keys differ, so the downgraded record is filed as a new escalation
+        instead of folding into the existing blocking parent.
+
+        To make these tests green, strip a trailing '[downgraded:...]' inside
+        summary_dedupe_key (or use a dedicated severity field) — see dedupe.py.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        # Pre-seed a pending blocking parent with the short summary
+        parent = Escalation(
+            id=queue.make_id('task-100'),
+            task_id='task-100',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+        queue.submit(parent)
+
+        # File an agent critical with the same summary — should fold into parent
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=summary,
+            severity='critical',
+        )
+
+        assert result['status'] == 'dedup_skipped', (
+            f'summary={summary!r}: expected dedup_skipped (short-summary fold), got: {result}'
+        )
+        assert result.get('parent_id') == parent.id, (
+            f'summary={summary!r}: expected parent_id={parent.id!r}, '
+            f'got parent_id={result.get("parent_id")!r}'
+        )
