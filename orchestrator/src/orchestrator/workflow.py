@@ -615,6 +615,13 @@ class TaskWorkflow:
             '(train=%r, members=%r)',
             self.task_id, len(member_ids), train_id, member_ids,
         )
+        # Only the tip branch (req.branch) is registered in the in-flight
+        # registry.  Member branches are intentionally out of scope here:
+        # GroupMergeRequest carries member_task_ids but not member branch names,
+        # so registering them would require coupling knowledge of the branch-
+        # naming convention into δ₂.  The on-disk _merge-* worktree scan in
+        # coalesce_or_enqueue_merge_request provides a fallback for member-branch
+        # coalescing after the train merge starts executing.
         await register_and_enqueue_merge_request(
             self.merge_queue, req, self.event_store, self.merge_inflight_registry,
         )

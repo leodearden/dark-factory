@@ -1587,9 +1587,22 @@ class InFlightMergeRegistry:
             return None
         return int(remaining)
 
-    def _release(self, branch: str) -> None:
-        """Remove *branch* from the in-flight registry.  Called by done_callback."""
+    def release(self, branch: str) -> None:
+        """Remove *branch* from the in-flight registry.
+
+        Public surface for callers that need to release a slot on an
+        exceptional path (e.g. enqueue failure before the worker can ever
+        resolve the future).  The ``done_callback`` registered inside
+        :meth:`acquire` is the normal release path; this method is the
+        explicit fallback used by the slot-leak guards in
+        :func:`register_and_enqueue_merge_request` and
+        :func:`coalesce_or_enqueue_merge_request`.
+        """
         self._slots.pop(branch, None)
+
+    # Keep the private alias so existing done_callbacks installed by acquire()
+    # continue to fire correctly without any change to those lambda closures.
+    _release = release
 
 
 def _emit_merge_queued(
@@ -1673,7 +1686,7 @@ async def register_and_enqueue_merge_request(
         # resolve req.result, the done_callback will never fire.  Release the
         # slot explicitly so a future merge for this branch can proceed.
         if acquired:
-            registry._release(req.branch)  # type: ignore[union-attr]
+            registry.release(req.branch)  # type: ignore[union-attr]
         raise
     return acquired
 
@@ -1841,7 +1854,7 @@ async def coalesce_or_enqueue_merge_request(
             # cancellation) before the worker can ever resolve req.result,
             # the done_callback will never fire.  Release the slot explicitly
             # so a future merge_request for this branch can proceed.
-            registry._release(branch)
+            registry.release(branch)
             raise
         return MergeDispatchResult(
             dispatched=True,

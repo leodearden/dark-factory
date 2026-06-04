@@ -9838,3 +9838,28 @@ class TestRegisterAndEnqueue:
 
         assert acquired is False
         assert queue.qsize() == 1
+
+    async def test_slot_leak_guard_releases_on_enqueue_failure(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(e) slot-leak guard: if enqueue_merge_request raises after acquire,
+        the slot is released and the exception propagates."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        req = _make_request('B', 'B', tmp_path, config)
+
+        # Patch enqueue_merge_request to raise before the worker can ever
+        # resolve req.result (simulating a closed queue / cancellation).
+        boom = RuntimeError('queue closed')
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request',
+            new=AsyncMock(side_effect=boom),
+        ), pytest.raises(RuntimeError, match='queue closed'):
+            await register_and_enqueue_merge_request(queue, req, None, registry)
+
+        # The slot-leak guard must have released the slot.
+        assert registry.is_inflight('B') is False
+        # The queue must be empty — the patched enqueue_merge_request never put.
+        assert queue.qsize() == 0
