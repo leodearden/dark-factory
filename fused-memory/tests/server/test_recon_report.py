@@ -200,10 +200,10 @@ class TestReconReportInRunDedup:
         assert r1['finding_id'] != r2['finding_id']
 
     def test_both_none_no_dedup(self):
-        """Two (None, None) findings are both allocated (informational)."""
+        """Two (None, None) findings with DISTINCT descriptions are both allocated."""
         state = self._make_state()
-        r1 = self._finding(state, task_id=None, flag_type=None)
-        r2 = self._finding(state, task_id=None, flag_type=None)
+        r1 = self._finding(state, task_id=None, flag_type=None, description='first observation')
+        r2 = self._finding(state, task_id=None, flag_type=None, description='second observation')
         assert 'finding_id' in r1
         assert 'finding_id' in r2
         assert r1['finding_id'] != r2['finding_id']
@@ -1078,3 +1078,250 @@ class TestReconReportCrossStageCitability:
         item = s1_report['flagged_items'][0]
         assert item['finding_id'] == finding_id_a
         assert any(c['canonical_name'] == 'AnotherEntity' for c in item['cited_entities'])
+
+
+# ---------------------------------------------------------------------------
+# task-1652: Null-task_id/null-flag_type description-hash dedup
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportNullDescDedup:
+    """Verify description-content dedup for (None, None) findings.
+
+    When both task_id and flag_type are None, add_finding must dedup by a
+    normalized SHA-256 hash of the description, returning the existing
+    _duplicate_finding_error shape.
+    """
+
+    def _make_state(self, ttl=300):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=ttl, clock=lambda: t[0])
+        return state, t
+
+    def _finding(
+        self,
+        state,
+        run_id: str = 'r1',
+        task_id: str | None = None,
+        flag_type: str | None = None,
+        description: str = 'informational observation',
+        **kwargs,
+    ):
+        defaults = dict(
+            run_id=run_id,
+            severity='low',
+            category='informational',
+            description=description,
+            suggested_action='none',
+            actionable=False,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_same_description_returns_duplicate_error(self):
+        """Second null-null finding with identical description → duplicate_finding."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = self._finding(state, description='same text')
+        assert 'finding_id' in first, f'First add_finding failed: {first}'
+        first_id = first['finding_id']
+
+        second = self._finding(state, description='same text')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding, got: {second}'
+        )
+        assert second['error_type'] == 'ReconReportDuplicateFinding'
+        assert second['existing_finding_id'] == first_id
+
+        # Stage report retains exactly ONE finding
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+        assert report['flagged_items'][0]['finding_id'] == first_id
+
+    def test_different_descriptions_both_allocate(self):
+        """Two null-null findings with different descriptions both get distinct ids."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        r1 = self._finding(state, description='alpha observation')
+        r2 = self._finding(state, description='beta observation')
+        assert 'finding_id' in r1, f'First failed: {r1}'
+        assert 'finding_id' in r2, f'Second failed: {r2}'
+        assert r1['finding_id'] != r2['finding_id']
+
+    def test_normalized_whitespace_and_case_dedups(self):
+        """Descriptions differing only by whitespace/case → second is a duplicate."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = self._finding(state, description='Memory is stale')
+        assert 'finding_id' in first, f'First failed: {first}'
+        first_id = first['finding_id']
+
+        # Differs only in case and extra internal whitespace
+        second = self._finding(state, description='memory  is  STALE')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected dedup on normalized description, got: {second}'
+        )
+        assert second['existing_finding_id'] == first_id
+
+        # Differs only in leading/trailing whitespace
+        third = self._finding(state, description='  Memory is stale  ')
+        assert third.get('error') == 'duplicate_finding', (
+            f'Expected dedup on whitespace-stripped description, got: {third}'
+        )
+        assert third['existing_finding_id'] == first_id
+
+    def test_null_null_independent_from_signature_dedup(self):
+        """A null-null finding and a signature finding with the same description
+        must both allocate — separate dedup namespaces."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        null_null = self._finding(state, task_id=None, flag_type=None, description='shared text')
+        assert 'finding_id' in null_null, f'null-null failed: {null_null}'
+
+        with_sig = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared text',
+            suggested_action='none',
+            actionable=False,
+            task_id='42',
+            flag_type='some_flag',
+        )
+        assert 'finding_id' in with_sig, f'sig finding failed: {with_sig}'
+        assert with_sig['finding_id'] != null_null['finding_id']
+
+    def test_cross_stage_same_description_dedups(self):
+        """Null-null identical description filed in Stage 1 then Stage 2 of the
+        SAME run_id → Stage 2 gets duplicate_finding."""
+        state, _ = self._make_state()
+
+        # Stage 1
+        state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        first = self._finding(state, run_id='r1', description='cross-stage observation')
+        assert 'finding_id' in first, f'Stage 1 failed: {first}'
+        first_id = first['finding_id']
+
+        # Stage 2 — same run_id, different stage
+        state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
+        second = self._finding(state, run_id='r1', description='cross-stage observation')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected cross-stage dedup, got: {second}'
+        )
+        assert second['existing_finding_id'] == first_id
+
+        # Stage 2's report must be empty
+        s2_report = state.get_assembled_report('r1', 'stage_two')
+        assert s2_report is not None
+        assert s2_report['flagged_items'] == []
+
+    def test_cross_run_isolation_same_description(self):
+        """Identical null-null description under different run_ids both allocate."""
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        r1 = self._finding(state, run_id='r1', description='shared observation')
+        assert 'finding_id' in r1, f'run r1 failed: {r1}'
+
+        state.start_report(run_id='r2', stage='s1', project_id='dark_factory')
+        r2 = self._finding(state, run_id='r2', description='shared observation')
+        assert 'finding_id' in r2, f'run r2 failed: {r2}'
+
+        assert r1['finding_id'] != r2['finding_id']
+
+    def test_eviction_clears_desc_index(self):
+        """After TTL eviction via tick(), _run_desc_index must not retain the
+        evicted run's hashes (prevents unbounded growth across runs)."""
+        state, t = self._make_state(ttl=300)
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        self._finding(state, run_id='r1', description='an informational note')
+        state.complete(run_id='r1', summary='done')
+
+        # Advance past TTL and evict
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+
+        # Entry is gone
+        assert state.get_assembled_report('r1', 's1') is None
+
+        # _run_desc_index must not retain r1's hashes
+        assert 'r1' not in state._run_desc_index
+
+    def test_empty_description_both_allocate(self):
+        """Blank or whitespace-only descriptions normalize to '' — each allocates
+        independently (no dedup key) rather than collapsing into one row.
+
+        This pins the design choice: empty string is not a meaningful dedup key.
+        Two observations with no description text are treated as distinct findings.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        # Two findings with empty description must both allocate
+        r1 = self._finding(state, description='')
+        r2 = self._finding(state, description='')
+        assert 'finding_id' in r1, f'First blank-desc failed: {r1}'
+        assert 'finding_id' in r2, f'Second blank-desc failed: {r2}'
+        assert r1['finding_id'] != r2['finding_id'], (
+            'Blank-description findings must not dedup — empty string is not a dedup key'
+        )
+
+        # Whitespace-only descriptions also skip dedup
+        r3 = self._finding(state, description='   ')
+        r4 = self._finding(state, description='\t  \n')
+        assert 'finding_id' in r3, f'Whitespace-only r3 failed: {r3}'
+        assert 'finding_id' in r4, f'Whitespace-only r4 failed: {r4}'
+        assert r3['finding_id'] != r4['finding_id'], (
+            'Whitespace-only findings must not dedup'
+        )
+
+    def test_eviction_partial_run_canonical_stage_cleared(self):
+        """Stage 1 holds the canonical finding; stage 2 dedups against it.
+        When stage 1 is evicted via tick(), the desc index entry must be cleaned
+        up correctly — the cleanup guard must not leave the hash dangling just
+        because another stage of the same run referenced it via duplicate_finding.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # Stage 1: file the canonical finding
+        state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        first = self._finding(state, run_id='r1', description='shared observation')
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        first_id = first['finding_id']
+
+        # Complete stage 1 so it becomes eligible for TTL eviction
+        state.complete(run_id='r1', summary='stage 1 done')
+
+        # Stage 2: same description → duplicate_finding pointing at stage 1's finding
+        state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
+        second = self._finding(state, run_id='r1', description='shared observation')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected cross-stage dedup, got: {second}'
+        )
+        assert second['existing_finding_id'] == first_id
+
+        # Advance past TTL — only stage_one has completed_at set, so only it evicts
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1, f'Expected 1 eviction, got {evicted}'
+
+        # Stage 1 entry must be gone
+        assert state.get_assembled_report('r1', 'stage_one') is None
+
+        # Stage 2 entry still exists (not completed → not eligible for eviction)
+        assert state.get_assembled_report('r1', 'stage_two') is not None
+
+        # _run_desc_index must NOT retain r1's hash after stage_one is evicted.
+        # The cleanup guard (guard against removing a hash a later entry re-registered)
+        # must not block the delete here, since stage_two never registered any hash.
+        assert 'r1' not in state._run_desc_index
