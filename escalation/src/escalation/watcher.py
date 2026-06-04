@@ -59,7 +59,7 @@ def _matches(
     """Return True iff esc is pending and satisfies the optional filters."""
     if esc.status != 'pending':
         return False
-    if esc.id in exclude_ids:
+    if esc.id in exclude_ids:  # defensive fallback: covers id/filename mismatch; filename stem pre-checks handle the normal case
         return False
     if task_id and esc.task_id != task_id:
         return False

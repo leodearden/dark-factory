@@ -383,6 +383,35 @@ class TestExcludeId:
         assert captured.out == ''
         mock_inotify.read.assert_called_once()
 
+    def test_exclude_id_json_suffix_normalized(self, tmp_path, capsys):
+        """--exclude-id with .json suffix is normalized; esc-7-1.json excludes esc-7-1."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-7-1', task_id='7', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending',
+        )
+        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', f'{esc.id}.json',
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        mock_inotify.read.assert_called_once()
+
     def test_event_loop_suppresses_excluded_event(self, tmp_path, capsys):
         """Event for an excluded file (e.g. dedupe MOVED_TO rewrite) is silently ignored."""
         queue_dir = tmp_path / 'queue'
