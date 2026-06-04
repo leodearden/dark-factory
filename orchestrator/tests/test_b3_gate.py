@@ -436,3 +436,106 @@ class TestCheckProposalMechanical:
         result = check_proposal(entry, worktree='/tmp', category=None,
                                 run_git=_fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
+
+
+# ---------------------------------------------------------------------------
+# step-11: freshness P1/P2 against a REAL git fixture
+# ---------------------------------------------------------------------------
+
+def _run_git_real(args, cwd):
+    """Real git runner for freshness tests."""
+    from orchestrator.b3_gate import _run_git
+    return _run_git(args, cwd)
+
+
+class TestCheckProposalFreshness:
+    """P1 (HEAD moved -> abort) and P2 (file-scoped main drift -> drift)."""
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _make_entry(self, head_sha, main_sha, files=None):
+        return {
+            'proposal_text': 'Fix it',
+            'risk_label': 'low',
+            'files_referenced': files or ['foo.py'],
+            'block_reason': 'test',
+            'investigated_at': '2026-06-04T09:00:00+00:00',
+            'head_sha': head_sha,
+            'main_sha': main_sha,
+        }
+
+    def _setup_repo(self, tmp_path):
+        """Create repo: main at initial commit, feature branch diverges; add foo.py."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        main_sha = _init_git_repo(repo)
+        # Create foo.py on main so it has a history
+        (repo / 'foo.py').write_text('original content')
+        p = str(repo)
+        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'add foo.py'],
+                       check=True, capture_output=True)
+        main_sha = subprocess.run(
+            ['git', '-C', p, 'rev-parse', 'main'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Diverge feature branch
+        head_sha = _diverge_feature_branch(repo)
+        assert head_sha != main_sha
+        return repo, head_sha, main_sha
+
+    def test_clean_is_fresh(self, tmp_path):
+        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_repo(tmp_path)
+        entry = self._make_entry(head_sha, main_sha)
+        result = check_proposal(entry, worktree=str(repo), category=None,
+                                run_git=_run_git, now=self._NOW)
+        assert result['verdict'] == FRESH, f'expected fresh: {result}'
+
+    def test_p1_head_moved_aborts(self, tmp_path):
+        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_repo(tmp_path)
+        entry = self._make_entry(head_sha, main_sha)
+        # Add extra commit on feature branch so HEAD moves
+        p = str(repo)
+        (repo / 'extra2.txt').write_text('more work')
+        subprocess.run(['git', '-C', p, 'add', 'extra2.txt'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'extra commit'],
+                       check=True, capture_output=True)
+        result = check_proposal(entry, worktree=str(repo), category=None,
+                                run_git=_run_git, now=self._NOW)
+        assert result['verdict'] == ABORT
+        # Reason must be git-anchored (both shas)
+        assert head_sha in result['reason'], f'expected recorded sha in reason: {result}'
+
+    def test_p2_footprint_file_changed_on_main_drifts(self, tmp_path):
+        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_repo(tmp_path)
+        entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
+        # Switch to main, change foo.py, switch back
+        p = str(repo)
+        subprocess.run(['git', '-C', p, 'checkout', 'main'], check=True, capture_output=True)
+        (repo / 'foo.py').write_text('updated content')
+        subprocess.run(['git', '-C', p, 'add', 'foo.py'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'update foo.py on main'],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'checkout', 'feature'], check=True, capture_output=True)
+        result = check_proposal(entry, worktree=str(repo), category=None,
+                                run_git=_run_git, now=self._NOW)
+        assert result['verdict'] == DRIFT, f'expected drift: {result}'
+
+    def test_p2_non_footprint_file_changed_on_main_still_fresh(self, tmp_path):
+        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        repo, head_sha, main_sha = self._setup_repo(tmp_path)
+        # footprint is foo.py only; change bar.py on main (not in footprint)
+        entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
+        p = str(repo)
+        subprocess.run(['git', '-C', p, 'checkout', 'main'], check=True, capture_output=True)
+        (repo / 'bar.py').write_text('new file')
+        subprocess.run(['git', '-C', p, 'add', 'bar.py'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'add bar.py on main'],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'checkout', 'feature'], check=True, capture_output=True)
+        result = check_proposal(entry, worktree=str(repo), category=None,
+                                run_git=_run_git, now=self._NOW)
+        assert result['verdict'] == FRESH, f'expected fresh (outside footprint): {result}'
