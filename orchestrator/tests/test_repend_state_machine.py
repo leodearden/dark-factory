@@ -352,8 +352,8 @@ class TestEscalationServerSeamB9B13:
         assert filed.severity == 'blocking', (
             f'Non-sentinel critical must be downgraded to blocking; got {filed.severity!r}'
         )
-        assert filed.level != 2, (
-            f'Downgraded record must not be born-at-L2 (level should be 0); got level={filed.level}'
+        assert filed.level == 0, (
+            f'Downgraded record must be level 0; got level={filed.level}'
         )
         assert filed.summary.endswith('[downgraded:critical]'), (
             f"Summary must end with '[downgraded:critical]'; got {filed.summary!r}"
@@ -508,9 +508,22 @@ class TestClusterActionsB4B5:
         harness.scheduler.lock_table = MagicMock()
         harness.scheduler.lock_table._held = set()
 
-        # Members reported as 'deferred' (not 'blocked') — sweep ignores them.
+        # Positive control: a 'blocked' sibling that the sweep DOES file for,
+        # proving the sweep actually ran and the deferred members were skipped by
+        # status — not for an unrelated reason (e.g. the loop never executing).
+        ctrl_id = 'task-b4-ctrl'
+        _make_resolved_l1(queue, 'esc-b4-ctrl-prior', ctrl_id)
+        # Clear event tracking so the control task is not gated by in-flight events.
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+
+        # Members reported 'deferred' (filtered by _RECONCILE_SWEEP_STATUSES);
+        # control is 'blocked' so the sweep processes it.
         harness.scheduler.get_statuses = AsyncMock(
-            return_value=({'task-b4-a': 'deferred', 'task-b4-b': 'deferred'}, None)
+            return_value=(
+                {'task-b4-a': 'deferred', 'task-b4-b': 'deferred', ctrl_id: 'blocked'},
+                None,
+            )
         )
         harness.scheduler.get_task = AsyncMock(return_value=None)
 
@@ -518,7 +531,7 @@ class TestClusterActionsB4B5:
             harness.scheduler.set_task_status = AsyncMock()
             await harness._reconcile_stranded_in_progress()
 
-            # No stranded_blocked escalation should have been filed.
+            # Deferred members: no stranded_blocked filed.
             for tid in ('task-b4-a', 'task-b4-b'):
                 new_filed = queue.get_by_task(tid, status='pending')
                 stranded = [e for e in new_filed if e.category == 'stranded_blocked']
@@ -526,6 +539,15 @@ class TestClusterActionsB4B5:
                     f'Sweep must not file stranded_blocked for deferred task {tid}; '
                     f'got {stranded}'
                 )
+
+        # Positive control: ctrl_id was filed in pass 1 (self-dedup suppressed pass 2),
+        # proving the sweep ran and deferred members were filtered by status.
+        ctrl_filed = queue.get_by_task(ctrl_id, status='pending')
+        ctrl_stranded = [e for e in ctrl_filed if e.category == 'stranded_blocked']
+        assert len(ctrl_stranded) == 1, (
+            f'Sweep must file exactly 1 stranded_blocked for blocked control {ctrl_id!r}; '
+            f'got {ctrl_stranded}'
+        )
 
     async def test_b5_abandon_born_at_l2_cancelled_sweep_ignores(
         self, harness: Harness, tmp_path: Path
@@ -570,16 +592,32 @@ class TestClusterActionsB4B5:
         harness.scheduler.get_task = AsyncMock(return_value=None)
         harness.scheduler.set_task_status = AsyncMock()
 
-        # Task reported as 'cancelled' — not in blocked set → not swept.
+        # Positive control: a 'blocked' sibling that the sweep DOES file for,
+        # proving the sweep ran and the cancelled task was filtered by status.
+        ctrl_id = 'task-b5-ctrl'
+        _make_resolved_l1(queue, 'esc-b5-ctrl-prior', ctrl_id)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+
+        # Cancelled task not in _RECONCILE_SWEEP_STATUSES → skipped; control is 'blocked'.
         harness.scheduler.get_statuses = AsyncMock(
-            return_value=({task_id: 'cancelled'}, None)
+            return_value=({task_id: 'cancelled', ctrl_id: 'blocked'}, None)
         )
 
         await harness._reconcile_stranded_in_progress()
 
+        # Cancelled task: no stranded_blocked filed.
         stranded = queue.get_by_task(task_id, status='pending')
         assert not stranded, (
             f'Sweep must not file stranded_blocked for cancelled task; got {stranded}'
+        )
+
+        # Positive control: ctrl_id filed (proves sweep ran).
+        ctrl_filed = queue.get_by_task(ctrl_id, status='pending')
+        ctrl_stranded = [e for e in ctrl_filed if e.category == 'stranded_blocked']
+        assert len(ctrl_stranded) == 1, (
+            f'Sweep must file exactly 1 stranded_blocked for blocked control {ctrl_id!r}; '
+            f'got {ctrl_stranded}'
         )
 
 
@@ -847,8 +885,7 @@ class TestReblockGuardB11B12:
         guard = task_state['metadata'].get('reblock_guard')
         assert guard is not None and guard['count'] == 1
 
-        # Simulate workflow cycle: pending → in-progress → blocked.
-        task_state['status'] = 'in-progress'
+        # Advance state to 'blocked' for the 2nd flip.
         task_state['status'] = 'blocked'
 
         # 2nd flip.
