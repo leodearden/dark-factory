@@ -69,7 +69,6 @@ from dashboard.data.merge_queue import (
     load_task_titles,
     resolve_active,
 )
-from dashboard.data.redux_api import _project_label
 from dashboard.data.metrics import (
     METRICS_SCHEMA,
     collect_metrics_snapshot,
@@ -99,6 +98,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
+from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
