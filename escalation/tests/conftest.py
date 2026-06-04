@@ -54,11 +54,17 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     if 'shared.async_sqlite_base' not in sys.modules:
         _async_base_stub = types.ModuleType('shared.async_sqlite_base')
         _CheckpointResult = collections.namedtuple('CheckpointResult', ['log', 'checkpointed'])
-        _async_base_stub.CheckpointResult = _CheckpointResult
-        _async_base_stub.AsyncSqliteBase = type('AsyncSqliteBase', (), {})
-        _async_base_stub.apply_full_durability_pragmas = lambda *a, **kw: None
-        _async_base_stub.apply_wal_pragmas = lambda *a, **kw: None
-        _async_base_stub.connect_daemon = lambda *a, **kw: None
+        # Populate via __dict__.update: pyright rejects attribute assignment on a
+        # bare ModuleType instance (reportAttributeAccessIssue), but a module
+        # namespace is a plain dict[str, Any], so this is runtime-equivalent and
+        # type-clean.
+        _async_base_stub.__dict__.update(
+            CheckpointResult=_CheckpointResult,
+            AsyncSqliteBase=type('AsyncSqliteBase', (), {}),
+            apply_full_durability_pragmas=lambda *a, **kw: None,
+            apply_wal_pragmas=lambda *a, **kw: None,
+            connect_daemon=lambda *a, **kw: None,
+        )
         sys.modules['shared.async_sqlite_base'] = _async_base_stub
 
     for _p in (str(_SHARED_SRC), str(_ORCH_SRC)):
