@@ -172,6 +172,14 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 ## Aborting
 
 On any ABORT:
+- **Cancel any live durable-intent entry.** If the ABORT occurs AFTER a successful
+  `merge_request` submission (i.e., a `request_id` was returned — which excludes the
+  `already_merged` fast-path, which returns no `request_id`), call
+  `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else. This prevents
+  an orphaned durable-intent entry (PRD D2 — submitted merges now outlive the MCP call and
+  session) from accumulating. `merge_cancel` never raises and is a safe no-op if the entry
+  already finalized (it returns `cancelled: false` with the terminal state). A coalesced or
+  `attached` `request_id` may resolve to `state: "unknown"` — treat the cancel as best-effort.
 - **Do NOT change the task status** beyond the `blocked` park that `release_workflow` already applied
   (that is the safe, sweep-immune state — leave it there).
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
