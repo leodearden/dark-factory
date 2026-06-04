@@ -95,6 +95,29 @@ auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
 advances the chain is broken and the request is escalated to humans via a 'blocked'
 outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
 
+_MERGE_AHEAD_BOUND = 1
+"""Maximum number of counted (non-speculative, non-train) items that may sit in
+the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
+
+With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
+Verifier: after enqueuing a counted item the Merger blocks at
+``_merge_ahead_cap.acquire()`` until the Verifier drains that item, at which
+point it re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are
+safe; higher values allow more build-ahead but increase staleness risk.
+
+Cap invariants (all verified by integration tests):
+- Acquired at the single success-enqueue site in _merger_loop for non-speculative
+  blocking-path items (trains continue before this site; speculative items are
+  governed by _speculation_slot instead).
+- Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
+  returns a non-None item, before any branching or item reassignment.  This
+  uniform placement covers all drain paths (normal verify, immediate_outcome,
+  chain-invalidation discard+_remerge, abandoned early-continue) with a single
+  release point and no risk of double-release (each counted item has exactly one
+  drain in the FIFO).
+- Released by stop() (over-release of a plain Semaphore is safe) so a merger
+  blocked at acquire() unblocks cleanly at shutdown."""
+
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
 
@@ -2681,6 +2704,7 @@ class SpeculativeItem:
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
+    counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
 
 class _TrainMergeHost(Protocol):
@@ -3615,6 +3639,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
         self._speculation_slot.set()  # initially free
+        # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
+        # build-ahead to _MERGE_AHEAD_BOUND items in the verifier queue.
+        # Plain Semaphore (not BoundedSemaphore) so stop() may over-release
+        # without raising.  Released ON-DRAIN (right after verifier_queue.get()
+        # for a counted item) so the slot is free while verify runs.
+        self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -3764,9 +3794,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
         shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
-        # Release speculation slot and WIP halt so merger doesn't hang waiting
+        # Release speculation slot, WIP halt, and merge-ahead cap so the merger
+        # doesn't hang waiting at any of the three synchronisation points.
+        # Over-releasing a plain Semaphore is safe (it just increments the counter).
         self._speculation_slot.set()
         self._wip_halt.set()
+        for _ in range(_MERGE_AHEAD_BOUND + 1):
+            self._merge_ahead_cap.release()
 
         # Drain main queue
         while not self._queue.empty():
@@ -4200,14 +4234,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         and merge_result.pre_merge_sha is not None
                         and merge_result.pre_merge_sha == base_for_merge
                     )
-                    await self._verifier_queue.put(SpeculativeItem(
-                        request=req, merge_result=merge_result,
-                        merge_wt=merge_result.merge_worktree,
-                        base_sha=base_for_merge, speculative=speculative,
-                        skip_verify=skip_verify,
-                        started_monotonic=t0,
-                        merged_branch_tip=branch_head,  # γ2: branch tip at merge time
-                    ))
+                    # Mechanism 1: cap non-speculative build-ahead.
+                    # Trains (continue before this) and immediate-outcome guards
+                    # (all return above) never reach this site, so `not speculative`
+                    # is the exact predicate for blocking-path items.
+                    counts_against_cap = not speculative
+                    if counts_against_cap:
+                        await self._merge_ahead_cap.acquire()
+                    try:
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=merge_result,
+                            merge_wt=merge_result.merge_worktree,
+                            base_sha=base_for_merge, speculative=speculative,
+                            skip_verify=skip_verify,
+                            started_monotonic=t0,
+                            merged_branch_tip=branch_head,  # γ2: branch tip at merge time
+                            counts_against_cap=counts_against_cap,
+                        ))
+                    except BaseException:
+                        # put() failed — the verifier will never drain this item
+                        # and release the cap.  Release it here to prevent the
+                        # merger from deadlocking at the next acquire.
+                        #
+                        # Double-release edge case: if CancelledError is raised
+                        # at the `await` boundary AFTER put() already enqueued
+                        # the item (a narrow asyncio race), this release fires
+                        # AND the verifier releases again on drain — two releases
+                        # for one acquire.  This is intentionally tolerated:
+                        # asyncio.Semaphore allows over-release (its counter
+                        # simply increments past the original bound).
+                        # Do NOT replace with asyncio.BoundedSemaphore, which
+                        # raises ValueError on over-release and would crash here.
+                        if counts_against_cap:
+                            self._merge_ahead_cap.release()
+                        raise
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-1 cap) ──────────────────
@@ -4330,6 +4390,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if item is None:
                 break  # shutdown sentinel
 
+            # Mechanism 1: release the merger-ahead cap ON-DRAIN — immediately
+            # after get(), before any branching or item reassignment, so every
+            # drain path (normal verify, immediate_outcome, discard/_remerge,
+            # abandoned early-continue) is covered uniformly and the flag is
+            # captured before _remerge could reassign `item`.
+            if item.counts_against_cap:
+                self._merge_ahead_cap.release()
+
             req = item.request
             # Track whether THIS iteration performs a re-merge so we can
             # propagate the chain-invalidation flag to the next iteration.
@@ -4350,11 +4418,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
 
             try:
-                # ── Discard stale speculative merge when chain is invalidated ─
-                # Two cases: (1) N failed directly (n_failed=True); (2) a prior
-                # iteration re-merged, meaning the Merger's spec_base for this
-                # item descended from a commit that never reached main.
+                # ── Unified re-merge site (Mechanism 2 + existing chain-invalidation) ─
+                #
+                # remerge_reason is set when the item must be re-merged:
+                #   'previous_failed'    — N failed verify (n_failed=True)
+                #   'chain_invalidated'  — a prior iteration re-merged; this item's
+                #                          spec_base descends from a stale commit
+                #   'main_advanced'      — real (non-speculative, non-train) item whose
+                #                          base_sha != current main (Mechanism 2,
+                #                          task 1646: freshness re-base at verify-pickup)
+                #
+                # The elif ordering guarantees:
+                #   • chain-invalidation is evaluated first so a speculative item that
+                #     is ALSO stale-base is not double-re-merged;
+                #   • 'main_advanced' only fires for real items (immediate_outcome is
+                #     None, merge_result is not None, not a train) that are not already
+                #     covered by chain-invalidation above.
+                remerge_reason: str | None = None
                 if item.speculative and (n_failed or remerge_occurred):
+                    remerge_reason = 'previous_failed' if n_failed else 'chain_invalidated'
+                elif (
+                    item.immediate_outcome is None
+                    and item.merge_result is not None
+                    and not isinstance(req, GroupMergeRequest)
+                ):
+                    # Mechanism 2: check staleness at pickup for real items.
+                    # Reading main once per non-speculative pickup adds one git
+                    # rev-parse per item — negligible vs. the merge/verify cost.
+                    #
+                    # Train exemption (D9/I6, boundary test 12):
+                    # GroupMergeRequest trains are exempt via two independent guards:
+                    #   1. `item.immediate_outcome is None` — trains always set
+                    #      immediate_outcome from _do_train_merge, so this is False
+                    #      and the elif is skipped for every train.
+                    #   2. `not isinstance(req, GroupMergeRequest)` — explicit
+                    #      defense-in-depth so the exemption is clear at the
+                    #      call site independent of the immediate_outcome contract.
+                    # Trains are also structurally exempt from Mechanism 1: the
+                    # GroupMergeRequest `continue` in _merger_loop executes before
+                    # the _merge_ahead_cap.acquire() site, so trains never acquire
+                    # the cap (counts_against_cap defaults to False).
+                    current_main = await self._git_ops.get_main_sha()
+                    if item.base_sha != current_main:
+                        remerge_reason = 'main_advanced'
+
+                if remerge_reason is not None:
                     # Set flag early so an exception during cleanup/_remerge still
                     # propagates chain invalidation to the next iteration.
                     iteration_did_remerge = True
@@ -4367,18 +4475,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # operators can distinguish it from normal verification.
                     self._verify_item = item
                     self._verify_phase = 'remerging'
-                    # Clean up the stale merge worktree (merged against a commit
-                    # that never reached main).
+                    # Clean up the stale merge worktree.
                     if item.merge_wt:
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
-                    discard_reason = 'previous_failed' if n_failed else 'chain_invalidated'
                     self._emit_speculative(
                         EventType.speculative_discard, req.task_id,
-                        reason=discard_reason,
+                        reason=remerge_reason,
                     )
                     logger.info(
-                        f'Task {req.task_id}: discarding stale speculative merge '
-                        f'({discard_reason}), re-merging against actual main'
+                        f'Task {req.task_id}: discarding stale merge '
+                        f'({remerge_reason}), re-merging against actual main'
                     )
                     item = await self._remerge(req, item.started_monotonic)
                     # Update _verify_item to the freshly re-merged item; phase stays
