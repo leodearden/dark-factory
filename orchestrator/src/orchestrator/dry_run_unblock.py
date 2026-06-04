@@ -247,6 +247,30 @@ async def run_dry_run_unblock(
     except Exception as exc:
         logger.error('dry_run_unblock: failed to persist proposal for task %s: %s', task_id, exc)
 
+    # Best-effort keep-last-N trim: read the full metadata blob, slice
+    # dry_run_proposals to the most recent keep_last entries, rewrite the
+    # whole blob (append=False preserves sibling keys like memory_hints/files).
+    # Wrapped in its own try/except — a trim failure never crashes the hook.
+    # keep_last <= 0 disables trimming.
+    # Note: existing MagicMock-scheduler tests stay green because their
+    # scheduler.get_task is non-awaitable — raises TypeError, is caught here,
+    # and only the single append=True call persists.
+    try:
+        keep_last = ua_cfg.b3_proposal_keep_last
+        if keep_last and keep_last > 0:
+            task = await scheduler.get_task(task_id)
+            if task:
+                metadata = task.get('metadata') or {}
+                proposals = metadata.get('dry_run_proposals') or []
+                if len(proposals) > keep_last:
+                    metadata['dry_run_proposals'] = proposals[-keep_last:]
+                    await scheduler.update_task(task_id, metadata, append=False)
+    except Exception as exc:
+        logger.warning(
+            'dry_run_unblock: trim failed for task %s (best-effort, continuing): %s',
+            task_id, exc,
+        )
+
     if event_store and result is not None:
         try:
             from orchestrator.event_store import EventType
