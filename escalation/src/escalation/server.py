@@ -1217,4 +1217,39 @@ def create_server(
             'hint': _MERGE_STATUS_UNKNOWN_HINT,
         }
 
+    # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
+
+    @mcp.tool()
+    async def merge_cancel(request_id: str) -> dict[str, Any]:
+        """Cancel an in-flight merge request by cancelling its waiter future.
+
+        Looks up the waiter registered by merge_request for *request_id* in the
+        server-side _waiters store and cancels its future.  This triggers, via
+        callbacks already wired by α1/β1:
+          - MergeWorker._request_abandoned: drops the request without halting the queue
+          - InFlightMergeRegistry: releases the branch slot via the acquire-time done-cb
+          - _on_finalized: records terminal state 'abandoned' to retention/event-store
+
+        Returns {cancelled: bool, state: str, reason: str | None}.
+        reason is None only on a successful cancel; always present otherwise.
+        state uses the same coarse vocabulary as merge_status (reusing _map_terminal_state).
+        """
+        rec = _waiters.get(request_id)
+
+        if rec is None:
+            # No live waiter — finalized+popped, never submitted, or server restarted.
+            # Durable-tier consult added in step-10; for now return unknown.
+            return {
+                'cancelled': False,
+                'state': 'unknown',
+                'reason': (
+                    f'No in-flight waiter for request_id {request_id!r} '
+                    '(already finalized, never submitted, or server restarted).'
+                ),
+            }
+
+        # Pending waiter — cancel the future.
+        rec.future.cancel()
+        return {'cancelled': True, 'state': 'abandoned', 'reason': None}
+
     return mcp
