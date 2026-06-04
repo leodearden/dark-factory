@@ -1256,6 +1256,20 @@ def create_server(
                 'reason': 'Request was already cancelled.',
             }
 
+        if rec.future.done():
+            # Mid-finalize window: the future resolved (not cancelled) but the
+            # call_soon-scheduled _waiters.pop done-callback hasn't run yet.
+            # Defensive: excepted futures are abnormal; treat as 'blocked'.
+            if rec.future.exception() is not None:
+                state: str = 'blocked'
+            else:
+                state = _map_terminal_state(rec.future.result().status)
+            return {
+                'cancelled': False,
+                'state': state,
+                'reason': 'Request already finalized; cannot cancel.',
+            }
+
         # Pending waiter — cancel the future.
         rec.future.cancel()
         return {'cancelled': True, 'state': 'abandoned', 'reason': None}
