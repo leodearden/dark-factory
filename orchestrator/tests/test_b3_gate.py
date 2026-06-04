@@ -628,3 +628,165 @@ class TestResolveCap:
         cfg_file = tmp_path / 'config.yaml'
         cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 10\n')
         assert _resolve_cap(str(cfg_file)) == 10
+
+
+# ---------------------------------------------------------------------------
+# step-17: CLI main() wiring for all three verbs, JSON to stdout
+# ---------------------------------------------------------------------------
+
+class TestCLIMain:
+    """Test the three CLI verbs via main(argv)."""
+
+    _NOW_ISO = '2026-06-04T12:00:00+00:00'
+    _NOW = datetime.fromisoformat(_NOW_ISO)
+
+    def _setup_repo_and_db(self, tmp_path):
+        """Create a git repo + seeded tasks.db with a fresh low-risk proposal.
+
+        Returns (repo_path, project_root, head_sha, main_sha).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        head_sha = _diverge_feature_branch(repo)
+        # main sha is the sha before we diverged
+        main_sha = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', 'main'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        root = tmp_path / 'root'
+        root.mkdir()
+
+        entry = {
+            'proposal_text': 'Fix the bug',
+            'risk_label': 'low',
+            'files_referenced': [],
+            'block_reason': 'test blocked',
+            'investigated_at': '2026-06-04T10:00:00+00:00',
+            'head_sha': head_sha,
+            'main_sha': main_sha,
+        }
+        _seed_tasks_db(root, 42, [entry])
+        return repo, root, head_sha, main_sha
+
+    def test_check_fresh_verdict_json(self, tmp_path, capsys):
+        """check verb: prints a single JSON object with verdict=='fresh'."""
+        from orchestrator.b3_gate import main
+        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+
+        rc = main([
+            'check',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+            '--category', 'task_failure',
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0, f'expected exit 0, got {rc}'
+
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)  # must be parseable JSON
+        assert data['verdict'] == 'fresh', f'expected fresh: {data}'
+        assert data['cap_remaining'] == 6
+        assert data['already_attempted'] is False
+        assert 'age_seconds' in data
+        assert 'reason' in data
+
+    def test_record_launch_first_call(self, tmp_path, capsys):
+        """record-launch verb: first call prints {recorded:True, already_attempted:False}."""
+        from orchestrator.b3_gate import main
+        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+
+        rc = main([
+            'record-launch',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+        ])
+        assert rc == 0
+
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+        assert data['recorded'] is True
+        assert data['already_attempted'] is False
+
+    def test_record_launch_idempotent_second_call(self, tmp_path, capsys):
+        """record-launch verb: second identical call prints already_attempted:True."""
+        from orchestrator.b3_gate import main
+        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+
+        argv = ['record-launch', '--task-id', '42',
+                '--worktree', str(repo), '--project-root', str(root)]
+        main(argv)
+        capsys.readouterr()  # discard first call output
+
+        rc = main(argv)
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+        assert data['recorded'] is False
+        assert data['already_attempted'] is True
+
+    def test_check_after_record_launch_reports_already_attempted(self, tmp_path, capsys):
+        """check verb: after record-launch, already_attempted==True."""
+        from orchestrator.b3_gate import main
+        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+
+        # Record launch first
+        main(['record-launch', '--task-id', '42',
+              '--worktree', str(repo), '--project-root', str(root)])
+        capsys.readouterr()
+
+        # Now check — already_attempted must be True
+        rc = main([
+            'check',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+        assert data['already_attempted'] is True
+
+    def test_charge_succeeds_remaining_five(self, tmp_path, capsys):
+        """charge verb: first charge prints {charged:True, remaining:5} (default cap=6)."""
+        from orchestrator.b3_gate import main
+        _, root, _, _ = self._setup_repo_and_db(tmp_path)
+
+        rc = main([
+            'charge',
+            '--task-id', '42',
+            '--project-root', str(root),
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+        assert data['charged'] is True
+        assert data['remaining'] == 5
+
+    def test_each_verb_prints_single_parseable_json(self, tmp_path, capsys):
+        """Each verb call prints exactly one parseable JSON line to stdout."""
+        from orchestrator.b3_gate import main
+        repo, root, head_sha, main_sha = self._setup_repo_and_db(tmp_path)
+
+        for argv in [
+            ['check', '--task-id', '42', '--worktree', str(repo),
+             '--project-root', str(root), '--now', self._NOW_ISO],
+            ['record-launch', '--task-id', '42', '--worktree', str(repo),
+             '--project-root', str(root)],
+            ['charge', '--task-id', '42', '--project-root', str(root),
+             '--now', self._NOW_ISO],
+        ]:
+            rc = main(argv)
+            assert rc == 0, f'expected exit 0 for {argv[0]}'
+            out = capsys.readouterr().out.strip()
+            # Must be a single parseable JSON object
+            parsed = json.loads(out)
+            assert isinstance(parsed, dict), f'expected dict, got {type(parsed)}'
+            # stdout must not have stray lines
+            assert '\n' not in out.strip() or out.strip().count('\n') == 0, \
+                f'multiple lines in stdout for {argv[0]}'
