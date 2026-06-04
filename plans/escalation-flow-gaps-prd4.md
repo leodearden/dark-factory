@@ -75,6 +75,13 @@ re-open of the DONE PRD-2 tasks. **If a single owner is wanted for that sweep, f
 new task depending on 1635 + 1638** — deliberately left unfiled here because β5/β6 may already
 leave the rationale coherent enough; decide after β6/β5 land.
 
+> **RESOLVED 2026-06-04 (human approved):** filed as **task 1648** (decide-and-implement-if-
+> needed; deps 1635 + 1638 — 1638 transitively covers β3–β7 incl. β6). If the post-flip prose
+> is already coherent, 1648 closes with a note and no edit; otherwise a minimal sweep confined
+> to the B3 subsection. Acceptance: no remaining unbounded-blocking claim anywhere in
+> escalation-watcher/SKILL.md; B3 rationale consistent with unblock-low-risk/SKILL.md and the
+> final merge_request docstring shapes.
+
 **Disjoint seams confirmed, no action (see no_action list):** merge_queue.py (PRD-4-exclusive,
 corroborated by task 1645's reciprocal invariant); workflow.py:3815-3854 (γ3/1641) vs the
 PRD-3 gates at :1186/:3093/:3442 (line-disjoint, module-locked); γ2/1640's blocking (NOT
