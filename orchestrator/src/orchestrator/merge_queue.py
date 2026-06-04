@@ -530,6 +530,25 @@ async def _finalize_advanced_merge(
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
+        # γ2: if chain_ctx is wired, try to discriminate whether the
+        # branch tip advanced mid-verify and auto-chain gen-(n+1).
+        if chain_ctx is not None:
+            chained = await _maybe_auto_chain_generation(
+                req, advanced_sha, git_ops, event_store,
+                merged_branch_tip=merged_branch_tip,
+                counts=chain_ctx.counts,
+                queue=chain_ctx.queue,
+                max_auto_generations=chain_ctx.max_auto_generations,
+            )
+            if chained is not None:
+                _emit_merge_attempt(
+                    event_store, req.task_id,
+                    'post_merge_generation_chained',
+                    duration_ms=_elapsed_ms(started_monotonic),
+                    train_id=train_id,
+                    member_task_ids=member_task_ids,
+                )
+                return chained
         return MergeOutcome(
             'blocked',
             reason=(
@@ -578,6 +597,10 @@ async def _finalize_advanced_merge(
         train_id=train_id,
         member_task_ids=member_task_ids,
     )
+    # γ2: clean landing — reset the per-branch generation chain counter
+    # so consecutive tip-advances count is cleared for this branch.
+    if chain_ctx is not None:
+        chain_ctx.counts.pop(req.branch, None)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 

@@ -9354,24 +9354,27 @@ class TestFinalizeAdvancedMerge:
         """(b) chain_ctx + merged_branch_tip + SUPERSET advance → returns superseded,
         enqueues gen-(n+1) request."""
         from orchestrator.merge_queue import (
+            MergeRequest,
             TipRelation,
             _GenerationChainContext,
             _finalize_advanced_merge,
         )
 
         git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.branch = 'task/t-chain'
-        req.worktree = tmp_path
-        req.generation = 1
-        req.task_id = 'task-chain'
-        req.pre_rebased = False
-        req.task_files = None
-        req.module_configs = []
-        req.snapshot_tip = None
-        loop = asyncio.get_event_loop()
-        req.result = loop.create_future()
-        # Make req a real MergeRequest-like object (use MagicMock attribute overrides above)
+        # _maybe_auto_chain_generation calls dataclasses.replace(req, ...) so
+        # we need a real MergeRequest (not MagicMock) for the chaining path.
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='task-chain',
+            branch='task/t-chain',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         counts: dict[str, int] = {}
