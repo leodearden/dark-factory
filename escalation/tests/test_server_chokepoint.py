@@ -1525,11 +1525,11 @@ class TestMergeCancel:
         rid = result_mr['request_id']
 
         # First cancel — must succeed
-        first = await tool.fn(request_id=rid)
+        first = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         assert first.get('cancelled') is True, f'First cancel must succeed: {first}'
 
         # Second cancel — no awaited suspension here, so _waiters.pop callback hasn't run
-        second = await tool.fn(request_id=rid)
+        second = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
 
         assert second.get('cancelled') is False, (
             f"Expected cancelled=False on double-cancel, got: {second}"
@@ -1597,7 +1597,7 @@ class TestMergeCancel:
         )
 
         # Immediately cancel (no intervening awaited suspension)
-        result = await tool.fn(request_id=rid)
+        result = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
 
         assert result.get('cancelled') is False, (
             f"Expected cancelled=False for mid-finalize window, got: {result}"
