@@ -10400,3 +10400,49 @@ class TestSnapshotExposesRequestId:
             f"snapshot entry['request_id']={entry['request_id']!r} "
             f"!= req.request_id={req.request_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-5 RED: WaiterRecord dataclass contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWaiterRecordContract:
+    """β1 step-5 RED: WaiterRecord dataclass contract.
+
+    RED until step-6 impl: WaiterRecord does not exist (ImportError).
+    """
+
+    async def test_waiter_record_fields(self):
+        """Construct WaiterRecord and verify all field contracts."""
+        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        wr = WaiterRecord(request_id='mr-x', future=fut)
+
+        assert wr.request_id == 'mr-x'
+        assert wr.future is fut
+        assert wr.source == 'mcp'          # default
+        assert wr.submitted_tip is None    # default
+
+    async def test_waiter_record_explicit_source_and_tip(self):
+        """Explicit source and submitted_tip are stored correctly."""
+        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        wr = WaiterRecord(
+            request_id='mr-y',
+            future=fut,
+            source='workflow',
+            submitted_tip='abc123def456',
+        )
+
+        assert wr.request_id == 'mr-y'
+        assert wr.future is fut
+        assert wr.source == 'workflow'
+        assert wr.submitted_tip == 'abc123def456'
