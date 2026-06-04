@@ -205,10 +205,84 @@ The merge procedure is iterative — don't assume one pass will be enough:
 4. Fix any failures.
 5. On green: rebase on main again — other tasks may have merged while you were fixing.
 6. Repeat steps 3-5 until stable (rebase is clean AND verification passes with no new changes needed).
-7. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
-8. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha-of-merge>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main (the normal case — merge_request returns the SHA). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* This keeps the step correct under both server modes — the legacy `wait_secs=None` default and the post-β8 `wait_secs=0` default. `queued` or `attached` responses are successful submissions (durable intent), never failures.
+
+   Submit to the merge queue with an explicit bounded wait:
+   ```
+   result = mcp__escalation__merge_request(
+       task_id="<TASK_ID>",
+       branch="task/<TASK_ID>",
+       worktree="<WORKTREE>",
+       description="<brief description of what landed>",
+       wait_secs=100,
+   )
+   ```
+   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s.
+
+   **Classify the immediate response** (`merge_request` discriminates on `status`):
+
+   - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
+     - Normal `done`: SHA is in `result["commit"]`.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive from `git log main --oneline | head -5` or fall back to `done_provenance={"note": "merge already present on main"}`.
+
+     Go directly to step 8.
+
+   - `status: "queued"` or `status: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
+     ```
+     request_id = result["request_id"]
+     poll_interval = 15  # seconds; ramp up to 60 s
+     loop:
+         sleep(poll_interval)
+         poll = mcp__escalation__merge_status(request_id=request_id)
+         if poll["state"] in ("done", "conflict", "blocked", "abandoned", "unknown"):
+             break  # any terminal (or restart/unknown) state
+         eta = poll.get("eta_seconds") or poll_interval * 2  # eta_seconds may be None
+         poll_interval = min(max(eta, 15), 60)
+     ```
+     After the loop exits, dispatch on `poll["state"]`:
+     - `"done"` → `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash). Re-derive the merge commit from git:
+       ```
+       git log main --oneline | head -5
+       ```
+       Thread the first commit SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
+     - `"conflict"`, `"blocked"`, `"abandoned"`, or `"unknown"` → see *Polled terminal failures* below.
+
+   *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
+
+8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
+
+**Merge-step failure and abandonment edges:**
+
+*Immediate-response failures (from `merge_request`):*
+
+- `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
+- `status: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
+- `status: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
+- `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge:
+  ```
+  git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
+  git push origin main               # advance the remote ref so downstream dispatch sees it
+  ```
+  Note: this fallback bypasses the merge worker's verification step — rely on the prior steps 3–6 verification to ensure correctness. Then proceed to step 8 with the resulting commit SHA.
+
+*Polled terminal failures (from `merge_status`):*
+
+- `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
+- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → fall back to confirming whether the merge already landed:
+  ```
+  git log main --oneline | head -5
+  ```
+  If the merge commit is present, proceed to step 8 with that SHA. If not, loop back to step 7.
+
+*Abandonment (`merge_cancel`):*
+
+To abandon a submitted merge (e.g. the task needs redesign after submission):
+```
+mcp__escalation__merge_cancel(request_id=request_id)
+```
+Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — fall back to `mcp__escalation__merge_status(request_id)` or `git log main --oneline | head -5` to confirm whether the merge landed before deciding next steps.
 
 *If this is an escalated task (pending escalation, agent is paused):*
 
