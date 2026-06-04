@@ -1170,3 +1170,129 @@ class TestMergeRequestWaitSecsZeroAttached:
 
         # Clean up the never-resolving future to avoid ResourceWarning
         never_future.cancel()
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-11 RED: wait_secs>0 bounded wait — happy path + clamp/timeout/shield
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestWaitSecsPositive:
+    """β1 step-11 RED: wait_secs>0 bounded wait with clamp, timeout, and shield.
+
+    RED until step-12 impl: wait_secs>0 falls through to the unbounded
+    asyncio.shield(future) → blocks forever → wait_for(timeout=2) raises
+    TimeoutError for scenario (b).  Scenario (a) happens to pass (worker
+    resolves quickly) but (b) is the regression driver.
+    """
+
+    async def test_wait_secs_positive_happy_path(self, tmp_path: Path):
+        """wait_secs=5: worker resolves quickly → terminal 'done' shape returned.
+
+        A background worker dequeues the MergeRequest and resolves it with
+        MergeOutcome('done').  The call must return the terminal outcome shape
+        before the timeout.
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        captured_req: list = []
+
+        async def _worker():
+            req = await mq.get()
+            captured_req.append(req)
+            req.result.set_result(MergeOutcome('done', reason='fast worker'))
+
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='task-wp',
+                branch='task-wp',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=5,
+            ),
+            timeout=5.0,
+        )
+        await worker_task
+
+        # Must return the terminal outcome shape
+        assert result.get('status') == 'done', (
+            f"Expected status='done', got: {result}"
+        )
+        assert 'request_id' in result, f'Missing request_id: {result}'
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+        for key in ('reason', 'conflict_details', 'push_status', 'commit'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+
+    async def test_wait_secs_clamp_timeout_shield(self, tmp_path: Path, monkeypatch):
+        """wait_secs=600 clamped to _MAX_WAIT_SECS (monkeypatched to 0.1):
+        times out → returns 'queued' shape; entry survives (not cancelled).
+
+        Monkeypatch escalation.server._MAX_WAIT_SECS to 0.1 so the clamp
+        fires immediately.  NO worker resolves the future.  The call must
+        return the non-terminal 'queued' shape within the outer wait_for
+        timeout (2 s).  The enqueued entry's future must NOT be cancelled
+        (asyncio.shield ensures the timeout cancels only the outer wait,
+        not req.result).
+        """
+        import escalation.server as _srv
+
+        monkeypatch.setattr(_srv, '_MAX_WAIT_SECS', 0.1)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='task-ct',
+                branch='task-ct',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=600,
+            ),
+            timeout=2.0,
+        )
+
+        # Must return the non-terminal 'queued' shape
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued' on timeout, got: {result}"
+        )
+        for key in ('request_id', 'snapshot_tip', 'generation', 'position', 'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+        assert result['generation'] == 0, f"Expected generation=0, got: {result['generation']}"
+
+        # Entry must be enqueued (not swallowed)
+        assert mq.qsize() == 1, f'Expected mq.qsize()==1, got: {mq.qsize()}'
+
+        # Shield: the entry's future must NOT be cancelled
+        req = mq.get_nowait()
+        assert not req.result.cancelled(), (
+            'Entry future must NOT be cancelled — asyncio.shield should protect it'
+        )
+        # Clean up
+        req.result.cancel()
