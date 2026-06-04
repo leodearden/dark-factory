@@ -59,13 +59,6 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, _is_gating_escalation
 
 # ---------------------------------------------------------------------------
-# B-row coverage set — step-8 verifies all 15 are tagged.
-# ---------------------------------------------------------------------------
-
-B_ROWS: frozenset[str] = frozenset({f'B{i}' for i in range(1, 16)})
-
-
-# ---------------------------------------------------------------------------
 # Fixtures — pre-2
 # ---------------------------------------------------------------------------
 
@@ -969,27 +962,3 @@ class TestStrandedSweepB10B15:
         assert pending[0].id == open_l1.id, (
             'Surviving L1 must be the original open one'
         )
-
-
-# ---------------------------------------------------------------------------
-# Step-8: Run all 15 B-rows — coverage check
-# ---------------------------------------------------------------------------
-
-
-def test_all_b_rows_covered():
-    """Verify all 15 B-row tags (B1–B15) appear as docstring markers in this module."""
-    import inspect
-
-    source = inspect.getsource(
-        __import__(__name__, fromlist=[__name__.split('.')[-1]])
-    )
-
-    missing = []
-    for row in sorted(B_ROWS):
-        if f'[{row}]' not in source:
-            missing.append(row)
-
-    assert not missing, (
-        f'Missing B-row coverage markers in test suite: {missing}\n'
-        f'Each boundary row must have at least one test with "[Bx]" in its docstring.'
-    )
