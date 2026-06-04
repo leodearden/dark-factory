@@ -4542,10 +4542,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # Same signature → increment; different signature → reset to 1.
         # Mirrors _check_*_thrash shape: same-sig +1, different-sig reset to 1
         # (reset to 1 = "we just saw one"; reset to 0 would lose the current flip).
-        if same_sig:
-            new_count = prev_count + 1
-        else:
-            new_count = 1
+        new_count = prev_count + 1 if same_sig else 1
 
         # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5).
         # append=True → recursive-merge: only the 'reblock_guard' key is written;

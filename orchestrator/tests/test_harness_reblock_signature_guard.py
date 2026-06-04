@@ -20,8 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
@@ -124,7 +123,6 @@ class TestSignatureDerivation:
 
     def test_none_summary_treated_as_empty(self):
         """Edge case: summary=None → treat as empty string (no crash)."""
-        esc = _make_l1_esc(category='infra_issue', summary='x')
         # Monkeypatch summary to None to simulate missing field
         esc_no_summary = Escalation(
             id='esc-1-1',
@@ -265,9 +263,9 @@ class TestSignatureReset:
 
         original_fake_set = harness.scheduler.set_task_status
 
-        async def recording_set_task_status(tid, status, **kwargs):
+        async def recording_set_task_status(task_id, status, **kwargs):
             set_task_status_calls.append(status)
-            await original_fake_set(tid, status, **kwargs)
+            await original_fake_set(task_id, status, **kwargs)
 
         harness.scheduler.set_task_status = recording_set_task_status
 
@@ -361,9 +359,9 @@ class TestThresholdTrip:
 
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
         harness.scheduler.set_task_status = spy_set
 
@@ -422,9 +420,8 @@ class TestDedupAndHumanReset:
             resolved_by='l2-cascade:esc-100-1',
         )
         sig = Harness._reblock_signature(esc)
-        root_cause = f'reblock-guard:{task_id}'
 
-        # Queue already has a pending L2 with this root_cause
+        # Queue already has a pending L2 for this task
         q = _make_mock_queue(pending_l2_root_cause='esc-42-L2-1')
         harness._escalation_queue = q
 
@@ -469,9 +466,9 @@ class TestDedupAndHumanReset:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def recording_set(tid, status, **kw):
+        async def recording_set(task_id, status, **kw):
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
         harness.scheduler.set_task_status = recording_set
 
