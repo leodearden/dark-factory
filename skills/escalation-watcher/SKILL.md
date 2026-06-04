@@ -572,26 +572,44 @@ Remind about unresolved items roughly every 3-5 escalation handling cycles — e
 mcp__escalation__resolve_issue(
   escalation_id="esc-XX-N",
   resolution="<text injected into the agent's briefing when it resumes>",
-  terminate=false,        # true to dismiss and abandon the task
+  action='resume',   # default least-destructive intent; see C1 table below
   resolved_by="escalation-watcher"
 )
 ```
+
+### C1 — `action` semantics (single source of truth)
+
+| `action` | Record disposition | Live workflow | Task status effect | Intent |
+|---|---|---|---|---|
+| `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
+| `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
+| `park` | `dismissed` | killed | → `deferred` (from any non-terminal status) | "Stop; human decides later; machine must not touch." |
+| `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
+| `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
+
+**C1 notes:**
+- Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
+- The removed `terminate` parameter now raises a hard error naming the five actions above.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API.
+- Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
 steward-resolved path, where a workflow is still live and waiting (`_wait_for_resolution` →
 `build_resume_prompt`). That is *not* the usual L2 case. For the escalations this skill resolves:
 
-- **L2 cluster (has member L1s), `terminate=false`:** the resolution cascades to each member L1,
+- **L2 cluster (has member L1s), `action='resume'`:** the resolution cascades to each member L1,
   flipping the member task `blocked→pending`. It re-dispatches into a **fresh** workflow that does
   **not** read your resolution text — the harness propagates status only. Don't rely on the string
   reaching the agent. If the agent needs specific guidance, either spawn an interactive `/unblock`
   (drive the worktree directly) or write durable guidance into fused-memory / task metadata, which
   the fresh workflow's briefing memory-search may surface.
-- **Born-at-L2 with no members (a direct `critical`/`urgent` blocker), `terminate=false`:** this
-  marks the record resolved but does **NOT** re-pend the task — the re-pend paths fire only for
-  `level==1`, and a directly-filed born-at-L2 has no members to cascade to. The task stays
-  `blocked`. To get it moving again use `terminate=true` (abandon → reschedulable) or drive it via
-  `/unblock`. The resolution text is recorded for audit only.
+- **Memberless born-at-L2 (a direct `critical`/`urgent` blocker with no L1 members):** under D7
+  (task β), `action='resume'` on a memberless born-at-L2 now flips `blocked→pending` — the orphan
+  flip accepts any task-attached `level >= 1`. The resolution text is recorded for audit only and
+  does not reach the agent (no live workflow); write durable guidance into fused-memory / task
+  metadata instead. To re-run fresh use `action='restart'` (→ `pending` from scratch); to park for
+  later use `action='park'` (→ `deferred`); to abandon permanently use `action='abandon'`
+  (→ `cancelled`); to close the record without touching the task use `action='close_only'`.
 
 Either way, still write a clear, specific `resolution` (file paths, function names, the decision and
 why): it is the audit record and the human-readable trail even when no agent re-reads it.
@@ -599,9 +617,10 @@ why): it is the audit record and the human-readable trail even when no agent re-
 **L2 cluster cascade (live).** When a resolved L2 represents a causal cluster (member L1
 escalations packaged by the auto-watcher), resolving the L2 here cascades to close its L1 members
 via the escalation server — this skill resolves only the L2 itself, never each member directly. The
-cascade is implemented in `queue.resolve()`: it recurses over `esc.members`, resolving each with
-`resolved_by='l2-cascade:<L2-id>'`, and the auto-watcher files clusters via `promote_to_l2`. For
-design details, see `plans/escalation-l2-tiering.md`.
+action applies uniformly across the cluster. The cascade is implemented in `queue.resolve()`: it
+recurses over `esc.members`, resolving each with `resolved_by='l2-cascade:<L2-id>'`, and the
+auto-watcher files clusters via `promote_to_l2`. For design details, see
+`plans/escalation-l2-tiering.md`.
 
 You may still occasionally see multiple *unclustered* L2s that share a root cause — the auto-watcher
 deduplicates by exact root-cause string, so near-miss hypotheses file separately. When you do, scan
