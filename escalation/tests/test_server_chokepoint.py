@@ -1485,3 +1485,62 @@ class TestMergeCancel:
         assert result.get('reason'), (
             f"Expected non-empty reason string for unknown id, got: {result}"
         )
+
+    async def test_idempotent_double_cancel_returns_already_cancelled(self, tmp_path: Path):
+        """Calling merge_cancel twice on the same request_id returns cancelled=False on the second call.
+
+        Acquires the merge_cancel tool up front (single tool lookup).  Submits
+        merge_request(wait_secs=0) to register a waiter; first cancel → {cancelled: True, ...}.
+        Immediately (no awaited suspension) calls merge_cancel again — the
+        _waiters.pop done-callback is call_soon-scheduled and has not run yet, so
+        the waiter is still present with future.cancelled()==True.  Second call must
+        return {cancelled: False, state: 'abandoned', reason: <non-empty>} and not raise.
+
+        RED until step-6 impl: the current body has no future.cancelled() branch.
+        It falls into the pending path, calls fut.cancel() on an already-cancelled
+        future (returns False), and still reports cancelled=True (incorrect).
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension between here and .fn() calls
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c2',
+            branch='c2',
+            worktree=str(tmp_path / 'wt-c2'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # First cancel — must succeed
+        first = await tool.fn(request_id=rid)
+        assert first.get('cancelled') is True, f'First cancel must succeed: {first}'
+
+        # Second cancel — no awaited suspension here, so _waiters.pop callback hasn't run
+        second = await tool.fn(request_id=rid)
+
+        assert second.get('cancelled') is False, (
+            f"Expected cancelled=False on double-cancel, got: {second}"
+        )
+        assert second.get('state') == 'abandoned', (
+            f"Expected state='abandoned' on double-cancel, got: {second}"
+        )
+        assert second.get('reason'), (
+            f"Expected non-empty reason on double-cancel, got: {second}"
+        )
+
+        # Clean up the drained-not-consumed entry
+        req = mq.get_nowait()
+        assert req.result.cancelled()
