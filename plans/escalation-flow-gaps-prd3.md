@@ -51,3 +51,27 @@ Protocol per `plans/escalation-flow-2026-06-04-prd-briefs.md`: append-only; sibl
      it first"), never restating posture rules.
    - PRD-1 entries 1/4, PRD-2 entries 1/3: no PRD-3 surface intersection (we make no agent
      invocations needing env_overrides; we don't touch queue-root file handling).
+
+7. **κ companion sweep — residual-`terminate=` audit (2026-06-04, task 1627).**
+   Two out-of-register skills migrated in-place (task 1627, step-1 + step-2):
+   - `skills/unblock/SKILL.md` §4.3 "If this is an escalated task": two snippets —
+     `terminate=false → action='resume'`; `terminate=true → action='restart'` (prose intent:
+     "Task goes to `pending`" — only `restart` yields pending in C1).  Bullet retitled
+     "Restart and reschedule"; placeholder updated to `<reason for restart>`.
+   - `skills/recon-escalation-watcher/SKILL.md` "The Action Set": four snippets —
+     verify-fixed/file-a-real-task/fix-directly `terminate=false → action='resume'`;
+     accept-as-known `terminate=true → action='close_only'` (recon findings not
+     task-attached; only record disposition matters).  Resolution-text convention paragraph
+     rewritten to `action='resume'` → resolved / `action='close_only'` → dismissed.
+
+   PRD-1/2-owned section sweep (per spec; append-only if in-flight):
+   - PRD-1 `## Main Loop` (escalation-watcher-auto/SKILL.md ~180-244): **0 residual
+     `terminate=`** — no edit needed.
+   - PRD-2 `### Low-risk auto-unblock gate (B3)` (~199-341) and AFK behavioural shift #2
+     (~181-190) (escalation-watcher/SKILL.md): **0 residual `terminate=`** — no edit needed.
+
+   Intentionally NOT touched (PRD-3-owned η/θ sections, work in flight):
+   - escalation-watcher/SKILL.md: AFK shift 1 (~174), scope_violation (~515),
+     dependency_discovered (~530), Resolving Escalations (~636/645/651/654).
+   - escalation-watcher-auto/SKILL.md: Per-Category Routing Table (~260/265/285/310/315).
+   Those sites are tasks η/θ's responsibility and must not be modified by κ.
