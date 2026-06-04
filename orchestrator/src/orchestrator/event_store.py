@@ -270,3 +270,69 @@ class EventStore:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+
+    def latest_merge_finalized(
+        self,
+        request_id: str | None = None,
+        branch: str | None = None,
+        task_id: str | None = None,
+    ) -> dict | None:
+        """Return the most-recent merge_finalized event row matching the given key.
+
+        Lookup precedence: request_id > branch > task_id.  When no key is
+        provided, returns None immediately.
+
+        The returned dict has keys:
+            request_id, task_id, branch, state, snapshot_tip, merge_sha,
+            finished_at (ISO-8601 timestamp string from the events table).
+
+        Returns None on miss, on unknown key, or if all keys are None.
+        Errors are logged and return None (read path is fire-safe).
+        """
+        if request_id is None and branch is None and task_id is None:
+            return None
+        try:
+            conn = self._connect()
+            try:
+                if request_id is not None:
+                    row = conn.execute(
+                        "SELECT task_id, data, timestamp FROM events "
+                        "WHERE event_type='merge_finalized' "
+                        "  AND json_extract(data,'$.request_id')=? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (request_id,),
+                    ).fetchone()
+                elif branch is not None:
+                    row = conn.execute(
+                        "SELECT task_id, data, timestamp FROM events "
+                        "WHERE event_type='merge_finalized' "
+                        "  AND json_extract(data,'$.branch')=? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (branch,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT task_id, data, timestamp FROM events "
+                        "WHERE event_type='merge_finalized' "
+                        "  AND task_id=? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return None
+            db_task_id, raw_data, timestamp = row
+            data = json.loads(raw_data) if raw_data else {}
+            return {
+                'request_id': data.get('request_id'),
+                'task_id': db_task_id,
+                'branch': data.get('branch'),
+                'state': data.get('state'),
+                'snapshot_tip': data.get('snapshot_tip'),
+                'merge_sha': data.get('merge_sha'),
+                'finished_at': timestamp,
+            }
+        except Exception:
+            logger.warning('event_store.latest_merge_finalized failed', exc_info=True)
+            return None
