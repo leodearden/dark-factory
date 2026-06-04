@@ -247,6 +247,36 @@ The merge procedure is iterative — don't assume one pass will be enough:
    - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from the terminal `done` outcome (step 7). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
+**Merge-step failure and abandonment edges:**
+
+*Immediate-response failures (from `merge_request`):*
+
+- `state: "conflict"` or `state: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
+- `state: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
+- `state: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
+- `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge:
+  ```
+  git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
+  ```
+  Then proceed to step 8 with the resulting commit SHA.
+
+*Polled terminal failures (from `merge_status`):*
+
+- `poll["state"] == "conflict"` or `poll["state"] == "blocked"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7.
+- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → fall back to confirming whether the merge already landed:
+  ```
+  git log main --oneline | head -5
+  ```
+  If the merge commit is present, proceed to step 8 with that SHA. If not, loop back to step 7.
+
+*Abandonment (`merge_cancel`):*
+
+To abandon a submitted merge (e.g. the task needs redesign after submission):
+```
+mcp__escalation__merge_cancel(request_id=request_id)
+```
+**Coalesced-id caveat:** An `attached` response shares the in-flight entry's `request_id` and registers no separate waiter. Cancelling via a coalesced id returns `{cancelled: false, state: "unknown"}` — always cancel via the **in-flight** `request_id` (the one returned with `state: "queued"`), not via a coalesced id.
+
 *If this is an escalated task (pending escalation, agent is paused):*
 
 Choose one of these based on the analysis:
