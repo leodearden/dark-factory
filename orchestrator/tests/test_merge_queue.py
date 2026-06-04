@@ -3889,10 +3889,9 @@ class TestSpeculativeMergeWorker:
             files_present = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
             verify_worktrees.append(files_present)
             # Gate only N's first verify (only N's file present, gate not yet open)
-            if 'file_rb_n.py' in files_present and 'file_rb_n1.py' not in files_present:
-                if not gate_open.is_set():
-                    n_verify_entered.set()
-                    await gate_open.wait()
+            if 'file_rb_n.py' in files_present and 'file_rb_n1.py' not in files_present and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
