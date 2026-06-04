@@ -374,116 +374,10 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 
 ### `review_suggestions` (info)
 
-Non-blocking suggestions from code review. The task is already on its way to Done, so these become follow-up work.
-
-**Delegate triage to a sub-agent** to conserve context. Use this prompt template:
-
-```
-Agent(
-  description="Triage review suggestions",
-  prompt="""
-Triage these review suggestions from escalation <escalation_id> (task <task_id>).
-
-## Escalation detail
-<paste the full escalation JSON here>
-
-## Classification rules
-
-**ACCEPT** if the suggestion has genuine merit:
-- Real bugs or correctness issues
-- Missing tests for important code paths (especially error paths, edge cases)
-- Code duplication across 3+ sites with maintenance risk
-- Violations of project conventions
-- Stale comments that would mislead future readers
-
-**SKIP** only if genuinely meritless:
-- Duplicates work already tracked in another task
-- Proposes deleting code an upcoming task depends on
-- Refactors that would pessimize the design or impede planned work
-- Renames that don't actually improve semantic transparency
-- Pre-existing issues not introduced by the diff
-
-When in doubt, ACCEPT. The cost of a small unnecessary task is low;
-the cost of missing a real issue compounds.
-
-## Output format
-
-Return a JSON object:
-{
-  "accepted": [
-    {
-      "suggestion": "brief description",
-      "reason": "why it has merit",
-      "files": ["affected/file/paths"],
-      "proposed_task_title": "concise task title"
-    }
-  ],
-  "skipped": [
-    {
-      "suggestion": "brief description",
-      "reason": "why it's meritless"
-    }
-  ],
-  "proposed_task_groups": [
-    {
-      "title": "task title grouping related accepted items",
-      "description": "what needs to be done, with file paths and specifics",
-      "items": [0, 2]  // indices into accepted array
-    }
-  ]
-}
-""",
-  subagent_type="general-purpose"
-)
-```
-
-After the sub-agent returns:
-1. Review the groupings (sanity check — don't re-triage, just confirm the groupings make sense)
-2. Create follow-up tasks using the two-phase pattern for each task group:
-
-   ```
-   # Phase 1: submit — returns immediately with a ticket id
-   submit_result = mcp__fused-memory__submit_task(
-       project_root="<project_root>",
-       title="<task group title>",
-       description="<task group description with file paths and specifics>",
-       priority="medium",
-       metadata={
-           "source": "review-suggestions",
-           "escalation_id": escalation_id,
-           "suggestion_hash": hash,          # (escalation_id, suggestion_hash) is the idempotency key
-           "spawn_context": "steward-triage",
-           "modules": ["<path/to/module>"],
-       },
-   )
-   ticket = submit_result["ticket"]
-
-   # Phase 2: block until the curator decides
-   resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>", timeout_seconds=<see _shared/ticket-failure-handling.md>)
-
-   if resolve["status"] == "created":
-       task_id = resolve["task_id"]           # new task
-   elif resolve["status"] == "combined":
-       task_id = resolve["task_id"]           # merged into existing task — normal, not an error
-   elif resolve["status"] == "failed":
-       # On `failed`: record the reason in the escalation resolution note and skip this
-       # suggestion group. This caller DOES set (escalation_id, suggestion_hash), so the
-       # R4 gate fires natively.
-       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
-       handle_failure(resolve["reason"])
-   ```
-
-3. Resolve the escalation using the **escalation** MCP — `mcp__escalation__resolve_issue` closes the
-   escalation record on the escalation server. This is distinct from `mcp__fused-memory__resolve_ticket`
-   above, which waits for the task curator on the fused-memory server. Despite the name overlap, the two
-   calls operate on different systems:
-   ```
-   mcp__escalation__resolve_issue(
-     escalation_id="...",
-     resolution="Triaged: N items queued as tasks [IDs], M items skipped [brief reasons]",
-     resolved_by="escalation-watcher"
-   )
-   ```
+> **This handler is unreachable at L2.** Review suggestions reach live workflows as curator tickets
+> (workflow.py:5923–6037, no escalation file) and fall back to level-0 steward escalations
+> (steward.py:222–234); they do not reach this queue. This stub is kept only to document why
+> `review_suggestions` must not be re-added here.
 
 ### `review_issues` (blocking)
 
@@ -573,16 +467,42 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting the snippet:
-  1. Substitute `"source": "escalation-info"` (only this field changes).
-  2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
-  3. For the `suggestion_hash` / `escalation_id` synthesis recipe and R4 gate details, see
-     [`skills/_shared/ticket-failure-handling.md`](../_shared/ticket-failure-handling.md).
-     At this callsite (Case A — the escalation's id is already in scope), the concrete
-     synthesis is:
-     ```python
-     suggestion_hash = hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]
-     ```
+- **Info**: queue as a follow-up task using the two-phase pattern:
+
+  ```python
+  suggestion_hash = hashlib.sha256(
+      (escalation['detail'] or escalation['summary'] or escalation['id']).encode()
+  ).hexdigest()[:16]   # Case A — escalation id already in scope; see _shared/ticket-failure-handling.md
+
+  # Phase 1: submit — returns immediately with a ticket id
+  submit_result = mcp__fused-memory__submit_task(
+      project_root="<project_root>",
+      title="<cleanup description>",
+      description="<what needs cleaning up, with file paths and specifics>",
+      priority="medium",
+      metadata={
+          "source": "escalation-info",
+          "escalation_id": escalation_id,
+          "suggestion_hash": suggestion_hash,   # (escalation_id, suggestion_hash) is the idempotency key
+          "spawn_context": "steward-triage",
+          "modules": ["<path/to/module>"],
+      },
+  )
+  ticket = submit_result["ticket"]
+
+  # Phase 2: block until the curator decides
+  resolve = mcp__fused-memory__resolve_ticket(
+      ticket=ticket, project_root="<project_root>",
+      timeout_seconds=<see skills/_shared/ticket-failure-handling.md>
+  )
+
+  if resolve["status"] in ("created", "combined"):
+      task_id = resolve["task_id"]
+  elif resolve["status"] == "failed":
+      # Record reason in escalation resolution note; skip this item.
+      # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
+      handle_failure(resolve["reason"])
+  ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
@@ -616,7 +536,6 @@ window this is the difference between one durable session and repeated restarts.
   at top level.
 
 **Delegate to sub-agents:**
-- Triaging review suggestions — use the prompt template in the `review_suggestions` section
 - Researching escalation context for ANY category that needs code reading (e.g. `task_failure`,
   `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
   only a compact verdict + recommended action — not the raw material
