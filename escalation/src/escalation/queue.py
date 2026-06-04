@@ -521,11 +521,12 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``members`` is not
-        atomic: two concurrent callers for the same parent each read the same
-        pre-mutation snapshot, both append and both write — the second rewrite
-        clobbers the first's additions.  Single-writer invariant matches the
-        rest of the queue; see ``attach_dedupe_child`` for a full discussion.
+        **Concurrency contract (sidecar flock).**  The entire read-modify-write
+        of ``members`` is serialized per-id by ``escalation_id_lock``, so
+        concurrent appends from multiple processes are union-preserving — no
+        write clobbers another's additions.  The lock target is the stable
+        sidecar ``{escalation_id}.json.lock`` (see ``escalation_id_lock`` for
+        the PRD-D3 rationale).
 
         Loads the L2 directly from ``queue_dir/{escalation_id}.json`` (queue root
         only).  This refuses archived L2s — they were already adjudicated by a
@@ -548,28 +549,29 @@ class EscalationQueue:
         ``None`` when *escalation_id* is not found in the queue root (unknown id
         or archived).
         """
-        path = self.queue_dir / f'{escalation_id}.json'
-        if not path.exists():
-            return None
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
-            return None
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
+                return None
 
-        if not new_member_ids:
-            return esc  # no-op
+            if not new_member_ids:
+                return esc  # no-op
 
-        existing = set(esc.members)
-        appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
-        if appended:
-            esc.members.extend(appended)
-            self._rewrite(escalation_id, esc)
-            logger.info(
-                'add_members_to_l2: added %d new member(s) to %s (total=%d)',
-                len(appended), escalation_id, len(esc.members),
-            )
-        return esc
+            existing = set(esc.members)
+            appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
+            if appended:
+                esc.members.extend(appended)
+                self._rewrite(escalation_id, esc)
+                logger.info(
+                    'add_members_to_l2: added %d new member(s) to %s (total=%d)',
+                    len(appended), escalation_id, len(esc.members),
+                )
+            return esc
 
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
