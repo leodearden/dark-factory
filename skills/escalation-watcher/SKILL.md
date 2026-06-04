@@ -262,6 +262,41 @@ The durable rolling-24h merge cap is enforced by `b3_gate charge` inside the unb
 sub-agent immediately before its merge-submit — a charge refusal causes the sub-agent to ABORT.
 The watcher consults only `check`'s `cap_remaining` to skip launches that charge would refuse.
 
+**Drift path — one-shot re-investigation:**
+
+On `verdict == "drift"`, spawn ONE read-only background sub-agent running
+`skills/unblock-auto/SKILL.md` in the worktree (Agent tool, general-purpose,
+`run_in_background: true`), passing `task_id`, `worktree`, and the block reason. Capture the git
+anchor at re-investigation start:
+
+```bash
+head_sha=$(git -C <worktree> rev-parse HEAD)
+main_sha=$(git -C <worktree> rev-parse main)
+```
+
+When the sub-agent returns `{proposal_text, files_referenced, risk_label}`, build a proposal
+entry mirroring `_build_entry` success-path keys and append it via
+`mcp__fused-memory__update_task(id=<task_id>, project_root=<project_root>, metadata={"dry_run_proposals": [entry]}, append=true)`:
+
+```json
+{
+  "proposal_text":    "<from sub-agent>",
+  "risk_label":       "<from sub-agent>",
+  "files_referenced": ["<from sub-agent>"],
+  "block_reason":     "<original block reason>",
+  "investigated_at":  "<ISO now at re-investigation start>",
+  "timestamp":        "<ISO now>",
+  "head_sha":         "<captured above>",
+  "main_sha":         "<captured above>"
+}
+```
+
+A malformed entry is fail-safe by construction — it simply fails the next `check` (`b3_gate check`
+is the single shape validator). Then **re-gate once**: re-run `b3_gate check`. If `fresh` →
+record-launch + launch; if `drift` again (a second drift in the same handling cycle) → leave
+pending + digest (drift-reinvestigated outcome — main is moving inside the task's footprint; a
+human should look). **At most one re-investigation per handling cycle.**
+
 **Completion handling:**
 
 On the sub-agent's **completion** (you're notified asynchronously — match the result to a recorded
@@ -271,7 +306,8 @@ launch by `task_id` / background-task-id):
 - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Keep the
   `task_id` in your context as completed this cycle (do NOT re-launch it), record the abort reason
   in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in AFK
-  mode; it waits for the human.
+  mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
+  not been used this cycle, route through the drift path once.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative. This gate is AFK-only — when a human is present, prefer interactive
