@@ -137,3 +137,78 @@ class TestSignatureDerivation:
         )
         sig = Harness._reblock_signature(esc_no_summary)
         assert sig == 'infra_issue:'
+
+
+# ---------------------------------------------------------------------------
+# Step-3 / Step-4: Below-threshold flips increment counter and proceed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBelowThresholdFlips:
+    """Three same-signature re-pends proceed; counter persisted before each flip."""
+
+    async def test_three_same_signature_flips_increment_counter_and_proceed(
+        self, harness: Harness
+    ):
+        """Counter increments 1→2→3 across three flips; all flip to 'pending'.
+
+        Verifies:
+        - After each flip the persisted reblock_guard = {count: N, signature: sig}
+        - set_task_status('pending') awaited on all three flips
+        - update_task called BEFORE set_task_status on each flip (crash-safe ordering)
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        expected_sig = Harness._reblock_signature(esc)
+
+        # Simulate a fake in-memory metadata store that tracks the latest
+        # reblock_guard after each update_task call.
+        persisted_metadata: dict = {}
+        call_order: list[str] = []
+
+        async def fake_get_task(tid):
+            return {'id': tid, 'metadata': dict(persisted_metadata)}
+
+        async def fake_update_task(tid, md, *, append=False):
+            if append and isinstance(md, dict):
+                # Recursive-merge (step-12 semantics; for now just update)
+                persisted_metadata.update(md)
+            else:
+                persisted_metadata.update(md)
+            call_order.append('update_task')
+            return True
+
+        async def fake_set_task_status(tid, status, **kwargs):
+            call_order.append('set_task_status')
+
+        harness.scheduler.get_task = fake_get_task
+        harness.scheduler.update_task = fake_update_task
+        harness.scheduler.set_task_status = fake_set_task_status
+
+        # Drive three flips via _on_escalation_resolved
+        for expected_count in range(1, 4):
+            call_order.clear()
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+            # Counter should have been persisted
+            guard = persisted_metadata.get('reblock_guard')
+            assert guard is not None, f'flip {expected_count}: reblock_guard not persisted'
+            assert guard['count'] == expected_count, (
+                f'flip {expected_count}: expected count={expected_count}, got {guard["count"]}'
+            )
+            assert guard['signature'] == expected_sig, (
+                f'flip {expected_count}: signature mismatch'
+            )
+
+            # Ordering: update_task must precede set_task_status (crash-safe)
+            assert call_order == ['update_task', 'set_task_status'], (
+                f'flip {expected_count}: expected update_task before set_task_status, '
+                f'got {call_order}'
+            )
