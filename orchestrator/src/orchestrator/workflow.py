@@ -3485,13 +3485,13 @@ class TaskWorkflow:
                 'source': 'orchestrator',
             })
 
-            # Check for escalations from debugger.  Same L0-only filter as
-            # the post-implementer check — a stale L1 from a prior run must
-            # not sink a successful debug pass.
-            blocking = [
-                e for e in self._check_escalations()
-                if e.severity == 'blocking' and e.level == 0
-            ]
+            # Check for escalations from debugger.  Same filter as the post-implementer
+            # check — a stale plain blocking L1 from a prior run must not sink a
+            # successful debug pass.  Born-at-L2 (critical/urgent) AND any level≥2
+            # escalations also gate here — D4 accepted consequence: a pending
+            # critical/urgent from a prior incarnation DOES sink a fresh run
+            # (intended stop-the-line semantics).  See _is_gating_escalation.
+            blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
