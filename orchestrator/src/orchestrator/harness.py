@@ -4501,6 +4501,47 @@ Output JSON matching the schema. Every task must appear in the output.
             return 'close_only'
         return 'resume'  # status == 'resolved'
 
+    async def _check_reblock_guard(self, escalation, task_id: str) -> bool:
+        """Check the re-block guard counter; persist before proceeding.
+
+        Returns True → proceed with the blocked→pending flip.
+        Returns False → withhold the flip (threshold reached).
+
+        Counter logic (C5):
+          - Read fresh metadata via scheduler.get_task.
+          - Compute new signature via _reblock_signature.
+          - If prev_signature == new_sig: new_count = prev_count + 1 (step-6 adds this branch).
+          - Otherwise: new_count = 1 (signature reset — step-6 adds this branch).
+          - Persist via scheduler.update_task(append=True) BEFORE the flip (crash-safe:
+            a crash over-counts, never under-counts — C5 ordering).
+          - At threshold (step-8 adds threshold check): withhold + file L2.
+
+        Steps 4 (initial scaffold): always increment (no reset branch yet), always return True.
+        """
+        new_sig = self._reblock_signature(escalation)
+
+        # Read fresh metadata so each incarnation sees the persisted count.
+        task = await self.scheduler.get_task(task_id)
+        metadata = (task or {}).get('metadata') or {}
+        try:
+            guard = metadata.get('reblock_guard') or {}
+            prev_count = int(guard.get('count') or 0)
+            prev_signature = guard.get('signature')
+        except (TypeError, ValueError):
+            prev_count = 0
+            prev_signature = None
+
+        # Increment counter (signature-reset branch added in step-6)
+        new_count = prev_count + 1
+
+        # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5)
+        await self.scheduler.update_task(
+            task_id,
+            {'reblock_guard': {'count': new_count, 'signature': new_sig}},
+        )
+
+        return True
+
     @staticmethod
     def _reblock_signature(escalation) -> str:
         """Derive the re-block guard signature from an escalation.
@@ -4546,6 +4587,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
                 task_id, status, escalation.resolved_by,
             )
+            return
+
+        # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
+        # withhold the flip when the threshold is reached.
+        if not await self._check_reblock_guard(escalation, task_id):
             return
 
         # Only 'blocked' reaches here — attempt the flip
