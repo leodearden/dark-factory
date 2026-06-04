@@ -664,18 +664,22 @@ def create_server(
         handles verification, conflict detection, and atomic ref advancement.
 
         Response shapes:
-        - Normal outcome: ``{status, reason, conflict_details, push_status}``
-          (plus optional ``failure_diagnostic`` on failure).
+        - Normal outcome: ``{status, request_id, reason, conflict_details,
+          push_status}`` (plus optional ``failure_diagnostic`` on failure).
           ``status`` is one of: ``done``, ``conflict``, ``blocked``,
           ``already_merged``, ``unknown_branch``, ``failed``.
           ``unknown_branch`` means the requested branch has no ref in the
           target repo — usually a merge_request mis-routed to the wrong
           repo's escalation MCP; check that the branch belongs here.
-        - Already in flight: ``{status='in_flight', branch, inflight_task_id,
-          eta_seconds, reason, conflict_details=None, push_status=None}``.
-          A merge for *branch* is already running; the caller should poll
-          rather than re-queuing.  ``eta_seconds`` is a best-effort hint
-          (``None`` once the estimate window is exceeded).
+          ``request_id`` is the stable per-entry identity of this request
+          (e.g. ``'mr-a1b2c3d4'``).
+        - Already in flight: ``{status='in_flight', request_id, branch,
+          inflight_task_id, eta_seconds, reason, conflict_details=None,
+          push_status=None}``.  A merge for *branch* is already running;
+          the caller should poll rather than re-queuing.  ``eta_seconds`` is
+          a best-effort hint (``None`` once the estimate window is exceeded).
+        - Already merged (fast-path): ``{status='already_merged', commit}``.
+          The branch tip is already an ancestor of main; no enqueue occurs.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -746,6 +750,7 @@ def create_server(
         outcome = await future
         result: dict[str, Any] = {
             'status': outcome.status,
+            'request_id': merge_req.request_id,
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
             'push_status': outcome.push_status,
