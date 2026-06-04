@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -964,7 +964,7 @@ def create_server(
 
     def _epoch_to_iso8601(ts: float) -> str:
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
-        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(ts, tz=UTC).isoformat()
 
     def _map_terminal_state(raw: str) -> str:
         """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary."""
