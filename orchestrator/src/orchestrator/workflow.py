@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
+    from orchestrator.merge_queue import InFlightMergeRegistry
     from orchestrator.usage_gate import UsageGate
 
 
@@ -315,6 +316,7 @@ class TaskWorkflow:
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
         merge_worker=None,
+        merge_inflight_registry: 'InFlightMergeRegistry | None' = None,
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
         cancel_event: asyncio.Event | None = None,
@@ -331,6 +333,7 @@ class TaskWorkflow:
         # handlers to register halt ownership. The asyncio.Queue above carries
         # merge requests; this is the worker that owns the halt flag.
         self.merge_worker = merge_worker
+        self.merge_inflight_registry = merge_inflight_registry
         self.event_store = event_store
         self.cost_store = cost_store
 

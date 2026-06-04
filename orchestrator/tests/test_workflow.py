@@ -509,3 +509,46 @@ class TestRunMergeDeferredGuard:
         )
         cast(AsyncMock, wf._enter_merge_deferred).assert_not_called()
         cast(AsyncMock, wf._submit_to_merge_queue).assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestWorkflowMergeInflightRegistry — merge_inflight_registry wiring in __init__
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowMergeInflightRegistry:
+    """Tests for the merge_inflight_registry parameter in TaskWorkflow.__init__."""
+
+    def test_registry_stored_when_provided(self, tmp_path: Path):
+        """Constructor stores the injected registry on self.merge_inflight_registry."""
+        sentinel = object()
+        wf = _make_workflow(tmp_path=tmp_path)
+        # Directly re-construct with the kwarg to check storage
+        assignment = MagicMock()
+        assignment.task_id = '999'
+        assignment.task = {'id': '999', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wf2 = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_inflight_registry=sentinel,
+        )
+        assert wf2.merge_inflight_registry is sentinel
+
+    def test_registry_defaults_to_none(self, tmp_path: Path):
+        """Without the kwarg, merge_inflight_registry is None."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.merge_inflight_registry is None
