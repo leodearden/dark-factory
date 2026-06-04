@@ -36,6 +36,10 @@ class TestUnblockAutoConfigDefaults:
         assert ua.max_turns == 50
         assert ua.effort == 'high'
         assert ua.backend == 'claude'
+        # Three new fields (step-1)
+        assert ua.attended_b3_enabled is False
+        assert ua.b3_merge_cap_per_24h == 6
+        assert ua.b3_proposal_keep_last == 5
 
     def test_defaults_yaml_has_unblock_auto_section(self):
         defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
@@ -51,6 +55,10 @@ class TestUnblockAutoConfigDefaults:
         assert ua['max_turns'] == 50
         assert ua['effort'] == 'high'
         assert ua['backend'] == 'claude'
+        # Three new fields (step-1)
+        assert ua['attended_b3_enabled'] is False
+        assert ua['b3_merge_cap_per_24h'] == 6
+        assert ua['b3_proposal_keep_last'] == 5
 
 
 # ---------------------------------------------------------------------------
