@@ -11763,3 +11763,110 @@ class TestMergeWorkerGenerationChain:
         assert ctx.counts is worker._generation_chain_counts
         assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
         assert _call_kwargs.get('merged_branch_tip') == branch_head_sha
+
+
+# ---------------------------------------------------------------------------
+# TestSMWGenerationChain — γ2 step-15/16: SpeculativeMergeWorker wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSMWGenerationChain:
+    """Unit tests for SpeculativeMergeWorker γ2 generation-chain wiring (step-15 RED / step-16 GREEN)."""
+
+    async def test_speculative_item_has_merged_branch_tip(self) -> None:
+        """(a) SpeculativeItem can carry merged_branch_tip (default None)."""
+        item = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='base',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert hasattr(item, 'merged_branch_tip')
+        assert item.merged_branch_tip is None
+        # Can be set explicitly
+        item2 = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='base',
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip='T1',
+        )
+        assert item2.merged_branch_tip == 'T1'
+
+    async def test_smw_init_has_generation_chain_counts(self) -> None:
+        """(b) SpeculativeMergeWorker.__init__ initialises self._generation_chain_counts == {}."""
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(MagicMock(), queue)
+        assert hasattr(worker, '_generation_chain_counts')
+        assert worker._generation_chain_counts == {}
+
+    async def test_verify_and_advance_passes_chain_ctx_and_merged_branch_tip(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) _verify_and_advance on an item with merged_branch_tip='T1' through a
+        successful advance awaits _finalize_advanced_merge with chain_ctx
+        (queue=self._queue, counts=self._generation_chain_counts,
+        max=MAX_AUTO_CHAINED_GENERATIONS) and merged_branch_tip=='T1'."""
+        from orchestrator.merge_queue import (
+            MAX_AUTO_CHAINED_GENERATIONS,
+            _GenerationChainContext,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        git_ops = MagicMock()
+        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='smw-wt',
+            branch='task/smw-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+        )
+        merge_commit_sha = 'merge-commit-smw'
+        item = SpeculativeItem(
+            request=req,
+            merge_result=MagicMock(
+                success=True,
+                conflicts=False,
+                merge_commit=merge_commit_sha,
+                merge_worktree=tmp_path / 'merge-wt',
+                pre_merge_sha='base-sha',
+            ),
+            merge_wt=tmp_path / 'merge-wt',
+            base_sha='base-sha',
+            speculative=False,
+            skip_verify=False,
+            started_monotonic=None,
+            merged_branch_tip='T1',
+        )
+
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        with (
+            patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        finalize_mock.assert_awaited_once()
+        _call_kwargs = finalize_mock.call_args.kwargs
+        assert 'chain_ctx' in _call_kwargs, 'chain_ctx not passed to _finalize_advanced_merge'
+        ctx: _GenerationChainContext = _call_kwargs['chain_ctx']
+        assert ctx.queue is worker._queue
+        assert ctx.counts is worker._generation_chain_counts
+        assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
+        assert _call_kwargs.get('merged_branch_tip') == 'T1'
