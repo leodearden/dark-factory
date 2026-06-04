@@ -532,7 +532,11 @@ class TestDispatchTeardownNoKill:
         self, harness: Harness, tmp_path: Path
     ):
         """Integration: L2 cluster resolved with park + two blocked L1 members
-        → both get set_task_status('deferred') via parent-action lookup."""
+        → both get set_task_status('deferred') via parent-action lookup.
+
+        Requires harness._escalation_queue wired so the member callbacks can
+        read the parent L2's resolution_action.
+        """
         queue = EscalationQueue(tmp_path / 'esc_c')
         l1_a = _make_l1_for_queue(queue, 'esc-c-l1-a', 'task-park-a')
         l1_b = _make_l1_for_queue(queue, 'esc-c-l1-b', 'task-park-b')
@@ -540,6 +544,8 @@ class TestDispatchTeardownNoKill:
             queue, 'esc-c-l2-park', [l1_a.id, l1_b.id], resolution_action='park',
         )
 
+        # Wire the queue so _resolve_escalation_action can look up the parent L2.
+        harness._escalation_queue = queue
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
         harness.is_workflow_active = MagicMock(return_value=False)
         queue.set_resolve_callback(harness._on_escalation_resolved)
@@ -548,9 +554,15 @@ class TestDispatchTeardownNoKill:
         await asyncio.gather(*list(harness._background_tasks))
 
         awaits = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        # Both L1 member tasks should be set to 'deferred' (L2's task is also
+        # written but we only assert the member tasks are present)
         task_ids_written = [a.args[0] for a in awaits]
-        assert 'task-park-a' in task_ids_written
-        assert 'task-park-b' in task_ids_written
+        assert 'task-park-a' in task_ids_written, (
+            f'task-park-a not written; writes: {task_ids_written}'
+        )
+        assert 'task-park-b' in task_ids_written, (
+            f'task-park-b not written; writes: {task_ids_written}'
+        )
         for a in awaits:
             assert a.args[1] == 'deferred', f'Expected deferred, got {a.args[1]}'
 

@@ -4313,11 +4313,72 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
             return
 
-        # restart / park / abandon → _action_teardown_and_set_status (step-6/8/12)
-        logger.debug(
-            'escalation %s action %r for task %s — teardown not yet wired '
-            '(step-6)', escalation.id, action, escalation.task_id,
+        # restart / park / abandon → teardown + status write.
+        _ACTION_TARGETS = {'restart': 'pending', 'park': 'deferred', 'abandon': 'cancelled'}
+        target = _ACTION_TARGETS.get(action)
+        if target is not None:
+            self._schedule_coro_threadsafe(
+                self._action_teardown_and_set_status(
+                    escalation.task_id, target, action,
+                ),
+                label=(
+                    f'action-teardown task {escalation.task_id} '
+                    f'action={action} target={target}'
+                ),
+            )
+        else:
+            logger.warning(
+                'escalation %s: unrecognised action %r for task %s — ignored',
+                escalation.id, action, escalation.task_id,
+            )
+
+    async def _action_teardown_and_set_status(
+        self,
+        task_id: str,
+        target_status: str,
+        action: str,
+    ) -> None:
+        """Async helper: execute a non-resume resolution action on a task.
+
+        Implements C3.1 (status-precedes-kill) ordering:
+          1. Terminal recheck — skip if the task is already done/cancelled.
+          2. Stamp ``_action_teardown_tasks`` (suppression — step-12).
+          3. Write ``target_status`` via scheduler.
+          4. Kill live workflow if active (soft → grace → hard — steps 8/12).
+          5. Clear the stamp once the workflow slot has cleared (step-12).
+
+        Steps 4/5 (kill/stamp) are added incrementally by later plan steps.
+        This stub handles the no-live-workflow case (step-6/C no-kill slice).
+        """
+        current = await self.scheduler.get_status(task_id)
+        if current in TERMINAL_STATUSES:
+            logger.debug(
+                'action-teardown %s: task %s is already %s (terminal) — skip',
+                action, task_id, current,
+            )
+            return
+
+        logger.info(
+            'action-teardown %s: writing task %s → %s',
+            action, task_id, target_status,
         )
+        try:
+            await self.scheduler.set_task_status(task_id, target_status)
+        except SetTaskStatusRejected as e:
+            logger.warning(
+                'action-teardown %s: set_task_status(%s, %s) rejected: %s',
+                action, task_id, target_status, e,
+            )
+            return
+
+        # Kill sequence for live workflow — steps 8/12 wire this.
+        # Guard exists now so the no-kill path is exercised by step-5 tests.
+        if self.is_workflow_active(task_id):
+            logger.info(
+                'action-teardown %s: task %s has active workflow — kill wired '
+                'in step-8', action, task_id,
+            )
+            # TODO (step-8): cancel_workflow → poll → hard_cancel_workflow
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
