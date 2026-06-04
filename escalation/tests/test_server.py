@@ -2396,5 +2396,5 @@ class TestDowngradeDedupeCorrectness:
             f'Expected second (SUMMARY_B) to be queued (distinct 3rd token), got: {second}'
         )
         assert second['id'] != first['id'], (
-            f'SUMMARY_A and SUMMARY_B must produce separate records'
+            'SUMMARY_A and SUMMARY_B must produce separate records'
         )
