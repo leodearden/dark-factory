@@ -46,7 +46,8 @@ mcp__escalation__merge_request(
   task_id="<TASK_ID>",
   branch="<TASK_ID>",
   worktree="<path to worktree>",
-  description="<brief description of what's being merged>"
+  description="<brief description of what's being merged>",
+  wait_secs=100
 )
 ```
 
@@ -55,12 +56,39 @@ Parameters:
 - `branch` — the task ID only (e.g., `"466"`), **not** the full branch name. The merge worker prepends the `task/` prefix automatically.
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
+- `wait_secs=100` — **always pass this explicitly.** The value 100 equals the server's maximum bounded wait (`_MAX_WAIT_SECS`), so fast/idle-queue merges return their terminal outcome in the same call. The call always returns within ≤100 s.
 
-This call blocks until the merge worker finishes rebasing, verifying, and CAS-advancing main — plus any time spent queued behind merges ahead of yours. That can be seconds on a small repo, but **tens of minutes** on a large/slow one (e.g. reify ~30 min). If you're calling this from a context that must stay responsive (such as the escalation-watcher loop), run the submission in a background sub-agent rather than blocking the foreground on it.
+The call returns with **either** a **terminal** status **or** a **non-terminal** status:
+
+- **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`): the merge resolved within the bounded wait. Jump straight to step 4.
+  - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done`.
+
+- **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
+  - `attached` means your submission was coalesced with an already-in-flight request for the same branch; you share that request's `request_id`.
+
+### Poll for completion
+
+Call `merge_status(request_id)` on a backoff schedule until the state is terminal:
+
+```
+mcp__escalation__merge_status(request_id="<request_id from submit>")
+```
+
+**Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field, use that value as the sleep duration instead (capped at 60 s).
+
+**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
+
+**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`) — proceed to step 4.
+
+**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. The response includes `hint: "check git log main"`. Run:
+```bash
+git log main --oneline -20  # confirm whether the merge already landed
+```
+If the commit is on main: treat as `done`. If not: resubmit (go back to step 3).
 
 ### 4. Handle the outcome
 
-The tool returns `{ status, reason, conflict_details }`. Handle each status:
+The outcome arrives from either the submit call (terminal at submit time) or the poll loop. Handle each status:
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
