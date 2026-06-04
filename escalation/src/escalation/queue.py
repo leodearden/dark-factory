@@ -163,8 +163,16 @@ class EscalationQueue:
             yield from archive_root.rglob(pattern)
 
     def submit(self, escalation: Escalation) -> str:
-        """Atomic write: {id}.tmp -> rename to {id}.json."""
-        self._atomic_write(escalation.id, escalation.to_json())
+        """Atomic write: {id}.tmp -> rename to {id}.json.
+
+        The write is serialized per-id by ``escalation_id_lock`` to prevent a
+        concurrent same-id submit from clobbering an in-progress RMW mutator
+        (add_members_to_l2, attach_dedupe_child, resolve).  The notify callback
+        fires OUTSIDE the lock so a callback that re-enters the queue for the
+        same id does not deadlock.
+        """
+        with escalation_id_lock(self.queue_dir, escalation.id):
+            self._atomic_write(escalation.id, escalation.to_json())
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
 
         if self._notify_callback:
@@ -345,9 +353,18 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
-        Idempotent: if the escalation is already resolved or dismissed, this
-        method returns the existing escalation unchanged without re-archiving
-        or re-firing the _resolve_callback.
+        Concurrency: the get → status-check → mutate → _atomic_write →
+        _archive_resolved critical section is serialized under
+        ``escalation_id_lock``.  Moving the idempotency status-check INSIDE
+        the lock ensures that two concurrent resolves for the same id
+        serialize and produce exactly one archive copy.
+
+        Callbacks and cascade run AFTER releasing the lock:
+        - ``_resolve_callback`` fires after the lock is released, preventing
+          re-entrant callback → resolve deadlocks.
+        - The member cascade calls ``self.resolve(member_id, …)`` for each L1
+          member; each cascaded call takes its OWN distinct sidecar lock
+          (different file → different inode → no same-fd re-entrancy/deadlock).
 
         Cascade: if the escalation is an L2 with a non-empty ``members`` list,
         after archiving the L2 each member id is resolved recursively with the
@@ -370,26 +387,28 @@ class EscalationQueue:
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
         """
-        esc = self.get(escalation_id)
-        if esc is None:
-            return None
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self.get(escalation_id)
+            if esc is None:
+                return None
 
-        if esc.status != 'pending':
-            logger.info(
-                f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
-            )
-            return esc
+            if esc.status != 'pending':
+                logger.info(
+                    f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
+                )
+                return esc
 
-        esc.status = 'dismissed' if dismiss else 'resolved'
-        esc.resolution = resolution
-        esc.resolved_at = datetime.now(UTC).isoformat()
-        if resolved_by is not None:
-            esc.resolved_by = resolved_by
-        if resolution_turns is not None:
-            esc.resolution_turns = resolution_turns
+            esc.status = 'dismissed' if dismiss else 'resolved'
+            esc.resolution = resolution
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            if resolved_by is not None:
+                esc.resolved_by = resolved_by
+            if resolution_turns is not None:
+                esc.resolution_turns = resolution_turns
 
-        self._atomic_write(escalation_id, esc.to_json())
-        self._archive_resolved(escalation_id, esc.resolved_at)
+            self._atomic_write(escalation_id, esc.to_json())
+            self._archive_resolved(escalation_id, esc.resolved_at)
+
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
 
         if self._resolve_callback:
@@ -453,10 +472,13 @@ class EscalationQueue:
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
 
-        # Step 2: atomic write then best-effort archive (delegates to shared helpers)
-        self._atomic_write(escalation.id, escalation.to_json())
-        # Step 3: best-effort archive move
-        self._archive_resolved(escalation.id, escalation.resolved_at)
+        # Step 2: atomic write + best-effort archive under the per-id lock.
+        # The lock prevents a concurrent same-id RMW from clobbering this write.
+        # The resolve callback fires OUTSIDE the lock (see lock-scope design decision).
+        with escalation_id_lock(self.queue_dir, escalation.id):
+            self._atomic_write(escalation.id, escalation.to_json())
+            # Step 3: best-effort archive move
+            self._archive_resolved(escalation.id, escalation.resolved_at)
 
         # Step 4: log
         logger.info(
