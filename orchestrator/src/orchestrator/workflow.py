@@ -53,6 +53,14 @@ from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUS
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
+# Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
+# escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
+# type annotation; a separate runtime import is needed here because
+# _is_gating_escalation evaluates the set at call time, not just for type hints.
+# This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
+# nothing in it imports orchestrator.
+from escalation.models import BORN_AT_L2_SEVERITIES
+
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -66,6 +74,35 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
     if any(t in _ESCALATION_TOOLS for t in (role.allowed_tools or []))
     and name not in {'steward', 'deep_reviewer'}
 )
+
+
+def _is_gating_escalation(e: 'Escalation') -> bool:
+    """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
+
+    Gating policy — an escalation gates when ANY disjunct fires:
+    1. Plain blocking L0: ``severity == 'blocking' and level == 0``
+       (fresh agent-filed blocker awaiting steward triage).
+    2. Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``
+       i.e. 'critical' or 'urgent' — these bypass the auto-watcher and route
+       straight to a human regardless of level.
+    3. Any level ≥ 2: ``level >= 2``
+       (escalation-watcher promoted to L2; a human must decide before the
+       workflow proceeds — applies to any severity, including 'info').
+
+    Deliberately NOT gating:
+    - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
+      steward hand-off from a *prior* run that is still awaiting human triage.
+      Sinking the current run on a stale L1 caused the run-2 false-blocked
+      outcome (esc-2911-22).  The B3 constraint preserves this property; note
+      that a *prior-run* critical/urgent (``severity in BORN_AT_L2_SEVERITIES``)
+      DOES gate the current run — that is the intended stop-the-line semantics
+      for high-severity escalations (D4 accepted consequence).
+    """
+    return (
+        (e.severity == 'blocking' and e.level == 0)
+        or e.severity in BORN_AT_L2_SEVERITIES
+        or e.level >= 2
+    )
 
 
 class _StewardReescalated(Exception):
