@@ -373,6 +373,18 @@ _CATEGORY_PRIORITY: list[str] = [
 ]
 
 
+# Categories skipped by the preexisting-main-break probe.  Timeouts and
+# lock contention are non-deterministic to re-run, so probing main for them
+# is neither cheap nor a reliable signal.  All other genuine failure categories
+# (compile_error, test_failure, npm_error, unknown_test_failure, …) DO
+# reproduce with a stable (category, cause_hint) signature when inherited and
+# are safe to re-check.
+PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
+    'infra_timeout',
+    'flock_error',
+})
+
+
 def _worst_category(categories: list[str]) -> str:
     """Return the highest-severity category from *categories*.
 

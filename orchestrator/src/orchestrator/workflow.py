@@ -58,7 +58,12 @@ from orchestrator.scheduler import (
 )
 from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify import (
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
+    VerifyResult,
+    run_scoped_verification,
+    verify_failure_is_preexisting_on_main,
+)
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -419,6 +424,10 @@ class TaskWorkflow:
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Set by _verify_debugfix_loop when a failure is classified as inherited
+        # from main (preexisting break).  Read at the call site (run()) to route
+        # _mark_blocked with dedupe_fingerprint instead of the generic reason.
+        self._inherited_break_info: dict | None = None
         # Per-run history of (category, normalised cause_hint) tuples for the
         # signature-repetition guard.  Ephemeral — intentionally not persisted
         # in task metadata because the verify loop is wholly within one
@@ -3412,6 +3421,53 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             verify_attempt += 1
+
+            # Broken-main contagion guard: detect whether this failure was
+            # inherited from main (preexisting break) rather than introduced by
+            # this task.  If so, block WITHOUT self-patching or advancing the
+            # signature-repeat counter — the stashed _inherited_break_info is
+            # read at the call site to route a single deduped escalation.
+            # Skips flaky/env categories (infra_timeout, flock_error) that are
+            # non-deterministic to re-check on main.
+            self._inherited_break_info = None
+            if (
+                self.config.escalate_preexisting_main_break
+                and not result.timed_out
+                and (result.category or '') not in PREEXISTING_BREAK_SKIP_CATEGORIES
+                and await verify_failure_is_preexisting_on_main(
+                    self.worktree, self.config, self._module_configs,
+                    self._task_files, result, self.git_ops,
+                )
+            ):
+                try:
+                    from escalation.dedupe import compute_content_fingerprint
+                    main_sha = await self.git_ops.get_main_sha()
+                    fp = compute_content_fingerprint(
+                        'preexisting_main_break',
+                        result.category or '',
+                        [],
+                        description=(
+                            _normalize_cause_hint(result.cause_hint) + '|' + main_sha
+                        ),
+                    )
+                except Exception:
+                    fp = ''
+                self._inherited_break_info = {
+                    'reason': (
+                        f'Verify failure is preexisting on main '
+                        f'(category={result.category!r}): {result.cause_hint[:120]}'
+                    ),
+                    'detail': result.failure_report(),
+                    'category': 'preexisting_main_break',
+                    'fingerprint': fp,
+                }
+                logger.warning(
+                    'Task %s: verify failure classified as inherited from main '
+                    '(category=%r, fp=%s) — blocking without self-patch',
+                    self.task_id, result.category, fp[:16] if fp else '',
+                )
+                return WorkflowOutcome.BLOCKED
+
             # Fast-fail: when the verifier's own injected ``Command timed out
             # after Ns: …`` wrapper string is the only signal, retrying gives
             # the debugger nothing actionable.  Escalate to L1 after
