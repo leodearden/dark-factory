@@ -2332,11 +2332,7 @@ async def verify_failure_is_preexisting_on_main(
                 )
             except Exception:
                 logger.debug('verify_failure_is_preexisting_on_main: worktree remove failed', exc_info=True)
-            try:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(tmp_path, ignore_errors=True)
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 await _run(['git', 'worktree', 'prune'], cwd=config.project_root)
-            except Exception:
-                pass

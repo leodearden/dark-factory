@@ -15,11 +15,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers / constants
