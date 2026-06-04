@@ -6346,7 +6346,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self._steward = steward
         await steward.start()
 
-    async def _await_cancellable(self, awaitable):
+    async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.
 
         Returns the awaitable's result, or ``None`` if the cancel event was
@@ -6357,9 +6357,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         If both the awaitable and the cancel event resolve in the same
         ``asyncio.wait`` window, the awaitable's result wins — the work
         already finished, no need to soft-cancel.
+
+        *on_soft_cancel*: optional ``Callable[[], None]`` invoked when the
+        cancel event wins and the future is not yet done.  When provided it
+        takes responsibility for orphan-avoidance (e.g. calling
+        ``registry.detach(branch, request_id)`` which cancels the primary
+        future only when the waiter count hits 0).  When ``None`` (default),
+        the existing ``fut.cancel()`` behaviour is preserved — this keeps the
+        group-merge / train path's blanket cancel untouched (D9).
         """
         fut = asyncio.ensure_future(awaitable)
         cancel_task = asyncio.create_task(self._cancel_event.wait())
+        cancel_won = False
         try:
             done, _pending = await asyncio.wait(
                 {fut, cancel_task},
@@ -6367,6 +6376,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             if fut in done:
                 return fut.result()
+            cancel_won = True
             return None
         finally:
             if not cancel_task.done():
@@ -6379,8 +6389,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # the queue with no workflow left to create the owning escalation.
             # See merge_queue.py: workers check req.result.cancelled() at entry
             # and before each halt_for_wip site.
-            if not fut.done():
-                fut.cancel()
+            if cancel_won and not fut.done():
+                if on_soft_cancel is not None:
+                    on_soft_cancel()
+                else:
+                    fut.cancel()
 
     async def _handle_soft_cancel(self, phase: str) -> WorkflowOutcome:
         """Decide an outcome after ``_cancel_event`` interrupted a long wait.

@@ -624,3 +624,60 @@ class TestSubmitToMergeQueueRegistersInRegistry:
             f'inflight_seen={inflight_seen}'
         )
         assert outcome == WorkflowOutcome.DONE
+
+
+@pytest.mark.asyncio
+class TestAwaitCancellableSoftCancelHook:
+    """_await_cancellable on_soft_cancel hook: detach instead of cancel."""
+
+    async def test_hook_called_future_not_cancelled_on_cancel_win(
+        self, tmp_path: Path,
+    ):
+        """When the cancel event wins the race, hook is called and future is NOT cancelled."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._cancel_event.set()  # cancel wins immediately
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        hook_calls: list[int] = []
+
+        result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result is None
+        assert hook_calls == [1], 'hook must be called exactly once'
+        assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
+
+    async def test_no_hook_future_is_cancelled_on_cancel_win(
+        self, tmp_path: Path,
+    ):
+        """Without a hook (default None), cancel-win still cancels the future."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._cancel_event.set()
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+
+        result = await wf._await_cancellable(fut)
+
+        assert result is None
+        assert fut.cancelled(), 'future must be cancelled when no hook is provided'
+
+    async def test_hook_not_called_when_future_resolves_first(
+        self, tmp_path: Path,
+    ):
+        """When the awaitable resolves first, hook is NOT called and its result is returned."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        # cancel_event is NOT set
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut.set_result('the_result')
+        hook_calls: list[int] = []
+
+        result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result == 'the_result'
+        assert hook_calls == [], 'hook must NOT be called when future resolves first'
