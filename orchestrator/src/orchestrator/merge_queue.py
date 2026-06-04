@@ -1833,6 +1833,7 @@ class MergeRequest:
     module_configs: list[ModuleConfig]
     config: OrchestratorConfig
     result: asyncio.Future[MergeOutcome] = field(repr=False)
+    enqueued_at: float = field(default_factory=time.time, kw_only=True)
 
 
 @dataclass

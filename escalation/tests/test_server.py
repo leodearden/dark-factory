@@ -1298,3 +1298,61 @@ class TestGetMergeQueue:
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
+
+    # ── step-3: MergeRequest.enqueued_at default ──────────────────────────
+
+    async def test_merge_request_has_enqueued_at_default(self, tmp_path: Path):
+        """MergeRequest has enqueued_at float default; GroupMergeRequest still builds."""
+        import asyncio
+        import time
+
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            GroupMergeRequest, MergeRequest,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+
+        req = MergeRequest(
+            task_id='T1',
+            branch='T1',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+
+        assert isinstance(req.enqueued_at, float), (
+            f'enqueued_at must be float, got {type(req.enqueued_at)}'
+        )
+        assert abs(req.enqueued_at - time.time()) < 60, (
+            f'enqueued_at={req.enqueued_at!r} not within 60s of now={time.time()!r}'
+        )
+
+        # Regression guard: GroupMergeRequest must still construct without TypeError
+        async def _noop_status(ids):
+            return {}
+
+        async def _noop_done(tid, sha):
+            pass
+
+        grq = GroupMergeRequest(
+            task_id='G1',
+            branch='G1',
+            worktree=tmp_path / 'wt2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            train_id='train-1',
+            member_task_ids=['G1'],
+            tip_branch='G1',
+            tip_task_id='G1',
+            status_check=_noop_status,
+            mark_member_done=_noop_done,
+        )
+        assert isinstance(grq.enqueued_at, float)
