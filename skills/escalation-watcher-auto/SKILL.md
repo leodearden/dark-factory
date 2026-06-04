@@ -24,11 +24,11 @@ Your operator has configured two rotation limits, injected into your user prompt
 - `ROTATION_ESCALATIONS` — maximum number of escalations to handle before exiting
 - `ROTATION_HOURS` — maximum wall-clock hours before exiting
 
-Track both from startup. When **either** limit is reached:
+At startup, compute a **wall-clock deadline** = start + ROTATION_HOURS × 3600 s. Re-check the deadline after every bounded wait. When **either** limit is reached — `escalations_handled >= ROTATION_ESCALATIONS` or `now >= deadline`:
 1. Emit the digest (see [Digest Format](#digest-format)) as your final message
 2. Exit cleanly (return normally — do NOT raise an exception)
 
-The supervisor will restart you immediately with a fresh context. This is the expected, healthy rotation path.
+The bounded wait (`--timeout min(540, remaining)`) ensures you regain control at your deadline, comfortably before the supervisor's force-kill grace window. The supervisor will restart you immediately with a fresh context. This is the expected, healthy rotation path.
 
 ## Architecture Map (Priors)
 
@@ -180,7 +180,7 @@ Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found 
 ## Main Loop
 
 ```
-1. Record start time
+1. Record start time; compute deadline = start + ROTATION_HOURS × 3600 s
 2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
    If YES → use L2 promotion paths throughout (steps 4 and 5)
    If NO  → fall back to LEGACY mode (see Graceful Degradation)
@@ -196,9 +196,16 @@ Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found 
    OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
 6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
    do NOT count toward the rotation limit
-7. Check rotation limits — if reached, emit digest and exit
-8. Wait for next L1: foreground-blocking call to escalation.watcher (see below)
-9. On watcher return: go to 3
+7. Check rotation limits:
+   If escalations_handled >= ROTATION_ESCALATIONS OR now >= deadline:
+     → emit digest as final message and exit cleanly (return normally — do NOT raise)
+8. Compute remaining = deadline − now (seconds)
+9. Arm a bounded foreground wait (see [Waiting for the next L1](#waiting-for-the-next-l1)):
+   a. On exit 0: parse the printed escalation JSON from stdout; go to 3
+      (drain ALL pending L1s — the drain is authoritative, not the single watcher event)
+   b. On exit 124 (timeout expired, empty stdout): re-check deadline:
+      - remaining > 0 → go to 8 (re-arm with updated remaining)
+      - remaining ≤ 0 → emit digest as final message and exit cleanly
 ```
 
 The digest is emitted on rotation-limit exit regardless of mode (promotion or legacy).
@@ -218,16 +225,22 @@ Handle only `work_batch` before (re)starting the wait.
 
 ### Waiting for the next L1
 
-After draining, wait for the next incoming L1 using a **foreground-blocking** call:
+After checking rotation limits (step 7), compute `remaining = deadline − now` (seconds) and arm a **foreground-blocking** call with a bounded timeout:
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
-  --queue-dir <project_root>/data/escalations --level 1
+  --queue-dir <project_root>/data/escalations --level 1 --timeout <min(540, remaining)>
 ```
 
-Run this as a **foreground** (blocking) Bash call — NOT `run_in_background`. The watcher uses inotify and exits after the first matching L1 escalation, printing its JSON to stdout. Parse the escalation from the output, then immediately drain all pending L1s again.
+The `<min(540, remaining)>` clamp sizes the final wait exactly to the remaining rotation time, so the agent regains control at its deadline rather than overshooting.
 
-**Rationale:** Background tasks exhaust the fd pool after ~35 restart cycles (a known limitation documented in the interactive watcher skill). Since you run for multi-hour AFK windows, use foreground blocking only.
+**Exit-code contract (from `escalation.watcher`):**
+- **exit 0** — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work.
+- **exit 124** — timeout expired, stdout is empty. Re-check the deadline: if `remaining > 0`, go to step 8 and re-arm; if `remaining ≤ 0`, emit the digest and exit cleanly.
+
+**Initial-scan semantics:** the watcher arms inotify first, then scans the queue directory for already-pending matches before blocking. If a matching L1 was filed between skill startup and watcher launch, the watcher fires immediately on that entry (exit 0). Treat instant fires as normal wakes — the drain that follows is authoritative.
+
+**Rationale for foreground blocking:** a single foreground call with a bounded `--timeout` is simpler than managing a background subprocess, and the bounded wait guarantees the agent regains control before the supervisor's force-kill grace window. File-descriptor exhaustion from restart cycles is not expected (historical — no longer expected; see escalation-watcher/SKILL.md §Troubleshooting).
 
 ## Per-Category Routing Table
 
