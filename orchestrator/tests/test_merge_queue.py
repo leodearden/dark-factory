@@ -7608,6 +7608,39 @@ class TestCoalesceOrEnqueueRegistryOnly:
         # Clean up the never-resolving future to avoid ResourceWarning
         other_future.cancel()
 
+    async def test_retention_forwarded_through_coalesce(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """coalesce_or_enqueue_merge_request forwards retention to enqueue chokepoint.
+
+        After a dispatched request's future resolves, the retention ring must
+        contain a record and a merge_finalized row must exist in the event store.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        req = _make_request('777', '777', tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result.dispatched is True
+
+        # Resolve the future → done-callback fires
+        req.result.set_result(MergeOutcome(status='done', merge_sha='cf1'))
+        await asyncio.sleep(0)
+
+        # Ring must have the record
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'cf1'
+
+        # merge_finalized row must exist in the event store
+        assert _count_events(event_store.db_path, 'merge_finalized') == 1
+
 
 # ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees

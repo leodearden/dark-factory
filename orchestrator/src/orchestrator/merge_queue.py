@@ -1871,6 +1871,7 @@ async def coalesce_or_enqueue_merge_request(
     git_ops: _FindInflightWorktreeP | None = None,
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
