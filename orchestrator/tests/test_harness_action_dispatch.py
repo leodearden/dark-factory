@@ -724,3 +724,168 @@ class TestTeardownKillSequence:
 
         # hard_cancel must be called because the slot never cleared
         harness.hard_cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Pair F — _action_teardown_tasks set + scheduler hook wiring + stamp/clear
+# Step-11: RED until step-12 wires the set, installs the hook, and stamps.
+# ---------------------------------------------------------------------------
+
+class TestActionTeardownTasksSet:
+    """Pair F (step-11, task 1620): Harness._action_teardown_tasks set + scheduler hook.
+
+    RED until step-12:
+      - Adds ``self._action_teardown_tasks: set[str] = set()`` to Harness.__init__.
+      - Installs ``self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__``
+        right beside the existing _on_park_stop_trip / _on_external_dep_block installs.
+    """
+
+    def test_action_teardown_tasks_is_empty_set(self, harness: Harness):
+        """(a.1) Harness exposes _action_teardown_tasks as an empty set after construction.
+
+        Fails before step-12 with AttributeError: Harness has no _action_teardown_tasks.
+        """
+        assert isinstance(getattr(harness, '_action_teardown_tasks', None), set), (
+            'Harness._action_teardown_tasks must be a set (fails before step-12)'
+        )
+        assert len(harness._action_teardown_tasks) == 0, (
+            '_action_teardown_tasks must start empty'
+        )
+
+    def test_scheduler_suppress_hook_wired_to_teardown_set(self, harness: Harness):
+        """(a.2) scheduler._suppress_blocked_write is wired to _action_teardown_tasks.__contains__:
+        returns True for stamped tids, False otherwise.
+
+        Before step-12, _action_teardown_tasks doesn't exist → AttributeError when we call .add().
+        After step-12, the hook is the set's __contains__: returns True/False correctly.
+        """
+        hook = harness.scheduler._suppress_blocked_write  # type: ignore[attr-defined]
+        harness._action_teardown_tasks.add('task-X')  # AttributeError before step-12
+        assert hook('task-X') is True, 'hook must return True for stamped task_id'
+        assert hook('task-Y') is False, 'hook must return False for unstamped task_id'
+
+
+@pytest.mark.asyncio
+class TestTeardownStampClear:
+    """Pair F (step-11): stamp/clear discipline in _action_teardown_and_set_status.
+
+    RED until step-12 adds the stamp before the kill and the clear in the finally block.
+    """
+
+    async def test_stamp_present_during_cancel_window(self, harness: Harness):
+        """(b) task_id is in _action_teardown_tasks when cancel_workflow is called
+        (stamped BEFORE the kill) and cleared after the slot clears.
+
+        Fails before step-12 because _action_teardown_tasks doesn't exist.
+        """
+        stamped_at_cancel: dict[str, bool] = {}
+        call_log: list[str] = []
+
+        async def fake_set_status(tid: str, status: str) -> None:
+            call_log.append(f'set_status:{tid}:{status}')
+
+        def fake_cancel(tid: str) -> None:
+            call_log.append(f'cancel:{tid}')
+            # Record whether the stamp was present at cancel time.
+            stamped_at_cancel[tid] = tid in harness._action_teardown_tasks
+
+        def fake_is_active(tid: str) -> bool:
+            # Active until cancel is logged (simulates immediate slot clear).
+            return not any(e == f'cancel:{tid}' for e in call_log)
+
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock(side_effect=fake_set_status)
+        harness.cancel_workflow = MagicMock(side_effect=fake_cancel)
+        harness.hard_cancel_workflow = MagicMock()
+        harness.is_workflow_active = MagicMock(side_effect=fake_is_active)
+        harness.config.terminal_status_hard_cancel_polls = 3
+
+        task_id = 'task-stamp-check'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        # Stamp must have been present when cancel_workflow was called.
+        assert stamped_at_cancel.get(task_id) is True, (
+            f'task_id must be in _action_teardown_tasks when cancel_workflow is called; '
+            f'stamped_at_cancel={stamped_at_cancel}'
+        )
+        # After slot clears, stamp must be discarded.
+        assert task_id not in harness._action_teardown_tasks, (
+            '_action_teardown_tasks must be cleared once the slot clears'
+        )
+
+    async def test_park_stamp_present_during_kill_and_cleared(self, harness: Harness):
+        """park action stamps before cancel and clears after slot clears."""
+        stamped_at_cancel: dict[str, bool] = {}
+        call_log: list[str] = []
+
+        def fake_cancel(tid: str) -> None:
+            call_log.append(f'cancel:{tid}')
+            stamped_at_cancel[tid] = tid in harness._action_teardown_tasks
+
+        def fake_is_active(tid: str) -> bool:
+            return not any(e == f'cancel:{tid}' for e in call_log)
+
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.cancel_workflow = MagicMock(side_effect=fake_cancel)
+        harness.hard_cancel_workflow = MagicMock()
+        harness.is_workflow_active = MagicMock(side_effect=fake_is_active)
+        harness.config.terminal_status_hard_cancel_polls = 3
+
+        task_id = 'task-park-stamp'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert stamped_at_cancel.get(task_id) is True, (
+            f'task_id must be stamped when cancel_workflow is called for park; '
+            f'stamped_at_cancel={stamped_at_cancel}'
+        )
+        assert task_id not in harness._action_teardown_tasks, (
+            'stamp must be cleared after slot clears'
+        )
+
+    async def test_abandon_stamp_cleared_no_crash(self, harness: Harness):
+        """(c) abandon stamps (harmless — abandon→cancelled is terminal, already protected
+        by scheduler terminal-exit gate) and clears cleanly; no crash.
+
+        Fails before step-12 because _action_teardown_tasks doesn't exist.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.is_workflow_active = MagicMock(return_value=False)
+        harness.cancel_workflow = MagicMock()
+
+        task_id = 'task-abandon-stamp'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='abandon',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # No crash; stamp must be cleared after completion.
+        assert task_id not in harness._action_teardown_tasks, (
+            '_action_teardown_tasks must not contain task_id after abandon completes'
+        )
