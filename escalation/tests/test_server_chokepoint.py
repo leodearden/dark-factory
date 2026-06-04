@@ -1608,3 +1608,57 @@ class TestMergeCancel:
         assert result.get('reason'), (
             f"Expected non-empty reason for mid-finalize window, got: {result}"
         )
+
+    async def test_cancel_finalized_popped_id_resolves_via_durable_tier(self, tmp_path: Path):
+        """Cancelling a finalized+popped request_id returns the durable terminal state.
+
+        Injects a tiny fake event_store that returns a finalized row for 'mr-finalized'
+        and None for other ids.  No waiter is registered (simulating finalized+popped).
+        merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
+        <non-empty>} — not 'unknown'.  merge_cancel('mr-never') must still return state='unknown'.
+
+        RED until step-10 impl: the None-rec branch always returns 'unknown' and never
+        consults event_store.
+        """
+
+        class FakeEventStore:
+            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
+                if request_id == 'mr-finalized':
+                    return {
+                        'request_id': request_id,
+                        'state': 'done',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                return None
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            event_store=FakeEventStore(),
+        )
+
+        # No waiter registered for 'mr-finalized' (simulates finalized+popped)
+        result_finalized = await _call_merge_cancel(server, request_id='mr-finalized')
+
+        assert result_finalized.get('cancelled') is False, (
+            f"Expected cancelled=False for finalized id, got: {result_finalized}"
+        )
+        assert result_finalized.get('state') == 'done', (
+            f"Expected state='done' from durable tier, got: {result_finalized}"
+        )
+        assert result_finalized.get('reason'), (
+            f"Expected non-empty reason for finalized id, got: {result_finalized}"
+        )
+
+        # An id not in the event_store must still return 'unknown'
+        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        assert result_never.get('state') == 'unknown', (
+            f"Expected state='unknown' for truly unknown id, got: {result_never}"
+        )
