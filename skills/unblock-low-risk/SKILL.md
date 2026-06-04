@@ -83,14 +83,31 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 6. **Commit.** `git -C <worktree> add <only the files you changed>` then commit on `task/<task_id>`
    with a clear message. Never `git add -A` (avoids `.task/` contamination); never `--no-verify`.
 
-7. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
+7. **Charge the merge slot.** From the **primary dark-factory checkout**, run:
+
+   ```
+   .venv/bin/python -m orchestrator.b3_gate charge \
+     --task-id <task_id> \
+     --project-root <project_root>
+   ```
+
+   Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
+
+   Parse JSON stdout; if `charged` is `false` (rolling-24h cap exceeded), **ABORT**, carrying the
+   gate's `reason` verbatim into the return value's `reason`. Only `charged: true` proceeds.
+
+   Rationale (PRD §4.2): the charge sits at the merge-submit choke point — the actual unattended-merge
+   risk axis — so every ABORT before this step (preconditions, scope check, rebase conflict, verify
+   failure) spends no slot and is free by design.
+
+8. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
    branch=task_id, worktree=<abs path>, description="unblock-low-risk: <one-line summary>")`. `branch`
    is the **bare task id** — the worker prepends `task/`. This blocks until the merge worker (which
    re-rebases and runs authoritative post-merge verification) finishes. **If it returns `{'error':
    ...}` (orchestrator not running) → ABORT.** Do NOT fall back to a direct `git merge` — an
    unattended direct merge to main is exactly the risk this skill refuses to take.
 
-8. **Handle the outcome:**
+9. **Handle the outcome:**
    - **`done` / `already_merged`:** success.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance={"kind": "merged", "commit": "<merge sha>"})`.
