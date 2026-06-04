@@ -3349,6 +3349,135 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await asyncio.wait_for(worker_task, timeout=30)
 
+    # ── Verifier ordering-token (γ3 step-5 / task-1644) ──────────────────────
+
+    async def test_verifier_skips_set_result_when_already_delivered(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Verifier must NOT resolve req.result when already_delivered=True.
+
+        The token represents an outcome the merger already delivered OOB.  The
+        verifier must use it only as an ordering token (n_failed flip + slot
+        release) and must not call set_result — the future stays PENDING.
+
+        RED before step-6 impl: the existing guard is
+        `if not req.result.done():` — since the future is pending, that guard
+        is True and the verifier still calls set_result.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('vot-a', 'vot-a', git_ops.project_root, config)
+        # Leave req.result PENDING — the OOB caller owns delivery; the verifier
+        # must respect the already_delivered flag and skip set_result.
+
+        token = SpeculativeItem(
+            request=req, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('conflict'),
+            already_delivered=True,
+        )
+        await worker._verifier_queue.put(token)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        await worker._verifier_loop()
+
+        assert not req.result.done(), (
+            'Verifier must NOT resolve req.result when already_delivered=True '
+            '(merger already resolved it OOB; verifier is ordering-token only). '
+            'RED before step-6 impl.'
+        )
+
+    async def test_verifier_already_delivered_token_drives_nfailed_chain(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """already_delivered failure token flips n_failed, triggering _remerge.
+
+        Token1: already_delivered=True, immediate_outcome='conflict', speculative=False,
+        request future pre-resolved.
+        Token2: speculative=True, immediate_outcome=None.
+
+        After the loop _remerge must be awaited exactly once (Token2 discarded
+        because n_failed=True from Token1) and _speculation_slot must be set.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Token1: pre-resolved (OOB delivery happened); the verifier sees it
+        # as an ordering token for n_failed bookkeeping.
+        req1 = _make_request('vot-b1', 'vot-b1', git_ops.project_root, config)
+        conflict_outcome = MergeOutcome('conflict')
+        req1.result.set_result(conflict_outcome)
+
+        token1 = SpeculativeItem(
+            request=req1, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=conflict_outcome,
+            already_delivered=True,
+        )
+
+        # Token2: speculative — will be discarded+re-merged because n_failed=True
+        req2 = _make_request('vot-b2', 'vot-b2', git_ops.project_root, config)
+        remerge_outcome = MergeOutcome('done', merge_sha='a' * 40)
+        remerged_item = SpeculativeItem(
+            request=req2, merge_result=None, merge_wt=None,
+            base_sha='newbase', speculative=False, skip_verify=False,
+            immediate_outcome=remerge_outcome,
+            already_delivered=False,
+        )
+        worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
+
+        token2 = SpeculativeItem(
+            request=req2, merge_result=None, merge_wt=None,
+            base_sha='stalebase', speculative=True, skip_verify=False,
+            immediate_outcome=None,
+        )
+
+        await worker._verifier_queue.put(token1)
+        await worker._verifier_queue.put(token2)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        await worker._verifier_loop()
+
+        worker._remerge.assert_awaited_once()  # type: ignore[attr-defined]
+        assert worker._speculation_slot.is_set(), (
+            '_speculation_slot must be set after verifier drains both tokens'
+        )
+
+    async def test_verifier_no_double_resolve_for_already_delivered_token(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Pre-resolved already_delivered token must not be double-resolved.
+
+        req.result is pre-set before the token is put on the queue (simulating
+        the realistic already_delivered path where the merger resolved the future
+        OOB).  The verifier must not overwrite it and must not raise
+        InvalidStateError.  The result identity must be unchanged after the loop.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('vot-c', 'vot-c', git_ops.project_root, config)
+        conflict_outcome = MergeOutcome('conflict', conflict_details='# conflict\n')
+        req.result.set_result(conflict_outcome)
+
+        token = SpeculativeItem(
+            request=req, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=conflict_outcome,
+            already_delivered=True,
+        )
+        await worker._verifier_queue.put(token)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        # Must not raise InvalidStateError
+        await worker._verifier_loop()
+
+        assert req.result.result() is conflict_outcome, (
+            'No double-resolve: result must be the original conflict_outcome '
+            'set by OOB delivery; verifier must not overwrite it'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
