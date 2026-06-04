@@ -318,6 +318,46 @@ Technical debt or cleanup discovered during development.
    ```
 2. Add to digest: `DISPATCHED: cleanup_needed — <task_id> — <summary>`
 
+#### `stranded_blocked`
+
+A task is blocked with no active workflow and no pending sibling escalation (filed by the harness stranded-blocked sweep; level=1, agent_role='harness-stranded-blocked-reaper'). Per D5/C6, this auto-resume path keeps genuinely-recovered strands off the human's desk — humans only see genuinely re-failed tasks.
+
+1. Re-verify the predicate still holds — the task state may have changed between sweep-file and watcher-pickup:
+   ```python
+   task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
+   # predicate: task still blocked, no active workflow, no pending sibling escalation for this task
+   already_pending = any(
+       e["task_id"] == task_id and e["id"] != escalation_id
+       for e in pending_l1s + pending_l2s
+   )
+   predicate_holds = (
+       task["status"] == "blocked"
+       and not task.get("metadata", {}).get("active_workflow")
+       and not already_pending
+   )
+   ```
+2. **If the predicate still holds:** Resolve with action='resume' — the Fix#1a orphan flip re-pends blocked→pending; the re-block guard (C5) applies automatically on the flip:
+   ```python
+   mcp__escalation__resolve_issue(
+     escalation_id="...",
+     resolution="Stranded blocked task re-pended.",
+     action='resume',
+     resolved_by="escalation-watcher-auto"
+   )
+   ```
+   Add to digest: `DISPATCHED: stranded_blocked — <task_id> — re-pended via resume`
+
+3. **If the predicate no longer holds** (task is no longer blocked, a workflow is active, or a sibling escalation is already being handled): The record is stale noise — close without touching the task:
+   ```python
+   mcp__escalation__resolve_issue(
+     escalation_id="...",
+     resolution="Predicate stale — task no longer blocked or sibling escalation active; closing without change.",
+     action='close_only',
+     resolved_by="escalation-watcher-auto"
+   )
+   ```
+   Add to digest: `DISPATCHED: stranded_blocked — <task_id> — predicate stale, closed (close_only)`
+
 ---
 
 ### Promote-to-L2 categories (require human judgment)
