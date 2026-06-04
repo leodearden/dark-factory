@@ -391,3 +391,186 @@ class TestResumeLevelGate:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             task_id, 'pending',
         )
+
+
+# ---------------------------------------------------------------------------
+# Pair C — restart/park/abandon status writes + terminal recheck (no kill)
+# Step-5: RED until _action_teardown_and_set_status is wired (step-6)
+# ---------------------------------------------------------------------------
+
+def _make_l1_for_queue(
+    queue: EscalationQueue, esc_id: str, task_id: str,
+) -> Escalation:
+    """Submit a minimal L1 escalation to a real queue."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='steward',
+        severity='blocking',
+        category='design_concern',
+        summary='L1 test escalation',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _make_l2_with_action_in_queue(
+    queue: EscalationQueue,
+    l2_id: str,
+    member_ids: list[str],
+    resolution_action: str | None,
+) -> Escalation:
+    """Submit a minimal L2 cluster escalation to a real queue."""
+    esc = Escalation(
+        id=l2_id,
+        task_id='task-cluster-c',
+        agent_role='escalation-watcher-auto',
+        severity='blocking',
+        category='design_concern',
+        summary='L2 cluster with action',
+        level=2,
+        root_cause='shared root cause C',
+        members=list(member_ids),
+        resolution_action=resolution_action,
+    )
+    queue.submit(esc)
+    return esc
+
+
+@pytest.mark.asyncio
+class TestDispatchTeardownNoKill:
+    """Pair C (B4/B5): restart/park/abandon write status + terminal recheck.
+
+    is_workflow_active is False in all tests here (no kill path exercised).
+    Fails until _action_teardown_and_set_status is wired in step-6.
+    """
+
+    async def test_restart_sets_pending(self, harness: Harness):
+        """resolution_action='restart' on orphan blocked task → set_task_status('pending')."""
+        task_id = 'task-restart'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+
+    async def test_park_sets_deferred(self, harness: Harness):
+        """resolution_action='park' → set_task_status('deferred')."""
+        task_id = 'task-park'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'deferred',
+        )
+
+    async def test_abandon_sets_cancelled(self, harness: Harness):
+        """resolution_action='abandon' → set_task_status('cancelled')."""
+        task_id = 'task-abandon'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='abandon',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'cancelled',
+        )
+
+    async def test_terminal_task_not_overwritten(self, harness: Harness):
+        """Terminal recheck: if task is already done/cancelled, no write."""
+        for terminal_status in ('done', 'cancelled'):
+            harness.scheduler.get_status = AsyncMock(return_value=terminal_status)
+            harness.scheduler.set_task_status = AsyncMock()
+            harness.is_workflow_active = MagicMock(return_value=False)
+
+            for action in ('restart', 'park', 'abandon'):
+                harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
+                task_id = f'task-terminal-{terminal_status}-{action}'
+                esc = _make_esc(
+                    task_id=task_id,
+                    resolution_action=action,
+                    status='dismissed' if action in ('park', 'abandon') else 'resolved',
+                    resolved_by='interactive',
+                    level=1,
+                )
+                harness._on_escalation_resolved(esc)
+                await asyncio.gather(*list(harness._background_tasks))
+
+                harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_l2_park_cascade_sets_both_members_deferred(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Integration: L2 cluster resolved with park + two blocked L1 members
+        → both get set_task_status('deferred') via parent-action lookup."""
+        queue = EscalationQueue(tmp_path / 'esc_c')
+        l1_a = _make_l1_for_queue(queue, 'esc-c-l1-a', 'task-park-a')
+        l1_b = _make_l1_for_queue(queue, 'esc-c-l1-b', 'task-park-b')
+        l2 = _make_l2_with_action_in_queue(
+            queue, 'esc-c-l2-park', [l1_a.id, l1_b.id], resolution_action='park',
+        )
+
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+
+        queue.resolve(l2.id, 'park the cluster', dismiss=True)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        awaits = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        task_ids_written = [a.args[0] for a in awaits]
+        assert 'task-park-a' in task_ids_written
+        assert 'task-park-b' in task_ids_written
+        for a in awaits:
+            assert a.args[1] == 'deferred', f'Expected deferred, got {a.args[1]}'
+
+    async def test_l2_legacy_dismiss_no_touch(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Integration: legacy L2 (no resolution_action) dismissed → close_only
+        → members NOT touched (old behavior preserved)."""
+        queue = EscalationQueue(tmp_path / 'esc_d')
+        l1 = _make_l1_for_queue(queue, 'esc-d-l1', 'task-d-member')
+        l2 = _make_l2_with_action_in_queue(
+            queue, 'esc-d-l2-legacy', [l1.id], resolution_action=None,
+        )
+
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+
+        queue.resolve(l2.id, 'legacy dismiss', dismiss=True)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Legacy L2 dismissed → close_only → no status write
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
