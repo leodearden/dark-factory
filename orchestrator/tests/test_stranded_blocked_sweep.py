@@ -379,3 +379,55 @@ class TestEventAtDispatchOrphanFlipSuppression:
         # The registered event means Fix #1a sees task_id in _escalation_events
         # → orphan-flip path is skipped → set_task_status NOT called
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Active-workflow gate — dispatch-time event suppresses stranded_blocked re-file
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestActiveWorkflowGateSuppressesReFile:
+    """Sweep-level: dispatch-time registered event fires the active-workflow gate.
+
+    harness.py:1875 — `tid not in self._escalation_events` (no active workflow).
+    This is the central race-fix: registering at dispatch time means the sweep
+    correctly identifies in-flight tasks and skips re-filing even before
+    _run_slot has had a chance to register the event itself.
+    """
+
+    async def test_dispatch_registered_event_suppresses_sweep_refiling(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """[Active-workflow gate] A blocked task whose event is in _escalation_events
+        (registered at dispatch time) must NOT have a new L1 filed by the sweep.
+
+        This validates the central race-fix end-to-end: the gate at harness.py:1875
+        must fire and skip the stranded_blocked re-file when an active workflow is
+        in flight, preventing a double-flip.
+        """
+        queue = EscalationQueue(tmp_path / 'esc_active_wf')
+        task_id = 'task-active-workflow'
+
+        harness._escalation_queue = queue
+        harness._workflow_cancel_at.clear()
+
+        # Simulate dispatch-time registration (as happens before create_task)
+        harness._register_escalation_event(task_id)  # type: ignore[attr-defined]
+        assert task_id in harness._escalation_events, (
+            'Pre-condition: event must be in _escalation_events before sweep'
+        )
+
+        # Task appears as blocked in the status map (e.g. it was soft-cancelled
+        # or flipped externally while the workflow slot is still starting up)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        filed = queue.get_by_task(task_id, status='pending')
+        assert len(filed) == 0, (
+            f'Expected no L1 filed for active-workflow task; got {len(filed)} — '
+            'harness.py:1875 active-workflow gate must suppress re-filing when '
+            'task_id is in _escalation_events'
+        )

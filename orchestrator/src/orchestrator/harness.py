@@ -905,6 +905,21 @@ class Harness:
                 )
                 active.add(task)
                 task.add_done_callback(active.discard)
+                # Guard against the narrow resource-leak window where the slot
+                # task is cancelled before _run_slot's body begins executing
+                # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
+                # before the event loop schedules the coroutine's first step).
+                # In that case _run_slot's finally block never runs and
+                # _escalation_events[task_id] would leak — permanently
+                # satisfying the active-workflow gate and suppressing both the
+                # stranded_blocked re-file and Fix #1a orphan-flip for that
+                # task forever.  The done_callback fires unconditionally when
+                # the Task reaches any terminal state; pop() is idempotent (a
+                # no-op if _run_slot's finally already removed the entry).
+                _tid = assignment.task_id
+                task.add_done_callback(
+                    lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
+                )
 
             # Drain remaining
             if active:
