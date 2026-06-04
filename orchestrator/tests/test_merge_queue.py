@@ -4516,6 +4516,46 @@ class TestEnqueueMergeRequest:
         assert rows[0][4] == 'task/42'       # data.branch
         assert rows[0][5] == 'abc123'        # data.merge_sha
 
+    @pytest.mark.asyncio
+    async def test_cancelled_future_is_recorded_as_abandoned(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A cancelled future triggers a merge_finalized row with state=='abandoned'.
+
+        Covers PRD D7 — cancelled futures must be finalized, not silently dropped.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_cancel.db'
+        event_store = EventStore(db_path, 'run-cancel-test')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('99', 'task/99', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Cancel the future — the done-callback must handle it
+        req.result.cancel()
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == req.request_id
+        assert rows[0][2] == 'abandoned'
+        assert rows[0][3] is None  # no merge_sha for abandoned
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
