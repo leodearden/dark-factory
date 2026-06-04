@@ -345,6 +345,45 @@ class TestInitialScanMain:
         assert data['id'] == blocking_escalation.id
 
 
+class TestExcludeId:
+    """--exclude-id flag: repeatable, honoured in initial scan AND event loop."""
+
+    def test_startup_excludes_both_pending_enters_event_loop(self, tmp_path, capsys):
+        """With two pending files both excluded, initial scan returns None -> event loop entered."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc1 = Escalation(
+            id='esc-20-1', task_id='20', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='first',
+        )
+        esc2 = Escalation(
+            id='esc-20-2', task_id='20', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='second',
+        )
+        (queue_dir / f'{esc1.id}.json').write_text(esc1.to_json())
+        (queue_dir / f'{esc2.id}.json').write_text(esc2.to_json())
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', esc1.id,
+                '--exclude-id', esc2.id,
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        mock_inotify.read.assert_called_once()
+
+
 class TestMainLoop:
     """CLI exit behavior after first match."""
 

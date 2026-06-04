@@ -2,6 +2,7 @@
 
 Usage: python -m escalation.watcher --queue-dir <path> [--task-id <id>]
        [--level <int>] [--ntfy-url <url>] [--timeout <secs>]
+       [--exclude-id <esc-id> ...]
 
 Watches for new .json files in the queue directory. When a matching pending
 escalation appears (or is already present at startup), prints the escalation
@@ -143,10 +144,18 @@ def main() -> None:
         '--timeout', type=float, default=None,
         help='max blocking wait in seconds; on expiry exit 124',
     )
+    parser.add_argument(
+        '--exclude-id', action='append', default=None,
+        help='esc-id to exclude from initial scan AND event loop; repeatable',
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
+
+    exclude_ids = frozenset(
+        e[:-5] if e.endswith('.json') else e for e in (args.exclude_id or [])
+    )
 
     # ARM inotify first so no events are missed between scan and watch.
     inotify = INotify()
@@ -154,7 +163,7 @@ def main() -> None:
     inotify.add_watch(str(queue_dir), watch_flags)
 
     # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level)
+    match = _initial_scan(queue_dir, args.task_id, args.level, exclude_ids)
     if match is not None:
         _emit(match, args.ntfy_url)
         sys.exit(0)
