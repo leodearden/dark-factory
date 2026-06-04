@@ -35,13 +35,6 @@ class SetTaskStatusResult(TypedDict):
     tasks: list[dict]
 
 
-class AddSubtaskResult(TypedDict):
-    id: str
-    parent_id: str
-    message: str
-    subtask: dict
-
-
 class RemoveTaskResult(TypedDict):
     successful: int
     failed: int
@@ -72,7 +65,6 @@ class GetTasksResult(TypedDict):
 
 
 __all__ = [
-    'AddSubtaskResult',
     'AddTaskResult',
     'DependencyResult',
     'GetTasksResult',

@@ -24,7 +24,6 @@ from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daem
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
-    AddSubtaskResult,
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
@@ -89,8 +88,8 @@ CREATE TABLE IF NOT EXISTS dependencies (
     PRIMARY KEY (tag, parent_id, task_id, depends_on)
 );
 
--- Monotonic id high-water marks per (tag, parent_id) sequence.  ``add_task`` /
--- ``add_subtask`` allocate ``max(MAX(tasks.id), max_id) + 1`` so a deleted
+-- Monotonic id high-water marks per (tag, parent_id) sequence.  ``add_task``
+-- allocates ``max(MAX(tasks.id), max_id) + 1`` so a deleted
 -- top-level id is NEVER reissued (the counter holds the line after the row is
 -- gone).  Applied idempotently via executescript on every connection open; old
 -- code that ignores this table still reads/writes ``tasks`` correctly, so the
@@ -826,98 +825,6 @@ class SqliteTaskBackend:
             'message': f'Task {task_id} updated',
             'updated': True,
             'updated_task': updated_task,
-        }
-
-    async def add_subtask(
-        self,
-        parent_id: str,
-        project_root: str,
-        title: str | None = None,
-        description: str | None = None,
-        details: str | None = None,
-        tag: str | None = None,
-    ) -> AddSubtaskResult:
-        await self.ensure_connected()
-        tag = tag or DEFAULT_TAG
-        parent_int = _parse_task_id(parent_id)
-        if parent_int[1] is not None:
-            raise TaskmasterError(
-                'INVALID_TASK_ID',
-                f'add_subtask: nested subtask ids not supported: {parent_id!r}',
-            )
-        parent_tid = parent_int[0]
-        if not title:
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR',
-                'add_subtask: title is required',
-            )
-
-        async with self._write_lock(project_root), self._txn(project_root) as conn:
-            cursor = await conn.execute(
-                'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, parent_tid, _TOP_LEVEL_SENTINEL),
-            )
-            if (await cursor.fetchone()) is None:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    f'Parent task not found: {parent_id}',
-                )
-
-            # Per-parent subtask sequence: high-water across live subtask rows
-            # AND the persisted counter (parent_id = the parent's int id), so a
-            # deleted subtask id is never reissued.  Self-heals legacy DBs the
-            # same way as add_task.
-            max_cursor = await conn.execute(
-                """
-                SELECT MAX(highwater) FROM (
-                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
-                        WHERE tag = ? AND parent_id = ?
-                    UNION ALL
-                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
-                        WHERE tag = ? AND parent_id = ?
-                )
-                """,
-                (tag, parent_tid, tag, parent_tid),
-            )
-            _max_row = await max_cursor.fetchone()
-            assert _max_row is not None  # aggregate MAX always returns one row
-            next_id = (_max_row[0] or 0) + 1
-            await conn.execute(
-                """
-                    INSERT INTO tasks (tag, id, parent_id, title, description,
-                                       details, test_strategy, status, priority,
-                                       metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, '', 'pending', NULL, NULL, ?)
-                    """,
-                (
-                    tag, next_id, parent_tid, title, description or '',
-                    details or '', _now(),
-                ),
-            )
-            await conn.execute(
-                """
-                INSERT INTO id_counters (tag, parent_id, max_id) VALUES (?, ?, ?)
-                    ON CONFLICT(tag, parent_id) DO UPDATE SET max_id = excluded.max_id
-                        WHERE excluded.max_id > id_counters.max_id
-                """,
-                (tag, parent_tid, next_id),
-            )
-
-            refreshed_cursor = await conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, next_id, parent_tid),
-            )
-            refreshed = await refreshed_cursor.fetchone()
-
-        subtask_dict = (
-            _row_to_task(refreshed, [], project_root=project_root) if refreshed is not None else {}
-        )
-        formatted_id = _format_task_id(next_id, parent_tid)
-        return {
-            'id': formatted_id,
-            'parent_id': str(parent_tid),
-            'message': f'New subtask {formatted_id} successfully created',
-            'subtask': subtask_dict,
         }
 
     async def remove_tasks(

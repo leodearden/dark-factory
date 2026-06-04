@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from fused_memory.backends.task_backend_types import (
-    AddSubtaskResult,
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
@@ -107,16 +106,6 @@ class TaskBackendProtocol(Protocol):
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult: ...
-
-    async def add_subtask(
-        self,
-        parent_id: str,
-        project_root: str,
-        title: str | None = None,
-        description: str | None = None,
-        details: str | None = None,
-        tag: str | None = None,
-    ) -> AddSubtaskResult: ...
 
     async def remove_tasks(
         self,
