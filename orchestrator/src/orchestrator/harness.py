@@ -440,6 +440,10 @@ class Harness:
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
+        # Single shared registry injected into both the escalation server and
+        # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
+        from orchestrator.merge_queue import InFlightMergeRegistry
+        self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
 
