@@ -1873,6 +1873,36 @@ class MergeDispatchResult:
     dispatched=True or the entry predates request_id tracking."""
 
 
+@dataclass
+class WaiterRecord:
+    """Server-side durable-intent waiter record keyed by request_id.
+
+    Registered in the ``merge_request`` MCP tool's closure dict
+    ``_waiters[request_id]`` at dispatch time, and cleaned up via a
+    ``future.add_done_callback``.  The ``asyncio.shield`` on every awaiting
+    path (β1) ensures that cancelling the tool coroutine (MCP client
+    disconnect) does NOT cancel ``future`` — only an explicit
+    ``merge_cancel`` call (β2) may do so, by looking up this record and
+    cancelling ``future`` directly.
+
+    Lifecycle:
+      - Created in the dispatched-path of ``merge_request``.
+      - Cleaned up automatically when the future resolves/errors/cancels
+        (done_callback removes it from ``_waiters``).
+      - Consumed by β2 (``merge_cancel``) which looks up ``request_id``
+        here to cancel the future explicitly.
+    """
+
+    request_id: str
+    """Stable per-instance identity of the MergeRequest (e.g. 'mr-a1b2c3d4')."""
+    future: asyncio.Future = field(repr=False)
+    """The MergeRequest.result future — the one shielded from MCP disconnect."""
+    source: str = 'mcp'
+    """Origin of the waiter: 'mcp' (via merge_request tool) or 'workflow'."""
+    submitted_tip: str | None = None
+    """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
+
+
 def _emit_merge_coalesced(
     event_store: EventStore | None,
     req: MergeRequest,
