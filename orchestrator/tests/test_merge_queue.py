@@ -11264,3 +11264,202 @@ class TestDecideAttachAction:
         from orchestrator.merge_queue import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=True)
+
+
+# ---------------------------------------------------------------------------
+# TestMaybeAutoChainGeneration — γ2 step-07/08/09/10: _maybe_auto_chain_generation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMaybeAutoChainGeneration:
+    """Unit tests for the _maybe_auto_chain_generation module-level helper (γ2)."""
+
+    def _make_req(
+        self,
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        *,
+        branch: str = 'task/t1',
+        generation: int = 1,
+    ) -> MergeRequest:
+        loop = asyncio.new_event_loop()
+        try:
+            fut: asyncio.Future[MergeOutcome] = loop.create_future()
+        finally:
+            loop.close()
+        import asyncio as _asyncio
+        # Use a detached future (we won't resolve it in these tests)
+        fut = _asyncio.get_event_loop().create_future()
+        return MergeRequest(
+            task_id='t1',
+            branch=branch,
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=generation,
+        )
+
+    async def test_merged_branch_tip_none_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(1) merged_branch_tip=None → returns None, queue stays empty."""
+        from orchestrator.merge_queue import _maybe_auto_chain_generation
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        event_store = MagicMock()
+
+        result = await _maybe_auto_chain_generation(
+            req, 'sha-adv', git_ops, event_store,
+            merged_branch_tip=None,
+            counts={},
+            queue=queue,
+            max_auto_generations=2,
+        )
+
+        assert result is None
+        assert queue.empty()
+
+    async def test_head_equals_merged_tip_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(2) current HEAD == merged_branch_tip → genuine drop, returns None."""
+        from orchestrator.merge_queue import _maybe_auto_chain_generation
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        tip = 'aaabbbccc'
+
+        with patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, tip + '\n', ''))):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip=tip,
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is None
+        assert queue.empty()
+
+    async def test_superset_within_bound_chains(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(3) SUPERSET advance within bound → returns MergeOutcome('superseded'),
+        enqueues gen-(n+1) request, increments counts[branch]."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        current_head = 'newhead111'
+        merged_tip = 'oldtip000'
+        counts: dict[str, int] = {}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, current_head + '\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip=merged_tip,
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'superseded'
+        assert result.superseded_by is not None
+        assert result.superseded_by.startswith('mr-')
+        assert result.merge_sha == 'sha-adv'
+        # Queue has the gen-(n+1) request
+        assert queue.qsize() == 1
+        chained = queue.get_nowait()
+        assert chained.request_id != req.request_id
+        assert chained.generation == 2
+        assert chained.snapshot_tip == current_head
+        assert chained.pre_rebased is False
+        assert chained.branch == req.branch
+        assert chained.task_id == req.task_id
+        assert result.superseded_by == chained.request_id
+        # counts incremented
+        assert counts[req.branch] == 1
+
+    async def test_divergent_resolves_to_superset_chains(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(4) DIVERGENT → resolve_divergent → SUPERSET → chains."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        current_head = 'divhead222'
+        counts: dict[str, int] = {}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, current_head + '\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.DIVERGENT)),
+            patch('orchestrator.merge_queue.resolve_divergent', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'superseded'
+        assert queue.qsize() == 1
+
+    async def test_divergent_resolves_to_subset_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(4b) DIVERGENT → resolve_divergent → SUBSET (patch-contained) → returns None."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'divhead333\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.DIVERGENT)),
+            patch('orchestrator.merge_queue.resolve_divergent', AsyncMock(return_value=TipRelation.SUBSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is None
+        assert queue.empty()

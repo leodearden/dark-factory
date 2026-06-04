@@ -87,6 +87,14 @@ Decision-2 check.  After ``advance_main`` succeeds, we verify that
 ``.task/``).  Any divergence indicates conflict resolution dropped or
 rewrote work and needs human judgement, not a steward retry."""
 
+MAX_AUTO_CHAINED_GENERATIONS = 2
+"""Maximum number of consecutive auto-chained generations per branch lineage (γ2 / PRD D3).
+
+When the branch tip advances during verify (tip-advanced pathology), the worker
+auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
+advances the chain is broken and the request is escalated to humans via a 'blocked'
+outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
+
 
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
@@ -2033,6 +2041,85 @@ def _emit_merge_queued(
         phase='merge',
         data=data,
     )
+
+
+async def _maybe_auto_chain_generation(
+    req: MergeRequest,
+    advanced_sha: str,
+    git_ops: GitOps,
+    event_store: EventStore | None,
+    *,
+    merged_branch_tip: str | None,
+    counts: dict[str, int],
+    queue: asyncio.Queue,
+    max_auto_generations: int,
+) -> MergeOutcome | None:
+    """Check whether a post-merge equivalence failure was caused by a tip advance,
+    and if so, enqueue a gen-(n+1) MergeRequest for the delta (γ2).
+
+    Returns:
+    - ``MergeOutcome('superseded', ...)`` if the tip advanced and the chain is
+      within the bound — a gen-(n+1) request has been placed on *queue*.
+    - ``MergeOutcome('blocked', ...)`` if the chain-generation bound is exceeded
+      (consecutive tip advances > *max_auto_generations*) — the branch counter
+      is reset.  Uses POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX so the
+      existing workflow blocked-handler routes to _mark_blocked(escalate_to_human=True).
+    - ``None`` if the tip has NOT advanced (genuine drop; caller should block
+      as before).
+
+    The *counts* dict is mutated in-place: incremented on a chain, reset on
+    bound-exceeded.  A clean 'done' landing pops the branch key (handled by
+    the caller: _finalize_advanced_merge).
+    """
+    if not merged_branch_tip:
+        return None
+
+    # Rev-parse the branch's current HEAD in its worktree.
+    rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=req.worktree)
+    if rc != 0:
+        # Fail-open: treat as genuine drop so the caller blocks as today.
+        return None
+    current_head = head_out.strip()
+
+    if current_head == merged_branch_tip:
+        # Tip has not moved — genuine drop.
+        return None
+
+    # Classify the topological relationship.
+    rel = await classify_tip_relation(current_head, merged_branch_tip, git_ops)
+    if rel is TipRelation.DIVERGENT:
+        rel = await resolve_divergent(current_head, merged_branch_tip, git_ops)
+
+    if rel is not TipRelation.SUPERSET:
+        # SUBSET (patch-contained) or SAME: no new content — genuine drop.
+        return None
+
+    # Tip advanced.  Enforce the per-branch generation bound.
+    new_count = counts.get(req.branch, 0) + 1
+    if new_count > max_auto_generations:
+        counts.pop(req.branch, None)
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                f'branch tip advanced past the merged snapshot for the '
+                f'{max_auto_generations}-generation auto-chain bound '
+                f'(consecutive tip advances). Manual review required.'
+            ),
+        )
+
+    # Within bound — build the gen-(n+1) request and enqueue it.
+    gen_next = dataclasses.replace(
+        req,
+        result=asyncio.get_event_loop().create_future(),
+        request_id=f'mr-{uuid.uuid4().hex[:8]}',
+        generation=req.generation + 1,
+        snapshot_tip=current_head,
+        pre_rebased=False,
+    )
+    await enqueue_merge_request(queue, gen_next, event_store)
+    counts[req.branch] = new_count
+    return MergeOutcome('superseded', superseded_by=gen_next.request_id, merge_sha=advanced_sha)
 
 
 async def enqueue_merge_request(
