@@ -614,6 +614,168 @@ class TestStrandedBlockedCategory:
 
 
 # ---------------------------------------------------------------------------
+# TestResolveIssueActionEnum: C1/C2 action enum contract + terminate= migration guard
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueActionEnum:
+    """resolve_issue action enum: C1 semantics table + terminate= migration guard (C2)."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-t1-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-1',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='action enum test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) terminate= sentinel ---
+
+    @pytest.mark.asyncio
+    async def test_terminate_true_returns_migration_error(self, tmp_path: Path):
+        """terminate=True returns {'error': ...} naming all five actions; record stays pending."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', terminate=True,
+        )
+
+        assert 'error' in result, f"Expected error dict, got: {result}"
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, f"Migration error must name '{action}'; got: {msg!r}"
+        # Record must be unchanged
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+    @pytest.mark.asyncio
+    async def test_terminate_false_returns_migration_error(self, tmp_path: Path):
+        """terminate=False also returns {'error': ...} (any non-None value triggers guard)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', terminate=False,
+        )
+
+        assert 'error' in result, f"Expected error dict for terminate=False, got: {result}"
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, f"Migration error must name '{action}'; got: {msg!r}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+    # --- (b) default + 'resume' → resolved ---
+
+    @pytest.mark.asyncio
+    async def test_default_action_resolves(self, tmp_path: Path):
+        """Default call (no action kwarg) resolves the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(server, escalation_id=esc.id, resolution='fixed')
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_resume_resolves(self, tmp_path: Path):
+        """action='resume' resolves the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    # --- (c) restart → resolved ---
+
+    @pytest.mark.asyncio
+    async def test_action_restart_resolves(self, tmp_path: Path):
+        """action='restart' resolves the escalation (dismiss=False path)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='restart approved', action='restart',
+        )
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
+
+    # --- (d) park / abandon / close_only → dismissed ---
+
+    @pytest.mark.asyncio
+    async def test_action_park_dismisses(self, tmp_path: Path):
+        """action='park' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_abandon_dismisses(self, tmp_path: Path):
+        """action='abandon' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='abandoned', action='abandon',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_action_close_only_dismisses(self, tmp_path: Path):
+        """action='close_only' dismisses the escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+
+    # --- (e) invalid action → error, record unchanged ---
+
+    @pytest.mark.asyncio
+    async def test_action_bogus_returns_error_record_unchanged(self, tmp_path: Path):
+        """action='bogus' returns {'error': ...} and record remains pending."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='bogus',
+        )
+
+        assert 'error' in result, f"Expected error dict for invalid action; got: {result}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+
+
+# ---------------------------------------------------------------------------
 # TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
 # ---------------------------------------------------------------------------
 
