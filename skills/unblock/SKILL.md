@@ -205,7 +205,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 4. Fix any failures.
 5. On green: rebase on main again — other tasks may have merged while you were fixing.
 6. Repeat steps 3-5 until stable (rebase is clean AND verification passes with no new changes needed).
-7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* This keeps the step correct under both server modes — the legacy `wait_secs=None` default and the post-β8 `wait_secs=0` default. `queued` or `attached` responses are successful submissions (durable intent), never failures.
+7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* `queued` or `attached` responses are successful submissions (durable intent), never failures.
 
    Submit to the merge queue with an explicit bounded wait:
    ```

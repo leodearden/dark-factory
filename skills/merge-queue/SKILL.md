@@ -11,7 +11,7 @@ The escalation MCP exposes a `merge_request` tool that lets you submit to this q
 
 > **Core rule:** every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.
 >
-> Passing an explicit `wait_secs` (not `None`) keeps the call correct under both server modes — the compat default (`None`) and the post-flip default (`0`) — because the bounded semantics are always opt-in regardless of the server default. Never omit `wait_secs`.
+> The server default is now `0` (immediate, non-blocking). Passing an explicit bounded `wait_secs` (use `100`) lets a fast or idle-queue merge resolve terminally within the submit call, avoiding a poll round-trip. Never omit `wait_secs`.
 
 ## Why this matters
 
