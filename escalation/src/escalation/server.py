@@ -690,20 +690,18 @@ def create_server(
         branch: str,
         worktree: str,
         description: str = '',
-        wait_secs: int | None = None,
+        wait_secs: int = 0,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
         Use this instead of directly merging into main.  The merge worker
         handles verification, conflict detection, and atomic ref advancement.
 
+        Invariant I1: no merge_request code path awaits longer than
+        ``_MAX_WAIT_SECS`` (100 s).  The unbounded blocking path is deleted.
+
         *wait_secs* controls how long the call blocks:
-        - ``None`` (default — legacy compat): block indefinitely until the
-          merge completes; coalesced branch returns ``status='in_flight'``.
-          The legacy path is retained during the compat ladder (β1–β7).
-          ``'in_flight'`` is a deprecated alias whose removal is scheduled
-          for β8 (Open Q5).
-        - ``0``: return immediately — dispatched branch returns
+        - ``0`` (default): return immediately — dispatched branch returns
           ``status='queued'``; coalesced branch returns ``status='attached'``.
           Shape: ``{status, request_id, snapshot_tip, generation, position,
           queue_depth, eta_seconds}``.
@@ -723,12 +721,8 @@ def create_server(
           repo's escalation MCP; check that the branch belongs here.
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
-        - Already in flight (legacy, wait_secs=None): ``{status='in_flight',
-          request_id, branch, inflight_task_id, eta_seconds, reason,
-          conflict_details=None, push_status=None}``.
-        - Queued / attached (wait_secs not None): ``{status='queued'|'attached',
-          request_id, snapshot_tip, generation, position, queue_depth,
-          eta_seconds}``.
+        - Queued / attached: ``{status='queued'|'attached', request_id,
+          snapshot_tip, generation, position, queue_depth, eta_seconds}``.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main (fast-path — no enqueue, no request_id)
