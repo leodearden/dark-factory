@@ -239,6 +239,11 @@ class UnblockAutoConfig(BaseModel):
     max_turns: int = Field(default=50)
     effort: str = Field(default='high')
     backend: str = Field(default='claude')
+    # SKILL-FACING: orchestrator code never reads this field.
+    # Consumed by the unblock-low-risk / escalation-watcher skills (PRD §4.3).
+    attended_b3_enabled: bool = Field(default=False)
+    b3_merge_cap_per_24h: int = Field(default=6)
+    b3_proposal_keep_last: int = Field(default=5)
 
 
 class ReviewConfig(BaseModel):
