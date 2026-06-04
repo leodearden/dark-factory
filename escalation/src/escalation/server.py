@@ -898,7 +898,23 @@ def create_server(
         if wait_secs == 0:
             return _nonblocking_state_response('queued', merge_req)
 
-        outcome = await asyncio.shield(future)
+        # wait_secs > 0: bounded wait — clamp to _MAX_WAIT_SECS (module constant,
+        # tests monkeypatch to a small value like 0.1 s to exercise this path fast).
+        # asyncio.shield(future) decouples req.result from the tool coroutine's
+        # cancellation: a wait_for timeout cancels only the outer shield wrapper,
+        # leaving req.result alive.  On timeout return the non-terminal 'queued'
+        # shape so the caller can poll (PRD I1/Open Q4).
+        if wait_secs is not None:
+            clamp = min(wait_secs, _MAX_WAIT_SECS)
+            try:
+                outcome = await asyncio.wait_for(asyncio.shield(future), clamp)
+            except asyncio.TimeoutError:
+                return _nonblocking_state_response('queued', merge_req)
+            # Resolved within clamp → fall through to terminal outcome shape below.
+        else:
+            # Legacy (wait_secs=None): unbounded blocking await — shielded so that
+            # MCP client disconnect (Task cancel) does not cancel req.result (PRD D2/I5).
+            outcome = await asyncio.shield(future)
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
         # the worker-produced already_merged case (merge marker path returns no SHA);
