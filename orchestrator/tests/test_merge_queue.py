@@ -9746,3 +9746,91 @@ class TestRegisterAndEnqueue:
         assert registry.is_inflight('B') is True
         assert registry.entry('B').task_id == 'B'
         assert queue.qsize() == 1
+
+    async def test_release_on_resolve_allows_redispatch(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) release-on-resolve: after future resolves, a second call re-acquires."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+        assert acquired is True
+
+        # Resolve the future → done_callback fires → slot released
+        req.result.set_result(MergeOutcome(status='done'))
+        await asyncio.sleep(0)
+        assert registry.is_inflight('B') is False
+
+        # Second call for the same branch should re-acquire (re-dispatch)
+        req2 = _make_request('B', 'B', tmp_path, config)
+        acquired2 = await register_and_enqueue_merge_request(queue, req2, event_store, registry)
+        assert acquired2 is True
+        assert registry.is_inflight('B') is True
+        assert queue.qsize() == 2  # both enqueued (queue not drained)
+
+    async def test_release_on_cancel_allows_retry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) release-on-cancel: soft-cancel releases the slot for the retry loop."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        await register_and_enqueue_merge_request(queue, req, event_store, registry)
+        assert registry.is_inflight('B') is True
+
+        # Cancel the future → done_callback fires → slot released
+        req.result.cancel()
+        await asyncio.sleep(0)
+        assert registry.is_inflight('B') is False
+
+    async def test_already_held_still_enqueues_returns_false(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) already-held: returns False but still enqueues (no deadlock),
+        and the slot remains owned by the first holder."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Pre-seed the slot with a never-resolving future from 'other' task
+        other_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'other', other_future)
+
+        # Helper call for same branch: slot already held → acquired=False
+        req = _make_request('B', 'B', tmp_path, config)
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+
+        assert acquired is False
+        # Still enqueued — workflow must not deadlock
+        assert queue.qsize() == 1
+        # Slot is still owned by the original holder
+        assert registry.entry('B').task_id == 'other'
+
+        # Cleanup
+        other_future.cancel()
+
+    async def test_registry_none_plain_enqueue(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) registry=None: falls back to plain enqueue, returns False."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, None)
+
+        assert acquired is False
+        assert queue.qsize() == 1
