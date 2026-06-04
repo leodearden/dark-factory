@@ -95,6 +95,16 @@ auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
 advances the chain is broken and the request is escalated to humans via a 'blocked'
 outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
 
+_MERGE_AHEAD_BOUND = 1
+"""Maximum number of counted (non-speculative, non-train) items that may sit in
+the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
+
+With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
+Verifier: after enqueuing a counted item the Merger blocks at
+``_merge_ahead_cap.acquire()`` until the Verifier drains that item, at which
+point it re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are
+safe; higher values allow more build-ahead but increase staleness risk."""
+
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
 
@@ -2681,6 +2691,7 @@ class SpeculativeItem:
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
+    counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
 
 class _TrainMergeHost(Protocol):
@@ -3615,6 +3626,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
         self._speculation_slot.set()  # initially free
+        # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
+        # build-ahead to _MERGE_AHEAD_BOUND items in the verifier queue.
+        # Plain Semaphore (not BoundedSemaphore) so stop() may over-release
+        # without raising.  Released ON-DRAIN (right after verifier_queue.get()
+        # for a counted item) so the slot is free while verify runs.
+        self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -3764,9 +3781,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
         shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
-        # Release speculation slot and WIP halt so merger doesn't hang waiting
+        # Release speculation slot, WIP halt, and merge-ahead cap so the merger
+        # doesn't hang waiting at any of the three synchronisation points.
+        # Over-releasing a plain Semaphore is safe (it just increments the counter).
         self._speculation_slot.set()
         self._wip_halt.set()
+        for _ in range(_MERGE_AHEAD_BOUND + 1):
+            self._merge_ahead_cap.release()
 
         # Drain main queue
         while not self._queue.empty():
@@ -4200,14 +4221,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         and merge_result.pre_merge_sha is not None
                         and merge_result.pre_merge_sha == base_for_merge
                     )
-                    await self._verifier_queue.put(SpeculativeItem(
-                        request=req, merge_result=merge_result,
-                        merge_wt=merge_result.merge_worktree,
-                        base_sha=base_for_merge, speculative=speculative,
-                        skip_verify=skip_verify,
-                        started_monotonic=t0,
-                        merged_branch_tip=branch_head,  # γ2: branch tip at merge time
-                    ))
+                    # Mechanism 1: cap non-speculative build-ahead.
+                    # Trains (continue before this) and immediate-outcome guards
+                    # (all return above) never reach this site, so `not speculative`
+                    # is the exact predicate for blocking-path items.
+                    counts_against_cap = not speculative
+                    if counts_against_cap:
+                        await self._merge_ahead_cap.acquire()
+                    try:
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=merge_result,
+                            merge_wt=merge_result.merge_worktree,
+                            base_sha=base_for_merge, speculative=speculative,
+                            skip_verify=skip_verify,
+                            started_monotonic=t0,
+                            merged_branch_tip=branch_head,  # γ2: branch tip at merge time
+                            counts_against_cap=counts_against_cap,
+                        ))
+                    except BaseException:
+                        # put() failed — the verifier will never drain this item
+                        # and release the cap.  Release it here to prevent the
+                        # merger from deadlocking at the next acquire.
+                        if counts_against_cap:
+                            self._merge_ahead_cap.release()
+                        raise
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-1 cap) ──────────────────
@@ -4329,6 +4366,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             item = await self._verifier_queue.get()
             if item is None:
                 break  # shutdown sentinel
+
+            # Mechanism 1: release the merger-ahead cap ON-DRAIN — immediately
+            # after get(), before any branching or item reassignment, so every
+            # drain path (normal verify, immediate_outcome, discard/_remerge,
+            # abandoned early-continue) is covered uniformly and the flag is
+            # captured before _remerge could reassign `item`.
+            if item.counts_against_cap:
+                self._merge_ahead_cap.release()
 
             req = item.request
             # Track whether THIS iteration performs a re-merge so we can
