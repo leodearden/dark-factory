@@ -2448,3 +2448,87 @@ class TestRecentWindow1440AcceptanceLock:
         assert 'task-old' not in recent_task_ids, (
             f'Expected task-old (25h old) absent from recent list at window=1440; got {recent_task_ids}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeLiveEntry (task-1606 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeLiveEntry:
+    """Tests for merge_queue._normalize_entry — snapshot entry → display shape."""
+
+    def test_full_entry_preserved(self):
+        """A fully-populated snapshot entry maps 1-to-1 onto the display shape."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {
+            'task_id': '3112',
+            'branch': 'task/3112',
+            'state': 'queued',
+            'age_secs': 14400.0,
+            'position': 1,
+            'waiter_alive': True,
+            'enqueued_at': '2026-06-04T08:00:00+00:00',
+            'worktree': '/tmp/wt',
+            'pre_rebased': False,
+        }
+        result = _normalize_entry(raw)
+        assert result['task_id'] == '3112'
+        assert result['branch'] == 'task/3112'
+        assert result['state'] == 'queued'
+        assert result['age_secs'] == 14400.0      # AC1: 4h entry must NOT be dropped
+        assert result['position'] == 1
+        assert result['waiter_alive'] is True
+
+    def test_ac1_long_queued_entry_preserved(self):
+        """AC1 lock: an entry queued 4h ago (age_secs=14400) survives normalization.
+
+        The event-derived fallback's 30-min TTL would drop this entry; the live
+        path must not apply any TTL, so a >30min entry must pass through intact.
+        """
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '3112', 'branch': 'task/3112', 'state': 'queued', 'age_secs': 14400.0,
+               'position': 1, 'waiter_alive': True}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] == 14400.0
+        assert result['state'] == 'queued'
+
+    def test_missing_optional_fields_get_safe_defaults(self):
+        """Missing waiter_alive and position get safe defaults (True and 0)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '42', 'branch': 'task/42', 'state': 'merging', 'age_secs': 5.0}
+        result = _normalize_entry(raw)
+        assert result['waiter_alive'] is True    # safe default: assume waiter alive
+        assert result['position'] == 0           # safe default: unknown position → 0
+        assert result['age_secs'] == 5.0
+
+    def test_none_optional_fields_get_safe_defaults(self):
+        """None waiter_alive and None position get the same safe defaults."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '7', 'branch': 'task/7', 'state': 'verifying',
+               'age_secs': 120.0, 'position': None, 'waiter_alive': None}
+        result = _normalize_entry(raw)
+        assert result['waiter_alive'] is True
+        assert result['position'] == 0
+
+    def test_only_display_keys_returned(self):
+        """Result contains exactly the six display keys (no internal snapshot fields)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '1', 'branch': 'b', 'state': 'queued', 'age_secs': 1.0,
+               'position': 0, 'waiter_alive': True,
+               'worktree': '/tmp/wt', 'pre_rebased': False, 'enqueued_at': 'ts'}
+        result = _normalize_entry(raw)
+        assert set(result.keys()) == {'task_id', 'branch', 'state', 'age_secs', 'position', 'waiter_alive'}
+
+    def test_missing_age_secs_defaults_zero(self):
+        """Missing age_secs defaults to 0.0 (defensive)."""
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '5', 'branch': 'b', 'state': 'queued'}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] == 0.0

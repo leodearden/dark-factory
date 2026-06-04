@@ -841,3 +841,37 @@ async def build_per_project_merge_queue(
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
     return dict(results)
 
+
+# ---------------------------------------------------------------------------
+# 9. Live merge-queue fan-out (task-1606)
+# ---------------------------------------------------------------------------
+
+from dashboard.data.memory import mcp_tool_call  # noqa: E402 (deferred import to avoid circular)
+
+_LIVE_DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+
+def _normalize_entry(raw: dict) -> dict:
+    """Project a raw get_merge_queue snapshot entry to the display shape.
+
+    Returns a dict with exactly six keys:
+      task_id, branch, state, age_secs, position, waiter_alive.
+
+    All fields are mandatory in the display contract; optional snapshot fields
+    (worktree, pre_rebased, enqueued_at) are dropped.  Safe defaults prevent
+    KeyError on partially-populated entries:
+      - position  defaults to 0   (unknown position)
+      - waiter_alive defaults to True  (assume waiter alive when unknown)
+      - age_secs  defaults to 0.0
+    """
+    waiter_alive = raw.get('waiter_alive')
+    position = raw.get('position')
+    return {
+        'task_id': raw.get('task_id'),
+        'branch': raw.get('branch'),
+        'state': raw.get('state'),
+        'age_secs': float(raw.get('age_secs') or 0.0),
+        'position': int(position) if position is not None else 0,
+        'waiter_alive': bool(waiter_alive) if waiter_alive is not None else True,
+    }
+
