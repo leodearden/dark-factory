@@ -396,9 +396,46 @@ def create_server(
         resolution_turns: int | None = None,
         terminate: None = None,
     ) -> dict[str, Any]:
-        """Resolve or dismiss an escalation (see full semantics table in docstring).
+        """Resolve or dismiss an escalation.
 
-        Placeholder docstring — replaced in step-7.
+        ``action`` selects the resolution intent (default: ``'resume'``):
+
+        +--------------+------------+----------------------------+------------------------+
+        | action       | record     | live-workflow effect       | task-status effect     |
+        +==============+============+============================+========================+
+        | resume       | resolved   | resume from pause point;   | stays in-progress      |
+        |              |            | resolution text injected   |                        |
+        |              |            | into agent briefing (L0    |                        |
+        |              |            | path only)                 |                        |
+        +--------------+------------+----------------------------+------------------------+
+        | restart      | resolved   | restart task from scratch  | reset to pending       |
+        |              |            | (harness β handles)        | (harness β handles)    |
+        +--------------+------------+----------------------------+------------------------+
+        | park         | dismissed  | task left paused; no       | stays blocked/deferred |
+        |              |            | immediate workflow action  |                        |
+        +--------------+------------+----------------------------+------------------------+
+        | abandon      | dismissed  | task cancelled outright    | cancelled              |
+        |              |            | (harness β handles)        | (harness β handles)    |
+        +--------------+------------+----------------------------+------------------------+
+        | close_only   | dismissed  | escalation closed with no  | unchanged              |
+        |              |            | workflow effect            |                        |
+        +--------------+------------+----------------------------+------------------------+
+
+        **Resolution text** reaches the agent only on the L0 live-resume path
+        (``action='resume'``).  For all other actions the text is stored on the
+        record for audit purposes but is not injected into any agent briefing.
+
+        **Legacy mapping** (D10): callers that resolve without ``resolution_action``
+        (i.e. records where ``resolution_action`` is ``None`` after the fact) are
+        interpreted as follows — ``dismiss=False`` (old ``terminate=False``) maps
+        to ``resume``; ``dismiss=True`` (old ``terminate=True``) maps to
+        ``close_only``.
+
+        ``terminate`` has been removed.  Passing any value raises a migration error
+        naming the five replacement actions.
+
+        ``resolved_by`` attributes the resolver (e.g. ``"steward"``, ``"interactive"``).
+        ``resolution_turns`` records how many conversation turns resolution took.
         """
         if terminate is not None:
             return {
