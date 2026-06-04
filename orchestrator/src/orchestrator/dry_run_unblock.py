@@ -8,6 +8,7 @@ Never mutates task state; all writes go through the parent process.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -112,6 +113,37 @@ _DISALLOWED_TOOLS: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# SHA capture helper
+# ---------------------------------------------------------------------------
+
+async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]:
+    """Capture HEAD and main branch SHAs from the worktree via git.
+
+    Fully defensive: any non-zero exit code, subprocess exception, or
+    non-repo worktree yields None for that sha — never raises.
+    Both shas are always returned (keys always present in the stamped entry)
+    so the entry shape stays consistent across repo and non-repo worktrees.
+    """
+    async def _rev_parse(ref: str) -> str | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'git', '-C', worktree, 'rev-parse', ref,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return None
+            return stdout.decode().strip() or None
+        except Exception:
+            return None
+
+    head_sha = await _rev_parse('HEAD')
+    main_sha = await _rev_parse('main')
+    return head_sha, main_sha
+
+
+# ---------------------------------------------------------------------------
 # SKILL.md loader
 # ---------------------------------------------------------------------------
 
@@ -150,6 +182,10 @@ async def run_dry_run_unblock(
 
     ua_cfg = config.unblock_auto
     start_time = time.monotonic()
+
+    # Capture worktree SHAs before invoke_agent so both the success and
+    # exception paths can stamp the same anchor values.
+    head_sha, main_sha = await _capture_worktree_shas(worktree)
 
     try:
         system_prompt = _load_skill_system_prompt()
@@ -194,6 +230,13 @@ async def run_dry_run_unblock(
             'timestamp': _now_iso(),
         }
         result = None
+
+    # Stamp the git anchor onto the entry at a single point so all four
+    # shapes (ok, investigation_failed, budget_exhausted, exception fallback)
+    # carry head_sha/main_sha. DRY_RUN_PROPOSAL_SCHEMA stays unchanged
+    # (additionalProperties:False, no sha keys) so the agent cannot forge these.
+    entry['head_sha'] = head_sha
+    entry['main_sha'] = main_sha
 
     try:
         await scheduler.update_task(
