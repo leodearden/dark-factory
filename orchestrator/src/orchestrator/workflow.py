@@ -3970,32 +3970,53 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             new_tip = tip_out.strip() if rc_tip == 0 and tip_out.strip() else None
 
-            # Tip-relation classification: only when both tips are available.
-            if old_tip and new_tip:
+            if not (old_tip and new_tip):
+                # Cannot classify topology when either tip is unavailable (e.g.
+                # rev-parse failed or entry has no snapshot_tip yet).  Fall
+                # through to an independent enqueue rather than blindly attaching
+                # — coalescing against an older tip could resolve this workflow
+                # as DONE before its newer commits are included.
+                logger.debug(
+                    f'Task {self.task_id}: coalesce skipped — tips unavailable '
+                    f'(old={old_tip!r}, new={new_tip!r}); enqueueing independently.'
+                )
+            else:
+                # Tip-relation classification.
                 relation = await classify_tip_relation(new_tip, old_tip, self.git_ops)
                 if relation is TipRelation.DIVERGENT:
                     relation = await resolve_divergent(new_tip, old_tip, self.git_ops)
                 action = decide_attach_action(relation, verifying=verifying)
                 if action is AttachAction.RESNAPSHOT:
                     _registry.re_snapshot(branch_name, new_tip)
+                elif action is AttachAction.ATTACH_AND_CHAIN:
+                    # ATTACH_AND_CHAIN requires γ2 worker generation chaining
+                    # (task 1640).  verifying is always False until γ2 sets it,
+                    # so this branch is currently unreachable.  Log a warning so
+                    # enabling verifying cannot silently drop new commits.
+                    logger.warning(
+                        f'Task {self.task_id}: ATTACH_AND_CHAIN reached before '
+                        f'γ2 chaining is wired (task 1640); proceeding as plain '
+                        f'attach — new commits may not be re-verified.'
+                    )
 
-            waiter = WaiterRecord(
-                request_id=merge_request.request_id,
-                future=merge_request.result,
-                source='workflow',
-                submitted_tip=new_tip,
-            )
-            # attach() may return False if the entry was released during the
-            # classify await (I10 await-gap).  Fall through to enqueue in that case.
-            attached = _registry.attach(branch_name, waiter)
-            if attached:
-                _emit_merge_coalesced(
-                    self.event_store, merge_request, 'workflow',
-                    _registry.eta_seconds(branch_name),
+                waiter = WaiterRecord(
+                    request_id=merge_request.request_id,
+                    future=merge_request.result,
+                    source='workflow',
+                    submitted_tip=new_tip,
                 )
+                # attach() may return False if the entry was released during the
+                # classify await (I10 await-gap).  Fall through to enqueue in that case.
+                attached = _registry.attach(branch_name, waiter)
+                if attached:
+                    _emit_merge_coalesced(
+                        self.event_store, merge_request, 'workflow',
+                        _registry.eta_seconds(branch_name),
+                    )
 
+        _acquired = False
         if not attached:
-            await register_and_enqueue_merge_request(
+            _acquired = await register_and_enqueue_merge_request(
                 self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
             )
 
@@ -4003,11 +4024,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # the future so the primary entry (and any remaining peers) stay alive.
         # detach() cancels primary_future only when the waiter count hits 0,
         # preserving the existing orphan-avoidance path (merge_queue.py).
-        # When no registry is wired (legacy / enqueue path), fall back to the
-        # original future.cancel() via the hook-less code path.
+        # Route through detach() only when this request is registered in the
+        # registry (attached as peer OR acquired as sole waiter); otherwise fall
+        # back to future.cancel() to avoid the orphan the old code prevented.
         _req_id = merge_request.request_id
         def _on_soft_cancel_detach() -> None:
-            if _registry is not None:
+            if _registry is not None and (attached or _acquired):
                 _registry.detach(branch_name, _req_id)
             elif not future.done():
                 future.cancel()
