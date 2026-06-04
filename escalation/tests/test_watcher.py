@@ -254,6 +254,57 @@ class TestInitialScan:
         assert result is not None
         assert result.id == 'esc-6-1'
 
+    def test_exclude_single_pending(self, tmp_path):
+        """Sole pending escalation in exclude_ids -> returns None."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-7-1', task_id='7', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending',
+        )
+        _write_esc(queue_dir, esc)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-7-1'})
+        assert result is None
+
+    def test_exclude_older_returns_newer(self, tmp_path):
+        """When the older of two pending escalations is excluded, returns the newer one."""
+        old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        new_ts = datetime.now(UTC).isoformat()
+        old_esc = Escalation(
+            id='esc-8-1', task_id='8', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='old',
+            timestamp=old_ts,
+        )
+        new_esc = Escalation(
+            id='esc-8-2', task_id='8', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='new',
+            timestamp=new_ts,
+        )
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        _write_esc(queue_dir, old_esc)
+        _write_esc(queue_dir, new_esc)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-8-1'})
+        assert result is not None
+        assert result.id == 'esc-8-2'
+
+    def test_exclude_all_pending_returns_none(self, tmp_path):
+        """All pending escalations in exclude_ids -> returns None."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc1 = Escalation(
+            id='esc-9-1', task_id='9', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='a',
+        )
+        esc2 = Escalation(
+            id='esc-9-2', task_id='9', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='b',
+        )
+        _write_esc(queue_dir, esc1)
+        _write_esc(queue_dir, esc2)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-9-1', 'esc-9-2'})
+        assert result is None
+
 
 class TestInitialScanMain:
     """main() emits a pre-existing pending escalation without any inotify event."""

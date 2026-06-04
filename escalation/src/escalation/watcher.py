@@ -49,9 +49,16 @@ from inotify_simple import INotify, flags
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 
 
-def _matches(esc: Escalation, task_id: str | None, level: int | None) -> bool:
+def _matches(
+    esc: Escalation,
+    task_id: str | None,
+    level: int | None,
+    exclude_ids: frozenset[str] = frozenset(),
+) -> bool:
     """Return True iff esc is pending and satisfies the optional filters."""
     if esc.status != 'pending':
+        return False
+    if esc.id in exclude_ids:
         return False
     if task_id and esc.task_id != task_id:
         return False
@@ -62,6 +69,7 @@ def _initial_scan(
     queue_dir: Path,
     task_id: str | None,
     level: int | None,
+    exclude_ids: frozenset[str] = frozenset(),
 ) -> Escalation | None:
     """Scan the queue directory for already-pending matching escalations.
 
@@ -73,12 +81,15 @@ def _initial_scan(
     best_ts: datetime | None = None
 
     for path in queue_dir.glob('esc-*.json'):
+        if path.stem in exclude_ids:
+            continue
+
         try:
             esc = Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, OSError, TypeError):
             continue
 
-        if not _matches(esc, task_id, level):
+        if not _matches(esc, task_id, level, exclude_ids):
             continue
 
         try:
