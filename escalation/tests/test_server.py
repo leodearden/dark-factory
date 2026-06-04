@@ -2827,3 +2827,122 @@ class TestMergeStatus:
         assert 'git log' in result['hint'].lower() or 'git' in result['hint'], (
             f'Expected hint to mention git, got: {result["hint"]!r}'
         )
+
+    # ── step-7: event-store tier + state mapping ──────────────────────────────
+
+    def _make_event_store(self, tmp_path: Path):
+        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+        return EventStore(tmp_path / 'runs.db', 'run-ms-test'), EventType
+
+    def _emit_finalized(self, store, EventType, *, request_id, task_id, branch, state):
+        store.emit(
+            EventType.merge_finalized,
+            task_id=task_id,
+            data={'request_id': request_id, 'branch': branch, 'state': state},
+        )
+
+    @pytest.mark.parametrize('raw_state,expected_coarse', [
+        ('done', 'done'),
+        ('done_wip_recovery', 'done'),
+        ('already_merged', 'done'),
+        ('conflict', 'conflict'),
+        ('blocked', 'blocked'),
+        ('wip_halted', 'blocked'),
+        ('wip_recovery_no_advance', 'blocked'),
+        ('unmerged_state', 'blocked'),
+        ('unknown_branch', 'blocked'),
+        ('error', 'blocked'),
+        ('abandoned', 'abandoned'),
+    ])
+    async def test_event_store_state_mapping(
+        self, tmp_path: Path, raw_state: str, expected_coarse: str
+    ) -> None:
+        """Event-store tier maps raw terminal states to the public coarse vocabulary."""
+        import types
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-statetest',
+            task_id='T-map',
+            branch='branch-map',
+            state=raw_state,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-statetest')
+
+        assert result.get('state') == expected_coarse, (
+            f'raw={raw_state!r}: expected coarse={expected_coarse!r}, got state={result.get("state")!r}'
+        )
+        assert result.get('outcome') == raw_state, (
+            f'raw={raw_state!r}: expected outcome preserved, got outcome={result.get("outcome")!r}'
+        )
+        assert result.get('generation') == 1
+        assert result.get('request_id') == 'mr-statetest'
+        assert result.get('finished_at') is not None
+
+    async def test_event_store_lookup_by_branch(self, tmp_path: Path) -> None:
+        """branch= lookup resolves to the most-recent row and echoes request_id."""
+        import types
+        event_store, EventType = self._make_event_store(tmp_path)
+        # Emit two rows for the same branch; the second should win
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-old', task_id='T1', branch='feat-branch', state='conflict'
+        )
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-new', task_id='T1', branch='feat-branch', state='done'
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, branch='feat-branch')
+
+        assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
+        assert result.get('request_id') == 'mr-new', (
+            f'Expected resolved request_id=mr-new, got: {result.get("request_id")!r}'
+        )
+
+    async def test_event_store_lookup_by_task_id(self, tmp_path: Path) -> None:
+        """task_id= lookup resolves to the most-recent row and echoes request_id."""
+        import types
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-earlier', task_id='T-tid', branch='b1', state='blocked'
+        )
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-later', task_id='T-tid', branch='b2', state='done'
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, task_id='T-tid')
+
+        assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
+        assert result.get('request_id') == 'mr-later', (
+            f'Expected resolved request_id=mr-later, got: {result.get("request_id")!r}'
+        )
+
+    async def test_event_store_miss_falls_through_to_unknown(self, tmp_path: Path) -> None:
+        """An id not in the event store falls through to unknown+hint."""
+        import types
+        event_store, EventType = self._make_event_store(tmp_path)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-nothere')
+
+        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert 'hint' in result
