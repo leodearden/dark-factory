@@ -180,9 +180,11 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
 
 2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
    a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
-   - **`task_failure` / `review_issues`:** first try the **low-risk auto-unblock gate** (below). If
-     it doesn't qualify or aborts, leave the escalation pending and add it to the digest — do NOT
-     spawn an interactive `/unblock`.
+   - **`task_failure` / `review_issues`:** run the **low-risk auto-unblock gate** first (see the
+     [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) subsection for the full
+     gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
+     already-attempted) OR the launched sub-agent aborts, leave the escalation pending and add
+     it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
      a terminal nobody attends just clutters.
