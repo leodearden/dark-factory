@@ -1,13 +1,36 @@
 """CLI watcher that uses inotify to watch for new escalations.
 
 Usage: python -m escalation.watcher --queue-dir <path> [--task-id <id>]
-       [--ntfy-url <url>]
+       [--level <int>] [--ntfy-url <url>] [--timeout <secs>]
 
-Watches for new .json files in the queue directory. When one appears and matches
-the optional task_id filter, prints the escalation JSON to stdout (and optionally
-sends a push notification via ntfy.sh).
+Watches for new .json files in the queue directory. When a matching pending
+escalation appears (or is already present at startup), prints the escalation
+JSON to stdout and optionally sends a push notification via ntfy.sh.
 
-Exits after the first matching escalation.
+Exit-code contract:
+  0    — one matching escalation printed to stdout.
+  124  — --timeout expired; nothing printed (coreutils convention).
+  0    — SIGTERM received (treated as a clean shutdown).
+
+Startup order: inotify watch is armed BEFORE the initial filesystem scan so
+no events are missed in the gap between the two.  If a pending match is found
+during the scan, it is emitted immediately and the event loop is never entered.
+
+Load-bearing invariants (callers MUST rely on these):
+
+  (a) Atomic writes: all escalation-queue writers use a tmp-file+rename
+      sequence (including fused-memory reconciliation).  A partial or
+      in-progress JSON file is therefore impossible to observe via an inotify
+      CREATE/MOVED_TO event — every event fires only after the rename has
+      completed and the file is fully durable.
+
+  (b) Wake-signal only, drains are authoritative: the watcher signals that
+      *something* happened; it does not guarantee exactly-once delivery or
+      that the returned escalation is still actionable.  Consumers MUST
+      re-drain the queue after every watcher return (via get_pending or
+      equivalent) and MUST tolerate spurious wakes (events that produce no
+      matching escalation after the drain).  A spurious wake is normal and
+      not an error.
 """
 
 from __future__ import annotations
