@@ -138,8 +138,7 @@ async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]
         except Exception:
             return None
 
-    head_sha = await _rev_parse('HEAD')
-    main_sha = await _rev_parse('main')
+    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse('main'))
     return head_sha, main_sha
 
 
@@ -255,6 +254,14 @@ async def run_dry_run_unblock(
     # Note: existing MagicMock-scheduler tests stay green because their
     # scheduler.get_task is non-awaitable — raises TypeError, is caught here,
     # and only the single append=True call persists.
+    #
+    # Concurrency note: this read-modify-write is not atomic. If another writer
+    # mutates the task metadata between get_task and update_task(append=False),
+    # that concurrent change is clobbered (stale-plus-trimmed blob wins).
+    # Concurrent dry-runs on the same blocked task are extremely unlikely — the
+    # scheduler dispatches at most one hook per task — so this is acceptable as
+    # a best-effort trim. A missed trim cycle is preferable to coordination
+    # overhead.
     try:
         keep_last = ua_cfg.b3_proposal_keep_last
         if keep_last and keep_last > 0:

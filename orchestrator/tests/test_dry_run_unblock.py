@@ -424,9 +424,23 @@ class TestShaStamping:
 
         repo_dir = tmp_path / 'repo'
         repo_dir.mkdir()
-        head_sha = _init_git_repo(repo_dir)
-        # After init, main and HEAD point to the same commit
-        main_sha = head_sha
+        main_sha = _init_git_repo(repo_dir)
+        # Diverge HEAD from main: create a feature branch, add a commit there.
+        # After this, git rev-parse main == main_sha (initial commit) while
+        # git rev-parse HEAD == head_sha (feature branch commit).
+        # Without this divergence head_sha == main_sha and the test cannot
+        # distinguish an impl bug that stamps HEAD into both anchor keys.
+        p = str(repo_dir)
+        subprocess.run(['git', '-C', p, 'checkout', '-b', 'feature'], check=True, capture_output=True)
+        (repo_dir / 'extra.txt').write_text('feature work')
+        subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', p, 'commit', '-m', 'feature commit'], check=True, capture_output=True)
+        head_result = subprocess.run(
+            ['git', '-C', p, 'rev-parse', 'HEAD'],
+            check=True, capture_output=True, text=True,
+        )
+        head_sha = head_result.stdout.strip()
+        assert head_sha != main_sha, 'test precondition: HEAD must differ from main'
 
         structured = {
             'proposal_text': 'Fix the blockage',
