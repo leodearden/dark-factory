@@ -132,12 +132,21 @@ def record_launch(
 
 def _count_charges_in_window(state: dict[str, Any], now: datetime) -> int:
     """Count charges in the rolling 24-hour window before *now*."""
-    raise NotImplementedError
+    cutoff = now - timedelta(hours=24)
+    count = 0
+    for c in state.get('charges', []):
+        try:
+            ts = datetime.fromisoformat(c['charged_at'])
+            if ts > cutoff:
+                count += 1
+        except (KeyError, ValueError):
+            pass
+    return count
 
 
 def _cap_remaining(state: dict[str, Any], cap: int, now: datetime) -> int:
     """Return how many merge slots remain in the current 24-hour window."""
-    raise NotImplementedError
+    return max(0, cap - _count_charges_in_window(state, now))
 
 
 def charge(
@@ -152,7 +161,25 @@ def charge(
     Returns ``{'charged': bool, 'remaining': int}`` (plus 'reason' on refusal).
     Over-cap calls return ``{'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}``.
     """
-    raise NotImplementedError
+    state = _load_state(state_path)
+    cutoff = now - timedelta(hours=24)
+    in_window = [c for c in state.get('charges', [])
+                 if _ts_in_window(c.get('charged_at', ''), cutoff)]
+    remaining_before = cap - len(in_window)
+    if remaining_before <= 0:
+        return {'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}
+    # Prune out-of-window charges to bound file growth, then append new one
+    state['charges'] = in_window + [{'task_id': task_id, 'charged_at': now.isoformat()}]
+    _save_state(state_path, state)
+    return {'charged': True, 'remaining': remaining_before - 1}
+
+
+def _ts_in_window(ts_str: str, cutoff: datetime) -> bool:
+    """Return True if *ts_str* parses to a datetime strictly after *cutoff*."""
+    try:
+        return datetime.fromisoformat(ts_str) > cutoff
+    except (ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
