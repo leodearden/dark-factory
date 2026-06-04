@@ -5296,6 +5296,87 @@ class TestBornAtL2GatesMergeEntry:
 
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
+class TestBornAtL2HaltsRunViaWaitForResolution:
+    """task γ amendment: A born-at-L2 escalation that trips an inner gate
+    (post-implementer / post-debugger) returns ESCALATED to run(), which then
+    calls _wait_for_resolution().  Without the fix _wait_for_resolution finds
+    no pending L0, returns '' immediately, and run() falls through the
+    already-on-main branch-check (fresh worktree HEAD == main SHA → break),
+    then reaches the MERGE gate which returns ESCALATED — so the outcome is
+    ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
+    _StewardReescalated for level≥2/born-at-L2, causing run() to call
+    _mark_blocked and return BLOCKED.
+
+    This tests the wait/gate handshake at the run() level, not just the
+    inner-gate predicate covered by TestBornAtL2GatesPostImplementer et al.
+    """
+
+    async def test_critical_l2_halts_run_not_spin(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Track invocation count to detect resume-spin: with the fix the stub
+        # should be called exactly once before _wait_for_resolution halts the run.
+        call_count = 0
+
+        async def _escalate_and_return_escalated():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate a post-implementer/post-debugger gate firing:
+                # the inner loop submitted a critical/level-2 escalation and
+                # returned ESCALATED — which bubbles up to run().
+                queue.submit(Escalation(
+                    id=queue.make_id(task_assignment.task_id),
+                    task_id=task_assignment.task_id,
+                    agent_role='implementer',
+                    severity='critical',
+                    category='risk_identified',
+                    summary='Stop-the-line: critical risk needing human review',
+                    detail='Born at L2 — cannot be auto-resolved by steward',
+                    level=2,
+                ))
+            return WorkflowOutcome.ESCALATED
+
+        workflow._execute_verify_review_loop = _escalate_and_return_escalated  # type: ignore[method-assign]
+
+        outcome = await workflow.run()
+
+        # With the fix: _wait_for_resolution raises _StewardReescalated for the
+        # pending level-2 escalation → _mark_blocked → BLOCKED.
+        # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
+        # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
+        # fires → ESCALATED.  So BLOCKED vs ESCALATED distinguishes the fix.
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Exactly one call — no resume-spin.
+        assert call_count == 1, (
+            f'_execute_verify_review_loop called {call_count} time(s); '
+            f'expected 1 — the fix must halt via _wait_for_resolution before any resume'
+        )
+        # The escalation is still pending — _wait_for_resolution must not consume it.
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(still_pending) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
 

@@ -4788,8 +4788,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _wait_for_resolution(self) -> str:
         """Wait for all level-0 pending escalations to be resolved.
 
-        Raises ``_StewardReescalated`` if the steward re-escalated to
-        level-1 (consumed by the auto-watcher), indicating the task should be blocked.
+        Born-at-L2 (critical/urgent severity) and any level≥2 pending
+        escalations are stop-the-line events — they cannot be resolved by
+        the auto-watcher/steward and require immediate human intervention.
+        Rather than waiting (which would either spin or block forever with
+        no resolver), they immediately raise ``_StewardReescalated`` so
+        that ``run()`` calls ``_mark_blocked`` and halts.
+
+        Raises ``_StewardReescalated`` if:
+        - A pending escalation with ``severity in BORN_AT_L2_SEVERITIES``
+          or ``level >= 2`` exists — immediate terminal, stop the line; OR
+        - The steward re-escalated to level-1 (consumed by auto-watcher).
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -4806,6 +4815,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
+
+        # Born-at-L2 (critical/urgent) and any level≥2 escalations are
+        # stop-the-line: no auto-watcher can resolve them, so waiting for the
+        # L0 loop to clear makes no sense and risks a busy resume-spin (gate
+        # fires → _wait_for_resolution returns '' → resume → gate fires again).
+        # Treat identically to _StewardReescalated so run() calls _mark_blocked
+        # and halts for human intervention rather than looping.
+        pending_high_sev = [
+            e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
+            if e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2
+        ]
+        if pending_high_sev:
+            raise _StewardReescalated(pending_high_sev)
 
         # Wait for level-0 pending escalations to clear
         while True:
