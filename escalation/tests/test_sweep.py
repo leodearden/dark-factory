@@ -352,6 +352,25 @@ class TestSweepIdempotency:
         assert self._disk_snapshot(tmp_path) == snapshot
 
 
+class TestSweepRelocationLock:
+    """sweep.sweep relocations must take the per-id sidecar lock."""
+
+    def test_relocation_creates_sidecar_lock_file(self, tmp_path: Path):
+        """After apply=True relocation, the stable sidecar .lock file exists in queue root."""
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00'
+        )
+        sweep.sweep(tmp_path, apply=True)
+        # (a) File was moved to dated archive subdir
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+        # (b) Stable sidecar .lock exists in queue root — proves lock was taken
+        assert (tmp_path / 'esc-1-1.json.lock').exists(), (
+            'Expected sidecar lock file esc-1-1.json.lock in queue root — '
+            'sweep.sweep must take escalation_id_lock around relocations'
+        )
+
+
 class TestSweepCli:
     """CLI entry point: main() and __main__ guard."""
 
