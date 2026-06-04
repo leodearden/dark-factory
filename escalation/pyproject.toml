@@ -23,7 +23,16 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
     "ruff>=0.4.0",
+    # Needed by TestMergeRequestDedup / TestGetMergeQueue in tests/test_server.py
+    # (added by task 1604), which lazily import orchestrator.merge_queue and
+    # orchestrator.git_ops. Dev-only — does not affect the published escalation
+    # package. orchestrator depends on escalation at runtime, so this is a
+    # dev-scoped workspace cycle, which uv resolves as one graph.
+    "orchestrator",
 ]
+
+[tool.uv.sources]
+orchestrator = { workspace = true }
 
 [tool.pytest.ini_options]
 # Default per-test timeout. Catches deadlocked lock implementations and
