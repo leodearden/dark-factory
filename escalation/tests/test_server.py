@@ -913,6 +913,24 @@ class TestChokepointSeverityDowngrade:
             f"sentinel_role={sentinel_role!r}: expected NO downgrade WARNING, got: {downgrade_warnings}"
         )
 
+    # --- (C) Robustness: None/empty agent_role falls through to downgrade ---
+
+    @pytest.mark.parametrize('agent_role', [None, ''])
+    def test_none_or_empty_agent_role_is_not_sentinel(self, agent_role):
+        """_is_harness_sentinel_role(None/'') returns False, not AttributeError.
+
+        The MCP tool validates agent_role as str, but legacy/deserialized records
+        may carry None or empty strings.  The defensive ``(agent_role or '')``
+        guard ensures these fall through to the downgrade (non-sentinel) path
+        rather than crashing with AttributeError inside the hot submit path.
+        """
+        from escalation.server import _is_harness_sentinel_role
+        # Must not raise, must return False (non-sentinel → downgrade path)
+        result = _is_harness_sentinel_role(agent_role)
+        assert result is False, (
+            f"agent_role={agent_role!r}: expected False (non-sentinel), got: {result!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers for promote_to_l2 tests

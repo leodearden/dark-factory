@@ -33,8 +33,13 @@ _HARNESS_SENTINEL_ROLE_PREFIXES = ('harness-', 'orchestrator-')
 
 
 def _is_harness_sentinel_role(agent_role: str) -> bool:
-    """Return True if *agent_role* belongs to the harness sentinel namespace."""
-    return any(agent_role.startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+    """Return True if *agent_role* belongs to the harness sentinel namespace.
+
+    Defensively coerces *agent_role* via ``(agent_role or '')`` so that
+    ``None`` or empty strings (possible on legacy/deserialized records) fall
+    through to the downgrade path instead of raising ``AttributeError``.
+    """
+    return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
 CATEGORIES = [
