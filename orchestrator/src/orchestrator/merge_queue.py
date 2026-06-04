@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+from enum import Enum
 import logging
 import posixpath
 import shutil
@@ -839,6 +840,166 @@ async def _check_plan_files_touched_in_branch(
             task_id or '<unknown>', base_sha, branch_head, not_touched,
         )
     return PlanFilesTouchedResult(not_touched=not_touched)
+
+
+class TipRelation(Enum):
+    """Topological relationship between two branch-tip SHAs.
+
+    Used by the γ1 multi-waiter coalescing substrate to decide how to handle
+    a new submission when a merge is already in-flight for the same branch.
+
+    Values:
+    - SAME: both tips are the same SHA.
+    - SUPERSET: *new_tip* is a strict ancestor-descendant of *old_tip*
+      (new has all of old's commits plus more).
+    - SUBSET: *new_tip* is an ancestor of *old_tip* (new is strictly behind).
+    - DIVERGENT: neither tip is an ancestor of the other; must be resolved via
+      :func:`resolve_divergent` before passing to :func:`decide_attach_action`.
+    """
+
+    SAME = 'same'
+    SUPERSET = 'superset'
+    SUBSET = 'subset'
+    DIVERGENT = 'divergent'
+
+
+async def classify_tip_relation(
+    new_tip: str,
+    old_tip: str,
+    git_ops: GitOps,
+) -> TipRelation:
+    """Return the topological relationship between *new_tip* and *old_tip*.
+
+    Checks performed in order (cheap first):
+
+    1. SHA equality → SAME.
+    2. ``is_ancestor(old_tip, new_tip)`` → SUPERSET (old is strictly behind new).
+    3. ``is_ancestor(new_tip, old_tip)`` → SUBSET (new is strictly behind old).
+    4. Neither → DIVERGENT (no ancestor relation; caller must use
+       :func:`resolve_divergent` to determine the patch-id relationship).
+
+    Consumed by γ2 (worker wiring) and γ3 (workflow caller) via the pure
+    :func:`decide_attach_action` mapping.
+    """
+    if new_tip == old_tip:
+        return TipRelation.SAME
+    if await git_ops.is_ancestor(old_tip, new_tip):
+        return TipRelation.SUPERSET
+    if await git_ops.is_ancestor(new_tip, old_tip):
+        return TipRelation.SUBSET
+    return TipRelation.DIVERGENT
+
+
+async def patch_content_contained(
+    head: str,
+    upstream: str,
+    git_ops: GitOps,
+) -> bool:
+    """Return True if every commit in *head* is already present (by patch-id) in *upstream*.
+
+    Uses ``git cherry upstream head``: lines without a leading ``+`` are
+    commits already applied; ``+`` lines are commits NOT yet in *upstream*.
+    An empty ``+``-line set → fully contained → True.
+
+    Fail-open: returns False on any git error (``rc != 0``) so that the
+    caller falls through to a full merge attempt rather than incorrectly
+    declaring the branch "already merged".
+
+    This is also the α2/D6 submit-time fast-path machinery: a branch whose
+    content is fully cherry-picked/rebased into main is "already merged" even
+    when its tip is not a literal ancestor.  The consumer wiring in
+    escalation/server.py is deferred to a downstream task.
+    """
+    rc, out, _ = await _run(
+        ['git', 'cherry', upstream, head],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        return False  # fail-open
+    return not any(line.startswith('+') for line in out.splitlines())
+
+
+async def resolve_divergent(
+    new_tip: str,
+    old_tip: str,
+    git_ops: GitOps,
+) -> TipRelation:
+    """Resolve a DIVERGENT tip-relation using patch-id content comparison.
+
+    Called when :func:`classify_tip_relation` returns DIVERGENT (neither tip
+    is a topological ancestor of the other).
+
+    If :func:`patch_content_contained` determines that *new_tip*'s commits are
+    all already present in *old_tip* (by patch-id — covers rebase/cherry-pick
+    rewrites), returns SUBSET (the new submission is content-equivalent to
+    what's already in-flight, just rebased).
+
+    Otherwise returns SUPERSET (the new submission has genuinely new content).
+    """
+    if await patch_content_contained(new_tip, old_tip, git_ops):
+        return TipRelation.SUBSET
+    return TipRelation.SUPERSET
+
+
+class AttachAction(Enum):
+    """Action to take when a new submission arrives for an already in-flight branch.
+
+    Derived from the PRD §7.2 dispatch table.  Computed by the pure
+    :func:`decide_attach_action` function given a resolved :class:`TipRelation`
+    and the current ``verifying`` flag.
+
+    Values:
+    - COALESCE: tip identical — attach as peer, resolve with same outcome.
+    - RESNAPSHOT: new tip is a superset and merge hasn't started verifying —
+      update snapshot_tip and re-try the merge with the new tip.
+    - ATTACH_AND_CHAIN: new tip is a superset but verify is already running —
+      attach as peer and set up gen-2 chaining (γ2 worker wiring).
+    - ATTACH_CONTAINMENT: new tip is a subset — attach as peer; at finalize
+      time the worker resolves via containment logic (boundary test 13).
+    """
+
+    COALESCE = 'coalesce'
+    RESNAPSHOT = 'resnapshot'
+    ATTACH_AND_CHAIN = 'attach_and_chain'
+    ATTACH_CONTAINMENT = 'attach_containment'
+
+
+def decide_attach_action(
+    relation: TipRelation,
+    *,
+    verifying: bool,
+) -> AttachAction:
+    """Return the coalescing action for *relation* given the *verifying* flag.
+
+    Pure function (no git I/O) — maps the PRD §7.2 table exactly:
+
+    +------------------+----------------+---------------------+
+    | relation         | verifying=False | verifying=True      |
+    +==================+================+=====================+
+    | SAME             | COALESCE        | COALESCE            |
+    +------------------+----------------+---------------------+
+    | SUPERSET         | RESNAPSHOT      | ATTACH_AND_CHAIN    |
+    +------------------+----------------+---------------------+
+    | SUBSET           | ATTACH_CONTAINMENT | ATTACH_CONTAINMENT |
+    +------------------+----------------+---------------------+
+    | DIVERGENT        | ValueError      | ValueError          |
+    +------------------+----------------+---------------------+
+
+    DIVERGENT must be resolved via :func:`resolve_divergent` before calling
+    this function; it raises :class:`ValueError` otherwise to enforce the
+    "patch-id compare first" contract.
+    """
+    if relation is TipRelation.SAME:
+        return AttachAction.COALESCE
+    if relation is TipRelation.SUBSET:
+        return AttachAction.ATTACH_CONTAINMENT
+    if relation is TipRelation.SUPERSET:
+        return AttachAction.ATTACH_AND_CHAIN if verifying else AttachAction.RESNAPSHOT
+    # TipRelation.DIVERGENT
+    raise ValueError(
+        'DIVERGENT must be resolved via resolve_divergent() first before '
+        'decide_attach_action() can map it to an AttachAction.'
+    )
 
 
 async def _check_post_merge_equivalence(

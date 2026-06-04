@@ -10815,3 +10815,211 @@ class TestReSnapshotSetVerifying:
         """set_verifying on a free branch is a no-op (does not raise)."""
         registry = InFlightMergeRegistry()
         registry.set_verifying('free')  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# TestTipRelation — γ1 step-9 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTipRelation:
+    """γ1 step-9 RED: TipRelation enum + classify_tip_relation with real git.
+
+    RED until step-10 impl: TipRelation/classify_tip_relation don't exist.
+    """
+
+    async def _head_sha(self, worktree: Path) -> str:
+        """Get HEAD SHA for a worktree."""
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return sha.strip()
+
+    async def test_same_tip(self, git_ops: GitOps):
+        """Same SHA → TipRelation.SAME."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        main_sha = await git_ops.get_main_sha()
+        relation = await classify_tip_relation(main_sha, main_sha, git_ops)
+        assert relation is TipRelation.SAME
+
+    async def test_superset(self, git_ops: GitOps):
+        """Branch advanced past old tip → TipRelation.SUPERSET (new is ancestor-descendant)."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        # Create branch with one commit; record that tip as "old"
+        worktree = await _make_branch_with_file(git_ops, 'tr-super', 'f.py', 'x=1\n')
+        old_sha = await self._head_sha(worktree)
+        # Advance branch: add another commit
+        (worktree / 'g.py').write_text('y=2\n')
+        await git_ops.commit(worktree, 'Add g.py')
+        new_sha = await self._head_sha(worktree)
+
+        relation = await classify_tip_relation(new_sha, old_sha, git_ops)
+        assert relation is TipRelation.SUPERSET
+
+    async def test_subset(self, git_ops: GitOps):
+        """Old tip is ahead of new tip → TipRelation.SUBSET."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        worktree = await _make_branch_with_file(git_ops, 'tr-sub', 'h.py', 'z=3\n')
+        old_sha = await self._head_sha(worktree)
+        (worktree / 'k.py').write_text('k=4\n')
+        await git_ops.commit(worktree, 'Add k.py')
+        new_sha_advanced = await self._head_sha(worktree)
+
+        # new=old_sha (behind), old=new_sha_advanced (ahead) → new is subset
+        relation = await classify_tip_relation(old_sha, new_sha_advanced, git_ops)
+        assert relation is TipRelation.SUBSET
+
+    async def test_divergent(self, git_ops: GitOps):
+        """Two branches off same base with distinct commits → TipRelation.DIVERGENT."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        wt_a = await _make_branch_with_file(git_ops, 'tr-div-a', 'a.py', 'a=1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'tr-div-b', 'b.py', 'b=2\n')
+        sha_a = await self._head_sha(wt_a)
+        sha_b = await self._head_sha(wt_b)
+
+        relation = await classify_tip_relation(sha_a, sha_b, git_ops)
+        assert relation is TipRelation.DIVERGENT
+
+
+# ---------------------------------------------------------------------------
+# TestPatchContentContained — γ1 step-11 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPatchContentContained:
+    """γ1 step-11 RED: patch_content_contained + resolve_divergent with real git.
+
+    RED until step-12 impl: helpers don't exist.
+    (implemented alongside TipRelation in step-10 commit; tests per plan.)
+    """
+
+    async def _head_sha(self, worktree: Path) -> str:
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return sha.strip()
+
+    async def test_cherry_picked_content_is_contained(self, git_ops: GitOps):
+        """Branch commit cherry-picked onto main → content already present (True)."""
+        from orchestrator.merge_queue import patch_content_contained
+        # Create branch with one file
+        wt = await _make_branch_with_file(git_ops, 'pcc-cherry', 'cherry.py', 'x = 42\n')
+        branch_tip = await self._head_sha(wt)
+
+        # Cherry-pick the branch commit onto main
+        main_sha_before = await git_ops.get_main_sha()
+        rc, _, err = await _run(
+            ['git', 'cherry-pick', branch_tip],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'cherry-pick failed: {err}'
+        upstream = await git_ops.get_main_sha()
+
+        # The branch tip's content is now on main (different SHA — rebase/cp)
+        result = await patch_content_contained(branch_tip, upstream, git_ops)
+        assert result is True
+
+    async def test_unapplied_commit_not_contained(self, git_ops: GitOps):
+        """Branch with a genuinely new commit not on main → False."""
+        from orchestrator.merge_queue import patch_content_contained
+        wt = await _make_branch_with_file(git_ops, 'pcc-new', 'new.py', 'y = 99\n')
+        branch_tip = await self._head_sha(wt)
+        main_tip = await git_ops.get_main_sha()
+
+        result = await patch_content_contained(branch_tip, main_tip, git_ops)
+        assert result is False
+
+    async def test_empty_range_is_contained(self, git_ops: GitOps):
+        """Branch tip == upstream (no commits beyond base) → True (vacuously contained)."""
+        from orchestrator.merge_queue import patch_content_contained
+        main_sha = await git_ops.get_main_sha()
+        # Branch off main with no extra commits: both tips are the same SHA
+        result = await patch_content_contained(main_sha, main_sha, git_ops)
+        assert result is True
+
+    async def test_bogus_ref_returns_false(self, git_ops: GitOps):
+        """git cherry with a bogus ref → rc != 0 → fail-open → False."""
+        from orchestrator.merge_queue import patch_content_contained
+        result = await patch_content_contained('deadbeef0000', 'abcdef1234', git_ops)
+        assert result is False
+
+    async def test_resolve_divergent_content_equal_returns_subset(self, git_ops: GitOps):
+        """resolve_divergent for cherry-picked content → TipRelation.SUBSET."""
+        from orchestrator.merge_queue import TipRelation, resolve_divergent
+        wt = await _make_branch_with_file(git_ops, 'rd-eq', 'eq.py', 'z = 7\n')
+        branch_tip = await self._head_sha(wt)
+        rc, _, err = await _run(
+            ['git', 'cherry-pick', branch_tip],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'cherry-pick failed: {err}'
+        upstream = await git_ops.get_main_sha()
+
+        relation = await resolve_divergent(branch_tip, upstream, git_ops)
+        assert relation is TipRelation.SUBSET
+
+    async def test_resolve_divergent_genuinely_new_returns_superset(self, git_ops: GitOps):
+        """resolve_divergent for a genuinely new branch commit → TipRelation.SUPERSET."""
+        from orchestrator.merge_queue import TipRelation, resolve_divergent
+        wt = await _make_branch_with_file(git_ops, 'rd-new', 'rd_new.py', 'w = 5\n')
+        branch_tip = await self._head_sha(wt)
+        main_tip = await git_ops.get_main_sha()
+
+        relation = await resolve_divergent(branch_tip, main_tip, git_ops)
+        assert relation is TipRelation.SUPERSET
+
+
+# ---------------------------------------------------------------------------
+# TestDecideAttachAction — γ1 step-13 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDecideAttachAction:
+    """γ1 step-13 RED: decide_attach_action pure mapping (PRD §7.2 table).
+
+    RED until step-14 impl: AttachAction/decide_attach_action don't exist.
+    (implemented alongside TipRelation in step-10 commit; tests per plan.)
+    """
+
+    async def test_same_not_verifying(self):
+        """SAME + not verifying → COALESCE."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SAME, verifying=False) is AttachAction.COALESCE
+
+    async def test_same_verifying(self):
+        """SAME + verifying → COALESCE."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SAME, verifying=True) is AttachAction.COALESCE
+
+    async def test_superset_not_verifying(self):
+        """SUPERSET + not verifying → RESNAPSHOT."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUPERSET, verifying=False) is AttachAction.RESNAPSHOT
+
+    async def test_superset_verifying(self):
+        """SUPERSET + verifying → ATTACH_AND_CHAIN (gen-2 chaining, γ2)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUPERSET, verifying=True) is AttachAction.ATTACH_AND_CHAIN
+
+    async def test_subset_not_verifying(self):
+        """SUBSET + not verifying → ATTACH_CONTAINMENT (boundary test 13 substrate)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUBSET, verifying=False) is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_subset_verifying(self):
+        """SUBSET + verifying → ATTACH_CONTAINMENT (containment applies regardless)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUBSET, verifying=True) is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_divergent_raises_value_error(self):
+        """DIVERGENT → ValueError (must resolve via resolve_divergent first)."""
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
+        import pytest
+        with pytest.raises(ValueError, match='DIVERGENT'):
+            decide_attach_action(TipRelation.DIVERGENT, verifying=False)
+
+    async def test_divergent_verifying_also_raises(self):
+        """DIVERGENT + verifying → ValueError (same constraint)."""
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
+        import pytest
+        with pytest.raises(ValueError, match='DIVERGENT'):
+            decide_attach_action(TipRelation.DIVERGENT, verifying=True)
