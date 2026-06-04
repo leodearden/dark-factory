@@ -81,7 +81,7 @@ cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watche
   --queue-dir <project_root>/data/escalations --level 2 2>&1
 ```
 
-Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout.
+Run as a **background task** (Bash with `run_in_background`). The `--level 2` flag restricts the inotify watcher to L2 escalation files only. The watcher uses inotify and exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2 escalation is already pending when the watcher starts, it may fire immediately at launch — this is expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain re-finds it).
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
