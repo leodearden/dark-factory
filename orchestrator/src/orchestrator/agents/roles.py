@@ -45,6 +45,22 @@ Use escalation when:
 - A test failure's root cause is in code you can't modify
 - A design decision requires broader context than this task provides
 - The verify/debug loop won't converge due to an external dependency
+
+### Severity policy
+
+`escalate_blocker` defaults to severity `blocking` — the correct level for agent-filed
+blockers.  Severities above `blocking` — `critical` and `urgent` — are **reserved for
+harness sentinels** (agent_role prefixed `harness-` or `orchestrator-`).  These route
+directly to a human (born at L2), bypassing the auto-watcher.
+
+If an agent files `critical` or `urgent`, the escalation server **downgrades it to
+`blocking`** at the chokepoint (logged at WARNING; summary gains a
+`[downgraded:critical]` / `[downgraded:urgent]` suffix).  Self-assigning a higher
+severity buys no faster human attention — only noise.
+
+To reach a human, use the existing ladder: file with `escalate_blocker` (L0 →
+steward); if the steward cannot resolve it, re-escalate with `level=1` (steward →
+auto-watcher; auto-watcher promotes to L2 if a human is needed).
 """
 
 _MEMORY_TOOLS = [
