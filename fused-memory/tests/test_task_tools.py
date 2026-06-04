@@ -367,7 +367,6 @@ def test_add_subtask_result_not_importable():
     task_backend_types.py, passes once step-4 removes it.
     """
     import importlib
-    import sys
 
     # If already in sys.modules (cached), reload to re-check the symbol.
     module_name = 'fused_memory.backends.task_backend_types'
