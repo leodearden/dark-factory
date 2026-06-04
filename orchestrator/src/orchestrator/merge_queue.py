@@ -2834,9 +2834,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
         # Verifier sub-state: current item and its phase within _verify_and_advance.
-        # Set by _verifier_loop after abandoned check; cleared in the loop's finally.
+        # Set by _verifier_loop (early, before _remerge, to cover the remerge blind
+        # spot); cleared in the loop's finally.
         self._verify_item: SpeculativeItem | None = None
         self._verify_phase: str | None = None
+        # Timestamp (wall clock) when _verify_phase first entered 'verifying'.
+        # Separate from enqueued_at so verify_in_progress can report pure verify
+        # time rather than total queue-wait time (useful for triage of stuck verifies).
+        self._verify_started_at: float | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
 
@@ -2887,6 +2892,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
 
         # 2. Awaiting-verify items from the verifier queue (skip None sentinel)
+        # Accessing asyncio.Queue._queue (the internal deque) directly — a CPython
+        # implementation detail.  Safe here: snapshot() is synchronous, runs under
+        # the single asyncio event loop, and never mutates the deque; the only
+        # alternative would be maintaining a separate side-list at every put/get
+        # call site.  A # type: ignore[attr-defined] suppresses the attr check.
         for item in list(self._verifier_queue._queue):  # type: ignore[attr-defined]
             if item is None:
                 continue
@@ -2905,6 +2915,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
 
         # 4. Queued (waiting for the merger; the incident blind spot)
+        # Same CPython internal-deque access as above — read-only, no lock needed.
         for req in list(self._queue._queue):  # type: ignore[attr-defined]
             if req is None:
                 continue
@@ -2913,9 +2924,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         verify_in_progress = None
         if self._verify_item is not None:
             vi = self._verify_item
+            verify_age: float | None = (
+                max(0.0, now - self._verify_started_at)
+                if self._verify_started_at is not None else None
+            )
             verify_in_progress = {
                 'task_id': vi.request.task_id,
+                # age_secs: total time since this request was enqueued (queue wait
+                # + verify time).  Use verify_age_secs for pure verification time.
                 'age_secs': max(0.0, now - vi.request.enqueued_at),
+                # verify_age_secs: time elapsed since 'verifying' phase started
+                # (None when still remerging / before first verify call).
+                'verify_age_secs': verify_age,
             }
 
         return {
@@ -3485,6 +3505,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Set flag early so an exception during cleanup/_remerge still
                     # propagates chain invalidation to the next iteration.
                     iteration_did_remerge = True
+                    # Make the item visible in snapshot() during the re-merge so it
+                    # is never in-flight-but-invisible.  _remerge can be slow
+                    # (a full merge operation); without this the item is popped from
+                    # _verifier_queue but not yet in _verify_item — the exact
+                    # "genuinely queued but invisible" window the tool was built to
+                    # surface (reify 3112).  Use 'remerging' as a distinct phase so
+                    # operators can distinguish it from normal verification.
+                    self._verify_item = item
+                    self._verify_phase = 'remerging'
                     # Clean up the stale merge worktree (merged against a commit
                     # that never reached main).
                     if item.merge_wt:
@@ -3499,6 +3528,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'({discard_reason}), re-merging against actual main'
                     )
                     item = await self._remerge(req, item.started_monotonic)
+                    # Update _verify_item to the freshly re-merged item; phase stays
+                    # 'remerging' until _verify_and_advance transitions it.
+                    self._verify_item = item
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
                 if item.immediate_outcome is not None:
@@ -3538,6 +3570,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 remerge_occurred = iteration_did_remerge
                 self._verify_item = None
                 self._verify_phase = None
+                self._verify_started_at = None
                 self._speculation_slot.set()
 
     async def _build_merge_failure_diagnostic(
@@ -3773,6 +3806,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
             self._verify_phase = 'verifying'
+            self._verify_started_at = time.time()  # wall-clock verify start for triage
             logger.info(
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
@@ -3983,6 +4017,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     attempt=gate_total,
                     duration_ms=_elapsed_ms(item.started_monotonic),
                 )
+                # Gate cleared — restore 'finalizing' so the next advance_main
+                # call in the loop reports the correct phase, not 'gate_reverify'.
+                self._verify_phase = 'finalizing'
                 continue
 
             if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):

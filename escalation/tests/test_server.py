@@ -1650,3 +1650,121 @@ class TestGetMergeQueue:
         snap = worker.snapshot()
         bad_states = {e['state'] for e in snap['entries']} & {'verifying', 'finalizing', 'gate_reverify'}
         assert not bad_states, f'Snapshot should have no active verifier states, got: {bad_states}'
+
+    # ── amend: gate_reverify phase set/cleared by production code ─────────
+
+    async def test_gate_reverify_phase_set_and_cleared(self, tmp_path: Path):
+        """_verify_and_advance sets _verify_phase='gate_reverify' when advance_main
+        returns 'rebased_pending_reverify', and resets to 'finalizing' after the gate
+        clears (so subsequent advance_main retries report the correct phase).
+        """
+        import asyncio
+        import types
+
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        advance_calls: list[int] = []
+        captured_phases_reverify: list[str | None] = []
+        captured_phases_advance2: list[str | None] = []
+
+        async def fake_advance_main(*args, **kwargs):
+            advance_calls.append(len(advance_calls) + 1)
+            if len(advance_calls) == 1:
+                # First call: trigger rebase path
+                return 'rebased_pending_reverify'
+            else:
+                # Second call (after gate cleared): terminal failure
+                captured_phases_advance2.append(worker._verify_phase)
+                return 'not_descendant'
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        # Side-channel attributes read by _verify_and_advance after
+        # 'rebased_pending_reverify' to extract the post-rebase SHAs.
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+            _last_advanced_sha='rebased0abc',
+            _rebased_from='from0sha',
+            _rebased_onto='onto0sha',
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id='GR',
+            branch='GR',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(
+            success=True,
+            merge_commit='deadbeef00000001',
+            merge_worktree=merge_wt,
+        )
+        # skip_verify=True: bypass Step 4 and go straight to the advance_main loop,
+        # which is where 'gate_reverify' is triggered.
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base0sha',
+            speculative=False,
+            skip_verify=True,
+        )
+
+        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+
+        async def fake_reverify_rebased_tree(*args, **kwargs):
+            # Capture the phase at the moment _reverify_rebased_tree is invoked.
+            captured_phases_reverify.append(worker._verify_phase)
+            # Return None → gate cleared (disjoint/green), advance proceeds.
+            return None
+
+        original_reverify = mq_module._reverify_rebased_tree
+        mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
+        try:
+            await worker._verify_and_advance(item)
+        finally:
+            mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
+
+        # _reverify_rebased_tree must have been called exactly once
+        assert len(captured_phases_reverify) == 1, (
+            f'Expected _reverify_rebased_tree called once, got: {len(captured_phases_reverify)}'
+        )
+        # Phase must be 'gate_reverify' when _reverify_rebased_tree is invoked
+        assert captured_phases_reverify[0] == 'gate_reverify', (
+            f'Expected gate_reverify at reverify call, got: {captured_phases_reverify[0]!r}'
+        )
+
+        # advance_main must have been called twice
+        assert len(advance_calls) == 2, (
+            f'Expected 2 advance_main calls, got: {advance_calls}'
+        )
+        # After gate cleared, phase must be 'finalizing' when the second advance_main runs
+        assert len(captured_phases_advance2) == 1, (
+            f'Expected phase captured for second advance_main, got: {captured_phases_advance2}'
+        )
+        assert captured_phases_advance2[0] == 'finalizing', (
+            f'Expected finalizing after gate cleared, got: {captured_phases_advance2[0]!r}'
+        )
+
+        # Request future is resolved (not_descendant → blocked)
+        assert req.result.done(), 'request future should be resolved after terminal advance_main'
