@@ -103,7 +103,20 @@ With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
 Verifier: after enqueuing a counted item the Merger blocks at
 ``_merge_ahead_cap.acquire()`` until the Verifier drains that item, at which
 point it re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are
-safe; higher values allow more build-ahead but increase staleness risk."""
+safe; higher values allow more build-ahead but increase staleness risk.
+
+Cap invariants (all verified by integration tests):
+- Acquired at the single success-enqueue site in _merger_loop for non-speculative
+  blocking-path items (trains continue before this site; speculative items are
+  governed by _speculation_slot instead).
+- Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
+  returns a non-None item, before any branching or item reassignment.  This
+  uniform placement covers all drain paths (normal verify, immediate_outcome,
+  chain-invalidation discard+_remerge, abandoned early-continue) with a single
+  release point and no risk of double-release (each counted item has exactly one
+  drain in the FIFO).
+- Released by stop() (over-release of a plain Semaphore is safe) so a merger
+  blocked at acquire() unblocks cleanly at shutdown."""
 
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
