@@ -66,6 +66,12 @@ logger = logging.getLogger(__name__)
 # branch-resolution races should clear well before this threshold fires.
 MAX_RECONCILE_FAILURES: int = 5
 
+# Maximum number of same-signature blocked→pending re-pends allowed before the
+# 4th flip is withheld and a born-at-L2 human escalation is filed.
+# Mirrors MAX_RECONCILE_FAILURES shape — a module constant so the value stays
+# inside the declared module scope without touching config.py / defaults.yaml.
+_REBLOCK_GUARD_THRESHOLD: int = 3
+
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
 #   'done' / 'cancelled'   — terminal-by-decision; nothing to recover
@@ -4495,6 +4501,155 @@ Output JSON matching the schema. Every task must appear in the output.
             return 'close_only'
         return 'resume'  # status == 'resolved'
 
+    async def _check_reblock_guard(self, escalation, task_id: str) -> bool:
+        """Check the re-block guard counter; persist before proceeding.
+
+        Returns True → proceed with the blocked→pending flip.
+        Returns False → withhold the flip (threshold reached).
+
+        Counter logic (C5):
+          - Read fresh metadata via scheduler.get_task (fresh each incarnation).
+          - Compute new signature via _reblock_signature.
+          - Same-sig → prev_count + 1; different-sig → reset to 1.
+          - Withhold iff same-sig AND prev_count >= _REBLOCK_GUARD_THRESHOLD
+            (check BEFORE incrementing — so 3 same-sig flips proceed and the
+            4th is withheld; this matches the "4th flip withheld" contract).
+          - Otherwise: increment/reset, persist via update_task(append=True)
+            BEFORE the flip (crash-safe: over-count never under-count — C5),
+            then return True.
+        """
+        new_sig = self._reblock_signature(escalation)
+
+        # Read fresh metadata so each incarnation sees the persisted count.
+        task = await self.scheduler.get_task(task_id)
+        metadata = (task or {}).get('metadata') or {}
+        try:
+            guard = metadata.get('reblock_guard')
+            # Validate shape: a corrupt/non-dict truthy value (e.g. a string
+            # from a bad write or manual edit) would raise AttributeError on
+            # guard.get(...).  Degrade gracefully to an empty dict so the guard
+            # resets to count 0 rather than aborting the flip entirely.
+            if not isinstance(guard, dict):
+                guard = {}
+            prev_count = int(guard.get('count') or 0)
+            prev_signature = guard.get('signature')
+        except (TypeError, ValueError):
+            prev_count = 0
+            prev_signature = None
+
+        same_sig = (prev_signature is not None and prev_signature == new_sig)
+
+        # NOTE on cumulative counting (C5, intentional): the counter is NEVER
+        # automatically cleared when the task makes progress (e.g. moves to
+        # in-progress or done and later gets re-blocked).  Only two paths reset
+        # it: (a) a human explicitly clears metadata.reblock_guard — an absent
+        # or non-dict guard reads as count 0, starting fresh; or (b) the
+        # escalation signature changes (different category or substantially
+        # different summary), which resets count to 1 and proceeds.
+        # This cumulative behaviour is intentional: repeated failures with an
+        # identical signature are considered pathologically repetitive regardless
+        # of intervening progress.  An operator who has genuinely fixed the root
+        # cause should clear the guard to signal "new slate".
+
+        # Threshold check (check-before-flip ordering — see design decision):
+        # same-sig AND prev_count >= threshold → withhold + file L2.
+        if same_sig and prev_count >= _REBLOCK_GUARD_THRESHOLD:
+            self._file_reblock_guard_l2(task_id, prev_count, new_sig)
+            return False
+
+        # Same signature → increment; different signature → reset to 1.
+        # Mirrors _check_*_thrash shape: same-sig +1, different-sig reset to 1
+        # (reset to 1 = "we just saw one"; reset to 0 would lose the current flip).
+        new_count = prev_count + 1 if same_sig else 1
+
+        # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5).
+        # append=True → recursive-merge: only the 'reblock_guard' key is written;
+        # sibling metadata keys (files, memory_hints, …) are preserved, and the
+        # flip's own set_task_status reopen_reason audit-merge cannot clobber the
+        # counter (C3.4 hazard).
+        await self.scheduler.update_task(
+            task_id,
+            {'reblock_guard': {'count': new_count, 'signature': new_sig}},
+            append=True,
+        )
+
+        return True
+
+    def _file_reblock_guard_l2(self, task_id: str, prev_count: int, sig: str) -> None:
+        """File a born-at-L2 human escalation when the re-block guard threshold is hit.
+
+        Mirrors _file_watcher_outage_l2:
+          - No-op when _escalation_queue is None (bare-Harness unit tests).
+          - Deduped via find_pending_l2_by_root_cause(root_cause) so repeated
+            trips for the same stuck task file exactly one L2.
+          - Best-effort: all exceptions are swallowed (same pattern as
+            _file_watcher_outage_l2) so this never breaks the re-pend path.
+          - agent_role='harness-reblock-guard' — a harness-sentinel that stays
+            born-at-L2 under the C4 allowlist (severity='urgent').
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
+            return
+        try:
+            root_cause = f'reblock-guard:{task_id}'
+            if queue.find_pending_l2_by_root_cause(root_cause) is not None:
+                return  # dedup: one open L2 per stuck task
+            from escalation.models import Escalation
+            summary = (
+                f'persistent re-block: {prev_count} redispatches, signature {sig}'
+            )[:200]
+            detail = (
+                f'Task {task_id} has been re-blocked {prev_count} time(s) with the '
+                f'same failure signature, reaching the _REBLOCK_GUARD_THRESHOLD.\n\n'
+                f'Signature: {sig}\n\n'
+                f'The automatic blocked→pending flip is now suppressed for this '
+                f'signature.  Investigate the root cause, fix the underlying issue, '
+                f'and clear metadata.reblock_guard on the task to allow future '
+                f're-pends to proceed.'
+            )
+            esc = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='harness-reblock-guard',
+                severity='urgent',
+                category='task_failure',
+                level=2,
+                root_cause=root_cause,
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_reblock_loop',
+            )
+            queue.submit(esc)
+            logger.warning(
+                'reblock-guard: task %s hit threshold (count=%d, sig=%r); '
+                'flip withheld, L2 filed %s',
+                task_id, prev_count, sig, esc.id,
+            )
+        except Exception:
+            logger.warning(
+                'reblock-guard: failed to file L2 for task %s', task_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _reblock_signature(escalation) -> str:
+        """Derive the re-block guard signature from an escalation.
+
+        Signature = ``category + ':' + normalize(summary)[:120]``, where
+        normalize = whitespace-collapse (``' '.join(s.split())``) + lowercase.
+
+        This makes the signature robust to trivial formatting differences
+        (extra spaces, newlines, capitalisation) across incarnations while
+        keeping it specific enough to distinguish genuinely different failure
+        modes (different category or substantially different summary).
+
+        The 120-char truncation is applied to the *normalised* summary only;
+        the category prefix is not counted toward the 120.
+        """
+        raw = escalation.summary or ''
+        normalized = ' '.join(raw.split()).lower()
+        return f'{escalation.category}:{normalized[:120]}'
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
 
@@ -4521,6 +4676,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
                 task_id, status, escalation.resolved_by,
             )
+            return
+
+        # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
+        # withhold the flip when the threshold is reached.
+        if not await self._check_reblock_guard(escalation, task_id):
             return
 
         # Only 'blocked' reaches here — attempt the flip

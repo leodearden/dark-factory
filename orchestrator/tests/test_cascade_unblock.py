@@ -43,6 +43,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler = MagicMock()
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
+    # _check_reblock_guard reads fresh metadata and persists the counter;
+    # provide no-op stubs so the guard doesn't raise in these tests.
+    h.scheduler.get_task = AsyncMock(return_value={'id': 'x', 'metadata': {}})
+    h.scheduler.update_task = AsyncMock(return_value=True)
 
     # _merge_worker stays None — unhalt branch is skipped in all tests here
     return h
