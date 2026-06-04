@@ -32,6 +32,8 @@ CATEGORIES = [
     'recon_integrity_issue',
     # Review triage
     'review_suggestions',
+    # Stranded-blocked recovery (PRD-3 D5 / C6)
+    'stranded_blocked',
 ]
 
 # Fields returned by get_pending_escalations(compact=True) — the triage-relevant
