@@ -721,8 +721,14 @@ def create_server(
           repo's escalation MCP; check that the branch belongs here.
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
-        - Queued / attached: ``{status='queued'|'attached', request_id,
-          snapshot_tip, generation, position, queue_depth, eta_seconds}``.
+        - Queued: ``{status='queued', request_id, snapshot_tip, generation,
+          position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
+          (or wait_secs timeout expired).
+        - Attached: ``{status='attached', request_id, snapshot_tip, generation,
+          position, queue_depth, eta_seconds, inflight_task_id}``.  Branch is
+          already in-flight; request_id is the *existing* entry's id (D8), not
+          the submitting call's id.  ``inflight_task_id`` is the authoritative
+          poll handle (merge_status accepts task_id per D10).
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main (fast-path — no enqueue, no request_id)
