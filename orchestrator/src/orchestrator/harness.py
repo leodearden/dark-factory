@@ -3658,6 +3658,11 @@ Output JSON matching the schema. Every task must appear in the output.
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
         timeout_secs = cfg.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
         bash_max_timeout_ms = str(int(timeout_secs * 1000))
+        logger.info(
+            'Escalation-watcher-auto rotation: injecting BASH_MAX_TIMEOUT_MS=%s (timeout_secs=%.0f)',
+            bash_max_timeout_ms,
+            timeout_secs,
+        )
 
         return await invoke_with_cap_retry(
             self.usage_gate,
