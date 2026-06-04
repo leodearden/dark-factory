@@ -10309,8 +10309,9 @@ class TestSnapshotEntryRequestId:
         config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
-        worker = SpeculativeMergeWorker(  # type: ignore[reportArgumentType]
-            git_ops=git_ops_stub, queue=mq
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=mq,
         )
 
         req = MergeRequest(

@@ -2831,7 +2831,10 @@ class TestMergeStatus:
     # ── step-7: event-store tier + state mapping ──────────────────────────────
 
     def _make_event_store(self, tmp_path: Path):
-        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
         return EventStore(tmp_path / 'runs.db', 'run-ms-test'), EventType
 
     def _emit_finalized(self, store, EventType, *, request_id, task_id, branch, state):
@@ -2983,14 +2986,16 @@ class TestMergeStatus:
 
     async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
         """Ring tier precedes event store: ring record wins when both have the same request_id."""
-        import time
         import types
 
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
-        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
 
         event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
         event_store.emit(
@@ -3023,8 +3028,13 @@ class TestMergeStatus:
         """Ring miss falls through to the event store tier."""
         import types
 
-        from orchestrator.merge_queue import TerminalOutcomeRetention  # type: ignore[reportMissingImports]
-        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
+        from orchestrator.merge_queue import (
+            TerminalOutcomeRetention,  # type: ignore[reportMissingImports]
+        )
 
         event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
         event_store.emit(
@@ -3066,8 +3076,9 @@ class TestMergeStatus:
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
-        worker = SpeculativeMergeWorker(  # type: ignore[reportArgumentType]
-            git_ops=git_ops_stub, queue=mq
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=mq,
         )
         req = MergeRequest(
             task_id='T-live', branch='branch-live',
@@ -3163,13 +3174,16 @@ class TestMergeStatus:
         import asyncio
         import types
 
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeRequest,
             SpeculativeMergeWorker,
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
-        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
 
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')

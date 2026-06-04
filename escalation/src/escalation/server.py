@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -1029,10 +1030,8 @@ def create_server(
             if entry is not None:
                 eta = None
                 if merge_inflight_registry is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         eta = merge_inflight_registry.eta_seconds(entry['branch'])
-                    except Exception:
-                        pass
                 return {
                     'state': _map_live_state(entry['state']),
                     'request_id': entry.get('request_id'),
