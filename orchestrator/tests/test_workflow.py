@@ -1466,3 +1466,148 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         if not queued_req.result.done():
             queued_req.result.set_result(MergeOutcome(status='done', merge_sha='sha2'))
         await submit_task
+
+
+# ---------------------------------------------------------------------------
+# TestBoundaryTableWorkflow — PRD §8 row 10 (soft-cancel detach)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBoundaryTableWorkflow:
+    """PRD §8 row 10: soft-cancel detach at the workflow seam.
+
+    Extends TestSubmitToMergeQueueSoftCancelDetaches with:
+    - The remaining-MCP-waiter-completes assertion (P resolves to 'done')
+    - The re-attach-coalesces assertion (entry waiter count back to 2)
+    """
+
+    def _make_wf_with_peer(self, tmp_path, real_queue, registry, *, tip: str):
+        """Build a workflow and pre-seed branch B with mcp-source primary P."""
+        from orchestrator.merge_queue import (  # noqa: F401 (local)
+            InFlightMergeRegistry,
+            MergeOutcome,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+        return wf
+
+    async def test_scenario_10_soft_cancel_detach_remaining_waiter_completes(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Row 10: soft-cancel detaches workflow waiter; primary MCP waiter still completes.
+
+        Acquire an mcp-source primary P on branch B; have the workflow attach
+        as a second waiter, then soft-cancel.  Assert:
+        (1) Workflow waiter detached — only mr-mcp remains (P NOT cancelled).
+        (2) Workflow outcome is REQUEUED.
+        (3) On retry, re-attach coalesces (entry waiter count = 2, no enqueue).
+        (4) Resolve P to 'done' — the remaining MCP waiter P is still done.
+        Extends TestSubmitToMergeQueueSoftCancelDetaches with (3) and (4).
+        """
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip-bt10-000000001'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf = self._make_wf_with_peer(tmp_path, real_queue, registry, tip=TIP)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # ── (1)+(2) First call: soft-cancel → detach ───────────────────────
+        wf._cancel_event.set()
+        outcome1 = await wf._submit_to_merge_queue('B', merge_phase=True)
+
+        entry = registry.entry('B')
+        assert entry is not None, 'entry must remain in-flight after detach'
+        assert len(entry.waiters) == 1, (
+            f'Only mcp waiter must remain after detach, got {len(entry.waiters)} waiters'
+        )
+        assert entry.waiters[0].request_id == 'mr-mcp', (
+            f'Remaining waiter must be mr-mcp, got: {entry.waiters[0].request_id!r}'
+        )
+        assert not P.cancelled(), 'Primary P must NOT be cancelled after workflow soft-cancel'
+        assert outcome1 == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED outcome after soft-cancel, got: {outcome1}'
+        )
+
+        # ── (3) Re-attach: coalesces back to 2 waiters ──────────────────────
+        wf._cancel_event.clear()
+        submit_task2 = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        entry2 = registry.entry('B')
+        assert entry2 is not None
+        assert len(entry2.waiters) == 2, (
+            f'Re-attach must coalesce to 2 waiters, got {len(entry2.waiters)}'
+        )
+        assert real_queue.qsize() == 0, (
+            f'Re-attach must NOT enqueue a duplicate, qsize={real_queue.qsize()}'
+        )
+
+        # ── (4) Resolve P → both waiters complete ────────────────────────────
+        P.set_result(MergeOutcome(status='done', merge_sha='sha-bt10'))
+        outcome2 = await asyncio.wait_for(submit_task2, timeout=5.0)
+
+        assert P.done() and not P.cancelled(), 'MCP waiter P must be done (not cancelled)'
+        assert P.result().status == 'done', (
+            f'MCP waiter P must resolve to done, got: {P.result().status!r}'
+        )
+        assert outcome2 == WorkflowOutcome.DONE, (
+            f'Workflow re-attach outcome must be DONE, got: {outcome2}'
+        )
