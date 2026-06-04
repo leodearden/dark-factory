@@ -678,8 +678,13 @@ def create_server(
           push_status=None}``.  A merge for *branch* is already running;
           the caller should poll rather than re-queuing.  ``eta_seconds`` is
           a best-effort hint (``None`` once the estimate window is exceeded).
-        - Already merged (fast-path): ``{status='already_merged', commit}``.
-          The branch tip is already an ancestor of main; no enqueue occurs.
+        - Already merged: ``{status='already_merged', commit, reason='',
+          conflict_details='', push_status=None}``.  Either the branch tip is
+          already an ancestor of main (fast-path — no enqueue, no request_id)
+          or the worker detected the branch was already merged via merge marker
+          (worker-path — also carries request_id and a None commit from
+          outcome.merge_sha).  All keys are present in both paths; callers
+          can safely read reason/conflict_details/push_status without KeyError.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -718,7 +723,16 @@ def create_server(
             if tip is not None and await git_ops_for_scan.is_ancestor(
                 tip, orch_config.git.main_branch
             ):
-                return {'status': 'already_merged', 'commit': tip}
+                # Shape converged with worker-path already_merged (suggestion 1).
+                # request_id is absent: the fast-path short-circuits before any
+                # MergeRequest entry is constructed (no entry → no id).
+                return {
+                    'status': 'already_merged',
+                    'commit': tip,
+                    'reason': '',
+                    'conflict_details': '',
+                    'push_status': None,
+                }
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
@@ -775,12 +789,17 @@ def create_server(
             }
 
         outcome = await future
+        # 'commit' (outcome.merge_sha) is included for shape convergence with the
+        # fast-path already_merged response.  It is None for most statuses and for
+        # the worker-produced already_merged case (merge marker path returns no SHA);
+        # it is non-None for 'done' and 'done_wip_recovery' where main was advanced.
         result: dict[str, Any] = {
             'status': outcome.status,
             'request_id': merge_req.request_id,
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
             'push_status': outcome.push_status,
+            'commit': outcome.merge_sha,
         }
         if outcome.failure_diagnostic is not None:
             result['failure_diagnostic'] = outcome.failure_diagnostic
