@@ -276,3 +276,48 @@ class TestCharge:
         state = _load_state(sp)
         rem = _cap_remaining(state, 3, self._NOW)
         assert rem == 1
+
+
+# ---------------------------------------------------------------------------
+# step-7: concurrency — two concurrent charge calls must serialize
+# ---------------------------------------------------------------------------
+
+class TestChargeConcurrency:
+    """Two threads racing on cap=1 must not both succeed."""
+
+    def test_only_one_charge_wins(self, tmp_path):
+        import threading
+        from orchestrator.b3_gate import _load_state, _state_path, charge
+
+        sp = _state_path(tmp_path)
+        # Ensure state file exists before threads start (avoids mkdir race)
+        from orchestrator.b3_gate import _save_state
+        _save_state(sp, {'launches': [], 'charges': []})
+
+        now = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()  # Both threads release simultaneously
+            r = charge('42', state_path=sp, cap=1, now=now)
+            results.append(r)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert len(results) == 2
+        charged = [r for r in results if r['charged']]
+        refused = [r for r in results if not r['charged']]
+        assert len(charged) == 1, f'expected exactly 1 charged, got {results}'
+        assert len(refused) == 1, f'expected exactly 1 refused, got {results}'
+
+        # Persisted state must have exactly one in-window charge
+        state = _load_state(sp)
+        assert len(state['charges']) == 1, (
+            f'expected exactly 1 persisted charge, got {state["charges"]}'
+        )
