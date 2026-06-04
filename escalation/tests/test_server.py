@@ -1264,3 +1264,37 @@ class TestMergeRequestDedup:
         assert not registry.is_inflight('Y'), (
             'Registry slot should be released after merge completes'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
+# ---------------------------------------------------------------------------
+
+
+async def _call_get_merge_queue(server) -> dict[str, Any]:
+    """Invoke the get_merge_queue MCP tool directly (sync tool)."""
+    tool = await server.get_tool('get_merge_queue')
+    return tool.fn()
+
+
+@pytest.mark.asyncio
+class TestGetMergeQueue:
+    """Tests for the get_merge_queue escalation MCP tool."""
+
+    def _make_orch_config(self, tmp_path: Path):
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        return OrchestratorConfig(project_root=tmp_path)
+
+    # ── step-1: standalone error ──────────────────────────────────────────
+
+    async def test_standalone_returns_error(self, tmp_path: Path):
+        """get_merge_queue with no merge_queue returns an error dict, no exception."""
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)  # NO merge_queue — standalone
+
+        result = await _call_get_merge_queue(server)
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert 'error' in result, f'Expected error key, got: {result}'

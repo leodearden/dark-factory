@@ -738,6 +738,26 @@ def create_server(
         return harness.get_merge_halt_status()
 
     @mcp.tool()
+    def get_merge_queue() -> dict[str, Any]:
+        """Return a live read-only snapshot of the merge worker's queue/pipeline state.
+
+        Shows all in-flight and queued merge requests: entries that are queued
+        (waiting for the merger), merging (merger is building a merge commit),
+        awaiting_verify (waiting in the verifier queue), verifying (active
+        verification), gate_reverify (re-verifying after a rebase), or
+        finalizing (CAS-advancing main).
+
+        This snapshot captures the blind spot missed by runs.db-events: a
+        genuinely-queued entry with no _merge-* worktree and no merge events.
+        """
+        if merge_queue is None:
+            return {'error': 'Merge queue not available — orchestrator not running'}
+        worker = getattr(harness, '_merge_worker', None)
+        if worker is None or not hasattr(worker, 'snapshot'):
+            return {'error': 'Merge worker not available'}
+        return worker.snapshot()
+
+    @mcp.tool()
     async def resume_scheduler(reason: str) -> dict[str, Any]:
         """Resume a paused orchestrator scheduler in-process (no restart).
 
