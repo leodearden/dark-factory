@@ -17,15 +17,12 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,8 +121,6 @@ class TestVerifyDebugfixLoopInheritedBreak:
           - _failure_signature_history is NOT appended (length stays 0)
           - _inherited_break_info is populated with category and fingerprint
         """
-        import orchestrator.verify as verify_module
-
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
@@ -147,7 +142,7 @@ class TestVerifyDebugfixLoopInheritedBreak:
         assert outcome == WorkflowOutcome.BLOCKED, (
             f'Expected BLOCKED when break is inherited; got {outcome}'
         )
-        workflow._invoke.assert_not_called()  # debugger must NOT run
+        workflow._invoke.assert_not_called()  # type: ignore[union-attr]  # debugger must NOT run
         assert len(workflow._failure_signature_history) == 0, (
             'Signature history must not be advanced for inherited failures '
             f'(actual: {workflow._failure_signature_history})'
@@ -179,10 +174,6 @@ class TestVerifyDebugfixLoopNonInheritedPaths:
         category: str = 'compile_error',
     ) -> tuple[WorkflowOutcome, MagicMock, MagicMock]:
         """Run one loop iteration, return (outcome, helper_spy, invoke_spy)."""
-        import orchestrator.verify as verify_module
-
-        from orchestrator.agents.invoke import AgentResult
-
         config = _make_config(tmp_path, escalate_preexisting=flag_on)
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
@@ -218,7 +209,7 @@ class TestVerifyDebugfixLoopNonInheritedPaths:
                 return await workflow._verify_debugfix_loop()
 
         outcome = asyncio.run(_run_loop())
-        return outcome, helper_spy, workflow._invoke
+        return outcome, helper_spy, workflow._invoke  # type: ignore[return-value]
 
     def test_helper_false_debugger_is_called_and_history_advances(
         self, tmp_path: Path,
@@ -291,7 +282,7 @@ class TestVerifyDebugfixLoopSiblingFix:
         assert workflow._inherited_break_info is None, (
             '_inherited_break_info must stay None when verify passes'
         )
-        workflow._invoke.assert_not_called()  # debugger must not run
+        workflow._invoke.assert_not_called()  # type: ignore[union-attr]  # debugger must not run
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +319,7 @@ class TestInheritedBreakEscalationFiling:
             # The call site will read _inherited_break_info and pass dedupe_fingerprint
             # to _mark_blocked.  Until step-14 wires this, _mark_blocked lacks the param.
             return await workflow._mark_blocked(
-                f'Verify failure is preexisting on main (category=\'compile_error\'): ...',
+                "Verify failure is preexisting on main (category='compile_error'): ...",
                 detail='type error detail',
                 category='preexisting_main_break',
                 suggested_action='await_preexisting_main_hotfix',
