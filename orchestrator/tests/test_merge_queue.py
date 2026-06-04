@@ -10290,3 +10290,68 @@ class TestRegisterAndEnqueue:
 
         # merge_finalized row must exist in the event store
         assert _count_events(event_store.db_path, 'merge_finalized') == 1
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-1 RED: _InFlightEntry.request_id + MergeDispatchResult.inflight_request_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightRegistryRequestId:
+    """β1 step-1 RED: InFlightMergeRegistry tracks request_id; coalesce surfaces it.
+
+    Tests are RED until step-2 impl:
+    - acquire() does not yet accept a request_id keyword argument (TypeError)
+    - _InFlightEntry has no request_id field (AttributeError)
+    - MergeDispatchResult has no inflight_request_id attribute (AttributeError)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_acquire_with_request_id_stores_it(self):
+        """(a) acquire(..., request_id='mr-x') → entry.request_id == 'mr-x'."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('X', 'task-X', fut, request_id='mr-x')
+
+        entry = registry.entry('X')
+        assert entry is not None
+        assert entry.request_id == 'mr-x'
+
+    async def test_acquire_without_request_id_is_none(self):
+        """(b) acquire(branch, task_id, future) without request_id → entry.request_id is None.
+
+        Back-compat: the existing 3-arg positional call still works unchanged.
+        """
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        registry.acquire('Y', 'task-Y', fut)
+
+        entry = registry.entry('Y')
+        assert entry is not None
+        assert entry.request_id is None
+
+    async def test_coalesce_surfaces_inflight_request_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) Second coalesce returns inflight_request_id == first req's request_id."""
+        from orchestrator.merge_queue import MergeDispatchResult  # noqa: F401
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        req1 = _make_request('C', 'branchC', tmp_path, config)
+        req2 = _make_request('C', 'branchC', tmp_path, config)
+
+        await coalesce_or_enqueue_merge_request(
+            queue, req1, None, registry, git_ops=None,
+        )
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, None, registry, git_ops=None,
+        )
+
+        assert result2.in_flight is True
+        assert result2.inflight_request_id == req1.request_id
