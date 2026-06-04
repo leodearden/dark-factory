@@ -394,3 +394,97 @@ class TestThresholdTrip:
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'Expected a WARNING record for threshold trip'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-9 / Step-10: Born-at-L2 dedup + human reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDedupAndHumanReset:
+    """Dedup prevents double-filing; clearing the guard allows the loop to resume."""
+
+    async def test_second_withhold_does_not_file_duplicate_l2(
+        self, harness: Harness
+    ):
+        """(a) Dedup: with a pending L2 already existing for this task, no second L2 filed.
+
+        Configure mock queue with find_pending_l2_by_root_cause returning an existing
+        id (simulating a pending L2), then drive a second withhold and assert NO
+        second escalation is submitted.
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        sig = Harness._reblock_signature(esc)
+        root_cause = f'reblock-guard:{task_id}'
+
+        # Queue already has a pending L2 with this root_cause
+        q = _make_mock_queue(pending_l2_root_cause='esc-42-L2-1')
+        harness._escalation_queue = q
+
+        # Seed: count=3 (at threshold)
+        _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # No second L2 should be submitted
+        assert len(q._submitted) == 0, (
+            f'Expected 0 new L2 submissions (dedup), got {len(q._submitted)}'
+        )
+
+    async def test_human_reset_allows_loop_to_resume(self, harness: Harness):
+        """(b) Human reset: clearing reblock_guard from metadata → next flip proceeds.
+
+        Seed metadata with no reblock_guard (simulating human clearance) and
+        drive a flip with the previously-tripping signature. Assert:
+        - persisted reblock_guard becomes {count: 1}
+        - set_task_status('pending') is called (loop resumes)
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+
+        # No queue (no L2 should be filed — this is just a normal flip)
+        harness._escalation_queue = None
+
+        # Seed: no reblock_guard (human cleared it)
+        persisted_metadata, call_order = _make_fake_scheduler(
+            harness,
+            initial_metadata={},
+        )
+        set_status_calls: list = []
+        original_set = harness.scheduler.set_task_status
+
+        async def recording_set(tid, status, **kw):
+            set_status_calls.append(status)
+            await original_set(tid, status, **kw)
+
+        harness.scheduler.set_task_status = recording_set
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        guard = persisted_metadata.get('reblock_guard')
+        assert guard is not None, 'reblock_guard should be persisted'
+        assert guard['count'] == 1, (
+            f'Expected count=1 (reset after human clear), got {guard["count"]}'
+        )
+
+        # Flip must proceed
+        assert 'pending' in set_status_calls, (
+            'set_task_status(pending) should be called after human reset'
+        )
