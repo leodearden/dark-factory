@@ -3478,6 +3478,167 @@ class TestSpeculativeMergeWorker:
             'set by OOB delivery; verifier must not overwrite it'
         )
 
+    # ── Regression-guard (γ3 step-7 / task-1644) ─────────────────────────────
+
+    async def test_train_not_oob_delivered(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Property 4 (trains): GroupMergeRequest must ride the FIFO, never OOB.
+
+        Drive _merger_loop() with a GroupMergeRequest.  _do_train_merge is
+        patched to return 'done'.  After the loop:
+        - req.result must still be PENDING (merger must not resolve it)
+        - The enqueued SpeculativeItem must have already_delivered=False
+        - The item's immediate_outcome.status must be 'done'
+        """
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id='tr-excl',
+            branch='tr-excl',
+            worktree=git_ops.project_root,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-excl',
+            member_task_ids=['tr-excl'],
+            tip_branch='tr-excl',
+            tip_task_id='tr-excl',
+            status_check=AsyncMock(),
+            mark_member_done=AsyncMock(),
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        done_outcome = MergeOutcome('done', merge_sha='a' * 40)
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=done_outcome),
+        ):
+            await worker._merger_loop()
+
+        assert not req.result.done(), (
+            'Train (GroupMergeRequest) must NOT be OOB-delivered — '
+            'its result must still be PENDING after _merger_loop. '
+            'Trains must resolve through the verifier FIFO (invariant e).'
+        )
+        item = worker._verifier_queue.get_nowait()
+        assert item is not None
+        assert item.already_delivered is False, (
+            'Train SpeculativeItem must have already_delivered=False '
+            '(verifier owns resolution for all train outcomes)'
+        )
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'done', (
+            f'immediate_outcome.status must be done, got: {item.immediate_outcome.status!r}'
+        )
+
+    async def test_oob_conflict_emits_terminal_event(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Property 3 (event): OOB conflict delivery leaves merge_attempt 'conflict'
+        as the latest merge-phase event — no trailing merge_dequeued phantom.
+
+        Run a non-speculative conflicting request through worker.run() with an
+        EventStore.  Assert the terminal merge_attempt 'conflict' event is
+        emitted and is the last merge-phase event row for the task.
+        """
+        db_path = tmp_path / 'events_oob_cfl.db'
+        event_store = EventStore(db_path=db_path, run_id='oob-evt-run')
+
+        wt = (await git_ops.create_worktree('oob-evt-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main evt side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main oob-evt side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch evt side\n')
+        await git_ops.commit(wt, 'Branch oob-evt conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('oob-evt-cfl', 'oob-evt-cfl', wt, config)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+        assert outcome.status == 'conflict'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') "
+            "FROM events WHERE task_id = 'oob-evt-cfl' ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        assert ('merge_attempt', 'conflict') in rows, f'rows={rows}'
+        assert rows[-1] == ('merge_attempt', 'conflict'), (
+            f'merge_attempt conflict must be the latest event (no trailing phantom): {rows}'
+        )
+
+    async def test_oob_conflict_resolves_attached_peer_waiter(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Multi-waiter fan-out: OOB delivery resolves the primary and all peers.
+
+        Wire a real InFlightMergeRegistry: acquire(branch, req.result) installs
+        the _mirror done-callbacks via attach().  When _oob_deliver sets
+        req.result, the γ1 mirror fan-out propagates the outcome to the peer
+        future immediately (no verifier involvement).
+
+        Asserts both the primary future and the attached peer future resolve to
+        status 'conflict'.
+        """
+        from orchestrator.merge_queue import WaiterRecord
+
+        wt = (await git_ops.create_worktree('mw-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main mw side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main mw side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch mw side\n')
+        await git_ops.commit(wt, 'Branch mw conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('mw-cfl', 'mw-cfl', wt, config)
+
+        # Register in a real registry and attach a peer waiter.
+        # req.result IS the primary_future; attach() installs _mirror callbacks on it.
+        registry = InFlightMergeRegistry()
+        registry.acquire('mw-cfl', 'mw-cfl', req.result, request_id='mr-mw-1')
+        peer_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        registry.attach('mw-cfl', WaiterRecord(
+            request_id='mr-mw-2', future=peer_future, source='mcp',
+        ))
+
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+        await worker._merger_loop()
+
+        # Allow done-callbacks to fire.
+        await asyncio.sleep(0)
+
+        assert req.result.done(), 'primary future must be resolved by OOB delivery'
+        assert req.result.result().status == 'conflict', (
+            f'primary: expected conflict, got {req.result.result().status!r}'
+        )
+        assert peer_future.done(), (
+            'peer future must be resolved via γ1 _mirror fan-out '
+            '(OOB delivery sets req.result → done-callbacks fire → peer resolved)'
+        )
+        assert peer_future.result().status == 'conflict', (
+            f'peer: expected conflict, got {peer_future.result().status!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
