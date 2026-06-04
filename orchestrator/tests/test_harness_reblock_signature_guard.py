@@ -666,3 +666,207 @@ class TestMetadataClobberBoundary:
         assert meta['memory_hints'] == ['hint1', 'hint2'], (
             f"'memory_hints' value corrupted: {meta['memory_hints']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3a: Orphan/direct re-pend branch exercises the same guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOrphanBranchGuard:
+    """Guard is exercised identically via the orphan/direct re-pend branch.
+
+    The orphan path in _on_escalation_resolved fires when:
+      - escalation.level >= 1
+      - resolved_by does NOT start with 'l2-cascade:'
+      - escalation.task_id NOT in _escalation_events
+
+    Both the l2-cascade and orphan paths call _cascade_unblock_member, so
+    the guard must behave identically regardless of which branch delivered
+    the escalation.
+    """
+
+    async def test_orphan_branch_increments_counter_and_proceeds(
+        self, harness: Harness
+    ):
+        """Orphan escalation (not l2-cascade) increments guard and flips to pending."""
+        task_id = '42'
+        # resolved_by does NOT start with 'l2-cascade:' → orphan/direct path
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='operator',      # orphan — not a cascade member
+            level=1,
+        )
+        expected_sig = Harness._reblock_signature(esc)
+
+        # task_id must not be in _escalation_events (orphan condition)
+        assert task_id not in harness._escalation_events
+
+        persisted_metadata, call_order = _make_fake_scheduler(harness)
+        set_status_calls: list[str] = []
+        original_set = harness.scheduler.set_task_status
+
+        async def spy_set(tid, status, **kw):
+            set_status_calls.append(status)
+            await original_set(tid, status, **kw)
+
+        harness.scheduler.set_task_status = spy_set
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Counter persisted with count=1
+        guard = persisted_metadata.get('reblock_guard')
+        assert guard is not None, 'orphan path: reblock_guard not persisted'
+        assert guard['count'] == 1, (
+            f'orphan path: expected count=1, got {guard["count"]}'
+        )
+        assert guard['signature'] == expected_sig
+
+        # Flip must proceed
+        assert 'pending' in set_status_calls, (
+            'orphan path: set_task_status(pending) should have been called'
+        )
+
+    async def test_orphan_branch_withholds_at_threshold(
+        self, harness: Harness, caplog
+    ):
+        """Orphan escalation is withheld at threshold just like cascade path."""
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='sweep-watcher',  # not l2-cascade → orphan path
+            level=1,
+        )
+        sig = Harness._reblock_signature(esc)
+
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+
+        # Seed: count=3 (at threshold)
+        _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+        set_status_calls: list = []
+
+        async def spy_set(tid, status, **kw):
+            set_status_calls.append(status)
+
+        harness.scheduler.set_task_status = spy_set
+
+        with caplog.at_level(logging.WARNING):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        # Flip must be withheld
+        assert set_status_calls == [], (
+            f'orphan path: flip should be withheld at threshold; got {set_status_calls}'
+        )
+        # L2 must be filed
+        assert len(q._submitted) == 1, (
+            f'orphan path: expected 1 L2 submitted, got {len(q._submitted)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3b: Corrupt-metadata robustness (non-dict reblock_guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCorruptMetadataRobustness:
+    """A corrupt (non-dict) reblock_guard degrades gracefully — no AttributeError.
+
+    If metadata.reblock_guard is a truthy non-dict value (e.g. a string from
+    a bad write or manual edit), the guard must treat it as absent (count=0)
+    rather than propagating an AttributeError that would abort the flip path.
+    """
+
+    async def test_string_reblock_guard_resets_to_count_1_and_proceeds(
+        self, harness: Harness
+    ):
+        """Non-dict reblock_guard value → treated as absent → count resets to 1."""
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+
+        # Seed a corrupt string value for reblock_guard
+        persisted_metadata, call_order = _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': 'corrupt-string-value'},
+        )
+        set_status_calls: list[str] = []
+        original_set = harness.scheduler.set_task_status
+
+        async def spy_set(tid, status, **kw):
+            set_status_calls.append(status)
+            await original_set(tid, status, **kw)
+
+        harness.scheduler.set_task_status = spy_set
+
+        # Must not raise; should proceed with count=1
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        guard = persisted_metadata.get('reblock_guard')
+        assert guard is not None, 'reblock_guard should be re-persisted after corrupt value'
+        assert isinstance(guard, dict), (
+            f'Expected dict, got {type(guard).__name__}: {guard!r}'
+        )
+        assert guard['count'] == 1, (
+            f'Corrupt guard should reset to count=1, got {guard["count"]}'
+        )
+
+        # Flip must proceed (corrupt counter = absent = start from 0)
+        assert 'pending' in set_status_calls, (
+            'Flip should proceed when guard was corrupt (treated as absent)'
+        )
+
+    async def test_integer_reblock_guard_resets_and_proceeds(
+        self, harness: Harness
+    ):
+        """An integer (not a dict) reblock_guard is also treated as absent."""
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='task_failure',
+            summary='worker crashed',
+            resolved_by='l2-cascade:esc-200-1',
+        )
+
+        persisted_metadata, _ = _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': 99},  # integer, not a dict
+        )
+        set_status_calls: list[str] = []
+        original_set = harness.scheduler.set_task_status
+
+        async def spy_set(tid, status, **kw):
+            set_status_calls.append(status)
+            await original_set(tid, status, **kw)
+
+        harness.scheduler.set_task_status = spy_set
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        guard = persisted_metadata.get('reblock_guard')
+        assert isinstance(guard, dict), (
+            f'Guard should be reset to a dict; got {type(guard).__name__}: {guard!r}'
+        )
+        assert guard['count'] == 1, (
+            f'Integer guard should reset to count=1, got {guard["count"]}'
+        )
+        assert 'pending' in set_status_calls, (
+            'Flip should proceed when guard was a plain integer (treated as absent)'
+        )

@@ -4524,7 +4524,13 @@ Output JSON matching the schema. Every task must appear in the output.
         task = await self.scheduler.get_task(task_id)
         metadata = (task or {}).get('metadata') or {}
         try:
-            guard = metadata.get('reblock_guard') or {}
+            guard = metadata.get('reblock_guard')
+            # Validate shape: a corrupt/non-dict truthy value (e.g. a string
+            # from a bad write or manual edit) would raise AttributeError on
+            # guard.get(...).  Degrade gracefully to an empty dict so the guard
+            # resets to count 0 rather than aborting the flip entirely.
+            if not isinstance(guard, dict):
+                guard = {}
             prev_count = int(guard.get('count') or 0)
             prev_signature = guard.get('signature')
         except (TypeError, ValueError):
@@ -4532,6 +4538,18 @@ Output JSON matching the schema. Every task must appear in the output.
             prev_signature = None
 
         same_sig = (prev_signature is not None and prev_signature == new_sig)
+
+        # NOTE on cumulative counting (C5, intentional): the counter is NEVER
+        # automatically cleared when the task makes progress (e.g. moves to
+        # in-progress or done and later gets re-blocked).  Only two paths reset
+        # it: (a) a human explicitly clears metadata.reblock_guard — an absent
+        # or non-dict guard reads as count 0, starting fresh; or (b) the
+        # escalation signature changes (different category or substantially
+        # different summary), which resets count to 1 and proceeds.
+        # This cumulative behaviour is intentional: repeated failures with an
+        # identical signature are considered pathologically repetitive regardless
+        # of intervening progress.  An operator who has genuinely fixed the root
+        # cause should clear the guard to signal "new slate".
 
         # Threshold check (check-before-flip ordering — see design decision):
         # same-sig AND prev_count >= threshold → withhold + file L2.
