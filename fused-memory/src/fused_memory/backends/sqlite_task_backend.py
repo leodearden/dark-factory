@@ -166,8 +166,9 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     """One-shot idempotent migration: parent_id schema → flat schema.
 
     Gated on ``PRAGMA user_version``.  When < _SCHEMA_VERSION AND tasks still
-    has a ``parent_id`` column: cancel straggler subtask rows, rebuild all
-    three tables without parent_id, set user_version = 1.  If parent_id is
+    has a ``parent_id`` column: rebuild all three tables without parent_id
+    (straggler subtask rows with parent_id != 0 are silently dropped — by
+    soak + DF-B there are none), set user_version = 1.  If parent_id is
     already absent (fresh DB opened with the new _SCHEMA_SQL), just stamps
     the version.  Skipped entirely when user_version >= _SCHEMA_VERSION.
     """
@@ -183,10 +184,10 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         return
 
     # Full rebuild: parent_id column is still present in all three tables.
+    # Rows with parent_id != 0 (straggler subtasks) are dropped by the
+    # INSERT...SELECT WHERE parent_id = 0 — no prior cancellation needed.
     await conn.executescript(f"""
         BEGIN;
-        UPDATE tasks SET status = 'cancelled'
-            WHERE parent_id != 0 AND status NOT IN ('done', 'cancelled');
 
         CREATE TABLE tasks_new (
             tag           TEXT NOT NULL DEFAULT 'master',
