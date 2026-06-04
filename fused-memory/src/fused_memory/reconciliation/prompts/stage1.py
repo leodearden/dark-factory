@@ -143,7 +143,14 @@ timestamps embed nearly identically, causing summaries to be silently dropped \
 (`memory_ids=[]`) in confirmed recurrences (run 899d2dad, summary 1ad1d2f5; task 1574, \
 same pathology as Stage 2 task 1572). \
 Both tokens are required: the nonce supplies structural entropy; the ISO timestamp \
-provides human-readable temporal context.
+provides human-readable temporal context. \
+In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>}}` on the \
+`add_memory` call that writes the per-cycle summary, where `<run_id>` is the exact \
+`run_id` value from the payload context (the same run_id embedded in the content). \
+This mirrors Stage 2's cycle-summary metadata convention \
+(`stage='task_knowledge_sync'`, fixed in task 9af436fe) and makes the summary \
+deterministically findable by a metadata-keyed lookup. \
+The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string.
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
