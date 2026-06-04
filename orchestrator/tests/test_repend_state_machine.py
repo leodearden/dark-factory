@@ -27,16 +27,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
-from orchestrator.harness import Harness
-from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, _is_gating_escalation
 
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path.
 from test_harness_action_dispatch import (
@@ -57,6 +50,13 @@ from test_workflow_e2e import (
     _build_workflow_with_escalation,
     _init_repo,
 )
+
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
+from orchestrator.harness import Harness
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import WorkflowOutcome, _is_gating_escalation
 
 # ---------------------------------------------------------------------------
 # B-row coverage set — step-8 verifies all 15 are tagged.
@@ -309,7 +309,8 @@ class TestEscalationServerSeamB9B13:
 
         # resolve_issue is a sync def — call tool.fn() directly (no await).
         tool = await server.get_tool('resolve_issue')
-        result = tool.fn(
+        assert tool is not None
+        result = tool.fn(  # type: ignore[union-attr]
             escalation_id=esc.id,
             resolution='attempt to use removed parameter',
             terminate=True,
@@ -340,9 +341,10 @@ class TestEscalationServerSeamB9B13:
         WARNING logged (C4/D3 downgrade)."""
         server, queue = make_escalation_server(tmp_path)
         tool = await server.get_tool('escalate_blocker')
+        assert tool is not None
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await tool.fn(
+            result = await tool.fn(  # type: ignore[union-attr]
                 task_id='task-b13-dg',
                 agent_role='implementer',
                 severity='critical',
@@ -372,8 +374,9 @@ class TestEscalationServerSeamB9B13:
         record keeps severity='critical' and level==2 (no downgrade)."""
         server, queue = make_escalation_server(tmp_path)
         tool = await server.get_tool('escalate_blocker')
+        assert tool is not None
 
-        result = await tool.fn(
+        result = await tool.fn(  # type: ignore[union-attr]
             task_id='task-b13-sentinel',
             agent_role='harness-stranded-blocked-reaper',
             severity='critical',
@@ -733,11 +736,11 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):  # noqa: F841
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
-        harness.scheduler.set_task_status = spy_set
+        harness.scheduler.set_task_status = spy_set  # type: ignore[method-assign]
 
         with caplog.at_level(logging.WARNING):
             harness._on_escalation_resolved(esc)
@@ -802,11 +805,11 @@ class TestReblockGuardB11B12:
         set_status_calls: list = []
         original_set = harness.scheduler.set_task_status
 
-        async def spy_set(tid, status, **kw):
+        async def spy_set(task_id, status, **kw):  # noqa: F841
             set_status_calls.append(status)
-            await original_set(tid, status, **kw)
+            await original_set(task_id, status, **kw)
 
-        harness.scheduler.set_task_status = spy_set
+        harness.scheduler.set_task_status = spy_set  # type: ignore[method-assign]
 
         harness._on_escalation_resolved(new_esc)
         await asyncio.gather(*list(harness._background_tasks))
@@ -836,8 +839,6 @@ class TestReblockGuardB11B12:
             summary='disk full',
             resolved_by='l2-cascade:esc-100-1',
         )
-        expected_sig = Harness._reblock_signature(esc)
-
         task_state, _ = _make_clobber_fake_scheduler(
             harness,
             initial_metadata={
@@ -977,7 +978,6 @@ class TestStrandedSweepB10B15:
 
 def test_all_b_rows_covered():
     """Verify all 15 B-row tags (B1–B15) appear as docstring markers in this module."""
-    import ast
     import inspect
 
     source = inspect.getsource(
