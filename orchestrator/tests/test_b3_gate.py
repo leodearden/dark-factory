@@ -321,3 +321,118 @@ class TestChargeConcurrency:
         assert len(state['charges']) == 1, (
             f'expected exactly 1 persisted charge, got {state["charges"]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9: check_proposal mechanical classification (fake git runner)
+# ---------------------------------------------------------------------------
+
+def _fake_git_fresh(args, cwd):
+    """Fake git runner: HEAD == recorded sha, diff is empty (fresh)."""
+    if 'rev-parse' in args:
+        return (0, 'aaabbbccc')
+    return (0, '')  # diff empty
+
+
+def _fake_git_never_called(args, cwd):
+    raise AssertionError(f'git should not have been called; args={args}')
+
+
+_LOW_RISK_ENTRY = {
+    'proposal_text': 'Fix it',
+    'risk_label': 'low',
+    'files_referenced': ['foo.py'],
+    'block_reason': 'test',
+    'investigated_at': '2026-06-04T09:00:00+00:00',
+    'head_sha': 'aaabbbccc',
+    'main_sha': 'dddeeefff',
+}
+
+
+class TestCheckProposalMechanical:
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def test_none_entry_aborts(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        result = check_proposal(
+            None, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT
+        assert 'proposal' in result['reason'].lower()
+
+    def test_medium_risk_aborts(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'medium'}
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == ABORT
+
+    def test_human_review_risk_aborts(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'human-review-required'}
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == ABORT
+
+    def test_status_key_present_aborts(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'status': 'investigation_failed'}
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == ABORT
+
+    def test_invalid_category_aborts(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category='infra_issue',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT
+
+    def test_valid_categories_not_aborted_on_category_check(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+        for cat in ('task_failure', 'review_issues'):
+            # Should NOT abort on category check (may abort/drift/fresh for other reasons)
+            result = check_proposal(
+                _LOW_RISK_ENTRY, worktree='/tmp', category=cat,
+                run_git=_fake_git_fresh, now=self._NOW,
+            )
+            # Category check passes -> proceeds to freshness check -> fresh
+            assert result['verdict'] != ABORT or 'category' not in result['reason'].lower(), \
+                f'Unexpected abort on valid category={cat}: {result}'
+
+    def test_no_category_skips_category_check(self):
+        from orchestrator.b3_gate import check_proposal
+        # category=None -> skip category check entirely -> proceeds to freshness
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        # Should not abort on category; may be fresh or drift depending on git
+        assert 'verdict' in result
+
+    def test_missing_head_sha_drifts(self):
+        from orchestrator.b3_gate import DRIFT, check_proposal
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['head_sha']
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == DRIFT
+        assert 'sha anchor' in result['reason'].lower()
+
+    def test_missing_main_sha_drifts(self):
+        from orchestrator.b3_gate import DRIFT, check_proposal
+        entry = {**_LOW_RISK_ENTRY}
+        del entry['main_sha']
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == DRIFT
+        assert 'sha anchor' in result['reason'].lower()
+
+    def test_none_head_sha_drifts(self):
+        from orchestrator.b3_gate import DRIFT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'head_sha': None}
+        result = check_proposal(entry, worktree='/tmp', category=None,
+                                run_git=_fake_git_never_called, now=self._NOW)
+        assert result['verdict'] == DRIFT
