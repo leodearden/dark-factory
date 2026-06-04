@@ -72,7 +72,8 @@ The background task's completion is a reliable signal that the spawned session h
 |-----------|---------|
 | `0..125`  | The spawned `claude` session's own exit code |
 | `126`     | No terminal emulator found — prompt the user for `$CLAUDE_TERMINAL_CMD` and retry. Suggest they export it in their shell profile for future sessions. |
-| `127`     | Launcher failed (e.g. emulator binary errored before opening a window). Surface the error to the caller. |
+| `127`     | Launcher failed to start the session (the emulator binary errored before running the payload — no sentinel was ever written). Surface the error to the caller. |
+| `129`     | Terminal window closed while the session was still alive (SIGHUP reached the running session). The session may or may not have completed its work; treat as inconclusive, not as a launcher failure. |
 | `2`       | Bad usage — caller bug, not user-recoverable. |
 
 If you want to confirm the spawned session is alive mid-run, `ps -ef | grep claude` works. The background task itself is the canonical liveness signal — don't poll it via `TaskGet` in tight loops; just wait for its completion notification.
