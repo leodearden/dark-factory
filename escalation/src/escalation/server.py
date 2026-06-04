@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 # A prefix check is forward-compatible: new harness sentinels are auto-exempt.
 _HARNESS_SENTINEL_ROLE_PREFIXES = ('harness-', 'orchestrator-')
 
+# Maximum number of seconds the server will block waiting for a merge outcome.
+# Callers may pass a larger wait_secs value; the server silently clamps it to
+# this limit so MCP framework timeouts (≈120 s) are never breached.
+# Tests monkeypatch this constant to a tiny value (e.g. 0.1) to exercise the
+# clamp+timeout branch in milliseconds.
+_MAX_WAIT_SECS: int | float = 100
+
 
 def _is_harness_sentinel_role(agent_role: str) -> bool:
     """Return True if *agent_role* belongs to the harness sentinel namespace.
@@ -127,6 +134,13 @@ def create_server(
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
+
+    # Server-side durable-intent waiter store (β1 D2/I5).
+    # Keyed by request_id; each entry is a WaiterRecord holding the shielded
+    # future.  Cleaned up automatically via future.add_done_callback when the
+    # entry resolves or is cancelled.  β2 (merge_cancel) looks up entries here
+    # to cancel a specific in-flight request by id.
+    _waiters: dict[str, Any] = {}
 
     # --- Shared submit/dedupe helper ---
 
@@ -657,11 +671,28 @@ def create_server(
         branch: str,
         worktree: str,
         description: str = '',
+        wait_secs: int | None = None,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
         Use this instead of directly merging into main.  The merge worker
         handles verification, conflict detection, and atomic ref advancement.
+
+        *wait_secs* controls how long the call blocks:
+        - ``None`` (default — legacy compat): block indefinitely until the
+          merge completes; coalesced branch returns ``status='in_flight'``.
+          The legacy path is retained during the compat ladder (β1–β7).
+          ``'in_flight'`` is a deprecated alias whose removal is scheduled
+          for β8 (Open Q5).
+        - ``0``: return immediately — dispatched branch returns
+          ``status='queued'``; coalesced branch returns ``status='attached'``.
+          Shape: ``{status, request_id, snapshot_tip, generation, position,
+          queue_depth, eta_seconds}``.
+        - ``>0``: server-clamped to ``≤_MAX_WAIT_SECS`` (100 s); bounded
+          wait via ``asyncio.wait_for(asyncio.shield(future), clamp)``.
+          Resolves within clamp → terminal outcome shape.
+          Timeout → non-terminal ``status='queued'`` shape (shield ensures
+          expiry never cancels the entry's future).
 
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
@@ -673,11 +704,12 @@ def create_server(
           repo's escalation MCP; check that the branch belongs here.
           ``request_id`` is the stable per-entry identity of this request
           (e.g. ``'mr-a1b2c3d4'``).
-        - Already in flight: ``{status='in_flight', request_id, branch,
-          inflight_task_id, eta_seconds, reason, conflict_details=None,
-          push_status=None}``.  A merge for *branch* is already running;
-          the caller should poll rather than re-queuing.  ``eta_seconds`` is
-          a best-effort hint (``None`` once the estimate window is exceeded).
+        - Already in flight (legacy, wait_secs=None): ``{status='in_flight',
+          request_id, branch, inflight_task_id, eta_seconds, reason,
+          conflict_details=None, push_status=None}``.
+        - Queued / attached (wait_secs not None): ``{status='queued'|'attached',
+          request_id, snapshot_tip, generation, position, queue_depth,
+          eta_seconds}``.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main (fast-path — no enqueue, no request_id)
@@ -699,6 +731,7 @@ def create_server(
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
+            WaiterRecord,
             coalesce_or_enqueue_merge_request,
         )
 
@@ -717,18 +750,20 @@ def create_server(
         # (tip=None) falls through to the normal enqueue so the worker still
         # emits its unknown_branch outcome, preserving existing semantics.
         # git_ops=None (standalone) skips the fast-path entirely.
+        # The resolved tip is also stored as merge_req.snapshot_tip (β1 D8).
+        resolved_tip: str | None = None
         if git_ops_for_scan is not None:
             full_branch = f'{orch_config.git.branch_prefix}{branch}'
-            tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
-            if tip is not None and await git_ops_for_scan.is_ancestor(
-                tip, orch_config.git.main_branch
+            resolved_tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
+            if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
+                resolved_tip, orch_config.git.main_branch
             ):
                 # Shape converged with worker-path already_merged (suggestion 1).
                 # request_id is absent: the fast-path short-circuits before any
                 # MergeRequest entry is constructed (no entry → no id).
                 return {
                     'status': 'already_merged',
-                    'commit': tip,
+                    'commit': resolved_tip,
                     'reason': '',
                     'conflict_details': '',
                     'push_status': None,
@@ -748,6 +783,7 @@ def create_server(
             module_configs=module_configs,
             config=orch_config,
             result=future,
+            snapshot_tip=resolved_tip,
         )
 
         # De-dup gate: consults the in-memory registry (and optionally the on-disk
@@ -763,32 +799,100 @@ def create_server(
             git_ops=git_ops_for_scan,
         )
 
-        if dispatch.in_flight:
-            # Branch already being merged — return in_flight immediately so the
-            # caller can poll rather than block.  ETA is a best-effort heuristic
-            # (None once the estimate window is exceeded).
-            # conflict_details / push_status are included with None for shape
-            # stability: callers that access result['conflict_details'] or
-            # result['push_status'] must not KeyError on a coalesced response.
-            # request_id is the D8 SUBSTRATE: the SUBMITTING request's own id.
-            # β1 re-sources this to the in-flight entry's request_id and renames
-            # status to 'attached'; inflight_task_id remains the authoritative
-            # poll handle (merge_status accepts task_id per D10) in the interim.
+        def _nonblocking_state_response(
+            status: str,
+            req: Any,
+            req_id_override: str | None = None,
+        ) -> dict[str, Any]:
+            """Build the non-blocking state response shape (§7.1).
+
+            Used by both wait_secs==0 and the wait_secs>0 TimeoutError branch.
+            position/queue_depth come from the live worker snapshot matched by
+            request_id; falls back to merge_queue.qsize() when no worker is
+            reachable (standalone / unit tests that wire a bare asyncio.Queue).
+            eta_seconds from the in-flight registry; generation is always 0 in β1.
+            """
+            request_id_val = req_id_override if req_id_override is not None else req.request_id
+            worker = getattr(harness, '_merge_worker', None)
+            position: int = 0
+            queue_depth: int = merge_queue.qsize()  # type: ignore[union-attr]
+            if worker is not None:
+                try:
+                    snap = worker.snapshot()
+                    entries = snap.get('entries', [])
+                    queue_depth = snap.get('depth', len(entries))
+                    for i, e in enumerate(entries):
+                        if e.get('request_id') == req.request_id:
+                            position = i
+                            break
+                    else:
+                        position = max(0, queue_depth - 1)
+                except Exception:
+                    pass
+            else:
+                # No live worker: use qsize as depth; position is last slot.
+                queue_depth = merge_queue.qsize()  # type: ignore[union-attr]
+                position = max(0, queue_depth - 1)
+            eta = _registry.eta_seconds(branch) if _registry is not None else None
             return {
-                'status': 'in_flight',
-                'request_id': merge_req.request_id,
-                'branch': branch,
-                'inflight_task_id': dispatch.inflight_task_id,
-                'eta_seconds': dispatch.eta_seconds,
-                'reason': (
-                    f'A merge for branch {branch!r} is already in flight '
-                    f'(source={dispatch.source!r}). Poll for completion.'
-                ),
-                'conflict_details': None,
-                'push_status': None,
+                'status': status,
+                'request_id': request_id_val,
+                'snapshot_tip': req.snapshot_tip,
+                'generation': 0,
+                'position': position,
+                'queue_depth': queue_depth,
+                'eta_seconds': eta,
             }
 
-        outcome = await future
+        if dispatch.in_flight:
+            # Branch already being merged.
+            if wait_secs is None:
+                # Legacy (compat default): return in_flight immediately so the
+                # caller can poll rather than block.  ETA is a best-effort heuristic
+                # (None once the estimate window is exceeded).
+                # conflict_details / push_status are included with None for shape
+                # stability: callers that access result['conflict_details'] or
+                # result['push_status'] must not KeyError on a coalesced response.
+                # request_id is the D8 SUBSTRATE: the SUBMITTING request's own id.
+                # β1 re-sources this to the in-flight entry's request_id and renames
+                # status to 'attached'; inflight_task_id remains the authoritative
+                # poll handle (merge_status accepts task_id per D10) in the interim.
+                return {
+                    'status': 'in_flight',
+                    'request_id': merge_req.request_id,
+                    'branch': branch,
+                    'inflight_task_id': dispatch.inflight_task_id,
+                    'eta_seconds': dispatch.eta_seconds,
+                    'reason': (
+                        f'A merge for branch {branch!r} is already in flight '
+                        f'(source={dispatch.source!r}). Poll for completion.'
+                    ),
+                    'conflict_details': None,
+                    'push_status': None,
+                }
+            # wait_secs not None → opt-in path: 'attached' with existing entry's id
+            # Step-10 impl completes this branch.
+            # For now fall through (unreachable during step-8's test scope).
+
+        # Register durable-intent waiter record (β1 D2/I5).
+        # shield(future) means cancelling the merge_request coroutine (MCP
+        # disconnect) no longer cancels req.result — _request_abandoned fires
+        # only for explicit merge_cancel (β2).
+        _waiters[merge_req.request_id] = WaiterRecord(
+            request_id=merge_req.request_id,
+            future=future,
+            source='mcp',
+            submitted_tip=merge_req.snapshot_tip,
+        )
+        future.add_done_callback(
+            lambda _f: _waiters.pop(merge_req.request_id, None)
+        )
+
+        # wait_secs == 0: immediate non-blocking return — 'queued' shape.
+        if wait_secs == 0:
+            return _nonblocking_state_response('queued', merge_req)
+
+        outcome = await asyncio.shield(future)
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
         # the worker-produced already_merged case (merge marker path returns no SHA);
