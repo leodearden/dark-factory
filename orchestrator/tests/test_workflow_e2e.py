@@ -3117,7 +3117,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         # Stub enqueue so the merge worker isn't needed: deliver a blocked
         # MergeOutcome whose reason matches the drop-guard prefix.
-        async def _fake_enqueue(_queue, request, _event_store):
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(MergeOutcome(
                 'blocked',
                 reason=(
@@ -3179,7 +3179,7 @@ class TestMarkBlockedFalseDoneGuard:
         spy_mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         workflow._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
 
-        async def _fake_enqueue(_queue, request, _event_store):
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(MergeOutcome(
                 'blocked',
                 reason=(

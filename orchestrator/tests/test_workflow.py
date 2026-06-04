@@ -134,7 +134,7 @@ class TestSubmitToMergeQueuePlanTightening:
         # not the post-merge SHA pipeline.
         from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
-        async def fake_enqueue(queue, req: MergeRequest, event_store):  # noqa: ARG001
+        async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):  # noqa: ARG001
             req.result.set_result(MergeOutcome('done', merge_sha='deadbeef'))
         monkeypatch.setattr(
             'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,

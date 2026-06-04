@@ -260,7 +260,7 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     # from "reset to None coincidentally" (would silently pass a weaker test).
     wf._last_merge_block_reason = 'sentinel'
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store):
+    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
         req.result.set_result(MergeOutcome(
             'blocked',
             reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py',
@@ -317,7 +317,7 @@ async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thra
         'type-check failed for subpkg on abc123456789. error: src/foo.py:10: ...'
     )
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store):
+    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
         req.result.set_result(MergeOutcome('blocked', reason=broken_reason))
 
     monkeypatch.setattr(
