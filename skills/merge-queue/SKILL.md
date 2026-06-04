@@ -1,6 +1,6 @@
 ---
 name: merge-queue
-description: "Merge a task branch to main via the orchestrator's merge queue. Use this skill whenever you need to merge a completed task branch into main and the orchestrator might be running — it routes through the escalation MCP's merge_request tool, which serializes merges and prevents races. Trigger this when an agent says 'merge to main', 'submit merge', 'merge task branch', finishes fixing a blocked task and needs to merge, or any time code on a task branch is ready to land on main. If the escalation MCP isn't reachable, the skill falls back to direct merge. Prefer this over raw git merge --no-ff whenever working in the dark-factory repo."
+description: "Merge a task branch to main via the orchestrator's merge queue using the submit→poll protocol. Use this skill whenever you need to merge a completed task branch into main and the orchestrator might be running — it submits via merge_request(wait_secs=100) then polls merge_status until the outcome is terminal, preventing races without blocking indefinitely. Trigger this when an agent says 'merge to main', 'submit merge', 'merge task branch', finishes fixing a blocked task and needs to merge, or any time code on a task branch is ready to land on main. If the escalation MCP isn't reachable, the skill falls back to direct merge. Prefer this over raw git merge --no-ff whenever working in the dark-factory repo."
 ---
 
 # Merge Queue
@@ -8,6 +8,10 @@ description: "Merge a task branch to main via the orchestrator's merge queue. Us
 When the orchestrator is running, all merges to main go through the **merge queue** — a serial worker that rebases, verifies, and atomically advances main using compare-and-swap. This prevents races between concurrent tasks, the steward, and interactive sessions.
 
 The escalation MCP exposes a `merge_request` tool that lets you submit to this queue from outside the orchestrator workflow. This skill tells you how to use it.
+
+> **Core rule:** every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.
+>
+> Passing an explicit `wait_secs` (not `None`) keeps the call correct under both server modes — the compat default (`None`) and the post-flip default (`0`) — because the bounded semantics are always opt-in regardless of the server default. Never omit `wait_secs`.
 
 ## Why this matters
 
@@ -153,9 +157,12 @@ After a successful direct merge:
 
 | Situation | Action |
 |-----------|--------|
-| Orchestrator running | Use `merge_request` via escalation MCP |
+| Orchestrator running | Submit via `merge_request(wait_secs=100)`, then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
-| Merge returns `conflict` | Fix in worktree, resubmit |
-| Merge returns `blocked` | Read reason, fix, resubmit |
-| Merge returns `done` or `already_merged` | Update task status, clean up |
+| Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
+| `merge_status` returns `state: "unknown"` | Run `git log main` to confirm whether merge landed; resubmit if not |
+| Outcome `conflict` | Fix in worktree, resubmit |
+| Outcome `blocked` | Read reason, fix, resubmit |
+| Outcome `done` or `already_merged` | Update task status, clean up |
+| Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
 | Unsure if orchestrator is running | Probe `get_pending_escalations()` — if it responds, use the queue |
