@@ -212,6 +212,13 @@ mechanical gate to check whether the at-block-time dry-run investigation found a
   --config <watched-project orchestrator config, e.g. orchestrator/config.yaml>
 ```
 
+> **`--tag` note:** Both `check` and `record-launch` default `--tag` to `master` — the
+> taskmaster tag under which the watched project stores its tasks. If the watched project
+> uses a non-`master` tag, supply `--tag <tag>` to both verbs. Without it, `check` will
+> silently find no proposal row and return `drift` or `abort` on every call (the behavior is
+> fail-safe — it never launches — but the watcher will appear stuck with no signal that the
+> tag was wrong).
+
 Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remaining`,
 `already_attempted`, `head_sha`, `main_sha`, `age_seconds`.
 
@@ -323,7 +330,10 @@ config `UnblockAutoConfig.attended_b3_enabled` (e.g. `orchestrator/config.yaml` 
 session via a session override. A session override wins in either direction — a human may turn it on
 even if config is false, or off even if config is true.
 
-**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md`, AFK shift 3):
+**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md` — the single
+shared B3 outcome ledger for both AFK and attended modes; the "afk" prefix reflects the file's
+original AFK-only scope, but it is now the unified record for all B3 outcomes regardless of session
+mode; AFK shift 3 manages it):
 - **Merged**: `B3 <task_id> — merged: <one-line summary> (sha: <merge_sha>)`
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
