@@ -394,7 +394,7 @@ def create_server(
         action: str = 'resume',
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
-        terminate: None = None,
+        terminate: Any = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
 
@@ -420,6 +420,12 @@ def create_server(
         | close_only   | dismissed  | escalation closed with no  | unchanged              |
         |              |            | workflow effect            |                        |
         +--------------+------------+----------------------------+------------------------+
+
+        **Note — task-status effects are not yet wired (pending harness β).**
+        Currently park, abandon, and close_only are indistinguishable at the
+        harness layer: all three produce ``status='dismissed'`` on the escalation
+        record.  The per-action task-status transitions described above will be
+        realised when harness β lands.
 
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the

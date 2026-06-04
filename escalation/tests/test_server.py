@@ -848,6 +848,72 @@ class TestResolveIssueResolutionActionPersisted:
         )
 
 
+
+# ---------------------------------------------------------------------------
+# TestResolveIssueTerminateMcpPath: terminate= guard reachable via MCP dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueTerminateMcpPath:
+    """terminate= migration guard is reachable through server.call_tool() (MCP dispatch path).
+
+    The terminate parameter is annotated Any so FastMCP's pydantic validation
+    does NOT reject non-null values at the schema layer.  Without this the
+    caller would get an opaque ValidationError instead of the friendly
+    migration error naming the five replacement actions.
+    """
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-mcp-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-mcp',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='mcp path terminate test',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_terminate_true_via_call_tool_returns_friendly_error(self, tmp_path: Path):
+        """terminate=True through server.call_tool() returns the migration error, not a ValidationError.
+
+        This exercises the full MCP dispatch path (pydantic schema validation +
+        middleware) rather than the bare tool.fn() shortcut, confirming the
+        guard is actually reachable end-to-end.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        tool_result = await server.call_tool('resolve_issue', {
+            'escalation_id': esc.id,
+            'resolution': 'done',
+            'terminate': True,
+        })
+
+        result = tool_result.structured_content
+        assert result is not None, (
+            "call_tool returned no structured_content — "
+            "terminate=True may have been rejected at the schema layer"
+        )
+        assert 'error' in result, (
+            f"Expected friendly migration error dict via MCP path, got: {result}"
+        )
+        msg = result['error']
+        for action in ('resume', 'restart', 'park', 'abandon', 'close_only'):
+            assert action in msg, (
+                f"Migration error must name '{action}'; got: {msg!r}"
+            )
+        # Record must be unchanged
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', (
+            f"Record must stay pending after migration error; got {record.status!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
 # ---------------------------------------------------------------------------
