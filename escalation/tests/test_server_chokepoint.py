@@ -13,6 +13,8 @@ and the same tmp_path isolation as test_server_dedupe.py.
 
 from __future__ import annotations
 
+import asyncio
+import types
 from pathlib import Path
 from typing import Any
 
@@ -607,3 +609,103 @@ class TestAutoResolveSingleNotification:
 # tests would mislead future readers into thinking the fallback is covered.
 # See design decision: "Remove TestResolveNoneFallback … in the impl step that
 # switches the server to submit_resolved."
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_request tests
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_request MCP tool directly."""
+    tool = await server.get_tool('merge_request')
+    return await tool.fn(**kwargs)
+
+
+def _make_orch_config(tmp_path: Path):
+    """Create a minimal OrchestratorConfig without a git remote."""
+    from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+    return OrchestratorConfig(project_root=tmp_path)
+
+
+def _make_registry():
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        InFlightMergeRegistry,
+    )
+    return InFlightMergeRegistry()
+
+
+# ---------------------------------------------------------------------------
+# Step-1 RED test: dispatched response includes request_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestRequestId:
+    """merge_request dispatched and in_flight responses include request_id."""
+
+    async def test_dispatched_response_includes_request_id(self, tmp_path: Path):
+        """Dispatched (terminal) response includes request_id from the MergeRequest.
+
+        RED until step-2 impl: the current dispatched path returns only
+        {status, reason, conflict_details, push_status} — no request_id key.
+
+        Setup: server with merge_queue + orch_config + injected registry and
+        NO harness (git_ops=None — also proves the fast-path is skipped
+        gracefully when git_ops is absent).  A background worker dequeues the
+        MergeRequest, captures req.request_id, and resolves req.result with
+        MergeOutcome('done').
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            # no harness → git_ops=None → fast-path skipped
+        )
+
+        captured_request_id: list[str] = []
+
+        async def _worker():
+            """Dequeue the MergeRequest, capture its request_id, resolve done."""
+            req = await mq.get()
+            captured_request_id.append(req.request_id)
+            req.result.set_result(MergeOutcome('done', reason='test done'))
+
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=5.0,
+        )
+
+        await worker_task
+
+        assert result['status'] == 'done', (
+            f"Expected status 'done', got: {result}"
+        )
+        assert len(captured_request_id) == 1, (
+            f"Worker did not capture request_id: {captured_request_id}"
+        )
+        assert 'request_id' in result, (
+            f"Expected 'request_id' key in dispatched result, got keys: {set(result.keys())}"
+        )
+        assert result['request_id'] == captured_request_id[0], (
+            f"Expected request_id={captured_request_id[0]!r}, got: {result.get('request_id')!r}"
+        )
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
