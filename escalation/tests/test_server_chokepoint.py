@@ -1359,6 +1359,65 @@ class TestMergeRequestWaitSecsPositive:
 
 
 # ---------------------------------------------------------------------------
+# β8 Step-3 RED: explicit None treated as 'queued' (I1 regression guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestExplicitNoneQueued:
+    """β8 step-3 RED: explicit wait_secs=None must NOT block (PRD invariant I1).
+
+    RED after step-2: explicit None still falls into the legacy
+    `else: outcome = await asyncio.shield(future)` unbounded branch → blocks
+    → wait_for raises TimeoutError.
+    GREEN after step-4 impl deletes the unbounded branch.
+    """
+
+    async def test_explicit_none_wait_secs_does_not_block(self, tmp_path: Path):
+        """Passing wait_secs=None explicitly returns 'queued' without blocking.
+
+        Setup: server with merge_queue + orch_config + injected registry,
+        NO worker.  Call merge_request(wait_secs=None) (type: ignore intentional —
+        exercises the retired sentinel) under asyncio.wait_for(timeout=2.0).
+        Must return before the timeout with status=='queued'.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='none-free',
+                branch='none-free',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=None,  # type: ignore[reportArgumentType]
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued' for explicit None, got: {result}"
+        )
+        assert 'request_id' in result, f'Missing request_id: {result}'
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+
+        # Clean up
+        req = mq.get_nowait()
+        req.result.cancel()
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-13 RED: legacy (wait_secs=None) — client disconnect doesn't cancel entry
 # ---------------------------------------------------------------------------
 
