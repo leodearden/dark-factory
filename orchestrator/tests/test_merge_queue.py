@@ -11870,3 +11870,89 @@ class TestSMWGenerationChain:
         assert ctx.counts is worker._generation_chain_counts
         assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
         assert _call_kwargs.get('merged_branch_tip') == 'T1'
+
+
+# ---------------------------------------------------------------------------
+# TestTrainEquivalenceNeverAutoChains — γ2 step-17 RED / step-18 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainEquivalenceNeverAutoChains:
+    """PRD D9 / boundary test 12 regression guard.
+
+    _do_train_merge must NEVER auto-chain on equivalence failure.  Trains are
+    multi-waiter (all members share a single git branch tip), so only the
+    single-branch MergeWorker/SpeculativeMergeWorker paths should grow with
+    new delta commits.  The ``chain_ctx=None`` default on
+    ``_finalize_advanced_merge`` guarantees this; these tests lock that
+    invariant in.
+    """
+
+    async def test_train_equiv_failure_returns_blocked_not_superseded(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Equivalence failure on a GroupMergeRequest returns 'blocked' (not 'superseded')
+        and leaves the worker queue empty — no auto-chain, no delta re-queue.
+
+        PRD D9: trains are bit-identical single-waiter merges; the γ2 chain
+        mechanism applies ONLY to single-branch MergeRequest paths.
+        """
+        from orchestrator.merge_queue import POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX
+
+        req = await _make_stacked_train(git_ops, config)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['train.py']),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        # (a) Outcome is 'blocked', not 'superseded' — trains never auto-chain
+        assert outcome.status == 'blocked', (
+            f'train equiv-failure must return blocked, got: {outcome!r}'
+        )
+        # (b) Reason carries the equivalence prefix
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'expected equiv prefix, got: {outcome.reason!r}'
+        )
+        # (c) Queue is empty — no gen-(n+1) request was enqueued for the train
+        assert worker._queue.empty(), (
+            'no gen-(n+1) request should be enqueued for train equiv-failure '
+            '(PRD D9: trains never auto-chain)'
+        )
+
+    async def test_do_train_merge_finalize_called_with_no_chain_ctx(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """_do_train_merge calls _finalize_advanced_merge WITHOUT chain_ctx (default None).
+
+        Asserts the chain_ctx=None invariant at the call site so any future
+        change that accidentally wires chain_ctx into the train path is caught
+        immediately.  Trains must stay bit-identical and single-waiter (PRD D9).
+        """
+        req = await _make_stacked_train(git_ops, config)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            await worker._do_merge(req)
+
+        finalize_mock.assert_awaited_once()
+        call_kwargs = finalize_mock.call_args.kwargs
+        # chain_ctx must be absent or explicitly None — trains never auto-chain (PRD D9)
+        assert call_kwargs.get('chain_ctx') is None, (
+            f'_do_train_merge must not pass chain_ctx to _finalize_advanced_merge; '
+            f'got chain_ctx={call_kwargs.get("chain_ctx")!r}'
+        )
