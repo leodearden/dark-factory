@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -313,12 +313,15 @@ class Harness:
         # here so the harness EscalationQueue and set_task_status are available).
         self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
-        # Set of task_ids currently undergoing action-teardown (park/restart/abandon).
-        # Stamped before the status write + kill; cleared in the finally block once the
-        # kill window closes.  Mirrors _workflow_cancel_at's grace lifecycle so a
+        # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
+        # Stamped (incremented) before the status write + kill; decremented in the
+        # finally block once the kill window closes.  A Counter (vs plain set) ensures
+        # overlapping teardown coros for the SAME task_id — low probability but possible
+        # with concurrent escalation resolutions — do not prematurely clear each other's
+        # suppression window.  Mirrors _workflow_cancel_at's grace lifecycle so a
         # re-dispatched (restart→pending) workflow can write 'blocked' legitimately in
         # its next incarnation rather than being permanently suppressed.
-        self._action_teardown_tasks: set[str] = set()
+        self._action_teardown_tasks: Counter[str] = Counter()
         # Wire to the scheduler's suppression predicate so that 'blocked' writes emitted
         # by a workflow being killed cannot clobber the action's target status
         # (pending/deferred).  Declared in scheduler.py, installed here alongside the
@@ -4359,13 +4362,35 @@ Output JSON matching the schema. Every task must appear in the output.
           4. Kill live workflow if active (soft → grace → hard).
           5. Clear the stamp (in finally block) once the kill window closes.
 
-        The stamp in step 2 activates the scheduler's _suppress_blocked_write
-        predicate, so any racing 'blocked' write emitted by the workflow before
-        the kill lands is absorbed without reaching fused-memory.  The stamp is
-        cleared in the finally block whether the status write succeeded, was
-        rejected, or the kill completed — ensuring a re-dispatched
-        (restart→pending) workflow can write 'blocked' legitimately in its next
-        incarnation rather than being permanently suppressed.
+        Preconditions per action:
+          - restart: task must be non-terminal (checked at step 1); target='pending'.
+            Any non-terminal current status is intentionally overwritten — restart is
+            a forced re-pend.  SetTaskStatusRejected handles the terminal-exit gate
+            if the task transitions terminally between the recheck and the write.
+          - park:    task must be non-terminal; target='deferred'.  Same TOCTOU note.
+          - abandon: task must be non-terminal; target='cancelled'.  SetTaskStatusRejected
+            is redundant here (cancelled is terminal and the scheduler's terminal-exit
+            gate would also catch it), but the recheck still avoids a no-op write.
+
+        Suppression scope — why suppressing only 'blocked' writes is correct (C3.2):
+          A workflow paused at an escalation-event wait has already written 'in-progress'
+          at task-start (``_setup_worktree_and_artifacts``).  After ``event.set()`` wakes
+          it, it continues mid-task execution and does NOT re-write 'in-progress' — that
+          write happens only once, at task dispatch time.  On cancellation the workflow's
+          cleanup path calls ``_mark_blocked``, which emits exactly one 'blocked' write.
+          That 'blocked' write is the racing write suppression must intercept; suppressing
+          'blocked' alone is therefore sufficient for this code path.
+
+        The stamp in step 2 activates the scheduler's _suppress_blocked_write predicate,
+        so any racing 'blocked' write emitted by the workflow before the kill lands is
+        absorbed without reaching fused-memory.  The stamp is cleared in the finally
+        block whether the status write succeeded, was rejected, or the kill completed —
+        ensuring a re-dispatched (restart→pending) workflow can write 'blocked'
+        legitimately in its next incarnation rather than being permanently suppressed.
+
+        Concurrency note: ``_action_teardown_tasks`` uses a Counter so that overlapping
+        teardown coros for the same task_id (low probability — each L2 cascade member is
+        a distinct task_id) do not prematurely clear each other's suppression windows.
         """
         current = await self.scheduler.get_status(task_id)
         if current in TERMINAL_STATUSES:
@@ -4383,7 +4408,9 @@ Output JSON matching the schema. Every task must appear in the output.
         # Must be set prior to set_task_status so that a racing workflow 'blocked' write
         # (concurrent with our status write or arriving before the kill lands) is
         # absorbed by the scheduler guard and cannot clobber the action's target status.
-        self._action_teardown_tasks.add(task_id)
+        # Counter increment (not set.add) so overlapping teardowns for the same task_id
+        # don't prematurely clear each other's suppression window (step-12 amend).
+        self._action_teardown_tasks[task_id] += 1
         try:
             try:
                 await self.scheduler.set_task_status(task_id, target_status)
@@ -4421,10 +4448,13 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                     self.hard_cancel_workflow(task_id)
         finally:
-            # Discard the suppression stamp once the kill window closes (step-12).
-            # A re-dispatched (restart→pending) workflow can now write 'blocked'
+            # Decrement the suppression refcount once the kill window closes (step-12).
+            # Delete the key when it reaches zero so Counter.__contains__ returns False
+            # and a re-dispatched (restart→pending) workflow can write 'blocked'
             # legitimately in its next incarnation.
-            self._action_teardown_tasks.discard(task_id)
+            self._action_teardown_tasks[task_id] -= 1
+            if self._action_teardown_tasks[task_id] <= 0:
+                del self._action_teardown_tasks[task_id]
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.

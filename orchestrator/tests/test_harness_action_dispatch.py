@@ -14,6 +14,7 @@ Step-1 (Pair A) — legacy mapping + close_only no-op + dispatch skeleton:
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -526,6 +527,38 @@ class TestDispatchTeardownNoKill:
 
                 harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
 
+    async def test_level0_teardown_executes(self, harness: Harness):
+        """(amend, Suggestion 4) level=0 escalation with explicit resolution_action triggers
+        teardown — restart/park/abandon have NO level gate (unlike resume which requires
+        level>=1).  This documents the intended asymmetry: resume re-pend is a
+        blocking-handoff behavior that only applies at level>=1, while teardown actions
+        apply whenever an explicit resolution_action is set regardless of escalation level.
+        """
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        for action, expected_target in (
+            ('restart', 'pending'),
+            ('park', 'deferred'),
+            ('abandon', 'cancelled'),
+        ):
+            harness.scheduler.get_status = AsyncMock(return_value='blocked')
+            harness.scheduler.set_task_status = AsyncMock()
+
+            task_id = f'task-level0-{action}'
+            esc = _make_esc(
+                task_id=task_id,
+                resolution_action=action,
+                status='dismissed' if action in ('park', 'abandon') else 'resolved',
+                resolved_by='interactive',
+                level=0,  # level=0 — no level gate for teardown actions
+            )
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+                task_id, expected_target,
+            ), f'level=0 {action} must write {expected_target}'
+
     async def test_l2_park_cascade_sets_both_members_deferred(
         self, harness: Harness, tmp_path: Path
     ):
@@ -552,8 +585,11 @@ class TestDispatchTeardownNoKill:
         await asyncio.gather(*list(harness._background_tasks))
 
         awaits = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-        # Both L1 member tasks should be set to 'deferred' (L2's task is also
-        # written but we only assert the member tasks are present)
+        # All three tasks should be set to 'deferred': the L2 cluster task itself
+        # ('task-cluster-c') is also written because the L2's own _on_escalation_resolved
+        # callback fires first (before the member cascades) and dispatches the same park
+        # teardown for its own task_id.  Making this explicit avoids a confusing failure
+        # if the L2 self-write semantics change intentionally (amend: Suggestion 5).
         task_ids_written = [a.args[0] for a in awaits]
         assert 'task-park-a' in task_ids_written, (
             f'task-park-a not written; writes: {task_ids_written}'
@@ -561,8 +597,15 @@ class TestDispatchTeardownNoKill:
         assert 'task-park-b' in task_ids_written, (
             f'task-park-b not written; writes: {task_ids_written}'
         )
-        for a in awaits:
-            assert a.args[1] == 'deferred', f'Expected deferred, got {a.args[1]}'
+        assert 'task-cluster-c' in task_ids_written, (
+            f'task-cluster-c (L2 self-write) not written; writes: {task_ids_written}'
+        )
+        # All three writes must target 'deferred'.
+        statuses_written = {a.args[0]: a.args[1] for a in awaits}
+        for tid in ('task-park-a', 'task-park-b', 'task-cluster-c'):
+            assert statuses_written[tid] == 'deferred', (
+                f'{tid}: expected deferred, got {statuses_written[tid]}'
+            )
 
     async def test_l2_legacy_dismiss_no_touch(
         self, harness: Harness, tmp_path: Path
@@ -730,27 +773,30 @@ class TestTeardownKillSequence:
 # ---------------------------------------------------------------------------
 
 class TestActionTeardownTasksSet:
-    """Pair F (step-11, task 1620): Harness._action_teardown_tasks set + scheduler hook.
+    """Pair F (step-11, task 1620): Harness._action_teardown_tasks Counter + scheduler hook.
 
     RED until step-12:
-      - Adds ``self._action_teardown_tasks: set[str] = set()`` to Harness.__init__.
+      - Adds ``self._action_teardown_tasks: Counter[str] = Counter()`` to Harness.__init__
+        (amend: was set[str]; changed to Counter for refcount safety — Suggestion 3).
       - Installs ``self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__``
         right beside the existing _on_park_stop_trip / _on_external_dep_block installs.
     """
 
-    def test_action_teardown_tasks_is_empty_set(self, harness: Harness):
-        """(a.1) Harness exposes _action_teardown_tasks as an empty set after construction.
+    def test_action_teardown_tasks_is_empty_counter(self, harness: Harness):
+        """(a.1) Harness exposes _action_teardown_tasks as an empty Counter after construction.
 
         Fails before step-12 with AttributeError: Harness has no _action_teardown_tasks.
+        Changed from set→Counter (amend, Suggestion 3): Counter.__contains__ works identically
+        to set.__contains__ for membership checks, so the scheduler hook is unaffected.
         """
-        assert isinstance(getattr(harness, '_action_teardown_tasks', None), set), (
-            'Harness._action_teardown_tasks must be a set (fails before step-12)'
+        assert isinstance(getattr(harness, '_action_teardown_tasks', None), Counter), (
+            'Harness._action_teardown_tasks must be a Counter (changed from set, amend Suggestion 3)'
         )
         assert len(harness._action_teardown_tasks) == 0, (
             '_action_teardown_tasks must start empty'
         )
 
-    def test_scheduler_suppress_hook_wired_to_teardown_set(
+    def test_scheduler_suppress_hook_wired_to_teardown_counter(
         self, tmp_path: Path, mock_orch_config
     ):
         """(a.2) scheduler._suppress_blocked_write is wired to _action_teardown_tasks.__contains__:
@@ -761,8 +807,9 @@ class TestActionTeardownTasksSet:
         survives on the actual Scheduler instance — the harness fixture replaces the
         scheduler after construction, which would discard the hook.
 
-        Before step-12, _action_teardown_tasks doesn't exist → AttributeError on .add().
-        After step-12, the hook is the set's __contains__: returns True/False correctly.
+        Counter.__contains__ returns True for keys with positive count and False otherwise
+        (as long as zero-count keys are deleted on decrement, which _action_teardown_and_set_status
+        guarantees).  Amend: stamp via ``counter[task_id] += 1`` (not set.add).
         """
         with (
             patch('orchestrator.harness.McpLifecycle'),
@@ -773,7 +820,7 @@ class TestActionTeardownTasksSet:
         # h.scheduler is a real Scheduler here (not replaced by the fixture).
         hook = h.scheduler._suppress_blocked_write
         assert hook is not None, '_suppress_blocked_write must be wired (None before step-12)'
-        h._action_teardown_tasks.add('task-X')  # AttributeError before step-12
+        h._action_teardown_tasks['task-X'] += 1  # Counter increment (was set.add — amend)
         assert hook('task-X') is True, 'hook must return True for stamped task_id'
         assert hook('task-Y') is False, 'hook must return False for unstamped task_id'
 
