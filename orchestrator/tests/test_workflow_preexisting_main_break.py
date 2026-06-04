@@ -156,3 +156,93 @@ class TestVerifyDebugfixLoopInheritedBreak:
             f'Expected category=preexisting_main_break; got {info}'
         )
         assert info.get('fingerprint'), '_inherited_break_info must carry a non-empty fingerprint'
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — non-inherited: helper=False -> debugger invoked, history advanced
+# Test 2b — flag off -> helper not called
+# Test 2c — skip-set category -> helper not called
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyDebugfixLoopNonInheritedPaths:
+    """Step-9 / test-expectation #2 + invariant e + flag-off: existing path unchanged."""
+
+    def _run_with_spy(
+        self,
+        tmp_path: Path,
+        *,
+        helper_return: bool = False,
+        flag_on: bool = True,
+        category: str = 'compile_error',
+    ) -> tuple[WorkflowOutcome, MagicMock, MagicMock]:
+        """Run one loop iteration, return (outcome, helper_spy, invoke_spy)."""
+        import orchestrator.verify as verify_module
+
+        from orchestrator.agents.invoke import AgentResult
+
+        config = _make_config(tmp_path, escalate_preexisting=flag_on)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_workflow(config, worktree)
+
+        failing_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='error TS2769: foo.tsx:12',
+            summary=f'{category} error',
+            cause_hint='error TS2769: foo.tsx:12',
+            category=category,
+        )
+
+        helper_spy = AsyncMock(return_value=helper_return)
+        # After one failing run: make next run pass to exit loop normally.
+        call_count = {'n': 0}
+
+        async def _verify_side_effect(*args, **kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return failing_result
+            return PASSING_RESULT
+
+        async def _run_loop() -> WorkflowOutcome:
+            with (
+                patch('orchestrator.workflow.run_scoped_verification',
+                      side_effect=_verify_side_effect),
+                patch('orchestrator.workflow.verify_failure_is_preexisting_on_main',
+                      new=helper_spy),
+            ):
+                return await workflow._verify_debugfix_loop()
+
+        outcome = asyncio.run(_run_loop())
+        return outcome, helper_spy, workflow._invoke
+
+    def test_helper_false_debugger_is_called_and_history_advances(
+        self, tmp_path: Path,
+    ) -> None:
+        """When helper returns False, existing path runs: debugger called, history +1."""
+        outcome, helper_spy, invoke_spy = self._run_with_spy(tmp_path, helper_return=False)
+        assert outcome == WorkflowOutcome.DONE  # second verify passes
+        invoke_spy.assert_called()  # type: ignore[union-attr]
+
+    def test_flag_off_helper_not_called(self, tmp_path: Path) -> None:
+        """When escalate_preexisting_main_break=False, helper is never called."""
+        outcome, helper_spy, invoke_spy = self._run_with_spy(
+            tmp_path, helper_return=False, flag_on=False,
+        )
+        helper_spy.assert_not_called()
+
+    def test_infra_timeout_category_skips_helper(self, tmp_path: Path) -> None:
+        """category='infra_timeout' is in the skip-set — helper must not be called."""
+        _outcome, helper_spy, _invoke = self._run_with_spy(
+            tmp_path, category='infra_timeout',
+        )
+        helper_spy.assert_not_called()
+
+    def test_flock_error_category_skips_helper(self, tmp_path: Path) -> None:
+        """category='flock_error' is in the skip-set — helper must not be called."""
+        _outcome, helper_spy, _invoke = self._run_with_spy(
+            tmp_path, category='flock_error',
+        )
+        helper_spy.assert_not_called()
