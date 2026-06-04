@@ -50,8 +50,8 @@ Use escalation when:
 
 `escalate_blocker` defaults to severity `blocking` — the correct level for agent-filed
 blockers.  Severities above `blocking` — `critical` and `urgent` — are **reserved for
-harness sentinels** (agent_role prefixed `harness-` or `orchestrator-`) and operator
-tools.  These route directly to a human (born at L2), bypassing the auto-watcher.
+harness sentinels** (agent_role prefixed `harness-` or `orchestrator-`).  These route
+directly to a human (born at L2), bypassing the auto-watcher.
 
 If an agent files `critical` or `urgent`, the escalation server **downgrades it to
 `blocking`** at the chokepoint (logged at WARNING; summary gains a
