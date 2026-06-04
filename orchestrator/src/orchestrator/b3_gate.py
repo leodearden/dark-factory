@@ -46,7 +46,7 @@ _EMPTY_STATE: dict[str, list] = {'launches': [], 'charges': []}
 
 def _state_path(project_root: str | Path) -> Path:
     """Return the canonical state-file path for a given project root."""
-    raise NotImplementedError
+    return Path(project_root) / STATE_REL_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -55,12 +55,30 @@ def _state_path(project_root: str | Path) -> Path:
 
 def _load_state(path: Path) -> dict[str, Any]:
     """Load b3 state from *path*; return empty state on any error."""
-    raise NotImplementedError
+    try:
+        text = path.read_text(encoding='utf-8')
+        if not text.strip():
+            return {'launches': [], 'charges': []}
+        data = json.loads(text)
+        # Ensure both keys present
+        return {
+            'launches': data.get('launches', []),
+            'charges': data.get('charges', []),
+        }
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        return {'launches': [], 'charges': []}
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
-    """Atomically write *state* to *path* (tmp + os.replace)."""
-    raise NotImplementedError
+    """Atomically write *state* to *path* (tmp + os.replace).
+
+    Modelled on digest.py:482 — writes to a sibling .tmp file then
+    os.replace so the file is never partially written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(state), encoding='utf-8')
+    os.replace(str(tmp), str(path))
 
 
 @contextmanager
