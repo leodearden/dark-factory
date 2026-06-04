@@ -3303,6 +3303,26 @@ class TestSpeculativeItemDefaults:
         # Tie the default to the observability guarantee: None → NULL duration_ms
         assert _elapsed_ms(item.started_monotonic) is None
 
+    def test_already_delivered_default_is_false(self):
+        """SpeculativeItem.already_delivered defaults to False when not passed.
+
+        True means the merger already resolved req.result out-of-band; the
+        verifier must skip set_result but still run n_failed / slot bookkeeping
+        for that ordering token.  The default must be False so existing
+        construction sites that omit the flag behave identically to before.
+        """
+        from unittest.mock import MagicMock
+
+        item = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert item.already_delivered is False
+
 
 # ---------------------------------------------------------------------------
 # TestEmitMergeAttemptHelper — unit tests for module-level _emit_merge_attempt

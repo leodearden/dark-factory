@@ -2677,6 +2677,7 @@ class SpeculativeItem:
     speculative: bool                  # True → merged against pending N's SHA
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
+    already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
