@@ -421,12 +421,12 @@ Two flavours:
 Agent discovered it needs modules beyond its assigned scope.
 
 1. Extend the required modules in task metadata via `mcp__fused-memory__update_task`
-2. Dismiss and terminate — the task will be rescheduled with the expanded module lock set:
+2. Re-pend the task — it will be dispatched with the expanded module lock set:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Scope expanded to include [modules]. Task will be rescheduled with updated module locks.",
-     terminate=true,
+     resolution="Scope expanded to include [modules]. Task re-pends with updated module locks.",
+     action='resume',   # flips blocked→pending; task redispatches with expanded scope
      resolved_by="escalation-watcher"
    )
    ```
@@ -436,12 +436,13 @@ Agent discovered it needs modules beyond its assigned scope.
 Agent found it depends on work that isn't done yet.
 
 1. Check if the prerequisite is an **existing task** that isn't Done yet.
-2. **If yes**: add the dependency via `mcp__fused-memory__add_dependency`, then dismiss and terminate:
+2. **If yes**: add the dependency via `mcp__fused-memory__add_dependency`, then re-pend — the
+   dependency gate will hold the task until the prerequisite completes:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Added dependency on task <dep_id>. Task rescheduled after dependency completes.",
-     terminate=true,
+     resolution="Added dependency on task <dep_id>. Task re-pends; held by dependency gate until dep completes.",
+     action='resume',   # flips blocked→pending; dependency gate holds dispatch until dep is done
      resolved_by="escalation-watcher"
    )
    ```
