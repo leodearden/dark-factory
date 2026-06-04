@@ -4279,12 +4279,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         if action == 'resume':
             # Re-pend the blocked task.  Still gated level==1 here (step-2);
-            # step-4 generalises to level>=1 so born-at-L2 tasks also flip.
+            # D7: level>=1 gate — covers L1 members and born-at-L2 orphans alike.
             # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
             # fired _resolve_callback for the L2 first, then each member with
             # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
             # NOT in _escalation_events (a live workflow owns its own re-pend).
-            if escalation.level == 1:
+            if escalation.level >= 1:
                 is_l2_cascade = (
                     isinstance(escalation.resolved_by, str)
                     and escalation.resolved_by.startswith('l2-cascade:')
