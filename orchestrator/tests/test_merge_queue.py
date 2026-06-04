@@ -3854,6 +3854,123 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── Mechanism 2: freshness re-base at verify-pickup (task 1646) ───────────
+
+    async def test_verify_pickup_rebases_when_main_advanced(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Mechanism 2: verifier re-bases a real item when main advanced since merge.
+
+        N is mid-verify (gated).  N+1 is built against M0 (main not yet advanced).
+        When N completes and advances main M0→M1, the Verifier picks up N+1 and
+        detects base_sha==M0 != M1.  It emits speculative_discard(reason='main_advanced')
+        and re-merges N+1 against M1.  Both resolve 'done', both files land on main.
+
+        Assertions:
+          (1) speculative_discard event with reason='main_advanced' in EventStore.
+          (2) N+1's re-verify runs exactly once and sees N's file (fresh M1 tree).
+          (3) _generation_chain_counts not incremented for N+1 (I7).
+
+        Fails on base: no pickup re-base → no 'main_advanced' discard event and
+        N+1's verify worktree lacks N's file.
+        """
+        db_path = tmp_path / 'events_rebase.db'
+        event_store = EventStore(db_path=db_path, run_id='test-rebase')
+
+        wt_n = await _make_branch_with_file(git_ops, 'rb-n', 'file_rb_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'rb-n1', 'file_rb_n1.py', 'n1 = 2\n')
+
+        # Gate N's verify; record which files each verify call sees
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+        verify_worktrees: list[frozenset] = []
+
+        async def tracking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            files_present = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
+            verify_worktrees.append(files_present)
+            # Gate only N's first verify (only N's file present, gate not yet open)
+            if 'file_rb_n.py' in files_present and 'file_rb_n1.py' not in files_present:
+                if not gate_open.is_set():
+                    n_verify_entered.set()
+                    await gate_open.wait()
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
+            req_n = _make_request('rb-n', 'rb-n', wt_n, config)
+            req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config)
+
+            # Submit N and wait for it to be mid-verify.  By the time the gate
+            # fires, the merger has tried (and missed) N+1's speculative look-ahead.
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            # Submit N+1 on the non-speculative blocking-get path.  Because N has not
+            # yet advanced main, N+1's merge is computed against M0.
+            await queue.put(req_n1)
+
+            # Wait for N+1 to land in the verifier queue (base_sha == M0, main still M0).
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 1:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail('N+1 never appeared in the verifier queue within 15 s')
+
+            # Release the gate — N verify completes, advances main M0→M1.
+            # The Verifier then picks up N+1 (base_sha==M0 != M1) and should
+            # re-merge it against M1 (Mechanism 2).
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+
+        # Both files must be on main
+        for fname in ('file_rb_n.py', 'file_rb_n1.py'):
+            _, out, _ = await _run(
+                ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
+            )
+            assert out.strip(), f'{fname} not on main'
+
+        # (1) speculative_discard with reason='main_advanced' must be in EventStore
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
+        assert 'main_advanced' in discard_reasons, (
+            f'Expected speculative_discard(reason=main_advanced); '
+            f'got discard reasons: {discard_reasons}  (all events: {rows})'
+        )
+
+        # (2) N+1 is re-verified exactly once and its worktree contains N's file
+        #     (proving it was merged against fresh M1, not stale M0)
+        n1_verify_calls = [fs for fs in verify_worktrees if 'file_rb_n1.py' in fs]
+        assert len(n1_verify_calls) == 1, (
+            f'N+1 should be verified exactly once (after re-merge against M1); '
+            f'got {len(n1_verify_calls)} verify call(s) with file_rb_n1.py'
+        )
+        assert 'file_rb_n.py' in n1_verify_calls[0], (
+            f"N+1 re-verify must see N's file (fresh M1 tree includes N's commit); "
+            f'got files: {n1_verify_calls[0]}'
+        )
+
+        # (3) Pickup re-base must NOT increment the generation chain count (I7)
+        assert worker._generation_chain_counts.get('rb-n1', 0) == 0, (
+            f'Pickup re-base must not advance γ2 generation; '
+            f'_generation_chain_counts: {worker._generation_chain_counts}'
+        )
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
