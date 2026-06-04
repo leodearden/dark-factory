@@ -17,9 +17,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers (adapted from test_dry_run_unblock.py)
 # ---------------------------------------------------------------------------
@@ -243,7 +240,7 @@ class TestCharge:
         assert r3['remaining'] == 0
 
     def test_old_charge_outside_window_not_counted(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _save_state, _state_path, charge
+        from orchestrator.b3_gate import _save_state, _state_path, charge
         sp = _state_path(tmp_path)
         # Seed an old charge older than 24h
         old_ts = (self._NOW - timedelta(hours=25)).isoformat()
@@ -255,7 +252,7 @@ class TestCharge:
         assert r['remaining'] == 0
 
     def test_in_window_charge_counted(self, tmp_path):
-        from orchestrator.b3_gate import _load_state, _save_state, _state_path, charge
+        from orchestrator.b3_gate import _save_state, _state_path, charge
         sp = _state_path(tmp_path)
         # Seed an in-window charge (12h ago)
         recent_ts = (self._NOW - timedelta(hours=12)).isoformat()
@@ -287,6 +284,7 @@ class TestChargeConcurrency:
 
     def test_only_one_charge_wins(self, tmp_path):
         import threading
+
         from orchestrator.b3_gate import _load_state, _state_path, charge
 
         sp = _state_path(tmp_path)
@@ -485,7 +483,7 @@ class TestCheckProposalFreshness:
         return repo, head_sha, main_sha
 
     def test_clean_is_fresh(self, tmp_path):
-        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        from orchestrator.b3_gate import FRESH, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_repo(tmp_path)
         entry = self._make_entry(head_sha, main_sha)
         result = check_proposal(entry, worktree=str(repo), category=None,
@@ -493,7 +491,7 @@ class TestCheckProposalFreshness:
         assert result['verdict'] == FRESH, f'expected fresh: {result}'
 
     def test_p1_head_moved_aborts(self, tmp_path):
-        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        from orchestrator.b3_gate import ABORT, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_repo(tmp_path)
         entry = self._make_entry(head_sha, main_sha)
         # Add extra commit on feature branch so HEAD moves
@@ -509,7 +507,7 @@ class TestCheckProposalFreshness:
         assert head_sha in result['reason'], f'expected recorded sha in reason: {result}'
 
     def test_p2_footprint_file_changed_on_main_drifts(self, tmp_path):
-        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_repo(tmp_path)
         entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
         # Switch to main, change foo.py, switch back
@@ -525,7 +523,7 @@ class TestCheckProposalFreshness:
         assert result['verdict'] == DRIFT, f'expected drift: {result}'
 
     def test_p2_non_footprint_file_changed_on_main_still_fresh(self, tmp_path):
-        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        from orchestrator.b3_gate import FRESH, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_repo(tmp_path)
         # footprint is foo.py only; change bar.py on main (not in footprint)
         entry = self._make_entry(head_sha, main_sha, files=['foo.py'])
@@ -847,7 +845,7 @@ class TestTwoWayBoundary:
 
     def test_a_clean_repo_is_fresh(self, tmp_path):
         """(a) Clean repo (HEAD == head_sha, main unchanged) -> fresh."""
-        from orchestrator.b3_gate import FRESH, check_proposal, _run_git
+        from orchestrator.b3_gate import FRESH, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         entry = self._make_success_entry(head_sha, main_sha)
         verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
@@ -856,7 +854,7 @@ class TestTwoWayBoundary:
 
     def test_b_head_moved_aborts_with_git_anchored_reason(self, tmp_path):
         """(b) Extra commit on feature branch -> abort, reason contains both shas."""
-        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        from orchestrator.b3_gate import ABORT, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         entry = self._make_success_entry(head_sha, main_sha)
         # Add extra commit — HEAD moves
@@ -875,7 +873,7 @@ class TestTwoWayBoundary:
 
     def test_c_footprint_file_changed_on_main_drifts(self, tmp_path):
         """(c) foo.py changed on main -> drift."""
-        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         entry = self._make_success_entry(head_sha, main_sha, files=['foo.py'])
         # Change foo.py on main
@@ -892,7 +890,7 @@ class TestTwoWayBoundary:
 
     def test_d_no_sha_stamping_drifts_with_no_sha_anchor(self, tmp_path):
         """(d) Entry without T1 sha-stamping -> drift 'no sha anchor'."""
-        from orchestrator.b3_gate import DRIFT, check_proposal, _run_git
+        from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         agent_result = _make_agent_result(
@@ -916,7 +914,7 @@ class TestTwoWayBoundary:
 
     def test_failure_entry_has_status_key_and_is_aborted(self, tmp_path):
         """Failure _build_entry carries a 'status' key; check_proposal aborts."""
-        from orchestrator.b3_gate import ABORT, check_proposal, _run_git
+        from orchestrator.b3_gate import ABORT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         # Build a failure entry
@@ -934,7 +932,6 @@ class TestTwoWayBoundary:
 
     def test_success_entry_has_no_status_key(self, tmp_path):
         """Success _build_entry must NOT have a 'status' key (contract invariant)."""
-        from orchestrator.dry_run_unblock import _build_entry
         _, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         entry = self._make_success_entry(head_sha, main_sha)
         assert 'status' not in entry, (

@@ -11,17 +11,17 @@ PRD: plans/b3-low-risk-auto-unblock-hardening-prd.md T2 §2.2, §4.1, §4.2, §4
 from __future__ import annotations
 
 import argparse
-import contextlib
 import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Constants
