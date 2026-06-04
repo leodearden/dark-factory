@@ -372,22 +372,96 @@ def _resolve_cap(config_path: str | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _parse_now(now_str: str | None) -> datetime:
+    """Parse an ISO datetime string, or return current UTC time if None."""
+    if now_str is None:
+        return datetime.now(UTC)
+    return datetime.fromisoformat(now_str)
+
+
+def _already_attempted(state: dict[str, Any], task_id: str,
+                        head_sha: str | None, investigated_at: str | None) -> bool:
+    """Return True if a launch entry with the given key exists in state."""
+    for entry in state.get('launches', []):
+        if (entry.get('task_id') == task_id
+                and entry.get('head_sha') == head_sha
+                and entry.get('investigated_at') == investigated_at):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # CLI verb runners
 # ---------------------------------------------------------------------------
 
 def run_check(args: argparse.Namespace) -> None:
     """Execute the 'check' verb: print JSON verdict to stdout."""
-    raise NotImplementedError
+    now = _parse_now(args.now)
+    cap = _resolve_cap(args.config)
+    sp = _state_path(args.project_root)
+    state = _load_state(sp)
+
+    tag = getattr(args, 'tag', DEFAULT_TAG)
+    entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
+    category = getattr(args, 'category', None)
+
+    result = check_proposal(
+        entry,
+        worktree=args.worktree,
+        category=category,
+        now=now,
+    )
+
+    # Add state-derived fields
+    result['cap_remaining'] = _cap_remaining(state, cap, now)
+    head_sha = entry.get('head_sha') if entry else None
+    investigated_at = entry.get('investigated_at') if entry else None
+    result['already_attempted'] = _already_attempted(
+        state, str(args.task_id), head_sha, investigated_at,
+    )
+
+    print(json.dumps(result))
 
 
 def run_record_launch(args: argparse.Namespace) -> None:
     """Execute the 'record-launch' verb: print JSON result to stdout."""
-    raise NotImplementedError
+    now = _parse_now(args.now)
+    sp = _state_path(args.project_root)
+    tag = getattr(args, 'tag', DEFAULT_TAG)
+
+    entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
+    if entry is None:
+        print(json.dumps({
+            'recorded': False,
+            'already_attempted': False,
+            'error': 'no proposal found',
+        }))
+        return
+
+    head_sha = entry.get('head_sha', '')
+    investigated_at = entry.get('investigated_at', '')
+
+    result = record_launch(
+        str(args.task_id),
+        head_sha,
+        investigated_at,
+        state_path=sp,
+        now=now,
+    )
+    print(json.dumps(result))
 
 
 def run_charge(args: argparse.Namespace) -> None:
     """Execute the 'charge' verb: print JSON result to stdout."""
-    raise NotImplementedError
+    now = _parse_now(args.now)
+    cap = _resolve_cap(args.config)
+    sp = _state_path(args.project_root)
+
+    result = charge(str(args.task_id), state_path=sp, cap=cap, now=now)
+    print(json.dumps(result))
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +469,62 @@ def run_charge(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    raise NotImplementedError
+    """Build the argument parser for the three CLI verbs."""
+    p = argparse.ArgumentParser(
+        prog='python -m orchestrator.b3_gate',
+        description=(
+            'B3 gate: mechanical freshness check, durable rolling cap, '
+            'per-proposal launch records.'
+        ),
+    )
+    sub = p.add_subparsers(dest='verb', required=True)
+
+    # --- Shared option factory ---
+    def _add_common(sp_parser, *, worktree=False):
+        sp_parser.add_argument('--task-id', required=True,
+                               help='task ID (integer)')
+        if worktree:
+            sp_parser.add_argument('--worktree', required=True,
+                                   help='path to the blocked task\'s worktree')
+        sp_parser.add_argument('--project-root', required=True,
+                               help='project root dir (contains data/escalations/)')
+        sp_parser.add_argument('--config', default=None,
+                               help='optional path to orchestrator config YAML')
+        sp_parser.add_argument('--now', default=None,
+                               help='inject current time as ISO string (tests/debugging)')
+        sp_parser.add_argument('--tag', default=DEFAULT_TAG,
+                               help=f'taskmaster tag (default: {DEFAULT_TAG!r})')
+
+    # --- check ---
+    check_p = sub.add_parser('check', help='classify latest proposal and return JSON verdict')
+    _add_common(check_p, worktree=True)
+    check_p.add_argument('--category', default=None,
+                         help='block category (task_failure or review_issues)')
+
+    # --- record-launch ---
+    rl_p = sub.add_parser('record-launch', help='record per-proposal launch entry')
+    _add_common(rl_p, worktree=True)
+
+    # --- charge ---
+    charge_p = sub.add_parser('charge', help='charge one rolling-24h merge slot')
+    _add_common(charge_p, worktree=False)
+
+    return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point; returns an exit code."""
-    raise NotImplementedError
+    """Entry point; returns an exit code (0 on success)."""
+    p = _build_parser()
+    args = p.parse_args(argv)
+
+    if args.verb == 'check':
+        run_check(args)
+    elif args.verb == 'record-launch':
+        run_record_launch(args)
+    elif args.verb == 'charge':
+        run_charge(args)
+
+    return 0
 
 
 if __name__ == '__main__':
