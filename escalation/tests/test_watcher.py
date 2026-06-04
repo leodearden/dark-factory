@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from escalation.models import Escalation
-from escalation.watcher import _send_ntfy
+from escalation.watcher import _initial_scan, _send_ntfy
 
 
 @pytest.fixture
@@ -136,6 +138,121 @@ class TestSendNtfy:
             assert req.get_header('Title') == '[URGENT] Task 99: risk_identified'
             assert req.get_header('Priority') == 'urgent'
             assert req.get_header('Tags') == 'rotating_light'
+
+
+def _write_esc(queue_dir, esc: Escalation) -> None:
+    """Helper: write an escalation JSON file named by its id."""
+    path = queue_dir / f'{esc.id}.json'
+    path.write_text(esc.to_json())
+
+
+class TestInitialScan:
+    """_initial_scan(queue_dir, task_id, level) -> Escalation|None."""
+
+    def test_returns_oldest_matching_pending(self, tmp_path):
+        """Among multiple matching pending files, return the OLDEST by timestamp."""
+        old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        new_ts = datetime.now(UTC).isoformat()
+        old_esc = Escalation(
+            id='esc-1-1', task_id='1', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='old',
+            timestamp=old_ts,
+        )
+        new_esc = Escalation(
+            id='esc-1-2', task_id='1', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='new',
+            timestamp=new_ts,
+        )
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        _write_esc(queue_dir, old_esc)
+        _write_esc(queue_dir, new_esc)
+
+        result = _initial_scan(queue_dir, task_id=None, level=None)
+        assert result is not None
+        assert result.id == 'esc-1-1'
+
+    def test_returns_none_on_empty_dir(self, tmp_path):
+        """Returns None when queue dir is empty."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        assert _initial_scan(queue_dir, task_id=None, level=None) is None
+
+    def test_skips_non_pending(self, tmp_path):
+        """Escalations with status != pending are skipped."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        resolved = Escalation(
+            id='esc-2-1', task_id='2', agent_role='steward',
+            severity='info', category='design_concern', summary='resolved',
+            status='resolved',
+        )
+        dismissed = Escalation(
+            id='esc-2-2', task_id='2', agent_role='steward',
+            severity='info', category='design_concern', summary='dismissed',
+            status='dismissed',
+        )
+        _write_esc(queue_dir, resolved)
+        _write_esc(queue_dir, dismissed)
+        assert _initial_scan(queue_dir, task_id=None, level=None) is None
+
+    def test_respects_task_id_filter(self, tmp_path):
+        """Non-matching task_id -> None."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-3-1', task_id='3', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='fail',
+        )
+        _write_esc(queue_dir, esc)
+        assert _initial_scan(queue_dir, task_id='99', level=None) is None
+
+    def test_task_id_match_returns_escalation(self, tmp_path):
+        """Matching task_id -> returns the escalation."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-4-1', task_id='4', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='fail',
+        )
+        _write_esc(queue_dir, esc)
+        result = _initial_scan(queue_dir, task_id='4', level=None)
+        assert result is not None
+        assert result.id == 'esc-4-1'
+
+    def test_respects_level_filter(self, tmp_path):
+        """Non-matching level -> None; matching level -> returns escalation."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc_l0 = Escalation(
+            id='esc-5-1', task_id='5', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='l0', level=0,
+        )
+        esc_l1 = Escalation(
+            id='esc-5-2', task_id='5', agent_role='steward',
+            severity='blocking', category='task_failure', summary='l1', level=1,
+        )
+        _write_esc(queue_dir, esc_l0)
+        _write_esc(queue_dir, esc_l1)
+        result = _initial_scan(queue_dir, task_id=None, level=1)
+        assert result is not None
+        assert result.id == 'esc-5-2'
+
+    def test_tolerates_malformed_json(self, tmp_path):
+        """Malformed .json file is skipped; valid match is still returned."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        # Write a garbage file
+        (queue_dir / 'esc-garbage.json').write_text('{not valid json}}}')
+        # Write a valid escalation
+        esc = Escalation(
+            id='esc-6-1', task_id='6', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='valid',
+        )
+        _write_esc(queue_dir, esc)
+        result = _initial_scan(queue_dir, task_id=None, level=None)
+        assert result is not None
+        assert result.id == 'esc-6-1'
 
 
 class TestMainLoop:
