@@ -1098,3 +1098,75 @@ class TestMergeRequestWaitSecsZeroFree:
         # Clean up enqueued future to avoid ResourceWarning
         req = mq.get_nowait()
         req.result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-9 RED: merge_request(wait_secs=0) in-flight branch → 'attached'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestWaitSecsZeroAttached:
+    """β1 step-9 RED: wait_secs=0 on an already-in-flight branch returns 'attached'.
+
+    RED until step-10 impl: the in_flight block currently ignores wait_secs
+    and either falls through to 'queued' (current fall-through path added in
+    step-8) with the submitting request's id, or returns 'in_flight' on the
+    legacy path — neither matches the expected 'attached' shape with the
+    EXISTING entry's request_id.
+    """
+
+    async def test_wait_secs_zero_inflight_returns_attached(self, tmp_path: Path):
+        """wait_secs=0 for an already-in-flight branch: returns 'attached' with existing id.
+
+        Pre-seed the registry with branch 'X' and request_id='mr-existing'.
+        Then call merge_request(task_id='X', branch='X', wait_secs=0).
+        Must return immediately (no blocking), status='attached', and the
+        request_id must be the existing entry's id ('mr-existing'), NOT the
+        submitting request's id.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        # Pre-seed the registry: acquire branch 'X' with a known request_id
+        # and a never-resolving future to simulate an in-flight merge.
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future, request_id='mr-existing')
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+
+        # Must be 'attached' (not 'in_flight' or 'queued')
+        assert result.get('status') == 'attached', (
+            f"Expected status='attached', got: {result}"
+        )
+        # request_id must be the EXISTING entry's id, not the submitting request's
+        assert result.get('request_id') == 'mr-existing', (
+            f"Expected request_id='mr-existing', got: {result.get('request_id')!r}"
+        )
+        # Required non-blocking shape keys
+        for key in ('snapshot_tip', 'generation', 'eta_seconds', 'position', 'queue_depth'):
+            assert key in result, f'Missing key {key!r} in result: {result}'
+        # generation is always 0 in β1
+        assert result['generation'] == 0, f"Expected generation=0, got: {result['generation']}"
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        never_future.cancel()
