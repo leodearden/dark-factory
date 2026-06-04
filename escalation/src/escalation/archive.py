@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 ARCHIVE_SUBDIR = 'archive'
 DATE_FORMAT = '%Y-%m-%d'
+DEFAULT_RETENTION_DAYS = 30
 
 
 def archive_dir_for_date(queue_dir: Path, resolved_at_iso: str) -> Path:
@@ -101,8 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         '--retention-days',
         type=int,
-        default=30,
-        help='Delete archive subdirs older than this many days (default: 30).',
+        default=DEFAULT_RETENTION_DAYS,
+        help=f'Delete archive subdirs older than this many days (default: {DEFAULT_RETENTION_DAYS}).',
     )
     args = parser.parse_args(argv)
 

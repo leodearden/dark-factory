@@ -180,6 +180,66 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     return report
 
 
+@dataclass
+class StartupSweepReport:
+    """Aggregated report from a single run_startup_sweep call."""
+    sweep: SweepReport
+    loose_reaped: int = 0
+    pruned_dirs: int = 0
+
+
+def run_startup_sweep(
+    queue_dir: Path,
+    *,
+    retention_days: int = archive.DEFAULT_RETENTION_DAYS,
+    apply: bool = True,
+    now: object = None,
+) -> StartupSweepReport:
+    """Orchestrate sweep + loose-reap + prune at escalation server start.
+
+    Runs three passes in sequence:
+      1. sweep(queue_dir, apply=apply)       — root→archive relocation
+      2. reap_loose_archive_files(…)         — archive top-level→dated subdir
+      3. archive.prune_archive(…)            — drop subdirs beyond retention
+
+    Logs one INFO summary line on the ``escalation.sweep`` logger.
+
+    Args:
+        queue_dir: Root queue directory.
+        retention_days: Retention threshold forwarded to prune_archive.
+        apply: If False, dry-run all three passes (no disk mutations).
+        now: Reference datetime for prune_archive cutoff (defaults to live UTC).
+
+    Returns:
+        StartupSweepReport with nested SweepReport plus loose_reaped and pruned_dirs.
+    """
+    queue_dir = Path(queue_dir)
+    sweep_report = sweep(queue_dir, apply=apply)
+    loose_reaped = reap_loose_archive_files(queue_dir, apply=apply)
+    pruned_dirs = archive.prune_archive(queue_dir, retention_days, now=now) if apply else 0
+
+    report = StartupSweepReport(
+        sweep=sweep_report,
+        loose_reaped=loose_reaped,
+        pruned_dirs=pruned_dirs,
+    )
+    logger.info(
+        'Startup sweep %s: archived=%d reconciled(root=%d archive=%d) '
+        'loose_reaped=%d pruned_dirs=%d pending=%d skipped=%d; root: %d → %d',
+        'APPLIED' if apply else 'DRY-RUN',
+        sweep_report.archived,
+        sweep_report.reconciled_root_wins,
+        sweep_report.reconciled_archive_wins,
+        loose_reaped,
+        pruned_dirs,
+        sweep_report.untouched_pending,
+        sweep_report.skipped_unparsable,
+        sweep_report.root_before,
+        sweep_report.root_after,
+    )
+    return report
+
+
 def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
     """Relocate loose archive-top-level esc-*.json files into dated subdirs.
 
