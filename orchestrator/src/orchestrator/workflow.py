@@ -526,7 +526,7 @@ class TaskWorkflow:
             TRAIN_INCOMPLETE_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
-            enqueue_merge_request,
+            register_and_enqueue_merge_request,
         )
 
         train = self._train
@@ -615,7 +615,9 @@ class TaskWorkflow:
             '(train=%r, members=%r)',
             self.task_id, len(member_ids), train_id, member_ids,
         )
-        await enqueue_merge_request(self.merge_queue, req, self.event_store)
+        await register_and_enqueue_merge_request(
+            self.merge_queue, req, self.event_store, self.merge_inflight_registry,
+        )
 
         result = await self._await_cancellable(future)
         if result is None:
@@ -3741,7 +3743,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             MergeRequest,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
-            enqueue_merge_request,
+            register_and_enqueue_merge_request,
         )
 
         assert self.worktree is not None
@@ -3826,7 +3828,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
         )
-        await enqueue_merge_request(self.merge_queue, merge_request, self.event_store)
+        await register_and_enqueue_merge_request(
+            self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+        )
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
