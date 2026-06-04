@@ -327,8 +327,12 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
    # predicate: task still blocked, no active workflow, no pending sibling escalation for this task
    already_pending = any(
-       e["task_id"] == task_id and e["id"] != escalation_id
-       for e in pending_l1s + pending_l2s
+       (e["task_id"] == task_id and e["id"] != escalation_id)
+       for e in candidate_l1s
+   ) or any(
+       # L2 cluster escalations: match by representative task_id OR by member list
+       (e["task_id"] == task_id or task_id in e.get("members", []))
+       for e in pending_l2s
    )
    predicate_holds = (
        task["status"] == "blocked"
