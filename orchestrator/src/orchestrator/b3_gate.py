@@ -203,7 +203,15 @@ def _ts_in_window(ts_str: str, cutoff: datetime) -> bool:
 
 def _run_git(args: list[str], cwd: str) -> tuple[int, str]:
     """Run a git command; return (returncode, stdout_stripped)."""
-    raise NotImplementedError
+    try:
+        result = subprocess.run(
+            ['git', '-C', cwd] + args,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode, result.stdout.strip()
+    except Exception as exc:
+        return 1, str(exc)
 
 
 def check_proposal(
