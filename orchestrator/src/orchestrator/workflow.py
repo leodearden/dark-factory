@@ -3451,6 +3451,13 @@ class TaskWorkflow:
                 try:
                     from escalation.dedupe import compute_content_fingerprint
                     main_sha = await self.git_ops.get_main_sha()
+                    # Fingerprint encodes (category, normalized-cause_hint, main_sha).
+                    # Fold key: same triple -> identical fp -> submit_or_dedupe collapses
+                    # N sibling tasks to ONE parent escalation.  Once the hotfix lands,
+                    # main_sha changes AND the break disappears from main, so a post-fix
+                    # failure gets a distinct fp and is never mis-attributed to the old
+                    # parent (design_decision #3 / step-16 verified by
+                    # TestCrossTaskInheritedBreakDedup.test_same_signature_folds_to_one_parent).
                     fp = compute_content_fingerprint(
                         'preexisting_main_break',
                         result.category or '',
