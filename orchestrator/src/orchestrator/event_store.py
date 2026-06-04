@@ -282,6 +282,12 @@ class EventStore:
         Lookup precedence: request_id > branch > task_id.  When no key is
         provided, returns None immediately.
 
+        Queries are scoped to the current run (``self.run_id``).  branch= and
+        task_id= lookups therefore return the most-recent outcome for the
+        *current* orchestrator run only; results from previous runs that
+        reused the same branch or task_id are not returned.  This prevents
+        merge_status from silently surfacing stale prior-run terminal outcomes.
+
         The returned dict has keys:
             request_id, task_id, branch, state, snapshot_tip, merge_sha,
             finished_at (ISO-8601 timestamp string from the events table).
@@ -298,25 +304,28 @@ class EventStore:
                     row = conn.execute(
                         "SELECT task_id, data, timestamp FROM events "
                         "WHERE event_type='merge_finalized' "
+                        "  AND run_id = ? "
                         "  AND json_extract(data,'$.request_id')=? "
                         "ORDER BY id DESC LIMIT 1",
-                        (request_id,),
+                        (self.run_id, request_id),
                     ).fetchone()
                 elif branch is not None:
                     row = conn.execute(
                         "SELECT task_id, data, timestamp FROM events "
                         "WHERE event_type='merge_finalized' "
+                        "  AND run_id = ? "
                         "  AND json_extract(data,'$.branch')=? "
                         "ORDER BY id DESC LIMIT 1",
-                        (branch,),
+                        (self.run_id, branch),
                     ).fetchone()
                 else:
                     row = conn.execute(
                         "SELECT task_id, data, timestamp FROM events "
                         "WHERE event_type='merge_finalized' "
+                        "  AND run_id = ? "
                         "  AND task_id=? "
                         "ORDER BY id DESC LIMIT 1",
-                        (task_id,),
+                        (self.run_id, task_id),
                     ).fetchone()
             finally:
                 conn.close()

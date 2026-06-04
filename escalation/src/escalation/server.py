@@ -1005,7 +1005,7 @@ def create_server(
         Returns a dict with at minimum:
             state, request_id, generation (always 1 in α3).
 
-        Live entries also carry: position, started_at, eta_seconds.
+        Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
         Unknown carries: hint.
         """
@@ -1044,7 +1044,7 @@ def create_server(
                         'request_id': entry.get('request_id'),
                         'generation': 1,
                         'position': entry.get('position'),
-                        'started_at': entry.get('enqueued_at'),
+                        'enqueued_at': entry.get('enqueued_at'),
                         'eta_seconds': eta,
                     }
             except Exception:

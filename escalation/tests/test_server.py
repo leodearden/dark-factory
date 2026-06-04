@@ -9,6 +9,9 @@ and tmp_path isolation with EscalationQueue.
 
 from __future__ import annotations
 
+import asyncio
+import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,25 @@ from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+
+# ---------------------------------------------------------------------------
+# Cross-package orchestrator imports — used by TestMergeStatus.
+# Guarded so the rest of the file is still collected when the orchestrator
+# package is absent (e.g. in an escalation-only install).
+# ---------------------------------------------------------------------------
+try:
+    from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+    from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        MergeRequest,
+        SpeculativeItem,
+        SpeculativeMergeWorker,
+        TerminalOutcomeRecord,
+        TerminalOutcomeRetention,
+    )
+    _ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    _ORCHESTRATOR_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2793,6 +2815,7 @@ async def _call_merge_status(server, **kwargs) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeStatus:
     """Tests for the merge_status escalation MCP tool (α3)."""
 
@@ -2831,10 +2854,6 @@ class TestMergeStatus:
     # ── step-7: event-store tier + state mapping ──────────────────────────────
 
     def _make_event_store(self, tmp_path: Path):
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
-            EventStore,
-            EventType,
-        )
         return EventStore(tmp_path / 'runs.db', 'run-ms-test'), EventType
 
     def _emit_finalized(self, store, EventType, *, request_id, task_id, branch, state):
@@ -2861,7 +2880,6 @@ class TestMergeStatus:
         self, tmp_path: Path, raw_state: str, expected_coarse: str
     ) -> None:
         """Event-store tier maps raw terminal states to the public coarse vocabulary."""
-        import types
         event_store, EventType = self._make_event_store(tmp_path)
         self._emit_finalized(
             event_store, EventType,
@@ -2892,7 +2910,6 @@ class TestMergeStatus:
 
     async def test_event_store_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the most-recent row and echoes request_id."""
-        import types
         event_store, EventType = self._make_event_store(tmp_path)
         # Emit two rows for the same branch; the second should win
         self._emit_finalized(
@@ -2917,7 +2934,6 @@ class TestMergeStatus:
 
     async def test_event_store_lookup_by_task_id(self, tmp_path: Path) -> None:
         """task_id= lookup resolves to the most-recent row and echoes request_id."""
-        import types
         event_store, EventType = self._make_event_store(tmp_path)
         self._emit_finalized(
             event_store, EventType,
@@ -2941,7 +2957,6 @@ class TestMergeStatus:
 
     async def test_event_store_miss_falls_through_to_unknown(self, tmp_path: Path) -> None:
         """An id not in the event store falls through to unknown+hint."""
-        import types
         event_store, EventType = self._make_event_store(tmp_path)
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -2957,14 +2972,6 @@ class TestMergeStatus:
 
     async def test_ring_tier_returns_terminal_record(self, tmp_path: Path) -> None:
         """Ring tier: a request_id in the ring returns the recorded terminal state."""
-        import time
-        import types
-
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
-
         ring = TerminalOutcomeRetention()
         finished = time.time() - 5.0
         ring.record(TerminalOutcomeRecord(
@@ -2992,17 +2999,6 @@ class TestMergeStatus:
 
     async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
         """Ring tier precedes event store: ring record wins when both have the same request_id."""
-        import types
-
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
-            EventStore,
-            EventType,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
-
         event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
         event_store.emit(
             EventType.merge_finalized,
@@ -3032,16 +3028,6 @@ class TestMergeStatus:
 
     async def test_ring_miss_falls_through_to_event_store(self, tmp_path: Path) -> None:
         """Ring miss falls through to the event store tier."""
-        import types
-
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
-            EventStore,
-            EventType,
-        )
-        from orchestrator.merge_queue import (
-            TerminalOutcomeRetention,  # type: ignore[reportMissingImports]
-        )
-
         event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
         event_store.emit(
             EventType.merge_finalized,
@@ -3065,19 +3051,10 @@ class TestMergeStatus:
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
 
     def _make_orch_config(self, tmp_path: Path):
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         return OrchestratorConfig(project_root=tmp_path)
 
     async def test_live_snapshot_state_mapping(self, tmp_path: Path) -> None:
         """Live snapshot states map to the public vocabulary."""
-        import asyncio
-        import types
-
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            SpeculativeMergeWorker,
-        )
-
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3105,20 +3082,12 @@ class TestMergeStatus:
         assert result.get('generation') == 1
         assert 'position' in result, f'Expected position key, got: {result}'
         assert isinstance(result.get('position'), int)
-        assert 'started_at' in result, f'Expected started_at key, got: {result}'
-        assert result.get('started_at') == req.enqueued_at
+        assert 'enqueued_at' in result, f'Expected enqueued_at key, got: {result}'
+        assert result.get('enqueued_at') == req.enqueued_at
         assert 'eta_seconds' in result, f'Expected eta_seconds key, got: {result}'
 
     async def test_live_snapshot_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the live entry's request_id."""
-        import asyncio
-        import types
-
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            SpeculativeMergeWorker,
-        )
-
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3144,14 +3113,6 @@ class TestMergeStatus:
 
     async def test_live_snapshot_lookup_by_task_id(self, tmp_path: Path) -> None:
         """task_id= lookup resolves to the live entry's request_id."""
-        import asyncio
-        import types
-
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            SpeculativeMergeWorker,
-        )
-
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3177,20 +3138,6 @@ class TestMergeStatus:
 
     async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
         """Live snapshot tier wins over ring and event store for the same request_id."""
-        import asyncio
-        import types
-
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
-            EventStore,
-            EventType,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            SpeculativeMergeWorker,
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
-
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3245,15 +3192,6 @@ class TestMergeStatus:
         self, tmp_path: Path, verify_phase: str, expected: str
     ) -> None:
         """Live snapshot state mapping covers all documented phase values."""
-        import asyncio
-        import types
-
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            SpeculativeItem,
-            SpeculativeMergeWorker,
-        )
-
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3294,3 +3232,43 @@ class TestMergeStatus:
         assert result.get('state') == expected, (
             f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
         )
+
+    # ── Tier-1 degradation: snapshot() failure falls through to durable tiers ─
+
+    async def test_snapshot_failure_degrades_to_durable_tier(self, tmp_path: Path) -> None:
+        """Tier-1 fire-safe wrapper: a snapshot() exception falls through to ring/event-store.
+
+        This covers the most safety-critical branch: merge_status must return a
+        durable-tier result (not propagate the exception) when the live worker
+        is present but snapshot() itself raises.
+        """
+        # Populate the event store so the durable tier has a result to serve.
+        event_store = EventStore(tmp_path / 'runs.db', 'run-snap-fail')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-snapfail',
+            data={'request_id': 'mr-snapfail', 'branch': 'b-snapfail', 'state': 'done'},
+        )
+
+        # Stub worker whose snapshot() always raises — simulates a transient
+        # introspection failure (e.g. queue internals in a bad state).
+        broken_worker = types.SimpleNamespace(
+            snapshot=lambda: (_ for _ in ()).throw(RuntimeError('simulated snapshot failure'))
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=broken_worker,
+            _terminal_retention=None,
+        )
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        # Should NOT raise; should fall through to the event-store tier.
+        result = await _call_merge_status(server, request_id='mr-snapfail')
+
+        assert result.get('state') == 'done', (
+            f'Expected durable-tier result after snapshot() failure, got: {result}'
+        )
+        assert result.get('request_id') == 'mr-snapfail'
+        assert result.get('outcome') == 'done'
+        assert 'finished_at' in result
