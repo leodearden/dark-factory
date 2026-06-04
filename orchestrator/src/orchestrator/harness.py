@@ -3657,6 +3657,7 @@ Output JSON matching the schema. Every task must appear in the output.
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
         timeout_secs = cfg.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
+        bash_max_timeout_ms = str(int(timeout_secs * 1000))
 
         return await invoke_with_cap_retry(
             self.usage_gate,
@@ -3677,6 +3678,7 @@ Output JSON matching the schema. Every task must appear in the output.
             backend=cfg.watcher_backend,
             mcp_config=mcp_config,
             timeout_seconds=timeout_secs,
+            env_overrides={'BASH_MAX_TIMEOUT_MS': bash_max_timeout_ms},
             allowed_tools=_WATCHER_ALLOWED_TOOLS,
             disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
         )
