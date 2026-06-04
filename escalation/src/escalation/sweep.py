@@ -131,6 +131,7 @@ def _relocate_terminal(
         ``True`` if the file was (or would be) moved; ``False`` if skipped due
         to a collision — the existing target is left untouched.
     """
+    assert esc.resolved_at is not None  # pre-condition: caller ensures terminal status
     target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
     target_path = target_dir / path.name
 
