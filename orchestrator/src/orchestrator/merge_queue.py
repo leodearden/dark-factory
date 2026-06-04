@@ -22,6 +22,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -841,6 +842,179 @@ async def _check_plan_files_touched_in_branch(
     return PlanFilesTouchedResult(not_touched=not_touched)
 
 
+class TipRelation(Enum):
+    """Topological relationship between two branch-tip SHAs.
+
+    Used by the γ1 multi-waiter coalescing substrate to decide how to handle
+    a new submission when a merge is already in-flight for the same branch.
+
+    Values:
+    - SAME: both tips are the same SHA.
+    - SUPERSET: *new_tip* is a strict ancestor-descendant of *old_tip*
+      (new has all of old's commits plus more).
+    - SUBSET: *new_tip* is an ancestor of *old_tip* (new is strictly behind).
+    - DIVERGENT: neither tip is an ancestor of the other; must be resolved via
+      :func:`resolve_divergent` before passing to :func:`decide_attach_action`.
+
+    Consumer wiring (pending as of γ1):
+    - γ2 (task 1640): wires :func:`classify_tip_relation` /
+      :func:`decide_attach_action` into the worker's post-merge-equivalence
+      path to trigger generation auto-chaining; flips ``entry.verifying`` via
+      :meth:`InFlightMergeRegistry.set_verifying`.
+    - γ3 (task 1641): wires :func:`classify_tip_relation` /
+      :func:`decide_attach_action` at the workflow merge-phase submission
+      site to attach as a peer waiter.
+    """
+
+    SAME = 'same'
+    SUPERSET = 'superset'
+    SUBSET = 'subset'
+    DIVERGENT = 'divergent'
+
+
+async def classify_tip_relation(
+    new_tip: str,
+    old_tip: str,
+    git_ops: GitOps,
+) -> TipRelation:
+    """Return the topological relationship between *new_tip* and *old_tip*.
+
+    Checks performed in order (cheap first):
+
+    1. SHA equality → SAME.
+    2. ``is_ancestor(old_tip, new_tip)`` → SUPERSET (old is strictly behind new).
+    3. ``is_ancestor(new_tip, old_tip)`` → SUBSET (new is strictly behind old).
+    4. Neither → DIVERGENT (no ancestor relation; caller must use
+       :func:`resolve_divergent` to determine the patch-id relationship).
+
+    Consumed by γ2 (worker wiring) and γ3 (workflow caller) via the pure
+    :func:`decide_attach_action` mapping.
+    """
+    if new_tip == old_tip:
+        return TipRelation.SAME
+    if await git_ops.is_ancestor(old_tip, new_tip):
+        return TipRelation.SUPERSET
+    if await git_ops.is_ancestor(new_tip, old_tip):
+        return TipRelation.SUBSET
+    return TipRelation.DIVERGENT
+
+
+async def patch_content_contained(
+    head: str,
+    upstream: str,
+    git_ops: GitOps,
+) -> bool:
+    """Return True if every commit in *head* is already present (by patch-id) in *upstream*.
+
+    Uses ``git cherry upstream head``: lines without a leading ``+`` are
+    commits already applied; ``+`` lines are commits NOT yet in *upstream*.
+    An empty ``+``-line set → fully contained → True.
+
+    Fail-open: returns False on any git error (``rc != 0``) so that the
+    caller falls through to a full merge attempt rather than incorrectly
+    declaring the branch "already merged".
+
+    This is also the α2/D6 submit-time fast-path machinery: a branch whose
+    content is fully cherry-picked/rebased into main is "already merged" even
+    when its tip is not a literal ancestor.  The ``is_ancestor``-only
+    fast-path was wired in task 1629; the patch-id extension (this helper)
+    for escalation/server.py is not yet scheduled as a separate task.
+    """
+    rc, out, _ = await _run(
+        ['git', 'cherry', upstream, head],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        return False  # fail-open
+    return not any(line.startswith('+') for line in out.splitlines())
+
+
+async def resolve_divergent(
+    new_tip: str,
+    old_tip: str,
+    git_ops: GitOps,
+) -> TipRelation:
+    """Resolve a DIVERGENT tip-relation using patch-id content comparison.
+
+    Called when :func:`classify_tip_relation` returns DIVERGENT (neither tip
+    is a topological ancestor of the other).
+
+    If :func:`patch_content_contained` determines that *new_tip*'s commits are
+    all already present in *old_tip* (by patch-id — covers rebase/cherry-pick
+    rewrites), returns SUBSET (the new submission is content-equivalent to
+    what's already in-flight, just rebased).
+
+    Otherwise returns SUPERSET (the new submission has genuinely new content).
+    """
+    if await patch_content_contained(new_tip, old_tip, git_ops):
+        return TipRelation.SUBSET
+    return TipRelation.SUPERSET
+
+
+class AttachAction(Enum):
+    """Action to take when a new submission arrives for an already in-flight branch.
+
+    Derived from the PRD §7.2 dispatch table.  Computed by the pure
+    :func:`decide_attach_action` function given a resolved :class:`TipRelation`
+    and the current ``verifying`` flag.
+
+    Values:
+    - COALESCE: tip identical — attach as peer, resolve with same outcome.
+    - RESNAPSHOT: new tip is a superset and merge hasn't started verifying —
+      update snapshot_tip and re-try the merge with the new tip.
+    - ATTACH_AND_CHAIN: new tip is a superset but verify is already running —
+      attach as peer and set up gen-2 chaining (γ2 worker wiring).
+    - ATTACH_CONTAINMENT: new tip is a subset — attach as peer; at finalize
+      time the worker resolves via containment logic (boundary test 13).
+
+    Consumer wiring (pending as of γ1): γ2 (task 1640) and γ3 (task 1641).
+    See :class:`TipRelation` for per-phase details.
+    """
+
+    COALESCE = 'coalesce'
+    RESNAPSHOT = 'resnapshot'
+    ATTACH_AND_CHAIN = 'attach_and_chain'
+    ATTACH_CONTAINMENT = 'attach_containment'
+
+
+def decide_attach_action(
+    relation: TipRelation,
+    *,
+    verifying: bool,
+) -> AttachAction:
+    """Return the coalescing action for *relation* given the *verifying* flag.
+
+    Pure function (no git I/O) — maps the PRD §7.2 table exactly:
+
+    +------------------+----------------+---------------------+
+    | relation         | verifying=False | verifying=True      |
+    +==================+================+=====================+
+    | SAME             | COALESCE        | COALESCE            |
+    +------------------+----------------+---------------------+
+    | SUPERSET         | RESNAPSHOT      | ATTACH_AND_CHAIN    |
+    +------------------+----------------+---------------------+
+    | SUBSET           | ATTACH_CONTAINMENT | ATTACH_CONTAINMENT |
+    +------------------+----------------+---------------------+
+    | DIVERGENT        | ValueError      | ValueError          |
+    +------------------+----------------+---------------------+
+
+    DIVERGENT must be resolved via :func:`resolve_divergent` before calling
+    this function; it raises :class:`ValueError` otherwise to enforce the
+    "patch-id compare first" contract.
+    """
+    if relation is TipRelation.SAME:
+        return AttachAction.COALESCE
+    if relation is TipRelation.SUBSET:
+        return AttachAction.ATTACH_CONTAINMENT
+    if relation is TipRelation.SUPERSET:
+        return AttachAction.ATTACH_AND_CHAIN if verifying else AttachAction.RESNAPSHOT
+    # TipRelation.DIVERGENT
+    raise ValueError(
+        'DIVERGENT must be resolved via resolve_divergent() first before '
+        'decide_attach_action() can map it to an AttachAction.'
+    )
+
+
 async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
@@ -1511,7 +1685,17 @@ Adjusted at module level or injected via `liveness_secs` in tests."""
 
 @dataclass
 class _InFlightEntry:
-    """Registry slot for a single in-flight merge branch."""
+    """Registry slot for a single in-flight merge branch.
+
+    γ1 extended fields (all have defaults — existing callers unaffected):
+    - ``branch`` / ``snapshot_tip`` / ``generation`` / ``verifying``:
+      substrate for the PRD §7.2 multi-waiter coalescing model.
+    - ``waiters``: ordered list of :class:`WaiterRecord` objects; the
+      dispatcher is seeded as waiter #1 by :meth:`InFlightMergeRegistry.acquire`.
+    - ``primary_future``: the future owned by the dispatcher (waiter #1).
+      Stored so :meth:`~InFlightMergeRegistry.attach` can mirror its
+      terminal outcome onto all later waiters' futures.
+    """
 
     task_id: str
     enqueued_monotonic: float  # time.monotonic() at acquire time
@@ -1519,6 +1703,24 @@ class _InFlightEntry:
     """Stable identity of the dispatched MergeRequest (e.g. 'mr-a1b2c3d4').
     Set at acquire time from the MergeRequest.request_id; None for legacy
     callers that don't pass a request_id (back-compat)."""
+    # ── γ1 multi-waiter substrate ─────────────────────────────────────────
+    branch: str | None = None
+    """Branch name (e.g. '591'), set at acquire time."""
+    snapshot_tip: str | None = None
+    """Git SHA of the branch tip at acquire time (PRD §7.2 snapshot_tip)."""
+    generation: int = 1
+    """Monotonically increasing generation counter; incremented on each
+    re-snapshot that triggers a new merge attempt (γ2)."""
+    verifying: bool = False
+    """True once the merge worker has entered the post-merge verify phase.
+    Used by :func:`decide_attach_action` to choose ATTACH_AND_CHAIN vs
+    RESNAPSHOT for SUPERSET incoming submissions (γ2)."""
+    waiters: list[WaiterRecord] = field(default_factory=list)
+    """Ordered list of waiters; dispatcher is waiter #1 (seeded by
+    :meth:`InFlightMergeRegistry.acquire`).  Empty ⟺ released."""
+    primary_future: asyncio.Future | None = field(default=None, repr=False)
+    """The dispatcher's future (waiter #1).  Resolved by the worker;
+    its done-callbacks fan the terminal outcome out to all attached waiters."""
 
 
 _INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
@@ -1606,6 +1808,9 @@ class InFlightMergeRegistry:
         future: asyncio.Future,
         *,
         request_id: str | None = None,
+        source: str = 'mcp',
+        submitted_tip: str | None = None,
+        snapshot_tip: str | None = None,
     ) -> bool:
         """Atomic check-and-set: claim *branch* for *task_id*.
 
@@ -1620,16 +1825,37 @@ class InFlightMergeRegistry:
         :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
         :class:`_InFlightEntry` so β1 can re-source the ``'attached'``
         response from the existing entry's id rather than the submitting
-        request's id (PRD D8).  Keyword-only; defaults to ``None`` so
-        existing 3-positional-arg callers remain valid.
+        request's id (PRD D8).
+
+        γ1 additions (keyword-only, all defaulted for back-compat):
+        - *source*: origin of the dispatcher (``'mcp'`` or ``'workflow'``).
+        - *submitted_tip*: branch tip SHA at submit time; used for
+          tip-relation classification downstream.
+        - *snapshot_tip*: branch tip SHA snapshotted at dispatch time
+          (often the same as *submitted_tip*); stored on the entry for
+          re-snapshot / gen-2 chaining (γ2).
+
+        The dispatcher is seeded as waiter #1 in ``entry.waiters``; the
+        entry invariant is ``in-flight ⟺ len(waiters) ≥ 1``.
         """
         if branch in self._slots:
             return False
-        self._slots[branch] = _InFlightEntry(
+        entry = _InFlightEntry(
             task_id=task_id,
             enqueued_monotonic=time.monotonic(),
             request_id=request_id,
+            branch=branch,
+            snapshot_tip=snapshot_tip,
+            generation=1,
+            primary_future=future,
         )
+        entry.waiters = [WaiterRecord(
+            request_id=request_id or '',
+            future=future,
+            source=source,
+            submitted_tip=submitted_tip,
+        )]
+        self._slots[branch] = entry
         future.add_done_callback(lambda _: self._release(branch))
         return True
 
@@ -1660,6 +1886,108 @@ class InFlightMergeRegistry:
             # legitimately be in-flight long after the ETA estimate runs out.)
             return None
         return int(remaining)
+
+    def attach(self, branch: str, waiter: WaiterRecord) -> bool:
+        """Attach *waiter* as a peer on the in-flight entry for *branch*.
+
+        Returns True if the branch is in-flight and the waiter was appended;
+        False if the branch is free (caller must dispatch independently).
+
+        Fan-out: registers a guarded done-callback on ``entry.primary_future``
+        that mirrors its terminal outcome (result / exception / cancel) onto
+        ``waiter.future``.  The guard skips ``waiter.future`` when it is
+        already done (soft-cancel / detach race), so the callback never raises
+        ``InvalidStateError``.
+
+        Synchronous (no ``await``) — I10 race-freedom guaranteed within a
+        single asyncio event loop tick.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.waiters.append(waiter)
+        primary = entry.primary_future
+        if primary is not None and primary is not waiter.future:
+            target = waiter.future
+
+            def _mirror(pf: asyncio.Future) -> None:
+                if target.done():
+                    return  # guard: pre-resolved / detached future — skip
+                if pf.cancelled():
+                    target.cancel()
+                elif (exc := pf.exception()) is not None:
+                    target.set_exception(exc)
+                else:
+                    target.set_result(pf.result())
+
+            primary.add_done_callback(_mirror)
+        return True
+
+    def detach(self, branch: str, request_id: str) -> int:
+        """Remove the waiter identified by *request_id* from *branch*.
+
+        Returns the remaining waiter count (0 when the last waiter detaches).
+
+        When the count reaches zero the entry is considered abandoned:
+        ``primary_future`` is cancelled (if not already done), which fires
+        the existing acquire-time release done-callback (slot freed) and
+        makes the existing ``_request_abandoned`` checkpoint return True at
+        the next worker poll — dropping the queued work with ZERO worker code
+        change.
+
+        While ≥ 1 waiter remains the entry proceeds normally (boundary test
+        10 substrate).
+
+        Returns 0 for a branch not in-flight (no-op, safe to call).
+        Unknown *request_id* is a no-op returning the unchanged count.
+
+        **Resolution race guard (γ2/task 1640 wiring invariant):**
+        ``primary_future`` may be cancelled by ``detach()`` while the worker
+        has already passed an ``_request_abandoned`` checkpoint (returning
+        False) but has not yet called ``req.result.set_result()`` /
+        ``set_exception()``.  Calling either on a cancelled future raises
+        ``InvalidStateError``.
+
+        The established codebase convention — ``if not req.result.done():
+        req.result.set_result(...)`` — is already present at every
+        production resolution site (e.g. lines 3054-3055, 3065-3066,
+        4456-4457) and degrades a detach-cancel race to a safe no-op.
+        **All new worker resolution paths introduced by γ2 (task 1640) MUST
+        use the same guard.**  No ``await`` may appear between an
+        ``_request_abandoned`` checkpoint returning False and the subsequent
+        resolution call.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return 0
+        entry.waiters = [w for w in entry.waiters if w.request_id != request_id]
+        if not entry.waiters:
+            pf = entry.primary_future
+            if pf is not None and not pf.done():
+                pf.cancel()
+        return len(entry.waiters)
+
+    def re_snapshot(self, branch: str, new_tip: str) -> bool:
+        """Update the snapshot tip for *branch* to *new_tip*.
+
+        Returns True on success; False if *branch* is not in-flight.
+        The generation counter is NOT incremented here — the caller (γ2
+        worker wiring) increments it when triggering a new merge attempt.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.snapshot_tip = new_tip
+        return True
+
+    def set_verifying(self, branch: str, verifying: bool = True) -> None:
+        """Set the ``verifying`` flag on the in-flight entry for *branch*.
+
+        No-op when *branch* is not in-flight (safe to call on release race).
+        """
+        entry = self._slots.get(branch)
+        if entry is not None:
+            entry.verifying = verifying
 
     def release(self, branch: str) -> None:
         """Remove *branch* from the in-flight registry.

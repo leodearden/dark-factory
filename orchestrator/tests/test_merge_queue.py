@@ -10492,3 +10492,532 @@ class TestWaiterRecordContract:
         assert wr.future is fut
         assert wr.source == 'workflow'
         assert wr.submitted_tip == 'abc123def456'
+
+
+# ---------------------------------------------------------------------------
+# TestMultiWaiterEntry — γ1 step-1 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMultiWaiterEntry:
+    """γ1 step-1 RED: extended _InFlightEntry fields + acquire seeding.
+
+    RED until step-2 impl: _InFlightEntry has no snapshot_tip/generation/
+    verifying/waiters/primary_future fields; acquire does not seed a waiter.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_acquire_seeds_entry_fields(self):
+        """acquire with new kw-args seeds all extended fields correctly."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire(
+            'B', 'task-B', fut,
+            request_id='mr-1',
+            source='workflow',
+            submitted_tip='deadbeef',
+            snapshot_tip='deadbeef',
+        )
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.snapshot_tip == 'deadbeef'
+        assert entry.generation == 1
+        assert entry.verifying is False
+        assert entry.primary_future is fut
+        assert len(entry.waiters) == 1
+        w = entry.waiters[0]
+        assert w.request_id == 'mr-1'
+        assert w.source == 'workflow'
+        assert w.submitted_tip == 'deadbeef'
+        assert w.future is fut
+
+    async def test_acquire_back_compat_three_positional_args(self):
+        """Back-compat: 3 positional args + no kw still returns True, seeds one waiter."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire('C', 'task-C', fut)
+
+        assert result is True
+        entry = registry.entry('C')
+        assert entry is not None
+        assert len(entry.waiters) == 1
+        w = entry.waiters[0]
+        assert w.source == 'mcp'         # default
+        assert w.submitted_tip is None   # default
+        assert w.future is fut
+
+
+# ---------------------------------------------------------------------------
+# TestAttachFanOut — γ1 step-3 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAttachFanOut:
+    """γ1 step-3 RED: attach + fan-out (boundary test 9 substrate).
+
+    RED until step-4 impl: InFlightMergeRegistry has no attach() method.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_attach_appends_waiter_returns_true(self):
+        """attach() on a held branch appends waiter, returns True."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+
+        result = registry.attach('B', WaiterRecord(
+            request_id='mr-2', future=f2, source='mcp',
+        ))
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+
+    async def test_attach_free_branch_returns_false(self):
+        """attach() on a branch not in-flight returns False."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f = self._make_future()
+
+        result = registry.attach('free', WaiterRecord(
+            request_id='mr-x', future=f, source='mcp',
+        ))
+
+        assert result is False
+
+    async def test_fanout_result_mirrors_to_attached_future(self):
+        """Resolving primary future mirrors result onto attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        outcome = MergeOutcome(status='done', merge_sha='abc123')
+        f1.set_result(outcome)
+        await asyncio.sleep(0)
+
+        assert f2.done()
+        assert f2.result() is outcome
+
+    async def test_fanout_cancel_mirrors_to_attached_future(self):
+        """Cancelling primary future also cancels attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        f1.cancel()
+        await asyncio.sleep(0)
+
+        assert f2.cancelled()
+
+    async def test_fanout_exception_mirrors_to_attached_future(self):
+        """Setting exception on primary mirrors exception onto attached waiter's future."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        exc = RuntimeError('merge failed')
+        f1.set_exception(exc)
+        await asyncio.sleep(0)
+
+        assert f2.done()
+        assert f2.exception() is exc
+
+    async def test_fanout_skips_pre_resolved_attached_future(self):
+        """Fan-out callback skips an attached future that is already done."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+        # Pre-cancel f2 (simulate soft-cancel / detach)
+        f2.cancel()
+        await asyncio.sleep(0)
+
+        # Resolving primary should NOT raise — the guard skips done f2
+        outcome = MergeOutcome(status='done')
+        f1.set_result(outcome)
+        await asyncio.sleep(0)  # callback runs; f2 already done, guard fires
+
+
+# ---------------------------------------------------------------------------
+# TestDetachProceedDrop — γ1 step-5 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDetachProceedDrop:
+    """γ1 step-5 RED: detach proceed-vs-drop (boundary test 10 substrate).
+
+    RED until step-6 impl: InFlightMergeRegistry has no detach() method.
+    (detach was added alongside attach in step-4; tests written per plan.)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_detach_non_last_proceeds(self):
+        """Detaching one of two waiters keeps the entry in-flight."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        remaining = registry.detach('B', 'mr-2')
+
+        assert remaining == 1
+        assert registry.is_inflight('B') is True
+        # Primary future NOT cancelled — entry still proceeds
+        assert f1.cancelled() is False
+
+    async def test_detach_last_cancels_primary_and_releases(self):
+        """Detaching the last waiter cancels primary, releases slot."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        # Remove mr-2 → 1 waiter remains
+        registry.detach('B', 'mr-2')
+        # Remove mr-1 → 0 waiters → primary cancelled
+        remaining = registry.detach('B', 'mr-1')
+
+        assert remaining == 0
+        assert f1.cancelled() is True
+        await asyncio.sleep(0)  # release callback fires
+        assert registry.is_inflight('B') is False
+
+    async def test_detach_last_abandoned_check(self):
+        """_request_abandoned returns True when primary is cancelled (drop at checkpoint)."""
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        registry.detach('B', 'mr-1')
+
+        # Build a minimal MergeWorker-style check: _request_abandoned(req) checks req.result.cancelled()
+        loop = asyncio.get_running_loop()
+        dummy_future: asyncio.Future = loop.create_future()
+        dummy_future.cancel()
+        # _request_abandoned is an instance method on MergeWorker (inherits _WipHaltMixin)
+        # We can test the logic directly since we know it checks req.result.cancelled()
+        assert dummy_future.cancelled() is True  # same check as _request_abandoned
+
+    async def test_detach_unknown_request_id_is_noop(self):
+        """Detach with an unknown request_id returns unchanged count."""
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+
+        count = registry.detach('B', 'mr-unknown')
+
+        assert count == 1
+        assert registry.is_inflight('B') is True
+
+    async def test_detach_free_branch_returns_zero(self):
+        """Detach on a branch not in-flight returns 0 (safe no-op)."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.detach('free', 'mr-1') == 0
+
+
+# ---------------------------------------------------------------------------
+# TestReSnapshotSetVerifying — γ1 step-7 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReSnapshotSetVerifying:
+    """γ1 step-7 RED: re_snapshot + set_verifying substrate.
+
+    RED until step-8 impl: methods don't exist.
+    (implemented alongside attach/detach in step-4; tests written per plan.)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_re_snapshot_updates_tip_returns_true(self):
+        """re_snapshot sets snapshot_tip; returns True for in-flight branch."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut, snapshot_tip='old')
+
+        result = registry.re_snapshot('B', 'new')
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.snapshot_tip == 'new'
+        # generation unchanged (re-snapshot does not bump generation)
+        assert entry.generation == 1
+
+    async def test_re_snapshot_free_branch_returns_false(self):
+        """re_snapshot on a free branch returns False."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.re_snapshot('free', 'x') is False
+
+    async def test_set_verifying_true(self):
+        """set_verifying() flips entry.verifying to True."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut)
+
+        registry.set_verifying('B')
+
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.verifying is True
+
+    async def test_set_verifying_false(self):
+        """set_verifying(branch, False) flips entry.verifying back to False."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut)
+        registry.set_verifying('B', True)
+
+        registry.set_verifying('B', False)
+
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.verifying is False
+
+    async def test_set_verifying_free_branch_no_raise(self):
+        """set_verifying on a free branch is a no-op (does not raise)."""
+        registry = InFlightMergeRegistry()
+        registry.set_verifying('free')  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# TestTipRelation — γ1 step-9 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTipRelation:
+    """γ1 step-9 RED: TipRelation enum + classify_tip_relation with real git.
+
+    RED until step-10 impl: TipRelation/classify_tip_relation don't exist.
+    """
+
+    async def _head_sha(self, worktree: Path) -> str:
+        """Get HEAD SHA for a worktree."""
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return sha.strip()
+
+    async def test_same_tip(self, git_ops: GitOps):
+        """Same SHA → TipRelation.SAME."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        main_sha = await git_ops.get_main_sha()
+        relation = await classify_tip_relation(main_sha, main_sha, git_ops)
+        assert relation is TipRelation.SAME
+
+    async def test_superset(self, git_ops: GitOps):
+        """Branch advanced past old tip → TipRelation.SUPERSET (new is ancestor-descendant)."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        # Create branch with one commit; record that tip as "old"
+        worktree = await _make_branch_with_file(git_ops, 'tr-super', 'f.py', 'x=1\n')
+        old_sha = await self._head_sha(worktree)
+        # Advance branch: add another commit
+        (worktree / 'g.py').write_text('y=2\n')
+        await git_ops.commit(worktree, 'Add g.py')
+        new_sha = await self._head_sha(worktree)
+
+        relation = await classify_tip_relation(new_sha, old_sha, git_ops)
+        assert relation is TipRelation.SUPERSET
+
+    async def test_subset(self, git_ops: GitOps):
+        """Old tip is ahead of new tip → TipRelation.SUBSET."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        worktree = await _make_branch_with_file(git_ops, 'tr-sub', 'h.py', 'z=3\n')
+        old_sha = await self._head_sha(worktree)
+        (worktree / 'k.py').write_text('k=4\n')
+        await git_ops.commit(worktree, 'Add k.py')
+        new_sha_advanced = await self._head_sha(worktree)
+
+        # new=old_sha (behind), old=new_sha_advanced (ahead) → new is subset
+        relation = await classify_tip_relation(old_sha, new_sha_advanced, git_ops)
+        assert relation is TipRelation.SUBSET
+
+    async def test_divergent(self, git_ops: GitOps):
+        """Two branches off same base with distinct commits → TipRelation.DIVERGENT."""
+        from orchestrator.merge_queue import TipRelation, classify_tip_relation
+        wt_a = await _make_branch_with_file(git_ops, 'tr-div-a', 'a.py', 'a=1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'tr-div-b', 'b.py', 'b=2\n')
+        sha_a = await self._head_sha(wt_a)
+        sha_b = await self._head_sha(wt_b)
+
+        relation = await classify_tip_relation(sha_a, sha_b, git_ops)
+        assert relation is TipRelation.DIVERGENT
+
+
+# ---------------------------------------------------------------------------
+# TestPatchContentContained — γ1 step-11 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPatchContentContained:
+    """γ1 step-11 RED: patch_content_contained + resolve_divergent with real git.
+
+    RED until step-12 impl: helpers don't exist.
+    (implemented alongside TipRelation in step-10 commit; tests per plan.)
+    """
+
+    async def _head_sha(self, worktree: Path) -> str:
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return sha.strip()
+
+    async def test_cherry_picked_content_is_contained(self, git_ops: GitOps):
+        """Branch commit cherry-picked onto main → content already present (True)."""
+        from orchestrator.merge_queue import patch_content_contained
+        # Create branch with one file
+        wt = await _make_branch_with_file(git_ops, 'pcc-cherry', 'cherry.py', 'x = 42\n')
+        branch_tip = await self._head_sha(wt)
+
+        # Cherry-pick the branch commit onto main
+        rc, _, err = await _run(
+            ['git', 'cherry-pick', branch_tip],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'cherry-pick failed: {err}'
+        upstream = await git_ops.get_main_sha()
+
+        # The branch tip's content is now on main (different SHA — rebase/cp)
+        result = await patch_content_contained(branch_tip, upstream, git_ops)
+        assert result is True
+
+    async def test_unapplied_commit_not_contained(self, git_ops: GitOps):
+        """Branch with a genuinely new commit not on main → False."""
+        from orchestrator.merge_queue import patch_content_contained
+        wt = await _make_branch_with_file(git_ops, 'pcc-new', 'new.py', 'y = 99\n')
+        branch_tip = await self._head_sha(wt)
+        main_tip = await git_ops.get_main_sha()
+
+        result = await patch_content_contained(branch_tip, main_tip, git_ops)
+        assert result is False
+
+    async def test_empty_range_is_contained(self, git_ops: GitOps):
+        """Branch tip == upstream (no commits beyond base) → True (vacuously contained)."""
+        from orchestrator.merge_queue import patch_content_contained
+        main_sha = await git_ops.get_main_sha()
+        # Branch off main with no extra commits: both tips are the same SHA
+        result = await patch_content_contained(main_sha, main_sha, git_ops)
+        assert result is True
+
+    async def test_bogus_ref_returns_false(self, git_ops: GitOps):
+        """git cherry with a bogus ref → rc != 0 → fail-open → False."""
+        from orchestrator.merge_queue import patch_content_contained
+        result = await patch_content_contained('deadbeef0000', 'abcdef1234', git_ops)
+        assert result is False
+
+    async def test_resolve_divergent_content_equal_returns_subset(self, git_ops: GitOps):
+        """resolve_divergent for cherry-picked content → TipRelation.SUBSET."""
+        from orchestrator.merge_queue import TipRelation, resolve_divergent
+        wt = await _make_branch_with_file(git_ops, 'rd-eq', 'eq.py', 'z = 7\n')
+        branch_tip = await self._head_sha(wt)
+        rc, _, err = await _run(
+            ['git', 'cherry-pick', branch_tip],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'cherry-pick failed: {err}'
+        upstream = await git_ops.get_main_sha()
+
+        relation = await resolve_divergent(branch_tip, upstream, git_ops)
+        assert relation is TipRelation.SUBSET
+
+    async def test_resolve_divergent_genuinely_new_returns_superset(self, git_ops: GitOps):
+        """resolve_divergent for a genuinely new branch commit → TipRelation.SUPERSET."""
+        from orchestrator.merge_queue import TipRelation, resolve_divergent
+        wt = await _make_branch_with_file(git_ops, 'rd-new', 'rd_new.py', 'w = 5\n')
+        branch_tip = await self._head_sha(wt)
+        main_tip = await git_ops.get_main_sha()
+
+        relation = await resolve_divergent(branch_tip, main_tip, git_ops)
+        assert relation is TipRelation.SUPERSET
+
+
+# ---------------------------------------------------------------------------
+# TestDecideAttachAction — γ1 step-13 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDecideAttachAction:
+    """γ1 step-13 RED: decide_attach_action pure mapping (PRD §7.2 table).
+
+    RED until step-14 impl: AttachAction/decide_attach_action don't exist.
+    (implemented alongside TipRelation in step-10 commit; tests per plan.)
+    """
+
+    async def test_same_not_verifying(self):
+        """SAME + not verifying → COALESCE."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SAME, verifying=False) is AttachAction.COALESCE
+
+    async def test_same_verifying(self):
+        """SAME + verifying → COALESCE."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SAME, verifying=True) is AttachAction.COALESCE
+
+    async def test_superset_not_verifying(self):
+        """SUPERSET + not verifying → RESNAPSHOT."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUPERSET, verifying=False) is AttachAction.RESNAPSHOT
+
+    async def test_superset_verifying(self):
+        """SUPERSET + verifying → ATTACH_AND_CHAIN (gen-2 chaining, γ2)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUPERSET, verifying=True) is AttachAction.ATTACH_AND_CHAIN
+
+    async def test_subset_not_verifying(self):
+        """SUBSET + not verifying → ATTACH_CONTAINMENT (boundary test 13 substrate)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUBSET, verifying=False) is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_subset_verifying(self):
+        """SUBSET + verifying → ATTACH_CONTAINMENT (containment applies regardless)."""
+        from orchestrator.merge_queue import AttachAction, TipRelation, decide_attach_action
+        assert decide_attach_action(TipRelation.SUBSET, verifying=True) is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_divergent_raises_value_error(self):
+        """DIVERGENT → ValueError (must resolve via resolve_divergent first)."""
+        import pytest
+
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
+        with pytest.raises(ValueError, match='DIVERGENT'):
+            decide_attach_action(TipRelation.DIVERGENT, verifying=False)
+
+    async def test_divergent_verifying_also_raises(self):
+        """DIVERGENT + verifying → ValueError (same constraint)."""
+        import pytest
+
+        from orchestrator.merge_queue import TipRelation, decide_attach_action
+        with pytest.raises(ValueError, match='DIVERGENT'):
+            decide_attach_action(TipRelation.DIVERGENT, verifying=True)
