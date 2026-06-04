@@ -106,12 +106,42 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    returns an error or a non-success outcome (`conflict`, `blocked`, `failed`) — those post-charge
    aborts cost a slot. This is the accepted §4.2 tradeoff.
 
-8. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
-   branch=task_id, worktree=<abs path>, description="unblock-low-risk: <one-line summary>")`. `branch`
-   is the **bare task id** — the worker prepends `task/`. This blocks until the merge worker (which
-   re-rebases and runs authoritative post-merge verification) finishes. **If it returns `{'error':
-   ...}` (orchestrator not running) → ABORT.** Do NOT fall back to a direct `git merge` — an
-   unattended direct merge to main is exactly the risk this skill refuses to take.
+8. **Merge via the queue — never directly.** Submit:
+
+   ```
+   mcp__escalation__merge_request(task_id=task_id, branch=task_id,
+       worktree=<abs path>, description="unblock-low-risk: <one-line summary>",
+       wait_secs=100)
+   ```
+
+   `branch` is the **bare task id** — the worker prepends `task/`. The server clamps the wait to
+   ≤100 s (its internal `_MAX_WAIT_SECS`); `wait_secs=100` is the PRD-prescribed bounded value.
+
+   **If it returns `{'error': ...}` (orchestrator not running) → ABORT.** Never fall back to a
+   direct `git merge` — an unattended direct merge to main is exactly the risk this skill refuses
+   to take.
+
+   The response shape determines the next action:
+
+   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict` | `blocked`
+     | `already_merged` | `unknown_branch` | `failed`. The call also returns a `request_id` in
+     all cases except `already_merged`, which short-circuits before entry construction and returns
+     no `request_id`. Proceed to step 9.
+
+   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:** This is a **successful submission**, not
+     a failure. `queued` means the entry is waiting in the merge queue; `attached` means it was
+     coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
+     terminal state:
+
+     ```
+     while state ∈ {queued, verifying, gate, finalizing}:
+         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
+         sleep(wait)
+         result = mcp__escalation__merge_status(request_id)
+     ```
+
+     Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
+     60 s]. Proceed to step 9 with the final `result.state`.
 
 9. **Handle the outcome:**
    - **`done` / `already_merged`:** success.
