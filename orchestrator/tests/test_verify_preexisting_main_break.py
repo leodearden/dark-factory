@@ -181,3 +181,87 @@ class TestVerifyFailureIsPreexistingFalseCases:
         assert result is False, (
             'Different failure signature on main — not the same inherited break, should return False.'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — lifecycle: temp worktree created + removed in finally, no task-wt mutation
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureIsPreexistingLifecycle:
+    """Step-5 / test-expectation #6: cleanup runs even when probe raises; task-wt untouched."""
+
+    def test_worktree_add_and_remove_are_called(self, tmp_path: Path) -> None:
+        """A ``git worktree add --detach <tmp> <sha>`` and matching remove are issued."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = MagicMock()
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+
+        run_calls: list[list[str]] = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(list(cmd))
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', return_value=SAME_RESULT),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        add_calls = [c for c in run_calls if 'worktree' in c and 'add' in c]
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert len(add_calls) == 1, f'Expected 1 worktree add; got: {add_calls}'
+        assert len(remove_calls) == 1, f'Expected 1 worktree remove; got: {remove_calls}'
+        add_cmd = add_calls[0]
+        assert '--detach' in add_cmd, f'worktree add must use --detach: {add_cmd}'
+        assert MAIN_SHA in add_cmd, f'worktree add must target main_sha: {add_cmd}'
+        # The task worktree path must NOT appear in any _run invocation
+        for c in run_calls:
+            assert str(worktree) not in c, (
+                f'Task worktree path leaked into git command: {c}'
+            )
+
+    def test_cleanup_runs_even_when_probe_raises(self, tmp_path: Path) -> None:
+        """Cleanup (worktree remove + rmtree) runs even when run_scoped_verification raises."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = MagicMock()
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+
+        run_calls: list[list[str]] = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(list(cmd))
+            return (0, '', '')
+
+        async def _raising_verify(*args, **kwargs):
+            raise RuntimeError('simulated probe crash')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_raising_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        # Fail-safe: exception does not propagate
+        assert result is False, 'Probe exception must return False (fail-safe), not propagate.'
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert len(remove_calls) == 1, (
+            f'Cleanup must run even when probe raises; remove calls: {remove_calls}'
+        )
