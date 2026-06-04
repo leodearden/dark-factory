@@ -123,14 +123,13 @@ _STATUS_PRIORITY: dict[str, int] = {
 def id_key(t: dict) -> int:
     """Return task id as int for sorting, defaulting to 0 on error.
 
-    For dotted subtask IDs like '450.2' or '450.2.1', returns the parent
-    (first dot-segment) as int, so subtasks sort alongside their parent.
+    Bare-integer ids (int or numeric string like '42') are coerced directly
+    to int.  Non-parseable values (None, 'abc', dotted strings like '450.2')
+    return 0.  Top-level tasks only; the scheduler is top-level-only (DF-D).
     """
     tid = t.get('id', 0)
     try:
-        tid_str = str(tid)
-        # For dotted IDs like '450.2', use only the first segment
-        return int(tid_str.split('.')[0])
+        return int(tid)
     except (TypeError, ValueError):
         return 0
 
@@ -150,11 +149,11 @@ class FilteredTaskTree:
     same invariant — downstream consumers omit per-element type guards.
 
     max_task_id: Comprehensive (uncapped) maximum top-level task id across the
-        FULL flattened input, computed via the id_key first-dot-segment-to-int
-        rule.  Dotted subtask ids (e.g. '4044.2') contribute their parent int
-        (4044).  Defaults to 0 when the input is empty or contains no parseable
-        ids.  This field is independent of the done/cancelled/active render caps
-        and provides ground truth for detecting partial/wrong-source bulk reads.
+        FULL input, computed by id_key (bare-integer parse only; non-parseable
+        ids return 0).  Defaults to 0 when the input is empty or contains no
+        parseable ids.  This field is independent of the done/cancelled/active
+        render caps and provides ground truth for detecting partial/wrong-source
+        bulk reads.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -170,56 +169,6 @@ class FilteredTaskTree:
     other_count: int = 0
     total_count: int = 0
     max_task_id: int = 0
-
-
-# --------------------------------------------------------------------------- #
-# Subtask flattening
-# --------------------------------------------------------------------------- #
-
-
-def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
-    """Flatten a nested task list into a single flat list including all subtasks.
-
-    Recursively walks each task's 'subtasks' array.  Bare-integer subtask IDs
-    are qualified as 'parent_id.subtask_id' using a shallow copy (originals are
-    never mutated).  Already-qualified IDs (containing a dot) are left unchanged.
-    The 'subtasks' key is stripped from each emitted dict so the result is a
-    genuinely flat list (no nested arrays on any entry).
-
-    Note on intentional divergence: ``task_curator._flatten_task_tree`` (line 948)
-    performs a similar recursive walk but does *not* qualify subtask IDs — its
-    purpose is shape normalisation, not ID canonicalisation.  Extracting a shared
-    helper would require an ID-qualification callback and add coupling across
-    package boundaries for minimal gain; the implementations are kept separate.
-
-    Args:
-        raw_tasks: Top-level list of task dicts from a get_tasks response.
-
-    Returns:
-        Flat list of task dicts (parents first, subtasks immediately following),
-        with subtask IDs qualified to 'parent_id.subtask_id' and the 'subtasks'
-        key removed from every entry.
-    """
-    result: list[dict] = []
-
-    def _walk(tasks: list[dict], parent_id: str | None) -> None:
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            if parent_id is not None:
-                tid = str(task.get('id', ''))
-                if '.' not in tid:
-                    # Bare integer subtask id — qualify it
-                    task = {**task, 'id': f'{parent_id}.{tid}'}
-            # Capture subtasks before stripping, then emit a clean flat entry
-            subtasks = task.get('subtasks')
-            result.append({k: v for k, v in task.items() if k != 'subtasks'})
-            if isinstance(subtasks, list) and subtasks:
-                # Use the (possibly newly qualified) id as parent for next level
-                _walk(subtasks, str(task.get('id', '')))
-
-    _walk(raw_tasks, None)
-    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -249,9 +198,6 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     if not isinstance(raw_tasks, list):
         return FilteredTaskTree()
 
-    # Flatten subtasks into the top-level list, qualifying bare-integer IDs
-    all_tasks = _flatten_with_subtasks(raw_tasks)
-
     active: list[dict] = []
     done: list[dict] = []
     cancelled: list[dict] = []
@@ -259,7 +205,7 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     cancelled_count = 0
     other_count = 0
 
-    for task in all_tasks:
+    for task in raw_tasks:
         if not isinstance(task, dict):
             continue  # Skip non-dict elements defensively
 
@@ -315,11 +261,11 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
 
     total = len(active) + done_count + cancelled_count + other_count
 
-    # Compute comprehensive max task id over the FULL flattened list (not the
-    # capped done_retained / cancelled_retained slices).  Dotted subtask ids
-    # contribute their parent int via id_key's first-dot-segment rule.
-    # Defaults to 0 when all_tasks is empty or every id_key returns 0.
-    max_task_id = max((id_key(t) for t in all_tasks), default=0)
+    # Compute comprehensive max task id over the FULL top-level list (not the
+    # capped done_retained / cancelled_retained slices).  Only bare-integer ids
+    # contribute a positive value; non-parseable ids return 0 via id_key.
+    # Defaults to 0 when raw_tasks is empty or every id_key returns 0.
+    max_task_id = max((id_key(t) for t in raw_tasks if isinstance(t, dict)), default=0)
 
     return FilteredTaskTree(
         active_tasks=active,

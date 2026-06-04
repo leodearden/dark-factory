@@ -10,7 +10,7 @@ Bound the reconciliation backlog. When exceeded, escalate or reject. No silent g
 - Threshold: new config key `reconciliation.backlog_hard_limit` default **500**.
 - When `db_backlog > limit`:
   - If orchestrator is live for that project → write L1 escalation to `<project_root>/data/escalations/esc-reconciliation-backlog-<timestamp>.json` (schema below). Rate-limit: once per project per 15 min.
-  - Else → mutating MCP tools (`add_task`, `set_task_status`, `update_task`, `add_subtask`, `remove_task`, `add_dependency`, `remove_dependency`, `add_memory`, `add_episode`) return `{"error": "ReconciliationBacklogExceeded: backlog N > limit M for project P; drain before retrying.", "error_type": "ReconciliationBacklogExceeded", "backlog": N, "threshold": M, "project_id": "P"}`. Reads unaffected.
+  - Else → mutating MCP tools (`add_task`, `set_task_status`, `update_task`, `remove_task`, `add_dependency`, `remove_dependency`, `add_memory`, `add_episode`) return `{"error": "ReconciliationBacklogExceeded: backlog N > limit M for project P; drain before retrying.", "error_type": "ReconciliationBacklogExceeded", "backlog": N, "threshold": M, "project_id": "P"}`. Reads unaffected.
 - When judge halts a project → same escalation-or-log policy.
 - When SqliteWatchdog fires wedge (via its `wedge_callback`) → same policy, different error shape (`"error_type": "SqliteDrainerWedged"`).
 

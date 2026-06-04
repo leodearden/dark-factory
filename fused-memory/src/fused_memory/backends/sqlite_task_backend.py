@@ -3,10 +3,6 @@
 Per-project DB file at ``<project_root>/.taskmaster/tasks/tasks.db``.
 WAL mode handles concurrent readers natively; mutations are serialised
 per project_root by an :class:`asyncio.Lock`.
-
-Subtasks live as their own rows with ``parent_id`` set to their parent's
-top-level id; the dotted display form (``"292.1"``) is composed at read
-time and parsed on write.
 """
 
 from __future__ import annotations
@@ -24,7 +20,6 @@ from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daem
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
-    AddSubtaskResult,
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
@@ -39,34 +34,27 @@ from fused_memory.models.scope import resolve_project_id
 logger = logging.getLogger(__name__)
 
 
-# ``parent_id = 0`` is a sentinel for top-level tasks; subtask rows store the
-# parent's int id. Avoiding NULL keeps the PRIMARY KEY simple — SQLite cannot
-# use COALESCE(...) inside a PRIMARY KEY column list, and NULLs in a UNIQUE
-# index are treated as distinct, which would let duplicate top-levels slip in.
-_TOP_LEVEL_SENTINEL = 0
+# Incremented whenever the DB schema changes shape.  Stored in the SQLite
+# user_version header; read by ``_migrate`` at connection-open time.
+_SCHEMA_VERSION = 1
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
 # DB with many corrupted rows would otherwise flood the log with duplicate
-# WARNINGs on every read.  Keyed by ``(project_root, tag, parent_id, id)``
-# because a single SqliteTaskBackend instance services all project_roots (its
-# class docstring and ``self._connections`` cache both use project_root as the
-# per-DB key), and the default first task in every project is ``(master, 0, 1)``
-# — without project_root in the key, a second project DB with the same corrupted
-# row silently swallows its WARN.  Top-level row ``(0, 1)`` and subtask ``(1, 1)``
-# within the same project still dedup independently via parent_id.
-# Growth is bounded by the number of distinct (project_root, tag, parent_id, id)
-# quadruples across all project DBs opened in this process — a small,
-# row-count-capped set in practice.  No eviction is needed; a process restart
+# WARNINGs on every read.  Keyed by ``(project_root, tag, id)`` because a single
+# SqliteTaskBackend instance services all project_roots, and the default first
+# task in every project is ``(master, 1)`` — without project_root in the key, a
+# second project DB with the same corrupted row silently swallows its WARN.
+# Growth is bounded by the number of distinct (project_root, tag, id) triples
+# across all project DBs opened in this process.  No eviction needed; restart
 # re-emits.
-_warned_malformed_task_ids: set[tuple[str, str, int, int]] = set()
+_warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     tag           TEXT NOT NULL DEFAULT 'master',
     id            INTEGER NOT NULL,
-    parent_id     INTEGER NOT NULL DEFAULT 0,
     title         TEXT NOT NULL,
     description   TEXT,
     details       TEXT,
@@ -75,33 +63,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority      TEXT,
     metadata      TEXT,
     updated_at    TEXT NOT NULL,
-    PRIMARY KEY (tag, parent_id, id)
+    PRIMARY KEY (tag, id)
 );
 
 CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-CREATE INDEX IF NOT EXISTS ix_tasks_parent ON tasks (tag, parent_id);
 
 CREATE TABLE IF NOT EXISTS dependencies (
     tag        TEXT NOT NULL DEFAULT 'master',
     task_id    INTEGER NOT NULL,
-    parent_id  INTEGER NOT NULL DEFAULT 0,
     depends_on INTEGER NOT NULL,
-    PRIMARY KEY (tag, parent_id, task_id, depends_on)
+    PRIMARY KEY (tag, task_id, depends_on)
 );
 
--- Monotonic id high-water marks per (tag, parent_id) sequence.  ``add_task`` /
--- ``add_subtask`` allocate ``max(MAX(tasks.id), max_id) + 1`` so a deleted
--- top-level id is NEVER reissued (the counter holds the line after the row is
--- gone).  Applied idempotently via executescript on every connection open; old
--- code that ignores this table still reads/writes ``tasks`` correctly, so the
--- change is backward-compatible.  ``parent_id`` mirrors the tasks sentinel:
--- ``_TOP_LEVEL_SENTINEL`` (0) for the top-level sequence, the parent's int id
--- for a per-parent subtask sequence.
+-- Monotonic id high-water mark per tag sequence.  ``add_task`` allocates
+-- ``max(MAX(tasks.id), max_id) + 1`` so a deleted id is NEVER reissued.
+-- Applied idempotently via executescript on every connection open.
 CREATE TABLE IF NOT EXISTS id_counters (
-    tag        TEXT NOT NULL DEFAULT 'master',
-    parent_id  INTEGER NOT NULL DEFAULT 0,
-    max_id     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (tag, parent_id)
+    tag    TEXT NOT NULL DEFAULT 'master',
+    max_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tag)
 );
 """
 
@@ -115,30 +95,21 @@ def _now() -> str:
     )
 
 
-def _parse_task_id(raw: str | int) -> tuple[int, int | None]:
-    """Parse ``"292"`` or ``"292.1"`` into ``(id, parent_id)``.
+def _parse_task_id(raw: str | int) -> int:
+    """Parse ``"292"`` or ``292`` into a bare integer task id.
 
-    Top-level ids return ``parent_id=None``. Raises ``TaskmasterError`` with
-    code ``INVALID_TASK_ID`` when the input is not a parseable id —
-    matching how Taskmaster surfaces malformed ids.
+    Raises ``TaskmasterError`` with code ``INVALID_TASK_ID`` for any dotted
+    (e.g. ``"292.1"``) or non-numeric input.
     """
     s = str(raw).strip()
     if not s:
         raise TaskmasterError('INVALID_TASK_ID', f'empty task id: {raw!r}')
     if '.' in s:
-        parent_str, child_str = s.split('.', 1)
-        if '.' in child_str:
-            raise TaskmasterError(
-                'INVALID_TASK_ID', f'nested subtask ids not supported: {raw!r}',
-            )
-        try:
-            return int(child_str), int(parent_str)
-        except ValueError as exc:
-            raise TaskmasterError(
-                'INVALID_TASK_ID', f'non-numeric task id components: {raw!r}',
-            ) from exc
+        raise TaskmasterError(
+            'INVALID_TASK_ID', f'dotted task ids are not supported: {raw!r}',
+        )
     try:
-        return int(s), None
+        return int(s)
     except ValueError as exc:
         raise TaskmasterError(
             'INVALID_TASK_ID', f'non-numeric task id: {raw!r}',
@@ -187,21 +158,92 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
     return norm_pid, dep_int
 
 
-def _format_task_id(task_id: int, parent_id: int | None) -> str:
-    return f'{parent_id}.{task_id}' if parent_id is not None else str(task_id)
+def _format_task_id(task_id: int) -> str:
+    return str(task_id)
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    """One-shot idempotent migration: parent_id schema → flat schema.
+
+    Gated on ``PRAGMA user_version``.  When < _SCHEMA_VERSION AND tasks still
+    has a ``parent_id`` column: rebuild all three tables without parent_id
+    (straggler subtask rows with parent_id != 0 are silently dropped — by
+    soak + DF-B there are none), set user_version = 1.  If parent_id is
+    already absent (fresh DB opened with the new _SCHEMA_SQL), just stamps
+    the version.  Skipped entirely when user_version >= _SCHEMA_VERSION.
+    """
+    row = await (await conn.execute('PRAGMA user_version')).fetchone()
+    if row and row[0] >= _SCHEMA_VERSION:
+        return
+
+    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
+    col_names = {r[1] for r in info_rows}
+    if 'parent_id' not in col_names:
+        await conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
+        await conn.commit()
+        return
+
+    # Full rebuild: parent_id column is still present in all three tables.
+    # Rows with parent_id != 0 (straggler subtasks) are dropped by the
+    # INSERT...SELECT WHERE parent_id = 0 — no prior cancellation needed.
+    await conn.executescript(f"""
+        BEGIN;
+
+        CREATE TABLE tasks_new (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        INSERT INTO tasks_new
+            (tag, id, title, description, details, test_strategy,
+             status, priority, metadata, updated_at)
+        SELECT tag, id, title, description, details, test_strategy,
+               status, priority, metadata, COALESCE(updated_at, '')
+        FROM tasks WHERE parent_id = 0;
+        DROP TABLE tasks;
+        ALTER TABLE tasks_new RENAME TO tasks;
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+
+        CREATE TABLE dependencies_new (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        INSERT OR IGNORE INTO dependencies_new (tag, task_id, depends_on)
+        SELECT tag, task_id, depends_on FROM dependencies WHERE parent_id = 0;
+        DROP TABLE dependencies;
+        ALTER TABLE dependencies_new RENAME TO dependencies;
+
+        CREATE TABLE id_counters_new (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+        INSERT INTO id_counters_new (tag, max_id)
+        SELECT tag, MAX(max_id) FROM id_counters WHERE parent_id = 0 GROUP BY tag;
+        DROP TABLE id_counters;
+        ALTER TABLE id_counters_new RENAME TO id_counters;
+
+        PRAGMA user_version = {_SCHEMA_VERSION};
+        COMMIT;
+    """)
 
 
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
-    Top-level tasks emit string ``id`` ("292") and an empty ``subtasks``
-    list (filled in later by ``_get_tasks_internal``). Subtasks emit a
-    short integer ``id`` plus ``parentTaskId`` mirroring Taskmaster's
-    actual file layout — see ``project_root/.taskmaster/tasks/tasks.json``
-    for an example.
+    All tasks are top-level after DF-D. Ids surface as strings (matches live
+    get_tasks wire shape). get_task converts to int after the call.
     """
-    parent_id_db = row['parent_id']
-    parent_id: int | None = parent_id_db if parent_id_db != _TOP_LEVEL_SENTINEL else None
     metadata_raw = row['metadata']
     metadata: Any = None
     if metadata_raw:
@@ -210,56 +252,31 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         except (TypeError, ValueError):
             # Malformed legacy row: discard and surface {} so downstream
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
-            # WARN once per (project_root, tag, parent_id, id) per process so a
-            # corrupted-row batch doesn't fan out to one log line per row per
-            # get_tasks call.  project_root is the leading key element so that
-            # two project DBs sharing (master, 0, 1) each produce their own WARN.
-            dedup_key = (project_root, row['tag'], row['parent_id'], row['id'])
+            # WARN once per (project_root, tag, id) per process so a corrupted-row
+            # batch doesn't fan out to one log line per row per get_tasks call.
+            dedup_key = (project_root, row['tag'], row['id'])
             if dedup_key not in _warned_malformed_task_ids:
                 _warned_malformed_task_ids.add(dedup_key)
                 logger.warning(
                     'sqlite_task_backend: malformed metadata JSON — project_root=%s'
-                    ' tag=%s id=%s parent_id=%s metadata_raw=%s; coerced to {}',
+                    ' tag=%s id=%s metadata_raw=%s; coerced to {}',
                     project_root,
                     row['tag'],
                     row['id'],
-                    row['parent_id'],
                     repr(metadata_raw)[:80],
                 )
             metadata = {}
 
-    if parent_id is None:
-        # Top-level: ids surface as strings (matches live get_tasks wire shape
-        # — see test_get_tasks_returns_flat_dto in test_taskmaster_client_contract.py).
-        out: dict[str, Any] = {
-            'id': str(row['id']),
-            'title': row['title'],
-            'description': row['description'] or '',
-            'details': row['details'] or '',
-            'testStrategy': row['test_strategy'] or '',
-            'status': row['status'],
-            'dependencies': dependencies,
-            'priority': row['priority'] or 'medium',
-            'subtasks': [],
-            'updatedAt': row['updated_at'],
-            'metadata': metadata if metadata is not None else {},
-        }
-        return out
-
-    # Subtask: short integer id + parentTaskId. testStrategy/priority are not
-    # surfaced (they follow the Taskmaster file-format shape). metadata IS
-    # surfaced so that memory_hints and other reconciliation data written via
-    # update_task('1.1', metadata=...) round-trip correctly to consumers like
-    # context_assembler.py that read `(task.get('metadata') or {}).get(...)`.
     return {
-        'id': row['id'],
+        'id': str(row['id']),
         'title': row['title'],
         'description': row['description'] or '',
         'details': row['details'] or '',
+        'testStrategy': row['test_strategy'] or '',
         'status': row['status'],
         'dependencies': dependencies,
-        'parentTaskId': parent_id,
-        'parentId': 'undefined',
+        'priority': row['priority'] or 'medium',
+        'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
     }
@@ -425,6 +442,7 @@ class SqliteTaskBackend:
             await conn.execute('PRAGMA foreign_keys=OFF')
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()
+            await _migrate(conn)
             self._connections[project_root] = conn
             logger.info('SqliteTaskBackend opened %s', db_path)
             return conn
@@ -462,17 +480,16 @@ class SqliteTaskBackend:
 
     async def _fetch_dependencies(
         self, conn: aiosqlite.Connection, tag: str,
-    ) -> dict[tuple[int, int], list[int]]:
-        """Return ``{(task_id, parent_id_or_0): [depends_on, ...]}`` for *tag*."""
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` for *tag*."""
         cursor = await conn.execute(
-            'SELECT task_id, parent_id, depends_on FROM dependencies WHERE tag = ?',
+            'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
             (tag,),
         )
         rows = await cursor.fetchall()
-        out: dict[tuple[int, int], list[int]] = {}
+        out: dict[int, list[int]] = {}
         for row in rows:
-            key = (row['task_id'], row['parent_id'])
-            out.setdefault(key, []).append(row['depends_on'])
+            out.setdefault(row['task_id'], []).append(row['depends_on'])
         for deps in out.values():
             deps.sort()
         return out
@@ -481,36 +498,16 @@ class SqliteTaskBackend:
         self, project_root: str, tag: str,
     ) -> list[dict[str, Any]]:
         conn = await self._get_connection(project_root)
-        # Order: top-levels first (parent_id=0), then subtasks. Within each,
-        # by id ascending — matches Taskmaster's file ordering.
         cursor = await conn.execute(
-            'SELECT * FROM tasks WHERE tag = ? ORDER BY '
-            'CASE WHEN parent_id = ? THEN id ELSE parent_id END, parent_id, id',
-            (tag, _TOP_LEVEL_SENTINEL),
+            'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
+            (tag,),
         )
         rows = await cursor.fetchall()
         deps = await self._fetch_dependencies(conn, tag)
-
-        # Build top-levels first, then attach subtasks under each.
-        top_by_id: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            if row['parent_id'] == _TOP_LEVEL_SENTINEL:
-                key = (row['id'], _TOP_LEVEL_SENTINEL)
-                top_by_id[row['id']] = _row_to_task(row, deps.get(key, []), project_root=project_root)
-
-        for row in rows:
-            if row['parent_id'] != _TOP_LEVEL_SENTINEL:
-                key = (row['id'], row['parent_id'])
-                parent = top_by_id.get(row['parent_id'])
-                if parent is None:
-                    # Orphan subtask — surface as top-level so it isn't lost.
-                    top_by_id[-row['parent_id']] = _row_to_task(
-                        row, deps.get(key, []), project_root=project_root,
-                    )
-                else:
-                    parent['subtasks'].append(_row_to_task(row, deps.get(key, []), project_root=project_root))
-
-        return [top_by_id[k] for k in sorted(top_by_id)]
+        return [
+            _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
+            for row in rows
+        ]
 
     # ── Public surface ─────────────────────────────────────────────────
 
@@ -527,13 +524,12 @@ class SqliteTaskBackend:
     ) -> dict:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        tid, parent_id = _parse_task_id(task_id)
-        parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
+        tid = _parse_task_id(task_id)
         conn = await self._get_connection(project_root)
 
         cursor = await conn.execute(
-            'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-            (tag, tid, parent_db),
+            'SELECT * FROM tasks WHERE tag = ? AND id = ?',
+            (tag, tid),
         )
         row = await cursor.fetchone()
         if row is None:
@@ -542,22 +538,11 @@ class SqliteTaskBackend:
             )
         deps = await self._fetch_dependencies(conn, tag)
 
-        out = _row_to_task(row, deps.get((row['id'], row['parent_id']), []), project_root=project_root)
+        out = _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
         # get_task surfaces a single task — Taskmaster returns int id here
         # (asymmetric with get_tasks; mirror that quirk to keep wire-compat).
-        if parent_id is None:
-            with contextlib.suppress(TypeError, ValueError):
-                out['id'] = int(out['id'])
-            # Walk subtasks under this top-level for completeness.
-            subtask_cursor = await conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND parent_id = ? ORDER BY id',
-                (tag, tid),
-            )
-            sub_rows = await subtask_cursor.fetchall()
-            out['subtasks'] = [
-                _row_to_task(r, deps.get((r['id'], r['parent_id']), []), project_root=project_root)
-                for r in sub_rows
-            ]
+        with contextlib.suppress(TypeError, ValueError):
+            out['id'] = int(out['id'])
         return out
 
     async def set_task_status(
@@ -569,12 +554,11 @@ class SqliteTaskBackend:
     ) -> SetTaskStatusResult:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        tid, parent_id = _parse_task_id(task_id)
-        parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
+        tid = _parse_task_id(task_id)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT status FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, tid, parent_db),
+                'SELECT status FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -585,8 +569,8 @@ class SqliteTaskBackend:
             old_status = row['status']
             await conn.execute(
                 'UPDATE tasks SET status = ?, updated_at = ? '
-                'WHERE tag = ? AND id = ? AND parent_id = ?',
-                (status, _now(), tag, tid, parent_db),
+                'WHERE tag = ? AND id = ?',
+                (status, _now(), tag, tid),
             )
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
@@ -641,26 +625,26 @@ class SqliteTaskBackend:
                 """
                 SELECT MAX(highwater) FROM (
                     SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
-                        WHERE tag = ? AND parent_id = ?
+                        WHERE tag = ?
                     UNION ALL
                     SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
-                        WHERE tag = ? AND parent_id = ?
+                        WHERE tag = ?
                 )
                 """,
-                (tag, _TOP_LEVEL_SENTINEL, tag, _TOP_LEVEL_SENTINEL),
+                (tag, tag),
             )
             _max_row = await cursor.fetchone()
             assert _max_row is not None  # aggregate MAX always returns one row
             next_id = (_max_row[0] or 0) + 1
             await conn.execute(
                 """
-                    INSERT INTO tasks (tag, id, parent_id, title, description,
+                    INSERT INTO tasks (tag, id, title, description,
                                        details, test_strategy, status, priority,
                                        metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?)
                     """,
                 (
-                    tag, next_id, _TOP_LEVEL_SENTINEL, title,
+                    tag, next_id, title,
                     description or '', details or '',
                     status, priority or 'medium', metadata, _now(),
                 ),
@@ -668,16 +652,16 @@ class SqliteTaskBackend:
             for dep in deps_list:
                 await conn.execute(
                     'INSERT OR IGNORE INTO dependencies '
-                    '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                    (tag, next_id, _TOP_LEVEL_SENTINEL, dep),
+                    '(tag, task_id, depends_on) VALUES (?, ?, ?)',
+                    (tag, next_id, dep),
                 )
             await conn.execute(
                 """
-                INSERT INTO id_counters (tag, parent_id, max_id) VALUES (?, ?, ?)
-                    ON CONFLICT(tag, parent_id) DO UPDATE SET max_id = excluded.max_id
+                INSERT INTO id_counters (tag, max_id) VALUES (?, ?)
+                    ON CONFLICT(tag) DO UPDATE SET max_id = excluded.max_id
                         WHERE excluded.max_id > id_counters.max_id
                 """,
-                (tag, _TOP_LEVEL_SENTINEL, next_id),
+                (tag, next_id),
             )
         return {
             'id': str(next_id),
@@ -708,13 +692,12 @@ class SqliteTaskBackend:
         # semantics keyed off ``append``.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        tid, parent_id = _parse_task_id(task_id)
-        parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
+        tid = _parse_task_id(task_id)
 
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, tid, parent_db),
+                'SELECT * FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -771,45 +754,30 @@ class SqliteTaskBackend:
             set_values.append(_now())
 
             set_clause = ', '.join(set_columns)
-            set_values.extend([tag, tid, parent_db])
+            set_values.extend([tag, tid])
             await conn.execute(
                 f'UPDATE tasks SET {set_clause} '
-                f'WHERE tag = ? AND id = ? AND parent_id = ?',
+                f'WHERE tag = ? AND id = ?',
                 set_values,
             )
 
-            # Dependencies: replace-mode only. Subtask deps are unsupported
-            # (matches add_dependency); structured callers pass top-level
-            # ids only. Empty list clears all deps.
+            # Dependencies: replace-mode only. Empty list clears all deps.
             if dependencies is not None:
-                if parent_id is not None:
-                    raise TaskmasterError(
-                        'TASKMASTER_TOOL_ERROR',
-                        'update_task: subtask dependencies are not supported',
-                    )
-                parsed_deps: list[int] = []
-                for raw in dependencies:
-                    dep_tid, dep_parent = _parse_task_id(raw)
-                    if dep_parent is not None:
-                        raise TaskmasterError(
-                            'TASKMASTER_TOOL_ERROR',
-                            'update_task: subtask dependencies are not supported',
-                        )
-                    parsed_deps.append(dep_tid)
+                parsed_deps: list[int] = [_parse_task_id(raw) for raw in dependencies]
                 await conn.execute(
-                    'DELETE FROM dependencies WHERE tag = ? AND task_id = ? AND parent_id = ?',
-                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                    'DELETE FROM dependencies WHERE tag = ? AND task_id = ?',
+                    (tag, tid),
                 )
                 for dep in parsed_deps:
                     await conn.execute(
                         'INSERT OR IGNORE INTO dependencies '
-                        '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                        (tag, tid, _TOP_LEVEL_SENTINEL, dep),
+                        '(tag, task_id, depends_on) VALUES (?, ?, ?)',
+                        (tag, tid, dep),
                     )
 
             refreshed_cursor = await conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, tid, parent_db),
+                'SELECT * FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
         deps = (
@@ -818,7 +786,7 @@ class SqliteTaskBackend:
             )
         )
         updated_task = (
-            _row_to_task(refreshed, deps.get((refreshed['id'], refreshed['parent_id']), []), project_root=project_root)
+            _row_to_task(refreshed, deps.get(refreshed['id'], []), project_root=project_root)
             if refreshed is not None else None
         )
         return {
@@ -826,98 +794,6 @@ class SqliteTaskBackend:
             'message': f'Task {task_id} updated',
             'updated': True,
             'updated_task': updated_task,
-        }
-
-    async def add_subtask(
-        self,
-        parent_id: str,
-        project_root: str,
-        title: str | None = None,
-        description: str | None = None,
-        details: str | None = None,
-        tag: str | None = None,
-    ) -> AddSubtaskResult:
-        await self.ensure_connected()
-        tag = tag or DEFAULT_TAG
-        parent_int = _parse_task_id(parent_id)
-        if parent_int[1] is not None:
-            raise TaskmasterError(
-                'INVALID_TASK_ID',
-                f'add_subtask: nested subtask ids not supported: {parent_id!r}',
-            )
-        parent_tid = parent_int[0]
-        if not title:
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR',
-                'add_subtask: title is required',
-            )
-
-        async with self._write_lock(project_root), self._txn(project_root) as conn:
-            cursor = await conn.execute(
-                'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, parent_tid, _TOP_LEVEL_SENTINEL),
-            )
-            if (await cursor.fetchone()) is None:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    f'Parent task not found: {parent_id}',
-                )
-
-            # Per-parent subtask sequence: high-water across live subtask rows
-            # AND the persisted counter (parent_id = the parent's int id), so a
-            # deleted subtask id is never reissued.  Self-heals legacy DBs the
-            # same way as add_task.
-            max_cursor = await conn.execute(
-                """
-                SELECT MAX(highwater) FROM (
-                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
-                        WHERE tag = ? AND parent_id = ?
-                    UNION ALL
-                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
-                        WHERE tag = ? AND parent_id = ?
-                )
-                """,
-                (tag, parent_tid, tag, parent_tid),
-            )
-            _max_row = await max_cursor.fetchone()
-            assert _max_row is not None  # aggregate MAX always returns one row
-            next_id = (_max_row[0] or 0) + 1
-            await conn.execute(
-                """
-                    INSERT INTO tasks (tag, id, parent_id, title, description,
-                                       details, test_strategy, status, priority,
-                                       metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, '', 'pending', NULL, NULL, ?)
-                    """,
-                (
-                    tag, next_id, parent_tid, title, description or '',
-                    details or '', _now(),
-                ),
-            )
-            await conn.execute(
-                """
-                INSERT INTO id_counters (tag, parent_id, max_id) VALUES (?, ?, ?)
-                    ON CONFLICT(tag, parent_id) DO UPDATE SET max_id = excluded.max_id
-                        WHERE excluded.max_id > id_counters.max_id
-                """,
-                (tag, parent_tid, next_id),
-            )
-
-            refreshed_cursor = await conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                (tag, next_id, parent_tid),
-            )
-            refreshed = await refreshed_cursor.fetchone()
-
-        subtask_dict = (
-            _row_to_task(refreshed, [], project_root=project_root) if refreshed is not None else {}
-        )
-        formatted_id = _format_task_id(next_id, parent_tid)
-        return {
-            'id': formatted_id,
-            'parent_id': str(parent_tid),
-            'message': f'New subtask {formatted_id} successfully created',
-            'subtask': subtask_dict,
         }
 
     async def remove_tasks(
@@ -938,110 +814,49 @@ class SqliteTaskBackend:
             }
 
         # Parse all upfront — a single bad id fails the whole batch (caller
-        # sent garbage; no partial-success on malformed input). Order is
-        # preserved so the reported removed_ids and missing list mirror the
-        # caller's input order.
-        parsed: list[tuple[int, int | None]] = [_parse_task_id(raw) for raw in ids]
+        # sent garbage; no partial-success on malformed input).
+        parsed: list[int] = [_parse_task_id(raw) for raw in ids]
 
         async with self._write_lock(project_root), self._txn(project_root) as conn:
-            # One SELECT to identify which requested rows exist. SQLite's
-            # default SQL parameter limit (999) bounds batch size; realistic
-            # callers stay well under it.
-            where_pairs = ' OR '.join(
-                '(id = ? AND parent_id = ?)' for _ in parsed
-            )
-            params: list[Any] = [tag]
-            for tid, parent_id in parsed:
-                parent_db = (
-                    parent_id if parent_id is not None
-                    else _TOP_LEVEL_SENTINEL
-                )
-                params.extend([tid, parent_db])
+            # One SELECT to identify which requested rows exist.
+            id_placeholders = ','.join('?' for _ in parsed)
             cursor = await conn.execute(
-                f'SELECT id, parent_id FROM tasks '
-                f'WHERE tag = ? AND ({where_pairs})',
-                params,
+                f'SELECT id FROM tasks WHERE tag = ? AND id IN ({id_placeholders})',
+                [tag, *parsed],
             )
-            existing_keys: set[tuple[int, int]] = {
-                (row['id'], row['parent_id'])
-                for row in await cursor.fetchall()
-            }
+            existing_ids: set[int] = {row['id'] for row in await cursor.fetchall()}
 
-            # Classify into existing (to remove) vs missing. Dedupe by
-            # (id, parent_id) so duplicate caller input doesn't double-count.
-            removed_keys: set[tuple[int, int]] = set()
+            # Classify into existing (to remove) vs missing.
+            removed_ids: list[int] = []
             removed_display: list[str] = []
-            existing_top_tids: set[int] = set()
             failed_display: list[str] = []
-            failed_seen: set[str] = set()
+            seen_removed: set[int] = set()
+            seen_failed: set[str] = set()
 
-            for tid, parent_id in parsed:
-                parent_db = (
-                    parent_id if parent_id is not None
-                    else _TOP_LEVEL_SENTINEL
-                )
-                key = (tid, parent_db)
-                disp = _format_task_id(tid, parent_id)
-                if key not in existing_keys:
-                    if disp not in failed_seen:
+            for tid in parsed:
+                disp = _format_task_id(tid)
+                if tid not in existing_ids:
+                    if disp not in seen_failed:
                         failed_display.append(disp)
-                        failed_seen.add(disp)
+                        seen_failed.add(disp)
                     continue
-                if key not in removed_keys:
-                    removed_keys.add(key)
+                if tid not in seen_removed:
+                    removed_ids.append(tid)
                     removed_display.append(disp)
-                if parent_id is None:
-                    existing_top_tids.add(tid)
-
-            # Cascade: every existing top-level pulls in its subtasks.
-            # Skip subtasks already explicitly listed by the caller so
-            # they aren't reported twice.
-            if existing_top_tids:
-                top_list = list(existing_top_tids)
-                top_placeholders = ','.join('?' for _ in top_list)
-                sub_cursor = await conn.execute(
-                    f'SELECT id, parent_id FROM tasks '
-                    f'WHERE tag = ? AND parent_id IN ({top_placeholders})',
-                    [tag, *top_list],
-                )
-                sub_rows = sorted(
-                    await sub_cursor.fetchall(),
-                    key=lambda r: (r['parent_id'], r['id']),
-                )
-                for sub_row in sub_rows:
-                    sub_key = (sub_row['id'], sub_row['parent_id'])
-                    if sub_key in removed_keys:
-                        continue
-                    removed_keys.add(sub_key)
-                    removed_display.append(
-                        _format_task_id(sub_row['id'], sub_row['parent_id']),
-                    )
+                    seen_removed.add(tid)
 
             # Two batch DELETEs — tasks then their owning dependencies.
             # Cross-task deps pointing AT removed ids stay dangling on
-            # purpose (matches the original single-id behaviour and lets
-            # validate_dependencies surface them).
-            if removed_keys:
-                keys_list = list(removed_keys)
-                task_pairs = ' OR '.join(
-                    '(id = ? AND parent_id = ?)' for _ in keys_list
-                )
-                task_params: list[Any] = [tag]
-                for tid, pdb in keys_list:
-                    task_params.extend([tid, pdb])
+            # purpose (lets validate_dependencies surface them).
+            if removed_ids:
+                rm_placeholders = ','.join('?' for _ in removed_ids)
                 await conn.execute(
-                    f'DELETE FROM tasks WHERE tag = ? AND ({task_pairs})',
-                    task_params,
+                    f'DELETE FROM tasks WHERE tag = ? AND id IN ({rm_placeholders})',
+                    [tag, *removed_ids],
                 )
-                dep_pairs = ' OR '.join(
-                    '(task_id = ? AND parent_id = ?)' for _ in keys_list
-                )
-                dep_params: list[Any] = [tag]
-                for tid, pdb in keys_list:
-                    dep_params.extend([tid, pdb])
                 await conn.execute(
-                    f'DELETE FROM dependencies WHERE tag = ? AND ({dep_pairs})',
-                    dep_params,
+                    f'DELETE FROM dependencies WHERE tag = ? AND task_id IN ({rm_placeholders})',
+                    [tag, *removed_ids],
                 )
 
         successful = len(removed_display)
@@ -1085,12 +900,7 @@ class SqliteTaskBackend:
 
         # ── Qualified (cross-project) path ─────────────────────────────────
         if ':' in str(depends_on):
-            tid, parent_id = _parse_task_id(task_id)
-            if parent_id is not None:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    'add_dependency: subtask dependencies are not supported',
-                )
+            tid = _parse_task_id(task_id)
             norm_pid, dep_int = _parse_qualified_dep(depends_on)
             canonical = f'{norm_pid}:{dep_int}'
 
@@ -1103,8 +913,8 @@ class SqliteTaskBackend:
 
             async with self._write_lock(project_root), self._txn(project_root) as conn:
                 cursor = await conn.execute(
-                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
+                    (tag, tid),
                 )
                 row = await cursor.fetchone()
                 if row is None:
@@ -1119,8 +929,8 @@ class SqliteTaskBackend:
                 )
                 await conn.execute(
                     'UPDATE tasks SET metadata = ?, updated_at = ? '
-                    'WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (new_meta, _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                    'WHERE tag = ? AND id = ?',
+                    (new_meta, _now(), tag, tid),
                 )
             return {
                 'id': str(tid),
@@ -1129,23 +939,15 @@ class SqliteTaskBackend:
             }
 
         # ── Bare-integer (same-project) path ───────────────────────────────
-        tid, parent_id = _parse_task_id(task_id)
-        dep_tid, dep_parent_id = _parse_task_id(depends_on)
-        if parent_id is not None or dep_parent_id is not None:
-            # Taskmaster's tasks.json schema only persists top-level dependencies;
-            # subtask deps are an undocumented edge that we explicitly reject so
-            # callers can't silently lose state across the SQLite cutover.
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR',
-                'add_dependency: subtask dependencies are not supported',
-            )
+        tid = _parse_task_id(task_id)
+        dep_tid = _parse_task_id(depends_on)
 
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             # Verify both endpoints exist before inserting.
             for tid_check in (tid, dep_tid):
                 cursor = await conn.execute(
-                    'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid_check, _TOP_LEVEL_SENTINEL),
+                    'SELECT id FROM tasks WHERE tag = ? AND id = ?',
+                    (tag, tid_check),
                 )
                 if (await cursor.fetchone()) is None:
                     raise TaskmasterError(
@@ -1159,8 +961,8 @@ class SqliteTaskBackend:
                 )
             await conn.execute(
                 'INSERT OR IGNORE INTO dependencies '
-                '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
+                '(tag, task_id, depends_on) VALUES (?, ?, ?)',
+                (tag, tid, dep_tid),
             )
         return {
             'id': str(tid),
@@ -1193,17 +995,12 @@ class SqliteTaskBackend:
         if ':' in str(depends_on):
             norm_pid, dep_int = _parse_qualified_dep(depends_on)
             canonical = f'{norm_pid}:{dep_int}'
-            tid, parent_id = _parse_task_id(task_id)
-            if parent_id is not None:
-                raise TaskmasterError(
-                    'TASKMASTER_TOOL_ERROR',
-                    'remove_dependency: subtask dependencies are not supported',
-                )
+            tid = _parse_task_id(task_id)
 
             async with self._write_lock(project_root), self._txn(project_root) as conn:
                 cursor = await conn.execute(
-                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, _TOP_LEVEL_SENTINEL),
+                    'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
+                    (tag, tid),
                 )
                 row = await cursor.fetchone()
                 if row is not None:
@@ -1217,8 +1014,8 @@ class SqliteTaskBackend:
                         meta['external_deps'] = updated
                         await conn.execute(
                             'UPDATE tasks SET metadata = ?, updated_at = ? '
-                            'WHERE tag = ? AND id = ? AND parent_id = ?',
-                            (json.dumps(meta), _now(), tag, tid, _TOP_LEVEL_SENTINEL),
+                            'WHERE tag = ? AND id = ?',
+                            (json.dumps(meta), _now(), tag, tid),
                         )
             return {
                 'id': str(tid),
@@ -1227,13 +1024,13 @@ class SqliteTaskBackend:
             }
 
         # ── Bare-integer (same-project) path ───────────────────────────────
-        tid, _ = _parse_task_id(task_id)
-        dep_tid, _ = _parse_task_id(depends_on)
+        tid = _parse_task_id(task_id)
+        dep_tid = _parse_task_id(depends_on)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             await conn.execute(
                 'DELETE FROM dependencies WHERE tag = ? AND task_id = ? '
-                'AND parent_id = ? AND depends_on = ?',
-                (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
+                'AND depends_on = ?',
+                (tag, tid, dep_tid),
             )
         return {
             'id': str(tid),
@@ -1255,10 +1052,9 @@ class SqliteTaskBackend:
             SELECT d.task_id, d.depends_on
             FROM dependencies d
             LEFT JOIN tasks t ON t.tag = d.tag AND t.id = d.depends_on
-                                 AND t.parent_id = ?
             WHERE d.tag = ? AND t.id IS NULL
             """,
-            (_TOP_LEVEL_SENTINEL, tag),
+            (tag,),
         )
         dangling = await cursor.fetchall()
         if not dangling:

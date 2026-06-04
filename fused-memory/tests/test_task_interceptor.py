@@ -27,7 +27,6 @@ def taskmaster():
     tm.get_tasks = AsyncMock(return_value={'tasks': []})
     tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
     tm.update_task = AsyncMock(return_value={'success': True})
-    tm.add_subtask = AsyncMock(return_value={'id': '1.1'})
     tm.remove_tasks = AsyncMock(return_value={'success': True})
     tm.add_dependency = AsyncMock(return_value={'success': True})
     tm.remove_dependency = AsyncMock(return_value={'success': True})
@@ -697,28 +696,17 @@ async def test_curator_combine_failure_falls_through_to_create(
     taskmaster.add_task.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_curator_drop_short_circuits_add_subtask(
-    curator_interceptor,
-    taskmaster,
-):
-    """add_subtask also runs the curator gate — previously bypassed."""
-    decision = CuratorDecision(
-        action='drop',
-        target_id='88',
-        justification='duplicate of sibling',
-    )
-    curator_interceptor._curator = _mock_curator(decision)
+def test_task_interceptor_has_no_add_subtask_method():
+    """TaskInterceptor must NOT have an add_subtask method after DF-D (task 1543).
 
-    result = await curator_interceptor.add_subtask(
-        '1',
-        '/project',
-        title='Duplicate subtask work',
+    This is a RED assertion: it fails while add_subtask is still present and
+    passes once step-4 deletes it.
+    """
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
+    assert not hasattr(TaskInterceptor, 'add_subtask'), (
+        'TaskInterceptor.add_subtask still exists; '
+        'DF-D (task 1543) step-4 must delete it.'
     )
-
-    assert result['id'] == '88'
-    assert result['action'] == 'drop'
-    taskmaster.add_subtask.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3333,16 +3321,12 @@ async def test_add_task_worker_takes_curator_lock_for_r3(
     taskmaster,
 ):
     """R3 invariant: the add_task worker path must acquire _curator_lock so
-    it is mutually exclusive with add_subtask / remove_task curator calls.
+    it is mutually exclusive with remove_task curator calls.
 
     Earlier in the ticket-queue refactor (step-46) the worker did not acquire
     this lock — the single-worker queue was treated as sufficient serialisation.
-    Reviewer feedback (esc-919-148) correctly pointed out that add_subtask
-    still enters _curator_lock directly and could therefore race against the
-    worker's curate() on a stale pre-note_created snapshot, with both paths
-    deciding "create" for the same candidate.  The worker now takes
-    _curator_lock(project_id) across curate() → note_created → record_task,
-    preserving the old cross-family R3 invariant while retaining per-project
+    The worker now takes _curator_lock(project_id) across curate() → note_created
+    → record_task, preserving the R3 invariant while retaining per-project
     queue+worker fairness.
     """
     acquisition_count = 0
@@ -3370,13 +3354,6 @@ async def test_add_task_worker_takes_curator_lock_for_r3(
     await _submit_and_resolve(interceptor_facade, project_root='/project', title='CL guard test')
     assert acquisition_count == 1, (
         f'add_task worker should acquire _curator_lock exactly once; got {acquisition_count}'
-    )
-
-    # --- add_subtask: must also acquire curator_lock exactly once ---
-    await interceptor_facade.add_subtask(parent_id='1', project_root='/project', title='Sub')
-    assert acquisition_count == 2, (
-        f'add_subtask should acquire _curator_lock exactly once; got {acquisition_count - 1} '
-        'after the add_task acquisition'
     )
 
 
@@ -4265,122 +4242,6 @@ class TestSubmitTaskGuardrail:
         taskmaster.add_task.assert_not_called()
 
 
-class TestAddSubtaskGuardrail:
-    """Integration tests: path-scope guard wired into add_subtask."""
-
-    @pytest.mark.asyncio
-    async def test_add_subtask_rejects_dark_factory_paths_in_wrong_project(
-        self,
-        interceptor,
-        taskmaster,
-    ):
-        """add_subtask referencing fused-memory/ under a non-dark-factory project
-        returns a DarkFactoryPathScopeViolation error and does NOT call taskmaster.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            title='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
-            description='Fix drop logic',
-        )
-
-        assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
-        )
-        assert 'fused-memory/' in result.get('matched_paths', []) or 'fused_memory/' in result.get(
-            'matched_paths', []
-        ), f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
-
-        # Taskmaster backend must never have been called
-        taskmaster.add_subtask.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_add_subtask_allows_dark_factory_paths_in_dark_factory_project(
-        self,
-        interceptor,
-        taskmaster,
-    ):
-        """add_subtask with dark-factory paths filed under /dark-factory proceeds
-        normally (project_id resolves to dark_factory and the guard no-ops).
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/dark-factory',
-            title='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
-            description='Fix drop logic',
-        )
-
-        # Should return the taskmaster mock's add_subtask result
-        assert isinstance(result, dict)
-        assert 'error_type' not in result, (
-            f'Should not have error_type for correctly-filed task: {result}'
-        )
-        # taskmaster.add_subtask should eventually be called (after curator)
-        # We don't assert exact call count here since the curator may drop/combine.
-
-    @pytest.mark.asyncio
-    async def test_add_subtask_rejects_prompt_only_dark_factory_paths_in_wrong_project(
-        self,
-        interceptor,
-        taskmaster,
-    ):
-        """A prompt-only add_subtask (no title) referencing fused-memory/ under a
-        non-dark-factory project returns a DarkFactoryPathScopeViolation error
-        and does NOT call taskmaster.add_subtask.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            prompt='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
-            # Deliberately NO title kwarg — this is the prompt-only path
-        )
-
-        assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
-        )
-        matched = result.get('matched_paths', [])
-        assert 'fused-memory/' in matched or 'fused_memory/' in matched, (
-            f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
-        )
-
-        # Taskmaster backend must never have been called
-        taskmaster.add_subtask.assert_not_called()
-
-    @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
-    @pytest.mark.asyncio
-    async def test_add_subtask_rejects_dark_factory_path_in_any_fallback_field(
-        self,
-        field,
-        interceptor,
-        taskmaster,
-    ):
-        """The fallback text guard scans prompt, description, AND details in add_subtask.
-
-        Each parametrised case passes a dark-factory path in ``field`` with no
-        title kwarg, routing _build_candidate to return None and engaging the
-        fallback branch.  All three channels must trigger
-        DarkFactoryPathScopeViolation.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            **{field: 'Edit fused-memory/src/fused_memory/middleware/task_curator.py'},
-            # Deliberately NO title — forces _build_candidate to return None
-        )
-
-        assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Field {field!r}: expected DarkFactoryPathScopeViolation, got: {result}'
-        )
-        matched = result.get('matched_paths', [])
-        assert 'fused-memory/' in matched or 'fused_memory/' in matched, (
-            f'Field {field!r}: expected fused-memory/ or fused_memory/ in matched_paths: {result}'
-        )
-        taskmaster.add_subtask.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
 # ---------------------------------------------------------------------------
@@ -4549,67 +4410,6 @@ class TestPathGuardFallbackMetadataFiles:
         # Taskmaster backend must never have been called
         taskmaster.add_task.assert_not_called()
 
-    @pytest.mark.parametrize('meta_key', ['files', 'files_to_modify'])
-    @pytest.mark.asyncio
-    async def test_add_subtask_fallback_rejects_dark_factory_path_in_metadata(
-        self,
-        meta_key,
-        interceptor,
-        taskmaster,
-    ):
-        """prompt-only add_subtask with dark-factory path ONLY in metadata[meta_key]
-        must be rejected even though all free-text fields are clean.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            prompt='Generic refactor',  # no dark-factory path here
-            # Deliberately NO title — forces _build_candidate → None → fallback
-            metadata={meta_key: ['orchestrator/harness.py']},
-        )
-
-        assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
-        )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
-        )
-
-        # Taskmaster backend must never have been called
-        taskmaster.add_subtask.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_path_guard_detects_dark_factory_path_in_multi_entry_metadata_list(
-        self,
-        interceptor,
-        taskmaster,
-    ):
-        """Dark-factory path in the SECOND entry of a multi-entry metadata list
-        must still trigger the guard.
-
-        Regression against a future scanner that stops scanning after the first
-        entry (or treats the joined text as a single path): if the join-with-newlines
-        approach ever stops scanning each entry independently, this test catches it.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            prompt='Generic refactor',
-            # The dark-factory path is the SECOND entry; the first is clean.
-            metadata={'files_to_modify': ['non_df_module/file.py', 'orchestrator/harness.py']},
-        )
-
-        assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            'expected DarkFactoryPathScopeViolation when dark-factory path is '
-            f'second entry in metadata list, got: {result}'
-        )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'expected orchestrator/ in matched_paths: {result}'
-        )
-        taskmaster.add_subtask.assert_not_called()
-
 
 # ---------------------------------------------------------------------------
 # Negative-control — clean metadata files must NOT be rejected
@@ -4646,28 +4446,6 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
-        assert 'error_type' not in result, (
-            f'Should not have error_type for clean metadata files: {result}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_add_subtask_allows_clean_metadata_files_in_other_project(
-        self,
-        interceptor,
-        taskmaster,
-    ):
-        """prompt-only add_subtask with non-dark-factory paths in metadata
-        must NOT be rejected — only dark-factory paths should trigger the guard.
-        """
-        result = await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            prompt='Refactor foo/bar.py routing',
-            # No title — prompt-only path
-            metadata={'files_to_modify': ['foo/bar.py', 'src/baz.py']},
-        )
-
-        assert isinstance(result, dict)
         assert 'error_type' not in result, (
             f'Should not have error_type for clean metadata files: {result}'
         )

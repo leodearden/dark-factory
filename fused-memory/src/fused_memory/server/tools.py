@@ -217,7 +217,7 @@ Task operations (when Taskmaster is connected):
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
-- update_task / add_subtask / remove_task: Task CRUD
+- update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
@@ -2531,46 +2531,6 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'update_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
-
-    @mcp.tool()
-    async def add_subtask(
-        id: str,
-        project_root: str,
-        title: str | None = None,
-        description: str | None = None,
-        details: str | None = None,
-        tag: str | None = None,
-    ) -> dict[str, Any]:
-        """Add a subtask to an existing task.
-
-        Args:
-            id: Parent task ID
-            project_root: Absolute path to project root
-            title: Subtask title
-            description: Subtask description
-            details: Subtask details
-            tag: Tag context (optional)
-        """
-        if err := _reject_if_ticket_id('id', id):
-            return err
-        _normalized = _normalize_project_root(project_root)
-        if isinstance(_normalized, dict):
-            return _normalized
-        project_root = _normalized
-        try:
-            return await task_interceptor.add_subtask(
-                parent_id=id,
-                project_root=project_root,
-                title=title,
-                description=description,
-                details=details,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_subtask error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()

@@ -13,7 +13,7 @@ Full prior analysis is in the session that produced the briefings — see especi
 ## Design decision (agreed)
 **Do not patch taskmaster-ai.** The user values low-friction upstream updates. Serialize on our side instead.
 
-Today, `fused-memory/src/fused_memory/middleware/task_interceptor.py` holds an `asyncio.Lock` per `project_id` (`self._project_locks`) but **only** wraps `add_task` and `add_subtask`. Extend this lock to wrap every mutating taskmaster tool call, so the taskmaster subprocess never has to handle concurrent mutations on the same project.
+Today, `fused-memory/src/fused_memory/middleware/task_interceptor.py` holds an `asyncio.Lock` per `project_id` (`self._project_locks`) but **only** wraps `add_task`. Extend this lock to wrap every mutating taskmaster tool call, so the taskmaster subprocess never has to handle concurrent mutations on the same project. (add_subtask removed — DF-D)
 
 Fused-memory is the ONLY writer of `tasks.json` (per project memory "Never write tasks.json directly — use fused-memory MCP"). So if every write path goes through this lock, the race cannot be exercised.
 
@@ -32,8 +32,7 @@ Fused-memory is the ONLY writer of `tasks.json` (per project memory "Never write
 - Any other method that ultimately calls `tm.<mutating>` on the TaskmasterBackend
 
 **Methods already guarded** (verify and keep as-is):
-- `add_task`
-- `add_subtask`
+- `add_task` (add_subtask removed — DF-D)
 
 **Methods that don't need the lock** (reads):
 - `get_tasks`, `get_task`, `next_task`, `complexity_report`, and similar read-only ops. Do not add locks to these (would unnecessarily cap read throughput).

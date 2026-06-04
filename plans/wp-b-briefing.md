@@ -34,7 +34,7 @@ Create `fused-memory/src/fused_memory/reconciliation/event_queue.py` (or similar
 ### 2. Call-site migration
 Every `await self.buffer.push(event)` in `task_interceptor.py` becomes `self.event_queue.enqueue(event)` (non-blocking).
 
-Grep `self.buffer.push` in `fused-memory/src/fused_memory/middleware/task_interceptor.py` — expect ~5-8 call sites (add_task, add_subtask, set_task_status, update_task, remove_task, add_dependency, remove_dependency). Confirm full list.
+Grep `self.buffer.push` in `fused-memory/src/fused_memory/middleware/task_interceptor.py` — expect ~5-7 call sites (add_task, set_task_status, update_task, remove_task, add_dependency, remove_dependency). Confirm full list. (add_subtask removed — DF-D)
 
 Also check for push call sites elsewhere — there may be direct pushes from elsewhere (e.g., bulk ops). Grep the whole `fused-memory/src/`.
 

@@ -10,7 +10,7 @@ taskmaster call goes through `self._project_lock(project_id)` in the
 | Method               | Has lock today? | Plan |
 |----------------------|-----------------|------|
 | `add_task`           | yes (`_add_task_locked`)   | keep as-is |
-| `add_subtask`        | yes (`_add_subtask_locked`) | keep as-is |
+| `add_subtask`        | removed — DF-D             | n/a |
 | `set_task_status`    | **no**  | add lock around `tm.get_task` + no-op check + `tm.set_task_status` |
 | `update_task`        | **no**  | add lock around `tm.update_task` only; re-embed path stays lock-free (reads `tm.get_task`) |
 | `remove_task`        | **no**  | add lock around `tm.remove_task` |
@@ -38,9 +38,8 @@ Pure reads (`get_tasks`, `get_task`) stay unlocked — confirmed scope rule.
   needed for a no-op check in `set_task_status`).
 - **Do not** hold the lock across `buffer.push(...)`, `_schedule_commit(...)`,
   reconciler dispatch, LLM calls, or curator re-embed.
-- Exception: `add_task` / `add_subtask` already hold the lock across
-  `curate()`. Pre-existing by R3 design; leave alone (briefing explicitly
-  says so).
+- Exception: `add_task` already holds the lock across `curate()`.
+  Pre-existing by R3 design; leave alone. (add_subtask removed — DF-D)
 
 ## Edits
 

@@ -5,7 +5,7 @@ Sever the synchronous dependency between MCP-tool writes and the SQLite event bu
 
 ## Context (pre-implementation)
 
-`task_interceptor.py` has **8 `await self.buffer.push(event)` call sites** (set_task_status, expand_task, parse_prd, `_add_task_locked`, update_task, `_add_subtask_locked`, remove_task, add_dependency, remove_dependency — so actually 9). One more call site exists in `services/memory_service.py::_emit_event` (memory ops, not task ops). That site is OUT OF SCOPE for WP-B because the MCP memory-write path is not the documented cause of the 2026-04-17 duplicate-task incident. Flagged in the reflection for a future WP.
+`task_interceptor.py` has **8 `await self.buffer.push(event)` call sites** (set_task_status, expand_task, parse_prd, `_add_task_locked`, update_task, remove_task, add_dependency, remove_dependency). (`_add_subtask_locked` removed — DF-D) One more call site exists in `services/memory_service.py::_emit_event` (memory ops, not task ops). That site is OUT OF SCOPE for WP-B because the MCP memory-write path is not the documented cause of the 2026-04-17 duplicate-task incident. Flagged in the reflection for a future WP.
 
 The existing `EventBuffer.push` is async and hits aiosqlite directly. After this WP, `push` is only invoked by the drainer.
 

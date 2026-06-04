@@ -11,7 +11,7 @@ project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
 
 Wired into :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
-at the ``submit_task`` and ``add_subtask`` entry points.  Path-guard
+at the ``submit_task`` entry point.  Path-guard
 rejections also fire a ``scope_violation`` escalation via
 :class:`fused_memory.middleware.scope_violation_escalator.ScopeViolationEscalator`
 when one is configured.

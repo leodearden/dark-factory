@@ -260,7 +260,7 @@ class TaskInterceptor:
         # stdio call. Every mutation takes this lock.
         #
         # ``_curator_locks`` (long, curator-family) serialises the
-        # add_subtask / remove_task flow so concurrent candidates can't both
+        # remove_task flow so concurrent candidates can't both
         # decide "create" for a duplicate. Held across ``curator.curate()``
         # (an LLM round-trip, 25-35s tail) plus the synchronous
         # ``note_created`` + awaited ``record_task`` so the NEXT waiter on
@@ -271,9 +271,9 @@ class TaskInterceptor:
         # asyncio.Task per project_id — so a slow curator round-trip on
         # project A does not delay submissions on project B.  The worker
         # STILL acquires ``_curator_lock(project_id)`` around curator.curate()
-        # through note_created + record_task to preserve R3: add_subtask /
-        # remove_task still enter _curator_lock directly, and without this
-        # acquisition their curate() calls could race against the worker's
+        # through note_created + record_task to preserve R3: remove_task
+        # still enters _curator_lock directly, and without this
+        # acquisition its curate() call could race against the worker's
         # on a stale pre-note_created snapshot and both decide "create" for
         # the same candidate.  Within a project, the lock provides
         # single-threaded curator execution; across projects, the per-project
@@ -1001,7 +1001,7 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_meta_files(kwargs: dict[str, Any]) -> list[str]:
-        """Extract metadata-supplied file/module list from add_task / add_subtask kwargs.
+        """Extract metadata-supplied file/module list from add_task kwargs.
 
         Thin wrapper around :meth:`_extract_meta_files_from_meta` that handles
         the ``kwargs → meta`` parsing step via :meth:`_parse_metadata`.
@@ -1020,7 +1020,7 @@ class TaskInterceptor:
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
-        """Extract a CandidateTask from add_task / add_subtask kwargs.
+        """Extract a CandidateTask from add_task kwargs.
 
         Returns None if there's no title (e.g. pure prompt-only add_task) —
         the curator cannot judge a candidate it cannot read.
@@ -1132,8 +1132,8 @@ class TaskInterceptor:
         returned.
 
         The optional *candidate* parameter lets callers pass an already-built
-        :class:`CandidateTask` (as ``add_subtask`` does); when ``None`` and
-        the guard needs to scan a candidate, this helper lazy-builds via
+        :class:`CandidateTask`; when ``None`` and the guard needs to scan a
+        candidate, this helper lazy-builds via
         ``_build_candidate`` so ``submit_task``'s hot-path optimisation
         that skips the build entirely for dark_factory still applies in
         back-compat mode.
@@ -1301,7 +1301,7 @@ class TaskInterceptor:
         Short-held; covers a single Taskmaster stdio write or an equivalent
         sqlite mutation. Every mutating op (set_task_status, update_task,
         add_dependency, remove_dependency, the actual tm.add_task /
-        tm.add_subtask / tm.remove_task calls) takes this lock.
+        tm.remove_task calls) takes this lock.
         """
         lock = self._write_locks.get(project_id)
         if lock is None:
@@ -1316,20 +1316,16 @@ class TaskInterceptor:
         post-write ``note_created``/``record_task`` steps so the next waiter
         on this lock sees the new entry on its pre-LLM check.
 
-        Taken by: ``add_subtask``, ``remove_task`` (conservative: protects
-        concurrent combine-target integrity) AND by ``_process_add_ticket``
-        (the add_task worker path) so curator decisions for the three families
-        are mutually exclusive within a project.  Without the worker taking
-        this lock, concurrent add_subtask + add_task on the same project
-        could both call curator.curate() against a stale snapshot and both
-        decide "create" for what is effectively the same candidate.
-        Lock order: curator_lock BEFORE write_lock. Short writes
+        Taken by: ``remove_task`` (conservative: protects concurrent
+        combine-target integrity) AND by ``_process_add_ticket`` (the add_task
+        worker path) so curator decisions are mutually exclusive within a
+        project.  Lock order: curator_lock BEFORE write_lock. Short writes
         (set_task_status etc.) never take this lock and so are not blocked
         by an in-flight curator decision.
 
-        NOTE: Routing ``add_subtask`` / ``remove_task`` through the per-project
-        worker queue is a planned follow-up (out-of-scope for this task); until
-        then the worker must acquire this lock to preserve R3.
+        NOTE: Routing ``remove_task`` through the per-project worker queue is
+        a planned follow-up; until then the worker must acquire this lock to
+        preserve R3.
         """
         lock = self._curator_locks.get(project_id)
         if lock is None:
@@ -2254,8 +2250,8 @@ class TaskInterceptor:
 
             # note_created + record_task under curator_lock + write_lock
             # (R3 invariant): by holding curator_lock across curate() →
-            # note_created, concurrent add_subtask curator calls cannot
-            # race on a stale in-memory snapshot.
+            # note_created, concurrent curator calls cannot race on a stale
+            # in-memory snapshot.
             # Each is wrapped independently: a failure appends to
             # post_create_warnings and is logged, but does NOT flip status.
             if curator is not None and candidate is not None and task_id_str:
@@ -2404,13 +2400,9 @@ class TaskInterceptor:
 
         try:
             # ── R3 invariant: serialise curator+write within this project ─
-            # The worker runs per-project, but add_subtask / remove_task still
-            # take _curator_lock in their own paths.  Without this acquisition,
-            # a concurrent add_subtask could call curator.curate() against a
-            # stale snapshot (note_created not yet published) and both paths
-            # could independently decide 'create' for the same candidate.
-            # Lock ordering: curator_lock (outer) → write_lock (inner), matching
-            # remove_task and _add_subtask_locked.
+            # The worker runs per-project, but remove_task still takes
+            # _curator_lock in its own path.  Lock ordering:
+            # curator_lock (outer) → write_lock (inner), matching remove_task.
             async with self._curator_lock(project_id):
                 # ── R4: escalation-level idempotency ─────────────────────────
                 # Short-circuits curator when (escalation_id, suggestion_hash) in
@@ -3053,137 +3045,13 @@ class TaskInterceptor:
                     )
         return result
 
-    async def add_subtask(
-        self,
-        parent_id: str,
-        project_root: str,
-        **kwargs: Any,
-    ) -> dict:
-        if err := await self._backlog_gate(project_root):
-            return err
-        # The candidate is built unconditionally because it is consumed downstream
-        # by _add_subtask_locked (curator + write path). The dark_factory
-        # short-circuit lives inside _path_guard_or_skip, which simply returns
-        # None for dark_factory without re-running the guard scan.
-        candidate = self._build_candidate(kwargs)
-        project_id = resolve_project_id(project_root)
-        # Path-scope guard: reject before acquiring the curator lock so a
-        # mis-filed task never touches the lock, ticket store, or curator.
-        # Pass the pre-built candidate so _path_guard_or_skip doesn't double-build.
-        if err := self._path_guard_or_skip(kwargs, project_root, project_id, candidate):
-            return err
-        # curator_lock across curator.curate + note_created/record_task;
-        # write_lock acquired internally for the brief tm.add_subtask call.
-        async with self._curator_lock(project_id):
-            return await self._add_subtask_locked(
-                parent_id=parent_id,
-                project_root=project_root,
-                project_id=project_id,
-                candidate=candidate,
-                kwargs=kwargs,
-            )
-
-    async def _add_subtask_locked(
-        self,
-        *,
-        parent_id: str,
-        project_root: str,
-        project_id: str,
-        candidate,
-        kwargs: dict,
-    ) -> dict:
-        # Curator gate for subtasks — previously bypassed entirely.
-        curator = await self._get_curator()
-        if curator is not None and candidate is not None:
-            candidate.spawned_from = str(parent_id)
-            candidate.spawn_context = candidate.spawn_context or 'manual'
-            decision = await curator.curate(candidate, project_id, project_root)
-            if decision.action == 'drop' and decision.target_id:
-                logger.warning(
-                    'task_curator: drop (subtask) — returning existing task %s '
-                    'instead of creating duplicate: %s',
-                    decision.target_id,
-                    candidate.title[:80],
-                )
-                return {
-                    'id': decision.target_id,
-                    'title': candidate.title,
-                    'deduplicated': True,
-                    'action': 'drop',
-                    'justification': decision.justification,
-                }
-            if decision.action == 'combine' and decision.target_id:
-                # _execute_combine writes; wrap in write_lock (curator_lock
-                # is already held by the caller).
-                async with self._write_lock(project_id):
-                    combine_result = await self._execute_combine(project_root, decision)
-                if combine_result is not None:
-                    logger.warning(
-                        'task_curator: combine (subtask) — folded into task %s',
-                        decision.target_id,
-                    )
-                    return {
-                        'id': decision.target_id,
-                        'title': (
-                            decision.rewritten_task.title
-                            if decision.rewritten_task
-                            else candidate.title
-                        ),
-                        'deduplicated': True,
-                        'action': 'combine',
-                        'justification': decision.justification,
-                    }
-
-        tm = await self._ensure_taskmaster()
-        # write_lock across the actual tm.add_subtask call so concurrent
-        # set_task_status / update_task on the same project see a consistent
-        # tasks.json view.
-        async with self._write_lock(project_id):
-            result = dict(
-                await self._journal_around(
-                    'add_subtask',
-                    project_root,
-                    {
-                        'parent_id': parent_id,
-                        **{k: _journal_param_clip(v) for k, v in kwargs.items()},
-                    },
-                    tm.add_subtask(
-                        parent_id=parent_id,
-                        project_root=project_root,
-                        **kwargs,
-                    ),
-                )
-            )
-        event = self._make_event(
-            EventType.task_created,
-            project_root,
-            {'parent_id': parent_id, 'operation': 'add_subtask'},
-        )
-        await self._journal(event)
-
-        # Record the new subtask in the curator corpus (synchronous cache
-        # update + awaited Qdrant upsert — see add_task for the rationale).
-        # AddSubtaskResult DTO guarantees a non-empty `id` on success.
-        if curator is not None and candidate is not None:
-            new_id = str(result['id'])
-            curator.note_created(project_id, candidate, new_id)
-            try:
-                await curator.record_task(new_id, candidate, project_id)
-            except Exception:
-                logger.warning(
-                    'add_subtask: curator.record_task awaited path failed for %s',
-                    new_id,
-                    exc_info=True,
-                )
-        return result
-
     async def remove_tasks(self, ids: list[str], project_root: str, tag: str | None = None) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
-        # curator_lock (conservative): a concurrent add_task / add_subtask
-        # curator decision of ``combine target=<one of these ids>`` would
+        # curator_lock (conservative): a concurrent add_task curator decision
+        # of ``combine target=<one of these ids>`` would
         # hold the curator_lock; blocking remove_tasks here prevents the
         # target from vanishing between the curator's decision and
         # _execute_combine's guarded write. _execute_combine also has a

@@ -16,7 +16,6 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
-    DISALLOW_SUBTASK_CREATE,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
     STAGE2_DISALLOWED,
@@ -126,14 +125,14 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_plus_subtask_create(self):
-        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE.
+    def test_stage2_disallows_builtins_only(self):
+        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN.
 
-        Stage 2 has full memory + task access except for add_subtask, which is
-        blocked because the orchestrator scheduler is top-level-only (see
-        DISALLOW_SUBTASK_CREATE comment in cli_stage_runner.py).
+        Stage 2 has full memory + task access; only built-ins are blocked.
+        add_subtask was previously in a separate DISALLOW_SUBTASK_CREATE list,
+        but the tool has been removed (DF-D).
         """
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE
+        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
@@ -162,17 +161,13 @@ class TestDisallowedToolLists:
         """add_task facade has been removed — the disallow list must no longer reference a non-existent tool."""
         assert 'mcp__fused-memory__add_task' not in DISALLOW_TASK_WRITES
 
-    def test_stage2_blocks_add_subtask(self):
-        """add_subtask must be blocked in Stage 2.
+    def test_stage2_no_add_subtask_in_disallowed(self):
+        """add_subtask is no longer in STAGE2_DISALLOWED because the tool was deleted (DF-D).
 
-        The orchestrator scheduler is top-level-only (iterates ``tasks`` without
-        descending into ``t['subtasks']``).  Any subtask created during Stage 2
-        reconciliation is permanently invisible to the dispatcher and will never
-        be executed — a silent orphan.  Closing the CREATION path in Stage 2
-        prevents a planning-budget-overflow escalation from re-introducing the
-        trap (see procedural memory fca61c20).
+        Protection has moved upstream: the MCP tool is unregistered entirely
+        (asserted in test_task_tools.py::test_add_subtask_mcp_tool_not_registered).
         """
-        assert 'mcp__fused-memory__add_subtask' in STAGE2_DISALLOWED
+        assert 'mcp__fused-memory__add_subtask' not in STAGE2_DISALLOWED
 
     def test_count_memories_by_metadata_not_in_stage3_disallowed(self):
         """Pin count_memories_by_metadata as auto-allowed (read-only) in Stage 3.

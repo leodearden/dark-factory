@@ -32,7 +32,6 @@ DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__update_task',
-    'mcp__fused-memory__add_subtask',
     'mcp__fused-memory__remove_task',
     'mcp__fused-memory__add_dependency',
     'mcp__fused-memory__remove_dependency',
@@ -52,13 +51,9 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__update_edge',
 ]
 
-# Subtask creation (disallowed in Stage 2 — orchestrator scheduler is top-level-only;
-# new subtasks would be silently orphaned and never dispatched, see procedural memory fca61c20)
-DISALLOW_SUBTASK_CREATE = ['mcp__fused-memory__add_subtask']
-
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
-STAGE2_DISALLOWED = DISALLOW_BUILTIN + DISALLOW_SUBTASK_CREATE  # Full memory + task tools EXCEPT add_subtask (see DISALLOW_SUBTASK_CREATE)
+STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Memory + task writes are allowed; only built-ins are blocked
 STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
 # NOTE: `mcp__recon-report__*` tools are intentionally NOT included in DISALLOW_MEMORY_WRITES
 # or DISALLOW_TASK_WRITES and therefore NOT in STAGE3_DISALLOWED.  These tools write only

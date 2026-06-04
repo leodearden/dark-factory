@@ -128,7 +128,7 @@ Follow the `_mock_curator` fixture pattern. Use `tmp_path` + monkeypatch of
 populate `target_fingerprint` matching the mocked `get_task` title
 (`'Test Task'`).
 
-The `add_subtask` combine test (if present) needs the same fix — check.
+The `add_subtask` combine test is moot — add_subtask removed by DF-D.
 
 ## Files touched
 
