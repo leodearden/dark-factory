@@ -411,6 +411,33 @@ class TestRunWatcherRotation:
         assert 'Edit' in disallowed, 'Edit must be in disallowed_tools (no code edits)'
         assert 'Write' in disallowed, 'Write must be in disallowed_tools (no code edits)'
 
+    @pytest.mark.asyncio
+    async def test_env_overrides_injects_bash_max_timeout_ms(self, tmp_path: Path) -> None:
+        """invoke_with_cap_retry receives env_overrides == {'BASH_MAX_TIMEOUT_MS': '<ms>'}.
+
+        Exact-dict equality:
+          - pins the injected value to int(timeout_secs * 1000)
+          - also asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
+        Default: rotation_hours=4.0, grace=300.0 → 14700 s → '14700000' ms.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        expected_ms = str(int((h.config.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS) * 1000))
+        assert captured.get('env_overrides') == {'BASH_MAX_TIMEOUT_MS': expected_ms}, (
+            f'env_overrides must be exactly {{"BASH_MAX_TIMEOUT_MS": "{expected_ms}"}}; '
+            f'got {captured.get("env_overrides")!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-9: Supervisor loop classification — clean/unclean backoff
