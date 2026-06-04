@@ -2386,11 +2386,21 @@ class TestRecentWindow1440AcceptanceLock:
     """Acceptance-criterion lock for task-1607.
 
     Validates that with recent_window_minutes=1440, a merge ~5h old appears in
-    result[pid]['recent'] and a merge ~25h old does not.  Exercises the
-    two-layer contract: SQL hour-granular look-back (recent_hours=24) fetches
-    the 5h row and excludes the 25h row, then filter_merges_within(1440) trims
-    to the exact 1440-min boundary (5h is inside; 25h is outside the SQL layer
-    already so it never reaches the Python trim).
+    result[pid]['recent'] and a merge ~25h old does not.
+
+    At window=1440 min, recent_hours = ceil(1440/60) = 24, so the SQL
+    look-back boundary and the Python filter_merges_within boundary are
+    *identical*.  The 25h row is therefore excluded at the SQL layer and never
+    reaches the Python trim — this test does **not** exercise filter_merges_within's
+    exclusion edge.  The Python trim's minute-precise boundary is exercised at
+    windows where SQL hours ≠ window minutes (e.g. window=90 min → SQL fetches
+    2h, Python trims to 90 min), covered by
+    TestBuildPerProjectMergeQueue.test_sql_over_fetches_are_trimmed_to_exact_minute_boundary.
+
+    This test's purpose is to codify the end-user acceptance criterion for the
+    task ("a merge from earlier today appears; one from yesterday does not")
+    through the full build_per_project_merge_queue pipeline at the deployed
+    window value.
     """
 
     @pytest.mark.asyncio
