@@ -19,6 +19,7 @@ import logging
 import posixpath
 import shutil
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1889,6 +1890,13 @@ class MergeRequest:
     config: OrchestratorConfig
     result: asyncio.Future[MergeOutcome] = field(repr=False)
     enqueued_at: float = field(default_factory=time.time, kw_only=True)
+    request_id: str = field(
+        default_factory=lambda: f'mr-{uuid.uuid4().hex[:8]}',
+        kw_only=True,
+    )
+    """Stable per-instance identity for this merge request (e.g. 'mr-a1b2c3d4')."""
+    snapshot_tip: str | None = field(default=None, kw_only=True)
+    """Optional git ref / SHA of the snapshot tip used by α3 merge-status lookups."""
 
 
 @dataclass

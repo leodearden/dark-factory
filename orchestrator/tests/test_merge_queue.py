@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -4467,6 +4468,88 @@ class TestEnqueueMergeRequest:
         assert queue.qsize() == 1
         dequeued = queue.get_nowait()
         assert dequeued is req
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestIdentity — step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestIdentity:
+    """MergeRequest.request_id and .snapshot_tip identity field contract."""
+
+    @pytest.mark.asyncio
+    async def test_request_id_format(self, config: OrchestratorConfig, tmp_path: Path) -> None:
+        """(a) request_id matches ^mr-[0-9a-f]{8}$."""
+        req = _make_request('1', 'task/1', tmp_path, config)
+        assert re.fullmatch(r'^mr-[0-9a-f]{8}$', req.request_id), (
+            f'request_id {req.request_id!r} does not match ^mr-[0-9a-f]{{8}}$'
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_id_is_unique_per_instance(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(b) Two independently-built requests have different request_id."""
+        req1 = _make_request('1', 'task/1', tmp_path, config)
+        req2 = _make_request('2', 'task/2', tmp_path, config)
+        assert req1.request_id != req2.request_id
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tip_defaults_to_none(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(c) snapshot_tip defaults to None."""
+        req = _make_request('1', 'task/1', tmp_path, config)
+        assert req.snapshot_tip is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tip_accepts_explicit_value(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(d) snapshot_tip carries an explicitly-set value."""
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='1',
+            branch='task/1',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            snapshot_tip='abc123def',
+        )
+        assert req.snapshot_tip == 'abc123def'
+
+    def test_group_merge_request_still_constructs(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """(e) GroupMergeRequest still constructs; exposes auto request_id + snapshot_tip=None.
+
+        Uses MagicMock for the Future so this test runs outside an event loop.
+        """
+        future: asyncio.Future[MergeOutcome] = MagicMock(spec=asyncio.Future)
+        status_check_mock = AsyncMock(return_value={})
+        mark_done_mock = AsyncMock()
+        greq = GroupMergeRequest(
+            task_id='tip',
+            branch='task/tip',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-1',
+            member_task_ids=['tip'],
+            tip_branch='task/tip',
+            tip_task_id='tip',
+            status_check=status_check_mock,
+            mark_member_done=mark_done_mock,
+        )
+        assert re.fullmatch(r'^mr-[0-9a-f]{8}$', greq.request_id)
+        assert greq.snapshot_tip is None
 
 
 # ---------------------------------------------------------------------------
