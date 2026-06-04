@@ -5235,6 +5235,63 @@ class TestBornAtL2GatesPostDebugger:
 
 
 @pytest.mark.asyncio
+class TestBornAtL2GatesMergeEntry:
+    """task γ / C7: A born-at-L2 escalation (critical, level=2) pending at
+    MERGE entry must cause ``run()`` to return ESCALATED before merge starts.
+
+    RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
+    ignores critical/level-2, so run() proceeds past the gate and the stubbed
+    _execute_verify_review_loop returns DONE.
+    """
+
+    async def test_critical_l2_blocks_merge_entry(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Stub _execute_verify_review_loop to submit a born-at-L2 escalation
+        # as a side effect then return DONE — simulates any code path that files
+        # a critical/level-2 escalation mid-run, before MERGE entry.
+        async def _exec_and_escalate():
+            queue.submit(Escalation(
+                id=queue.make_id(task_assignment.task_id),
+                task_id=task_assignment.task_id,
+                agent_role='implementer',
+                severity='critical',
+                category='risk_identified',
+                summary='Critical risk requiring human review before merge',
+                detail='Born at L2 — routes straight to human',
+                level=2,
+            ))
+            return WorkflowOutcome.DONE
+        workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
+
+        outcome = await workflow.run()
+
+        # MERGE-phase gate must intercept before merge is attempted.
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending — the gate does not consume it.
+        pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(pending) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
