@@ -410,6 +410,15 @@ def create_server(
             }
         if action not in RESOLVE_ACTIONS:
             return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
+        # Pre-stamp resolution_action on the pending record so resolve()'s
+        # read-modify-write carries it into the archived JSON (C1 persistence).
+        # Guard: only rewrite pending records — archived records must not be resurrected.
+        pending = queue.get(escalation_id)
+        if pending is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        if pending.status == 'pending':
+            pending.resolution_action = action
+            queue._rewrite(escalation_id, pending)
         dismiss = action in _DISMISS_ACTIONS
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
