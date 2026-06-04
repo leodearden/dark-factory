@@ -853,10 +853,11 @@ def create_server(
                 # conflict_details / push_status are included with None for shape
                 # stability: callers that access result['conflict_details'] or
                 # result['push_status'] must not KeyError on a coalesced response.
-                # request_id is the D8 SUBSTRATE: the SUBMITTING request's own id.
-                # β1 re-sources this to the in-flight entry's request_id and renames
-                # status to 'attached'; inflight_task_id remains the authoritative
-                # poll handle (merge_status accepts task_id per D10) in the interim.
+                # request_id is the submitting request's own id (legacy D8 shape).
+                # The opt-in path (wait_secs not None, above) re-sources to the
+                # existing entry's id and renames status to 'attached'.
+                # inflight_task_id remains the authoritative poll handle (merge_status
+                # accepts task_id per D10) on both paths.
                 return {
                     'status': 'in_flight',
                     'request_id': merge_req.request_id,
