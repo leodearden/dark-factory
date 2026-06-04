@@ -301,7 +301,9 @@ def check_proposal(
     if files:
         diff_args = ['diff', f'{main_sha}..main', '--'] + list(files)
         rc, diff_out = run_git(diff_args, worktree)
-        if rc == 0 and diff_out.strip():
+        if rc != 0:
+            return _result(DRIFT, f'could not verify footprint drift (git diff rc={rc})')
+        if diff_out.strip():
             return _result(DRIFT, 'main moved within proposal footprint (files_referenced)')
 
     # --- (8) Fresh ---
