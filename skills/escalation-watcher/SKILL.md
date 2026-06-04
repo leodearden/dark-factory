@@ -30,9 +30,8 @@ Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/sp
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
 2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
 3. Handle each drained escalation
-4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if any
-   background merge-submission / auto-unblock sub-agent is in flight — that sub-agent completing.
-   Handle whichever arrives.
+4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
+   an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
 6. Go to 1 (restart watcher → confirm up → drain → handle)
@@ -276,14 +275,13 @@ Then launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE **background**
 to read and follow `skills/unblock-low-risk/SKILL.md`. It applies the fix scoped to
 `files_referenced`, runs the verify suite, and merges via the queue — or aborts cleanly.
 
-**Background, not foreground — why.** The sub-agent's merge step blocks on `merge_request` until
-the merge worker finishes rebasing, verifying, and CAS-advancing main. On a large/slow repo (e.g.
-reify) that single call can take ~30 minutes. Run in the *foreground* (`Agent` without
-`run_in_background`), that whole window freezes the watch loop — new L2 escalations accumulate
-undrained until the merge returns, and a born-at-L2 `critical` could sit unseen for half an hour.
-Backgrounding keeps the foreground responsive: record the launch (above), then immediately loop
-back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result when
-it completes — that completion is itself a wake signal (Main Loop step 4), handled below.
+**Background, not foreground — why.** The unblock-low-risk sub-agent runs a full
+apply → verify → submit → poll cycle in its own context — verify alone can take several minutes on
+a large repo. Run in the *foreground* (`Agent` without `run_in_background`), that entire cycle
+occupies the watch loop's context, making it unresponsive to incoming L2 escalations throughout.
+Backgrounding keeps the foreground lean and responsive: record the launch (above), then immediately
+loop back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result
+when it completes — that completion is itself a wake signal (Main Loop step 4), handled below.
 
 **Record the launch; don't double-launch.** The durable `b3_gate record-launch` call above
 serializes concurrent and restart races. Stash `{task_id, escalation_id, background-task-id}` in
@@ -624,11 +622,10 @@ window this is the difference between one durable session and repeated restarts.
   `design_concern`): have the sub-agent fetch the full escalation, read the code/reviews, and return
   only a compact verdict + recommended action — not the raw material
 - The low-risk auto-unblock sub-agent (`unblock-low-risk`) — run it in the **background**
-  (`run_in_background: true`) so a slow merge (~30 min on big repos like reify) can't freeze the
-  watch loop; it does the whole apply→verify→merge in its own context and returns only a small JSON
-  result when it completes
-- ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — `merge_request`
-  only ever runs inside a background sub-agent; see "Merge Submissions — NEVER in the Foreground"
+  (`run_in_background: true`) so its full apply→verify→submit→poll cycle stays in its own context,
+  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes
+- ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
+  top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
 
 **Keep in top-level context:**
