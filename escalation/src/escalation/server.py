@@ -12,6 +12,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from escalation import sweep as _sweep
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
@@ -94,6 +95,7 @@ def create_server(
     dedupe_config: DedupeConfig | None = None,
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
     merge_inflight_registry: Any = None,
+    startup_sweep: bool = True,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -121,9 +123,24 @@ def create_server(
     all ``merge_request`` calls for the lifetime of the server.  When
     *merge_queue* is None (escalation standalone — orchestrator not wired) the
     registry is never imported, preserving the standalone import path.
+
+    *startup_sweep* (default True) — when True, runs
+    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time (the
+    pre-serving single-writer window) to relocate resolved/dismissed root
+    orphans and loose archive files, and prune stale dated subdirs.  Non-fatal:
+    any exception is logged at WARNING level and the server continues binding.
+    Pass False in tests that pre-populate the queue and do not want the sweep
+    to run.
     """
     mcp = FastMCP('escalation')
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+
+    # --- Startup sweep (pre-serving single-writer window) ---
+    if startup_sweep:
+        try:
+            _sweep.run_startup_sweep(queue.queue_dir)
+        except Exception as _e:
+            logger.warning('startup queue sweep failed (non-fatal): %s', _e)
 
     # --- Per-branch in-flight de-dup registry for merge_request ---
     # Lazily imported so escalation's standalone typecheck env (which does not

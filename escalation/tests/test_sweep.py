@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from escalation import sweep
@@ -350,6 +351,334 @@ class TestSweepIdempotency:
         assert report2.reconciled_archive_wins == 0
         assert report2.untouched_pending == 1
         assert self._disk_snapshot(tmp_path) == snapshot
+
+
+class TestStartupSweepIdempotency:
+    """run_startup_sweep is idempotent: first run clears the backlog, second is a no-op."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+
+    def _disk_snapshot(self, root: Path) -> dict[str, bytes]:
+        """Return {relative_path_str: content_bytes} for every regular file under root."""
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob('*'))
+            if p.is_file()
+        }
+
+    def test_first_run_clears_backlog_second_run_is_noop(self, tmp_path: Path):
+        """Seed a mix: resolved + dismissed root escs, loose archive esc, pending esc."""
+        # Resolved root esc
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00'
+        )
+        # Dismissed root esc
+        _write_root_esc(
+            tmp_path, 'esc-2-1', 'dismissed', resolved_at='2026-05-21T08:00:00+00:00'
+        )
+        # Pending esc (must remain in root)
+        _write_root_esc(tmp_path, 'esc-3-1', 'pending')
+        # Loose archive esc
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose = archive_root / 'esc-4-1.json'
+        loose_esc = Escalation(
+            id='esc-4-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose',
+            status='resolved',
+            resolved_at='2026-05-22T06:00:00+00:00',
+        )
+        loose.write_text(loose_esc.to_json())
+
+        # Run 1: should clean up the backlog
+        report1 = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+        assert report1.sweep.archived >= 2, 'resolved + dismissed should be archived'
+        assert report1.loose_reaped == 1, 'loose archive esc should be reaped'
+
+        # After run 1: only the pending esc remains in queue root (+ lock sidecars)
+        root_escs = list(tmp_path.glob('esc-*.json'))
+        assert len(root_escs) == 1, f'Only pending esc should remain: {root_escs}'
+        assert root_escs[0].name == 'esc-3-1.json'
+
+        # Capture disk state after run 1
+        snapshot_after_run1 = self._disk_snapshot(tmp_path)
+
+        # Run 2: should be a complete no-op
+        report2 = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+        assert report2.sweep.archived == 0, 'no new root escs to archive'
+        assert report2.loose_reaped == 0, 'no loose archive escs to reap'
+        assert report2.pruned_dirs == 0, 'no dirs to prune (all recent)'
+
+        # Disk state byte-stable between the two post-run states
+        assert self._disk_snapshot(tmp_path) == snapshot_after_run1, (
+            'Disk state changed on second run_startup_sweep — not idempotent!'
+        )
+
+
+class TestD6GlobInvariant:
+    """D6 HARD-INVARIANT regression: non-esc-* root files are NEVER touched by a sweep pass."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+    _RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def test_non_esc_files_untouched_by_run_startup_sweep(self, tmp_path: Path):
+        """b3-state.json (PRD-2) and afk-digest.md in root survive a full startup sweep."""
+        # Non-esc residents
+        b3_state = tmp_path / 'b3-state.json'
+        afk_digest = tmp_path / 'afk-digest.md'
+        b3_state.write_bytes(b'{"state": "active"}')
+        afk_digest.write_bytes(b'# AFK digest\n\nSome content here.')
+
+        b3_bytes = b3_state.read_bytes()
+        afk_bytes = afk_digest.read_bytes()
+        b3_mtime = b3_state.stat().st_mtime
+        afk_mtime = afk_digest.stat().st_mtime
+
+        # One resolved esc that SHOULD be relocated
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self._RESOLVED_AT)
+
+        sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        # Non-esc files completely unchanged
+        assert b3_state.exists(), 'b3-state.json was deleted by sweep — glob widened!'
+        assert afk_digest.exists(), 'afk-digest.md was deleted by sweep — glob widened!'
+        assert b3_state.read_bytes() == b3_bytes, 'b3-state.json content changed'
+        assert afk_digest.read_bytes() == afk_bytes, 'afk-digest.md content changed'
+        assert b3_state.stat().st_mtime == b3_mtime, 'b3-state.json mtime changed'
+        assert afk_digest.stat().st_mtime == afk_mtime, 'afk-digest.md mtime changed'
+
+        # The resolved esc WAS relocated
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+
+
+class TestRunStartupSweep:
+    """Tests for sweep.run_startup_sweep and StartupSweepReport."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+    _RESOLVED_AT_RECENT = '2026-05-20T10:00:00+00:00'
+    _RESOLVED_AT_LOOSE = '2026-05-21T12:00:00+00:00'
+    _RESOLVED_AT_STALE = '2026-01-01T00:00:00+00:00'
+
+    def test_run_startup_sweep_archives_and_reaps_and_prunes(self, tmp_path: Path, caplog):
+        """Full integration: root esc archived, loose esc relocated, stale dir pruned."""
+        # One resolved root esc
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at=self._RESOLVED_AT_RECENT
+        )
+        # One loose archive esc (sits at archive top-level)
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-2-1.json'
+        loose_esc = Escalation(
+            id='esc-2-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose',
+            status='resolved',
+            resolved_at=self._RESOLVED_AT_LOOSE,
+        )
+        loose_path.write_text(loose_esc.to_json())
+        # One stale dated dir (older than 30 days relative to _NOW)
+        stale_dir = archive_root / '2026-01-01'
+        stale_dir.mkdir(parents=True)
+        stale_file = stale_dir / 'esc-9-1.json'
+        stale_file.write_text(loose_esc.to_json())
+
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        # Root esc archived
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+        # Loose esc relocated
+        assert (archive_root / '2026-05-21' / 'esc-2-1.json').exists()
+        assert not loose_path.exists()
+        # Stale dir pruned (2026-01-01 is >30 days before 2026-06-04)
+        assert not stale_dir.exists()
+
+        # StartupSweepReport fields
+        assert report.sweep.archived >= 1
+        assert report.loose_reaped == 1
+        assert report.pruned_dirs == 1
+
+        # INFO log line emitted on escalation.sweep logger
+        assert any(
+            r.name == 'escalation.sweep' and r.levelno == logging.INFO
+            for r in caplog.records
+        ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
+
+
+class TestReapLooseArchiveFiles:
+    """Tests for sweep.reap_loose_archive_files."""
+
+    def test_loose_resolved_file_moved_to_dated_subdir_with_lock(self, tmp_path: Path):
+        """(a) Loose resolved file at archive top-level is moved to dated subdir."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-1-1.json'
+        esc = Escalation(
+            id='esc-1-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='loose test',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Moved to dated subdir
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        # Loose copy gone
+        assert not loose_path.exists()
+        # Returns 1
+        assert count == 1
+        # Per-id sidecar lock was created in queue root
+        assert (tmp_path / 'esc-1-1.json.lock').exists()
+
+    def test_loose_file_without_resolved_at_left_in_place(self, tmp_path: Path):
+        """(b) Loose file with resolved_at=None is left in place and NOT counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-2-1.json'
+        esc = Escalation(
+            id='esc-2-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='no resolved_at',
+            status='resolved',
+            resolved_at=None,
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Left untouched
+        assert loose_path.exists()
+        # Not counted
+        assert count == 0
+
+    def test_apply_false_reports_count_without_moving(self, tmp_path: Path):
+        """(c) apply=False leaves loose file untouched but reports would-move count."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-3-1.json'
+        esc = Escalation(
+            id='esc-3-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='dry run loose',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=False)
+
+        # File still in place
+        assert loose_path.exists()
+        # But count is 1 (would-move)
+        assert count == 1
+
+    def test_collision_target_already_exists_leaves_loose_untouched(self, tmp_path: Path):
+        """Safety-critical: if target dated-subdir file already exists, loose file is NOT overwritten."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-5-1.json'
+        esc = Escalation(
+            id='esc-5-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='collision test',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        # Pre-create the target file with sentinel bytes distinct from the loose copy
+        target_dir = archive_root / '2026-05-20'
+        target_dir.mkdir(parents=True)
+        target_path = target_dir / 'esc-5-1.json'
+        target_bytes = b'{"existing": "sentinel"}'
+        target_path.write_bytes(target_bytes)
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Loose file is left in place — never moved when target exists
+        assert loose_path.exists()
+        # Count is 0 — collision guard fired
+        assert count == 0
+        # Existing target bytes are unchanged — no data loss
+        assert target_path.read_bytes() == target_bytes
+
+    def test_non_terminal_status_left_in_place(self, tmp_path: Path):
+        """Loose archive file with non-terminal status (pending) is skipped and not counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-6-1.json'
+        esc = Escalation(
+            id='esc-6-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='pending loose file',
+            status='pending',
+            resolved_at=None,
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        assert loose_path.exists()
+        assert count == 0
+
+    def test_unparsable_json_left_in_place(self, tmp_path: Path):
+        """Loose archive file with unparsable JSON is skipped and not counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-7-1.json'
+        loose_path.write_bytes(b'{not valid json')
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        assert loose_path.exists()
+        assert count == 0
+
+
+class TestSweepRelocationLock:
+    """sweep.sweep relocations must take the per-id sidecar lock."""
+
+    def test_relocation_creates_sidecar_lock_file(self, tmp_path: Path):
+        """After apply=True relocation, the stable sidecar .lock file exists in queue root."""
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00'
+        )
+        sweep.sweep(tmp_path, apply=True)
+        # (a) File was moved to dated archive subdir
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not (tmp_path / 'esc-1-1.json').exists()
+        # (b) Stable sidecar .lock exists in queue root — proves lock was taken
+        assert (tmp_path / 'esc-1-1.json.lock').exists(), (
+            'Expected sidecar lock file esc-1-1.json.lock in queue root — '
+            'sweep.sweep must take escalation_id_lock around relocations'
+        )
 
 
 class TestSweepCli:
