@@ -1451,3 +1451,37 @@ class TestMergeCancel:
             f'Expected future to be cancelled after merge_cancel, got: '
             f'done={req.result.done()} cancelled={req.result.cancelled()}'
         )
+
+    async def test_cancel_unknown_request_id_returns_unknown(self, tmp_path: Path):
+        """Cancelling a request_id with no live waiter returns cancelled=False, state='unknown'.
+
+        Fresh server with no submissions.  Call merge_cancel with a random id.
+        Must return a dict (no raise) with cancelled=False, state='unknown', and
+        a non-empty reason string.
+
+        RED until step-4 impl: the current minimal body calls rec.future on a None rec,
+        raising AttributeError.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        result = await _call_merge_cancel(server, request_id='mr-doesnotexist')
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for unknown id, got: {result}"
+        )
+        assert result.get('state') == 'unknown', (
+            f"Expected state='unknown' for unknown id, got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason string for unknown id, got: {result}"
+        )
