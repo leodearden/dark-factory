@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -961,6 +962,10 @@ def create_server(
 
     _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
 
+    def _epoch_to_iso8601(ts: float) -> str:
+        """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
     def _map_terminal_state(raw: str) -> str:
         """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary."""
         if raw in ('done', 'done_wip_recovery', 'already_merged'):
@@ -1008,40 +1013,47 @@ def create_server(
         if request_id is None and branch is None and task_id is None:
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
-        # Tier 1: live snapshot
+        # Tier 1: live snapshot — wrapped fire-safe so a transient worker-introspection
+        # failure degrades to the durable tiers rather than erroring the read-only probe.
         worker = getattr(harness, '_merge_worker', None) if harness is not None else None
         if worker is not None and hasattr(worker, 'snapshot'):
-            snap = worker.snapshot()
-            entries = snap.get('entries', [])
-            entry = None
-            if request_id is not None:
-                entry = next(
-                    (e for e in entries if e.get('request_id') == request_id), None
-                )
-            else:
-                # Most-recent by enqueued_at for branch / task_id
-                candidates = [
-                    e for e in entries
-                    if (branch is not None and e.get('branch') == branch)
-                    or (task_id is not None and e.get('task_id') == task_id)
-                ]
-                if candidates:
-                    entry = max(candidates, key=lambda e: e.get('enqueued_at', 0))
-            if entry is not None:
-                eta = None
-                if merge_inflight_registry is not None:
-                    with contextlib.suppress(Exception):
-                        eta = merge_inflight_registry.eta_seconds(entry['branch'])
-                return {
-                    'state': _map_live_state(entry['state']),
-                    'request_id': entry.get('request_id'),
-                    'generation': 1,
-                    'position': entry.get('position'),
-                    'started_at': entry.get('enqueued_at'),
-                    'eta_seconds': eta,
-                }
+            try:
+                snap = worker.snapshot()
+                entries = snap.get('entries', [])
+                entry = None
+                if request_id is not None:
+                    entry = next(
+                        (e for e in entries if e.get('request_id') == request_id), None
+                    )
+                else:
+                    # Most-recent by enqueued_at for branch / task_id
+                    candidates = [
+                        e for e in entries
+                        if (branch is not None and e.get('branch') == branch)
+                        or (task_id is not None and e.get('task_id') == task_id)
+                    ]
+                    if candidates:
+                        entry = max(candidates, key=lambda e: e.get('enqueued_at', 0))
+                if entry is not None:
+                    eta = None
+                    if merge_inflight_registry is not None:
+                        with contextlib.suppress(Exception):
+                            eta = merge_inflight_registry.eta_seconds(entry['branch'])
+                    return {
+                        'state': _map_live_state(entry['state']),
+                        'request_id': entry.get('request_id'),
+                        'generation': 1,
+                        'position': entry.get('position'),
+                        'started_at': entry.get('enqueued_at'),
+                        'eta_seconds': eta,
+                    }
+            except Exception:
+                logger.warning('merge_status: snapshot() failed, falling through to durable tiers',
+                               exc_info=True)
 
         # Tier 2: retention ring (request_id only)
+        # finished_at is stored as epoch float; normalise to ISO-8601 string so the
+        # same logical merge returns the same type regardless of which tier serves it.
         ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
         if ring is not None and request_id is not None:
             rec = ring.get(request_id)
@@ -1051,7 +1063,7 @@ def create_server(
                     'request_id': rec.request_id,
                     'generation': 1,
                     'outcome': rec.state,
-                    'finished_at': rec.finished_at,
+                    'finished_at': _epoch_to_iso8601(rec.finished_at),
                 }
 
         # Tier 3: event store

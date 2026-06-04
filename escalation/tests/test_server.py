@@ -2885,7 +2885,10 @@ class TestMergeStatus:
         )
         assert result.get('generation') == 1
         assert result.get('request_id') == 'mr-statetest'
-        assert result.get('finished_at') is not None
+        # finished_at must be an ISO-8601 string (same type as ring tier after normalisation)
+        fa = result.get('finished_at')
+        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
+        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
 
     async def test_event_store_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the most-recent row and echoes request_id."""
@@ -2982,7 +2985,10 @@ class TestMergeStatus:
         assert result.get('request_id') == 'mr-aaaa1111'
         assert result.get('generation') == 1
         assert result.get('outcome') == 'done'
-        assert result.get('finished_at') == finished
+        # finished_at is normalised to ISO-8601 string (same type as event-store tier)
+        fa = result.get('finished_at')
+        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
+        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
 
     async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
         """Ring tier precedes event store: ring record wins when both have the same request_id."""
