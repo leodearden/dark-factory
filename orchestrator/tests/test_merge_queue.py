@@ -3639,6 +3639,62 @@ class TestSpeculativeMergeWorker:
             f'peer: expected conflict, got {peer_future.result().status!r}'
         )
 
+    async def test_retention_ring_populated_on_oob_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Invariant-(b): α1/1628 merge_finalized retention callback fires on OOB delivery.
+
+        The done-callback registered by enqueue_merge_request is scheduled via
+        call_soon when req.result is set — before the verifier drains the FIFO
+        ordering token.  After OOB delivery the retention ring must contain a
+        record with state=='conflict' for the request.
+
+        Uses the real chokepoint: register_and_enqueue_merge_request with a
+        TerminalOutcomeRetention ring so the callback is wired identically to
+        the production workflow path.
+        """
+        db_path = tmp_path / 'events_ret_oob.db'
+        event_store = EventStore(db_path=db_path, run_id='ret-oob-run')
+        retention = TerminalOutcomeRetention()
+
+        wt = (await git_ops.create_worktree('ret-oob-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main ret side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main ret side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch ret side\n')
+        await git_ops.commit(wt, 'Branch ret conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('ret-oob-cfl', 'ret-oob-cfl', wt, config)
+        await register_and_enqueue_merge_request(
+            queue, req, event_store, None, retention=retention,
+        )
+
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+        assert outcome.status == 'conflict'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+        # Yield to the event loop so the add_done_callback scheduled by
+        # set_result fires (call_soon semantics — one tick suffices).
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None, (
+            'TerminalOutcomeRetention must contain a record for the request '
+            '(α1/1628 merge_finalized callback must fire on OOB set_result)'
+        )
+        assert stored.state == 'conflict', (
+            f'retention.state must be conflict, got: {stored.state!r}. '
+            'The done-callback must fire before the verifier drains the FIFO token.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
