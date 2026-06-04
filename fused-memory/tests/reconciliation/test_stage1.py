@@ -329,6 +329,30 @@ class TestStage1PromptMandatesCycleSummaryStageMetadata:
             "memory_consolidator} can find the summary."
         )
 
+    def test_prompt_mandates_post_write_stage_self_check(self):
+        """STAGE1_SYSTEM_PROMPT must contain 'stage': 'memory_consolidator' at least twice.
+
+        The stage key must appear in BOTH:
+        (1) the metadata write directive (add_memory call),
+        (2) the post-write self-check filter passed to count_memories_by_metadata
+            — the triple filter {kind: cycle_summary, run_id, stage: memory_consolidator}
+            used to confirm the stage key persisted (a return of 0 means the key did
+            not persist, causing Stage 3's triple-filter verification to falsely report
+            'Stage 1 summary missing').
+        count(...) >= 2 ensures both are present.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        count = STAGE1_SYSTEM_PROMPT.count("'stage': 'memory_consolidator'")
+        assert count >= 2, (
+            f"STAGE1_SYSTEM_PROMPT must contain \"'stage': 'memory_consolidator'\" at "
+            f"least twice (write directive + post-write self-check filter); found {count}. "
+            "Both the metadata write directive and the count_memories_by_metadata "
+            "triple-filter {kind: cycle_summary, run_id, stage: memory_consolidator} "
+            "must carry the stage key."
+        )
+
+
 # ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
