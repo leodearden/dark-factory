@@ -1408,3 +1408,56 @@ class TestGetMergeQueue:
         assert entry['pre_rebased'] is False
         assert isinstance(entry['age_secs'], (int, float))
         assert entry['age_secs'] >= 0
+
+    # ── step-7: waiter_alive reflects cancelled future ────────────────────
+
+    async def test_waiter_alive_reflects_cancelled_future(self, tmp_path: Path):
+        """waiter_alive=True for a live future, False for a cancelled future."""
+        import asyncio
+        import types
+
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest, SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+
+        live_fut = loop.create_future()
+        cancelled_fut = loop.create_future()
+        cancelled_fut.cancel()
+
+        await mq.put(MergeRequest(
+            task_id='LIVE', branch='LIVE', worktree=tmp_path / 'wt1',
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=live_fut,
+        ))
+        await mq.put(MergeRequest(
+            task_id='DEAD', branch='DEAD', worktree=tmp_path / 'wt2',
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=cancelled_fut,
+        ))
+
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+        entries = result.get('entries', [])
+
+        live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
+        dead_entry = next((e for e in entries if e['task_id'] == 'DEAD'), None)
+
+        assert live_entry is not None, 'LIVE entry missing from snapshot'
+        assert dead_entry is not None, 'DEAD entry missing from snapshot'
+        assert live_entry['waiter_alive'] is True, (
+            f'Expected waiter_alive=True for live future, got: {live_entry}'
+        )
+        assert dead_entry['waiter_alive'] is False, (
+            f'Expected waiter_alive=False for cancelled future, got: {dead_entry}'
+        )
