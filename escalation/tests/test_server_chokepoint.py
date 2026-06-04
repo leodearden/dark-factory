@@ -1628,8 +1628,6 @@ class TestMergeCancel:
         Previously untested: the existing test only covers set_result(MergeOutcome)
         (the normal-outcome sub-path).  This test exercises the excepted-future branch.
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]  # noqa: F401
-
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
         orch_config = _make_orch_config(tmp_path / 'repo')
