@@ -54,7 +54,7 @@ def _matches(
     esc: Escalation,
     task_id: str | None,
     level: int | None,
-    exclude_ids: frozenset[str] = frozenset(),
+    exclude_ids: frozenset[str] | set[str] = frozenset(),
 ) -> bool:
     """Return True iff esc is pending and satisfies the optional filters."""
     if esc.status != 'pending':
@@ -70,7 +70,7 @@ def _initial_scan(
     queue_dir: Path,
     task_id: str | None,
     level: int | None,
-    exclude_ids: frozenset[str] = frozenset(),
+    exclude_ids: frozenset[str] | set[str] = frozenset(),
 ) -> Escalation | None:
     """Scan the queue directory for already-pending matching escalations.
 
