@@ -40,6 +40,18 @@ try:
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
+    # Satisfy pyright's definite-assignment check.  The TestMergeStatus class
+    # is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so these
+    # stubs are never exercised at runtime.  Annotating as Any lets pyright
+    # treat every subsequent use (calls, attribute access) as valid.
+    OrchestratorConfig: Any = None
+    EventStore: Any = None
+    EventType: Any = None
+    MergeRequest: Any = None
+    SpeculativeItem: Any = None
+    SpeculativeMergeWorker: Any = None
+    TerminalOutcomeRecord: Any = None
+    TerminalOutcomeRetention: Any = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2249,7 +2261,7 @@ class TestGetMergeQueue:
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
-        def _req(tid: str) -> MergeRequest:
+        def _req(tid: str):
             return MergeRequest(
                 task_id=tid, branch=tid,
                 worktree=tmp_path / f'wt-{tid}',
