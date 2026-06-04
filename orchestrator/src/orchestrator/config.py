@@ -672,6 +672,15 @@ class OrchestratorConfig(BaseSettings):
     # identical failures with no variation in error text means the debugger
     # is not making progress and human review is the right next step.
     max_failure_signature_repeat: int = Field(default=3, ge=1)
+    # Verify-phase broken-main contagion guard.  Before invoking the debugger
+    # on a verify failure, detect whether the SAME (category, normalised
+    # cause_hint) signature is present on the current merge-base/main.  If so,
+    # classify the failure as inherited (not this task's own), skip
+    # self-patching, and escalate ONCE (deduped across N sibling tasks that
+    # see the same inherited break) so a single hotfix lands instead of N
+    # conflicting duplicate patches.  Default True closes the demonstrated
+    # StatusBar.tsx TS2769 contagion incident; ops can opt out if needed.
+    escalate_preexisting_main_break: bool = Field(default=True)
     merge_verify_min_free_disk_bytes: int = Field(
         default=10 * 1024**3,
         description=(
