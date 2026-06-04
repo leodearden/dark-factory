@@ -539,3 +539,69 @@ class TestCheckProposalFreshness:
         result = check_proposal(entry, worktree=str(repo), category=None,
                                 run_git=_run_git, now=self._NOW)
         assert result['verdict'] == FRESH, f'expected fresh (outside footprint): {result}'
+
+
+# ---------------------------------------------------------------------------
+# step-13: _read_latest_proposal
+# ---------------------------------------------------------------------------
+
+class TestReadLatestProposal:
+    def test_returns_last_proposal_entry(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        entry_a = {'proposal_text': 'first', 'risk_label': 'low'}
+        entry_b = {'proposal_text': 'second', 'risk_label': 'low'}
+        _seed_tasks_db(tmp_path, 42, [entry_a, entry_b])
+        result = _read_latest_proposal(42, tmp_path)
+        assert result == entry_b, f'expected last entry, got {result}'
+
+    def test_missing_task_id_returns_none(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        _seed_tasks_db(tmp_path, 42, [{'proposal_text': 'x', 'risk_label': 'low'}])
+        result = _read_latest_proposal(99, tmp_path)  # id 99 not seeded
+        assert result is None
+
+    def test_missing_db_returns_none(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        # No tasks.db at all
+        result = _read_latest_proposal(42, tmp_path)
+        assert result is None
+
+    def test_empty_proposals_list_returns_none(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        _seed_tasks_db(tmp_path, 42, [])
+        result = _read_latest_proposal(42, tmp_path)
+        assert result is None
+
+    def test_metadata_missing_dry_run_proposals_returns_none(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        # Seed with metadata that lacks dry_run_proposals key
+        db_dir = tmp_path / '.taskmaster' / 'tasks'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'tasks.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS tasks '
+            '(tag TEXT, id INTEGER, status TEXT, priority TEXT, metadata TEXT, updated_at TEXT)'
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('master', 42, 'blocked', 'medium', ?, ?)",
+            (json.dumps({'other_key': 'value'}), '2026-06-04T00:00:00+00:00'),
+        )
+        conn.commit()
+        conn.close()
+        result = _read_latest_proposal(42, tmp_path)
+        assert result is None
+
+    def test_uses_default_tag_master(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        entry = {'proposal_text': 'x', 'risk_label': 'low'}
+        _seed_tasks_db(tmp_path, 42, [entry])  # seeds tag='master'
+        result = _read_latest_proposal(42, tmp_path)  # default tag='master'
+        assert result == entry
+
+    def test_string_task_id_works(self, tmp_path):
+        from orchestrator.b3_gate import _read_latest_proposal
+        entry = {'proposal_text': 'x', 'risk_label': 'low'}
+        _seed_tasks_db(tmp_path, 42, [entry])
+        result = _read_latest_proposal('42', tmp_path)
+        assert result == entry
