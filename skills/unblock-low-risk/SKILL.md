@@ -148,6 +148,10 @@ Return ONLY this JSON object (no prose):
 
 - Only `risk_label == 'low'`; only `task_failure` / `review_issues`.
 - Edits scoped to `files_referenced`; never main-only / CI / infra / config.
+- **Freshness enforced by `b3_gate check`** (precondition 6): proceed only on `verdict == "fresh"`;
+  any `drift` or `abort` verdict → ABORT with the gate's `reason` verbatim.
+- **Rolling-24h merge cap enforced by `b3_gate charge`** (step 7, immediately before `merge_request`):
+  a refused charge (`charged: false`) → ABORT. All aborts before this step cost no slot.
 - Merge ONLY through `merge_request`; never a direct `git merge`; never `--no-verify`.
 - One attempt. No retry loops. ABORT on the first sign of doubt.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
