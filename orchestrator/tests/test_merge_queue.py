@@ -3737,6 +3737,123 @@ class TestSpeculativeMergeWorker:
         )
         assert not future2.done(), 'req.result must remain pending for done outcome'
 
+    # ── Mechanism 1: merge-ahead cap (task 1646) ──────────────────────────────
+
+    async def test_merger_ahead_cap_bounds_blocking_path(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Mechanism 1: _MERGE_AHEAD_BOUND caps non-speculative merger build-ahead.
+
+        With BOUND=1: after N's verify is gated and N+1 is in the verifier queue,
+        submitting N+2 on the non-speculative blocking-get path must NOT land in the
+        verifier queue — the Merger blocks at cap.acquire() until the Verifier drains.
+
+        RED before impl: ImportError on _MERGE_AHEAD_BOUND (constant not yet added),
+        then assertion failure (no cap → both N+1 and N+2 enqueue → qsize=2 > BOUND).
+        """
+        from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+
+        wt_n = await _make_branch_with_file(git_ops, 'cap-n', 'file_cap_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'cap-n1', 'file_cap_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'cap-n2', 'file_cap_n2.py', 'n2 = 3\n')
+
+        # Gate N's verify to simulate slow verification latency
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+
+        async def gated_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            if (merge_wt / 'file_cap_n.py').exists() and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
+            return MagicMock(passed=True, summary='')
+
+        # Track when N+2's git merge finishes so we can check the cap state
+        # deterministically: by the time n2_merge_done fires, the merger has either
+        # blocked at cap.acquire() (WITH cap) or enqueued N+2 and gone back to
+        # queue.get() (WITHOUT cap).  Both sides yield to the event loop before we
+        # resume, so the verifier-queue snapshot is stable.
+        n2_merge_done = asyncio.Event()
+        original_merge = git_ops.merge_to_main
+
+        async def tracking_merge(worktree, branch, **kwargs):
+            result = await original_merge(worktree, branch, **kwargs)
+            if branch == 'cap-n2' and result.success:
+                n2_merge_done.set()
+            return result
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=gated_verify),
+            patch.object(git_ops, 'merge_to_main', new=tracking_merge),
+        ):
+            req_n = _make_request('cap-n', 'cap-n', wt_n, config)
+            req_n1 = _make_request('cap-n1', 'cap-n1', wt_n1, config)
+            req_n2 = _make_request('cap-n2', 'cap-n2', wt_n2, config)
+
+            # Phase 1: submit N and wait for it to be mid-verify.
+            # By the time n_verify_entered fires, the merger has already processed
+            # N, tried (and missed) the speculative look-ahead for N+1 (N+1 not
+            # yet submitted), and blocked at queue.get() — so N+1 will take the
+            # non-speculative blocking-get path.
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            # Phase 2: submit N+1 on the non-speculative path.
+            await queue.put(req_n1)
+
+            # Wait for N+1 to land in the verifier queue, which proves the merger
+            # has tried (and missed) N+2 in N+1's speculative look-ahead — so N+2
+            # will also take the blocking-get (non-speculative) path.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 1:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail('N+1 never appeared in the verifier queue within 15 s')
+
+            # Phase 3: submit N+2 on the non-speculative path.
+            await queue.put(req_n2)
+
+            # Wait for N+2's git merge to complete.  After this wait the merger
+            # has made its cap decision: either blocked (WITH cap) or enqueued
+            # N+2 and returned to queue.get() (WITHOUT cap).
+            await asyncio.wait_for(n2_merge_done.wait(), timeout=30)
+
+            # KEY ASSERTION — verifier queue must not exceed BOUND counted items
+            q_size = worker._verifier_queue.qsize()
+            assert q_size <= _MERGE_AHEAD_BOUND, (
+                f'verifier queue has {q_size} items but _MERGE_AHEAD_BOUND={_MERGE_AHEAD_BOUND}; '
+                f'merger built too far ahead (merge-ahead cap not implemented)'
+            )
+            # N+2 must still be pending — merger is blocked at cap.acquire()
+            assert not req_n2.result.done(), (
+                'N+2 result must still be pending while N is mid-verify '
+                '(merger should be blocked at _merge_ahead_cap.acquire())'
+            )
+
+            # Phase 4: release gate — N, N+1, N+2 all complete as 'done'
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+        assert outcome_n2.status == 'done', f'N+2: {outcome_n2}'
+
+        for fname in ('file_cap_n.py', 'file_cap_n1.py', 'file_cap_n2.py'):
+            _, out, _ = await _run(
+                ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
+            )
+            assert out.strip(), f'{fname} not on main after all merges completed'
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
