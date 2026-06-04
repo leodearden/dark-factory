@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2216,3 +2220,70 @@ class TestResolveCascade:
         assert result.status == 'resolved'
         assert result.resolution == 'Fixed; no members'
 
+
+# ---------------------------------------------------------------------------
+# Step-1: Unit tests for the escalation_id_lock exported helper
+# ---------------------------------------------------------------------------
+
+class TestEscalationIdLock:
+    """Unit tests for the escalation_id_lock(queue_dir, escalation_id) context manager."""
+
+    def test_importable_from_escalation_queue(self):
+        """(a) escalation_id_lock is importable from escalation.queue at module level."""
+        from escalation.queue import escalation_id_lock  # noqa: F401
+
+    def test_entering_context_creates_sidecar_file(self, tmp_path: Path):
+        """(b) Entering the context creates the sidecar .lock file at the expected path."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+
+        assert not lock_path.exists(), 'Sidecar must not exist before context entry'
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            assert lock_path.exists(), 'Sidecar must exist while context is held'
+        # File persists after release (stable inode — never deleted)
+        assert lock_path.exists(), 'Sidecar must persist after context exit (stable inode)'
+
+    def test_held_lock_blocks_second_acquire_nonblocking(self, tmp_path: Path):
+        """(c) While the context is held, a non-blocking flock on the same path raises BlockingIOError."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            # Open a second fd on the same sidecar file
+            fd2 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd2)
+
+        # After context exits the lock is released — non-blocking acquire succeeds
+        fd3 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            # Must NOT raise — lock has been released
+            fcntl.flock(fd3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd3, fcntl.LOCK_UN)
+        finally:
+            os.close(fd3)
+
+    def test_lock_file_invisible_to_esc_json_glob(self, tmp_path: Path):
+        """(d) The .lock sidecar does NOT appear in Path.glob('esc-*.json')."""
+        from escalation.queue import escalation_id_lock
+
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        with escalation_id_lock(queue_dir, 'esc-1-1'):
+            pass
+
+        matched = list(queue_dir.glob('esc-*.json'))
+        lock_path = queue_dir / 'esc-1-1.json.lock'
+        assert lock_path not in matched, (
+            f'Lock sidecar must not match esc-*.json glob; matched={matched}'
+        )
