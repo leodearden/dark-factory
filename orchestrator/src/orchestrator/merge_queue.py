@@ -1688,6 +1688,8 @@ async def enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
     event_store: EventStore | None,
+    *,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
 
@@ -1699,7 +1701,55 @@ async def enqueue_merge_request(
     If ``event_store`` is None the request is still enqueued; emission is
     silently skipped (mirrors the None-safe pattern used by
     ``_emit_merge_attempt``).
+
+    Registers a single ``req.result.add_done_callback`` that, when the future
+    reaches its terminal state (resolved, cancelled, or exception), emits a
+    ``merge_finalized`` event and records the outcome into *retention* (when
+    provided).  The callback is fire-and-forget: any exception is logged as a
+    warning and never propagates.
     """
+    def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
+        try:
+            if fut.cancelled():
+                state: str = 'abandoned'
+                merge_sha: str | None = None
+            elif fut.exception() is not None:
+                state = 'error'
+                merge_sha = None
+            else:
+                outcome: MergeOutcome = fut.result()
+                state = outcome.status
+                merge_sha = outcome.merge_sha
+            if event_store is not None:
+                event_store.emit(
+                    EventType.merge_finalized,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={
+                        'request_id': req.request_id,
+                        'branch': req.branch,
+                        'state': state,
+                        'snapshot_tip': req.snapshot_tip,
+                        'merge_sha': merge_sha,
+                    },
+                )
+            if retention is not None:
+                retention.record(TerminalOutcomeRecord(
+                    request_id=req.request_id,
+                    task_id=req.task_id,
+                    branch=req.branch,
+                    state=state,
+                    snapshot_tip=req.snapshot_tip,
+                    merge_sha=merge_sha,
+                ))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'enqueue_merge_request: _on_finalized callback failed for '
+                'request_id=%s task_id=%s',
+                req.request_id, req.task_id, exc_info=True,
+            )
+
+    req.result.add_done_callback(_on_finalized)
     await queue.put(req)
     _emit_merge_queued(event_store, req)
 

@@ -4472,6 +4472,50 @@ class TestEnqueueMergeRequest:
         dequeued = queue.get_nowait()
         assert dequeued is req
 
+    @pytest.mark.asyncio
+    async def test_enqueue_registers_terminal_callback_emitting_merge_finalized(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """enqueue_merge_request registers a done-callback that emits merge_finalized.
+
+        Resolving req.result triggers the callback; one merge_finalized row
+        must appear with the correct request_id, state, branch, and merge_sha.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-mf-test')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Resolve the future — the done-callback should fire
+        req.result.set_result(MergeOutcome(status='done', merge_sha='abc123'))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.branch') AS branch, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_finalized'
+        assert rows[0][1] == '42'           # task_id
+        assert rows[0][2] == req.request_id  # data.request_id
+        assert rows[0][3] == 'done'          # data.state
+        assert rows[0][4] == 'task/42'       # data.branch
+        assert rows[0][5] == 'abc123'        # data.merge_sha
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
