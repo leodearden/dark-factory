@@ -134,7 +134,7 @@ def harness_for_run_slot() -> Harness:
     h.usage_gate = None
     h._merge_queue = None  # type: ignore[assignment]
     h._merge_worker = None
-    h._merge_inflight_registry = None
+    h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None
     # _collect_done_reports uses these
     h._run_store = None

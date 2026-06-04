@@ -26,6 +26,7 @@ from _orch_helpers import _init_harness_state_for_test
 import orchestrator.harness as harness_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.merge_queue import InFlightMergeRegistry
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
@@ -61,7 +62,7 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     harness.usage_gate = MagicMock()
     harness._merge_queue = asyncio.Queue()
     harness._merge_worker = None
-    harness._merge_inflight_registry = None
+    harness._merge_inflight_registry = InFlightMergeRegistry()
     harness.event_store = None
     harness.cost_store = None
     harness._run_id = 'run-test'
