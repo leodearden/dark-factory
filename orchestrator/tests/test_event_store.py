@@ -389,3 +389,126 @@ class TestTrainEventTypes:
 
         derailed_data = json.loads(rows[3]['data'])
         assert 'verify' in derailed_data['derail_reason']
+
+
+class TestLatestMergeFinalized:
+    """EventStore.latest_merge_finalized — query helper for the merge_status tool."""
+
+    def _emit_finalized(
+        self,
+        store: EventStore,
+        *,
+        request_id: str,
+        task_id: str,
+        branch: str,
+        state: str,
+        snapshot_tip: str | None = None,
+        merge_sha: str | None = None,
+    ) -> None:
+        store.emit(
+            EventType.merge_finalized,
+            task_id=task_id,
+            data={
+                'request_id': request_id,
+                'branch': branch,
+                'state': state,
+                'snapshot_tip': snapshot_tip,
+                'merge_sha': merge_sha,
+            },
+        )
+
+    def test_returns_none_on_empty_store(self, tmp_path: Path) -> None:
+        """Returns None when no merge_finalized rows exist."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        assert store.latest_merge_finalized(request_id='mr-unknown') is None
+
+    def test_lookup_by_request_id(self, tmp_path: Path) -> None:
+        """Returns the matching row when looked up by request_id."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(
+            store,
+            request_id='mr-aa001',
+            task_id='T1',
+            branch='branch-T1',
+            state='done',
+            merge_sha='abc123',
+            snapshot_tip='tip-sha',
+        )
+
+        row = store.latest_merge_finalized(request_id='mr-aa001')
+        assert row is not None, 'Expected a result row, got None'
+        assert row['request_id'] == 'mr-aa001'
+        assert row['task_id'] == 'T1'
+        assert row['branch'] == 'branch-T1'
+        assert row['state'] == 'done'
+        assert row['merge_sha'] == 'abc123'
+        assert row['snapshot_tip'] == 'tip-sha'
+        assert row['finished_at'] is not None
+
+    def test_lookup_by_request_id_returns_none_for_unknown(self, tmp_path: Path) -> None:
+        """Returns None for a request_id that was never recorded."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(store, request_id='mr-exists', task_id='T', branch='b', state='done')
+        assert store.latest_merge_finalized(request_id='mr-does-not-exist') is None
+
+    def test_lookup_by_branch_returns_most_recent(self, tmp_path: Path) -> None:
+        """branch= lookup returns the most-recent (highest id) matching row."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(
+            store, request_id='mr-old', task_id='T1', branch='feature-x', state='conflict'
+        )
+        self._emit_finalized(
+            store, request_id='mr-new', task_id='T1', branch='feature-x', state='done'
+        )
+
+        row = store.latest_merge_finalized(branch='feature-x')
+        assert row is not None
+        assert row['request_id'] == 'mr-new', (
+            f'Expected most-recent row (mr-new), got {row["request_id"]!r}'
+        )
+        assert row['state'] == 'done'
+
+    def test_lookup_by_task_id_returns_most_recent(self, tmp_path: Path) -> None:
+        """task_id= lookup returns the most-recent matching row."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(
+            store, request_id='mr-first', task_id='T42', branch='b1', state='blocked'
+        )
+        self._emit_finalized(
+            store, request_id='mr-second', task_id='T42', branch='b2', state='done'
+        )
+
+        row = store.latest_merge_finalized(task_id='T42')
+        assert row is not None
+        assert row['request_id'] == 'mr-second', (
+            f'Expected most-recent row (mr-second), got {row["request_id"]!r}'
+        )
+        assert row['state'] == 'done'
+
+    def test_no_lookup_key_returns_none(self, tmp_path: Path) -> None:
+        """Calling with no key (all None) returns None immediately."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(store, request_id='mr-x', task_id='T', branch='b', state='done')
+        assert store.latest_merge_finalized() is None
+
+    def test_unknown_branch_returns_none(self, tmp_path: Path) -> None:
+        """Returns None when branch doesn't match any row."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(store, request_id='mr-y', task_id='T', branch='branch-a', state='done')
+        assert store.latest_merge_finalized(branch='branch-z') is None
+
+    def test_request_id_takes_precedence_over_branch(self, tmp_path: Path) -> None:
+        """When both request_id and branch are passed, request_id wins."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        self._emit_finalized(
+            store, request_id='mr-req', task_id='T1', branch='branch-req', state='done'
+        )
+        self._emit_finalized(
+            store, request_id='mr-branch', task_id='T2', branch='branch-other', state='conflict'
+        )
+
+        row = store.latest_merge_finalized(request_id='mr-req', branch='branch-other')
+        assert row is not None
+        assert row['request_id'] == 'mr-req', (
+            f'Expected request_id-matched row, got {row["request_id"]!r}'
+        )
