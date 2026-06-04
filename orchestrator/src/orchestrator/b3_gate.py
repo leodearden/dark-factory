@@ -357,8 +357,18 @@ def _read_latest_proposal(
 # ---------------------------------------------------------------------------
 
 def _resolve_cap(config_path: str | None) -> int:
-    """Return the b3_merge_cap_per_24h value from config, or DEFAULT_CAP."""
-    raise NotImplementedError
+    """Return the b3_merge_cap_per_24h value from config, or DEFAULT_CAP.
+
+    Falls back to DEFAULT_CAP on any load failure so the gate never hard-fails
+    on a bad/foreign config path (§4.5).
+    """
+    if config_path is None:
+        return DEFAULT_CAP
+    try:
+        from orchestrator.config import load_config
+        return load_config(Path(config_path)).unblock_auto.b3_merge_cap_per_24h
+    except Exception:
+        return DEFAULT_CAP
 
 
 # ---------------------------------------------------------------------------
