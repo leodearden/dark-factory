@@ -11740,6 +11740,65 @@ class TestMaybeAutoChainGeneration:
             assert queue.empty()
             assert 'task/t-seq' not in counts  # reset
 
+    async def test_retention_seam_chained_request_gets_recorded(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(γ2 step-21 RED) provenance retention seam: when _maybe_auto_chain_generation
+        receives a retention ring it passes it to enqueue_merge_request so the gen-(n+1)
+        terminal outcome is recorded (superseded_by pointer resolves)."""
+        from orchestrator.merge_queue import (
+            MergeOutcome,
+            TipRelation,
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+            _GenerationChainContext,
+            _maybe_auto_chain_generation,
+        )
+
+        # _GenerationChainContext must accept a retention kwarg and expose it.
+        ring = TerminalOutcomeRetention(maxlen=50)
+        queue: asyncio.Queue = asyncio.Queue()
+        ctx = _GenerationChainContext(
+            queue=queue,
+            counts={},
+            max_auto_generations=2,
+            retention=ring,
+        )
+        assert ctx.retention is ring
+
+        req = self._make_req(tmp_path, config, branch='task/t-ret', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        event_store.emit = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip',
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+                retention=ring,
+            )
+
+        assert result is not None and result.status == 'superseded'
+        gen_next = await queue.get()
+        assert gen_next.generation == 2
+
+        # Resolve the gen-(n+1) future so _on_finalized fires.
+        gen_next.result.set_result(MergeOutcome('done', merge_sha='advsha'))
+        await asyncio.sleep(0)  # let callbacks run
+
+        rec = ring.get(gen_next.request_id)
+        assert rec is not None, 'ring should contain the gen-(n+1) terminal record'
+        assert isinstance(rec, TerminalOutcomeRecord)
+        assert rec.state == 'done'
+        assert rec.generation == 2
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerGenerationChain — γ2 step-13/14: MergeWorker wiring
