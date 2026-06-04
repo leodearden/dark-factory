@@ -246,3 +246,47 @@ class TestVerifyDebugfixLoopNonInheritedPaths:
             tmp_path, category='flock_error',
         )
         helper_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — sibling fix: verify PASSES post-rebase -> guard never reached
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyDebugfixLoopSiblingFix:
+    """Step-11 / test-expectation #3: post-rebase passing verify exits DONE without guard."""
+
+    def test_passing_verify_exits_done_without_calling_helper(
+        self, tmp_path: Path,
+    ) -> None:
+        """When run_scoped_verification returns passed=True, loop returns DONE immediately.
+
+        verify_failure_is_preexisting_on_main must NOT be called,
+        no escalation/_mark_blocked occurs, and _inherited_break_info stays None.
+        """
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_workflow(config, worktree)
+
+        helper_spy = AsyncMock(return_value=False)
+
+        async def _run_loop() -> WorkflowOutcome:
+            with (
+                patch('orchestrator.workflow.run_scoped_verification',
+                      new=AsyncMock(return_value=PASSING_RESULT)),
+                patch('orchestrator.workflow.verify_failure_is_preexisting_on_main',
+                      new=helper_spy),
+            ):
+                return await workflow._verify_debugfix_loop()
+
+        outcome = asyncio.run(_run_loop())
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE when verify passes; got {outcome}'
+        )
+        helper_spy.assert_not_called()
+        assert workflow._inherited_break_info is None, (
+            '_inherited_break_info must stay None when verify passes'
+        )
+        workflow._invoke.assert_not_called()  # debugger must not run
