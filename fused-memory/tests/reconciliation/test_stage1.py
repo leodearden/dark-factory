@@ -298,6 +298,38 @@ class TestStage2PromptMandatesUniquenessToken:
 
 
 # ---------------------------------------------------------------------------
+# task-1653: STAGE1 prompt mandates metadata.stage='memory_consolidator' in
+# per-cycle summary writes (mirrors Stage 2's stage='task_knowledge_sync' fix)
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PromptMandatesCycleSummaryStageMetadata:
+    """Minimal contract tests: STAGE1_SYSTEM_PROMPT carries the stage metadata
+    directive for per-cycle summary writes.
+
+    Regression guards against the directive being dropped from the prompt.
+    """
+
+    def test_prompt_mandates_stage_in_cycle_summary_metadata(self):
+        """STAGE1_SYSTEM_PROMPT must contain the stage key for cycle-summary writes.
+
+        The Stage 1 per-cycle summary add_memory call must carry
+        metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>}
+        so that Stage 3's triple-filter existence check
+        {kind: cycle_summary, run_id, stage: memory_consolidator} returns >= 1
+        instead of 0 (which formerly caused false 'Stage 1 summary missing' reports).
+        Mirrors Stage 2's fix (task 9af436fe, stage='task_knowledge_sync').
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert "'stage': 'memory_consolidator'" in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must include \"'stage': 'memory_consolidator'\" in the "
+            "per-cycle summary metadata directive so the add_memory call carries the "
+            "stage key and the triple-filter {kind: cycle_summary, run_id, stage: "
+            "memory_consolidator} can find the summary."
+        )
+
+# ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
 
