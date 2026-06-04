@@ -40,7 +40,8 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
      --task-id <task_id> \
      --worktree <worktree> \
      --project-root <project_root> \
-     --category <category>
+     --category <category> \
+     --config <project_root>/orchestrator/config.yaml
    ```
 
    `<category>` is the escalation category already asserted in precondition 4. The gate reads
@@ -88,7 +89,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    ```
    .venv/bin/python -m orchestrator.b3_gate charge \
      --task-id <task_id> \
-     --project-root <project_root>
+     --project-root <project_root> \
+     --config <project_root>/orchestrator/config.yaml
    ```
 
    Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
@@ -99,6 +101,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Rationale (PRD §4.2): the charge sits at the merge-submit choke point — the actual unattended-merge
    risk axis — so every ABORT before this step (preconditions, scope check, rebase conflict, verify
    failure) spends no slot and is free by design.
+
+   Note: once `charged: true` is returned the slot is consumed even if the subsequent `merge_request`
+   returns an error or a non-success outcome (`conflict`, `blocked`, `failed`) — those post-charge
+   aborts cost a slot. This is the accepted §4.2 tradeoff.
 
 8. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
    branch=task_id, worktree=<abs path>, description="unblock-low-risk: <one-line summary>")`. `branch`
