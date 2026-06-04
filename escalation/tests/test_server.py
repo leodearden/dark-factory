@@ -2946,3 +2946,102 @@ class TestMergeStatus:
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result
+
+    # ── step-9: ring tier ─────────────────────────────────────────────────────
+
+    async def test_ring_tier_returns_terminal_record(self, tmp_path: Path) -> None:
+        """Ring tier: a request_id in the ring returns the recorded terminal state."""
+        import time
+        import types
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+
+        ring = TerminalOutcomeRetention()
+        finished = time.time() - 5.0
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-aaaa1111',
+            task_id='T-ring',
+            branch='branch-ring',
+            state='done',
+            finished_at=finished,
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, request_id='mr-aaaa1111')
+
+        assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
+        assert result.get('request_id') == 'mr-aaaa1111'
+        assert result.get('generation') == 1
+        assert result.get('outcome') == 'done'
+        assert result.get('finished_at') == finished
+
+    async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
+        """Ring tier precedes event store: ring record wins when both have the same request_id."""
+        import time
+        import types
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rv',
+            data={'request_id': 'mr-ringwin', 'branch': 'b-rv', 'state': 'done'},
+        )
+
+        # Ring says 'blocked' — this should win over event store's 'done'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-ringwin',
+            task_id='T-rv',
+            branch='b-rv',
+            state='blocked',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-ringwin')
+
+        assert result.get('state') == 'blocked', (
+            f'Expected ring value (blocked) to beat event store (done), got: {result}'
+        )
+        assert result.get('outcome') == 'blocked'
+
+    async def test_ring_miss_falls_through_to_event_store(self, tmp_path: Path) -> None:
+        """Ring miss falls through to the event store tier."""
+        import types
+
+        from orchestrator.merge_queue import TerminalOutcomeRetention  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rm',
+            data={'request_id': 'mr-in-ev-only', 'branch': 'b-rm', 'state': 'conflict'},
+        )
+
+        # Ring is empty — miss should fall through to event store
+        ring = TerminalOutcomeRetention()
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-in-ev-only')
+
+        assert result.get('state') == 'conflict', (
+            f'Expected conflict from event-store fallback, got: {result}'
+        )
