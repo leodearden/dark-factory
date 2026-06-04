@@ -3134,15 +3134,15 @@ class TaskWorkflow:
 
             self.metrics.execute_iterations += 1
 
-            # Check for escalations.  L1 (already-escalated-to-human) issues
-            # from prior runs of this same task stay in the queue until a
+            # Check for escalations.  Plain blocking L1 (already-escalated-to-human)
+            # issues from prior runs of this same task stay in the queue until a
             # human or escalation-watcher resolves them; we must not let them
-            # sink the current run.  Only fresh L0 blocking escalations
-            # gate progress here.
-            blocking = [
-                e for e in self._check_escalations()
-                if e.severity == 'blocking' and e.level == 0
-            ]
+            # sink the current run.  Fresh L0 blocking escalations gate progress
+            # here, AND born-at-L2 (critical/urgent) escalations AND any level≥2
+            # escalations also gate regardless of severity — D4 accepted consequence:
+            # a pending critical/urgent from a prior incarnation DOES sink a fresh
+            # run (intended stop-the-line semantics).  See _is_gating_escalation.
+            blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
