@@ -438,6 +438,37 @@ class TestRunWatcherRotation:
             f'got {captured.get("env_overrides")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_rotation_start_logs_bash_max_timeout_ms(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An INFO record on orchestrator.harness at rotation start contains
+        'BASH_MAX_TIMEOUT_MS' and the injected ms value string.
+
+        Proves the operator-visible dispatch log records the injected value so
+        it is greppable in production logs.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            return AgentResult(success=True, output='')
+
+        caplog.set_level(logging.INFO, logger='orchestrator.harness')
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        expected_ms = str(int((h.config.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS) * 1000))
+        matching = [
+            r for r in caplog.records
+            if 'BASH_MAX_TIMEOUT_MS' in r.getMessage() and expected_ms in r.getMessage()
+        ]
+        assert matching, (
+            f'Expected an INFO record containing both "BASH_MAX_TIMEOUT_MS" and "{expected_ms}" '
+            f'on logger orchestrator.harness; records: {[r.getMessage() for r in caplog.records]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-9: Supervisor loop classification — clean/unclean backoff
