@@ -279,6 +279,7 @@ class ReconReportState:
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
         sig = (task_id, flag_type)
+        desc_hash = ""
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
             if existing_id is not None:
