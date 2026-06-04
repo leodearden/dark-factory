@@ -94,9 +94,13 @@ class TestVerifyFailureIsPreexistingOnMain:
         module_configs: list = []
         task_files = ['src/foo.tsx']
 
-        # Mock git_ops: get_main_sha returns a SHA
+        # Mock git_ops: get_main_sha returns a SHA; worktree_base is a real Path
+        # so the helper builds a valid probe path under it (env-parity invariant).
         mock_git_ops = MagicMock()
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        mock_git_ops.worktree_base = worktree_base
 
         # run_scoped_verification on main -> same failure
         async def _fake_verify(*args, **kwargs) -> VerifyResult:
@@ -144,6 +148,9 @@ class TestVerifyFailureIsPreexistingFalseCases:
 
         mock_git_ops = MagicMock()
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        mock_git_ops.worktree_base = worktree_base
 
         async def _fake_verify(*args, **kwargs) -> VerifyResult:
             return main_result
@@ -199,6 +206,9 @@ class TestVerifyFailureIsPreexistingLifecycle:
         worktree.mkdir()
         mock_git_ops = MagicMock()
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        mock_git_ops.worktree_base = worktree_base
 
         run_calls: list[list[str]] = []
 
@@ -243,6 +253,9 @@ class TestVerifyFailureIsPreexistingLifecycle:
         worktree.mkdir()
         mock_git_ops = MagicMock()
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        mock_git_ops.worktree_base = worktree_base
 
         run_calls: list[list[str]] = []
 
@@ -293,7 +306,6 @@ class TestVerifyFailureProbeWorktreePlacement:
 
     def test_probe_path_is_under_worktree_base_not_tmp(self, tmp_path: Path) -> None:
         """The 'git worktree add --detach' target must be a child of git_ops.worktree_base."""
-        import tempfile
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
@@ -330,13 +342,21 @@ class TestVerifyFailureProbeWorktreePlacement:
         assert len(probe_paths) == 1, f'Expected exactly 1 worktree add call; got: {probe_paths}'
         probe_path = Path(probe_paths[0])
 
-        # MUST be under worktree_base — not in /tmp or any system temp dir
-        assert probe_path.is_relative_to(worktree_base), (
-            f'Probe path {probe_path!r} must be under worktree_base={worktree_base} '
-            f'for environment parity (upward dependency resolution). '
-            f'Current parent: {probe_path.parent}'
+        # MUST be a direct child of worktree_base with the '_mainprobe-' prefix.
+        # This pins the environment-parity invariant: task worktrees live at
+        # worktree_base/<name> and resolve node_modules / repo-root installs by
+        # upward traversal that reaches project_root.  A probe at an independent
+        # mkdtemp path (old behaviour: /tmp/df-mainprobe-xxx/probe) cannot reach
+        # project_root via upward traversal, so inherited TS/compile breaks surface
+        # a different signature ('Cannot find module') and the guard silently never fires.
+        assert probe_path.parent == worktree_base, (
+            f'Probe path {probe_path!r} must be a direct child of '
+            f'worktree_base={worktree_base} (not a sub-directory of some other dir). '
+            f'Actual parent: {probe_path.parent}'
         )
-        assert not probe_path.is_relative_to(Path(tempfile.gettempdir())), (
-            f'Probe path {probe_path!r} must NOT be under system temp dir '
-            f'{tempfile.gettempdir()} — /tmp probes fail to resolve node_modules upward'
+        assert probe_path.name.startswith('_mainprobe-'), (
+            f"Probe dir name {probe_path.name!r} must start with '_mainprobe-' "
+            f"(distinct from '_merge-*' so the disk-pressure prune never reclaims it mid-run)"
         )
+        # Belt check: the probe is NOT the task worktree itself or a sub-path of it
+        assert probe_path != worktree, f'Probe must differ from task worktree {worktree}'

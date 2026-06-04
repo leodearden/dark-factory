@@ -2263,12 +2263,21 @@ async def verify_failure_is_preexisting_on_main(
     avoids redundant probes from the same or sibling tasks against an unchanged main.
 
     The task worktree is NEVER mutated — all git ops target *config.project_root*
-    (for worktree-level commands) and the detached temp path (for probe verify).
-    Cleanup (worktree remove --force + shutil.rmtree of the temp parent) always
+    (for worktree-level commands) and the detached probe path (for probe verify).
+    Cleanup (worktree remove --force + shutil.rmtree of the probe dir) always
     runs in a ``finally`` block.  No broad ``git worktree prune`` is issued so
     concurrently-active sibling probes are not disturbed.
+
+    The probe worktree is created under *git_ops.worktree_base* with a
+    ``_mainprobe-<id>`` prefix (mirroring ``_create_merge_worktree``'s
+    ``_merge-<id>`` scheme).  Placement under worktree_base ensures environment
+    parity: upward directory traversal resolves node_modules / repo-root shared
+    installs exactly as task worktrees do.  The ``_mainprobe-`` prefix is
+    distinct from ``_merge-`` so the disk-pressure prune
+    (``prune_stale_merge_worktrees``, targeting ``_merge-*`` only) never
+    reclaims the probe mid-run.
     """
-    import tempfile
+    import uuid
 
     from orchestrator.git_ops import _run
 
@@ -2283,11 +2292,13 @@ async def verify_failure_is_preexisting_on_main(
         except Exception:
             return (hint or '').strip().lower()
 
-    # tmp_root: mkdtemp-created parent dir that we own for cleanup.
-    # tmp_path: non-existent child of tmp_root that git worktree add creates.
-    # Using a child path avoids the pre-existing-directory footgun on strict git
-    # versions that reject an already-present directory.
-    tmp_root: Path | None = None
+    # tmp_path: probe worktree path under git_ops.worktree_base.
+    # Using worktree_base/<name> (not /tmp) ensures the same upward directory
+    # traversal as task worktrees for node_modules / repo-root dependencies.
+    # The '_mainprobe-' prefix keeps it distinct from '_merge-*' so the disk-
+    # pressure prune (prune_stale_merge_worktrees) never reclaims it mid-run.
+    # git worktree add CREATES tmp_path; we must NOT pre-create it or git will
+    # reject an already-present directory on strict versions.
     tmp_path: Path | None = None
     worktree_added: bool = False
     try:
@@ -2313,10 +2324,13 @@ async def verify_failure_is_preexisting_on_main(
                 )
                 return _cached, (main_sha if _cached else '')
 
-        # Create the probe worktree: mkdtemp gives us an owned parent; the child
-        # 'probe/' is passed to git so git creates it (avoids pre-existing-dir footgun).
-        tmp_root = Path(tempfile.mkdtemp(prefix='df-mainprobe-'))
-        tmp_path = tmp_root / 'probe'
+        # Create the probe worktree path under worktree_base so upward directory
+        # traversal resolves node_modules / repo-root installs identically to
+        # task worktrees.  git worktree add CREATES the path, so we must NOT
+        # pre-create it (strict git rejects pre-existing directories).
+        base = git_ops.worktree_base  # type: ignore[union-attr]
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_path = base / f'_mainprobe-{uuid.uuid4().hex[:8]}'
 
         # Retry worktree add on transient git lock contention (serialised metadata
         # writes mean concurrent sibling probes can hit LOCK_MAX).
@@ -2383,6 +2397,8 @@ async def verify_failure_is_preexisting_on_main(
                     'verify_failure_is_preexisting_on_main: worktree remove failed',
                     exc_info=True,
                 )
-        if tmp_root is not None:
+        if tmp_path is not None:
             with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                # Belt-and-suspenders: rmtree the probe dir in case git worktree
+                # remove left an empty skeleton, or the worktree add never ran.
+                shutil.rmtree(tmp_path, ignore_errors=True)
