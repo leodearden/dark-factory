@@ -254,6 +254,57 @@ class TestInitialScan:
         assert result is not None
         assert result.id == 'esc-6-1'
 
+    def test_exclude_single_pending(self, tmp_path):
+        """Sole pending escalation in exclude_ids -> returns None."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-7-1', task_id='7', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending',
+        )
+        _write_esc(queue_dir, esc)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-7-1'})
+        assert result is None
+
+    def test_exclude_older_returns_newer(self, tmp_path):
+        """When the older of two pending escalations is excluded, returns the newer one."""
+        old_ts = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        new_ts = datetime.now(UTC).isoformat()
+        old_esc = Escalation(
+            id='esc-8-1', task_id='8', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='old',
+            timestamp=old_ts,
+        )
+        new_esc = Escalation(
+            id='esc-8-2', task_id='8', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='new',
+            timestamp=new_ts,
+        )
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        _write_esc(queue_dir, old_esc)
+        _write_esc(queue_dir, new_esc)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-8-1'})
+        assert result is not None
+        assert result.id == 'esc-8-2'
+
+    def test_exclude_all_pending_returns_none(self, tmp_path):
+        """All pending escalations in exclude_ids -> returns None."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc1 = Escalation(
+            id='esc-9-1', task_id='9', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='a',
+        )
+        esc2 = Escalation(
+            id='esc-9-2', task_id='9', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='b',
+        )
+        _write_esc(queue_dir, esc1)
+        _write_esc(queue_dir, esc2)
+        result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-9-1', 'esc-9-2'})
+        assert result is None
+
 
 class TestInitialScanMain:
     """main() emits a pre-existing pending escalation without any inotify event."""
@@ -292,6 +343,145 @@ class TestInitialScanMain:
         assert blocking_escalation.id in captured.out
         data = json.loads(captured.out)
         assert data['id'] == blocking_escalation.id
+
+
+class TestExcludeId:
+    """--exclude-id flag: repeatable, honoured in initial scan AND event loop."""
+
+    def test_startup_excludes_both_pending_enters_event_loop(self, tmp_path, capsys):
+        """With two pending files both excluded, initial scan returns None -> event loop entered."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc1 = Escalation(
+            id='esc-20-1', task_id='20', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='first',
+        )
+        esc2 = Escalation(
+            id='esc-20-2', task_id='20', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='second',
+        )
+        (queue_dir / f'{esc1.id}.json').write_text(esc1.to_json())
+        (queue_dir / f'{esc2.id}.json').write_text(esc2.to_json())
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', esc1.id,
+                '--exclude-id', esc2.id,
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        mock_inotify.read.assert_called_once()
+
+    def test_exclude_id_json_suffix_normalized(self, tmp_path, capsys):
+        """--exclude-id with .json suffix is normalized; esc-7-1.json excludes esc-7-1."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-7-1', task_id='7', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='pending',
+        )
+        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', f'{esc.id}.json',
+            ]),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = KeyboardInterrupt
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        mock_inotify.read.assert_called_once()
+
+    def test_event_loop_suppresses_excluded_event(self, tmp_path, capsys):
+        """Event for an excluded file (e.g. dedupe MOVED_TO rewrite) is silently ignored."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        esc = Escalation(
+            id='esc-21-1', task_id='21', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='deliberately-pending',
+        )
+        (queue_dir / f'{esc.id}.json').write_text(esc.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{esc.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', esc.id,
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_not_called()
+        assert capsys.readouterr().out == ''
+
+    def test_event_loop_fires_on_non_excluded_event(self, tmp_path, capsys):
+        """Event for a different (non-excluded) file fires normally."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        excluded_esc = Escalation(
+            id='esc-22-1', task_id='22', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='excluded',
+        )
+        live_esc = Escalation(
+            id='esc-22-2', task_id='22', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='live',
+        )
+        (queue_dir / f'{excluded_esc.id}.json').write_text(excluded_esc.to_json())
+        (queue_dir / f'{live_esc.id}.json').write_text(live_esc.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{live_esc.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+                '--exclude-id', excluded_esc.id,
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+        mock_exit.assert_called_once_with(0)
+        assert live_esc.id in capsys.readouterr().out
 
 
 class TestMainLoop:

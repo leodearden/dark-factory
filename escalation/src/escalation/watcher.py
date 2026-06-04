@@ -2,6 +2,7 @@
 
 Usage: python -m escalation.watcher --queue-dir <path> [--task-id <id>]
        [--level <int>] [--ntfy-url <url>] [--timeout <secs>]
+       [--exclude-id <esc-id> ...]
 
 Watches for new .json files in the queue directory. When a matching pending
 escalation appears (or is already present at startup), prints the escalation
@@ -49,9 +50,16 @@ from inotify_simple import INotify, flags
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 
 
-def _matches(esc: Escalation, task_id: str | None, level: int | None) -> bool:
+def _matches(
+    esc: Escalation,
+    task_id: str | None,
+    level: int | None,
+    exclude_ids: frozenset[str] | set[str] = frozenset(),
+) -> bool:
     """Return True iff esc is pending and satisfies the optional filters."""
     if esc.status != 'pending':
+        return False
+    if esc.id in exclude_ids:  # defensive fallback: covers id/filename mismatch; filename stem pre-checks handle the normal case
         return False
     if task_id and esc.task_id != task_id:
         return False
@@ -62,6 +70,7 @@ def _initial_scan(
     queue_dir: Path,
     task_id: str | None,
     level: int | None,
+    exclude_ids: frozenset[str] | set[str] = frozenset(),
 ) -> Escalation | None:
     """Scan the queue directory for already-pending matching escalations.
 
@@ -73,12 +82,15 @@ def _initial_scan(
     best_ts: datetime | None = None
 
     for path in queue_dir.glob('esc-*.json'):
+        if path.stem in exclude_ids:
+            continue
+
         try:
             esc = Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, OSError, TypeError):
             continue
 
-        if not _matches(esc, task_id, level):
+        if not _matches(esc, task_id, level, exclude_ids):
             continue
 
         try:
@@ -132,10 +144,18 @@ def main() -> None:
         '--timeout', type=float, default=None,
         help='max blocking wait in seconds; on expiry exit 124',
     )
+    parser.add_argument(
+        '--exclude-id', action='append', default=None,
+        help='esc-id to exclude from initial scan AND event loop; repeatable',
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
+
+    exclude_ids = frozenset(
+        e[:-5] if e.endswith('.json') else e for e in (args.exclude_id or [])
+    )
 
     # ARM inotify first so no events are missed between scan and watch.
     inotify = INotify()
@@ -143,7 +163,7 @@ def main() -> None:
     inotify.add_watch(str(queue_dir), watch_flags)
 
     # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level)
+    match = _initial_scan(queue_dir, args.task_id, args.level, exclude_ids)
     if match is not None:
         _emit(match, args.ntfy_url)
         sys.exit(0)
@@ -171,13 +191,16 @@ def main() -> None:
             if not name or not (name.startswith('esc-') and name.endswith('.json')):
                 continue
 
+            if name[:-5] in exclude_ids:
+                continue
+
             path = queue_dir / name
             try:
                 esc = Escalation.from_json(path.read_text())
             except (json.JSONDecodeError, KeyError, OSError, TypeError):
                 continue
 
-            if not _matches(esc, args.task_id, args.level):
+            if not _matches(esc, args.task_id, args.level, exclude_ids):
                 continue
 
             _emit(esc, args.ntfy_url)
