@@ -1289,8 +1289,6 @@ class TestGetMergeQueue:
 
     async def test_standalone_returns_error(self, tmp_path: Path):
         """get_merge_queue with no merge_queue returns an error dict, no exception."""
-        import asyncio
-
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # NO merge_queue — standalone
 
@@ -1306,9 +1304,9 @@ class TestGetMergeQueue:
         import asyncio
         import time
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            GroupMergeRequest, MergeRequest,
+            GroupMergeRequest,
+            MergeRequest,
         )
 
         loop = asyncio.get_running_loop()
@@ -1364,9 +1362,9 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest, SpeculativeMergeWorker,
+            MergeRequest,
+            SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
@@ -1374,7 +1372,7 @@ class TestGetMergeQueue:
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
         req = MergeRequest(
             task_id='Q',
@@ -1416,9 +1414,9 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest, SpeculativeMergeWorker,
+            MergeRequest,
+            SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
@@ -1426,7 +1424,7 @@ class TestGetMergeQueue:
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
         live_fut = loop.create_future()
         cancelled_fut = loop.create_future()
@@ -1472,16 +1470,17 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest, SpeculativeItem, SpeculativeMergeWorker,
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
         config = self._make_orch_config(tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
         def _req(tid: str) -> MergeRequest:
             return MergeRequest(
@@ -1565,10 +1564,11 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest, SpeculativeItem, SpeculativeMergeWorker,
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
@@ -1598,7 +1598,7 @@ class TestGetMergeQueue:
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
             config=config,
         )
-        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
         req = MergeRequest(
             task_id='P',
