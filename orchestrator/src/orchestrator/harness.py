@@ -893,12 +893,33 @@ class Harness:
 
                 await sem.acquire()
                 self._task_modules[assignment.task_id] = list(assignment.modules)
+                # Register escalation wake-event BEFORE create_task so Fix #1a
+                # (_on_escalation_resolved orphan-flip gate) sees task_id in
+                # _escalation_events immediately — closing the sub-second race
+                # where a resolving escalation would mis-classify a just-
+                # dispatched task as an orphan and double-flip it.
+                self._register_escalation_event(assignment.task_id)
                 task = asyncio.create_task(
                     self._run_slot(assignment, sem),
                     name=f'workflow-{assignment.task_id}',
                 )
                 active.add(task)
                 task.add_done_callback(active.discard)
+                # Guard against the narrow resource-leak window where the slot
+                # task is cancelled before _run_slot's body begins executing
+                # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
+                # before the event loop schedules the coroutine's first step).
+                # In that case _run_slot's finally block never runs and
+                # _escalation_events[task_id] would leak — permanently
+                # satisfying the active-workflow gate and suppressing both the
+                # stranded_blocked re-file and Fix #1a orphan-flip for that
+                # task forever.  The done_callback fires unconditionally when
+                # the Task reaches any terminal state; pop() is idempotent (a
+                # no-op if _run_slot's finally already removed the entry).
+                _tid = assignment.task_id
+                task.add_done_callback(
+                    lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
+                )
 
             # Drain remaining
             if active:
@@ -1472,6 +1493,54 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Orphan reaper: %d reaped, %d quarantined', reaped, quarantined,
             )
 
+    def _workflow_cancel_recent(self, tid: str) -> bool:
+        """Return True if *tid* has a workflow-cancel stamp within the grace window.
+
+        Replaces the membership check ``tid not in _workflow_cancel_at`` in the
+        Fix #1b re-file gate and in the sweep loop's R3 race guard.
+
+        Semantics:
+          - No stamp (never cancelled / already pruned) → False.
+          - Stamp exists AND now - stamp < _RECONCILE_CANCEL_GRACE_S → True
+            (workflow's finally-block may still be writing state; skip).
+          - Stamp exists AND now - stamp >= grace → False (stale; re-filing
+            is safe — the stamp will be lazily pruned by the sweep loop on the
+            next mid-run cycle via the existing pop() call).
+        """
+        cancelled_at = self._workflow_cancel_at.get(tid)
+        return (
+            cancelled_at is not None
+            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+        )
+
+    def _register_escalation_event(self, task_id: str) -> asyncio.Event | None:
+        """Register an escalation wake-event for *task_id* at dispatch time.
+
+        Calling this BEFORE ``asyncio.create_task(_run_slot(...))`` closes the
+        sub-second race in Fix #1a (``_on_escalation_resolved``):
+
+          dispatch → create_task(_run_slot)
+                          ↑
+                     [gap: _run_slot hasn't run yet; task_id not in
+                      _escalation_events → Fix #1a sees it as an orphan
+                      and double-flips blocked→pending, racing the
+                      workflow's own re-pend]
+
+        With dispatch-time registration, ``task_id in _escalation_events`` is
+        True the instant the slot is created, so Fix #1a's orphan-flip gate
+        always sees an active workflow and skips the orphan path.
+
+        Returns:
+            The newly-created ``asyncio.Event`` stored at
+            ``_escalation_events[task_id]``, or ``None`` when
+            ``_escalation_queue`` is falsy (no escalation wiring — no-op).
+        """
+        if not self._escalation_queue:
+            return None
+        esc_event = asyncio.Event()
+        self._escalation_events[task_id] = esc_event
+        return esc_event
+
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
 
@@ -1541,8 +1610,6 @@ Output JSON matching the schema. Every task must appear in the output.
         # blocked tasks (manual `git merge` while task was blocked) get
         # marked done by the next sweep cycle.  See _RECONCILE_SWEEP_STATUSES
         # for the full list of intentionally excluded statuses.
-        now = time.monotonic()
-
         for tid, status in statuses.items():
             if status not in _RECONCILE_SWEEP_STATUSES:
                 continue
@@ -1559,14 +1626,12 @@ Output JSON matching the schema. Every task must appear in the output.
             # grace period elapses so we don't revert work the workflow
             # is still finishing.
             if mid_run:
-                cancelled_at = self._workflow_cancel_at.get(tid)
-                if cancelled_at is not None:
-                    if now - cancelled_at < self._RECONCILE_CANCEL_GRACE_S:
-                        continue
-                    # Grace window elapsed — lazily prune so the dict stays
-                    # bounded for tasks that exit terminal and are never
-                    # re-dispatched (re-dispatch otherwise clears the stamp).
-                    self._workflow_cancel_at.pop(tid, None)
+                if self._workflow_cancel_recent(tid):
+                    continue
+                # Grace window elapsed (or never set) — lazily prune so the
+                # dict stays bounded for tasks that exit terminal and are never
+                # re-dispatched (re-dispatch otherwise clears the stamp).
+                self._workflow_cancel_at.pop(tid, None)
 
             try:
                 outcome = await self._reconcile_one_stranded(
@@ -1806,11 +1871,24 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # Self-dedupes: once filed, the pending-escalation check below
             # suppresses re-filing on the next cycle until it is resolved.
+            #
+            # Category: 'stranded_blocked' (PRD-3 task ε, 2026-06-04).
+            # The escalation-watcher (task θ) auto-resolves stranded_blocked
+            # L1s with action='resume', triggering this exact Fix #1a path:
+            # _on_escalation_resolved → _cascade_unblock_member →
+            # blocked→pending re-pend.  This replaces the prior 'task_failure'
+            # category, which routed to the human-triage watcher instead of the
+            # auto-resume watcher.
+            #
+            # RE-FILE-NEVER-FLIP discipline is PRESERVED: we still only file
+            # the L1 and let resolution drive the status change.  The /unblock
+            # blocked-park protection (pending-escalation check above) is also
+            # preserved — an open L1 of any category prevents re-filing.
             if (
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
                 and tid not in self._escalation_events       # no active workflow
-                and tid not in self._workflow_cancel_at       # not a recent cancel/park
+                and not self._workflow_cancel_recent(tid)     # not a recent cancel/park
                 and not self._escalation_queue.get_by_task(tid, status='pending')
             ):
                 from escalation.models import Escalation
@@ -1820,7 +1898,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     task_id=tid,
                     agent_role='harness-stranded-blocked-reaper',
                     severity='blocking',
-                    category='task_failure',
+                    category='stranded_blocked',
                     summary=(
                         f'Stranded blocked: task {tid} blocked with no open '
                         f'escalation and no active workflow — likely an orphaned '
@@ -1848,7 +1926,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         task_id=tid,
                         data={
                             'escalation_id': esc.id,
-                            'category': 'task_failure',
+                            'category': 'stranded_blocked',
                             'severity': 'blocking',
                             'level': 1,
                             'reason': 'stranded-blocked-backstop',
@@ -2353,11 +2431,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Starting workflow for task {assignment.task_id}: '
                 f'{assignment.task.get("title", "")}'
             )
-            # Create escalation event for this task
-            esc_event = None
-            if self._escalation_queue:
-                esc_event = asyncio.Event()
-                self._escalation_events[assignment.task_id] = esc_event
+            # Retrieve the escalation wake-event registered at dispatch time.
+            # _register_escalation_event was called at the dispatch point
+            # (before create_task) so _escalation_events already has an entry.
+            # The defensive create-if-missing branch handles direct _run_slot
+            # invocations (e.g. unit tests) that bypass the dispatch path.
+            esc_event = self._escalation_events.get(assignment.task_id)
+            if esc_event is None and self._escalation_queue:
+                esc_event = self._register_escalation_event(assignment.task_id)
 
             # Soft-cancel event — exposed so external code (reconciliation
             # subscriber, release_workflow MCP tool) can interrupt long
