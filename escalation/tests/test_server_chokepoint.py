@@ -771,3 +771,98 @@ class TestMergeRequestRequestId:
 
         # Clean up the never-resolving future to avoid ResourceWarning
         never_future.cancel()
+
+    async def test_submit_time_already_merged_fast_path(self, tmp_path: Path):
+        """When branch tip is already an ancestor of main, merge_request returns
+        {status:'already_merged', commit} immediately — no enqueue, no merge_queued.
+
+        RED until step-6 impl: without the fast-path, the code proceeds to
+        coalesce+enqueue (emits merge_queued, mq non-empty) then blocks on the
+        future → asyncio.wait_for raises TimeoutError.
+
+        Verifies PRD invariant I4: guaranteed-redundant submission is killed at
+        the door.  Also verifies that resolve_branch_sha is called with the
+        prefixed ref 'task/591' (not bare '591') per the worker convention.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        FAKE_TIP = 'deadbeef12345678'
+
+        # Recording event_store stub
+        class _RecordingEventStore:
+            def __init__(self):
+                self.events: list = []
+
+            def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+                self.events.append(event_type)
+
+        recording_event_store = _RecordingEventStore()
+
+        # git_ops stub recording calls
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str:
+            resolve_calls.append(name)
+            return FAKE_TIP
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return True
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        git_ops_stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            event_store=recording_event_store,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Fast-path result: {status, commit} only — no request_id (no entry exists)
+        assert result == {'status': 'already_merged', 'commit': FAKE_TIP}, (
+            f"Expected already_merged fast-path result, got: {result}"
+        )
+        assert mq.empty(), (
+            f"Expected empty queue (no enqueue on already_merged), qsize={mq.qsize()}"
+        )
+        assert EventType.merge_queued not in recording_event_store.events, (
+            f"Expected no merge_queued event, got: {recording_event_store.events}"
+        )
+        # resolve_branch_sha must be called with the prefixed ref 'task/591'
+        assert resolve_calls == ['task/591'], (
+            f"Expected resolve_branch_sha('task/591'), got: {resolve_calls}"
+        )
+        # is_ancestor must be called with (tip, main_branch)
+        assert len(ancestor_calls) == 1, (
+            f"Expected is_ancestor called once, got: {ancestor_calls}"
+        )
+        assert ancestor_calls[0] == (FAKE_TIP, 'main'), (
+            f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
+        )
