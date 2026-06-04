@@ -9,6 +9,9 @@ and tmp_path isolation with EscalationQueue.
 
 from __future__ import annotations
 
+import asyncio
+import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,37 @@ from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+
+# ---------------------------------------------------------------------------
+# Cross-package orchestrator imports — used by TestMergeStatus.
+# Guarded so the rest of the file is still collected when the orchestrator
+# package is absent (e.g. in an escalation-only install).
+# ---------------------------------------------------------------------------
+try:
+    from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+    from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        MergeRequest,
+        SpeculativeItem,
+        SpeculativeMergeWorker,
+        TerminalOutcomeRecord,
+        TerminalOutcomeRetention,
+    )
+    _ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    _ORCHESTRATOR_AVAILABLE = False
+    # Satisfy pyright's definite-assignment check.  The TestMergeStatus class
+    # is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so these
+    # stubs are never exercised at runtime.  Annotating as Any lets pyright
+    # treat every subsequent use (calls, attribute access) as valid.
+    OrchestratorConfig: Any = None
+    EventStore: Any = None
+    EventType: Any = None
+    MergeRequest: Any = None
+    SpeculativeItem: Any = None
+    SpeculativeMergeWorker: Any = None
+    TerminalOutcomeRecord: Any = None
+    TerminalOutcomeRetention: Any = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2227,7 +2261,7 @@ class TestGetMergeQueue:
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
-        def _req(tid: str) -> MergeRequest:
+        def _req(tid: str):
             return MergeRequest(
                 task_id=tid, branch=tid,
                 worktree=tmp_path / f'wt-{tid}',
@@ -2779,3 +2813,474 @@ class TestDowngradeDedupeCorrectness:
             f'summary={summary!r}: expected parent_id={parent.id!r}, '
             f'got parent_id={result.get("parent_id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeStatus — merge_status MCP tool (task 1630 α3)
+# ---------------------------------------------------------------------------
+
+
+async def _call_merge_status(server, **kwargs) -> dict:
+    """Invoke the merge_status MCP tool (async tool)."""
+    tool = await server.get_tool('merge_status')
+    return await tool.fn(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeStatus:
+    """Tests for the merge_status escalation MCP tool (α3)."""
+
+    # ── step-5a: no key returns error ────────────────────────────────────────
+
+    async def test_no_key_returns_error(self, tmp_path: Path) -> None:
+        """Calling merge_status with no request_id/branch/task_id returns {'error': ...}."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)
+
+        result = await _call_merge_status(server)
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert 'error' in result, f'Expected error key, got: {result}'
+
+    # ── step-5b: standalone unknown + hint ───────────────────────────────────
+
+    async def test_standalone_returns_unknown_with_hint(self, tmp_path: Path) -> None:
+        """On a server with no event_store/harness, merge_status returns unknown + hint."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)  # standalone: no event_store, no harness
+
+        result = await _call_merge_status(server, request_id='mr-deadbeef')
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
+        assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
+        assert result.get('request_id') == 'mr-deadbeef', (
+            f'Expected request_id echoed, got: {result}'
+        )
+        assert 'hint' in result, f'Expected hint key in result: {result}'
+        assert 'git log' in result['hint'].lower() or 'git' in result['hint'], (
+            f'Expected hint to mention git, got: {result["hint"]!r}'
+        )
+
+    # ── step-7: event-store tier + state mapping ──────────────────────────────
+
+    def _make_event_store(self, tmp_path: Path):
+        return EventStore(tmp_path / 'runs.db', 'run-ms-test'), EventType
+
+    def _emit_finalized(self, store, EventType, *, request_id, task_id, branch, state):
+        store.emit(
+            EventType.merge_finalized,
+            task_id=task_id,
+            data={'request_id': request_id, 'branch': branch, 'state': state},
+        )
+
+    @pytest.mark.parametrize('raw_state,expected_coarse', [
+        ('done', 'done'),
+        ('done_wip_recovery', 'done'),
+        ('already_merged', 'done'),
+        ('conflict', 'conflict'),
+        ('blocked', 'blocked'),
+        ('wip_halted', 'blocked'),
+        ('wip_recovery_no_advance', 'blocked'),
+        ('unmerged_state', 'blocked'),
+        ('unknown_branch', 'blocked'),
+        ('error', 'blocked'),
+        ('abandoned', 'abandoned'),
+    ])
+    async def test_event_store_state_mapping(
+        self, tmp_path: Path, raw_state: str, expected_coarse: str
+    ) -> None:
+        """Event-store tier maps raw terminal states to the public coarse vocabulary."""
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-statetest',
+            task_id='T-map',
+            branch='branch-map',
+            state=raw_state,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-statetest')
+
+        assert result.get('state') == expected_coarse, (
+            f'raw={raw_state!r}: expected coarse={expected_coarse!r}, got state={result.get("state")!r}'
+        )
+        assert result.get('outcome') == raw_state, (
+            f'raw={raw_state!r}: expected outcome preserved, got outcome={result.get("outcome")!r}'
+        )
+        assert result.get('generation') == 1
+        assert result.get('request_id') == 'mr-statetest'
+        # finished_at must be an ISO-8601 string (same type as ring tier after normalisation)
+        fa = result.get('finished_at')
+        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
+        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
+
+    async def test_event_store_lookup_by_branch(self, tmp_path: Path) -> None:
+        """branch= lookup resolves to the most-recent row and echoes request_id."""
+        event_store, EventType = self._make_event_store(tmp_path)
+        # Emit two rows for the same branch; the second should win
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-old', task_id='T1', branch='feat-branch', state='conflict'
+        )
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-new', task_id='T1', branch='feat-branch', state='done'
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, branch='feat-branch')
+
+        assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
+        assert result.get('request_id') == 'mr-new', (
+            f'Expected resolved request_id=mr-new, got: {result.get("request_id")!r}'
+        )
+
+    async def test_event_store_lookup_by_task_id(self, tmp_path: Path) -> None:
+        """task_id= lookup resolves to the most-recent row and echoes request_id."""
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-earlier', task_id='T-tid', branch='b1', state='blocked'
+        )
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-later', task_id='T-tid', branch='b2', state='done'
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, task_id='T-tid')
+
+        assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
+        assert result.get('request_id') == 'mr-later', (
+            f'Expected resolved request_id=mr-later, got: {result.get("request_id")!r}'
+        )
+
+    async def test_event_store_miss_falls_through_to_unknown(self, tmp_path: Path) -> None:
+        """An id not in the event store falls through to unknown+hint."""
+        event_store, EventType = self._make_event_store(tmp_path)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-nothere')
+
+        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert 'hint' in result
+
+    # ── step-9: ring tier ─────────────────────────────────────────────────────
+
+    async def test_ring_tier_returns_terminal_record(self, tmp_path: Path) -> None:
+        """Ring tier: a request_id in the ring returns the recorded terminal state."""
+        ring = TerminalOutcomeRetention()
+        finished = time.time() - 5.0
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-aaaa1111',
+            task_id='T-ring',
+            branch='branch-ring',
+            state='done',
+            finished_at=finished,
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, request_id='mr-aaaa1111')
+
+        assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
+        assert result.get('request_id') == 'mr-aaaa1111'
+        assert result.get('generation') == 1
+        assert result.get('outcome') == 'done'
+        # finished_at is normalised to ISO-8601 string (same type as event-store tier)
+        fa = result.get('finished_at')
+        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
+        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
+
+    async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
+        """Ring tier precedes event store: ring record wins when both have the same request_id."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rv',
+            data={'request_id': 'mr-ringwin', 'branch': 'b-rv', 'state': 'done'},
+        )
+
+        # Ring says 'blocked' — this should win over event store's 'done'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-ringwin',
+            task_id='T-rv',
+            branch='b-rv',
+            state='blocked',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-ringwin')
+
+        assert result.get('state') == 'blocked', (
+            f'Expected ring value (blocked) to beat event store (done), got: {result}'
+        )
+        assert result.get('outcome') == 'blocked'
+
+    async def test_ring_miss_falls_through_to_event_store(self, tmp_path: Path) -> None:
+        """Ring miss falls through to the event store tier."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rm',
+            data={'request_id': 'mr-in-ev-only', 'branch': 'b-rm', 'state': 'conflict'},
+        )
+
+        # Ring is empty — miss should fall through to event store
+        ring = TerminalOutcomeRetention()
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id='mr-in-ev-only')
+
+        assert result.get('state') == 'conflict', (
+            f'Expected conflict from event-store fallback, got: {result}'
+        )
+
+    # ── step-11: live-snapshot tier ───────────────────────────────────────────
+
+    def _make_orch_config(self, tmp_path: Path):
+        return OrchestratorConfig(project_root=tmp_path)
+
+    async def test_live_snapshot_state_mapping(self, tmp_path: Path) -> None:
+        """Live snapshot states map to the public vocabulary."""
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+        req = MergeRequest(
+            task_id='T-live', branch='branch-live',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, request_id=req.request_id)
+
+        assert result.get('state') == 'queued', f'Expected queued, got: {result}'
+        assert result.get('request_id') == req.request_id
+        assert result.get('generation') == 1
+        assert 'position' in result, f'Expected position key, got: {result}'
+        assert isinstance(result.get('position'), int)
+        assert 'enqueued_at' in result, f'Expected enqueued_at key, got: {result}'
+        assert result.get('enqueued_at') == req.enqueued_at
+        assert 'eta_seconds' in result, f'Expected eta_seconds key, got: {result}'
+
+    async def test_live_snapshot_lookup_by_branch(self, tmp_path: Path) -> None:
+        """branch= lookup resolves to the live entry's request_id."""
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
+        req = MergeRequest(
+            task_id='T-lbranch', branch='branch-bylookup',
+            worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
+            module_configs=[], config=config, result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, branch='branch-bylookup')
+
+        assert result.get('state') == 'queued', f'Expected queued, got: {result}'
+        assert result.get('request_id') == req.request_id, (
+            f'Expected resolved request_id={req.request_id!r}, got: {result.get("request_id")!r}'
+        )
+
+    async def test_live_snapshot_lookup_by_task_id(self, tmp_path: Path) -> None:
+        """task_id= lookup resolves to the live entry's request_id."""
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
+        req = MergeRequest(
+            task_id='T-ltask', branch='branch-ltask',
+            worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
+            module_configs=[], config=config, result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, task_id='T-ltask')
+
+        assert result.get('state') == 'queued', f'Expected queued, got: {result}'
+        assert result.get('request_id') == req.request_id, (
+            f'Expected resolved request_id={req.request_id!r}, got: {result.get("request_id")!r}'
+        )
+
+    async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
+        """Live snapshot tier wins over ring and event store for the same request_id."""
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
+        req = MergeRequest(
+            task_id='T-prec', branch='branch-prec',
+            worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
+            module_configs=[], config=config, result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        # Ring says 'done'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id=req.request_id,
+            task_id=req.task_id,
+            branch=req.branch,
+            state='done',
+        ))
+
+        # Event store also says 'done'
+        event_store = EventStore(tmp_path / 'runs.db', 'run-prec')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id=req.task_id,
+            data={'request_id': req.request_id, 'branch': req.branch, 'state': 'done'},
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=worker, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, request_id=req.request_id)
+
+        # Live snapshot is 'queued'; ring+event store have 'done'
+        # Live must win
+        assert result.get('state') == 'queued', (
+            f'Expected live state (queued) to beat ring/ev (done), got: {result}'
+        )
+        assert 'position' in result, 'Live entry should carry position'
+
+    @pytest.mark.parametrize('verify_phase,expected', [
+        ('merging', 'verifying'),
+        ('awaiting_verify', 'verifying'),
+        ('verifying', 'verifying'),
+        ('gate_reverify', 'gate'),
+        ('finalizing', 'finalizing'),
+        ('queued', 'queued'),
+    ])
+    async def test_live_snapshot_phase_mapping(
+        self, tmp_path: Path, verify_phase: str, expected: str
+    ) -> None:
+        """Live snapshot state mapping covers all documented phase values."""
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
+
+        req = MergeRequest(
+            task_id='T-phase', branch='branch-phase',
+            worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
+            module_configs=[], config=config, result=loop.create_future(),
+        )
+
+        if verify_phase == 'queued':
+            await mq.put(req)
+        else:
+            # Put req through the verify item path
+            merge_wt = tmp_path / 'merge-wt'
+            merge_wt.mkdir()
+            item = SpeculativeItem(
+                request=req,
+                merge_result=None, merge_wt=merge_wt,
+                base_sha='base', speculative=False, skip_verify=False,
+            )
+            if verify_phase in ('merging',):
+                worker._inflight_req = req
+            elif verify_phase == 'awaiting_verify':
+                await worker._verifier_queue.put(item)
+            else:
+                worker._verify_item = item
+                worker._verify_phase = verify_phase
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, request_id=req.request_id)
+
+        assert result.get('state') == expected, (
+            f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
+        )
+
+    # ── Tier-1 degradation: snapshot() failure falls through to durable tiers ─
+
+    async def test_snapshot_failure_degrades_to_durable_tier(self, tmp_path: Path) -> None:
+        """Tier-1 fire-safe wrapper: a snapshot() exception falls through to ring/event-store.
+
+        This covers the most safety-critical branch: merge_status must return a
+        durable-tier result (not propagate the exception) when the live worker
+        is present but snapshot() itself raises.
+        """
+        # Populate the event store so the durable tier has a result to serve.
+        event_store = EventStore(tmp_path / 'runs.db', 'run-snap-fail')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-snapfail',
+            data={'request_id': 'mr-snapfail', 'branch': 'b-snapfail', 'state': 'done'},
+        )
+
+        # Stub worker whose snapshot() always raises — simulates a transient
+        # introspection failure (e.g. queue internals in a bad state).
+        broken_worker = types.SimpleNamespace(
+            snapshot=lambda: (_ for _ in ()).throw(RuntimeError('simulated snapshot failure'))
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=broken_worker,
+            _terminal_retention=None,
+        )
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        # Should NOT raise; should fall through to the event-store tier.
+        result = await _call_merge_status(server, request_id='mr-snapfail')
+
+        assert result.get('state') == 'done', (
+            f'Expected durable-tier result after snapshot() failure, got: {result}'
+        )
+        assert result.get('request_id') == 'mr-snapfail'
+        assert result.get('outcome') == 'done'
+        assert 'finished_at' in result

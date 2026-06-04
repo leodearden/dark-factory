@@ -10293,6 +10293,52 @@ class TestRegisterAndEnqueue:
 
 
 # ---------------------------------------------------------------------------
+# TestSnapshotEntryRequestId — snapshot entry dict exposes request_id (task 1630)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotEntryRequestId:
+    """Snapshot entry dict must expose ``request_id`` (α3 additive wiring)."""
+
+    async def test_snapshot_entry_exposes_request_id(self, tmp_path: Path) -> None:
+        """worker.snapshot()['entries'][0] contains 'request_id' == req.request_id."""
+        import types
+
+        loop = asyncio.get_running_loop()
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+
+        req = MergeRequest(
+            task_id='T1630',
+            branch='T1630',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        snap = worker.snapshot()
+        entries = snap['entries']
+        assert len(entries) == 1, f'Expected 1 entry, got: {entries}'
+        entry = entries[0]
+        assert 'request_id' in entry, (
+            f"'request_id' key missing from snapshot entry: {entry}"
+        )
+        assert entry['request_id'] == req.request_id, (
+            f"entry['request_id']={entry['request_id']!r} != req.request_id={req.request_id!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-1 RED: _InFlightEntry.request_id + MergeDispatchResult.inflight_request_id
 # ---------------------------------------------------------------------------
 

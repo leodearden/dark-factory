@@ -3119,7 +3119,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Each entry dict contains:
           task_id, branch, state, enqueued_at, age_secs, position,
-          waiter_alive, worktree, pre_rebased.
+          waiter_alive, worktree, pre_rebased, request_id.
         State values: queued, merging, awaiting_verify, verifying,
           gate_reverify, finalizing.
         """
