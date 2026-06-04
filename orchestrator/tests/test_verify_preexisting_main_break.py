@@ -126,3 +126,58 @@ class TestVerifyFailureIsPreexistingOnMain:
         assert result is True, (
             'Expected True — same (category, cause_hint) reproduced on main means inherited.'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — false cases: main passes -> False; different signature -> False
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureIsPreexistingFalseCases:
+    """Step-3 / test-expectation #2 + invariant a: non-inherited cases return False."""
+
+    def _run_helper(
+        self, tmp_path: Path, failing_result: VerifyResult, main_result: VerifyResult,
+    ) -> bool:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return main_result
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            return asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, mock_git_ops,
+                )
+            )
+
+    def test_returns_false_when_main_passes(self, tmp_path: Path) -> None:
+        """Main probe passes -> break is task-own -> False.
+
+        Invariant (a): a sibling's already-landed hotfix makes main clean,
+        so the helper correctly reports 'not inherited' and lets the debugger run.
+        """
+        result = self._run_helper(tmp_path, FAILING_RESULT, PASSING_RESULT)
+        assert result is False, (
+            'Main passes after sibling hotfix — should return False so debugger runs.'
+        )
+
+    def test_returns_false_when_different_signature_on_main(self, tmp_path: Path) -> None:
+        """Main fails with a DIFFERENT (category, cause_hint) -> different break -> False."""
+        result = self._run_helper(tmp_path, FAILING_RESULT, DIFFERENT_RESULT)
+        assert result is False, (
+            'Different failure signature on main — not the same inherited break, should return False.'
+        )
