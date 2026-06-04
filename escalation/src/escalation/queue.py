@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -16,6 +17,51 @@ from escalation import archive
 from escalation.models import Escalation
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
+    """Per-escalation-id exclusive advisory lock using a stable sidecar file.
+
+    WHY A SIDECAR (PRD D3 rationale):
+    The queue's writers are atomic tmp+rename (_atomic_write_path).  After a
+    tmp+rename replace, the data file ``{escalation_id}.json`` is a NEW inode.
+    A second writer that flock()s the (new) data-file path binds to a different
+    inode and races anyway — the lock is defeated.  The fix is a STABLE lock
+    target: ``{escalation_id}.json.lock``, created once via os.open(O_CREAT)
+    and NEVER renamed or replaced, so all writers flock the same inode and
+    actually serialize.
+
+    EXPORT CONTRACT:
+    This helper is module-level and exported so task ε (server-start sweep /
+    reaper) can import it as::
+
+        from escalation.queue import escalation_id_lock
+
+    and take the same lock around its root↔archive relocations without
+    instantiating an EscalationQueue.
+
+    GLOB INVISIBILITY:
+    The sidecar ends in ``.lock`` and does NOT match the ``esc-*.json`` glob
+    used by get_pending / get_by_task / make_id / iter_all_escalation_paths.
+    Lock files are intentionally never deleted or renamed (stable inode);
+    accumulation at current queue volumes is acceptable.
+
+    Usage::
+
+        with escalation_id_lock(queue_dir, escalation_id):
+            data = read(); data = mutate(data); atomic_write(data)
+    """
+    lock_path = Path(queue_dir) / f'{escalation_id}.json.lock'
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 # Severity rank map for promotion logic.  Alphabetical comparison is wrong
 # ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
