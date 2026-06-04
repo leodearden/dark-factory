@@ -102,33 +102,120 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    risk axis — so every ABORT before this step (preconditions, scope check, rebase conflict, verify
    failure) spends no slot and is free by design.
 
-   Note: once `charged: true` is returned the slot is consumed even if the subsequent `merge_request`
-   returns an error or a non-success outcome (`conflict`, `blocked`, `failed`) — those post-charge
-   aborts cost a slot. This is the accepted §4.2 tradeoff.
+   Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
+   Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
+   slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
+   `abandoned`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
+   post-charge aborts cost a slot. This is the accepted §4.2 tradeoff.
 
-8. **Merge via the queue — never directly.** `mcp__escalation__merge_request(task_id=task_id,
-   branch=task_id, worktree=<abs path>, description="unblock-low-risk: <one-line summary>")`. `branch`
-   is the **bare task id** — the worker prepends `task/`. This blocks until the merge worker (which
-   re-rebases and runs authoritative post-merge verification) finishes. **If it returns `{'error':
-   ...}` (orchestrator not running) → ABORT.** Do NOT fall back to a direct `git merge` — an
-   unattended direct merge to main is exactly the risk this skill refuses to take.
+8. **Merge via the queue — never directly.** Submit:
 
-9. **Handle the outcome:**
-   - **`done` / `already_merged`:** success.
+   ```
+   mcp__escalation__merge_request(task_id=task_id, branch=task_id,
+       worktree=<abs path>, description="unblock-low-risk: <one-line summary>",
+       wait_secs=100)
+   ```
+
+   `branch` is the **bare task id** — the worker prepends `task/`. The server clamps the wait to
+   ≤100 s (its internal `_MAX_WAIT_SECS`); `wait_secs=100` is the PRD-prescribed bounded value.
+
+   **If it returns `{'error': ...}` (orchestrator not running) → ABORT.** Never fall back to a
+   direct `git merge` — an unattended direct merge to main is exactly the risk this skill refuses
+   to take.
+
+   The response shape determines the next action:
+
+   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict` | `blocked`
+     | `already_merged` | `unknown_branch` | `failed`. The call returns a `request_id` in all
+     cases except the `already_merged` ancestor fast-path, which short-circuits before entry
+     construction (no `request_id`, `commit` is the ancestor sha). The `already_merged`
+     worker-path (entry was constructed, merge found already done) does carry a `request_id`
+     but may have `commit: null`. Proceed to step 9.
+
+   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:** This is a **successful submission**, not
+     a failure. `queued` means the entry is waiting in the merge queue; `attached` means it was
+     coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
+     terminal state:
+
+     ```
+     deadline = now() + 1200 s          # 20-minute hard ceiling
+     while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
+         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
+         sleep(wait)
+         result = mcp__escalation__merge_status(request_id)
+     if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
+         mcp__escalation__merge_cancel(request_id)
+         ABORT   # leave escalation pending; 'one attempt, abort on doubt'
+     ```
+
+     Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
+     60 s]. Cap total polling at 20 minutes: if the entry is still live at the deadline, call
+     `merge_cancel(request_id)` and ABORT — leaving the escalation pending for a human,
+     consistent with the skill's bounded-operation ethos and 'one attempt, abort on doubt'
+     principle. Proceed to step 9 with the final `result.state` if the deadline is not reached.
+
+9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
+   overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
+   collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
+   `merge_request` never returns; `unknown` is a polled-only fallback state.
+
+   - **`done` (polled state) or `already_merged` (submit-time):** success.
+     `already_merged` comes in two sub-cases:
+     - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
+       use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
+     - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
+       but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
+       confirm the landed sha and use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from git log main --oneline -20>",
+       "note": "merge found already done by worker; sha confirmed via git log"}`.
+       `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
-        done_provenance={"kind": "merged", "commit": "<merge sha>"})`.
+        done_provenance=<shape>)`. Choose by HOW `done` was observed:
+        - **In-window** (`merge_request` returned terminal `done`): the response contains a
+          `commit` field (the merge sha) — use
+          `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
+        - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
+          carries **no `commit` field** — never assume one is present. Run
+          `git log main --oneline -20` to recover the landed sha, then use
+          `done_provenance={"kind": "merged", "commit": "<recovered sha>"}` (the server
+          ancestor-checks it) or `done_provenance={"kind": "found_on_main",
+          "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
+          sha recovered from git log"}`. A polled-done sha MUST be recovered from git log;
+          it is never present in the merge_status response.
+        - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
+          above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
         `dry_run_proposals` / `memory_hints` / `files`. Immediately
         `update_task(..., append=true)` to restore them.
      c. Clean up: `git worktree remove .worktrees/<task_id>` and `git branch -d task/<task_id>`.
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
-   - **Anything else** (`conflict`, `blocked`, `failed`, `unknown_branch`, `in_flight`): **ABORT.**
-     Do not resolve, do not retry, do not direct-merge.
+
+   - **`conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch`:**
+     call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
+     retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
+     `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
+
+   - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
+     `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
+     the task's commit landed on main.
+     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha confirmed on main via git log main --oneline -20>",
+       "note": "confirmed on main after unknown merge_status; sha from git log"}` and proceed
+       with sub-steps a–d above.
+     - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
 
 ## Aborting
 
 On any ABORT:
+- **Cancel any live durable-intent entry.** If the ABORT occurs AFTER a successful
+  `merge_request` submission (i.e., a `request_id` was returned — which excludes the
+  `already_merged` fast-path, which returns no `request_id`), call
+  `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else. This prevents
+  an orphaned durable-intent entry (PRD D2 — submitted merges now outlive the MCP call and
+  session) from accumulating. `merge_cancel` never raises and is a safe no-op if the entry
+  already finalized (it returns `cancelled: false` with the terminal state). A coalesced or
+  `attached` `request_id` may resolve to `state: "unknown"` — treat the cancel as best-effort.
 - **Do NOT change the task status** beyond the `blocked` park that `release_workflow` already applied
   (that is the safe, sweep-immune state — leave it there).
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
@@ -158,6 +245,12 @@ Return ONLY this JSON object (no prose):
   any `drift` or `abort` verdict → ABORT with the gate's `reason` verbatim.
 - **Rolling-24h merge cap enforced by `b3_gate charge`** (step 7, immediately before `merge_request`):
   a refused charge (`charged: false`) → ABORT. All aborts before this step cost no slot.
-- Merge ONLY through `merge_request`; never a direct `git merge`; never `--no-verify`.
+- Merge ONLY through `merge_request` with explicit `wait_secs=100`; completion is awaited ONLY via
+  `merge_status` polling (15 s→60 s backoff using `eta_seconds`); never a direct `git merge`;
+  never `--no-verify`.
+- **Cancel on abort:** any ABORT after a successful submission (a `request_id` was returned) MUST
+  call `merge_cancel(request_id)` first — so no durable-intent entry outlives the aborted run.
+  Skip only when `already_merged` (no `request_id` exists). The call is a safe no-op on terminal
+  entries.
 - One attempt. No retry loops. ABORT on the first sign of doubt.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
