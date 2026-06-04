@@ -20,7 +20,8 @@
 # Exit codes:
 #   0..125 — claude's own exit code (recovered from sentinel)
 #   126    — no terminal emulator found
-#   127    — launcher itself failed (couldn't open a window)
+#   127    — launcher itself failed (emulator exited before writing the sentinel)
+#   129    — terminal window closed while the session was alive (SIGHUP)
 #   2      — bad usage
 
 set -u
@@ -44,12 +45,37 @@ q_cwd=$(printf %q "$cwd")
 q_prompt=$(printf %q "$prompt")
 q_sentinel=$(printf %q "$sentinel")
 
-# Payload that runs inside the new terminal. We capture claude's exit code in
-# the sentinel so it can be propagated back through this script.
-inner="cd $q_cwd && claude $flags $q_prompt; ec=\$?; echo \$ec > $q_sentinel; exit \$ec"
+# Payload that runs inside the new terminal.  Traps ensure the sentinel is
+# written even when the terminal window is closed (SIGHUP/TERM) while the
+# session is alive:
+#   - EXIT trap: always writes ${ec:-$?} — claude's real code on normal exit,
+#     or a 128+signo default when pre-empted.
+#   - HUP trap: converts SIGHUP into exit 129 so the EXIT trap records 129
+#     (distinguishable "window closed while alive" code).
+#   - TERM trap: converts SIGTERM into exit 143 (128+15).
+# ec is set only after claude returns so ${ec:-$?} captures the signal-path
+# default if claude is pre-empted before ec is assigned.
+inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
+trap 'exit 129' HUP; \
+trap 'exit 143' TERM; \
+cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+
+# How long to wait for the sentinel to appear after the launcher returns
+# (covers a hair-late write or a very fast emulator).  Tests can shrink this.
+SPAWN_LAUNCH_GRACE_SECS="${SPAWN_LAUNCH_GRACE_SECS:-5}"
 
 await_sentinel() {
   while [ ! -f "$sentinel" ]; do sleep 2; done
+}
+
+# Wait up to SPAWN_LAUNCH_GRACE_SECS for the sentinel to appear.
+# Returns 0 if the sentinel appeared in time, 1 if it did not.
+_wait_sentinel_grace() {
+  local end=$(( SECONDS + SPAWN_LAUNCH_GRACE_SECS ))
+  while [ ! -f "$sentinel" ] && [ "$SECONDS" -lt "$end" ]; do
+    sleep 0.1
+  done
+  [ -f "$sentinel" ]
 }
 
 finish() {
@@ -59,6 +85,36 @@ finish() {
   fi
   rm -f "$sentinel"
   exit "$rc"
+}
+
+# resolve_foreground: called after a foreground emulator returns.
+# Sentinel present (or appears within a short grace) → session ran; its code
+# wins.  Absent → launcher never started the payload → 127.
+resolve_foreground() {
+  if [ -f "$sentinel" ] || _wait_sentinel_grace; then
+    finish
+  fi
+  exit 127
+}
+
+# resolve_detached: called after a detaching emulator's launcher process exits.
+# $1 = launcher exit code.
+#   Sentinel present                      → session ran; its code wins.
+#   launch_rc != 0, no sentinel in grace  → genuine launcher failure → 127.
+#   launch_rc == 0, no sentinel           → session still running → await unbounded.
+resolve_detached() {
+  local launch_rc="$1"
+  if [ -f "$sentinel" ]; then
+    finish
+  elif [ "$launch_rc" -ne 0 ]; then
+    if _wait_sentinel_grace; then
+      finish
+    fi
+    exit 127
+  else
+    await_sentinel
+    finish
+  fi
 }
 
 # --- emulator selection ----------------------------------------------------
@@ -94,35 +150,33 @@ case "$first_word" in
     args=(--wait)
     [ -n "$title" ] && args+=(--title="$title")
     args+=(-- bash -c "$inner")
-    gnome-terminal "${args[@]}" || exit 127
-    finish
+    gnome-terminal "${args[@]}"
+    resolve_foreground
     ;;
   xterm)
     # xterm is naturally foreground.
     args=()
     [ -n "$title" ] && args+=(-T "$title")
     args+=(-e bash -c "$inner")
-    xterm "${args[@]}" || exit 127
-    finish
+    xterm "${args[@]}"
+    resolve_foreground
     ;;
   kitty)
     # Default kitty (no --single-instance) is naturally foreground.
     args=()
     [ -n "$title" ] && args+=(--title "$title")
     args+=(bash -c "$inner")
-    kitty "${args[@]}" || exit 127
-    finish
+    kitty "${args[@]}"
+    resolve_foreground
     ;;
   konsole)
-    # konsole daemonizes — launch, check that the launcher itself didn't fail,
-    # then wait on the sentinel.
+    # konsole daemonizes — launch, then wait on the sentinel.
     args=()
     [ -n "$title" ] && args+=(-p "tabtitle=$title")
     args+=(-e bash -c "$inner")
     konsole "${args[@]}" &
-    wait $! || { rm -f "$sentinel"; exit 127; }
-    await_sentinel
-    finish
+    wait $!
+    resolve_detached $?
     ;;
   mac-terminal)
     # `open -a Terminal` needs a script file — it doesn't forward command args.
@@ -138,8 +192,7 @@ case "$first_word" in
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
     # and detaching semantics — wait on sentinel.
     eval "$emulator -- bash -c \"\$inner\"" &
-    wait $! || { rm -f "$sentinel"; exit 127; }
-    await_sentinel
-    finish
+    wait $!
+    resolve_detached $?
     ;;
 esac
