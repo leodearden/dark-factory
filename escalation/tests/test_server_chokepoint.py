@@ -2115,6 +2115,7 @@ def _build_merge_server(
     retention: Any = None,
     event_store: Any = None,
     registry: Any = None,
+    git_ops: Any = None,
 ) -> tuple:
     """Wire EscalationQueue + asyncio.Queue + registry + _FakeHarness into create_server.
 
@@ -2127,7 +2128,7 @@ def _build_merge_server(
     orch_config = _make_orch_config(tmp_path / 'repo')
     reg = registry if registry is not None else InFlightMergeRegistry()
 
-    harness = _FakeHarness(worker=worker, retention=retention)
+    harness = _FakeHarness(worker=worker, retention=retention, git_ops=git_ops)
 
     server = create_server(
         esc_queue,
@@ -2224,10 +2225,9 @@ class TestBoundaryTableMcpSurface:
             f"Expected exactly 1 merge_queued event, got: {len(queued_spy)}"
         )
 
-        # Cleanup
-        x_future.cancel()
-        y_req = mq.get_nowait()
-        y_req.result.cancel()
+        # Cleanup: drain all entries (X was pre-loaded, Y was enqueued by merge_request)
+        while not mq.empty():
+            mq.get_nowait().result.cancel()
 
     async def test_scenario_2_bounded_wait_expiry_entry_intact(
         self, tmp_path: Path, monkeypatch,
@@ -2309,32 +2309,10 @@ class TestBoundaryTableMcpSurface:
             find_inflight_merge_worktree=_find_wt,
         )
 
-        server, mq, _, _, _ = _build_merge_server(
+        server3, mq3, _, _, _ = _build_merge_server(
             tmp_path,
             event_store=_RecordingES(),
-        )
-        # Override harness.git_ops on the already-built harness
-        # We need to re-build with git_ops wired; use the full-form harness
-        from orchestrator.merge_queue import (
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
-        )
-
-        from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
-
-        esc_q = EscalationQueue(tmp_path / 'esc3')
-        mq3: asyncio.Queue = asyncio.Queue()
-        orch_cfg = _make_orch_config(tmp_path / 'repo3')
-        reg3 = InFlightMergeRegistry()
-        harness3 = _FakeHarness(git_ops=git_ops_stub)
-
-        server3 = create_server(
-            esc_q,
-            merge_queue=mq3,
-            orch_config=orch_cfg,
-            event_store=_RecordingES(),
-            harness=harness3,
-            merge_inflight_registry=reg3,
-            startup_sweep=False,
+            git_ops=git_ops_stub,
         )
 
         result = await asyncio.wait_for(
@@ -2445,7 +2423,7 @@ class TestBoundaryTableMcpSurface:
         assert status_done['state'] == 'done', (
             f"Expected 'done' from retention ring, got: {status_done}"
         )
-        assert 'outcome' in status_done or status_done.get('state') == 'done', (
+        assert 'outcome' in status_done, (
             f"Terminal entry must include outcome: {status_done}"
         )
 
