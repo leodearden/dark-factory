@@ -302,7 +302,8 @@ human should look). **At most one re-investigation per handling cycle.**
 On the sub-agent's **completion** (you're notified asynchronously — match the result to a recorded
 launch by `task_id` / background-task-id):
 - `outcome == "merged"`: it has already set the task done and resolved the escalation. Add a
-  one-line success entry to the digest.
+  digest entry. In attended mode, also emit an immediate in-session report: one-line summary +
+  merge sha + diff pointer.
 - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Keep the
   `task_id` in your context as completed this cycle (do NOT re-launch it), record the abort reason
   in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in AFK
@@ -310,8 +311,21 @@ launch by `task_id` / background-task-id):
   not been used this cycle, route through the drift path once.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
-its abort as authoritative. This gate is AFK-only — when a human is present, prefer interactive
-`/unblock` so they stay in the loop.
+its abort as authoritative.
+
+**Applicability:**
+
+B3 applies in AFK mode always. In attended mode it applies when the watched project's orchestrator
+config `UnblockAutoConfig.attended_b3_enabled` (e.g. `orchestrator/config.yaml` →
+`unblock_auto.attended_b3_enabled`, default `false`) is `true` OR the human enabled it for this
+session via a session override. A session override wins in either direction — a human may turn it on
+even if config is false, or off even if config is true.
+
+**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md`, AFK shift 3):
+- **Merged**: `B3 <task_id> — merged: <one-line summary> (sha: <merge_sha>)`
+- **Aborted**: `B3 <task_id> — aborted: <reason>`
+- **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
+- **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
 
 ## Handling Escalations by Category
 
