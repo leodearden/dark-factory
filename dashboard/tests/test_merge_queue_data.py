@@ -2541,7 +2541,7 @@ class TestNormalizeLiveEntry:
 
 # Shared MCP mock helpers (mirrored from test_merge_halt.py)
 
-def _mcp_response(inner: dict, request_id: int = 1) -> 'httpx.Response':  # type: ignore[name-defined]
+def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
     return httpx.Response(
         200,
         json={
@@ -2555,7 +2555,7 @@ def _mcp_response(inner: dict, request_id: int = 1) -> 'httpx.Response':  # type
     )
 
 
-def _init_response(request_id: int = 1) -> 'httpx.Response':  # type: ignore[name-defined]
+def _init_response(request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
     return httpx.Response(
         200,
         json={
@@ -2581,16 +2581,16 @@ class _PerPortHandler:
 
     def __init__(
         self,
-        snapshot_responses: 'dict[int, dict] | None' = None,
+        snapshot_responses: dict[int, dict] | None = None,
         *,
-        fail_ports: 'set[int] | None' = None,
-        slow_ports: 'dict[int, float] | None' = None,
+        fail_ports: set[int] | None = None,
+        slow_ports: dict[int, float] | None = None,
     ):
         self.snapshot_responses = snapshot_responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
 
-    async def __call__(self, request: 'httpx.Request') -> 'httpx.Response':  # type: ignore[name-defined]
+    async def __call__(self, request: httpx.Request) -> httpx.Response:  # type: ignore[name-defined]
         port = request.url.port
         assert port is not None
         if port in self.fail_ports:
