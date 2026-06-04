@@ -871,8 +871,14 @@ def create_server(
                     'push_status': None,
                 }
             # wait_secs not None → opt-in path: 'attached' with existing entry's id
-            # Step-10 impl completes this branch.
-            # For now fall through (unreachable during step-8's test scope).
+            # Re-source request_id from the in-flight entry (D8) so the caller
+            # can correlate with the existing entry, not the coalesced submission.
+            base = _nonblocking_state_response(
+                'attached', merge_req,
+                req_id_override=dispatch.inflight_request_id,
+            )
+            base['inflight_task_id'] = dispatch.inflight_task_id
+            return base
 
         # Register durable-intent waiter record (β1 D2/I5).
         # shield(future) means cancelling the merge_request coroutine (MCP
