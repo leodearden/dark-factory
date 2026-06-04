@@ -709,3 +709,65 @@ class TestMergeRequestRequestId:
         assert result['request_id'].startswith('mr-'), (
             f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
         )
+
+    async def test_in_flight_response_includes_request_id(self, tmp_path: Path):
+        """In-flight (coalesced) response includes request_id from the MergeRequest.
+
+        RED until step-4 impl: the current in_flight branch returns only
+        {status, branch, inflight_task_id, eta_seconds, reason,
+        conflict_details, push_status} — no request_id key.
+
+        Setup: registry pre-seeded with branch 'X' via a never-resolving
+        future; server with injected registry and NO harness.  The call
+        returns immediately (no blocking await on the coalesced future).
+
+        Note: the request_id in the in_flight response is the SUBMITTING
+        request's own id (D8 substrate); it is NOT the in-flight entry's id.
+        The existing inflight_task_id remains the authoritative poll handle.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        # Pre-seed the registry: acquire branch 'X' with a never-resolving future
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('X', 'existing-task', never_future)
+        assert acquired, 'Prerequisite: registry must accept first acquire'
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            # no harness → git_ops=None → fast-path skipped
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='X',
+                branch='X',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Existing keys must be preserved
+        assert result.get('status') == 'in_flight', (
+            f"Expected status 'in_flight', got: {result}"
+        )
+        assert result.get('inflight_task_id') == 'existing-task', (
+            f"Expected inflight_task_id='existing-task', got: {result.get('inflight_task_id')!r}"
+        )
+        # New key: request_id of the submitting request (D8 substrate)
+        assert 'request_id' in result, (
+            f"Expected 'request_id' key in in_flight result, got keys: {set(result.keys())}"
+        )
+        assert result['request_id'].startswith('mr-'), (
+            f"Expected request_id to start with 'mr-', got: {result['request_id']!r}"
+        )
+
+        # Clean up the never-resolving future to avoid ResourceWarning
+        never_future.cancel()
