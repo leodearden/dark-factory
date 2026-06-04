@@ -43,6 +43,8 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler = MagicMock()
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
+    h.scheduler.update_task = AsyncMock(return_value=True)
 
     # _merge_worker stays None — unhalt branch skipped in all tests here
     return h

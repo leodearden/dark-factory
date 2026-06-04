@@ -41,6 +41,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.get_task = AsyncMock(return_value=None)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.update_task = AsyncMock(return_value=True)
     # Provide dispatched/lock_table for mid_run path (not used in startup tests)
     h.scheduler._dispatched = set()
     h.scheduler.lock_table = MagicMock()
