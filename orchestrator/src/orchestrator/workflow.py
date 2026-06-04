@@ -3977,10 +3977,26 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
             )
 
+        # Soft-cancel hook: detach the workflow waiter instead of cancelling
+        # the future so the primary entry (and any remaining peers) stay alive.
+        # detach() cancels primary_future only when the waiter count hits 0,
+        # preserving the existing orphan-avoidance path (merge_queue.py).
+        # When no registry is wired (legacy / enqueue path), fall back to the
+        # original future.cancel() via the hook-less code path.
+        _req_id = merge_request.request_id
+        def _on_soft_cancel_detach() -> None:
+            if _registry is not None:
+                _registry.detach(branch_name, _req_id)
+            elif not future.done():
+                future.cancel()
+
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
         # waiting for the merge worker to finish.
-        result = await self._await_cancellable(future)
+        result = await self._await_cancellable(
+            future,
+            on_soft_cancel=_on_soft_cancel_detach,
+        )
         if result is None:
             return await self._handle_soft_cancel('merge')
 

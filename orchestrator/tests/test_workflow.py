@@ -729,6 +729,178 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
 
 @pytest.mark.asyncio
+class TestSubmitToMergeQueueSoftCancelDetaches:
+    """Soft-cancel detaches the workflow waiter instead of cancelling the primary."""
+
+    async def test_soft_cancel_detaches_waiter_primary_lives(
+        self, tmp_path, monkeypatch,
+    ):
+        """Soft-cancel removes workflow waiter; primary stays alive for the MCP waiter."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip000000000000001'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # Pre-set cancel_event so the workflow soft-cancels after attaching
+        wf._cancel_event.set()
+
+        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+
+        # (1) Workflow waiter was detached; only MCP waiter 'mr-mcp' remains
+        entry = registry.entry('B')
+        assert entry is not None, 'entry must still be in-flight (primary not cancelled)'
+        assert len(entry.waiters) == 1
+        assert entry.waiters[0].request_id == 'mr-mcp'
+
+        # (2) Primary P is NOT cancelled
+        assert not P.cancelled()
+
+        # (3) Outcome is REQUEUED (scheduler says in-progress → _handle_soft_cancel returns REQUEUED)
+        assert outcome == WorkflowOutcome.REQUEUED
+
+    async def test_re_attach_coalesces_after_soft_cancel(
+        self, tmp_path, monkeypatch,
+    ):
+        """A second _submit_to_merge_queue after soft-cancel re-attaches (2 waiters, no enqueue)."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip000000000000002'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # First call: soft-cancel → detach
+        wf._cancel_event.set()
+        await wf._submit_to_merge_queue('B', merge_phase=True)
+        assert len(registry.entry('B').waiters) == 1  # detached
+
+        # Second call: re-attach (cancel_event still set, but entry still in-flight)
+        # Clear the cancel event so the second call can actually attach and await
+        wf._cancel_event.clear()
+        submit_task = asyncio.create_task(wf._submit_to_merge_queue('B', merge_phase=True))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Re-attached: 2 waiters again, no enqueue
+        assert real_queue.qsize() == 0
+        assert len(registry.entry('B').waiters) == 2
+
+        # Clean up: resolve P so the task can finish
+        P.set_result(MergeOutcome(status='done', merge_sha='sha2'))
+        await submit_task
+
+
+@pytest.mark.asyncio
 class TestAwaitCancellableSoftCancelHook:
     """_await_cancellable on_soft_cancel hook: detach instead of cancel."""
 
