@@ -1,6 +1,6 @@
 ---
 name: merge-queue
-description: "Merge a task branch to main via the orchestrator's merge queue. Use this skill whenever you need to merge a completed task branch into main and the orchestrator might be running — it routes through the escalation MCP's merge_request tool, which serializes merges and prevents races. Trigger this when an agent says 'merge to main', 'submit merge', 'merge task branch', finishes fixing a blocked task and needs to merge, or any time code on a task branch is ready to land on main. If the escalation MCP isn't reachable, the skill falls back to direct merge. Prefer this over raw git merge --no-ff whenever working in the dark-factory repo."
+description: "Merge a task branch to main via the orchestrator's merge queue using the submit→poll protocol. Use this skill whenever you need to merge a completed task branch into main and the orchestrator might be running — it submits via merge_request(wait_secs=100) then polls merge_status until the outcome is terminal, preventing races without blocking indefinitely. Trigger this when an agent says 'merge to main', 'submit merge', 'merge task branch', finishes fixing a blocked task and needs to merge, or any time code on a task branch is ready to land on main. If the escalation MCP isn't reachable, the skill falls back to direct merge. Prefer this over raw git merge --no-ff whenever working in the dark-factory repo."
 ---
 
 # Merge Queue
@@ -8,6 +8,10 @@ description: "Merge a task branch to main via the orchestrator's merge queue. Us
 When the orchestrator is running, all merges to main go through the **merge queue** — a serial worker that rebases, verifies, and atomically advances main using compare-and-swap. This prevents races between concurrent tasks, the steward, and interactive sessions.
 
 The escalation MCP exposes a `merge_request` tool that lets you submit to this queue from outside the orchestrator workflow. This skill tells you how to use it.
+
+> **Core rule:** every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.
+>
+> Passing an explicit `wait_secs` (not `None`) keeps the call correct under both server modes — the compat default (`None`) and the post-flip default (`0`) — because the bounded semantics are always opt-in regardless of the server default. Never omit `wait_secs`.
 
 ## Why this matters
 
@@ -37,7 +41,7 @@ mcp__escalation__get_pending_escalations()
 ```
 
 - **If it responds:** proceed to step 3 (use the merge queue).
-- **If it errors or times out:** the orchestrator isn't running. Fall back to direct merge (step 5).
+- **If it errors or times out:** the orchestrator isn't running. Fall back to direct merge (step 6).
 
 ### 3. Submit the merge request
 
@@ -46,7 +50,8 @@ mcp__escalation__merge_request(
   task_id="<TASK_ID>",
   branch="<TASK_ID>",
   worktree="<path to worktree>",
-  description="<brief description of what's being merged>"
+  description="<brief description of what's being merged>",
+  wait_secs=100
 )
 ```
 
@@ -55,12 +60,39 @@ Parameters:
 - `branch` — the task ID only (e.g., `"466"`), **not** the full branch name. The merge worker prepends the `task/` prefix automatically.
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
+- `wait_secs=100` — **always pass this explicitly.** The value 100 equals the server's maximum bounded wait (`_MAX_WAIT_SECS`), so fast/idle-queue merges return their terminal outcome in the same call. The call always returns within ≤100 s.
 
-This call blocks until the merge worker finishes rebasing, verifying, and CAS-advancing main — plus any time spent queued behind merges ahead of yours. That can be seconds on a small repo, but **tens of minutes** on a large/slow one (e.g. reify ~30 min). If you're calling this from a context that must stay responsive (such as the escalation-watcher loop), run the submission in a background sub-agent rather than blocking the foreground on it.
+The call returns with **either** a **terminal** status **or** a **non-terminal** status:
+
+- **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`): the merge resolved within the bounded wait. Jump straight to step 4.
+  - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done`.
+
+- **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
+  - `attached` means your submission was coalesced with an already-in-flight request for the same branch; you share that request's `request_id`.
+
+### Poll for completion
+
+Call `merge_status(request_id)` on a backoff schedule until the state is terminal:
+
+```
+mcp__escalation__merge_status(request_id="<request_id from submit>")
+```
+
+**Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field whose value is a **positive number**, use that value as the sleep duration (capped at 60 s); if `eta_seconds` is absent or `null`, fall back to the 15 s→60 s backoff schedule.
+
+**Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
+
+**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`) — proceed to step 4.
+
+**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. The response includes `hint: "check git log main"`. Run:
+```bash
+git log main --oneline -20  # confirm whether the merge already landed
+```
+If the commit is on main: treat as `done`. If not: resubmit (go back to step 3).
 
 ### 4. Handle the outcome
 
-The tool returns `{ status, reason, conflict_details }`. Handle each status:
+The outcome arrives from either the submit call (terminal at submit time) or the poll loop. Handle each status:
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
@@ -86,7 +118,30 @@ The tool returns `{ status, reason, conflict_details }`. Handle each status:
   - CAS retry limit — main was moving too fast (rare at normal concurrency). Wait a moment and retry.
   - `.task/` contamination detected — check that `.task/` isn't committed on your branch.
 
-### 5. Fallback: direct merge
+**`failed`** — The merge worker encountered an unexpected error (surfaces from the submit call only; `merge_status` collapses this into `blocked`). Treat it the same as `blocked`: read any `failure_diagnostic` or `reason` field, fix the underlying problem, and resubmit.
+
+**`unknown_branch`** — The branch ref does not exist in the target repository (surfaces from the submit call only). Likely causes: the branch name is wrong, the branch was deleted before submission, or the request was routed to the wrong repo's escalation MCP. Verify the branch exists locally (`git branch -a`) and that you're submitting to the correct escalation server.
+
+**`abandoned`** — The submission was cancelled via `merge_cancel` before it finished (surfaces from the poll loop). If the merge is still wanted, resubmit (go back to step 3); otherwise, no further action is needed.
+
+### 5. Abandoning a submission (merge_cancel)
+
+To abandon a submitted merge — for example, the work was superseded, the wrong branch was submitted, or the queued entry is redundant — call:
+
+```
+mcp__escalation__merge_cancel(request_id="<request_id from submit>")
+```
+
+The response is `{ cancelled, state, reason }`:
+
+- **`cancelled: true`** with `state: "abandoned"` — a pending waiter was dropped. The merge will not proceed.
+- **`cancelled: false`** — the request was already finalized (terminal), unknown, or already cancelled. The `state` and `reason` fields explain why.
+
+**Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
+
+If your submit returned `status: "attached"`, your submission was coalesced with an in-flight entry. Cancel using the `request_id` returned with that `attached` response — it points to the shared in-flight entry.
+
+### 6. Fallback: direct merge
 
 If the escalation MCP is down (orchestrator not running), merge directly. There's no queue to race with.
 
@@ -108,9 +163,12 @@ After a successful direct merge:
 
 | Situation | Action |
 |-----------|--------|
-| Orchestrator running | Use `merge_request` via escalation MCP |
+| Orchestrator running | Submit via `merge_request(wait_secs=100)`, then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
-| Merge returns `conflict` | Fix in worktree, resubmit |
-| Merge returns `blocked` | Read reason, fix, resubmit |
-| Merge returns `done` or `already_merged` | Update task status, clean up |
+| Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
+| `merge_status` returns `state: "unknown"` | Run `git log main` to confirm whether merge landed; resubmit if not |
+| Outcome `conflict` | Fix in worktree, resubmit |
+| Outcome `blocked` | Read reason, fix, resubmit |
+| Outcome `done` or `already_merged` | Update task status, clean up |
+| Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
 | Unsure if orchestrator is running | Probe `get_pending_escalations()` — if it responds, use the queue |
