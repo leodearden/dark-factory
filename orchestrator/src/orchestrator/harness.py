@@ -1806,6 +1806,19 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # Self-dedupes: once filed, the pending-escalation check below
             # suppresses re-filing on the next cycle until it is resolved.
+            #
+            # Category: 'stranded_blocked' (PRD-3 task ε, 2026-06-04).
+            # The escalation-watcher (task θ) auto-resolves stranded_blocked
+            # L1s with action='resume', triggering this exact Fix #1a path:
+            # _on_escalation_resolved → _cascade_unblock_member →
+            # blocked→pending re-pend.  This replaces the prior 'task_failure'
+            # category, which routed to the human-triage watcher instead of the
+            # auto-resume watcher.
+            #
+            # RE-FILE-NEVER-FLIP discipline is PRESERVED: we still only file
+            # the L1 and let resolution drive the status change.  The /unblock
+            # blocked-park protection (pending-escalation check above) is also
+            # preserved — an open L1 of any category prevents re-filing.
             if (
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
@@ -1820,7 +1833,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     task_id=tid,
                     agent_role='harness-stranded-blocked-reaper',
                     severity='blocking',
-                    category='task_failure',
+                    category='stranded_blocked',
                     summary=(
                         f'Stranded blocked: task {tid} blocked with no open '
                         f'escalation and no active workflow — likely an orphaned '
@@ -1848,7 +1861,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         task_id=tid,
                         data={
                             'escalation_id': esc.id,
-                            'category': 'task_failure',
+                            'category': 'stranded_blocked',
                             'severity': 'blocking',
                             'level': 1,
                             'reason': 'stranded-blocked-backstop',
