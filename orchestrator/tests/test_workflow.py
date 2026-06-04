@@ -780,7 +780,9 @@ class TestSubmitToMergeQueueAttachesAsPeer:
             f're_snapshot not called with (B, {NEW!r}); calls={re_snapshot_calls}'
         )
         # Waiter is still attached
-        assert len(registry.entry('B').waiters) == 2
+        _entry = registry.entry('B')
+        assert _entry is not None
+        assert len(_entry.waiters) == 2
 
         P.set_result(MergeOutcome(status='done', merge_sha='sha'))
         await submit_task
@@ -898,6 +900,7 @@ class TestAttachedWaiterOutcomeMapping:
 
     async def _setup_attached_workflow(self, tmp_path, monkeypatch):
         import asyncio
+
         from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
@@ -961,6 +964,7 @@ class TestAttachedWaiterOutcomeMapping:
     ):
         """Conflict from primary → _resolve_and_resubmit (as if own merge failed)."""
         import asyncio
+
         from orchestrator.merge_queue import MergeOutcome
 
         wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
@@ -988,6 +992,7 @@ class TestAttachedWaiterOutcomeMapping:
     ):
         """Blocked from primary → _mark_blocked (as if own merge failed)."""
         import asyncio
+
         from orchestrator.merge_queue import MergeOutcome
 
         wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
@@ -1167,7 +1172,9 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         # First call: soft-cancel → detach
         wf._cancel_event.set()
         await wf._submit_to_merge_queue('B', merge_phase=True)
-        assert len(registry.entry('B').waiters) == 1  # detached
+        _entry = registry.entry('B')
+        assert _entry is not None
+        assert len(_entry.waiters) == 1  # detached
 
         # Second call: re-attach (cancel_event still set, but entry still in-flight)
         # Clear the cancel event so the second call can actually attach and await
@@ -1178,7 +1185,9 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
 
         # Re-attached: 2 waiters again, no enqueue
         assert real_queue.qsize() == 0
-        assert len(registry.entry('B').waiters) == 2
+        _entry2 = registry.entry('B')
+        assert _entry2 is not None
+        assert len(_entry2.waiters) == 2
 
         # Clean up: resolve P so the task can finish
         P.set_result(MergeOutcome(status='done', merge_sha='sha2'))
