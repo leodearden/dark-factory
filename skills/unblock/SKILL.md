@@ -205,9 +205,46 @@ The merge procedure is iterative — don't assume one pass will be enough:
 4. Fix any failures.
 5. On green: rebase on main again — other tasks may have merged while you were fixing.
 6. Repeat steps 3-5 until stable (rebase is clean AND verification passes with no new changes needed).
-7. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
-8. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha-of-merge>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main (the normal case — merge_request returns the SHA). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* This keeps the step correct under both server modes — the legacy `wait_secs=None` default and the post-β8 `wait_secs=0` default. `queued` or `attached` responses are successful submissions (durable intent), never failures.
+
+   Submit to the merge queue with an explicit bounded wait:
+   ```
+   result = mcp__escalation__merge_request(
+       task_id="<TASK_ID>",
+       branch="task/<TASK_ID>",
+       worktree="<WORKTREE>",
+       description="<brief description of what landed>",
+       wait_secs=100,
+   )
+   ```
+   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s.
+
+   **Classify the immediate response:**
+
+   - `state: "done"` or `state: "already_merged"` → **terminal success.** Thread the merge commit SHA:
+     - Normal `done`: SHA is in `result["outcome"]`.
+     - `already_merged`: SHA is in `result["commit"]`.
+
+     Go directly to step 8.
+
+   - `state: "queued"` or `state: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
+     ```
+     request_id = result["request_id"]
+     poll_interval = 15  # seconds; ramp up to 60 s
+     loop:
+         sleep(poll_interval)
+         poll = mcp__escalation__merge_status(request_id=request_id)
+         if poll["state"] == "done":
+             merge_sha = poll["outcome"]
+             break
+         poll_interval = min(max(poll.get("eta_seconds", poll_interval * 2), 15), 60)
+     ```
+     On polling `done`: proceed to step 8, threading the SHA from `poll["outcome"]`.
+
+   *(Conflict, `unknown_branch`, orchestrator-down, `{state: "unknown"}`, and cancellation edges are covered below.)*
+
+8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from the terminal `done` outcome (step 7). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 *If this is an escalated task (pending escalation, agent is paused):*
