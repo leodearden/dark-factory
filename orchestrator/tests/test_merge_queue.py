@@ -3160,6 +3160,196 @@ class TestSpeculativeMergeWorker:
             f'merge_sha is not a hex string: {outcome_n.merge_sha!r}'
         )
 
+    # ── OOB delivery (γ3 / task-1644) ────────────────────────────────────────
+
+    async def test_oob_delivery_nonspec_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Non-spec conflict: merger resolves req.result OOB at detection time.
+
+        Drive _merger_loop() directly with a single conflicting non-speculative
+        request.  With OOB delivery the merger must resolve req.result to
+        'conflict' before the verifier runs.  The enqueued SpeculativeItem must
+        carry already_delivered=True.
+
+        RED before step-4 impl: req.result is not resolved by the merger.
+        """
+        # Worktree created BEFORE the main-side README.md change so the merge
+        # base is the initial main.  Both sides then diverge on README.md →
+        # three-way merge detects a conflict.
+        wt = (await git_ops.create_worktree('oob-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main oob-cfl side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch side\n')
+        await git_ops.commit(wt, 'Branch oob-cfl conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('oob-cfl', 'oob-cfl', wt, config)
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        await worker._merger_loop()
+
+        # Merger must have resolved req.result at conflict-detection time
+        assert req.result.done(), (
+            'OOB delivery: req.result must be resolved by the merger before '
+            'the verifier dequeues the SpeculativeItem'
+        )
+        assert req.result.result().status == 'conflict', (
+            f'Expected conflict, got {req.result.result().status!r}'
+        )
+
+        # The ordering token must be flagged so the verifier skips set_result
+        item = worker._verifier_queue.get_nowait()
+        assert isinstance(item, SpeculativeItem)
+        assert item.already_delivered is True, (
+            'Non-spec conflict SpeculativeItem must have already_delivered=True'
+        )
+
+    async def test_oob_not_delivered_for_speculative_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Speculative conflict is NOT OOB-delivered — it rides through the verifier FIFO.
+
+        Pre-load N (clean) + M (conflicting) so M is speculatively prefetched.
+        Assert req_M.result stays pending and M's ordering token has
+        already_delivered=False and speculative=True — locking the
+        'not speculative' predicate clause.
+
+        Passes both before and after step-4 impl (negative/guard test).
+        """
+        # N: clean branch with a unique file (created BEFORE main-side change)
+        wt_n = await _make_branch_with_file(
+            git_ops, 'oob-spec-n', 'file_spec_n.py', 'n = 1\n',
+        )
+
+        # M: also created BEFORE the main-side README.md change so the merge
+        # base is the initial main.  Both main and M then diverge on README.md.
+        wt_m = (await git_ops.create_worktree('oob-spec-m')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main spec side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main spec side'], cwd=git_ops.project_root)
+
+        (wt_m / 'README.md').write_text('# M spec conflict\n')
+        await git_ops.commit(wt_m, 'M spec conflict')
+
+        # Pre-load N + M + sentinel so M is speculatively prefetched after N
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('oob-spec-n', 'oob-spec-n', wt_n, config)
+        req_m = _make_request('oob-spec-m', 'oob-spec-m', wt_m, config)
+        await queue.put(req_n)
+        await queue.put(req_m)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        await worker._merger_loop()
+
+        # Speculative conflict must NOT be OOB-delivered
+        assert not req_m.result.done(), (
+            'Speculative conflict must NOT be OOB-delivered; req_m.result '
+            'must remain pending until the verifier drains the ordering token'
+        )
+
+        # Drain verifier queue to find M's SpeculativeItem
+        items: list[SpeculativeItem | None] = []
+        while True:
+            it = worker._verifier_queue.get_nowait()
+            items.append(it)
+            if it is None:
+                break
+
+        m_items = [i for i in items if isinstance(i, SpeculativeItem) and i.request is req_m]
+        assert len(m_items) == 1, f'Expected one SpeculativeItem for req_m, got: {m_items}'
+        m_item = m_items[0]
+        assert m_item.speculative is True, (
+            'M was prefetched speculatively — item.speculative must be True'
+        )
+        assert m_item.already_delivered is False, (
+            'Speculative conflict must have already_delivered=False '
+            '(verifier owns resolution for speculative items)'
+        )
+
+    async def test_oob_delivery_unblocks_waiter_while_verifier_busy(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """OOB-delivered conflict resolves immediately while verifier is blocked.
+
+        Start worker.run(); enqueue N (clean, blocking verify); await
+        verify_started; enqueue M (non-spec conflict); assert req_M.result
+        resolves to 'conflict' within 5 seconds while req_N.result is still
+        pending.  The verifier is draining N the entire time — this test proves
+        OOB delivery bypasses the FIFO delay.
+
+        RED before step-4 impl: req_M.result does not resolve until N's verify
+        finishes, causing the wait_for to time out.
+        """
+        # N: clean branch
+        wt_n = await _make_branch_with_file(
+            git_ops, 'oob-e2e-n', 'file_e2e_n.py', 'n = 1\n',
+        )
+
+        # M: created BEFORE main-side README.md change so the merge base is
+        # the initial main — both main and M then diverge on README.md.
+        wt_m = (await git_ops.create_worktree('oob-e2e-m')).path
+        (git_ops.project_root / 'README.md').write_text('# Main e2e\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main e2e change'], cwd=git_ops.project_root)
+        (wt_m / 'README.md').write_text('# M e2e conflict\n')
+        await git_ops.commit(wt_m, 'M e2e conflict')
+
+        verify_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_verify(merge_wt, cfg, module_configs, task_files=None, **kwargs):  # type: ignore[no-untyped-def]
+            verify_started.set()
+            await release.wait()
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req_n = _make_request('oob-e2e-n', 'oob-e2e-n', wt_n, config)
+        req_m = _make_request('oob-e2e-m', 'oob-e2e-m', wt_m, config)
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=blocking_verify,
+        ):
+            await queue.put(req_n)
+            await asyncio.wait_for(verify_started.wait(), timeout=30)
+
+            # Verifier is now blocked on N. Enqueue M — merger detects conflict OOB.
+            await queue.put(req_m)
+
+            # M must resolve before N's verify finishes
+            outcome_m = await asyncio.wait_for(req_m.result, timeout=5)
+            assert outcome_m.status == 'conflict', (
+                f'OOB: M must resolve to conflict while N verify is blocked; '
+                f'got {outcome_m.status!r}'
+            )
+
+            # N is still blocked
+            assert not req_n.result.done(), (
+                'req_n.result must still be pending — verifier is blocked on N'
+            )
+
+            # Unblock N; it completes as done
+            release.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'done', f'N should complete as done: {outcome_n}'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
 # ---------------------------------------------------------------------------
