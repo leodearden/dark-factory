@@ -235,16 +235,19 @@ The merge procedure is iterative — don't assume one pass will be enough:
          sleep(poll_interval)
          poll = mcp__escalation__merge_status(request_id=request_id)
          if poll["state"] == "done":
-             merge_sha = poll["outcome"]
              break
          poll_interval = min(max(poll.get("eta_seconds", poll_interval * 2), 15), 60)
      ```
-     On polling `done`: proceed to step 8, threading the SHA from `poll["outcome"]`.
+     On polling `done`: `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash). Re-derive the merge commit from git:
+     ```
+     git log main --oneline | head -5
+     ```
+     Thread the first commit SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
 
    *(Conflict, `unknown_branch`, orchestrator-down, `{state: "unknown"}`, and cancellation edges are covered below.)*
 
 8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note below). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 **Merge-step failure and abandonment edges:**
