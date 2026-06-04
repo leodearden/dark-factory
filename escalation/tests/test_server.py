@@ -584,6 +584,289 @@ class TestStrandedBlockedCategory:
 
 
 # ---------------------------------------------------------------------------
+# TestChokepointSeverityDowngrade: C4/D3 agent-role downgrade + sentinel exemption
+# ---------------------------------------------------------------------------
+
+
+class TestChokepointSeverityDowngrade:
+    """Critical/urgent escalations from AGENT roles are downgraded to 'blocking' (C4/D3).
+
+    (A) AGENT-ROLE DOWNGRADE — agent_role='implementer', severity in critical/urgent:
+        - result['status'] == 'queued'
+        - on-disk record: severity=='blocking', level==0
+        - summary prefixed '[downgraded:critical] ' / '[downgraded:urgent] '
+        - a WARNING is emitted on logger 'escalation.server'
+
+    (B) SENTINEL EXEMPTION — harness-/orchestrator- prefixed roles keep born-at-L2:
+        - on-disk record: severity unchanged, level==2
+        - summary NOT prefixed
+        - NO WARNING logged
+    """
+
+    # --- (A) Agent-role downgrade via escalate_blocker ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_returns_queued(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker(severity='critical'/'urgent', agent_role='implementer') → status=='queued'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} summary',
+            severity=severity,
+        )
+
+        assert result['status'] == 'queued', (
+            f"severity={severity!r}: expected 'queued' after downgrade, got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_on_disk_severity_blocking_level0(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker agent downgrade: on-disk record has severity=='blocking', level==0."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} summary',
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking', (
+            f"severity={severity!r}: expected on-disk severity=='blocking', got: {esc.severity!r}"
+        )
+        assert esc.level == 0, (
+            f"severity={severity!r}: expected on-disk level==0, got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_summary_prefixed(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_blocker agent downgrade: summary prefixed '[downgraded:<original>] '."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = f'original {severity} summary'
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=original_summary,
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        expected_prefix = f'[downgraded:{severity}] '
+        assert esc.summary.startswith(expected_prefix), (
+            f"severity={severity!r}: expected summary prefixed {expected_prefix!r}, got: {esc.summary!r}"
+        )
+        assert original_summary in esc.summary, (
+            f"severity={severity!r}: original summary text must be preserved after prefix"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_blocker_agent_role_downgrade_emits_warning(
+        self, tmp_path: Path, severity: str, caplog,
+    ):
+        """escalate_blocker agent downgrade: WARNING emitted on logger 'escalation.server'."""
+        import logging
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            await _blocker(
+                server,
+                task_id='task-999',
+                agent_role='implementer',
+                category='scope_violation',
+                summary=f'original {severity} summary',
+                severity=severity,
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'escalation.server']
+        assert warnings, (
+            f"severity={severity!r}: expected a WARNING on logger 'escalation.server', got: {caplog.records}"
+        )
+
+    # --- (A) Agent-role downgrade via escalate_info ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_info_agent_role_downgrade_on_disk_severity_blocking_level0(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_info agent downgrade: on-disk record has severity=='blocking', level==0."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=f'original {severity} info summary',
+            severity=severity,
+        )
+
+        assert result['status'] == 'queued', (
+            f"severity={severity!r}: expected 'queued', got: {result}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking', (
+            f"severity={severity!r}: expected severity=='blocking', got: {esc.severity!r}"
+        )
+        assert esc.level == 0, (
+            f"severity={severity!r}: expected level==0, got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('severity', ['critical', 'urgent'])
+    async def test_info_agent_role_downgrade_summary_prefixed(
+        self, tmp_path: Path, severity: str,
+    ):
+        """escalate_info agent downgrade: summary prefixed '[downgraded:<original>] '."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = f'original {severity} info summary'
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='scope_violation',
+            summary=original_summary,
+            severity=severity,
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.summary.startswith(f'[downgraded:{severity}] '), (
+            f"severity={severity!r}: expected '[downgraded:{severity}] ' prefix, got: {esc.summary!r}"
+        )
+
+    # --- (B) Sentinel exemption (harness- and orchestrator- prefixes) ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_keeps_level2_severity_unchanged(
+        self, tmp_path: Path, sentinel_role: str,
+    ):
+        """Sentinel roles are exempt from downgrade: severity stays 'critical', level stays 2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role=sentinel_role,
+            category='scope_violation',
+            summary='sentinel critical escalation',
+            severity='critical',
+        )
+
+        assert result['status'] == 'queued', (
+            f"sentinel_role={sentinel_role!r}: expected 'queued', got: {result}"
+        )
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'critical', (
+            f"sentinel_role={sentinel_role!r}: severity must NOT be downgraded, got: {esc.severity!r}"
+        )
+        assert esc.level == 2, (
+            f"sentinel_role={sentinel_role!r}: level must stay 2 (born-at-L2), got: {esc.level}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_summary_not_prefixed(
+        self, tmp_path: Path, sentinel_role: str,
+    ):
+        """Sentinel roles are exempt: summary is NOT prefixed with '[downgraded:...]'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        original_summary = 'sentinel critical escalation'
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role=sentinel_role,
+            category='scope_violation',
+            summary=original_summary,
+            severity='critical',
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert not esc.summary.startswith('[downgraded:'), (
+            f"sentinel_role={sentinel_role!r}: summary must NOT be prefixed, got: {esc.summary!r}"
+        )
+        assert esc.summary == original_summary, (
+            f"sentinel_role={sentinel_role!r}: summary must be unchanged, got: {esc.summary!r}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('sentinel_role', [
+        'harness-stranded-blocked-reaper',
+        'orchestrator-watcher-supervisor',
+    ])
+    async def test_sentinel_role_no_warning_logged(
+        self, tmp_path: Path, sentinel_role: str, caplog,
+    ):
+        """Sentinel roles are exempt: NO downgrade WARNING is logged."""
+        import logging
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            await _blocker(
+                server,
+                task_id='task-999',
+                agent_role=sentinel_role,
+                category='scope_violation',
+                summary='sentinel critical escalation',
+                severity='critical',
+            )
+
+        # Filter out the task_status_lookup warning (not present here); only
+        # check that no "downgrad" warning was emitted.
+        downgrade_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'downgrad' in r.message.lower()
+        ]
+        assert not downgrade_warnings, (
+            f"sentinel_role={sentinel_role!r}: expected NO downgrade WARNING, got: {downgrade_warnings}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers for promote_to_l2 tests
 # ---------------------------------------------------------------------------
 
