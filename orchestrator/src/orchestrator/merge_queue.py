@@ -2991,6 +2991,11 @@ async def _do_train_merge(
     # merge_wt has already been cleaned up above (caller contract for finalize).
     # t0 is passed as started_monotonic so finalize's duration_ms is accurate
     # for the whole train attempt, not just the post-advance window.
+    #
+    # PRD D9: trains are bit-identical, multi-waiter merges — γ2 auto-chaining
+    # applies ONLY to single-branch MergeRequest paths (MergeWorker /
+    # SpeculativeMergeWorker).  chain_ctx=None is passed explicitly here so the
+    # invariant is visible at the call site and not left implicit.
     outcome = await _finalize_advanced_merge(
         git_ops, req, event_store,
         merge_commit_fallback=merge_commit,
@@ -3002,6 +3007,7 @@ async def _do_train_merge(
         log_label=' (train)',
         train_id=req.train_id,
         member_task_ids=req.member_task_ids,
+        chain_ctx=None,  # PRD D9: trains never auto-chain
     )
     if outcome.status != 'done':
         # Equivalence or pyright gate fired — main landed but post-merge gates
