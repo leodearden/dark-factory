@@ -5095,6 +5095,67 @@ class TestIsGatingEscalation:
 
 
 @pytest.mark.asyncio
+class TestBornAtL2GatesPostImplementer:
+    """task γ / C7: A born-at-L2 escalation (critical, level=2) pending when
+    ``_execute_iterations`` checks the gate must cause it to return ESCALATED.
+
+    RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
+    ignores critical/level-2, so the run completes with DONE instead.
+    """
+
+    async def test_critical_l2_blocks_execute_iterations(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+        from orchestrator.artifacts import TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Submit a born-at-L2 (critical, level=2) escalation BEFORE running
+        # _execute_iterations.  The post-implementer gate must intercept it.
+        queue.submit(Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='Critical risk surfaced during implementation (born at L2)',
+            detail='Pending from a prior or concurrent escalation path',
+            level=2,
+        ))
+
+        # Wire up artifacts and worktree identically to TestStaleL1DoesNotSinkRun.
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [
+            {**s, 'status': 'pending'} for s in plan['steps']
+        ]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        await _init_repo(wt)
+        workflow.config.inter_iteration_rebase = False
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending — the gate does not consume it.
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=2,
+        )
+        assert len(still_pending) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
