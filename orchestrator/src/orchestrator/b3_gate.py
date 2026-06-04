@@ -36,9 +36,7 @@ ABORT = 'abort'
 
 DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
-
-_EMPTY_STATE: dict[str, list] = {'launches': [], 'charges': []}
-
+_LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
 # ---------------------------------------------------------------------------
 # State path
@@ -65,7 +63,7 @@ def _load_state(path: Path) -> dict[str, Any]:
             'launches': data.get('launches', []),
             'charges': data.get('charges', []),
         }
-    except (FileNotFoundError, json.JSONDecodeError, Exception):
+    except (OSError, json.JSONDecodeError, ValueError):
         return {'launches': [], 'charges': []}
 
 
@@ -119,11 +117,20 @@ def record_launch(
     """Record a per-proposal launch entry under a lock.
 
     Idempotent: same (task_id, head_sha, investigated_at) triple is not re-added.
+    Launch entries older than _LAUNCH_RETENTION_DAYS (by recorded_at) are pruned
+    on each write to bound state-file growth; this horizon is comfortably beyond
+    any re-armable window.
     Returns ``{'recorded': bool, 'already_attempted': bool}``.
     """
+    retention_cutoff = now - timedelta(days=_LAUNCH_RETENTION_DAYS)
     with _locked_state(state_path):
         state = _load_state(state_path)
-        # Check for existing entry with the same key
+        # Prune stale launch entries to bound file growth
+        state['launches'] = [
+            e for e in state['launches']
+            if _ts_in_window(e.get('recorded_at', ''), retention_cutoff)
+        ]
+        # Check for existing entry with the same key (after pruning)
         for entry in state['launches']:
             if (entry.get('task_id') == task_id
                     and entry.get('head_sha') == head_sha
@@ -144,18 +151,19 @@ def record_launch(
 # charge
 # ---------------------------------------------------------------------------
 
+def _ts_in_window(ts_str: str, cutoff: datetime) -> bool:
+    """Return True if *ts_str* parses to a datetime strictly after *cutoff*."""
+    try:
+        return datetime.fromisoformat(ts_str) > cutoff
+    except (ValueError, TypeError):
+        return False
+
+
 def _count_charges_in_window(state: dict[str, Any], now: datetime) -> int:
     """Count charges in the rolling 24-hour window before *now*."""
     cutoff = now - timedelta(hours=24)
-    count = 0
-    for c in state.get('charges', []):
-        try:
-            ts = datetime.fromisoformat(c['charged_at'])
-            if ts > cutoff:
-                count += 1
-        except (KeyError, ValueError):
-            pass
-    return count
+    return sum(1 for c in state.get('charges', [])
+               if _ts_in_window(c.get('charged_at', ''), cutoff))
 
 
 def _cap_remaining(state: dict[str, Any], cap: int, now: datetime) -> int:
@@ -189,14 +197,6 @@ def charge(
     return {'charged': True, 'remaining': remaining_before - 1}
 
 
-def _ts_in_window(ts_str: str, cutoff: datetime) -> bool:
-    """Return True if *ts_str* parses to a datetime strictly after *cutoff*."""
-    try:
-        return datetime.fromisoformat(ts_str) > cutoff
-    except (ValueError, TypeError):
-        return False
-
-
 # ---------------------------------------------------------------------------
 # check_proposal (verdict core)
 # ---------------------------------------------------------------------------
@@ -208,6 +208,7 @@ def _run_git(args: list[str], cwd: str) -> tuple[int, str]:
             ['git', '-C', cwd] + args,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         return result.returncode, result.stdout.strip()
     except Exception as exc:
