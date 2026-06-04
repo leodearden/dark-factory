@@ -3160,6 +3160,584 @@ class TestSpeculativeMergeWorker:
             f'merge_sha is not a hex string: {outcome_n.merge_sha!r}'
         )
 
+    # ── OOB delivery (γ3 / task-1644) ────────────────────────────────────────
+
+    async def test_oob_delivery_nonspec_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Non-spec conflict: merger resolves req.result OOB at detection time.
+
+        Drive _merger_loop() directly with a single conflicting non-speculative
+        request.  With OOB delivery the merger must resolve req.result to
+        'conflict' before the verifier runs.  The enqueued SpeculativeItem must
+        carry already_delivered=True.
+
+        RED before step-4 impl: req.result is not resolved by the merger.
+        """
+        # Worktree created BEFORE the main-side README.md change so the merge
+        # base is the initial main.  Both sides then diverge on README.md →
+        # three-way merge detects a conflict.
+        wt = (await git_ops.create_worktree('oob-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main oob-cfl side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch side\n')
+        await git_ops.commit(wt, 'Branch oob-cfl conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('oob-cfl', 'oob-cfl', wt, config)
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        await worker._merger_loop()
+
+        # Merger must have resolved req.result at conflict-detection time
+        assert req.result.done(), (
+            'OOB delivery: req.result must be resolved by the merger before '
+            'the verifier dequeues the SpeculativeItem'
+        )
+        assert req.result.result().status == 'conflict', (
+            f'Expected conflict, got {req.result.result().status!r}'
+        )
+
+        # The ordering token must be flagged so the verifier skips set_result
+        item = worker._verifier_queue.get_nowait()
+        assert isinstance(item, SpeculativeItem)
+        assert item.already_delivered is True, (
+            'Non-spec conflict SpeculativeItem must have already_delivered=True'
+        )
+
+    async def test_oob_not_delivered_for_speculative_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Speculative conflict is NOT OOB-delivered — it rides through the verifier FIFO.
+
+        Pre-load N (clean) + M (conflicting) so M is speculatively prefetched.
+        Assert req_M.result stays pending and M's ordering token has
+        already_delivered=False and speculative=True — locking the
+        'not speculative' predicate clause.
+
+        Passes both before and after step-4 impl (negative/guard test).
+        """
+        # N: clean branch with a unique file (created BEFORE main-side change)
+        wt_n = await _make_branch_with_file(
+            git_ops, 'oob-spec-n', 'file_spec_n.py', 'n = 1\n',
+        )
+
+        # M: also created BEFORE the main-side README.md change so the merge
+        # base is the initial main.  Both main and M then diverge on README.md.
+        wt_m = (await git_ops.create_worktree('oob-spec-m')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main spec side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main spec side'], cwd=git_ops.project_root)
+
+        (wt_m / 'README.md').write_text('# M spec conflict\n')
+        await git_ops.commit(wt_m, 'M spec conflict')
+
+        # Pre-load N + M + sentinel so M is speculatively prefetched after N
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('oob-spec-n', 'oob-spec-n', wt_n, config)
+        req_m = _make_request('oob-spec-m', 'oob-spec-m', wt_m, config)
+        await queue.put(req_n)
+        await queue.put(req_m)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        await worker._merger_loop()
+
+        # Speculative conflict must NOT be OOB-delivered
+        assert not req_m.result.done(), (
+            'Speculative conflict must NOT be OOB-delivered; req_m.result '
+            'must remain pending until the verifier drains the ordering token'
+        )
+
+        # Drain verifier queue to find M's SpeculativeItem
+        items: list[SpeculativeItem | None] = []
+        while True:
+            it = worker._verifier_queue.get_nowait()
+            items.append(it)
+            if it is None:
+                break
+
+        m_items = [i for i in items if isinstance(i, SpeculativeItem) and i.request is req_m]
+        assert len(m_items) == 1, f'Expected one SpeculativeItem for req_m, got: {m_items}'
+        m_item = m_items[0]
+        assert m_item.speculative is True, (
+            'M was prefetched speculatively — item.speculative must be True'
+        )
+        assert m_item.already_delivered is False, (
+            'Speculative conflict must have already_delivered=False '
+            '(verifier owns resolution for speculative items)'
+        )
+
+    async def test_oob_delivery_unblocks_waiter_while_verifier_busy(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """OOB-delivered conflict resolves immediately while verifier is blocked.
+
+        Start worker.run(); enqueue N (clean, blocking verify); await
+        verify_started; enqueue M (non-spec conflict); assert req_M.result
+        resolves to 'conflict' within 5 seconds while req_N.result is still
+        pending.  The verifier is draining N the entire time — this test proves
+        OOB delivery bypasses the FIFO delay.
+
+        RED before step-4 impl: req_M.result does not resolve until N's verify
+        finishes, causing the wait_for to time out.
+        """
+        # N: clean branch
+        wt_n = await _make_branch_with_file(
+            git_ops, 'oob-e2e-n', 'file_e2e_n.py', 'n = 1\n',
+        )
+
+        # M: created BEFORE main-side README.md change so the merge base is
+        # the initial main — both main and M then diverge on README.md.
+        wt_m = (await git_ops.create_worktree('oob-e2e-m')).path
+        (git_ops.project_root / 'README.md').write_text('# Main e2e\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main e2e change'], cwd=git_ops.project_root)
+        (wt_m / 'README.md').write_text('# M e2e conflict\n')
+        await git_ops.commit(wt_m, 'M e2e conflict')
+
+        verify_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_verify(merge_wt, cfg, module_configs, task_files=None, **kwargs):  # type: ignore[no-untyped-def]
+            verify_started.set()
+            await release.wait()
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req_n = _make_request('oob-e2e-n', 'oob-e2e-n', wt_n, config)
+        req_m = _make_request('oob-e2e-m', 'oob-e2e-m', wt_m, config)
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=blocking_verify,
+        ):
+            await queue.put(req_n)
+            await asyncio.wait_for(verify_started.wait(), timeout=30)
+
+            # Verifier is now blocked on N. Enqueue M — merger detects conflict OOB.
+            await queue.put(req_m)
+
+            # M must resolve before N's verify finishes
+            outcome_m = await asyncio.wait_for(req_m.result, timeout=5)
+            assert outcome_m.status == 'conflict', (
+                f'OOB: M must resolve to conflict while N verify is blocked; '
+                f'got {outcome_m.status!r}'
+            )
+
+            # N is still blocked
+            assert not req_n.result.done(), (
+                'req_n.result must still be pending — verifier is blocked on N'
+            )
+
+            # Unblock N; it completes as done
+            release.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'done', f'N should complete as done: {outcome_n}'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+    # ── Verifier ordering-token (γ3 step-5 / task-1644) ──────────────────────
+
+    async def test_verifier_skips_set_result_when_already_delivered(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Verifier must NOT resolve req.result when already_delivered=True.
+
+        The token represents an outcome the merger already delivered OOB.  The
+        verifier must use it only as an ordering token (n_failed flip + slot
+        release) and must not call set_result — the future stays PENDING.
+
+        RED before step-6 impl: the existing guard is
+        `if not req.result.done():` — since the future is pending, that guard
+        is True and the verifier still calls set_result.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('vot-a', 'vot-a', git_ops.project_root, config)
+        # Leave req.result PENDING — the OOB caller owns delivery; the verifier
+        # must respect the already_delivered flag and skip set_result.
+
+        token = SpeculativeItem(
+            request=req, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('conflict'),
+            already_delivered=True,
+        )
+        await worker._verifier_queue.put(token)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        await worker._verifier_loop()
+
+        assert not req.result.done(), (
+            'Verifier must NOT resolve req.result when already_delivered=True '
+            '(merger already resolved it OOB; verifier is ordering-token only). '
+            'RED before step-6 impl.'
+        )
+
+    async def test_verifier_already_delivered_token_drives_nfailed_chain(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """already_delivered failure token flips n_failed, triggering _remerge.
+
+        Token1: already_delivered=True, immediate_outcome='conflict', speculative=False,
+        request future pre-resolved.
+        Token2: speculative=True, immediate_outcome=None.
+
+        After the loop _remerge must be awaited exactly once (Token2 discarded
+        because n_failed=True from Token1) and _speculation_slot must be set.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Token1: pre-resolved (OOB delivery happened); the verifier sees it
+        # as an ordering token for n_failed bookkeeping.
+        req1 = _make_request('vot-b1', 'vot-b1', git_ops.project_root, config)
+        conflict_outcome = MergeOutcome('conflict')
+        req1.result.set_result(conflict_outcome)
+
+        token1 = SpeculativeItem(
+            request=req1, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=conflict_outcome,
+            already_delivered=True,
+        )
+
+        # Token2: speculative — will be discarded+re-merged because n_failed=True
+        req2 = _make_request('vot-b2', 'vot-b2', git_ops.project_root, config)
+        remerge_outcome = MergeOutcome('done', merge_sha='a' * 40)
+        remerged_item = SpeculativeItem(
+            request=req2, merge_result=None, merge_wt=None,
+            base_sha='newbase', speculative=False, skip_verify=False,
+            immediate_outcome=remerge_outcome,
+            already_delivered=False,
+        )
+        worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
+
+        token2 = SpeculativeItem(
+            request=req2, merge_result=None, merge_wt=None,
+            base_sha='stalebase', speculative=True, skip_verify=False,
+            immediate_outcome=None,
+        )
+
+        await worker._verifier_queue.put(token1)
+        await worker._verifier_queue.put(token2)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        await worker._verifier_loop()
+
+        worker._remerge.assert_awaited_once()  # type: ignore[attr-defined]
+        assert worker._speculation_slot.is_set(), (
+            '_speculation_slot must be set after verifier drains both tokens'
+        )
+
+    async def test_verifier_no_double_resolve_for_already_delivered_token(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Pre-resolved already_delivered token must not be double-resolved.
+
+        req.result is pre-set before the token is put on the queue (simulating
+        the realistic already_delivered path where the merger resolved the future
+        OOB).  The verifier must not overwrite it and must not raise
+        InvalidStateError.  The result identity must be unchanged after the loop.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('vot-c', 'vot-c', git_ops.project_root, config)
+        conflict_outcome = MergeOutcome('conflict', conflict_details='# conflict\n')
+        req.result.set_result(conflict_outcome)
+
+        token = SpeculativeItem(
+            request=req, merge_result=None, merge_wt=None,
+            base_sha='deadbeef', speculative=False, skip_verify=False,
+            immediate_outcome=conflict_outcome,
+            already_delivered=True,
+        )
+        await worker._verifier_queue.put(token)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        # Must not raise InvalidStateError
+        await worker._verifier_loop()
+
+        assert req.result.result() is conflict_outcome, (
+            'No double-resolve: result must be the original conflict_outcome '
+            'set by OOB delivery; verifier must not overwrite it'
+        )
+
+    # ── Regression-guard (γ3 step-7 / task-1644) ─────────────────────────────
+
+    async def test_train_not_oob_delivered(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Property 4 (trains): GroupMergeRequest must ride the FIFO, never OOB.
+
+        Drive _merger_loop() with a GroupMergeRequest.  _do_train_merge is
+        patched to return 'done'.  After the loop:
+        - req.result must still be PENDING (merger must not resolve it)
+        - The enqueued SpeculativeItem must have already_delivered=False
+        - The item's immediate_outcome.status must be 'done'
+        """
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id='tr-excl',
+            branch='tr-excl',
+            worktree=git_ops.project_root,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-excl',
+            member_task_ids=['tr-excl'],
+            tip_branch='tr-excl',
+            tip_task_id='tr-excl',
+            status_check=AsyncMock(),
+            mark_member_done=AsyncMock(),
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        done_outcome = MergeOutcome('done', merge_sha='a' * 40)
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=done_outcome),
+        ):
+            await worker._merger_loop()
+
+        assert not req.result.done(), (
+            'Train (GroupMergeRequest) must NOT be OOB-delivered — '
+            'its result must still be PENDING after _merger_loop. '
+            'Trains must resolve through the verifier FIFO (invariant e).'
+        )
+        item = worker._verifier_queue.get_nowait()
+        assert item is not None
+        assert item.already_delivered is False, (
+            'Train SpeculativeItem must have already_delivered=False '
+            '(verifier owns resolution for all train outcomes)'
+        )
+        assert item.immediate_outcome is not None
+        assert item.immediate_outcome.status == 'done', (
+            f'immediate_outcome.status must be done, got: {item.immediate_outcome.status!r}'
+        )
+
+    async def test_oob_conflict_emits_terminal_event(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Property 3 (event): OOB conflict delivery leaves merge_attempt 'conflict'
+        as the latest merge-phase event — no trailing merge_dequeued phantom.
+
+        Run a non-speculative conflicting request through worker.run() with an
+        EventStore.  Assert the terminal merge_attempt 'conflict' event is
+        emitted and is the last merge-phase event row for the task.
+        """
+        db_path = tmp_path / 'events_oob_cfl.db'
+        event_store = EventStore(db_path=db_path, run_id='oob-evt-run')
+
+        wt = (await git_ops.create_worktree('oob-evt-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main evt side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main oob-evt side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch evt side\n')
+        await git_ops.commit(wt, 'Branch oob-evt conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('oob-evt-cfl', 'oob-evt-cfl', wt, config)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+        assert outcome.status == 'conflict'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') "
+            "FROM events WHERE task_id = 'oob-evt-cfl' ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        assert ('merge_attempt', 'conflict') in rows, f'rows={rows}'
+        assert rows[-1] == ('merge_attempt', 'conflict'), (
+            f'merge_attempt conflict must be the latest event (no trailing phantom): {rows}'
+        )
+
+    async def test_oob_conflict_resolves_attached_peer_waiter(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Multi-waiter fan-out: OOB delivery resolves the primary and all peers.
+
+        Wire a real InFlightMergeRegistry: acquire(branch, req.result) installs
+        the _mirror done-callbacks via attach().  When _oob_deliver sets
+        req.result, the γ1 mirror fan-out propagates the outcome to the peer
+        future immediately (no verifier involvement).
+
+        Asserts both the primary future and the attached peer future resolve to
+        status 'conflict'.
+        """
+        from orchestrator.merge_queue import WaiterRecord
+
+        wt = (await git_ops.create_worktree('mw-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main mw side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main mw side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch mw side\n')
+        await git_ops.commit(wt, 'Branch mw conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('mw-cfl', 'mw-cfl', wt, config)
+
+        # Register in a real registry and attach a peer waiter.
+        # req.result IS the primary_future; attach() installs _mirror callbacks on it.
+        registry = InFlightMergeRegistry()
+        registry.acquire('mw-cfl', 'mw-cfl', req.result, request_id='mr-mw-1')
+        peer_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        registry.attach('mw-cfl', WaiterRecord(
+            request_id='mr-mw-2', future=peer_future, source='mcp',
+        ))
+
+        await queue.put(req)
+        await queue.put(None)  # type: ignore[arg-type]
+        await worker._merger_loop()
+
+        # Allow done-callbacks to fire.
+        await asyncio.sleep(0)
+
+        assert req.result.done(), 'primary future must be resolved by OOB delivery'
+        assert req.result.result().status == 'conflict', (
+            f'primary: expected conflict, got {req.result.result().status!r}'
+        )
+        assert peer_future.done(), (
+            'peer future must be resolved via γ1 _mirror fan-out '
+            '(OOB delivery sets req.result → done-callbacks fire → peer resolved)'
+        )
+        assert peer_future.result().status == 'conflict', (
+            f'peer: expected conflict, got {peer_future.result().status!r}'
+        )
+
+    async def test_retention_ring_populated_on_oob_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Invariant-(b): α1/1628 merge_finalized retention callback fires on OOB delivery.
+
+        The done-callback registered by enqueue_merge_request is scheduled via
+        call_soon when req.result is set — before the verifier drains the FIFO
+        ordering token.  After OOB delivery the retention ring must contain a
+        record with state=='conflict' for the request.
+
+        Uses the real chokepoint: register_and_enqueue_merge_request with a
+        TerminalOutcomeRetention ring so the callback is wired identically to
+        the production workflow path.
+        """
+        db_path = tmp_path / 'events_ret_oob.db'
+        event_store = EventStore(db_path=db_path, run_id='ret-oob-run')
+        retention = TerminalOutcomeRetention()
+
+        wt = (await git_ops.create_worktree('ret-oob-cfl')).path
+
+        (git_ops.project_root / 'README.md').write_text('# Main ret side\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main ret side'], cwd=git_ops.project_root)
+
+        (wt / 'README.md').write_text('# Branch ret side\n')
+        await git_ops.commit(wt, 'Branch ret conflict')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('ret-oob-cfl', 'ret-oob-cfl', wt, config)
+        await register_and_enqueue_merge_request(
+            queue, req, event_store, None, retention=retention,
+        )
+
+        outcome = await asyncio.wait_for(req.result, timeout=30)
+        assert outcome.status == 'conflict'
+
+        await worker.stop()
+        await asyncio.wait_for(worker_task, timeout=30)
+
+        # Yield to the event loop so the add_done_callback scheduled by
+        # set_result fires (call_soon semantics — one tick suffices).
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None, (
+            'TerminalOutcomeRetention must contain a record for the request '
+            '(α1/1628 merge_finalized callback must fire on OOB set_result)'
+        )
+        assert stored.state == 'conflict', (
+            f'retention.state must be conflict, got: {stored.state!r}. '
+            'The done-callback must fire before the verifier drains the FIFO token.'
+        )
+
+    async def test_oob_deliver_status_guard_blocks_done_and_already_merged(
+        self,
+    ) -> None:
+        """_oob_deliver returns False for 'done'/'already_merged' outcomes.
+
+        Locks the status-guard clause independently of the isinstance guard:
+        even when req is a non-GroupMergeRequest and speculative=False, a
+        'done' or 'already_merged' outcome must NOT be OOB-delivered.
+
+        RED without the status-guard: returns True and resolves req.result.
+        """
+        from unittest.mock import MagicMock
+
+        worker = SpeculativeMergeWorker(MagicMock(), MagicMock())
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MagicMock(spec=MergeRequest)
+        req.result = future
+
+        result = worker._oob_deliver(req, MergeOutcome('already_merged'), speculative=False)
+
+        assert result is False, (
+            '_oob_deliver must return False for already_merged outcome '
+            '(status-guard clause); status guard must block OOB delivery'
+        )
+        assert not future.done(), (
+            'req.result must remain pending — _oob_deliver must not call '
+            'set_result for already_merged outcome'
+        )
+
+        # Verify 'done' outcome is equally excluded
+        future2: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req2 = MagicMock(spec=MergeRequest)
+        req2.result = future2
+
+        result2 = worker._oob_deliver(req2, MergeOutcome('done'), speculative=False)
+
+        assert result2 is False, (
+            '_oob_deliver must return False for done outcome (status-guard clause)'
+        )
+        assert not future2.done(), 'req.result must remain pending for done outcome'
+
+
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
 # ---------------------------------------------------------------------------
@@ -3302,6 +3880,26 @@ class TestSpeculativeItemDefaults:
         assert item.started_monotonic is None
         # Tie the default to the observability guarantee: None → NULL duration_ms
         assert _elapsed_ms(item.started_monotonic) is None
+
+    def test_already_delivered_default_is_false(self):
+        """SpeculativeItem.already_delivered defaults to False when not passed.
+
+        True means the merger already resolved req.result out-of-band; the
+        verifier must skip set_result but still run n_failed / slot bookkeeping
+        for that ordering token.  The default must be False so existing
+        construction sites that omit the flag behave identically to before.
+        """
+        from unittest.mock import MagicMock
+
+        item = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert item.already_delivered is False
 
 
 # ---------------------------------------------------------------------------
