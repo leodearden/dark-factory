@@ -10355,3 +10355,48 @@ class TestInFlightRegistryRequestId:
 
         assert result2.in_flight is True
         assert result2.inflight_request_id == req1.request_id
+
+
+# ---------------------------------------------------------------------------
+# β1 Step-3 RED: SpeculativeMergeWorker.snapshot() exposes request_id per entry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotExposesRequestId:
+    """β1 step-3 RED: snapshot() must include request_id in each entry dict.
+
+    RED until step-4 impl: _entry() does not yet include a 'request_id' key
+    (KeyError when test asserts entry['request_id']).
+    """
+
+    async def test_snapshot_queued_entry_includes_request_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A queued MergeRequest appears in snapshot with its request_id."""
+        import types
+
+        queue: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops_stub,  # type: ignore[reportArgumentType]
+            queue=queue,
+        )
+
+        req = _make_request('snap-req', 'snap-req', tmp_path, config)
+        await queue.put(req)
+
+        snap = worker.snapshot()
+
+        entries = snap['entries']
+        matching = [e for e in entries if e.get('task_id') == 'snap-req']
+        assert matching, f'Entry for snap-req not found in snapshot: {entries}'
+
+        entry = matching[0]
+        assert 'request_id' in entry, (
+            f'snapshot entry missing request_id key; keys present: {list(entry.keys())}'
+        )
+        assert entry['request_id'] == req.request_id, (
+            f"snapshot entry['request_id']={entry['request_id']!r} "
+            f"!= req.request_id={req.request_id!r}"
+        )
