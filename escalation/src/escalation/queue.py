@@ -53,6 +53,9 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
             data = read(); data = mutate(data); atomic_write(data)
     """
     lock_path = Path(queue_dir) / f'{escalation_id}.json.lock'
+    # Defensively create queue_dir so standalone callers (e.g. task ε sweep/reaper)
+    # can take the lock without having first instantiated an EscalationQueue.
+    Path(queue_dir).mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)

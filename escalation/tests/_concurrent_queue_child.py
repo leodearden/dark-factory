@@ -63,6 +63,9 @@ def main() -> None:
     elif op == 'attach':
         for i in range(count):
             queue.attach_dedupe_child(parent_id, f'{prefix}-{i}')
+    elif op == 'resolve':
+        # count is ignored; call resolve once per process (idempotent after first call).
+        queue.resolve(parent_id, f'resolved-by-{prefix}')
     else:
         print(f'Unknown op: {op!r}', file=sys.stderr)
         sys.exit(2)

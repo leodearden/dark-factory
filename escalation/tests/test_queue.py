@@ -2344,9 +2344,16 @@ class TestAddMembersToL2Concurrency:
             env=env,
         )
 
-        # Wait for both to complete
-        rc_a = proc_a.wait(timeout=25)
-        rc_b = proc_b.wait(timeout=25)
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
         assert rc_a == 0, f'Child process A exited with rc={rc_a}'
         assert rc_b == 0, f'Child process B exited with rc={rc_b}'
 
@@ -2414,8 +2421,16 @@ class TestAttachDedupeChildConcurrency:
             env=env,
         )
 
-        rc_a = proc_a.wait(timeout=25)
-        rc_b = proc_b.wait(timeout=25)
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
         assert rc_a == 0, f'Child process A exited with rc={rc_a}'
         assert rc_b == 0, f'Child process B exited with rc={rc_b}'
 
@@ -2431,6 +2446,70 @@ class TestAttachDedupeChildConcurrency:
         )
         assert result.dedupe_count == count * 2, (
             f'Expected dedupe_count={count * 2}, got {result.dedupe_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Concurrent resolve: exactly-one-archive-copy invariant
+# ---------------------------------------------------------------------------
+
+class TestConcurrentResolveExactlyOneArchive:
+    """Two-OS-process test: two concurrent resolve() calls for the same id produce exactly one archive copy."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_resolves_produce_exactly_one_archive(self, tmp_path: Path):
+        """Two concurrent resolve() calls for the same pending escalation must leave exactly one archive file.
+
+        Without the sidecar lock the idempotency check (status != 'pending') can race:
+        both processes read 'pending', mutate, write, and archive — producing two archive
+        copies.  With the lock the second resolve() serializes after the first, sees
+        status != 'pending', and returns early without archiving again.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        esc = Escalation(
+            id=queue.make_id('task-5'),
+            task_id='task-5',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='Concurrent resolve test',
+            level=0,
+        )
+        queue.submit(esc)
+        esc_id = esc.id
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        proc_a = subprocess.Popen(child_args + ['resolve', esc_id, 'a', '1'], env=env)
+        proc_b = subprocess.Popen(child_args + ['resolve', esc_id, 'b', '1'], env=env)
+
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Queue root file must be absent — archived by the winning resolve()
+        assert not (queue_dir / f'{esc_id}.json').exists(), (
+            f'Queue root file {esc_id}.json was not archived after concurrent resolves'
+        )
+
+        # Exactly one archive copy must exist — the losing resolve() is a no-op
+        archive_files = list((queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        assert len(archive_files) == 1, (
+            f'Expected exactly 1 archive copy, found {len(archive_files)}: {archive_files}'
         )
 
 
