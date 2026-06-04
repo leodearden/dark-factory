@@ -257,12 +257,12 @@ Agent discovered it needs modules beyond its assigned scope.
    mcp__fused-memory__update_task(id=<task_id>, project_root=<project_root>,
      updates={"metadata": {"modules": [<existing> + <new_module>]}})
    ```
-2. Resolve with terminate=true:
+2. Resolve with action='resume':
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Scope expanded to include [modules]. Task will be rescheduled with updated module locks.",
-     terminate=true,
+     resolution="Scope expanded to include [modules]; resuming — task re-pends (blocked→pending) and the scheduler re-dispatches with the updated module locks.",
+     action='resume',
      resolved_by="escalation-watcher-auto"
    )
    ```
@@ -281,8 +281,8 @@ Agent found it depends on work that isn't done yet.
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Added dependency on task <dep_id>. Task rescheduled after dependency completes.",
-     terminate=true,
+     resolution="Added dependency on task <dep_id>; resuming — task re-pends (blocked→pending) and the scheduler holds it until <dep_id> is done.",
+     action='resume',
      resolved_by="escalation-watcher-auto"
    )
    ```
@@ -296,7 +296,7 @@ Agent found it depends on work that isn't done yet.
      member_ids=[<escalation_id>],
      root_cause="dependency-no-task:" + <dep_description_slug>,
      evidence=<dep_description>,
-     options=["A: create the missing prerequisite task", "B: remove dependency and let agent continue", "C: terminate and defer", "D: something else"],
+     options=["A: create the missing prerequisite task", "B: remove dependency and let agent continue", "C: park the task (defer for later human decision)", "D: something else"],
      summary="dependency_discovered — no matching task for: " + <dep_description>,
      category="dependency_discovered",
    )
@@ -307,12 +307,12 @@ Agent found it depends on work that isn't done yet.
 
 Technical debt or cleanup discovered during development.
 
-1. Resolve with terminate=false (agent continues after cleanup is queued):
+1. Resolve with action='resume' (the dispatch agent is parked on the L0 live wait; resume injects the ack and continues):
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
      resolution="Cleanup queued. Agent may continue — cleanup tracked in digest for follow-up.",
-     terminate=false,
+     action='resume',
      resolved_by="escalation-watcher-auto"
    )
    ```
@@ -346,7 +346,7 @@ The task is blocked. The `/unblock-auto` hook runs dry-run proposals at block ti
        f"Task {task_id}: {summary}. "
        + (f"Dry-run proposal: {latest_proposal.proposal_text} [risk: {latest_proposal.risk_label}]" if latest_proposal else "No proposal available.")
      ),
-     options=["A: apply dry-run proposal", "B: investigate and fix manually", "C: terminate and reschedule", "D: something else"],
+     options=["A: apply dry-run proposal", "B: investigate and fix manually", "C: restart the task (re-run fresh)", "D: something else"],
      summary=<escalation summary>,
      category="task_failure",
    )
