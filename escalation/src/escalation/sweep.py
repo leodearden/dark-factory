@@ -23,6 +23,7 @@ from pathlib import Path
 
 from escalation import archive
 from escalation.models import Escalation
+from escalation.queue import escalation_id_lock
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +146,9 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                 # No archive copy: move to dated subdir
                 target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
                 if apply:
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    _atomic_move(path, target_dir / path.name)
+                    with escalation_id_lock(queue_dir, path.stem):
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        _atomic_move(path, target_dir / path.name)
                 report.archived += 1
             else:
                 # Archive copy exists: compare richness
@@ -154,12 +156,14 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                 if _pick_richer(esc, archive_esc):
                     # Root wins: atomically overwrite the archive slot
                     if apply:
-                        _atomic_move(path, existing_archive)
+                        with escalation_id_lock(queue_dir, path.stem):
+                            _atomic_move(path, existing_archive)
                     report.reconciled_root_wins += 1
                 else:
                     # Archive wins: drop the duplicate root copy
                     if apply:
-                        os.unlink(path)
+                        with escalation_id_lock(queue_dir, path.stem):
+                            os.unlink(path)
                     report.reconciled_archive_wins += 1
             continue
 
