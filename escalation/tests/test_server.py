@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from escalation.dedupe import DedupeConfig
+from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -2176,3 +2176,207 @@ class TestGetMergeQueue:
 
         # Request future is resolved (not_descendant → blocked)
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
+
+
+# ---------------------------------------------------------------------------
+# TestDowngradeDedupeCorrectness — C4/D3 review fix: appended marker vs. dedupe key
+# ---------------------------------------------------------------------------
+
+
+class TestDowngradeDedupeCorrectness:
+    """Downgraded marker must not corrupt the summary_dedupe_key.
+
+    summary_dedupe_key() keys on the FIRST three whitespace tokens.  When the
+    marker was PREPENDED ('[downgraded:critical] {summary}'), every token
+    shifted: downgraded criticals never matched equivalent normally-filed
+    'blocking' parents (defeating dedupe), and unrelated criticals whose first
+    two words matched could false-merge on the constant leading token.
+
+    The fix (step-6) APPENDS the marker so the leading tokens are unchanged.
+    All four tests below fail on current (prepend) code and pass once the
+    marker is appended:
+
+    (1) PRISTINE KEY — key(esc.summary) == key(original)
+    (2) FOLDS INTO BLOCKING PARENT — downgraded critical matches blocking parent
+    (3) TWO AGENT-CRITICALS DEDUPE — second downgraded critical folds into first
+    (4) DISTINCT SUMMARIES DO NOT MERGE — different 3rd token keeps them separate
+    """
+
+    # IMPORTANT: DedupeConfig() folds only category='infra_issue' (default
+    # infra_dedupe_categories=('infra_issue',)).  The downgrade tests above use
+    # category='scope_violation' which never dedupes.  These tests use
+    # category='infra_issue' so submit_or_dedupe actually attempts a fold.
+
+    _SUMMARY_A = 'fused memory connection timeout'
+    _SUMMARY_B = 'fused memory disk full'
+
+    @pytest.mark.asyncio
+    async def test_pristine_key_equals_original_summary_key(self, tmp_path: Path):
+        """(1) PRISTINE KEY — downgraded record key == original summary key.
+
+        After downgrade, summary_dedupe_key(esc.summary) must equal
+        summary_dedupe_key(original_summary) so the record can fold into a
+        normally-filed 'blocking' parent with the same summary.
+
+        On current (prepend) code this FAILS because the key shifts to
+        ('downgradedcritical', first, second) instead of (first, second, third).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+
+        assert result['status'] == 'queued', f'Expected queued, got: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        # The marker must be present somewhere in the summary (not stripped)
+        assert '[downgraded:critical]' in esc.summary, (
+            f'Expected downgrade marker in summary, got: {esc.summary!r}'
+        )
+        # KEY INVARIANT: downgraded summary's key must equal the original key
+        assert summary_dedupe_key(esc.summary) == summary_dedupe_key(S), (
+            f'summary_dedupe_key mismatch after downgrade:\n'
+            f'  downgraded key: {summary_dedupe_key(esc.summary)}\n'
+            f'  original key:   {summary_dedupe_key(S)}\n'
+            f'  esc.summary: {esc.summary!r}'
+        )
+        # The original text must appear FIRST (not after the marker)
+        assert esc.summary.startswith(S), (
+            f'Expected summary to start with original text {S!r}, got: {esc.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_downgraded_critical_folds_into_blocking_parent(self, tmp_path: Path):
+        """(2) FOLDS INTO BLOCKING PARENT — downgraded critical matches blocking parent.
+
+        Pre-seed a pending severity='blocking', category='infra_issue' parent
+        with summary S; then file an agent critical infra_issue with the SAME
+        summary S via escalate_blocker; assert result['status']=='dedup_skipped'.
+
+        On current (prepend) code this FAILS because the downgraded key
+        ('downgradedcritical', ...) never matches the parent's ('fused', ...).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        # Pre-seed a blocking parent directly via queue.submit()
+        parent = Escalation(
+            id=queue.make_id('task-100'),
+            task_id='task-100',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=S,
+        )
+        queue.submit(parent)
+
+        # File an agent critical with the SAME summary — should fold into parent
+        result = await _blocker(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+
+        assert result['status'] == 'dedup_skipped', (
+            f'Expected dedup_skipped (downgraded key should match blocking parent), got: {result}'
+        )
+        assert result.get('parent_id') == parent.id, (
+            f'Expected parent_id={parent.id!r}, got parent_id={result.get("parent_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_agent_criticals_dedupe(self, tmp_path: Path):
+        """(3) TWO AGENT-CRITICALS DEDUPE — second folds into first (regression guard).
+
+        File two agent critical infra_issue escalations with the same summary S:
+        first must be 'queued', second must be 'dedup_skipped' with parent_id
+        pointing at the first.
+
+        This passes on BOTH current (prepend) and fixed (append) code because
+        both records get the same marker → same key.  It locks the invariant
+        so any future change that breaks the folding fails this test.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+        S = self._SUMMARY_A
+
+        first = await _blocker(
+            server,
+            task_id='task-1',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+        assert first['status'] == 'queued', f'Expected first to be queued, got: {first}'
+
+        second = await _blocker(
+            server,
+            task_id='task-2',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=S,
+            severity='critical',
+        )
+        assert second['status'] == 'dedup_skipped', (
+            f'Expected second agent-critical to fold into first, got: {second}'
+        )
+        assert second.get('parent_id') == first['id'], (
+            f'Expected parent_id={first["id"]!r}, got: {second.get("parent_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_distinct_summaries_do_not_merge(self, tmp_path: Path):
+        """(4) DISTINCT SUMMARIES DO NOT MERGE — different 3rd token keeps them separate.
+
+        File two agent critical infra_issue escalations whose summaries share
+        the first two real tokens but differ on the third:
+          _SUMMARY_A = 'fused memory connection timeout'
+          _SUMMARY_B = 'fused memory disk full'
+        Both must be 'queued' — their keys differ at the 3rd token.
+
+        On current (prepend) code this FAILS because both summaries collapse
+        to ('downgradedcritical', 'fused', 'memory'), causing the second to
+        return 'dedup_skipped' instead of 'queued'.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, dedupe_config=DedupeConfig())
+
+        first = await _blocker(
+            server,
+            task_id='task-1',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=self._SUMMARY_A,
+            severity='critical',
+        )
+        assert first['status'] == 'queued', (
+            f'Expected first (SUMMARY_A) to be queued, got: {first}'
+        )
+
+        second = await _blocker(
+            server,
+            task_id='task-2',
+            agent_role='implementer',
+            category='infra_issue',
+            summary=self._SUMMARY_B,
+            severity='critical',
+        )
+        assert second['status'] == 'queued', (
+            f'Expected second (SUMMARY_B) to be queued (distinct 3rd token), got: {second}'
+        )
+        assert second['id'] != first['id'], (
+            f'SUMMARY_A and SUMMARY_B must produce separate records'
+        )
