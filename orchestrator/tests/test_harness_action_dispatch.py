@@ -586,3 +586,141 @@ class TestDispatchTeardownNoKill:
 
         # Legacy L2 dismissed → close_only → no status write
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Pair D — live-workflow kill sequence + status-precedes-kill (C3.1, D9)
+# Step-7: RED until the kill sequence is wired in step-8
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestTeardownKillSequence:
+    """B6: kill live workflow after writing target status; status PRECEDES kill."""
+
+    def _make_kill_harness(self, harness: Harness):
+        """Set up harness for kill-sequence tests: live workflow initially active."""
+        call_log: list[str] = []
+
+        async def fake_set_status(tid, status):
+            call_log.append(f'set_status:{tid}:{status}')
+
+        def fake_cancel(tid):
+            call_log.append(f'cancel:{tid}')
+            return True
+
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock(side_effect=fake_set_status)
+        harness.cancel_workflow = MagicMock(side_effect=fake_cancel)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+
+        # is_workflow_active: True until cancel is called, then False (slot cleared)
+        def fake_is_active(tid):
+            return not any(e.startswith('cancel:') for e in call_log)
+
+        harness.is_workflow_active = MagicMock(side_effect=fake_is_active)
+        # Small poll budget so tests are fast
+        harness.config.terminal_status_hard_cancel_polls = 3
+
+        return call_log
+
+    async def test_restart_status_precedes_kill(self, harness: Harness):
+        """resolution_action='restart' on live workflow: set_task_status('pending')
+        BEFORE cancel_workflow -- status-precedes-kill (C3.1).
+        """
+        call_log = self._make_kill_harness(harness)
+        task_id = 'task-kill-restart'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # cancel_workflow must be called
+        harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+
+        # Ordering: set_status BEFORE cancel
+        assert any('set_status' in e for e in call_log), 'set_task_status not recorded'
+        assert any('cancel:' in e for e in call_log), 'cancel_workflow not recorded'
+        first_set = next(i for i, e in enumerate(call_log) if 'set_status' in e)
+        first_cancel = next(i for i, e in enumerate(call_log) if 'cancel:' in e)
+        assert first_set < first_cancel, (
+            f'set_status must precede cancel_workflow; call_log={call_log}'
+        )
+
+    async def test_park_kills_workflow(self, harness: Harness):
+        """resolution_action='park' on live workflow: cancel_workflow called,
+        task written to 'deferred'.
+        """
+        call_log = self._make_kill_harness(harness)
+        task_id = 'task-kill-park'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'deferred',
+        )
+
+    async def test_abandon_kills_workflow(self, harness: Harness):
+        """resolution_action='abandon' on live workflow: cancel_workflow called,
+        task written to 'cancelled'.
+        """
+        call_log = self._make_kill_harness(harness)
+        task_id = 'task-kill-abandon'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='abandon',
+            status='dismissed',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'cancelled',
+        )
+
+    async def test_hard_cancel_called_if_slot_persists(self, harness: Harness):
+        """If the workflow slot does not clear within the poll budget,
+        hard_cancel_workflow is called as the escalation.
+        is_workflow_active always True -> polls exhaust -> hard_cancel called.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.cancel_workflow = MagicMock(return_value=True)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+        # Always active -- slot never clears
+        harness.is_workflow_active = MagicMock(return_value=True)
+        # Very small poll budget so test terminates fast
+        harness.config.terminal_status_hard_cancel_polls = 2
+
+        task_id = 'task-kill-hard'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # hard_cancel must be called because the slot never cleared
+        harness.hard_cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
