@@ -14,6 +14,7 @@ and the same tmp_path isolation as test_server_dedupe.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import types
 from pathlib import Path
 from typing import Any
@@ -973,10 +974,8 @@ class TestMergeRequestFastPathFallThrough:
             )
         finally:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
 
     async def test_non_ancestor_tip_falls_through_to_enqueue(self, tmp_path: Path):
         """resolve_branch_sha returns a SHA but is_ancestor returns False → enqueues.
@@ -1023,7 +1022,5 @@ class TestMergeRequestFastPathFallThrough:
             )
         finally:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
