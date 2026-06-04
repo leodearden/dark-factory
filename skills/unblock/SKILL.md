@@ -219,15 +219,15 @@ The merge procedure is iterative — don't assume one pass will be enough:
    ```
    `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s.
 
-   **Classify the immediate response:**
+   **Classify the immediate response** (`merge_request` discriminates on `status`):
 
-   - `state: "done"` or `state: "already_merged"` → **terminal success.** Thread the merge commit SHA:
-     - Normal `done`: SHA is in `result["outcome"]`.
+   - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
+     - Normal `done`: SHA is in `result["commit"]`.
      - `already_merged`: SHA is in `result["commit"]`.
 
      Go directly to step 8.
 
-   - `state: "queued"` or `state: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
+   - `status: "queued"` or `status: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
      ```
      request_id = result["request_id"]
      poll_interval = 15  # seconds; ramp up to 60 s
@@ -244,16 +244,16 @@ The merge procedure is iterative — don't assume one pass will be enough:
    *(Conflict, `unknown_branch`, orchestrator-down, `{state: "unknown"}`, and cancellation edges are covered below.)*
 
 8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from the terminal `done` outcome (step 7). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note below). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 **Merge-step failure and abandonment edges:**
 
 *Immediate-response failures (from `merge_request`):*
 
-- `state: "conflict"` or `state: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
-- `state: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
-- `state: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
+- `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
+- `status: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
+- `status: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
 - `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge:
   ```
   git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
@@ -275,7 +275,7 @@ To abandon a submitted merge (e.g. the task needs redesign after submission):
 ```
 mcp__escalation__merge_cancel(request_id=request_id)
 ```
-**Coalesced-id caveat:** An `attached` response shares the in-flight entry's `request_id` and registers no separate waiter. Cancelling via a coalesced id returns `{cancelled: false, state: "unknown"}` — always cancel via the **in-flight** `request_id` (the one returned with `state: "queued"`), not via a coalesced id.
+**Coalesced-id caveat:** An `attached` response shares the in-flight entry's `request_id` and registers no separate waiter. Cancelling via a coalesced id returns `{cancelled: false, state: "unknown"}` — always cancel via the **in-flight** `request_id` (the one returned with `status: "queued"`), not via a coalesced id.
 
 *If this is an escalated task (pending escalation, agent is paused):*
 
