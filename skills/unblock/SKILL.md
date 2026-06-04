@@ -216,13 +216,13 @@ Choose one of these based on the analysis:
 
 - **Resolve and resume** — if your blocker fixes address the escalation concern, resolve with actionable instructions for the resumed agent:
   ```
-  resolve_issue(escalation_id="<id>", resolution="<specific instructions>", terminate=false, resolved_by="interactive", resolution_turns=<N>)
+  resolve_issue(escalation_id="<id>", resolution="<specific instructions>", action='resume', resolved_by="interactive", resolution_turns=<N>)
   ```
   The agent resumes with your resolution injected into its briefing. Task stays `in-progress`.
 
-- **Terminate and reschedule** — if the task needs fundamental redesign:
+- **Restart and reschedule** — if the task needs fundamental redesign:
   ```
-  resolve_issue(escalation_id="<id>", resolution="<reason for termination>", terminate=true, resolved_by="interactive", resolution_turns=<N>)
+  resolve_issue(escalation_id="<id>", resolution="<reason for restart>", action='restart', resolved_by="interactive", resolution_turns=<N>)
   ```
   Then create or update tasks as needed. Task goes to `pending`.
 
