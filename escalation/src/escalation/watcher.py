@@ -16,12 +16,63 @@ import argparse
 import json
 import signal
 import sys
+import time
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Optional
 
 from inotify_simple import INotify, flags
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+
+
+def _matches(esc: Escalation, task_id: Optional[str], level: Optional[int]) -> bool:
+    """Return True iff esc is pending and satisfies the optional filters."""
+    if esc.status != 'pending':
+        return False
+    if task_id and esc.task_id != task_id:
+        return False
+    if level is not None and esc.level != level:
+        return False
+    return True
+
+
+def _initial_scan(
+    queue_dir: Path,
+    task_id: Optional[str],
+    level: Optional[int],
+) -> Optional[Escalation]:
+    """Scan the queue directory for already-pending matching escalations.
+
+    Returns the OLDEST by timestamp, or None if no match found.
+    Malformed / unreadable JSON files are skipped (never silently dropped).
+    Mirrors the get_pending + find_pending_l2_by_root_cause idiom in queue.py.
+    """
+    best: Optional[Escalation] = None
+    best_ts: Optional[datetime] = None
+
+    for path in queue_dir.glob('esc-*.json'):
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, OSError, TypeError):
+            continue
+
+        if not _matches(esc, task_id, level):
+            continue
+
+        try:
+            ts = datetime.fromisoformat(esc.timestamp)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+        except (ValueError, TypeError):
+            ts = datetime.min.replace(tzinfo=UTC)
+
+        if best_ts is None or ts < best_ts:
+            best = esc
+            best_ts = ts
+
+    return best
 
 
 def _send_ntfy(url: str, escalation: Escalation) -> None:
