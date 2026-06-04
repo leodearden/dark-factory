@@ -2328,7 +2328,7 @@ async def verify_failure_is_preexisting_on_main(
         # traversal resolves node_modules / repo-root installs identically to
         # task worktrees.  git worktree add CREATES the path, so we must NOT
         # pre-create it (strict git rejects pre-existing directories).
-        base = git_ops.worktree_base  # type: ignore[union-attr]
+        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
         base.mkdir(parents=True, exist_ok=True)
         tmp_path = base / f'_mainprobe-{uuid.uuid4().hex[:8]}'
 
