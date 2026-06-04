@@ -10,6 +10,7 @@ Acceptance criteria:
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -213,3 +214,91 @@ class TestB15OpenL1Guard:
             'pending-escalation gate must suppress re-filing'
         )
         assert pending[0].id == open_l1.id, 'The surviving L1 must be the original open one'
+
+
+# ---------------------------------------------------------------------------
+# Age-gate — _workflow_cancel_recent unit tests + sweep integration
+# ---------------------------------------------------------------------------
+
+class TestWorkflowCancelRecentHelper:
+    """Unit tests for _workflow_cancel_recent(tid) helper."""
+
+    def test_absent_stamp_returns_false(self, harness: Harness):
+        """No entry in _workflow_cancel_at → _workflow_cancel_recent returns False."""
+        harness._workflow_cancel_at.clear()
+        assert harness._workflow_cancel_recent('no-such-task') is False  # type: ignore[attr-defined]
+
+    def test_fresh_stamp_returns_true(self, harness: Harness):
+        """Stamp = now → within grace window → True."""
+        harness._workflow_cancel_at['fresh-task'] = time.monotonic()
+        assert harness._workflow_cancel_recent('fresh-task') is True  # type: ignore[attr-defined]
+
+    def test_stale_stamp_returns_false(self, harness: Harness):
+        """Stamp > _RECONCILE_CANCEL_GRACE_S old → outside grace window → False."""
+        grace = harness._RECONCILE_CANCEL_GRACE_S
+        harness._workflow_cancel_at['stale-task'] = time.monotonic() - grace - 1.0
+        assert harness._workflow_cancel_recent('stale-task') is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestAgeGateSweepIntegration:
+    """Sweep-level: stale stamp → re-filed; recent stamp → skipped."""
+
+    async def test_stale_cancel_stamp_allows_refiling(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Blocked task with a STALE _workflow_cancel_at stamp (> grace) IS re-filed.
+
+        RED under current membership gate (tid not in _workflow_cancel_at → stale
+        stamp is STILL in the map, so the gate fires and no L1 is filed).
+        """
+        queue = EscalationQueue(tmp_path / 'esc_stale')
+        task_id = 'task-stale-stamp'
+
+        harness._escalation_queue = queue
+        harness._escalation_events.clear()
+
+        # Stale stamp: older than _RECONCILE_CANCEL_GRACE_S
+        grace = harness._RECONCILE_CANCEL_GRACE_S
+        harness._workflow_cancel_at[task_id] = time.monotonic() - grace - 5.0
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        filed = queue.get_by_task(task_id, status='pending')
+        assert len(filed) == 1, (
+            'Expected stranded_blocked L1 for stale-stamp task; got none — '
+            'age-based gate must allow re-filing when stamp is stale'
+        )
+
+    async def test_recent_cancel_stamp_suppresses_refiling(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Blocked task with a RECENT _workflow_cancel_at stamp is NOT re-filed.
+
+        GREEN under both old membership gate and new age-based gate (recent stamp
+        is in the map → both gates suppress re-filing).
+        """
+        queue = EscalationQueue(tmp_path / 'esc_recent')
+        task_id = 'task-recent-stamp'
+
+        harness._escalation_queue = queue
+        harness._escalation_events.clear()
+
+        # Recent stamp: just now
+        harness._workflow_cancel_at[task_id] = time.monotonic()
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({task_id: 'blocked'}, None)
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        filed = queue.get_by_task(task_id, status='pending')
+        assert len(filed) == 0, (
+            f'Expected no L1 for recent-stamp task; got {len(filed)} — '
+            'age-based gate must suppress re-filing within grace window'
+        )
