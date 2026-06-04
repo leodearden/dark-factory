@@ -3971,6 +3971,111 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── Guard: train path exempt from both mechanisms (task 1646) ────────────
+
+    async def test_train_exempt_from_cap_and_pickup_rebase(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Guard (D9/I6): GroupMergeRequest is exempt from Mechanism 1 cap and
+        Mechanism 2 pickup re-base.
+
+        Main is advanced externally after the train branch is created, so if
+        the guards are absent the staleness check (base_sha != current_main)
+        would fire on the train item.  The test asserts that it never fires
+        and that the cap is untouched throughout.
+
+        Train path in _merger_loop continues before the cap-acquire site and
+        always sets immediate_outcome — both structural guards.  Mechanism 2's
+        elif further requires `item.immediate_outcome is None` and
+        `not isinstance(req, GroupMergeRequest)`.
+
+        Assertions:
+          (1) train resolves 'done' (sentinel outcome); _do_train_merge called once.
+          (2) NO speculative_discard with reason='main_advanced' in EventStore.
+          (3) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND (cap never consumed).
+        """
+        from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+
+        db_path = tmp_path / 'events_train_exempt.db'
+        event_store = EventStore(db_path=db_path, run_id='test-train-exempt')
+
+        # Create a train branch worktree
+        tr_wt = await _make_branch_with_file(
+            git_ops, 'tr-exempt', 'file_tr_exempt.py', 'train = 1\n',
+        )
+
+        # Advance main externally so the train's base_sha at merge time would be
+        # "stale".  Without the isinstance/immediate_outcome guards Mechanism 2
+        # would detect base_sha != current_main and emit a 'main_advanced' discard.
+        (git_ops.project_root / 'advance_tr.py').write_text('advance = 1\n')
+        await _run(['git', 'add', 'advance_tr.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Advance main before train'], cwd=git_ops.project_root)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+
+        sentinel_outcome = MergeOutcome('done', merge_sha='b' * 40)
+        train_mock = AsyncMock(return_value=sentinel_outcome)
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id='tr-exempt',
+            branch='tr-exempt',
+            worktree=tr_wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            train_id='train-exempt',
+            member_task_ids=['tr-exempt'],
+            tip_branch='tr-exempt',
+            tip_task_id='tr-exempt',
+            status_check=AsyncMock(),
+            mark_member_done=AsyncMock(),
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue._do_train_merge', train_mock):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(future, timeout=30)
+
+        # (1) Train resolves to the sentinel outcome; _do_train_merge called once
+        assert outcome.status == 'done', f'train outcome: {outcome}'
+        assert outcome is sentinel_outcome, (
+            '_do_train_merge sentinel outcome must be propagated unchanged'
+        )
+        assert train_mock.call_count == 1, (
+            f'_do_train_merge must be called exactly once; got {train_mock.call_count}'
+        )
+
+        # (2) NO speculative_discard with reason='main_advanced' for the train
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        main_advanced_discards = [
+            r for r in rows
+            if r[0] == 'speculative_discard' and r[1] == 'main_advanced'
+        ]
+        assert not main_advanced_discards, (
+            f'Train must not trigger a main_advanced discard (Mechanism 2 exempt); '
+            f'got: {main_advanced_discards}  (all events: {rows})'
+        )
+
+        # (3) merge-ahead cap must be untouched — trains never call acquire
+        cap_value = worker._merge_ahead_cap._value
+        assert cap_value == _MERGE_AHEAD_BOUND, (
+            f'_merge_ahead_cap._value={cap_value} after train; '
+            f'expected {_MERGE_AHEAD_BOUND}.  '
+            'Train must not consume the merge-ahead cap (Mechanism 1 exempt).'
+        )
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
