@@ -28,6 +28,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import parse_utc, safe_gather_result
@@ -846,8 +847,6 @@ async def build_per_project_merge_queue(
 # 9. Live merge-queue fan-out (task-1606)
 # ---------------------------------------------------------------------------
 
-from dashboard.data.memory import mcp_tool_call  # noqa: E402 (deferred import to avoid circular)
-
 _LIVE_DEFAULT_PER_CALL_TIMEOUT = 2.0
 
 
@@ -868,11 +867,14 @@ async def _probe_live_one(
             mcp_tool_call(client, base_url, 'get_merge_queue', {}),
             timeout=timeout,
         )
-    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
+    except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
         logger.debug('get_merge_queue failed for %s: %s', base_url, exc)
         return {'entries': [], 'reachable': False, 'error': str(exc)}
+    # Guard against unexpected non-dict results (e.g. a list)
+    if not isinstance(result, dict):
+        return {'entries': [], 'reachable': False, 'error': 'unexpected result type'}
     # Orchestrator/worker not running → result dict has an 'error' key
-    if isinstance(result, dict) and 'error' in result:
+    if 'error' in result:
         return {'entries': [], 'reachable': False, 'error': result['error']}
     raw_entries = result.get('entries') or []
     return {
