@@ -830,8 +830,8 @@ def create_server(
                 except Exception:
                     pass
             else:
-                # No live worker: use qsize as depth; position is last slot.
-                queue_depth = merge_queue.qsize()  # type: ignore[union-attr]
+                # No live worker: queue_depth already holds merge_queue.qsize() from
+                # the initialiser above; only position needs to be set.
                 position = max(0, queue_depth - 1)
             eta = _registry.eta_seconds(branch) if _registry is not None else None
             return {
