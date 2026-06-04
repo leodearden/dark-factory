@@ -285,3 +285,112 @@ class TestSignatureReset:
         assert 'pending' in set_task_status_calls, (
             'set_task_status(pending) should have been called (flip proceeds on reset)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-7 / Step-8: Threshold trip — 4th same-signature flip withheld + L2
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_queue(*, pending_l2_root_cause: str | None = None):
+    """Build a minimal mock EscalationQueue for threshold tests.
+
+    Exposes make_id, submit, find_pending_l2_by_root_cause, get.
+    submitted_escalations is a list of submitted Escalation objects.
+
+    q.get() returns None (no parent L2) so _resolve_escalation_action falls
+    back to the legacy mapping (resolved → 'resume').
+    """
+    submitted: list = []
+
+    def make_id(task_id: str) -> str:
+        return f'esc-{task_id}-L2-1'
+
+    def submit(esc):
+        submitted.append(esc)
+
+    def find_pending_l2_by_root_cause(root_cause: str) -> str | None:
+        return pending_l2_root_cause
+
+    q = MagicMock()
+    q.make_id = make_id
+    q.submit = submit
+    q.find_pending_l2_by_root_cause = find_pending_l2_by_root_cause
+    q._submitted = submitted
+    # get() must return None so _resolve_escalation_action falls back to the
+    # legacy resolved→resume mapping (not an unrecognised MagicMock action).
+    q.get = MagicMock(return_value=None)
+    return q
+
+
+@pytest.mark.asyncio
+class TestThresholdTrip:
+    """4th same-signature flip is withheld; a born-at-L2 escalation is filed."""
+
+    async def test_fourth_flip_withheld_and_l2_filed(
+        self, harness: Harness, caplog
+    ):
+        """Seed count=3 + same signature → withhold + born-at-L2.
+
+        Asserts:
+        - set_task_status('pending') is NOT called
+        - Exactly one L2 submitted with severity='urgent', category='task_failure',
+          level=2, agent_role='harness-reblock-guard'
+        - Summary == 'persistent re-block: 3 redispatches, signature <sig>'
+        - WARNING logged
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        sig = Harness._reblock_signature(esc)
+
+        # Wire mock queue so the L2 is filed
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+
+        # Seed: count=3 with same signature (prev_count >= threshold)
+        persisted_metadata, _ = _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+        set_status_calls: list = []
+
+        original_set = harness.scheduler.set_task_status
+
+        async def spy_set(tid, status, **kw):
+            set_status_calls.append(status)
+            await original_set(tid, status, **kw)
+
+        harness.scheduler.set_task_status = spy_set
+
+        with caplog.at_level(logging.WARNING):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        # Flip must be WITHHELD
+        assert set_status_calls == [], (
+            f'set_task_status should NOT be called at threshold; got {set_status_calls}'
+        )
+
+        # Exactly one L2 filed
+        assert len(q._submitted) == 1, (
+            f'Expected 1 L2 submitted, got {len(q._submitted)}'
+        )
+        filed = q._submitted[0]
+        assert filed.severity == 'urgent'
+        assert filed.category == 'task_failure'
+        assert filed.level == 2
+        assert filed.agent_role == 'harness-reblock-guard'
+        expected_summary = f'persistent re-block: 3 redispatches, signature {sig}'
+        assert filed.summary == expected_summary, (
+            f'Expected summary {expected_summary!r}, got {filed.summary!r}'
+        )
+
+        # WARNING should be logged
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING record for threshold trip'
+        )
