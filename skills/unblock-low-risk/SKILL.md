@@ -143,8 +143,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
      60 s]. Proceed to step 9 with the final `result.state`.
 
-9. **Handle the outcome:**
-   - **`done` / `already_merged`:** success.
+9. **Handle the outcome** (use the polled `merge_status` `state` from step 8's polling loop, or the
+   `status` returned directly by the bounded `merge_request` call if it resolved in-window — treat
+   them uniformly):
+
+   - **`done` (polled state) or `already_merged` (submit-time fast-path):** success.
+     `already_merged` carries no `request_id` — nothing to poll or cancel.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance={"kind": "merged", "commit": "<merge sha>"})`.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
@@ -153,8 +157,17 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      c. Clean up: `git worktree remove .worktrees/<task_id>` and `git branch -d task/<task_id>`.
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
-   - **Anything else** (`conflict`, `blocked`, `failed`, `unknown_branch`, `in_flight`): **ABORT.**
-     Do not resolve, do not retry, do not direct-merge.
+
+   - **`conflict` | `blocked` | `abandoned` | `superseded` | `failed` | `unknown_branch`:**
+     call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
+     retry, do not direct-merge.
+
+   - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
+     `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
+     the task's commit landed on main.
+     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main"}` and proceed
+       with sub-steps a–d above.
+     - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
 
 ## Aborting
 
