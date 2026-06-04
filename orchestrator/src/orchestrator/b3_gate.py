@@ -108,7 +108,22 @@ def record_launch(
     Idempotent: same (task_id, head_sha, investigated_at) triple is not re-added.
     Returns ``{'recorded': bool, 'already_attempted': bool}``.
     """
-    raise NotImplementedError
+    state = _load_state(state_path)
+    # Check for existing entry with the same key
+    for entry in state['launches']:
+        if (entry.get('task_id') == task_id
+                and entry.get('head_sha') == head_sha
+                and entry.get('investigated_at') == investigated_at):
+            return {'recorded': False, 'already_attempted': True}
+    # Not found — append new launch record
+    state['launches'].append({
+        'task_id': task_id,
+        'head_sha': head_sha,
+        'investigated_at': investigated_at,
+        'recorded_at': now.isoformat(),
+    })
+    _save_state(state_path, state)
+    return {'recorded': True, 'already_attempted': False}
 
 
 # ---------------------------------------------------------------------------
