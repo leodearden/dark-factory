@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -2430,4 +2431,93 @@ class TestAttachDedupeChildConcurrency:
         )
         assert result.dedupe_count == count * 2, (
             f'Expected dedupe_count={count * 2}, got {result.dedupe_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
+# ---------------------------------------------------------------------------
+
+class TestSubmitResolveAdoptLock:
+    """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
+
+    def _make_pending_escalation(self, esc_id: str, task_id: str = '1') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='Lock adoption test',
+            level=0,
+        )
+
+    def test_submit_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) queue.submit(esc) records a lock acquisition for esc.id."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-1-1')
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.submit(esc)
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    def test_submit_resolved_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(b) queue.submit_resolved(esc, ...) records a lock acquisition for esc.id."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-2-1', task_id='2')
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.submit_resolved(esc, resolution='Auto-resolved at submit')
+
+        assert any(eid == 'esc-2-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-2-1; got {acquired}'
+        )
+
+    def test_resolve_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(c) queue.resolve('esc-3-1', ...) on a pending escalation records a lock for 'esc-3-1'."""
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = self._make_pending_escalation('esc-3-1', task_id='3')
+        queue.submit(esc)  # seed without spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.resolve('esc-3-1', resolution='Fixed')
+
+        assert any(eid == 'esc-3-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
