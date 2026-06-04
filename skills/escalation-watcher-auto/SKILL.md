@@ -330,8 +330,10 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
        (e["task_id"] == task_id and e["id"] != escalation_id)
        for e in candidate_l1s
    ) or any(
-       # L2 cluster escalations: match by representative task_id OR by member list
-       (e["task_id"] == task_id or task_id in e.get("members", []))
+       # L2 cluster escalations: match by representative task_id OR member-escalation-id
+       # prefix (members holds L1 esc ids of form esc-<task_id>-<seq>, per models.py:51/76;
+       # trailing hyphen prevents numeric-prefix collisions, e.g. task 16 vs 162)
+       (e["task_id"] == task_id or any(m.startswith(f"esc-{task_id}-") for m in e.get("members", [])))
        for e in pending_l2s
    )
    predicate_holds = (
