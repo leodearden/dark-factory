@@ -3204,6 +3204,10 @@ class MergeWorker(_WipHaltMixin):
         # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
         # the timeout counter: persists across submissions, reset on success.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # γ2 per-branch generation auto-chain counter.  Incremented on each
+        # consecutive tip-advance equivalence failure; popped on a clean 'done'
+        # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
+        self._generation_chain_counts: dict[str, int] = {}
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -3454,6 +3458,12 @@ class MergeWorker(_WipHaltMixin):
                 cas_retries=self._cas_retries,
                 timeouts=self._post_merge_verify_timeouts,
                 enospc_retries=self._post_merge_verify_enospc_retries,
+                chain_ctx=_GenerationChainContext(
+                    queue=self._queue,
+                    counts=self._generation_chain_counts,
+                    max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                ),
+                merged_branch_tip=branch_head.strip(),
             )
 
         if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
