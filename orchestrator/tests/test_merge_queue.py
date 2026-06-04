@@ -9318,6 +9318,128 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'done'
         assert outcome.merge_sha == 'the-fallback-sha'
 
+    # γ2 step-11 RED: chain_ctx integration tests
+    async def test_back_compat_no_chain_ctx_still_blocks(self) -> None:
+        """(a) BACK-COMPAT: called without chain_ctx → equivalence failure returns blocked (unchanged)."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+        ):
+            # No chain_ctx — default behaviour
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+    async def test_chain_ctx_superset_advance_returns_superseded_and_enqueues(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(b) chain_ctx + merged_branch_tip + SUPERSET advance → returns superseded,
+        enqueues gen-(n+1) request."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _GenerationChainContext,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.branch = 'task/t-chain'
+        req.worktree = tmp_path
+        req.generation = 1
+        req.task_id = 'task-chain'
+        req.pre_rebased = False
+        req.task_files = None
+        req.module_configs = []
+        req.snapshot_tip = None
+        loop = asyncio.get_event_loop()
+        req.result = loop.create_future()
+        # Make req a real MergeRequest-like object (use MagicMock attribute overrides above)
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded'
+        assert outcome.superseded_by is not None
+        assert queue.qsize() == 1
+
+    async def test_chain_ctx_done_pops_branch_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) on 'done' path with chain_ctx, counts[branch] is popped."""
+        from orchestrator.merge_queue import (
+            _GenerationChainContext,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.branch = 'task/t-done-pop'
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {'task/t-done-pop': 1}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'done'
+        assert 'task/t-done-pop' not in counts  # popped on clean landing
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper

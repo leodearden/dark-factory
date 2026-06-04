@@ -440,6 +440,24 @@ async def _run_post_merge_verify(
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _GenerationChainContext:
+    """Bundle passed from a worker into _finalize_advanced_merge for γ2 auto-chaining.
+
+    Carries the worker's queue, the per-branch generation counter dict, and
+    the configured maximum so _finalize_advanced_merge can delegate to
+    _maybe_auto_chain_generation without a direct worker reference.
+
+    Defaulting to None in _finalize_advanced_merge preserves the function's
+    behaviour for trains (_do_train_merge passes None, per PRD D9) and all
+    existing callers.
+    """
+
+    queue: asyncio.Queue
+    counts: dict  # dict[str, int] — per-branch chain counter
+    max_auto_generations: int
+
+
 async def _finalize_advanced_merge(
     git_ops: GitOps,
     req: MergeRequest,
@@ -454,6 +472,8 @@ async def _finalize_advanced_merge(
     log_label: str = '',
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
+    chain_ctx: _GenerationChainContext | None = None,
+    merged_branch_tip: str | None = None,
 ) -> MergeOutcome:
     """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -474,6 +494,15 @@ async def _finalize_advanced_merge(
     MergeWorker and SpeculativeMergeWorker pass ``None`` (no behavior
     change); ``_do_train_merge`` passes the request's train metadata so
     ``merge_attempt`` events stay tagged for downstream reconciliation.
+
+    *chain_ctx* + *merged_branch_tip* enable γ2 generation auto-chaining.
+    When *chain_ctx* is not None and an equivalence failure is detected,
+    :func:`_maybe_auto_chain_generation` is consulted: if the branch tip
+    advanced during verify a gen-(n+1) request is enqueued and a
+    ``'superseded'`` outcome is returned instead of ``'blocked'``.
+    On a clean ``'done'`` landing, chain_ctx.counts pops the branch key
+    (resetting the lineage counter).  Passing ``None`` (the default)
+    preserves all existing behaviour — trains pass ``None`` (PRD D9).
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
