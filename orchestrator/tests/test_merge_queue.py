@@ -9709,3 +9709,40 @@ class TestSpeculativeMergeWorkerGate:
         assert len(verify_calls) == 1, (
             f'(d) No-movement: expected 1 verify call, got {len(verify_calls)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRegisterAndEnqueue — register_and_enqueue_merge_request unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRegisterAndEnqueue:
+    """Unit tests for register_and_enqueue_merge_request.
+
+    Exercises the workflow-path enqueue helper that registers the branch
+    in the InFlightMergeRegistry before enqueuing, so the MCP coalesce
+    gate sees cross-path in-flight merges.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'rae_events.db'
+        return EventStore(db_path=db, run_id='rae-test')
+
+    async def test_happy_path_acquires_and_enqueues(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Happy path: acquired=True, branch is_inflight, entry.task_id=='B', queue has 1 item."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+
+        assert acquired is True
+        assert registry.is_inflight('B') is True
+        assert registry.entry('B').task_id == 'B'
+        assert queue.qsize() == 1
