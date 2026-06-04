@@ -440,6 +440,10 @@ class Harness:
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
+        # Single shared registry injected into both the escalation server and
+        # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
+        from orchestrator.merge_queue import InFlightMergeRegistry
+        self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
 
@@ -2414,6 +2418,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
                 merge_worker=self._merge_worker,
+                merge_inflight_registry=self._merge_inflight_registry,
                 event_store=self.event_store,
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
@@ -3218,6 +3223,7 @@ Output JSON matching the schema. Every task must appear in the output.
             event_store=self.event_store,
             harness=self,
             task_status_lookup=self._build_task_status_lookup(),
+            merge_inflight_registry=self._merge_inflight_registry,
         )
         host = self.config.escalation.host
         port = self.config.escalation.port

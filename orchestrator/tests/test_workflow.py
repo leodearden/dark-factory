@@ -509,3 +509,118 @@ class TestRunMergeDeferredGuard:
         )
         cast(AsyncMock, wf._enter_merge_deferred).assert_not_called()
         cast(AsyncMock, wf._submit_to_merge_queue).assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestWorkflowMergeInflightRegistry — merge_inflight_registry wiring in __init__
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowMergeInflightRegistry:
+    """Tests for the merge_inflight_registry parameter in TaskWorkflow.__init__."""
+
+    def test_registry_stored_when_provided(self, tmp_path: Path):
+        """Constructor stores the injected registry on self.merge_inflight_registry."""
+        from orchestrator.merge_queue import InFlightMergeRegistry
+        sentinel = InFlightMergeRegistry()
+        _make_workflow(tmp_path=tmp_path)
+        # Directly re-construct with the kwarg to check storage
+        assignment = MagicMock()
+        assignment.task_id = '999'
+        assignment.task = {'id': '999', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wf2 = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_inflight_registry=sentinel,
+        )
+        assert wf2.merge_inflight_registry is sentinel
+
+    def test_registry_defaults_to_none(self, tmp_path: Path):
+        """Without the kwarg, merge_inflight_registry is None."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.merge_inflight_registry is None
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueRegistersInRegistry:
+    """_submit_to_merge_queue registers its branch in the injected registry."""
+
+    async def test_branch_is_inflight_at_dequeue_time(self, tmp_path: Path, monkeypatch):
+        """Branch is registered in the registry before the merge worker dequeues.
+
+        The workflow-path enqueue must call register_and_enqueue_merge_request
+        (not plain enqueue_merge_request) so the registry slot is held while
+        the request sits in the queue.  A background worker captures
+        is_inflight at dequeue time; the test asserts it was True.
+
+        RED until step-8 impl switches the enqueue call.
+        """
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}          # empty → _task_files=None → gate skipped
+        wf._base_commit = None
+        wf._module_configs = []
+
+        inflight_seen: list[bool] = []
+
+        async def _worker():
+            req = await real_queue.get()
+            inflight_seen.append(registry.is_inflight(req.branch))
+            req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
+
+        worker_task = asyncio.create_task(_worker())
+        outcome = await wf._submit_to_merge_queue('B')
+        await worker_task
+
+        assert inflight_seen == [True], (
+            f'Branch must be registered in registry at dequeue time; '
+            f'inflight_seen={inflight_seen}'
+        )
+        assert outcome == WorkflowOutcome.DONE

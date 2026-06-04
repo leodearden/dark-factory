@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
+    from orchestrator.merge_queue import InFlightMergeRegistry
     from orchestrator.usage_gate import UsageGate
 
 
@@ -315,6 +316,7 @@ class TaskWorkflow:
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
         merge_worker=None,
+        merge_inflight_registry: InFlightMergeRegistry | None = None,
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
         cancel_event: asyncio.Event | None = None,
@@ -331,6 +333,7 @@ class TaskWorkflow:
         # handlers to register halt ownership. The asyncio.Queue above carries
         # merge requests; this is the worker that owns the halt flag.
         self.merge_worker = merge_worker
+        self.merge_inflight_registry = merge_inflight_registry
         self.event_store = event_store
         self.cost_store = cost_store
 
@@ -523,7 +526,7 @@ class TaskWorkflow:
             TRAIN_INCOMPLETE_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
-            enqueue_merge_request,
+            register_and_enqueue_merge_request,
         )
 
         train = self._train
@@ -612,7 +615,16 @@ class TaskWorkflow:
             '(train=%r, members=%r)',
             self.task_id, len(member_ids), train_id, member_ids,
         )
-        await enqueue_merge_request(self.merge_queue, req, self.event_store)
+        # Only the tip branch (req.branch) is registered in the in-flight
+        # registry.  Member branches are intentionally out of scope here:
+        # GroupMergeRequest carries member_task_ids but not member branch names,
+        # so registering them would require coupling knowledge of the branch-
+        # naming convention into δ₂.  The on-disk _merge-* worktree scan in
+        # coalesce_or_enqueue_merge_request provides a fallback for member-branch
+        # coalescing after the train merge starts executing.
+        await register_and_enqueue_merge_request(
+            self.merge_queue, req, self.event_store, self.merge_inflight_registry,
+        )
 
         result = await self._await_cancellable(future)
         if result is None:
@@ -3738,7 +3750,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             MergeRequest,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
-            enqueue_merge_request,
+            register_and_enqueue_merge_request,
         )
 
         assert self.worktree is not None
@@ -3823,7 +3835,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
         )
-        await enqueue_merge_request(self.merge_queue, merge_request, self.event_store)
+        await register_and_enqueue_merge_request(
+            self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+        )
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of

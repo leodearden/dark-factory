@@ -9709,3 +9709,157 @@ class TestSpeculativeMergeWorkerGate:
         assert len(verify_calls) == 1, (
             f'(d) No-movement: expected 1 verify call, got {len(verify_calls)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRegisterAndEnqueue — register_and_enqueue_merge_request unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRegisterAndEnqueue:
+    """Unit tests for register_and_enqueue_merge_request.
+
+    Exercises the workflow-path enqueue helper that registers the branch
+    in the InFlightMergeRegistry before enqueuing, so the MCP coalesce
+    gate sees cross-path in-flight merges.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'rae_events.db'
+        return EventStore(db_path=db, run_id='rae-test')
+
+    async def test_happy_path_acquires_and_enqueues(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Happy path: acquired=True, branch is_inflight, entry.task_id=='B', queue has 1 item."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+
+        assert acquired is True
+        assert registry.is_inflight('B') is True
+        entry_b = registry.entry('B')
+        assert entry_b is not None
+        assert entry_b.task_id == 'B'
+        assert queue.qsize() == 1
+
+    async def test_release_on_resolve_allows_redispatch(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) release-on-resolve: after future resolves, a second call re-acquires."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+        assert acquired is True
+
+        # Resolve the future → done_callback fires → slot released
+        req.result.set_result(MergeOutcome(status='done'))
+        await asyncio.sleep(0)
+        assert registry.is_inflight('B') is False
+
+        # Second call for the same branch should re-acquire (re-dispatch)
+        req2 = _make_request('B', 'B', tmp_path, config)
+        acquired2 = await register_and_enqueue_merge_request(queue, req2, event_store, registry)
+        assert acquired2 is True
+        assert registry.is_inflight('B') is True
+        assert queue.qsize() == 2  # both enqueued (queue not drained)
+
+    async def test_release_on_cancel_allows_retry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) release-on-cancel: soft-cancel releases the slot for the retry loop."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        await register_and_enqueue_merge_request(queue, req, event_store, registry)
+        assert registry.is_inflight('B') is True
+
+        # Cancel the future → done_callback fires → slot released
+        req.result.cancel()
+        await asyncio.sleep(0)
+        assert registry.is_inflight('B') is False
+
+    async def test_already_held_still_enqueues_returns_false(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) already-held: returns False but still enqueues (no deadlock),
+        and the slot remains owned by the first holder."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Pre-seed the slot with a never-resolving future from 'other' task
+        other_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'other', other_future)
+
+        # Helper call for same branch: slot already held → acquired=False
+        req = _make_request('B', 'B', tmp_path, config)
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, registry)
+
+        assert acquired is False
+        # Still enqueued — workflow must not deadlock
+        assert queue.qsize() == 1
+        # Slot is still owned by the original holder
+        entry_b = registry.entry('B')
+        assert entry_b is not None
+        assert entry_b.task_id == 'other'
+
+        # Cleanup
+        other_future.cancel()
+
+    async def test_registry_none_plain_enqueue(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) registry=None: falls back to plain enqueue, returns False."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('B', 'B', tmp_path, config)
+
+        acquired = await register_and_enqueue_merge_request(queue, req, event_store, None)
+
+        assert acquired is False
+        assert queue.qsize() == 1
+
+    async def test_slot_leak_guard_releases_on_enqueue_failure(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(e) slot-leak guard: if enqueue_merge_request raises after acquire,
+        the slot is released and the exception propagates."""
+        from orchestrator.merge_queue import register_and_enqueue_merge_request
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        req = _make_request('B', 'B', tmp_path, config)
+
+        # Patch enqueue_merge_request to raise before the worker can ever
+        # resolve req.result (simulating a closed queue / cancellation).
+        boom = RuntimeError('queue closed')
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request',
+            new=AsyncMock(side_effect=boom),
+        ), pytest.raises(RuntimeError, match='queue closed'):
+            await register_and_enqueue_merge_request(queue, req, None, registry)
+
+        # The slot-leak guard must have released the slot.
+        assert registry.is_inflight('B') is False
+        # The queue must be empty — the patched enqueue_merge_request never put.
+        assert queue.qsize() == 0

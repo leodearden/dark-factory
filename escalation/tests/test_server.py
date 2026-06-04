@@ -1265,6 +1265,80 @@ class TestMergeRequestDedup:
             'Registry slot should be released after merge completes'
         )
 
+    async def test_inflight_with_workflow_path_registration(self, tmp_path: Path):
+        """Acceptance #1: a branch registered via the workflow-path helper is
+        visible to the MCP merge_request coalesce gate.
+
+        Simulates the dedup blind-spot fix: the workflow enqueues via
+        register_and_enqueue_merge_request (which registers in the shared
+        registry), then a subsequent MCP merge_request call for the same
+        branch returns status='in_flight' (coalesced from registry) with
+        inflight_task_id='workflow-task' and NO duplicate queue entry.
+        """
+        import asyncio
+        from pathlib import Path as _Path
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            register_and_enqueue_merge_request,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        # Simulate the workflow-path enqueue: build a MergeRequest inline
+        # (no _make_request helper in test_server.py — it lives in test_merge_queue.py)
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        workflow_req = MergeRequest(
+            task_id='workflow-task',
+            branch='B',
+            worktree=_Path(str(tmp_path / 'wf-wt')),
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=orch_config,
+            result=never_future,
+        )
+
+        # Workflow-path enqueue registers in the shared registry
+        acquired = await register_and_enqueue_merge_request(mq, workflow_req, None, registry)
+        assert acquired is True, 'Prerequisite: workflow must acquire the registry slot'
+        assert registry.is_inflight('B'), 'Prerequisite: branch must be registered'
+
+        # MCP caller: create server with the SAME shared registry
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # MCP merge_request for the same branch 'B' must coalesce
+        result = await _call_merge_request(
+            server,
+            task_id='mcp-caller',
+            branch='B',
+            worktree=str(tmp_path / 'mcp-wt'),
+            description='',
+        )
+
+        # Acceptance assertions
+        assert result.get('status') == 'in_flight', (
+            f'Expected status in_flight (coalesced from registry), got: {result}'
+        )
+        assert result.get('inflight_task_id') == 'workflow-task', (
+            f'Expected inflight_task_id=workflow-task (from registry entry), got: {result}'
+        )
+        # Only the workflow's entry in the queue — MCP call must NOT enqueue a duplicate
+        assert mq.qsize() == 1, (
+            f'Expected queue size 1 (workflow entry only), got qsize={mq.qsize()}'
+        )
+
+        # Cleanup
+        never_future.cancel()
+
 
 # ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
