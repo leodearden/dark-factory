@@ -4531,8 +4531,13 @@ Output JSON matching the schema. Every task must appear in the output.
             prev_count = 0
             prev_signature = None
 
-        # Increment counter (signature-reset branch added in step-6)
-        new_count = prev_count + 1
+        # Same signature → increment; different signature → reset to 1.
+        # Mirrors _check_*_thrash shape: same-sig +1, different-sig reset to 1
+        # (reset to 1 = "we just saw one"; reset to 0 would lose the current flip).
+        if prev_signature is not None and prev_signature == new_sig:
+            new_count = prev_count + 1
+        else:
+            new_count = 1
 
         # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5)
         await self.scheduler.update_task(
