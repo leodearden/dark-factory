@@ -312,6 +312,18 @@ class Harness:
         # Mirrors the _on_park_stop_trip pattern (declared in scheduler.py, installed
         # here so the harness EscalationQueue and set_task_status are available).
         self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
+        # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
+        # Set of task_ids currently undergoing action-teardown (park/restart/abandon).
+        # Stamped before the status write + kill; cleared in the finally block once the
+        # kill window closes.  Mirrors _workflow_cancel_at's grace lifecycle so a
+        # re-dispatched (restart→pending) workflow can write 'blocked' legitimately in
+        # its next incarnation rather than being permanently suppressed.
+        self._action_teardown_tasks: set[str] = set()
+        # Wire to the scheduler's suppression predicate so that 'blocked' writes emitted
+        # by a workflow being killed cannot clobber the action's target status
+        # (pending/deferred).  Declared in scheduler.py, installed here alongside the
+        # other callback installs — same pattern as _on_park_stop_trip / _on_external_dep_block.
+        self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -4342,13 +4354,18 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Implements C3.1 (status-precedes-kill) ordering:
           1. Terminal recheck — skip if the task is already done/cancelled.
-          2. Stamp ``_action_teardown_tasks`` (suppression — step-12).
+          2. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
           3. Write ``target_status`` via scheduler.
-          4. Kill live workflow if active (soft → grace → hard — steps 8/12).
-          5. Clear the stamp once the workflow slot has cleared (step-12).
+          4. Kill live workflow if active (soft → grace → hard).
+          5. Clear the stamp (in finally block) once the kill window closes.
 
-        Steps 4/5 (kill/stamp) are added incrementally by later plan steps.
-        This stub handles the no-live-workflow case (step-6/C no-kill slice).
+        The stamp in step 2 activates the scheduler's _suppress_blocked_write
+        predicate, so any racing 'blocked' write emitted by the workflow before
+        the kill lands is absorbed without reaching fused-memory.  The stamp is
+        cleared in the finally block whether the status write succeeded, was
+        rejected, or the kill completed — ensuring a re-dispatched
+        (restart→pending) workflow can write 'blocked' legitimately in its next
+        incarnation rather than being permanently suppressed.
         """
         current = await self.scheduler.get_status(task_id)
         if current in TERMINAL_STATUSES:
@@ -4362,41 +4379,52 @@ Output JSON matching the schema. Every task must appear in the output.
             'action-teardown %s: writing task %s → %s',
             action, task_id, target_status,
         )
+        # Stamp suppression window BEFORE the status write (C3.2 / D9, task 1620 step-12).
+        # Must be set prior to set_task_status so that a racing workflow 'blocked' write
+        # (concurrent with our status write or arriving before the kill lands) is
+        # absorbed by the scheduler guard and cannot clobber the action's target status.
+        self._action_teardown_tasks.add(task_id)
         try:
-            await self.scheduler.set_task_status(task_id, target_status)
-        except SetTaskStatusRejected as e:
-            logger.warning(
-                'action-teardown %s: set_task_status(%s, %s) rejected: %s',
-                action, task_id, target_status, e,
-            )
-            return
-
-        # Kill sequence for a live workflow (C3.1, D9).
-        # Status write is already done above — kill strictly follows.
-        if self.is_workflow_active(task_id):
-            self.cancel_workflow(task_id)
-            logger.info(
-                'action-teardown %s: soft-cancelled workflow for task %s',
-                action, task_id,
-            )
-            # Poll for slot to clear.  _action_teardown_tasks suppression
-            # (step-12) ensures a racing _mark_blocked write is absorbed while
-            # the kill is in flight.  Use the terminal-status hard-cancel
-            # budget as the poll ceiling — consistent with the existing cancel
-            # scan discipline (harness.py:_mark_terminal_status_cancel_scan).
-            _POLL_SLEEP_S = 0.05
-            max_polls = getattr(self.config, 'terminal_status_hard_cancel_polls', 10)
-            polls = 0
-            while self.is_workflow_active(task_id) and polls < max_polls:
-                await asyncio.sleep(_POLL_SLEEP_S)
-                polls += 1
-            if self.is_workflow_active(task_id):
+            try:
+                await self.scheduler.set_task_status(task_id, target_status)
+            except SetTaskStatusRejected as e:
                 logger.warning(
-                    'action-teardown %s: workflow for task %s did not clear '
-                    'within %d polls — escalating to hard_cancel_workflow',
-                    action, task_id, max_polls,
+                    'action-teardown %s: set_task_status(%s, %s) rejected: %s',
+                    action, task_id, target_status, e,
                 )
-                self.hard_cancel_workflow(task_id)
+                return
+
+            # Kill sequence for a live workflow (C3.1, D9).
+            # Status write is already done above — kill strictly follows.
+            if self.is_workflow_active(task_id):
+                self.cancel_workflow(task_id)
+                logger.info(
+                    'action-teardown %s: soft-cancelled workflow for task %s',
+                    action, task_id,
+                )
+                # Poll for slot to clear.  The _action_teardown_tasks suppression
+                # (still active in the stamp) ensures a racing _mark_blocked write is
+                # absorbed while the kill is in flight.  Use the terminal-status
+                # hard-cancel budget as the poll ceiling — consistent with the existing
+                # cancel scan discipline (harness.py:_mark_terminal_status_cancel_scan).
+                _POLL_SLEEP_S = 0.05
+                max_polls = getattr(self.config, 'terminal_status_hard_cancel_polls', 10)
+                polls = 0
+                while self.is_workflow_active(task_id) and polls < max_polls:
+                    await asyncio.sleep(_POLL_SLEEP_S)
+                    polls += 1
+                if self.is_workflow_active(task_id):
+                    logger.warning(
+                        'action-teardown %s: workflow for task %s did not clear '
+                        'within %d polls — escalating to hard_cancel_workflow',
+                        action, task_id, max_polls,
+                    )
+                    self.hard_cancel_workflow(task_id)
+        finally:
+            # Discard the suppression stamp once the kill window closes (step-12).
+            # A re-dispatched (restart→pending) workflow can now write 'blocked'
+            # legitimately in its next incarnation.
+            self._action_teardown_tasks.discard(task_id)
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.

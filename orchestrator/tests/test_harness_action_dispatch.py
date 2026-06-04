@@ -752,15 +752,29 @@ class TestActionTeardownTasksSet:
             '_action_teardown_tasks must start empty'
         )
 
-    def test_scheduler_suppress_hook_wired_to_teardown_set(self, harness: Harness):
+    def test_scheduler_suppress_hook_wired_to_teardown_set(
+        self, tmp_path: Path, mock_orch_config
+    ):
         """(a.2) scheduler._suppress_blocked_write is wired to _action_teardown_tasks.__contains__:
         returns True for stamped tids, False otherwise.
 
-        Before step-12, _action_teardown_tasks doesn't exist → AttributeError when we call .add().
+        Uses the real-Scheduler construction path (Scheduler NOT patched) so that the
+        hook install ``scheduler._suppress_blocked_write = _action_teardown_tasks.__contains__``
+        survives on the actual Scheduler instance — the harness fixture replaces the
+        scheduler after construction, which would discard the hook.
+
+        Before step-12, _action_teardown_tasks doesn't exist → AttributeError on .add().
         After step-12, the hook is the set's __contains__: returns True/False correctly.
         """
-        hook = harness.scheduler._suppress_blocked_write  # type: ignore[attr-defined]
-        harness._action_teardown_tasks.add('task-X')  # AttributeError before step-12
+        with (
+            patch('orchestrator.harness.McpLifecycle'),
+            patch('orchestrator.harness.OverrideStore'),
+            patch('orchestrator.harness.BriefingAssembler'),
+        ):
+            h = Harness(mock_orch_config)
+        # h.scheduler is a real Scheduler here (not replaced by the fixture).
+        hook = h.scheduler._suppress_blocked_write
+        h._action_teardown_tasks.add('task-X')  # AttributeError before step-12
         assert hook('task-X') is True, 'hook must return True for stamped task_id'
         assert hook('task-Y') is False, 'hook must return False for unstamped task_id'
 
