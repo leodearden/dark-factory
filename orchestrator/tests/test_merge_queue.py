@@ -3181,6 +3181,98 @@ class TestMergeOutcomeDataclass:
 
 
 # ---------------------------------------------------------------------------
+# TestGenerationFieldsIdentity — γ2 step-01 RED: 'superseded' status +
+# superseded_by field on MergeOutcome; generation field on MergeRequest.
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationFieldsIdentity:
+    """γ2 step-01/02: MergeOutcome gains 'superseded' status + superseded_by;
+    MergeRequest and GroupMergeRequest gain generation field."""
+
+    def test_merge_outcome_superseded_status_and_superseded_by(self) -> None:
+        """(a) MergeOutcome('superseded', superseded_by='mr-x') constructs and exposes superseded_by."""
+        outcome = MergeOutcome(status='superseded', superseded_by='mr-x')  # type: ignore[call-arg]
+        assert outcome.status == 'superseded'
+        assert outcome.superseded_by == 'mr-x'  # type: ignore[attr-defined]
+
+    def test_merge_outcome_blocked_superseded_by_default_none(self) -> None:
+        """(b) MergeOutcome('blocked') has superseded_by default None."""
+        outcome = MergeOutcome('blocked')
+        assert outcome.superseded_by is None  # type: ignore[attr-defined]
+
+    def test_merge_request_generation_defaults_to_1(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) MergeRequest(...) defaults generation==1."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = MergeRequest(
+                task_id='t-gen1',
+                branch='task/t-gen1',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+            )
+            assert req.generation == 1  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+    def test_merge_request_generation_can_be_set(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(d) MergeRequest(..., generation=2) carries 2."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = MergeRequest(
+                task_id='t-gen2',
+                branch='task/t-gen2',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+                generation=2,
+            )
+            assert req.generation == 2  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+    def test_group_merge_request_generation_defaults_to_1(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(e) GroupMergeRequest still constructs and exposes generation default 1."""
+        loop = asyncio.new_event_loop()
+        try:
+            future: asyncio.Future[MergeOutcome] = loop.create_future()
+            req = GroupMergeRequest(
+                task_id='t-grp',
+                branch='task/t-grp',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future,
+                train_id='train-1',
+                member_task_ids=['t-grp'],
+                tip_branch='task/t-grp',
+                tip_task_id='t-grp',
+                status_check=AsyncMock(),
+                mark_member_done=AsyncMock(),
+            )
+            assert req.generation == 1  # type: ignore[attr-defined]
+        finally:
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeItemDefaults — unit tests for SpeculativeItem field defaults
 # ---------------------------------------------------------------------------
 
@@ -4677,6 +4769,111 @@ class TestEnqueueMergeRequest:
         assert stored.state == 'error'
         assert stored.merge_sha is None
 
+    # γ2 step-05/06 — _on_finalized propagates supersession provenance
+    @pytest.mark.asyncio
+    async def test_on_finalized_propagates_superseded_by_and_generation(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Resolving gen-1 future with MergeOutcome('superseded', superseded_by='mr-2')
+        causes _on_finalized to record superseded_by + generation in the retention ring
+        AND in the merge_finalized event data dict.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_sup.db'
+        event_store = EventStore(db_path, 'run-sup-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt-sup'
+        wt.mkdir()
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[MergeOutcome] = loop.create_future()
+        req = MergeRequest(
+            task_id='sup-task',
+            branch='task/sup-task',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            generation=1,
+        )
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        # Resolve the gen-1 future with a 'superseded' outcome
+        req.result.set_result(MergeOutcome(
+            status='superseded',
+            superseded_by='mr-gen2abc',
+            merge_sha='sha-adv',
+        ))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        # --- in-memory ring: superseded_by + generation must be present ------
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'superseded'
+        assert stored.superseded_by == 'mr-gen2abc'
+        assert stored.generation == 1
+
+        # --- durable event: data dict must include superseded_by + generation --
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.superseded_by') AS superseded_by, "
+            "json_extract(data, '$.generation') AS generation, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'superseded'
+        assert rows[0][1] == 'mr-gen2abc'
+        assert rows[0][2] == 1
+        assert rows[0][3] == 'sha-adv'
+
+    @pytest.mark.asyncio
+    async def test_on_finalized_blocked_outcome_superseded_by_null(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Blocked outcomes don't set superseded_by (None in both ring and event)."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_blk.db'
+        event_store = EventStore(db_path, 'run-blk-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt-blk'
+        wt.mkdir()
+        req = _make_request('blk-task', 'task/blk-task', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.set_result(MergeOutcome(status='blocked', reason='oops'))
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.superseded_by is None
+        assert stored.generation == 1  # default
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT "
+            "json_extract(data, '$.superseded_by') AS superseded_by, "
+            "json_extract(data, '$.generation') AS generation "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] is None  # superseded_by NULL
+        assert rows[0][1] == 1    # generation present
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
@@ -4827,6 +5024,52 @@ class TestTerminalOutcomeRetention:
         assert stored is not None
         assert stored.snapshot_tip == 'sha-tip'
         assert stored.merge_sha == 'deadbeef'
+
+    # γ2 step-03/04 — supersession provenance fields
+    def test_superseded_by_and_generation_stored_and_retrieved(self) -> None:
+        """TerminalOutcomeRecord with superseded_by + generation round-trips the ring."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-alpha1',
+            task_id='t1',
+            branch='task/t1',
+            state='superseded',
+            snapshot_tip=None,
+            merge_sha='sha-adv',
+            superseded_by='mr-alpha2',
+            generation=1,
+        )
+        ring.record(rec)
+        stored = ring.get('mr-alpha1')
+        assert stored is not None
+        assert stored.superseded_by == 'mr-alpha2'
+        assert stored.generation == 1
+
+    def test_superseded_by_defaults_none_generation_defaults_1(self) -> None:
+        """Defaults: superseded_by is None, generation is 1 when omitted."""
+        rec = TerminalOutcomeRecord(
+            request_id='mr-defaults',
+            task_id='t2',
+            branch='task/t2',
+            state='done',
+        )
+        assert rec.superseded_by is None  # type: ignore[attr-defined]
+        assert rec.generation == 1  # type: ignore[attr-defined]
+
+    def test_generation_2_stored_correctly(self) -> None:
+        """Generation=2 is preserved through record/get."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-gen2',
+            task_id='t3',
+            branch='task/t3',
+            state='done',
+            generation=2,
+        )
+        ring.record(rec)
+        stored = ring.get('mr-gen2')
+        assert stored is not None
+        assert stored.generation == 2
 
 
 # ---------------------------------------------------------------------------
@@ -9075,6 +9318,278 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'done'
         assert outcome.merge_sha == 'the-fallback-sha'
 
+    # γ2 step-11 RED: chain_ctx integration tests
+    async def test_back_compat_no_chain_ctx_still_blocks(self) -> None:
+        """(a) BACK-COMPAT: called without chain_ctx → equivalence failure returns blocked (unchanged)."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+        ):
+            # No chain_ctx — default behaviour
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+    async def test_feature_gate_default_off_blocks_not_supersedes(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(b-gate) AUTO_CHAIN_GENERATIONS_ENABLED defaults to False; with kill-switch
+        OFF, _finalize_advanced_merge returns 'blocked' (not 'superseded') even when
+        chain_ctx is wired and tip is a SUPERSET advance, and the queue stays empty."""
+        import orchestrator.merge_queue as mq
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        # Verify the kill-switch is False by default.
+        assert mq.AUTO_CHAIN_GENERATIONS_ENABLED is False
+
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-gate',
+            branch='task/t-gate',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        # Kill-switch is OFF (default) — no patch needed.
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'blocked', (
+            f'kill-switch OFF should block, got {outcome.status!r}'
+        )
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert queue.empty(), 'no gen-(n+1) request should be enqueued while kill-switch is OFF'
+
+    async def test_chain_ctx_superset_advance_returns_superseded_and_enqueues(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(b) chain_ctx + merged_branch_tip + SUPERSET advance → returns superseded,
+        enqueues gen-(n+1) request (tested with AUTO_CHAIN_GENERATIONS_ENABLED=True)."""
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        git_ops = self._make_git_ops()
+        # _maybe_auto_chain_generation calls dataclasses.replace(req, ...) so
+        # we need a real MergeRequest (not MagicMock) for the chaining path.
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-chain',
+            branch='task/t-chain',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded'
+        assert outcome.superseded_by is not None
+        assert queue.qsize() == 1
+
+    async def test_chain_ctx_superseded_emits_generation_chained_event(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When AUTO_CHAIN_GENERATIONS_ENABLED=True and _maybe_auto_chain_generation
+        returns a chained outcome, _finalize_advanced_merge emits a
+        'post_merge_generation_chained' merge_attempt event to the event_store.
+        This is the observable contract for reconciliation provenance."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        event_store = MagicMock()
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-event',
+            branch='task/t-event',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, event_store,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded', (
+            f'expected superseded, got {outcome.status!r}'
+        )
+        # Assert that the 'post_merge_generation_chained' merge_attempt event was emitted.
+        # Note: event_store.emit is also called for merge_queued events (from
+        # enqueue_merge_request → _emit_merge_queued_event) whose data dict has
+        # no 'outcome' key — guard with .get() to skip those.
+        emitted_outcomes = [
+            call.kwargs['data'].get('outcome')
+            for call in event_store.emit.call_args_list
+            if 'data' in call.kwargs
+        ]
+        assert 'post_merge_generation_chained' in emitted_outcomes, (
+            f'expected post_merge_generation_chained event; got: {emitted_outcomes!r}'
+        )
+        # The 'post_merge_equivalence_failed' event should also have been emitted first.
+        assert 'post_merge_equivalence_failed' in emitted_outcomes, (
+            f'expected post_merge_equivalence_failed event; got: {emitted_outcomes!r}'
+        )
+        # Event was emitted with the correct task_id.
+        chained_call = next(
+            c for c in event_store.emit.call_args_list
+            if 'data' in c.kwargs
+            and c.kwargs['data'].get('outcome') == 'post_merge_generation_chained'
+        )
+        assert chained_call.args[0] == EventType.merge_attempt
+        assert chained_call.kwargs['task_id'] == req.task_id
+
+    async def test_chain_ctx_done_pops_branch_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) on 'done' path with chain_ctx, counts[branch] is popped."""
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.branch = 'task/t-done-pop'
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {'task/t-done-pop': 1}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'done'
+        assert 'task/t-done-pop' not in counts  # popped on clean landing
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
@@ -11021,3 +11536,624 @@ class TestDecideAttachAction:
         from orchestrator.merge_queue import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=True)
+
+
+# ---------------------------------------------------------------------------
+# TestMaybeAutoChainGeneration — γ2 step-07/08/09/10: _maybe_auto_chain_generation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMaybeAutoChainGeneration:
+    """Unit tests for the _maybe_auto_chain_generation module-level helper (γ2)."""
+
+    def _make_req(
+        self,
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        *,
+        branch: str = 'task/t1',
+        generation: int = 1,
+    ) -> MergeRequest:
+        # Called from @pytest.mark.asyncio tests — get_running_loop() is always valid here.
+        fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        return MergeRequest(
+            task_id='t1',
+            branch=branch,
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=generation,
+        )
+
+    async def test_merged_branch_tip_none_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(1) merged_branch_tip=None → returns None, queue stays empty."""
+        from orchestrator.merge_queue import _maybe_auto_chain_generation
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        event_store = MagicMock()
+
+        result = await _maybe_auto_chain_generation(
+            req, 'sha-adv', git_ops, event_store,
+            merged_branch_tip=None,
+            counts={},
+            queue=queue,
+            max_auto_generations=2,
+        )
+
+        assert result is None
+        assert queue.empty()
+
+    async def test_head_equals_merged_tip_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(2) current HEAD == merged_branch_tip → genuine drop, returns None."""
+        from orchestrator.merge_queue import _maybe_auto_chain_generation
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        tip = 'aaabbbccc'
+
+        with patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, tip + '\n', ''))):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip=tip,
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is None
+        assert queue.empty()
+
+    async def test_superset_within_bound_chains(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(3) SUPERSET advance within bound → returns MergeOutcome('superseded'),
+        enqueues gen-(n+1) request, increments counts[branch]."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        current_head = 'newhead111'
+        merged_tip = 'oldtip000'
+        counts: dict[str, int] = {}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, current_head + '\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip=merged_tip,
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'superseded'
+        assert result.superseded_by is not None
+        assert result.superseded_by.startswith('mr-')
+        assert result.merge_sha == 'sha-adv'
+        # Queue has the gen-(n+1) request
+        assert queue.qsize() == 1
+        chained = queue.get_nowait()
+        assert chained.request_id != req.request_id
+        assert chained.generation == 2
+        assert chained.snapshot_tip == current_head
+        assert chained.pre_rebased is False
+        assert chained.branch == req.branch
+        assert chained.task_id == req.task_id
+        assert result.superseded_by == chained.request_id
+        # counts incremented
+        assert counts[req.branch] == 1
+
+    async def test_divergent_resolves_to_superset_chains(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(4) DIVERGENT → resolve_divergent → SUPERSET → chains."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        current_head = 'divhead222'
+        counts: dict[str, int] = {}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, current_head + '\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.DIVERGENT)),
+            patch('orchestrator.merge_queue.resolve_divergent', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'superseded'
+        assert queue.qsize() == 1
+
+    async def test_divergent_resolves_to_subset_returns_none(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(4b) DIVERGENT → resolve_divergent → SUBSET (patch-contained) → returns None."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'divhead333\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.DIVERGENT)),
+            patch('orchestrator.merge_queue.resolve_divergent', AsyncMock(return_value=TipRelation.SUBSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is None
+        assert queue.empty()
+
+    # γ2 step-09/10 — bound enforcement
+    async def test_bound_exceeded_returns_blocked_and_resets_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """counts already at MAX_AUTO_CHAINED_GENERATIONS → escalate, reset counter."""
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t-bound')
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        # Pre-populate counter at max
+        counts: dict[str, int] = {'task/t-bound': 2}
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead777\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip000',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=2,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert '2' in result.reason  # mentions the bound
+        assert queue.empty()  # NO new request enqueued
+        # Counter reset (popped)
+        assert 'task/t-bound' not in counts
+
+    async def test_consecutive_sequence_first_two_chain_third_escalates(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Sequence: advance-1 → counts=1, advance-2 → counts=2, advance-3 → escalate + reset."""
+        from orchestrator.merge_queue import (
+            TipRelation,
+            _maybe_auto_chain_generation,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = self._make_req(tmp_path, config, branch='task/t-seq')
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        counts: dict[str, int] = {}
+        heads = iter(['head1\n', 'head2\n', 'head3\n'])
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=lambda *a, **kw: (0, next(heads), ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            # First advance → chain
+            r1 = await _maybe_auto_chain_generation(
+                req, 'sha1', git_ops, event_store,
+                merged_branch_tip='old0', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r1 is not None and r1.status == 'superseded'
+            assert counts.get('task/t-seq') == 1
+            _ = queue.get_nowait()  # drain
+
+            # Second advance → chain
+            r2 = await _maybe_auto_chain_generation(
+                req, 'sha2', git_ops, event_store,
+                merged_branch_tip='head1', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r2 is not None and r2.status == 'superseded'
+            assert counts.get('task/t-seq') == 2
+            _ = queue.get_nowait()  # drain
+
+            # Third advance → escalate
+            r3 = await _maybe_auto_chain_generation(
+                req, 'sha3', git_ops, event_store,
+                merged_branch_tip='head2', counts=counts, queue=queue, max_auto_generations=2,
+            )
+            assert r3 is not None and r3.status == 'blocked'
+            assert queue.empty()
+            assert 'task/t-seq' not in counts  # reset
+
+    async def test_retention_seam_chained_request_gets_recorded(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(γ2 step-21 RED) provenance retention seam: when _maybe_auto_chain_generation
+        receives a retention ring it passes it to enqueue_merge_request so the gen-(n+1)
+        terminal outcome is recorded (superseded_by pointer resolves)."""
+        from orchestrator.merge_queue import (
+            MergeOutcome,
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+            TipRelation,
+            _GenerationChainContext,
+            _maybe_auto_chain_generation,
+        )
+
+        # _GenerationChainContext must accept a retention kwarg and expose it.
+        ring = TerminalOutcomeRetention(maxlen=50)
+        queue: asyncio.Queue = asyncio.Queue()
+        ctx = _GenerationChainContext(
+            queue=queue,
+            counts={},
+            max_auto_generations=2,
+            retention=ring,
+        )
+        assert ctx.retention is ring
+
+        req = self._make_req(tmp_path, config, branch='task/t-ret', generation=1)
+        git_ops = MagicMock()
+        git_ops.project_root = tmp_path
+        event_store = MagicMock()
+        event_store.emit = MagicMock()
+
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result = await _maybe_auto_chain_generation(
+                req, 'sha-adv', git_ops, event_store,
+                merged_branch_tip='oldtip',
+                counts={},
+                queue=queue,
+                max_auto_generations=2,
+                retention=ring,
+            )
+
+        assert result is not None and result.status == 'superseded'
+        gen_next = await queue.get()
+        assert gen_next.generation == 2
+
+        # Resolve the gen-(n+1) future so _on_finalized fires.
+        gen_next.result.set_result(MergeOutcome('done', merge_sha='advsha'))
+        await asyncio.sleep(0)  # let callbacks run
+
+        rec = ring.get(gen_next.request_id)
+        assert rec is not None, 'ring should contain the gen-(n+1) terminal record'
+        assert isinstance(rec, TerminalOutcomeRecord)
+        assert rec.state == 'done'
+        assert rec.generation == 2
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerGenerationChain — γ2 step-13/14: MergeWorker wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeWorkerGenerationChain:
+    """Unit tests for MergeWorker γ2 generation-chain wiring (step-13 RED / step-14 GREEN)."""
+
+    async def test_init_has_generation_chain_counts(self) -> None:
+        """MergeWorker.__init__ initialises self._generation_chain_counts == {}."""
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(MagicMock(), queue)
+        assert hasattr(worker, '_generation_chain_counts')
+        assert worker._generation_chain_counts == {}
+
+    async def test_do_merge_passes_chain_ctx_and_merged_branch_tip(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """_do_merge passes chain_ctx(queue=worker._queue, counts=_generation_chain_counts,
+        max=MAX_AUTO_CHAINED_GENERATIONS) and merged_branch_tip=branch HEAD to
+        _finalize_advanced_merge on the 'advanced' path."""
+        from orchestrator.merge_queue import (
+            MAX_AUTO_CHAINED_GENERATIONS,
+            _GenerationChainContext,
+        )
+
+        # Set up a real MergeRequest so the worker can process it
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(MagicMock(), queue)
+
+        branch_head_sha = 'branch-head-abc123'
+        merge_commit_sha = 'merge-commit-xyz'
+
+        # Mock git_ops methods needed by _do_merge
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value='main-sha')
+        git_ops.is_ancestor = AsyncMock(return_value=False)  # not already on main
+        git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+        git_ops.merge_to_main = AsyncMock(return_value=MagicMock(
+            success=True,
+            conflicts=False,
+            merge_commit=merge_commit_sha,
+            merge_worktree=tmp_path / 'merge-wt',
+            pre_merge_sha='main-sha',
+        ))
+        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        worker._git_ops = git_ops
+
+        # rev-parse HEAD → branch_head_sha for the branch tip snapshot
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='wt-1',
+            branch='task/wt-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+        )
+
+        with (
+            patch('orchestrator.merge_queue._run',
+                  AsyncMock(return_value=(0, branch_head_sha + '\n', ''))),
+            patch('orchestrator.merge_queue._classify_branch_presence', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._check_plan_targets_in_tree',
+                  AsyncMock(return_value=MagicMock(dropped=[]))),
+            patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None and outcome.status == 'done'
+        finalize_mock.assert_awaited_once()
+        _call_kwargs = finalize_mock.call_args.kwargs
+        assert 'chain_ctx' in _call_kwargs, 'chain_ctx not passed to _finalize_advanced_merge'
+        ctx: _GenerationChainContext = _call_kwargs['chain_ctx']
+        assert ctx.queue is worker._queue
+        assert ctx.counts is worker._generation_chain_counts
+        assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
+        assert _call_kwargs.get('merged_branch_tip') == branch_head_sha
+
+
+# ---------------------------------------------------------------------------
+# TestSMWGenerationChain — γ2 step-15/16: SpeculativeMergeWorker wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSMWGenerationChain:
+    """Unit tests for SpeculativeMergeWorker γ2 generation-chain wiring (step-15 RED / step-16 GREEN)."""
+
+    async def test_speculative_item_has_merged_branch_tip(self) -> None:
+        """(a) SpeculativeItem can carry merged_branch_tip (default None)."""
+        item = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='base',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert hasattr(item, 'merged_branch_tip')
+        assert item.merged_branch_tip is None
+        # Can be set explicitly
+        item2 = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='base',
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip='T1',
+        )
+        assert item2.merged_branch_tip == 'T1'
+
+    async def test_smw_init_has_generation_chain_counts(self) -> None:
+        """(b) SpeculativeMergeWorker.__init__ initialises self._generation_chain_counts == {}."""
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(MagicMock(), queue)
+        assert hasattr(worker, '_generation_chain_counts')
+        assert worker._generation_chain_counts == {}
+
+    async def test_verify_and_advance_passes_chain_ctx_and_merged_branch_tip(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(c) _verify_and_advance on an item with merged_branch_tip='T1' through a
+        successful advance awaits _finalize_advanced_merge with chain_ctx
+        (queue=self._queue, counts=self._generation_chain_counts,
+        max=MAX_AUTO_CHAINED_GENERATIONS) and merged_branch_tip=='T1'."""
+        from orchestrator.merge_queue import (
+            MAX_AUTO_CHAINED_GENERATIONS,
+            _GenerationChainContext,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        git_ops = MagicMock()
+        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='smw-wt',
+            branch='task/smw-branch',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+        )
+        merge_commit_sha = 'merge-commit-smw'
+        item = SpeculativeItem(
+            request=req,
+            merge_result=MagicMock(
+                success=True,
+                conflicts=False,
+                merge_commit=merge_commit_sha,
+                merge_worktree=tmp_path / 'merge-wt',
+                pre_merge_sha='base-sha',
+            ),
+            merge_wt=tmp_path / 'merge-wt',
+            base_sha='base-sha',
+            speculative=False,
+            skip_verify=False,
+            started_monotonic=None,
+            merged_branch_tip='T1',
+        )
+
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        with (
+            patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        finalize_mock.assert_awaited_once()
+        _call_kwargs = finalize_mock.call_args.kwargs
+        assert 'chain_ctx' in _call_kwargs, 'chain_ctx not passed to _finalize_advanced_merge'
+        ctx: _GenerationChainContext = _call_kwargs['chain_ctx']
+        assert ctx.queue is worker._queue
+        assert ctx.counts is worker._generation_chain_counts
+        assert ctx.max_auto_generations == MAX_AUTO_CHAINED_GENERATIONS
+        assert _call_kwargs.get('merged_branch_tip') == 'T1'
+
+
+# ---------------------------------------------------------------------------
+# TestTrainEquivalenceNeverAutoChains — γ2 step-17 RED / step-18 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainEquivalenceNeverAutoChains:
+    """PRD D9 / boundary test 12 regression guard.
+
+    _do_train_merge must NEVER auto-chain on equivalence failure.  Trains are
+    multi-waiter (all members share a single git branch tip), so only the
+    single-branch MergeWorker/SpeculativeMergeWorker paths should grow with
+    new delta commits.  The ``chain_ctx=None`` default on
+    ``_finalize_advanced_merge`` guarantees this; these tests lock that
+    invariant in.
+    """
+
+    async def test_train_equiv_failure_returns_blocked_not_superseded(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Equivalence failure on a GroupMergeRequest returns 'blocked' (not 'superseded')
+        and leaves the worker queue empty — no auto-chain, no delta re-queue.
+
+        PRD D9: trains are bit-identical single-waiter merges; the γ2 chain
+        mechanism applies ONLY to single-branch MergeRequest paths.
+        """
+        from orchestrator.merge_queue import POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX
+
+        req = await _make_stacked_train(git_ops, config)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['train.py']),
+            ),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None, 'expected a MergeOutcome, got None'
+        # (a) Outcome is 'blocked', not 'superseded' — trains never auto-chain
+        assert outcome.status == 'blocked', (
+            f'train equiv-failure must return blocked, got: {outcome!r}'
+        )
+        # (b) Reason carries the equivalence prefix
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'expected equiv prefix, got: {outcome.reason!r}'
+        )
+        # (c) Queue is empty — no gen-(n+1) request was enqueued for the train
+        assert worker._queue.empty(), (
+            'no gen-(n+1) request should be enqueued for train equiv-failure '
+            '(PRD D9: trains never auto-chain)'
+        )
+
+    async def test_do_train_merge_finalize_called_with_no_chain_ctx(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """_do_train_merge calls _finalize_advanced_merge WITHOUT chain_ctx (default None).
+
+        Asserts the chain_ctx=None invariant at the call site so any future
+        change that accidentally wires chain_ctx into the train path is caught
+        immediately.  Trains must stay bit-identical and single-waiter (PRD D9).
+        """
+        req = await _make_stacked_train(git_ops, config)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+        ):
+            await worker._do_merge(req)
+
+        finalize_mock.assert_awaited_once()
+        call_kwargs = finalize_mock.call_args.kwargs
+        # chain_ctx must be absent or explicitly None — trains never auto-chain (PRD D9)
+        assert call_kwargs.get('chain_ctx') is None, (
+            f'_do_train_merge must not pass chain_ctx to _finalize_advanced_merge; '
+            f'got chain_ctx={call_kwargs.get("chain_ctx")!r}'
+        )

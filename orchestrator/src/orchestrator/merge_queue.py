@@ -87,6 +87,30 @@ Decision-2 check.  After ``advance_main`` succeeds, we verify that
 ``.task/``).  Any divergence indicates conflict resolution dropped or
 rewrote work and needs human judgement, not a steward retry."""
 
+MAX_AUTO_CHAINED_GENERATIONS = 2
+"""Maximum number of consecutive auto-chained generations per branch lineage (γ2 / PRD D3).
+
+When the branch tip advances during verify (tip-advanced pathology), the worker
+auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
+advances the chain is broken and the request is escalated to humans via a 'blocked'
+outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
+
+AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
+"""Kill-switch for the γ2 generation auto-chaining producer.
+
+MUST remain False until γ3 lands BOTH:
+  1. The workflow.py 'superseded' consumer handler (so the workflow.py:3963-4071
+     single-task merge consumer has a branch for 'superseded' outcomes instead of
+     falling through to _mark_blocked with an empty reason).
+  2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
+     branch slot in InFlightMergeRegistry for the chained request without tripping
+     the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
+     from the harness into the workers — harness.py:3238 omits both today).
+
+While False, _finalize_advanced_merge ignores chain_ctx on equivalence failures
+and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reach
+the workflow consumer."""
+
 
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
@@ -432,6 +456,29 @@ async def _run_post_merge_verify(
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _GenerationChainContext:
+    """Bundle passed from a worker into _finalize_advanced_merge for γ2 auto-chaining.
+
+    Carries the worker's queue, the per-branch generation counter dict, and
+    the configured maximum so _finalize_advanced_merge can delegate to
+    _maybe_auto_chain_generation without a direct worker reference.
+
+    Defaulting to None in _finalize_advanced_merge preserves the function's
+    behaviour for trains (_do_train_merge passes None, per PRD D9) and all
+    existing callers.
+    """
+
+    queue: asyncio.Queue
+    counts: dict  # dict[str, int] — per-branch chain counter
+    max_auto_generations: int
+    retention: TerminalOutcomeRetention | None = None
+    """Retention ring to pass to enqueue_merge_request for the chained gen-(n+1)
+    request so its terminal outcome is recorded (provenance: superseded_by resolves).
+    The in-flight-registry SLOT HANDOFF for gen-(n+1) belongs to γ3's ATTACH_AND_CHAIN
+    scope and is the second precondition guarded by AUTO_CHAIN_GENERATIONS_ENABLED."""
+
+
 async def _finalize_advanced_merge(
     git_ops: GitOps,
     req: MergeRequest,
@@ -446,6 +493,8 @@ async def _finalize_advanced_merge(
     log_label: str = '',
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
+    chain_ctx: _GenerationChainContext | None = None,
+    merged_branch_tip: str | None = None,
 ) -> MergeOutcome:
     """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -466,6 +515,17 @@ async def _finalize_advanced_merge(
     MergeWorker and SpeculativeMergeWorker pass ``None`` (no behavior
     change); ``_do_train_merge`` passes the request's train metadata so
     ``merge_attempt`` events stay tagged for downstream reconciliation.
+
+    *chain_ctx* + *merged_branch_tip* enable γ2 generation auto-chaining
+    when :data:`AUTO_CHAIN_GENERATIONS_ENABLED` is ``True``.  While the
+    kill-switch is ``False`` (the default, pending γ3), equivalence failures
+    always return ``'blocked'`` and no ``'superseded'`` outcome is produced.
+    When enabled and *chain_ctx* is not None, :func:`_maybe_auto_chain_generation`
+    is consulted: if the branch tip advanced during verify a gen-(n+1) request
+    is enqueued and a ``'superseded'`` outcome is returned instead of ``'blocked'``.
+    On a clean ``'done'`` landing, chain_ctx.counts pops the branch key
+    (resetting the lineage counter).  Passing ``None`` (the default)
+    preserves all existing behaviour — trains pass ``None`` (PRD D9).
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -493,6 +553,28 @@ async def _finalize_advanced_merge(
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
+        # γ2: if chain_ctx is wired AND the kill-switch is on, try to
+        # discriminate whether the branch tip advanced mid-verify and
+        # auto-chain gen-(n+1).  The switch is OFF by default until γ3
+        # lands the workflow 'superseded' consumer handler + slot handoff.
+        if chain_ctx is not None and AUTO_CHAIN_GENERATIONS_ENABLED:
+            chained = await _maybe_auto_chain_generation(
+                req, advanced_sha, git_ops, event_store,
+                merged_branch_tip=merged_branch_tip,
+                counts=chain_ctx.counts,
+                queue=chain_ctx.queue,
+                max_auto_generations=chain_ctx.max_auto_generations,
+                retention=chain_ctx.retention,
+            )
+            if chained is not None:
+                _emit_merge_attempt(
+                    event_store, req.task_id,
+                    'post_merge_generation_chained',
+                    duration_ms=_elapsed_ms(started_monotonic),
+                    train_id=train_id,
+                    member_task_ids=member_task_ids,
+                )
+                return chained
         return MergeOutcome(
             'blocked',
             reason=(
@@ -541,6 +623,10 @@ async def _finalize_advanced_merge(
         train_id=train_id,
         member_task_ids=member_task_ids,
     )
+    # γ2: clean landing — reset the per-branch generation chain counter
+    # so consecutive tip-advances count is cleared for this branch.
+    if chain_ctx is not None:
+        chain_ctx.counts.pop(req.branch, None)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -1747,6 +1833,10 @@ class TerminalOutcomeRecord:
     snapshot_tip: str | None = None
     merge_sha: str | None = None
     finished_at: float = field(default_factory=time.time, kw_only=True)
+    superseded_by: str | None = field(default=None, kw_only=True)
+    """request_id of the gen-(n+1) request that supersedes this one (α1/γ2 provenance)."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation of the merge request that produced this record (γ2 provenance)."""
 
 
 class TerminalOutcomeRetention:
@@ -2031,6 +2121,94 @@ def _emit_merge_queued(
     )
 
 
+async def _maybe_auto_chain_generation(
+    req: MergeRequest,
+    advanced_sha: str,
+    git_ops: GitOps,
+    event_store: EventStore | None,
+    *,
+    merged_branch_tip: str | None,
+    counts: dict[str, int],
+    queue: asyncio.Queue,
+    max_auto_generations: int,
+    retention: TerminalOutcomeRetention | None = None,
+) -> MergeOutcome | None:
+    """Check whether a post-merge equivalence failure was caused by a tip advance,
+    and if so, enqueue a gen-(n+1) MergeRequest for the delta (γ2).
+
+    Returns:
+    - ``MergeOutcome('superseded', ...)`` if the tip advanced and the chain is
+      within the bound — a gen-(n+1) request has been placed on *queue*.
+    - ``MergeOutcome('blocked', ...)`` if the chain-generation bound is exceeded
+      (consecutive tip advances > *max_auto_generations*) — the branch counter
+      is reset.  Uses POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX so the
+      existing workflow blocked-handler routes to _mark_blocked(escalate_to_human=True).
+    - ``None`` if the tip has NOT advanced (genuine drop; caller should block
+      as before).
+
+    The *counts* dict is mutated in-place: incremented on a chain, reset on
+    bound-exceeded.  A clean 'done' landing pops the branch key (handled by
+    the caller: _finalize_advanced_merge).
+
+    NOTE: this function is only reachable when :data:`AUTO_CHAIN_GENERATIONS_ENABLED`
+    is ``True`` (the kill-switch in _finalize_advanced_merge gates the call site).
+    The in-flight-registry SLOT HANDOFF for gen-(n+1) (re-acquiring the branch
+    slot without tripping the gen-1 done-callback double-release, plus threading
+    InFlightMergeRegistry and TerminalOutcomeRetention from the harness into the
+    workers — harness.py:3238 omits both) belongs to γ3's ATTACH_AND_CHAIN scope
+    and is the second precondition guarded by the kill-switch.
+    """
+    if not merged_branch_tip:
+        return None
+
+    # Rev-parse the branch's current HEAD in its worktree.
+    rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=req.worktree)
+    if rc != 0:
+        # Fail-open: treat as genuine drop so the caller blocks as today.
+        return None
+    current_head = head_out.strip()
+
+    if current_head == merged_branch_tip:
+        # Tip has not moved — genuine drop.
+        return None
+
+    # Classify the topological relationship.
+    rel = await classify_tip_relation(current_head, merged_branch_tip, git_ops)
+    if rel is TipRelation.DIVERGENT:
+        rel = await resolve_divergent(current_head, merged_branch_tip, git_ops)
+
+    if rel is not TipRelation.SUPERSET:
+        # SUBSET (patch-contained) or SAME: no new content — genuine drop.
+        return None
+
+    # Tip advanced.  Enforce the per-branch generation bound.
+    new_count = counts.get(req.branch, 0) + 1
+    if new_count > max_auto_generations:
+        counts.pop(req.branch, None)
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                f'branch tip advanced past the merged snapshot for the '
+                f'{max_auto_generations}-generation auto-chain bound '
+                f'(consecutive tip advances). Manual review required.'
+            ),
+        )
+
+    # Within bound — build the gen-(n+1) request and enqueue it.
+    gen_next = dataclasses.replace(
+        req,
+        result=asyncio.get_running_loop().create_future(),
+        request_id=f'mr-{uuid.uuid4().hex[:8]}',
+        generation=req.generation + 1,
+        snapshot_tip=current_head,
+        pre_rebased=False,
+    )
+    await enqueue_merge_request(queue, gen_next, event_store, retention=retention)
+    counts[req.branch] = new_count
+    return MergeOutcome('superseded', superseded_by=gen_next.request_id, merge_sha=advanced_sha)
+
+
 async def enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -2057,6 +2235,7 @@ async def enqueue_merge_request(
     """
     def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
         # --- derive terminal state -------------------------------------------
+        superseded_by: str | None = None
         try:
             if fut.cancelled():
                 state: str = 'abandoned'
@@ -2068,6 +2247,7 @@ async def enqueue_merge_request(
                 outcome: MergeOutcome = fut.result()
                 state = outcome.status
                 merge_sha = outcome.merge_sha
+                superseded_by = outcome.superseded_by
         except Exception:  # noqa: BLE001
             logger.warning(
                 'enqueue_merge_request: _on_finalized could not derive terminal '
@@ -2086,6 +2266,8 @@ async def enqueue_merge_request(
                     state=state,
                     snapshot_tip=req.snapshot_tip,
                     merge_sha=merge_sha,
+                    superseded_by=superseded_by,
+                    generation=req.generation,
                 ))
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -2106,6 +2288,8 @@ async def enqueue_merge_request(
                         'state': state,
                         'snapshot_tip': req.snapshot_tip,
                         'merge_sha': merge_sha,
+                        'superseded_by': superseded_by,
+                        'generation': req.generation,
                     },
                 )
             except Exception:  # noqa: BLE001
@@ -2420,6 +2604,9 @@ class MergeRequest:
     """Stable per-instance identity for this merge request (e.g. 'mr-a1b2c3d4')."""
     snapshot_tip: str | None = field(default=None, kw_only=True)
     """Optional git ref / SHA of the snapshot tip used by α3 merge-status lookups."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation counter for auto-chained merges (γ2).  Gen-1 is the original;
+    each auto-chain increments by 1.  Bounded by MAX_AUTO_CHAINED_GENERATIONS."""
 
 
 @dataclass
@@ -2459,7 +2646,7 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
@@ -2471,6 +2658,8 @@ class MergeOutcome:
     """True when the disk guard fired and ``run_scoped_verification`` was never
     called.  Lets callers distinguish a disk-guard short-circuit from an actual
     verification failure in log messages."""
+    superseded_by: str | None = None
+    """request_id of the gen-(n+1) request that supersedes this one (γ2)."""
 
 
 @dataclass
@@ -2490,6 +2679,7 @@ class SpeculativeItem:
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
+    merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
 
 
 class _TrainMergeHost(Protocol):
@@ -2836,6 +3026,11 @@ async def _do_train_merge(
     # merge_wt has already been cleaned up above (caller contract for finalize).
     # t0 is passed as started_monotonic so finalize's duration_ms is accurate
     # for the whole train attempt, not just the post-advance window.
+    #
+    # PRD D9: trains are bit-identical, multi-waiter merges — γ2 auto-chaining
+    # applies ONLY to single-branch MergeRequest paths (MergeWorker /
+    # SpeculativeMergeWorker).  chain_ctx=None is passed explicitly here so the
+    # invariant is visible at the call site and not left implicit.
     outcome = await _finalize_advanced_merge(
         git_ops, req, event_store,
         merge_commit_fallback=merge_commit,
@@ -2847,6 +3042,7 @@ async def _do_train_merge(
         log_label=' (train)',
         train_id=req.train_id,
         member_task_ids=req.member_task_ids,
+        chain_ctx=None,  # PRD D9: trains never auto-chain
     )
     if outcome.status != 'done':
         # Equivalence or pyright gate fired — main landed but post-merge gates
@@ -3050,6 +3246,10 @@ class MergeWorker(_WipHaltMixin):
         # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
         # the timeout counter: persists across submissions, reset on success.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # γ2 per-branch generation auto-chain counter.  Incremented on each
+        # consecutive tip-advance equivalence failure; popped on a clean 'done'
+        # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
+        self._generation_chain_counts: dict[str, int] = {}
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -3300,6 +3500,12 @@ class MergeWorker(_WipHaltMixin):
                 cas_retries=self._cas_retries,
                 timeouts=self._post_merge_verify_timeouts,
                 enospc_retries=self._post_merge_verify_enospc_retries,
+                chain_ctx=_GenerationChainContext(
+                    queue=self._queue,
+                    counts=self._generation_chain_counts,
+                    max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                ),
+                merged_branch_tip=branch_head.strip(),
             )
 
         if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
@@ -3400,6 +3606,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Persists across
         # submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # γ2 per-branch generation auto-chain counter (mirrors MergeWorker).
+        # Incremented on each consecutive tip-advance equivalence failure;
+        # popped on a clean 'done' landing or bound-exceeded escalation.
+        self._generation_chain_counts: dict[str, int] = {}
         # Depth-1 cap: cleared when a speculative merge is in flight,
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
@@ -3941,6 +4151,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         base_sha=base_for_merge, speculative=speculative,
                         skip_verify=skip_verify,
                         started_monotonic=t0,
+                        merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                     ))
                     self._inflight_req = None  # item is now owned by verifier
 
@@ -4481,6 +4692,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     timeouts=self._post_merge_verify_timeouts,
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     log_label=' (speculative)',
+                    chain_ctx=_GenerationChainContext(
+                        queue=self._queue,
+                        counts=self._generation_chain_counts,
+                        max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                    ),
+                    merged_branch_tip=item.merged_branch_tip,
                 )
                 if not req.result.done():
                     req.result.set_result(outcome)
