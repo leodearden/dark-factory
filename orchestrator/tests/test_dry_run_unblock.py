@@ -2,11 +2,12 @@
 
 Covers: config defaults, proposal schema shape, happy path, conservative
 risk_label default, agent-failure fallback, budget-exhausted fallback,
-and invocation_end event tagging.
+invocation_end event tagging, sha-stamping, and keep-last-N trim.
 """
 
 from __future__ import annotations
 
+import subprocess
 from importlib import resources as pkg_resources
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -90,7 +91,9 @@ class TestProposalSchemaShape:
 # ---------------------------------------------------------------------------
 
 def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
-                 model='sonnet', max_turns=50, effort='high', backend='claude'):
+                 model='sonnet', max_turns=50, effort='high', backend='claude',
+                 attended_b3_enabled=False, b3_merge_cap_per_24h=6,
+                 b3_proposal_keep_last=5):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
@@ -99,7 +102,23 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     cfg.unblock_auto.max_turns = max_turns
     cfg.unblock_auto.effort = effort
     cfg.unblock_auto.backend = backend
+    cfg.unblock_auto.attended_b3_enabled = attended_b3_enabled
+    cfg.unblock_auto.b3_merge_cap_per_24h = b3_merge_cap_per_24h
+    cfg.unblock_auto.b3_proposal_keep_last = b3_proposal_keep_last
     return cfg
+
+
+def _init_git_repo(path) -> str:
+    """Init a minimal git repo at *path* (must be a pathlib.Path), return HEAD sha."""
+    p = str(path)
+    subprocess.run(['git', 'init', '-b', 'main', p], check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'config', 'user.name', 'Test User'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'config', 'user.email', 'test@example.com'], check=True, capture_output=True)
+    (path / 'README.md').write_text('init')
+    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'], check=True, capture_output=True)
+    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True)
+    return result.stdout.strip()
 
 
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
@@ -375,3 +394,127 @@ class TestEventTagging:
         data = emit_call.kwargs.get('data', {})
         assert data.get('dry_run') is True
         assert 'risk_label' in data
+
+
+# ---------------------------------------------------------------------------
+# step-3: sha-stamping tests
+# ---------------------------------------------------------------------------
+
+class TestShaStamping:
+    """head_sha/main_sha are stamped onto every entry shape; schema stays closed."""
+
+    def test_schema_guard_no_sha_in_agent_schema(self):
+        """DRY_RUN_PROPOSAL_SCHEMA must stay closed — agent cannot forge sha anchors."""
+        from orchestrator.dry_run_unblock import DRY_RUN_PROPOSAL_SCHEMA
+
+        assert DRY_RUN_PROPOSAL_SCHEMA['additionalProperties'] is False
+        props = DRY_RUN_PROPOSAL_SCHEMA.get('properties', {})
+        assert 'head_sha' not in props, 'head_sha must NOT be in agent output schema'
+        assert 'main_sha' not in props, 'main_sha must NOT be in agent output schema'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', [
+        'ok',
+        'investigation_failed',
+        'budget_exhausted',
+        'exception_fallback',
+    ])
+    async def test_sha_stamped_on_entry(self, shape, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        repo_dir = tmp_path / 'repo'
+        repo_dir.mkdir()
+        head_sha = _init_git_repo(repo_dir)
+        # After init, main and HEAD point to the same commit
+        main_sha = head_sha
+
+        structured = {
+            'proposal_text': 'Fix the blockage',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+
+        if shape == 'exception_fallback':
+            agent_mock = AsyncMock(side_effect=RuntimeError('unexpected error'))
+        elif shape == 'ok':
+            agent_result = _make_agent_result(success=True, structured_output=structured)
+            agent_mock = AsyncMock(return_value=agent_result)
+        elif shape == 'investigation_failed':
+            agent_result = _make_agent_result(
+                success=False, subtype='error_max_turns',
+                output='Exceeded max turns', structured_output=None,
+            )
+            agent_mock = AsyncMock(return_value=agent_result)
+        else:  # budget_exhausted
+            agent_result = _make_agent_result(
+                success=False, subtype='error_max_budget_usd',
+                cost_usd=5.0, structured_output=None,
+            )
+            agent_mock = AsyncMock(return_value=agent_result)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=agent_mock):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(repo_dir),
+                reason='test blocked',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        # Find the append=True call (forward-compatible: step-6 adds append=False trim call)
+        append_call = next(
+            c for c in scheduler.update_task.call_args_list
+            if c.kwargs.get('append') is True
+        )
+        entry = append_call.args[1]['dry_run_proposals'][0]
+
+        assert entry['head_sha'] == head_sha, (
+            f'shape={shape}: head_sha mismatch: {entry["head_sha"]!r} != {head_sha!r}'
+        )
+        assert entry['main_sha'] == main_sha, (
+            f'shape={shape}: main_sha mismatch: {entry["main_sha"]!r} != {main_sha!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sha_stamps_nonrepo_yields_none(self, tmp_path):
+        """Non-git worktree: keys present in entry, values are None (graceful degradation)."""
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        # tmp_path is not a git repo — _capture_worktree_shas must return (None, None)
+        structured = {
+            'proposal_text': 'Fix the blockage',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='99',
+                worktree=str(tmp_path),
+                reason='test blocked',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        append_call = next(
+            c for c in scheduler.update_task.call_args_list
+            if c.kwargs.get('append') is True
+        )
+        entry = append_call.args[1]['dry_run_proposals'][0]
+
+        assert 'head_sha' in entry, 'head_sha key must always be present'
+        assert 'main_sha' in entry, 'main_sha key must always be present'
+        assert entry['head_sha'] is None, f'Expected None, got {entry["head_sha"]!r}'
+        assert entry['main_sha'] is None, f'Expected None, got {entry["main_sha"]!r}'
