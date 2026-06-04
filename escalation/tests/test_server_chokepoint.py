@@ -1544,3 +1544,67 @@ class TestMergeCancel:
         # Clean up the drained-not-consumed entry
         req = mq.get_nowait()
         assert req.result.cancelled()
+
+    async def test_cancel_mid_finalize_window_returns_coarse_terminal(self, tmp_path: Path):
+        """Cancelling a waiter whose future is resolved-but-not-yet-popped returns cancelled=False.
+
+        Simulates the mid-finalize window: merge_request has resolved the future (e.g.
+        the worker delivered MergeOutcome('done')) but the call_soon-scheduled _waiters.pop
+        done-callback has not run yet (the loop has not regained control).
+
+        Steps: acquire merge_cancel tool up front; submit merge_request(wait_secs=0);
+        drain mq; resolve req.result.set_result(MergeOutcome('done', reason='late resolve'));
+        immediately call merge_cancel (no intervening awaited suspension).  The waiter is
+        still present (future.done()==True, not cancelled()), so the call must return
+        {cancelled: False, state: 'done', reason: <non-empty>}.
+
+        RED until step-8 impl: current body has no future.done() (non-cancelled terminal)
+        branch; falls into the pending path, calls fut.cancel() on a done future (returns
+        False), and mis-reports cancelled=True.
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension until .fn() call
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c3',
+            branch='c3',
+            worktree=str(tmp_path / 'wt-c3'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # Drain the queue and resolve the future (simulate worker delivering outcome)
+        req = mq.get_nowait()
+        req.result.set_result(MergeOutcome('done', reason='late resolve'))
+        # Confirm we're in the mid-finalize window: done but not cancelled
+        assert req.result.done() and not req.result.cancelled(), (
+            'Prerequisite: future must be done and not cancelled for mid-finalize test'
+        )
+
+        # Immediately cancel (no intervening awaited suspension)
+        result = await tool.fn(request_id=rid)
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for mid-finalize window, got: {result}"
+        )
+        assert result.get('state') == 'done', (
+            f"Expected state='done' (via _map_terminal_state), got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason for mid-finalize window, got: {result}"
+        )
