@@ -7,11 +7,14 @@ introduced by this task).  Tests are organised as:
   1. Happy path: same signature on main -> True
   2. False cases: main passes / different signature -> False
   3. Cheapness refinement: only non-flaky categories reach the helper
-  4. Lifecycle / cleanup: temp worktree create + remove in finally, no task-worktree mutation
+  4. Lifecycle / cleanup: probe worktree create + remove in finally, no task-wt mutation
+  5. Placement: probe is under git_ops.worktree_base, not the system temp dir
+  6. Integration: real git repo + real GitOps; only run_scoped_verification is stubbed
 """
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -360,3 +363,117 @@ class TestVerifyFailureProbeWorktreePlacement:
         )
         # Belt check: the probe is NOT the task worktree itself or a sub-path of it
         assert probe_path != worktree, f'Probe must differ from task worktree {worktree}'
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — step-19: integration test with a REAL git repo and a REAL GitOps
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyFailureIsPreexistingIntegration:
+    """Step-19: integration test — real git + real GitOps; only run_scoped_verification stubbed.
+
+    This is the test that would have caught the /tmp placement bug: it exercises
+    a real ``git worktree add`` (not mocked), so the probe path must physically
+    live under git_ops.worktree_base for it to succeed.  A /tmp path would fail
+    to resolve node_modules upward and surface a wrong signature; this test
+    asserts the probe actually exists on disk inside worktree_base during verify.
+    """
+
+    def test_real_git_probe_lifecycle(self, tmp_path: Path) -> None:
+        """Real git repo: probe created under worktree_base, deregistered after, task-wt intact."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.git_ops import GitOps
+
+        # ── Set up a real git repo ──────────────────────────────────────────
+        project_root = tmp_path / 'repo'
+        project_root.mkdir()
+        for cmd in [
+            ['git', 'init', '-b', 'main'],
+            ['git', 'config', 'user.email', 'test@test.com'],
+            ['git', 'config', 'user.name', 'Test'],
+        ]:
+            subprocess.run(cmd, cwd=project_root, check=True, capture_output=True)
+        (project_root / 'file.txt').write_text('hello')
+        subprocess.run(['git', 'add', '.'], cwd=project_root, check=True, capture_output=True)
+        subprocess.run(
+            ['git', 'commit', '-m', 'init'], cwd=project_root, check=True, capture_output=True,
+        )
+
+        # Record the real main SHA before the probe runs
+        main_sha_before = subprocess.run(
+            ['git', 'rev-parse', 'main'], cwd=project_root, capture_output=True, text=True,
+        ).stdout.strip()
+
+        # ── Construct real GitOps ────────────────────────────────────────────
+        config = OrchestratorConfig(
+            project_root=project_root,
+            max_concurrent_tasks=1,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+        )
+        git_ops = GitOps(config.git, project_root)
+
+        # Create a task worktree directory (placeholder; helper reads its path, not content)
+        task_wt = git_ops.worktree_base / 'task-123'
+        task_wt.mkdir(parents=True, exist_ok=True)
+
+        # ── Stub ONLY run_scoped_verification ────────────────────────────────
+        # The stub asserts from within that the probe physically exists on disk
+        # and is under worktree_base — exactly what the /tmp-path bug prevented.
+        probe_worktrees_seen: list[Path] = []
+
+        async def _stub_verify(worktree_arg: Path, *args, **kwargs) -> VerifyResult:
+            # Probe must exist on disk (git worktree add created it)
+            assert worktree_arg.exists(), (
+                f'Probe worktree {worktree_arg} must physically exist during verify; '
+                f'a /tmp path may fail git worktree add for the same git repo'
+            )
+            # Probe must be under worktree_base for env-parity
+            assert worktree_arg.is_relative_to(git_ops.worktree_base), (
+                f'Probe {worktree_arg} must be under worktree_base={git_ops.worktree_base}'
+            )
+            probe_worktrees_seen.append(worktree_arg)
+            return SAME_RESULT
+
+        with patch.object(verify_module, 'run_scoped_verification', side_effect=_stub_verify):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    task_wt, config, [], ['file.txt'], FAILING_RESULT, git_ops,
+                )
+            )
+
+        # (a) Helper returns (True, main_sha_before)
+        is_preexisting, probe_sha = result
+        assert is_preexisting, f'Expected (True, ...) — same signature on main; got {result!r}'
+        assert probe_sha == main_sha_before, (
+            f'Returned sha {probe_sha!r} must match real main SHA {main_sha_before!r}'
+        )
+
+        # (b) Probe dir is gone after return; git worktree list shows no _mainprobe-* leftover
+        assert len(probe_worktrees_seen) == 1, 'Exactly one probe verify call expected'
+        probe_path = probe_worktrees_seen[0]
+        assert not probe_path.exists(), (
+            f'Probe dir {probe_path} must be removed by cleanup (git worktree remove + rmtree)'
+        )
+        wt_list = subprocess.run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=project_root, capture_output=True, text=True,
+        ).stdout
+        assert '_mainprobe-' not in wt_list, (
+            f'No _mainprobe-* worktrees should remain registered after cleanup:\n{wt_list}'
+        )
+
+        # (c) main SHA unchanged — helper never modified the repo state
+        main_sha_after = subprocess.run(
+            ['git', 'rev-parse', 'main'], cwd=project_root, capture_output=True, text=True,
+        ).stdout.strip()
+        assert main_sha_after == main_sha_before, (
+            f'main SHA changed from {main_sha_before} to {main_sha_after}; '
+            f'helper must never modify the repo or task worktree'
+        )
