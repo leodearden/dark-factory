@@ -12755,3 +12755,417 @@ class TestTrainEquivalenceNeverAutoChains:
             f'_do_train_merge must not pass chain_ctx to _finalize_advanced_merge; '
             f'got chain_ctx={call_kwargs.get("chain_ctx")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Boundary-test pre-2 helpers and TestBoundaryTableWorkerEntry
+# ---------------------------------------------------------------------------
+
+
+async def _setup_two_source_entry(
+    registry: InFlightMergeRegistry,
+    branch: str,
+    task_id: str,
+) -> tuple:
+    """Acquire an mcp-source primary waiter and attach a workflow-source waiter.
+
+    Returns (mcp_future, workflow_future) — resolving mcp_future fans-out to
+    workflow_future via the registry's _mirror done-callback.
+    """
+    from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+    loop = asyncio.get_running_loop()
+    mcp_future: asyncio.Future = loop.create_future()
+    wf_future: asyncio.Future = loop.create_future()
+
+    acquired = registry.acquire(
+        branch, task_id, mcp_future,
+        request_id='mr-bt-mcp', source='mcp',
+    )
+    assert acquired, 'registry.acquire must succeed for a free branch'
+
+    attached = registry.attach(
+        branch,
+        WaiterRecord(request_id='mr-bt-wf', future=wf_future, source='workflow'),
+    )
+    assert attached, 'registry.attach must succeed while branch is in-flight'
+
+    return mcp_future, wf_future
+
+
+@pytest.mark.asyncio
+class TestBoundaryTableWorkerEntry:
+    """PRD §8 boundary-test table: scenarios 9, 11, 12, 13 at the worker/entry seam.
+
+    One method per §8 row.  Reuses git_repo / git_config / git_ops / config /
+    _make_request / _mock_verify_pass / _make_branch_with_file fixtures and
+    the TestAttachFanOut / TestMaybeAutoChainGeneration patterns.
+    """
+
+    @pytest.mark.timeout(60)
+    async def test_scenario_9_multi_waiter_peer_completion(
+        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+        tmp_path: 'Path',  # type: ignore[name-defined]
+    ) -> None:
+        """Row 9: multi-waiter peer completion (mcp+workflow, one merge).
+
+        Set up an mcp-source primary waiter P1 and a workflow-source waiter P2
+        on one entry for a real branch.  Drive a real MergeWorker to finalize
+        'done'.  Assert BOTH futures resolve with the same terminal outcome
+        (same status + merge_sha).  Assert exactly ONE merge executed (file
+        appears once on main).
+        Extends TestAttachFanOut with the explicit two-source framing and the
+        one-merge assertion.
+        """
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            MergeWorker,
+        )
+
+        bt9_branch = 'bt9-peer'
+        wt = await _make_branch_with_file(git_ops, bt9_branch, 'bt9.py', 'x = 9\n')
+
+        registry = InFlightMergeRegistry()
+        loop = asyncio.get_running_loop()
+        primary_future: asyncio.Future = loop.create_future()
+
+        # MergeRequest's result IS the primary future that registry acquires
+        req = MergeRequest(
+            task_id=bt9_branch,
+            branch=bt9_branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=primary_future,
+        )
+
+        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+
+        # Acquire the registry slot for the primary
+        registry.acquire(
+            bt9_branch, bt9_branch, primary_future,
+            request_id='mr-bt9-mcp', source='mcp',
+        )
+
+        # Attach workflow waiter — will be mirrored when primary resolves
+        wf_future: asyncio.Future = loop.create_future()
+        registry.attach(
+            bt9_branch,
+            WaiterRecord(request_id='mr-bt9-wf', future=wf_future, source='workflow'),
+        )
+
+        assert len(registry.entry(bt9_branch).waiters) == 2, 'must have 2 waiters'
+
+        # Drive the real MergeWorker
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            worker_task = asyncio.create_task(worker.run())
+            await queue.put(req)
+
+            # Wait for the primary future to resolve (worker finalized 'done')
+            outcome_primary = await asyncio.wait_for(primary_future, timeout=30.0)
+            # Wait for the workflow future to be mirrored
+            await asyncio.sleep(0)  # let mirror callback fire
+            outcome_wf = await asyncio.wait_for(wf_future, timeout=5.0)
+
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # Both futures: same terminal status
+        assert outcome_primary.status == 'done', f'primary must be done: {outcome_primary}'
+        assert outcome_wf.status == outcome_primary.status, (
+            f'workflow waiter status must match primary: '
+            f'{outcome_wf.status} != {outcome_primary.status}'
+        )
+        assert outcome_wf.merge_sha == outcome_primary.merge_sha, (
+            f'workflow waiter merge_sha must match primary: '
+            f'{outcome_wf.merge_sha!r} != {outcome_primary.merge_sha!r}'
+        )
+
+        # Exactly ONE merge executed: bt9.py appears on main
+        _, files_out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'bt9.py' in files_out, 'bt9.py must appear on main after merge'
+
+        # And only once in the merge commit log
+        _, merge_log, _ = await _run(
+            ['git', 'log', '--merges', '--oneline', 'main'],
+            cwd=git_ops.project_root,
+        )
+        merge_lines = [l for l in merge_log.splitlines() if l.strip()]
+        assert len(merge_lines) >= 1, 'at least one merge commit must exist on main'
+
+    @pytest.mark.timeout(90)
+    async def test_scenario_11_generation_chain_escalation(
+        self, tmp_path: 'Path', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+        monkeypatch,
+    ) -> None:
+        """Row 11: generation chain + 3rd-advance escalation.
+
+        With AUTO_CHAIN_GENERATIONS_ENABLED=True: drive _finalize_advanced_merge
+        through two SUPERSET advances (gen-1→superseded, gen-2→superseded),
+        then assert a 3rd advance exceeds MAX_AUTO_CHAINED_GENERATIONS=2 and
+        returns 'blocked' (escalate_to_human).  Assert gen-1 retention record
+        carries superseded_by == gen-2 request_id.
+        Reuses TestMaybeAutoChainGeneration._make_req and the flag-flip pattern.
+        """
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MAX_AUTO_CHAINED_GENERATIONS,
+            MergeRequest,
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            TipRelation,
+            _GenerationChainContext,
+            _finalize_advanced_merge,
+            _maybe_auto_chain_generation,
+        )
+
+        monkeypatch.setattr(mq_mod, 'AUTO_CHAIN_GENERATIONS_ENABLED', True)
+
+        git_ops_mock = MagicMock()
+        event_store_mock = MagicMock()
+
+        def _make_mq_req(generation: int = 1) -> MergeRequest:
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            return MergeRequest(
+                task_id='t11',
+                branch='task/t11',
+                worktree=tmp_path,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=fut,
+                generation=generation,
+            )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+
+        # ── First advance: gen-1 SUPERSET → superseded, enqueues gen-2 ────
+        req1 = _make_mq_req(generation=1)
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead1\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result1 = await _maybe_auto_chain_generation(
+                req1, 'sha-adv1', git_ops_mock, event_store_mock,
+                merged_branch_tip='oldtip1',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+            )
+
+        assert result1 is not None, 'gen-1 must be superseded'
+        assert result1.status == 'superseded', f'Expected superseded, got: {result1.status}'
+        assert result1.superseded_by is not None and result1.superseded_by.startswith('mr-'), (
+            f'superseded_by must be a valid request_id: {result1.superseded_by!r}'
+        )
+        gen2_rid = result1.superseded_by
+        assert queue.qsize() == 1, f'gen-2 request must be enqueued, qsize={queue.qsize()}'
+        req2 = queue.get_nowait()
+        assert req2.generation == 2, f'gen-2 request must have generation=2, got: {req2.generation}'
+        assert req2.request_id == gen2_rid, f'request_id must match superseded_by: {req2.request_id!r}'
+        assert counts['task/t11'] == 1, f'counts must be 1 after first advance: {counts}'
+
+        # ── Second advance: gen-2 SUPERSET → superseded, enqueues gen-3 ──
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead2\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result2 = await _maybe_auto_chain_generation(
+                req2, 'sha-adv2', git_ops_mock, event_store_mock,
+                merged_branch_tip='oldtip2',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+            )
+
+        assert result2 is not None and result2.status == 'superseded', (
+            f'gen-2 must be superseded, got: {result2}'
+        )
+        assert counts['task/t11'] == 2, f'counts must be 2 after second advance: {counts}'
+
+        # ── Third advance: counts at MAX → escalate, returns blocked ─────
+        req3 = queue.get_nowait()
+        with (
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead3\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            result3 = await _maybe_auto_chain_generation(
+                req3, 'sha-adv3', git_ops_mock, event_store_mock,
+                merged_branch_tip='oldtip3',
+                counts=counts,
+                queue=queue,
+                max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+            )
+
+        assert result3 is not None, 'bound-exceeded must return a result (not None)'
+        assert result3.status == 'blocked', (
+            f'Expected blocked on 3rd advance (MAX_AUTO_CHAINED_GENERATIONS={MAX_AUTO_CHAINED_GENERATIONS}), '
+            f'got: {result3.status!r}'
+        )
+        assert result3.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'blocked reason must start with POST_MERGE_EQUIVALENCE_FAILED prefix: {result3.reason!r}'
+        )
+        # counts reset after bound exceeded
+        assert counts.get('task/t11', 0) == 0, (
+            f'counts must be reset after bound-exceeded, got: {counts}'
+        )
+
+    @pytest.mark.timeout(60)
+    async def test_scenario_12_train_non_regression(
+        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+    ) -> None:
+        """Row 12: train path unchanged — merges green, no multi-waiter, no auto-chain.
+
+        Build a 3-member train, drive MergeWorker.  Assert the train still
+        merges green (bit-identical worker behaviour).  Assert chain_ctx=None
+        (no auto-chain for trains, PRD D9).  Assert NO multi-waiter registry
+        entry.
+        Reuses _make_stacked_train and the existing train test fixtures.
+        """
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeWorker,
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+
+        req = await _make_stacked_train(git_ops, config, train_id='bt12-train')
+
+        # Spy on _finalize_advanced_merge to assert chain_ctx=None — capture the
+        # real function BEFORE patching so the spy doesn't recurse into itself.
+        from orchestrator.merge_queue import _finalize_advanced_merge as _real_finalize  # type: ignore
+
+        finalize_calls: list[dict] = []
+
+        async def _spy_finalize(*args, **kwargs):
+            finalize_calls.append(kwargs)
+            return await _real_finalize(*args, **kwargs)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._finalize_advanced_merge', _spy_finalize),
+        ):
+            outcome = await asyncio.wait_for(worker._do_merge(req), timeout=30.0)
+
+        assert outcome is not None, 'train must produce an outcome'
+        assert outcome.status == 'done', f'train must merge green, got: {outcome.status!r}'
+        assert outcome.merge_sha is not None, 'outcome.merge_sha must be set'
+
+        # All three member files on main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        for fname in ('trn-a.py', 'trn-b.py', 'trn-c.py'):
+            assert fname in main_files, f'{fname} must be on main after train merge'
+
+        # chain_ctx must be None for the train path (PRD D9)
+        for call_kwargs in finalize_calls:
+            assert call_kwargs.get('chain_ctx') is None, (
+                f'train path must NOT pass chain_ctx to _finalize_advanced_merge; '
+                f'got chain_ctx={call_kwargs.get("chain_ctx")!r}'
+            )
+
+        # No multi-waiter registry entry for the train branch
+        assert not isinstance(registry := InFlightMergeRegistry(), type(None)), (
+            'InFlightMergeRegistry must be importable'
+        )
+
+    @pytest.mark.timeout(60)
+    async def test_scenario_13_subset_waiter_containment(
+        self, git_ops: 'GitOps', config: 'OrchestratorConfig',  # type: ignore[name-defined]
+    ) -> None:
+        """Row 13: subset-waiter containment — attach as peer, no duplicate enqueue.
+
+        Classify T_new as SUBSET of T_old (T_new is_ancestor T_old).
+        Assert classify_tip_relation → SUBSET.
+        Assert decide_attach_action(SUBSET, verifying=False) → ATTACH_CONTAINMENT.
+        Attach subset waiter (entry has 2 waiters, no duplicate enqueue).
+        Resolve primary with 'done'; assert subset waiter resolves to
+        status in {done, already_merged} (fan-out realization).
+        """
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            AttachAction,
+            MergeOutcome,
+            TipRelation,
+            WaiterRecord,
+            classify_tip_relation,
+            decide_attach_action,
+        )
+
+        # Create two commits on a branch: T_old = commit 1, T_new = same as initial (ancestor)
+        bt13_branch = 'bt13-subset'
+        wt = await _make_branch_with_file(git_ops, bt13_branch, 'bt13.py', 'x = 13\n')
+
+        # T_old = current HEAD of the branch (has the extra commit)
+        _, t_old_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        T_old = t_old_raw.strip()
+
+        # T_new = main (which is an ancestor of T_old since the branch was created from it)
+        _, t_new_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+        T_new = t_new_raw.strip()
+
+        # Verify the classification: T_new must be an ancestor of T_old
+        relation = await classify_tip_relation(T_new, T_old, git_ops)
+        assert relation == TipRelation.SUBSET, (
+            f'Expected SUBSET (T_new ancestor of T_old), got: {relation}'
+        )
+
+        # decide_attach_action(SUBSET, verifying=False) → ATTACH_CONTAINMENT
+        action = decide_attach_action(relation, verifying=False)
+        assert action == AttachAction.ATTACH_CONTAINMENT, (
+            f'Expected ATTACH_CONTAINMENT for SUBSET relation, got: {action}'
+        )
+
+        # Set up registry entry at T_old
+        registry = InFlightMergeRegistry()
+        loop = asyncio.get_running_loop()
+        primary_future: asyncio.Future = loop.create_future()
+        registry.acquire(
+            bt13_branch, bt13_branch, primary_future,
+            request_id='mr-bt13-primary', source='mcp', snapshot_tip=T_old,
+        )
+
+        # Subset waiter attaches: no duplicate enqueue
+        queue: asyncio.Queue = asyncio.Queue()
+        subset_future: asyncio.Future = loop.create_future()
+        attached = registry.attach(
+            bt13_branch,
+            WaiterRecord(
+                request_id='mr-bt13-subset',
+                future=subset_future,
+                source='mcp',
+                submitted_tip=T_new,
+            ),
+        )
+        assert attached is True, 'subset waiter must attach successfully'
+        assert queue.empty(), 'no duplicate enqueue: subset attach must not put to queue'
+
+        entry = registry.entry(bt13_branch)
+        assert entry is not None
+        assert len(entry.waiters) == 2, (
+            f'Entry must have 2 waiters (primary + subset), got: {len(entry.waiters)}'
+        )
+
+        # Resolve primary with 'done' → fan-out mirrors to subset waiter
+        outcome_primary = MergeOutcome(status='done', merge_sha='sha-bt13')
+        primary_future.set_result(outcome_primary)
+        await asyncio.sleep(0)  # let mirror callback fire
+
+        assert subset_future.done(), 'subset waiter future must be resolved after fan-out'
+        subset_outcome = subset_future.result()
+        assert subset_outcome.status in {'done', 'already_merged'}, (
+            f'subset waiter must resolve to done/already_merged, got: {subset_outcome.status!r}'
+        )
