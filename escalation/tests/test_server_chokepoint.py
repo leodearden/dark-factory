@@ -1609,6 +1609,71 @@ class TestMergeCancel:
             f"Expected non-empty reason for mid-finalize window, got: {result}"
         )
 
+    async def test_cancel_mid_finalize_window_excepted_future_returns_blocked(
+        self, tmp_path: Path
+    ):
+        """Mid-finalize window: excepted future (abnormal) returns state='blocked'.
+
+        Exercises the defensive sub-path in the mid-finalize branch:
+        ``rec.future.exception() is not None → state='blocked'``.  This case
+        cannot arise via the normal MergeWorker path, but the branch exists to
+        keep the tool exception-free when a future is resolved with an exception
+        rather than a MergeOutcome result.
+
+        Steps: acquire merge_cancel tool up front; submit merge_request(wait_secs=0);
+        drain mq; call req.result.set_exception(RuntimeError(...)); immediately call
+        merge_cancel (no awaited suspension).  Must return
+        {cancelled: False, state: 'blocked', reason: <non-empty>}.
+
+        Previously untested: the existing test only covers set_result(MergeOutcome)
+        (the normal-outcome sub-path).  This test exercises the excepted-future branch.
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]  # noqa: F401
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        # Acquire the tool up front — no awaited suspension until .fn() call
+        tool = await server.get_tool('merge_cancel')
+
+        result_mr = await _call_merge_request(
+            server,
+            task_id='c4',
+            branch='c4',
+            worktree=str(tmp_path / 'wt-c4'),
+            wait_secs=0,
+        )
+        rid = result_mr['request_id']
+
+        # Drain and set an exception on the future (abnormal mid-finalize window)
+        req = mq.get_nowait()
+        req.result.set_exception(RuntimeError('worker exploded'))
+        assert req.result.done() and not req.result.cancelled(), (
+            'Prerequisite: future must be done (excepted) for this test'
+        )
+
+        # Immediately cancel (no awaited suspension between set_exception and .fn())
+        result = await tool.fn(request_id=rid)  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+
+        assert result.get('cancelled') is False, (
+            f"Expected cancelled=False for excepted-future mid-finalize, got: {result}"
+        )
+        assert result.get('state') == 'blocked', (
+            f"Expected state='blocked' for excepted future, got: {result}"
+        )
+        assert result.get('reason'), (
+            f"Expected non-empty reason for excepted-future mid-finalize, got: {result}"
+        )
+
     async def test_cancel_finalized_popped_id_resolves_via_durable_tier(self, tmp_path: Path):
         """Cancelling a finalized+popped request_id returns the durable terminal state.
 
@@ -1661,6 +1726,96 @@ class TestMergeCancel:
         result_never = await _call_merge_cancel(server, request_id='mr-never')
         assert result_never.get('state') == 'unknown', (
             f"Expected state='unknown' for truly unknown id, got: {result_never}"
+        )
+
+    async def test_cancel_finalized_popped_id_resolves_via_retention_ring(
+        self, tmp_path: Path
+    ):
+        """Cancelling a finalized+popped id resolves via the retention ring (Tier 2).
+
+        Injects a fake harness whose ``_terminal_retention`` ring returns a record for
+        'mr-ring-hit' (state='done') and a fake event_store that would return 'conflict'
+        for the same id.  The ring (Tier 2) must take precedence over the event_store
+        (Tier 3).
+
+        Also asserts:
+          - 'mr-store-only' (ring miss, event_store hit) returns state='conflict'.
+          - 'mr-never' (both miss) returns state='unknown'.
+
+        Previously untested: test_cancel_finalized_popped_id_resolves_via_durable_tier
+        covers the event_store-only path but not the retention-ring path.  A regression
+        in the ring branch (e.g. wrong attribute name, wrong precedence) would go
+        undetected without this test.
+        """
+
+        class FakeRetentionRecord:
+            def __init__(self, request_id: str, state: str) -> None:
+                self.request_id = request_id
+                self.state = state
+                self.finished_at = 1_700_000_000.0  # epoch float — normalised by _epoch_to_iso8601
+
+        class FakeRetentionRing:
+            def get(self, request_id: str):
+                if request_id == 'mr-ring-hit':
+                    return FakeRetentionRecord('mr-ring-hit', 'done')
+                return None
+
+        class FakeHarness:
+            _terminal_retention = FakeRetentionRing()
+
+        class FakeEventStore:
+            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
+                if request_id == 'mr-ring-hit':
+                    # Ring takes precedence — this row must NOT be returned
+                    return {
+                        'request_id': request_id,
+                        'state': 'conflict',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                if request_id == 'mr-store-only':
+                    return {
+                        'request_id': request_id,
+                        'state': 'conflict',
+                        'finished_at': '2026-01-01T00:00:00+00:00',
+                    }
+                return None
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            harness=FakeHarness(),
+            event_store=FakeEventStore(),
+        )
+
+        # Ring hit: returns state='done' from ring (not 'conflict' from event_store)
+        result_ring = await _call_merge_cancel(server, request_id='mr-ring-hit')
+        assert result_ring.get('cancelled') is False, (
+            f"Expected cancelled=False for finalized ring-hit id, got: {result_ring}"
+        )
+        assert result_ring.get('state') == 'done', (
+            f"Expected state='done' from retention ring (Tier 2), got: {result_ring}"
+        )
+        assert result_ring.get('reason'), (
+            f"Expected non-empty reason for finalized ring-hit id, got: {result_ring}"
+        )
+
+        # Event-store only: ring misses, falls through to event_store
+        result_store = await _call_merge_cancel(server, request_id='mr-store-only')
+        assert result_store.get('state') == 'conflict', (
+            f"Expected state='conflict' from event_store (Tier 3), got: {result_store}"
+        )
+
+        # Truly unknown: both tiers miss
+        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        assert result_never.get('state') == 'unknown', (
+            f"Expected state='unknown' when both durable tiers miss, got: {result_never}"
         )
 
 
