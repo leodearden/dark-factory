@@ -1246,18 +1246,38 @@ def create_server(
 
     @mcp.tool()
     async def merge_cancel(request_id: str) -> dict[str, Any]:
-        """Cancel an in-flight merge request by cancelling its waiter future.
+        """Cancel an in-flight merge request by its request_id.
 
-        Looks up the waiter registered by merge_request for *request_id* in the
-        server-side _waiters store and cancels its future.  This triggers, via
-        callbacks already wired by α1/β1:
+        Accepts a single *request_id* parameter (authoritative merge-request identifier
+        returned by merge_request).  Returns a dict with three fields:
+
+            cancelled (bool)  — True only when a pending waiter was successfully cancelled.
+            state     (str)   — Coarse terminal state in the same vocabulary as merge_status:
+                                'abandoned' | 'done' | 'conflict' | 'blocked' | 'unknown'
+            reason    (str|None) — None on success; non-None string on every other path.
+
+        Branch order (all paths return — never raises):
+          1. Waiter absent from _waiters (finalized+popped, never submitted, or server
+             restarted): consult durable tiers (_terminal_state_for_request, which mirrors
+             merge_status Tiers 2–3: retention ring → event_store) to distinguish
+             'already-terminal' from truly 'unknown'.
+          2. Waiter present, future already cancelled (idempotent double-cancel):
+             {cancelled: False, state: 'abandoned', reason: ...}.
+          3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
+             worker delivered an outcome but the _waiters.pop done-callback hasn't run yet):
+             {cancelled: False, state: <coarse terminal via _map_terminal_state>, reason: ...}.
+          4. Waiter present, future pending: cancel the future, return
+             {cancelled: True, state: 'abandoned', reason: None}.
+
+        AUTOMATIC CONSEQUENCES of cancelling the future (NOT implemented here — covered by
+        α1/β1 callbacks and tested in test_merge_queue.py:4520/:4601):
           - MergeWorker._request_abandoned: drops the request without halting the queue
           - InFlightMergeRegistry: releases the branch slot via the acquire-time done-cb
           - _on_finalized: records terminal state 'abandoned' to retention/event-store
 
-        Returns {cancelled: bool, state: str, reason: str | None}.
-        reason is None only on a successful cancel; always present otherwise.
-        state uses the same coarse vocabulary as merge_status (reusing _map_terminal_state).
+        The tool is async so that future mutation runs on the event loop (not a FastMCP
+        threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
+        contains no await, preserving loop-synchronous race-freedom (I10).
         """
         rec = _waiters.get(request_id)
 
