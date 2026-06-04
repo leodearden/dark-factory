@@ -4385,7 +4385,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
                 if item.immediate_outcome is not None:
-                    if not req.result.done():
+                    if not item.already_delivered and not req.result.done():
                         req.result.set_result(item.immediate_outcome)
                     n_failed = item.immediate_outcome.status not in ('done', 'already_merged')
                     continue  # finally will call _speculation_slot.set()
