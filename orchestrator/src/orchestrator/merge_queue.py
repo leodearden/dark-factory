@@ -1511,7 +1511,17 @@ Adjusted at module level or injected via `liveness_secs` in tests."""
 
 @dataclass
 class _InFlightEntry:
-    """Registry slot for a single in-flight merge branch."""
+    """Registry slot for a single in-flight merge branch.
+
+    γ1 extended fields (all have defaults — existing callers unaffected):
+    - ``branch`` / ``snapshot_tip`` / ``generation`` / ``verifying``:
+      substrate for the PRD §7.2 multi-waiter coalescing model.
+    - ``waiters``: ordered list of :class:`WaiterRecord` objects; the
+      dispatcher is seeded as waiter #1 by :meth:`InFlightMergeRegistry.acquire`.
+    - ``primary_future``: the future owned by the dispatcher (waiter #1).
+      Stored so :meth:`~InFlightMergeRegistry.attach` can mirror its
+      terminal outcome onto all later waiters' futures.
+    """
 
     task_id: str
     enqueued_monotonic: float  # time.monotonic() at acquire time
@@ -1519,6 +1529,24 @@ class _InFlightEntry:
     """Stable identity of the dispatched MergeRequest (e.g. 'mr-a1b2c3d4').
     Set at acquire time from the MergeRequest.request_id; None for legacy
     callers that don't pass a request_id (back-compat)."""
+    # ── γ1 multi-waiter substrate ─────────────────────────────────────────
+    branch: str | None = None
+    """Branch name (e.g. '591'), set at acquire time."""
+    snapshot_tip: str | None = None
+    """Git SHA of the branch tip at acquire time (PRD §7.2 snapshot_tip)."""
+    generation: int = 1
+    """Monotonically increasing generation counter; incremented on each
+    re-snapshot that triggers a new merge attempt (γ2)."""
+    verifying: bool = False
+    """True once the merge worker has entered the post-merge verify phase.
+    Used by :func:`decide_attach_action` to choose ATTACH_AND_CHAIN vs
+    RESNAPSHOT for SUPERSET incoming submissions (γ2)."""
+    waiters: list[WaiterRecord] = field(default_factory=list)
+    """Ordered list of waiters; dispatcher is waiter #1 (seeded by
+    :meth:`InFlightMergeRegistry.acquire`).  Empty ⟺ released."""
+    primary_future: asyncio.Future | None = field(default=None, repr=False)
+    """The dispatcher's future (waiter #1).  Resolved by the worker;
+    its done-callbacks fan the terminal outcome out to all attached waiters."""
 
 
 _INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
@@ -1606,6 +1634,9 @@ class InFlightMergeRegistry:
         future: asyncio.Future,
         *,
         request_id: str | None = None,
+        source: str = 'mcp',
+        submitted_tip: str | None = None,
+        snapshot_tip: str | None = None,
     ) -> bool:
         """Atomic check-and-set: claim *branch* for *task_id*.
 
@@ -1620,16 +1651,37 @@ class InFlightMergeRegistry:
         :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
         :class:`_InFlightEntry` so β1 can re-source the ``'attached'``
         response from the existing entry's id rather than the submitting
-        request's id (PRD D8).  Keyword-only; defaults to ``None`` so
-        existing 3-positional-arg callers remain valid.
+        request's id (PRD D8).
+
+        γ1 additions (keyword-only, all defaulted for back-compat):
+        - *source*: origin of the dispatcher (``'mcp'`` or ``'workflow'``).
+        - *submitted_tip*: branch tip SHA at submit time; used for
+          tip-relation classification downstream.
+        - *snapshot_tip*: branch tip SHA snapshotted at dispatch time
+          (often the same as *submitted_tip*); stored on the entry for
+          re-snapshot / gen-2 chaining (γ2).
+
+        The dispatcher is seeded as waiter #1 in ``entry.waiters``; the
+        entry invariant is ``in-flight ⟺ len(waiters) ≥ 1``.
         """
         if branch in self._slots:
             return False
-        self._slots[branch] = _InFlightEntry(
+        entry = _InFlightEntry(
             task_id=task_id,
             enqueued_monotonic=time.monotonic(),
             request_id=request_id,
+            branch=branch,
+            snapshot_tip=snapshot_tip,
+            generation=1,
+            primary_future=future,
         )
+        entry.waiters = [WaiterRecord(
+            request_id=request_id or '',
+            future=future,
+            source=source,
+            submitted_tip=submitted_tip,
+        )]
+        self._slots[branch] = entry
         future.add_done_callback(lambda _: self._release(branch))
         return True
 

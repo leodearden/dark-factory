@@ -10492,3 +10492,64 @@ class TestWaiterRecordContract:
         assert wr.future is fut
         assert wr.source == 'workflow'
         assert wr.submitted_tip == 'abc123def456'
+
+
+# ---------------------------------------------------------------------------
+# TestMultiWaiterEntry — γ1 step-1 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMultiWaiterEntry:
+    """γ1 step-1 RED: extended _InFlightEntry fields + acquire seeding.
+
+    RED until step-2 impl: _InFlightEntry has no snapshot_tip/generation/
+    verifying/waiters/primary_future fields; acquire does not seed a waiter.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_acquire_seeds_entry_fields(self):
+        """acquire with new kw-args seeds all extended fields correctly."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire(
+            'B', 'task-B', fut,
+            request_id='mr-1',
+            source='workflow',
+            submitted_tip='deadbeef',
+            snapshot_tip='deadbeef',
+        )
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.snapshot_tip == 'deadbeef'
+        assert entry.generation == 1
+        assert entry.verifying is False
+        assert entry.primary_future is fut
+        assert len(entry.waiters) == 1
+        w = entry.waiters[0]
+        assert w.request_id == 'mr-1'
+        assert w.source == 'workflow'
+        assert w.submitted_tip == 'deadbeef'
+        assert w.future is fut
+
+    async def test_acquire_back_compat_three_positional_args(self):
+        """Back-compat: 3 positional args + no kw still returns True, seeds one waiter."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+
+        result = registry.acquire('C', 'task-C', fut)
+
+        assert result is True
+        entry = registry.entry('C')
+        assert entry is not None
+        assert len(entry.waiters) == 1
+        w = entry.waiters[0]
+        assert w.source == 'mcp'         # default
+        assert w.submitted_tip is None   # default
+        assert w.future is fut
