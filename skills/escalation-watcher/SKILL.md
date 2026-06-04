@@ -387,7 +387,7 @@ This is distinct from `review_suggestions` (info-level, non-blocking). Review is
 
 **Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
 
-**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
+If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
 ### `task_failure` (blocking)
 
@@ -395,7 +395,7 @@ Merge conflicts, verification failures, build breaks. The task agent is stopped 
 
 **Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
 
-**In AFK mode:** try the low-risk auto-unblock gate first (see [AFK Mode](#afk-mode-extended-unattended-operation)). Spawn the interactive session only when a human is present; otherwise, if the gate doesn't qualify or the sub-agent aborts, leave the escalation pending and add it to the digest.
+If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
 ### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
 
