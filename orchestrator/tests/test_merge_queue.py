@@ -3695,6 +3695,48 @@ class TestSpeculativeMergeWorker:
             'The done-callback must fire before the verifier drains the FIFO token.'
         )
 
+    async def test_oob_deliver_status_guard_blocks_done_and_already_merged(
+        self,
+    ) -> None:
+        """_oob_deliver returns False for 'done'/'already_merged' outcomes.
+
+        Locks the status-guard clause independently of the isinstance guard:
+        even when req is a non-GroupMergeRequest and speculative=False, a
+        'done' or 'already_merged' outcome must NOT be OOB-delivered.
+
+        RED without the status-guard: returns True and resolves req.result.
+        """
+        from unittest.mock import MagicMock
+
+        worker = SpeculativeMergeWorker(MagicMock(), MagicMock())
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MagicMock(spec=MergeRequest)
+        req.result = future
+
+        result = worker._oob_deliver(req, MergeOutcome('already_merged'), speculative=False)
+
+        assert result is False, (
+            '_oob_deliver must return False for already_merged outcome '
+            '(status-guard clause); status guard must block OOB delivery'
+        )
+        assert not future.done(), (
+            'req.result must remain pending — _oob_deliver must not call '
+            'set_result for already_merged outcome'
+        )
+
+        # Verify 'done' outcome is equally excluded
+        future2: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req2 = MagicMock(spec=MergeRequest)
+        req2.result = future2
+
+        result2 = worker._oob_deliver(req2, MergeOutcome('done'), speculative=False)
+
+        assert result2 is False, (
+            '_oob_deliver must return False for done outcome (status-guard clause)'
+        )
+        assert not future2.done(), 'req.result must remain pending for done outcome'
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields

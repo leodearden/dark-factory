@@ -3869,10 +3869,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         'done'/'already_merged' are excluded because they are either never
         produced here or are already handled at the door.
 
-        Returns True (already_delivered flag) only when the precondition
-        holds and set_result was called.  The caller passes the return value
-        as already_delivered on the SpeculativeItem ordering token so the
-        verifier skips set_result but still runs n_failed/slot bookkeeping.
+        Returns True when the OOB precondition holds (the verifier must skip
+        set_result), regardless of whether set_result was actually invoked
+        here — the result may already be resolved by a peer/door.  The caller
+        passes the return value as already_delivered on the SpeculativeItem
+        ordering token so the verifier skips set_result but still runs
+        n_failed/slot bookkeeping.
         """
         if (
             isinstance(req, GroupMergeRequest)
@@ -4387,6 +4389,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item.immediate_outcome is not None:
                     if not item.already_delivered and not req.result.done():
                         req.result.set_result(item.immediate_outcome)
+                    # immediate_outcome is always identical to the OOB-delivered
+                    # outcome at every _oob_deliver call site; no divergence today.
                     n_failed = item.immediate_outcome.status not in ('done', 'already_merged')
                     continue  # finally will call _speculation_slot.set()
 
