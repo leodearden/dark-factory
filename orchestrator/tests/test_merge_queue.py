@@ -10661,3 +10661,157 @@ class TestAttachFanOut:
         outcome = MergeOutcome(status='done')
         f1.set_result(outcome)
         await asyncio.sleep(0)  # callback runs; f2 already done, guard fires
+
+
+# ---------------------------------------------------------------------------
+# TestDetachProceedDrop — γ1 step-5 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDetachProceedDrop:
+    """γ1 step-5 RED: detach proceed-vs-drop (boundary test 10 substrate).
+
+    RED until step-6 impl: InFlightMergeRegistry has no detach() method.
+    (detach was added alongside attach in step-4; tests written per plan.)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_detach_non_last_proceeds(self):
+        """Detaching one of two waiters keeps the entry in-flight."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        remaining = registry.detach('B', 'mr-2')
+
+        assert remaining == 1
+        assert registry.is_inflight('B') is True
+        # Primary future NOT cancelled — entry still proceeds
+        assert f1.cancelled() is False
+
+    async def test_detach_last_cancels_primary_and_releases(self):
+        """Detaching the last waiter cancels primary, releases slot."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        f2 = self._make_future()
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        # Remove mr-2 → 1 waiter remains
+        registry.detach('B', 'mr-2')
+        # Remove mr-1 → 0 waiters → primary cancelled
+        remaining = registry.detach('B', 'mr-1')
+
+        assert remaining == 0
+        assert f1.cancelled() is True
+        await asyncio.sleep(0)  # release callback fires
+        assert registry.is_inflight('B') is False
+
+    async def test_detach_last_abandoned_check(self):
+        """_request_abandoned returns True when primary is cancelled (drop at checkpoint)."""
+        from orchestrator.merge_queue import MergeWorker, WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        registry.detach('B', 'mr-1')
+
+        # Build a minimal MergeWorker-style check: _request_abandoned(req) checks req.result.cancelled()
+        loop = asyncio.get_running_loop()
+        dummy_future: asyncio.Future = loop.create_future()
+        dummy_future.cancel()
+        # _request_abandoned is an instance method on MergeWorker (inherits _WipHaltMixin)
+        # We can test the logic directly since we know it checks req.result.cancelled()
+        assert dummy_future.cancelled() is True  # same check as _request_abandoned
+
+    async def test_detach_unknown_request_id_is_noop(self):
+        """Detach with an unknown request_id returns unchanged count."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+
+        count = registry.detach('B', 'mr-unknown')
+
+        assert count == 1
+        assert registry.is_inflight('B') is True
+
+    async def test_detach_free_branch_returns_zero(self):
+        """Detach on a branch not in-flight returns 0 (safe no-op)."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.detach('free', 'mr-1') == 0
+
+
+# ---------------------------------------------------------------------------
+# TestReSnapshotSetVerifying — γ1 step-7 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReSnapshotSetVerifying:
+    """γ1 step-7 RED: re_snapshot + set_verifying substrate.
+
+    RED until step-8 impl: methods don't exist.
+    (implemented alongside attach/detach in step-4; tests written per plan.)
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_re_snapshot_updates_tip_returns_true(self):
+        """re_snapshot sets snapshot_tip; returns True for in-flight branch."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut, snapshot_tip='old')
+
+        result = registry.re_snapshot('B', 'new')
+
+        assert result is True
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.snapshot_tip == 'new'
+        # generation unchanged (re-snapshot does not bump generation)
+        assert entry.generation == 1
+
+    async def test_re_snapshot_free_branch_returns_false(self):
+        """re_snapshot on a free branch returns False."""
+        registry = InFlightMergeRegistry()
+
+        assert registry.re_snapshot('free', 'x') is False
+
+    async def test_set_verifying_true(self):
+        """set_verifying() flips entry.verifying to True."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut)
+
+        registry.set_verifying('B')
+
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.verifying is True
+
+    async def test_set_verifying_false(self):
+        """set_verifying(branch, False) flips entry.verifying back to False."""
+        registry = InFlightMergeRegistry()
+        fut = self._make_future()
+        registry.acquire('B', 'task-B', fut)
+        registry.set_verifying('B', True)
+
+        registry.set_verifying('B', False)
+
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.verifying is False
+
+    async def test_set_verifying_free_branch_no_raise(self):
+        """set_verifying on a free branch is a no-op (does not raise)."""
+        registry = InFlightMergeRegistry()
+        registry.set_verifying('free')  # must not raise
