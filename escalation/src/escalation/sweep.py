@@ -102,6 +102,59 @@ def _atomic_move(src: Path, dst: Path) -> None:
             raise
 
 
+def _relocate_terminal(
+    queue_dir: Path,
+    path: Path,
+    esc: Escalation,
+    *,
+    apply: bool = True,
+) -> bool:
+    """Relocate a terminal esc file to its dated archive subdir.
+
+    Shared by ``sweep()``'s archive-missing branch and ``reap_loose_archive_files()``
+    to avoid the two copies drifting independently.
+
+    Performs target path computation, collision guard (checked **inside** the
+    per-id lock to close the TOCTOU window), and the locked atomic move.
+
+    Pre-conditions (verified by caller):
+        - ``esc.status`` is ``'resolved'`` or ``'dismissed'``
+        - ``esc.resolved_at`` is not ``None``
+
+    Args:
+        queue_dir: Root queue directory (parent of ``archive/``).
+        path: Source file path to relocate.
+        esc: Parsed escalation record.
+        apply: If True, actually move the file; if False, only check (dry-run).
+
+    Returns:
+        ``True`` if the file was (or would be) moved; ``False`` if skipped due
+        to a collision — the existing target is left untouched.
+    """
+    target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
+    target_path = target_dir / path.name
+
+    if apply:
+        with escalation_id_lock(queue_dir, path.stem):
+            # Re-check inside the lock to close the TOCTOU window: a concurrent
+            # writer could have created target_path between our pre-check and
+            # acquiring the lock.
+            if target_path.exists():
+                logger.warning(
+                    'skipping %s: target already exists at %s (not overwriting)',
+                    path.name, target_path,
+                )
+                return False
+            target_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_move(path, target_path)
+    else:
+        # Dry-run: check for collisions without acquiring the lock.
+        if target_path.exists():
+            return False
+
+    return True
+
+
 def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     """Sweep resolved/dismissed escalations from queue root to archive.
 
@@ -144,13 +197,12 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
             existing_archive = archive_index.get(path.stem)
 
             if existing_archive is None:
-                # No archive copy: move to dated subdir
-                target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
-                if apply:
-                    with escalation_id_lock(queue_dir, path.stem):
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        _atomic_move(path, target_dir / path.name)
-                report.archived += 1
+                # No archive copy: move to dated subdir via shared helper.
+                # The helper re-checks for collisions inside the per-id lock so
+                # a file that appeared between index-build and lock-acquire is
+                # detected atomically (TOCTOU safe).
+                if _relocate_terminal(queue_dir, path, esc, apply=apply):
+                    report.archived += 1
             else:
                 # Archive copy exists: compare richness
                 archive_esc = Escalation.from_json(existing_archive.read_text())
@@ -273,9 +325,13 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
         return 0
 
     moved = 0
+    # Materialize the glob before iterating so the directory scan completes
+    # before any moves occur — mutating a directory during os.scandir/readdir
+    # has unspecified behaviour on some filesystems and can cause subsequent
+    # sibling entries to be skipped (mirrors sweep()'s `root_files = list(...)` pattern).
     # Only glob the archive top level — non-recursive, so dated-subdir files
     # are excluded (the glob `esc-*.json` does not recurse into subdirs).
-    for path in archive_root.glob('esc-*.json'):
+    for path in list(archive_root.glob('esc-*.json')):
         try:
             esc = Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -294,21 +350,10 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
             )
             continue
 
-        target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
-        target_path = target_dir / path.name
-
-        if target_path.exists():
-            logger.warning(
-                'reap_loose: skipping %s: target already exists at %s (not overwriting)',
-                path.name, target_path,
-            )
-            continue
-
-        if apply:
-            with escalation_id_lock(queue_dir, path.stem):
-                target_dir.mkdir(parents=True, exist_ok=True)
-                _atomic_move(path, target_path)
-        moved += 1
+        # _relocate_terminal handles the collision guard inside the per-id lock
+        # (closing the TOCTOU window) and performs the atomic move.
+        if _relocate_terminal(queue_dir, path, esc, apply=apply):
+            moved += 1
 
     return moved
 

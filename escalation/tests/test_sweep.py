@@ -594,6 +594,73 @@ class TestReapLooseArchiveFiles:
         # But count is 1 (would-move)
         assert count == 1
 
+    def test_collision_target_already_exists_leaves_loose_untouched(self, tmp_path: Path):
+        """Safety-critical: if target dated-subdir file already exists, loose file is NOT overwritten."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-5-1.json'
+        esc = Escalation(
+            id='esc-5-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='collision test',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        loose_path.write_text(esc.to_json())
+
+        # Pre-create the target file with sentinel bytes distinct from the loose copy
+        target_dir = archive_root / '2026-05-20'
+        target_dir.mkdir(parents=True)
+        target_path = target_dir / 'esc-5-1.json'
+        target_bytes = b'{"existing": "sentinel"}'
+        target_path.write_bytes(target_bytes)
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # Loose file is left in place — never moved when target exists
+        assert loose_path.exists()
+        # Count is 0 — collision guard fired
+        assert count == 0
+        # Existing target bytes are unchanged — no data loss
+        assert target_path.read_bytes() == target_bytes
+
+    def test_non_terminal_status_left_in_place(self, tmp_path: Path):
+        """Loose archive file with non-terminal status (pending) is skipped and not counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-6-1.json'
+        esc = Escalation(
+            id='esc-6-1',
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='pending loose file',
+            status='pending',
+            resolved_at=None,
+        )
+        loose_path.write_text(esc.to_json())
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        assert loose_path.exists()
+        assert count == 0
+
+    def test_unparsable_json_left_in_place(self, tmp_path: Path):
+        """Loose archive file with unparsable JSON is skipped and not counted."""
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        loose_path = archive_root / 'esc-7-1.json'
+        loose_path.write_bytes(b'{not valid json')
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        assert loose_path.exists()
+        assert count == 0
+
 
 class TestSweepRelocationLock:
     """sweep.sweep relocations must take the per-id sidecar lock."""
