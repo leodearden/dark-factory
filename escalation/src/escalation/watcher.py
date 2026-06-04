@@ -168,13 +168,13 @@ def main() -> None:
 
         for event in events:
             name = event.name
-            if not name or not name.endswith('.json'):
+            if not name or not (name.startswith('esc-') and name.endswith('.json')):
                 continue
 
             path = queue_dir / name
             try:
                 esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, OSError):
+            except (json.JSONDecodeError, KeyError, OSError, TypeError):
                 continue
 
             if not _matches(esc, args.task_id, args.level):

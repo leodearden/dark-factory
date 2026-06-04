@@ -393,6 +393,52 @@ class TestTimeout:
 
         mock_inotify.read.assert_called_once_with(timeout=None)
 
+    def test_timeout_with_matching_event_exits_0(
+        self, tmp_path, blocking_escalation: Escalation, capsys
+    ):
+        """--timeout set AND matching event arrives before deadline -> exit 0 + JSON."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        # Pre-create the escalation file so the event loop can read it
+        esc_path = queue_dir / f'{blocking_escalation.id}.json'
+        esc_path.write_text(blocking_escalation.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{blocking_escalation.id}.json'
+
+        # monotonic sequence: first call sets deadline = 0.0 + 5.0 = 5.0;
+        # second call in the loop -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500
+        monotonic_values = iter([0.0, 0.5])
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+        ):
+            mock_inotify = MockINotify.return_value
+            # read returns a matching event on the first call
+            mock_inotify.read.return_value = [mock_event]
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 0
+
+        # stdout contains the escalation JSON
+        captured = capsys.readouterr()
+        assert blocking_escalation.id in captured.out
+        data = json.loads(captured.out)
+        assert data['id'] == blocking_escalation.id
+
+        # read was called with a positive timeout (not None)
+        assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
+
 
 class TestLevelFilter:
     """--level argument filters by escalation level."""
