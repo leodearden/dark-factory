@@ -180,9 +180,11 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
 
 2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
    a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
-   - **`task_failure` / `review_issues`:** first try the **low-risk auto-unblock gate** (below). If
-     it doesn't qualify or aborts, leave the escalation pending and add it to the digest — do NOT
-     spawn an interactive `/unblock`.
+   - **`task_failure` / `review_issues`:** run the **low-risk auto-unblock gate** first (see the
+     [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) subsection for the full
+     gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
+     already-attempted) OR the launched sub-agent aborts, leave the escalation pending and add
+     it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
      a terminal nobody attends just clutters.
@@ -196,50 +198,146 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
 
 ### Low-risk auto-unblock gate (B3)
 
-For `task_failure` and `review_issues` in AFK mode, before leaving the item for the human, check
-whether the orchestrator's at-block-time dry-run investigation already found a **low-risk** fix:
+When this gate applies (see Applicability below), before leaving the item for the human, run the
+mechanical gate to check whether the at-block-time dry-run investigation found a **low-risk** fix:
 
-1. `get_task(task_id)` → `latest = metadata.dry_run_proposals[-1]` (if any).
-2. Gate — ALL must hold, else fall through to "leave pending + digest":
-   - `latest['risk_label'] == 'low'` and `latest` has no `status` key (not a failed / budget-exhausted entry);
-   - `latest` is fresh (the most-recent entry; the branch is not materially changed since `latest['timestamp']`);
-   - you have launched **fewer than 3 low-risk auto-unblocks this session** (in-flight *or*
-     completed) — a self-imposed cap. Because the sub-agent now runs in the background (step 3),
-     count it at **launch**, not on completion — otherwise several concurrent background sub-agents
-     could each pass the gate before any returns and blow past the cap. Over the cap, leave pending +
-     digest so a runaway can't merge unattended.
-3. If the gate passes, launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE **background**
-   sub-agent (the `Agent` tool, general-purpose, **`run_in_background: true`** — NOT `/spawn`),
-   passing `task_id`, `escalation_id`, `project_root`, the `worktree` path, and the `latest`
-   proposal, and telling it to read and follow `skills/unblock-low-risk/SKILL.md`. It applies the fix
-   scoped to `files_referenced`, runs the verify suite, and merges via the queue — or aborts cleanly.
+**Gate check** — run from `$DARK_FACTORY_ROOT`:
 
-   **Background, not foreground — why.** The sub-agent's merge step blocks on `merge_request` until
-   the merge worker finishes rebasing, verifying, and CAS-advancing main. On a large/slow repo (e.g.
-   reify) that single call can take ~30 minutes. Run in the *foreground* (`Agent` without
-   `run_in_background`), that whole window freezes the watch loop — new L2 escalations accumulate
-   undrained until the merge returns, and a born-at-L2 `critical` could sit unseen for half an hour.
-   Backgrounding keeps the foreground responsive: record the launch (below), then immediately loop
-   back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result when
-   it completes — that completion is itself a wake signal (Main Loop step 4), handled in step 4 below.
+```bash
+.venv/bin/python -m orchestrator.b3_gate check \
+  --task-id <task_id> \
+  --worktree <worktree> \
+  --project-root <project_root> \
+  --category <task_failure|review_issues> \
+  --config <watched-project orchestrator config, e.g. orchestrator/config.yaml>
+```
 
-   **Record the launch; don't double-launch.** Stash `{task_id, escalation_id, background-task-id}`
-   in your context and count it toward the cap (step 2). The escalation stays `pending` until the
-   background sub-agent resolves it, so the *next* drain WILL re-find it — before launching for any
-   task, skip it if that `task_id` already has an in-flight (or this-session-completed)
-   unblock-low-risk sub-agent, or you'll start a second one racing the first.
-4. On the sub-agent's **completion** (you're notified asynchronously — you did not block waiting;
-   match the result to a recorded launch by `task_id` / background-task-id):
-   - `outcome == "merged"`: it has already set the task done and resolved the escalation. It was
-     counted toward the cap at launch — don't double-count. Add a one-line success entry to the digest.
-   - `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Keep the
-     `task_id` in your attempted set (do NOT re-launch it — its cap slot is spent), record the abort
-     reason in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in
-     AFK mode; it waits for the human.
+> **`--tag` note:** Both `check` and `record-launch` default `--tag` to `master` — the
+> taskmaster tag under which the watched project stores its tasks. If the watched project
+> uses a non-`master` tag, supply `--tag <tag>` to both verbs. Without it, `check` will
+> silently find no proposal row and return `drift` or `abort` on every call (the behavior is
+> fail-safe — it never launches — but the watcher will appear stuck with no signal that the
+> tag was wrong).
+
+Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remaining`,
+`already_attempted`, `head_sha`, `main_sha`, `age_seconds`.
+
+**Decision table:**
+
+| Condition | Action |
+|---|---|
+| `already_attempted == true` OR `cap_remaining == 0` | Leave escalation pending + digest line; do NOT launch |
+| `verdict == "abort"` | Leave escalation pending + digest line carrying the gate's `reason` |
+| `verdict == "drift"` | Drift path (see Drift path section below) |
+| `verdict == "fresh"` | Record-launch + launch (see below) |
+
+**On `fresh` — record-launch then launch:**
+
+Before launching, run from `$DARK_FACTORY_ROOT`:
+
+```bash
+.venv/bin/python -m orchestrator.b3_gate record-launch \
+  --task-id <task_id> \
+  --worktree <worktree> \
+  --project-root <project_root> \
+  --config <watched-project orchestrator config>
+```
+
+If `record-launch` returns `already_attempted: true` (concurrent or restart race), skip the
+launch: leave pending + digest line. Otherwise it durably records the launch — this is the
+don't-double-launch marker.
+
+Then launch the **`unblock-low-risk`** skill as a NON-INTERACTIVE **background** sub-agent (the
+`Agent` tool, general-purpose, **`run_in_background: true`** — NOT `/spawn`), passing `task_id`,
+`escalation_id`, `project_root`, the `worktree` path, and the latest proposal, and instructing it
+to read and follow `skills/unblock-low-risk/SKILL.md`. It applies the fix scoped to
+`files_referenced`, runs the verify suite, and merges via the queue — or aborts cleanly.
+
+**Background, not foreground — why.** The sub-agent's merge step blocks on `merge_request` until
+the merge worker finishes rebasing, verifying, and CAS-advancing main. On a large/slow repo (e.g.
+reify) that single call can take ~30 minutes. Run in the *foreground* (`Agent` without
+`run_in_background`), that whole window freezes the watch loop — new L2 escalations accumulate
+undrained until the merge returns, and a born-at-L2 `critical` could sit unseen for half an hour.
+Backgrounding keeps the foreground responsive: record the launch (above), then immediately loop
+back to re-arm the watcher and drain. The harness re-invokes you with the sub-agent's result when
+it completes — that completion is itself a wake signal (Main Loop step 4), handled below.
+
+**Record the launch; don't double-launch.** The durable `b3_gate record-launch` call above
+serializes concurrent and restart races. Stash `{task_id, escalation_id, background-task-id}` in
+your context. The escalation stays `pending` until the background sub-agent resolves it, so the
+*next* drain WILL re-find it — before the gate check for any task, check your context: if that
+`task_id` already has an in-flight or this-cycle-completed unblock-low-risk sub-agent, skip it.
+The durable rolling-24h merge cap is enforced by `b3_gate charge` inside the unblock-low-risk
+sub-agent immediately before its merge-submit — a charge refusal causes the sub-agent to ABORT.
+The watcher consults only `check`'s `cap_remaining` to skip launches that charge would refuse.
+
+**Drift path — one-shot re-investigation:**
+
+On `verdict == "drift"`, spawn ONE read-only background sub-agent running
+`skills/unblock-auto/SKILL.md` in the worktree (Agent tool, general-purpose,
+`run_in_background: true`), passing `task_id`, `worktree`, and the block reason. Capture the git
+anchor at re-investigation start:
+
+```bash
+head_sha=$(git -C <worktree> rev-parse HEAD)
+main_sha=$(git -C <worktree> rev-parse main)
+```
+
+When the sub-agent returns `{proposal_text, files_referenced, risk_label}`, build a proposal
+entry mirroring `_build_entry` success-path keys and append it via
+`mcp__fused-memory__update_task(id=<task_id>, project_root=<project_root>, metadata={"dry_run_proposals": [entry]}, append=true)`:
+
+```json
+{
+  "proposal_text":    "<from sub-agent>",
+  "risk_label":       "<from sub-agent>",
+  "files_referenced": ["<from sub-agent>"],
+  "block_reason":     "<original block reason>",
+  "investigated_at":  "<ISO now at re-investigation start>",
+  "timestamp":        "<ISO now>",
+  "head_sha":         "<captured above>",
+  "main_sha":         "<captured above>"
+}
+```
+
+A malformed entry is fail-safe by construction — it simply fails the next `check` (`b3_gate check`
+is the single shape validator). Then **re-gate once**: re-run `b3_gate check`. If `fresh` →
+record-launch + launch; if `drift` again (a second drift in the same handling cycle) → leave
+pending + digest (drift-reinvestigated outcome — main is moving inside the task's footprint; a
+human should look). **At most one re-investigation per handling cycle.**
+
+**Completion handling:**
+
+On the sub-agent's **completion** (you're notified asynchronously — match the result to a recorded
+launch by `task_id` / background-task-id):
+- `outcome == "merged"`: it has already set the task done and resolved the escalation. Add a
+  digest entry. In attended mode, also emit an immediate in-session report: one-line summary +
+  merge sha + diff pointer.
+- `outcome == "aborted"`: it changed nothing terminal and left the escalation pending. Keep the
+  `task_id` in your context as completed this cycle (do NOT re-launch it), record the abort reason
+  in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in AFK
+  mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
+  not been used this cycle, route through the drift path once.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
-its abort as authoritative. This gate is AFK-only — when a human is present, prefer interactive
-`/unblock` so they stay in the loop.
+its abort as authoritative.
+
+**Applicability:**
+
+B3 applies in AFK mode always. In attended mode it applies when the watched project's orchestrator
+config `UnblockAutoConfig.attended_b3_enabled` (e.g. `orchestrator/config.yaml` →
+`unblock_auto.attended_b3_enabled`, default `false`) is `true` OR the human enabled it for this
+session via a session override. A session override wins in either direction — a human may turn it on
+even if config is false, or off even if config is true.
+
+**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md` — the single
+shared B3 outcome ledger for both AFK and attended modes; the "afk" prefix reflects the file's
+original AFK-only scope, but it is now the unified record for all B3 outcomes regardless of session
+mode; AFK shift 3 manages it):
+- **Merged**: `B3 <task_id> — merged: <one-line summary> (sha: <merge_sha>)`
+- **Aborted**: `B3 <task_id> — aborted: <reason>`
+- **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
+- **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
 
 ## Handling Escalations by Category
 
