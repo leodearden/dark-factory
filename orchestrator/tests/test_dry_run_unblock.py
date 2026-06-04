@@ -518,3 +518,121 @@ class TestShaStamping:
         assert 'main_sha' in entry, 'main_sha key must always be present'
         assert entry['head_sha'] is None, f'Expected None, got {entry["head_sha"]!r}'
         assert entry['main_sha'] is None, f'Expected None, got {entry["main_sha"]!r}'
+
+
+# ---------------------------------------------------------------------------
+# step-5: keep-last-N trim tests
+# ---------------------------------------------------------------------------
+
+class _RecordingScheduler:
+    """Faithful fake scheduler for trim tests.
+
+    append=True: recursive-merge — extends dry_run_proposals list
+                  and updates any other supplied keys.
+    append=False: replaces the whole metadata blob.
+    get_task: returns {'metadata': <current blob>}.
+    Tracks all update_task calls for assertion.
+    """
+
+    def __init__(self, initial_metadata: dict):
+        self._meta: dict = dict(initial_metadata)
+        self.update_task_calls: list[dict] = []
+
+    async def update_task(self, task_id, metadata, *, append=False):
+        self.update_task_calls.append({
+            'task_id': task_id,
+            'metadata': metadata,
+            'append': append,
+        })
+        if append:
+            # Recursive-merge: extend lists, update other keys
+            for key, value in metadata.items():
+                if key in self._meta and isinstance(self._meta[key], list) and isinstance(value, list):
+                    self._meta[key] = self._meta[key] + value
+                else:
+                    self._meta[key] = value
+        else:
+            # Full blob replace
+            self._meta = dict(metadata)
+
+    async def get_task(self, task_id):
+        return {'metadata': dict(self._meta)}
+
+
+class TestKeepLastNTrim:
+    """keep-last-N trim bounds dry_run_proposals growth and preserves sibling keys."""
+
+    @pytest.mark.asyncio
+    async def test_trim_keeps_last_n_and_preserves_siblings(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        repo_dir = tmp_path / 'repo'
+        repo_dir.mkdir()
+        _init_git_repo(repo_dir)
+
+        # Seed scheduler with sibling metadata keys that must survive trim
+        initial_metadata = {
+            'dry_run_proposals': [],
+            'memory_hints': ['hint-A', 'hint-B'],
+            'files': ['src/foo.py'],
+        }
+        scheduler = _RecordingScheduler(initial_metadata)
+
+        keep_last = 5
+        num_runs = 6  # one more than keep_last
+
+        for i in range(num_runs):
+            proposal_text = f'Proposal number {i}'
+            structured = {
+                'proposal_text': proposal_text,
+                'risk_label': 'low',
+                'files_referenced': [],
+            }
+            agent_result = _make_agent_result(structured_output=structured)
+
+            with patch('orchestrator.dry_run_unblock.invoke_agent',
+                       new=AsyncMock(return_value=agent_result)):
+                await run_dry_run_unblock(
+                    task_id='trim-test',
+                    worktree=str(repo_dir),
+                    reason='verify exhausted',
+                    detail='',
+                    scheduler=scheduler,
+                    mcp=MagicMock(),
+                    config=_make_config(b3_proposal_keep_last=keep_last),
+                )
+
+        proposals = scheduler._meta['dry_run_proposals']
+
+        # After 6 runs with keep_last=5, exactly 5 remain
+        assert len(proposals) == keep_last, (
+            f'Expected {keep_last} proposals after trim, got {len(proposals)}'
+        )
+
+        # The retained entries are the LAST 5 (proposals 1-5, not proposal 0)
+        retained_texts = [p['proposal_text'] for p in proposals]
+        assert retained_texts == [f'Proposal number {i}' for i in range(1, num_runs)], (
+            f'Expected proposals 1-5 to be retained, got: {retained_texts}'
+        )
+
+        # Sibling keys are intact after the full-blob trim write
+        assert scheduler._meta.get('memory_hints') == ['hint-A', 'hint-B'], (
+            'memory_hints sibling key must survive trim'
+        )
+        assert scheduler._meta.get('files') == ['src/foo.py'], (
+            'files sibling key must survive trim'
+        )
+
+        # At least one update_task call was made with append=False (the RMW trim write)
+        rmw_calls = [c for c in scheduler.update_task_calls if not c['append']]
+        assert len(rmw_calls) >= 1, (
+            'Expected at least one update_task(append=False) trim write, got none'
+        )
+        # The trim write must carry the full blob (including sibling keys)
+        trim_call = rmw_calls[-1]
+        assert 'memory_hints' in trim_call['metadata'], (
+            'Trim write must carry the full blob (memory_hints missing)'
+        )
+        assert 'files' in trim_call['metadata'], (
+            'Trim write must carry the full blob (files missing)'
+        )
