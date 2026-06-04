@@ -851,6 +851,62 @@ from dashboard.data.memory import mcp_tool_call  # noqa: E402 (deferred import t
 _LIVE_DEFAULT_PER_CALL_TIMEOUT = 2.0
 
 
+async def _probe_live_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    timeout: float,
+) -> dict:
+    """Probe one orchestrator's get_merge_queue tool; return a result dict.
+
+    On transport/timeout failure (or when the tool result itself contains an
+    'error' key, meaning the orchestrator/worker is not running), returns
+    {entries: [], reachable: False, error: <message>}.  An authoritative empty
+    queue (entries=[], no error) returns {entries: [], reachable: True}.
+    """
+    try:
+        result = await asyncio.wait_for(
+            mcp_tool_call(client, base_url, 'get_merge_queue', {}),
+            timeout=timeout,
+        )
+    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
+        logger.debug('get_merge_queue failed for %s: %s', base_url, exc)
+        return {'entries': [], 'reachable': False, 'error': str(exc)}
+    # Orchestrator/worker not running → result dict has an 'error' key
+    if isinstance(result, dict) and 'error' in result:
+        return {'entries': [], 'reachable': False, 'error': result['error']}
+    raw_entries = result.get('entries') or []
+    return {
+        'entries': [_normalize_entry(e) for e in raw_entries],
+        'reachable': True,
+    }
+
+
+async def fetch_live_merge_queues(
+    client: httpx.AsyncClient,
+    escalation_urls: dict[str, str],
+    *,
+    per_call_timeout: float = _LIVE_DEFAULT_PER_CALL_TIMEOUT,
+) -> dict[str, dict]:
+    """Fan out get_merge_queue to every escalation URL concurrently.
+
+    Returns ``{project_label: {entries, reachable, [error]}}``.  Keys match
+    the labels from ``config.escalation_urls`` (project basenames).  Failures
+    (transport errors, timeouts, or orchestrator/worker down) produce
+    ``{entries: [], reachable: False, error: ...}`` — an authoritative empty
+    queue produces ``{entries: [], reachable: True}``.
+    """
+    if not escalation_urls:
+        return {}
+    labels = list(escalation_urls.keys())
+    urls = [escalation_urls[lbl] for lbl in labels]
+    base_urls = [u.removesuffix('/mcp').rstrip('/') for u in urls]
+    results = await asyncio.gather(
+        *(_probe_live_one(client, base, per_call_timeout) for base in base_urls),
+        return_exceptions=False,
+    )
+    return dict(zip(labels, results, strict=True))
+
+
 def _normalize_entry(raw: dict) -> dict:
     """Project a raw get_merge_queue snapshot entry to the display shape.
 
