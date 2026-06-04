@@ -4769,6 +4769,111 @@ class TestEnqueueMergeRequest:
         assert stored.state == 'error'
         assert stored.merge_sha is None
 
+    # γ2 step-05/06 — _on_finalized propagates supersession provenance
+    @pytest.mark.asyncio
+    async def test_on_finalized_propagates_superseded_by_and_generation(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Resolving gen-1 future with MergeOutcome('superseded', superseded_by='mr-2')
+        causes _on_finalized to record superseded_by + generation in the retention ring
+        AND in the merge_finalized event data dict.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_sup.db'
+        event_store = EventStore(db_path, 'run-sup-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt-sup'
+        wt.mkdir()
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[MergeOutcome] = loop.create_future()
+        req = MergeRequest(
+            task_id='sup-task',
+            branch='task/sup-task',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            generation=1,
+        )
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        # Resolve the gen-1 future with a 'superseded' outcome
+        req.result.set_result(MergeOutcome(
+            status='superseded',
+            superseded_by='mr-gen2abc',
+            merge_sha='sha-adv',
+        ))
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        # --- in-memory ring: superseded_by + generation must be present ------
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'superseded'
+        assert stored.superseded_by == 'mr-gen2abc'
+        assert stored.generation == 1
+
+        # --- durable event: data dict must include superseded_by + generation --
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT "
+            "json_extract(data, '$.state') AS state, "
+            "json_extract(data, '$.superseded_by') AS superseded_by, "
+            "json_extract(data, '$.generation') AS generation, "
+            "json_extract(data, '$.merge_sha') AS merge_sha "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'superseded'
+        assert rows[0][1] == 'mr-gen2abc'
+        assert rows[0][2] == 1
+        assert rows[0][3] == 'sha-adv'
+
+    @pytest.mark.asyncio
+    async def test_on_finalized_blocked_outcome_superseded_by_null(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Blocked outcomes don't set superseded_by (None in both ring and event)."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_blk.db'
+        event_store = EventStore(db_path, 'run-blk-test')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt-blk'
+        wt.mkdir()
+        req = _make_request('blk-task', 'task/blk-task', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.set_result(MergeOutcome(status='blocked', reason='oops'))
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.superseded_by is None
+        assert stored.generation == 1  # default
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT "
+            "json_extract(data, '$.superseded_by') AS superseded_by, "
+            "json_extract(data, '$.generation') AS generation "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] is None  # superseded_by NULL
+        assert rows[0][1] == 1    # generation present
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
