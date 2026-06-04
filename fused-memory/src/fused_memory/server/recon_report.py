@@ -285,10 +285,15 @@ class ReconReportState:
             if existing_id is not None:
                 return _duplicate_finding_error(existing_id)
         else:
-            desc_hash = _description_hash(description)
-            existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
-            if existing_id is not None:
-                return _duplicate_finding_error(existing_id)
+            # Blank/whitespace-only descriptions normalize to '' — skip dedup so
+            # each blank informational finding allocates independently.  The empty
+            # string is not a meaningful dedup key (two observations with no text
+            # are not the same observation).
+            if _normalize_description(description):
+                desc_hash = _description_hash(description)
+                existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
+                if existing_id is not None:
+                    return _duplicate_finding_error(existing_id)
 
         finding_id = str(uuid.uuid4())
         finding = _Finding(
@@ -306,8 +311,9 @@ class ReconReportState:
             entry._signature_to_finding[sig] = finding_id
             self._run_sig_index.setdefault(run_id, {})[sig] = finding_id
         else:
-            entry._deschash_to_finding[desc_hash] = finding_id
-            self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
+            if desc_hash:  # empty when description normalizes to blank — skip index
+                entry._deschash_to_finding[desc_hash] = finding_id
+                self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
 
         return {'finding_id': finding_id}

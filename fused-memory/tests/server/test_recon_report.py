@@ -1256,3 +1256,72 @@ class TestReconReportNullDescDedup:
 
         # _run_desc_index must not retain r1's hashes
         assert 'r1' not in state._run_desc_index
+
+    def test_empty_description_both_allocate(self):
+        """Blank or whitespace-only descriptions normalize to '' — each allocates
+        independently (no dedup key) rather than collapsing into one row.
+
+        This pins the design choice: empty string is not a meaningful dedup key.
+        Two observations with no description text are treated as distinct findings.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        # Two findings with empty description must both allocate
+        r1 = self._finding(state, description='')
+        r2 = self._finding(state, description='')
+        assert 'finding_id' in r1, f'First blank-desc failed: {r1}'
+        assert 'finding_id' in r2, f'Second blank-desc failed: {r2}'
+        assert r1['finding_id'] != r2['finding_id'], (
+            'Blank-description findings must not dedup — empty string is not a dedup key'
+        )
+
+        # Whitespace-only descriptions also skip dedup
+        r3 = self._finding(state, description='   ')
+        r4 = self._finding(state, description='\t  \n')
+        assert 'finding_id' in r3, f'Whitespace-only r3 failed: {r3}'
+        assert 'finding_id' in r4, f'Whitespace-only r4 failed: {r4}'
+        assert r3['finding_id'] != r4['finding_id'], (
+            'Whitespace-only findings must not dedup'
+        )
+
+    def test_eviction_partial_run_canonical_stage_cleared(self):
+        """Stage 1 holds the canonical finding; stage 2 dedups against it.
+        When stage 1 is evicted via tick(), the desc index entry must be cleaned
+        up correctly — the cleanup guard must not leave the hash dangling just
+        because another stage of the same run referenced it via duplicate_finding.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # Stage 1: file the canonical finding
+        state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        first = self._finding(state, run_id='r1', description='shared observation')
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        first_id = first['finding_id']
+
+        # Complete stage 1 so it becomes eligible for TTL eviction
+        state.complete(run_id='r1', summary='stage 1 done')
+
+        # Stage 2: same description → duplicate_finding pointing at stage 1's finding
+        state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
+        second = self._finding(state, run_id='r1', description='shared observation')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected cross-stage dedup, got: {second}'
+        )
+        assert second['existing_finding_id'] == first_id
+
+        # Advance past TTL — only stage_one has completed_at set, so only it evicts
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1, f'Expected 1 eviction, got {evicted}'
+
+        # Stage 1 entry must be gone
+        assert state.get_assembled_report('r1', 'stage_one') is None
+
+        # Stage 2 entry still exists (not completed → not eligible for eviction)
+        assert state.get_assembled_report('r1', 'stage_two') is not None
+
+        # _run_desc_index must NOT retain r1's hash after stage_one is evicted.
+        # The cleanup guard (guard against removing a hash a later entry re-registered)
+        # must not block the delete here, since stage_two never registered any hash.
+        assert 'r1' not in state._run_desc_index
