@@ -3443,14 +3443,19 @@ class TaskWorkflow:
                 self.config.escalate_preexisting_main_break
                 and not result.timed_out
                 and (result.category or '') not in PREEXISTING_BREAK_SKIP_CATEGORIES
-                and await verify_failure_is_preexisting_on_main(
+            ):
+                # Helper returns (is_preexisting, probe_main_sha); we reuse probe_main_sha
+                # for fingerprint composition so probe and fingerprint reference the SAME
+                # main SHA — avoids the TOCTOU window of a second get_main_sha() call.
+                _is_inherited, _probe_sha = await verify_failure_is_preexisting_on_main(
                     self.worktree, self.config, self._module_configs,
                     self._task_files, result, self.git_ops,
                 )
-            ):
+            else:
+                _is_inherited, _probe_sha = False, ''
+            if _is_inherited:
                 try:
                     from escalation.dedupe import compute_content_fingerprint
-                    main_sha = await self.git_ops.get_main_sha()
                     # Fingerprint encodes (category, normalized-cause_hint, main_sha).
                     # Fold key: same triple -> identical fp -> submit_or_dedupe collapses
                     # N sibling tasks to ONE parent escalation.  Once the hotfix lands,
@@ -3463,7 +3468,7 @@ class TaskWorkflow:
                         result.category or '',
                         [],
                         description=(
-                            _normalize_cause_hint(result.cause_hint) + '|' + main_sha
+                            _normalize_cause_hint(result.cause_hint) + '|' + _probe_sha
                         ),
                     )
                 except Exception:
@@ -5607,6 +5612,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             data={'escalation_id': esc.id, 'category': category,
                                   'severity': 'blocking', 'summary': reason[:200]},
                         )
+                    # Per-task stewards for child folds: dedup collapses ESCALATION
+                    # ENTRIES to one parent (N-1 siblings don't each add a queue file),
+                    # but each sibling task still spins up its own steward below.  This
+                    # is intentional — each blocked task needs its own steward to watch
+                    # for resolution and unblock the task when the hotfix lands.  The
+                    # single-hotfix goal is achieved by collapsing notification/queue
+                    # entries, not by preventing individual tasks from monitoring their
+                    # own blocked state.
                 else:
                     self.escalation_queue.submit(esc)
                     if self.event_store:

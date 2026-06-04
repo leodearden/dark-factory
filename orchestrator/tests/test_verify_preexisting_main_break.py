@@ -120,8 +120,8 @@ class TestVerifyFailureIsPreexistingOnMain:
                 )
             )
 
-        assert result is True, (
-            'Expected True — same (category, cause_hint) reproduced on main means inherited.'
+        assert result == (True, MAIN_SHA), (
+            f'Expected (True, {MAIN_SHA!r}) — same signature reproduced on main means inherited; got {result!r}'
         )
 
 
@@ -168,15 +168,17 @@ class TestVerifyFailureIsPreexistingFalseCases:
         so the helper correctly reports 'not inherited' and lets the debugger run.
         """
         result = self._run_helper(tmp_path, FAILING_RESULT, PASSING_RESULT)
-        assert result is False, (
-            'Main passes after sibling hotfix — should return False so debugger runs.'
+        is_preexisting, probe_sha = result
+        assert not is_preexisting, (
+            'Main passes after sibling hotfix — should return (False, ...) so debugger runs.'
         )
 
     def test_returns_false_when_different_signature_on_main(self, tmp_path: Path) -> None:
         """Main fails with a DIFFERENT (category, cause_hint) -> different break -> False."""
         result = self._run_helper(tmp_path, FAILING_RESULT, DIFFERENT_RESULT)
-        assert result is False, (
-            'Different failure signature on main — not the same inherited break, should return False.'
+        is_preexisting, probe_sha = result
+        assert not is_preexisting, (
+            'Different failure signature on main — not the same inherited break, should return (False, ...).'
         )
 
 
@@ -205,7 +207,12 @@ class TestVerifyFailureIsPreexistingLifecycle:
             return (0, '', '')
 
         with (
-            patch.object(verify_module, 'run_scoped_verification', return_value=SAME_RESULT),
+            # AsyncMock is required because run_scoped_verification is awaited;
+            # a plain return_value=SAME_RESULT would produce a TypeError that the
+            # helper's except-swallows, exercising the error path instead of the
+            # intended happy probe path.
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=SAME_RESULT)),
             patch('orchestrator.git_ops._run', side_effect=_fake_run),
         ):
             asyncio.run(
@@ -256,8 +263,9 @@ class TestVerifyFailureIsPreexistingLifecycle:
                 )
             )
 
-        # Fail-safe: exception does not propagate
-        assert result is False, 'Probe exception must return False (fail-safe), not propagate.'
+        # Fail-safe: exception does not propagate; returns (False, '') tuple
+        is_preexisting, probe_sha = result
+        assert not is_preexisting, 'Probe exception must return (False, ...) (fail-safe), not propagate.'
         remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
         assert len(remove_calls) == 1, (
             f'Cleanup must run even when probe raises; remove calls: {remove_calls}'

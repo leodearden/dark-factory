@@ -384,6 +384,13 @@ PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
     'flock_error',
 })
 
+# Process-wide cache for main-probe results: avoids redundant worktree-add +
+# full-build/test re-runs when the same task retries (helper returned False, debugger
+# ran, verify failed again) or when sibling tasks probe the same unchanged main.
+# Key: (main_sha, category, normalised_cause_hint); Value: (probe_time, is_preexisting).
+_PROBE_CACHE: dict[tuple[str, str, str], tuple[float, bool]] = {}
+_PROBE_CACHE_TTL: float = 300.0  # 5 minutes; main_sha changes on every hotfix merge
+
 
 def _worst_category(categories: list[str]) -> str:
     """Return the highest-severity category from *categories*.
@@ -2237,25 +2244,30 @@ async def verify_failure_is_preexisting_on_main(
     task_files: 'list[str] | None',
     failing_result: VerifyResult,
     git_ops: object,
-) -> bool:
+) -> tuple[bool, str]:
     """Detect whether *failing_result* is inherited from the current main HEAD.
 
-    Returns True iff:
-      - The same (category, normalised cause_hint) signature reproduces on main.
+    Returns:
+        ``(True, main_sha)`` iff the same (category, normalised cause_hint) signature
+        reproduces on main — the break is preexisting.  The caller can reuse
+        *main_sha* for fingerprint composition without a second ``get_main_sha`` call.
 
-    Returns False (fail-safe) for any of:
-      - Main probe passes (break is task-own).
-      - Different signature (break is task-own or different inherited break).
-      - ``git_ops.get_main_sha()`` fails or returns empty.
-      - ``git worktree add --detach`` fails (rc != 0).
-      - Any unexpected exception during probing.
+        ``(False, '')`` (fail-safe) for any of:
+          - Main probe passes (break is task-own).
+          - Different signature (break is task-own or different inherited break).
+          - ``git_ops.get_main_sha()`` fails or returns empty.
+          - ``git worktree add --detach`` fails after retries.
+          - Any unexpected exception during probing.
+
+    A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
+    avoids redundant probes from the same or sibling tasks against an unchanged main.
 
     The task worktree is NEVER mutated — all git ops target *config.project_root*
     (for worktree-level commands) and the detached temp path (for probe verify).
-    Cleanup (worktree remove --force + shutil.rmtree + worktree prune) always
-    runs in a ``finally`` block.
+    Cleanup (worktree remove --force + shutil.rmtree of the temp parent) always
+    runs in a ``finally`` block.  No broad ``git worktree prune`` is issued so
+    concurrently-active sibling probes are not disturbed.
     """
-    import shutil
     import tempfile
 
     from orchestrator.git_ops import _run
@@ -2271,31 +2283,62 @@ async def verify_failure_is_preexisting_on_main(
         except Exception:
             return (hint or '').strip().lower()
 
+    # tmp_root: mkdtemp-created parent dir that we own for cleanup.
+    # tmp_path: non-existent child of tmp_root that git worktree add creates.
+    # Using a child path avoids the pre-existing-directory footgun on strict git
+    # versions that reject an already-present directory.
+    tmp_root: Path | None = None
     tmp_path: Path | None = None
+    worktree_added: bool = False
     try:
         # Resolve the current main SHA.
         try:
             main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
         except Exception:
             logger.debug('verify_failure_is_preexisting_on_main: get_main_sha failed', exc_info=True)
-            return False
+            return False, ''
         if not main_sha:
-            return False
+            return False, ''
 
-        # Create the temp probe worktree at main's HEAD.
-        tmp_dir = tempfile.mkdtemp(prefix='df-mainprobe-')
-        tmp_path = Path(tmp_dir)
+        # Check the process-wide probe cache before paying the worktree-add cost.
+        _norm_hint = _normalize(failing_result.cause_hint)
+        _cache_key = (main_sha, failing_result.category or '', _norm_hint)
+        _now = time.monotonic()
+        if _cache_key in _PROBE_CACHE:
+            _cached_at, _cached = _PROBE_CACHE[_cache_key]
+            if _now - _cached_at < _PROBE_CACHE_TTL:
+                logger.debug(
+                    'verify_failure_is_preexisting_on_main: cache hit '
+                    '(main_sha=%.8s, preexisting=%s)', main_sha, _cached,
+                )
+                return _cached, (main_sha if _cached else '')
 
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
-            cwd=config.project_root,
-        )
-        if rc != 0:
-            logger.debug(
-                'verify_failure_is_preexisting_on_main: worktree add failed (rc=%d): %s',
-                rc, err,
+        # Create the probe worktree: mkdtemp gives us an owned parent; the child
+        # 'probe/' is passed to git so git creates it (avoids pre-existing-dir footgun).
+        tmp_root = Path(tempfile.mkdtemp(prefix='df-mainprobe-'))
+        tmp_path = tmp_root / 'probe'
+
+        # Retry worktree add on transient git lock contention (serialised metadata
+        # writes mean concurrent sibling probes can hit LOCK_MAX).
+        _MAX_ADD_RETRIES = 3
+        rc, _, err = 1, '', 'not attempted'
+        for _attempt in range(_MAX_ADD_RETRIES):
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
+                cwd=config.project_root,
             )
-            return False
+            if rc == 0:
+                worktree_added = True
+                break
+            if _attempt < _MAX_ADD_RETRIES - 1:
+                await asyncio.sleep(0.5 * (_attempt + 1))
+        if not worktree_added:
+            logger.warning(
+                'verify_failure_is_preexisting_on_main: worktree add failed after %d retries '
+                '(rc=%d): %s — contagion guard disabled for this attempt',
+                _MAX_ADD_RETRIES, rc, err,
+            )
+            return False, ''
 
         # Probe main with the same scoped commands, no retries.
         try:
@@ -2309,30 +2352,37 @@ async def verify_failure_is_preexisting_on_main(
             logger.debug(
                 'verify_failure_is_preexisting_on_main: probe verify raised', exc_info=True,
             )
-            return False
+            return False, ''
 
         if main_result.passed:
             # Main is clean — the break is task-own.
-            return False
+            _PROBE_CACHE[_cache_key] = (time.monotonic(), False)
+            return False, ''
 
         # Compare (category, normalised cause_hint).
-        branch_sig = (failing_result.category or '', _normalize(failing_result.cause_hint))
+        branch_sig = (failing_result.category or '', _norm_hint)
         main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
-        return branch_sig == main_sig
+        is_preexisting = branch_sig == main_sig
+        _PROBE_CACHE[_cache_key] = (time.monotonic(), is_preexisting)
+        return is_preexisting, (main_sha if is_preexisting else '')
 
     except Exception:
         logger.debug('verify_failure_is_preexisting_on_main: unexpected error', exc_info=True)
-        return False
+        return False, ''
     finally:
-        if tmp_path is not None:
+        # Scoped cleanup: remove only the specific probe worktree (not a broad prune
+        # that could deregister concurrently-active sibling probes).
+        if worktree_added and tmp_path is not None:
             try:
                 await _run(
                     ['git', 'worktree', 'remove', '--force', str(tmp_path)],
                     cwd=config.project_root,
                 )
             except Exception:
-                logger.debug('verify_failure_is_preexisting_on_main: worktree remove failed', exc_info=True)
+                logger.debug(
+                    'verify_failure_is_preexisting_on_main: worktree remove failed',
+                    exc_info=True,
+                )
+        if tmp_root is not None:
             with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_path, ignore_errors=True)
-            with contextlib.suppress(Exception):
-                await _run(['git', 'worktree', 'prune'], cwd=config.project_root)
+                shutil.rmtree(tmp_root, ignore_errors=True)

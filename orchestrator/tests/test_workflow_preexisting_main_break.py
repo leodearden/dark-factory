@@ -133,7 +133,7 @@ class TestVerifyDebugfixLoopInheritedBreak:
                       new=AsyncMock(return_value=COMPILE_ERROR_RESULT)),
                 # verify_failure_is_preexisting_on_main will be imported in workflow.py (step-8)
                 patch('orchestrator.workflow.verify_failure_is_preexisting_on_main',
-                      new=AsyncMock(return_value=True)),
+                      new=AsyncMock(return_value=(True, MAIN_SHA))),
             ):
                 return await workflow._verify_debugfix_loop()
 
@@ -189,7 +189,10 @@ class TestVerifyDebugfixLoopNonInheritedPaths:
             category=category,
         )
 
-        helper_spy = AsyncMock(return_value=helper_return)
+        # Helper now returns (bool, str) tuple; False→(False,''), True→(True, MAIN_SHA).
+        helper_spy = AsyncMock(
+            return_value=(True, MAIN_SHA) if helper_return else (False, ''),
+        )
         # After one failing run: make next run pass to exit loop normally.
         call_count = {'n': 0}
 
@@ -262,7 +265,7 @@ class TestVerifyDebugfixLoopSiblingFix:
         worktree.mkdir()
         workflow = _make_workflow(config, worktree)
 
-        helper_spy = AsyncMock(return_value=False)
+        helper_spy = AsyncMock(return_value=(False, ''))
 
         async def _run_loop() -> WorkflowOutcome:
             with (
@@ -480,4 +483,109 @@ class TestCrossTaskInheritedBreakDedup:
         assert len(queue_files_after_c) == 2, (
             f'Expected 2 files after task C (different main_sha) queues a new parent; '
             f'got {queue_files_after_c}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — fingerprint-exception fallback: fp='' -> raw-submit branch
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintExceptionFallback:
+    """Suggestion 4: when compute_content_fingerprint raises, fp is '' and
+    _mark_blocked uses the raw-submit branch (no submit_or_dedupe fold) while
+    still filing the L0 with the correct category/severity.
+
+    Two complementary tests:
+      (a) Loop-level guard: compute_content_fingerprint raises -> loop returns BLOCKED
+          and _inherited_break_info['fingerprint'] == ''.
+      (b) _mark_blocked raw-submit branch: dedupe_fingerprint='' routes to raw submit,
+          escalation is still filed with correct severity/category and falsy fp.
+    """
+
+    def test_fingerprint_exception_yields_empty_fp_and_blocked(
+        self, tmp_path: Path,
+    ) -> None:
+        """When compute_content_fingerprint raises inside the guard, fp=='' and the
+        loop still returns BLOCKED with _inherited_break_info populated.
+        """
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_workflow(config, worktree)
+
+        async def _run_loop() -> WorkflowOutcome:
+            with (
+                patch('orchestrator.workflow.run_scoped_verification',
+                      new=AsyncMock(return_value=COMPILE_ERROR_RESULT)),
+                # Helper returns preexisting + SHA so the guard is entered.
+                patch('orchestrator.workflow.verify_failure_is_preexisting_on_main',
+                      new=AsyncMock(return_value=(True, MAIN_SHA))),
+                # Fingerprint computation raises — fp falls back to ''.
+                # Must patch at source (escalation.dedupe) since workflow uses a
+                # lazy 'from escalation.dedupe import compute_content_fingerprint'
+                # inside the try block, which rebinds the current value at call time.
+                patch(
+                    'escalation.dedupe.compute_content_fingerprint',
+                    side_effect=RuntimeError('fingerprint computation failed'),
+                ),
+            ):
+                return await workflow._verify_debugfix_loop()
+
+        outcome = asyncio.run(_run_loop())
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Loop must still return BLOCKED when fingerprint raises; got {outcome}'
+        )
+        info = workflow._inherited_break_info  # type: ignore[attr-defined]
+        assert info is not None, '_inherited_break_info must be set even on fp exception'
+        assert info.get('fingerprint') == '', (
+            f'fingerprint must be empty string on exception; got {info.get("fingerprint")!r}'
+        )
+        assert info.get('category') == 'preexisting_main_break', (
+            f'category must still be preexisting_main_break; got {info!r}'
+        )
+
+    def test_empty_fp_takes_raw_submit_branch_in_mark_blocked(
+        self, tmp_path: Path,
+    ) -> None:
+        """_mark_blocked(dedupe_fingerprint='') routes via raw-submit (not submit_or_dedupe),
+        still files an L0 escalation with severity='blocking' and the correct category.
+        The empty fp means no fold occurs and dedupe_fingerprint stays falsy on the filed esc.
+        """
+        from escalation.queue import EscalationQueue
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_workflow(config, worktree)
+
+        eq = EscalationQueue(tmp_path / 'escalations')
+        workflow.escalation_queue = eq
+
+        async def _drive():
+            return await workflow._mark_blocked(
+                "Verify failure is preexisting on main (category='compile_error'): ...",
+                detail='type error detail',
+                category='preexisting_main_break',
+                suggested_action='await_preexisting_main_hotfix',
+                dedupe_fingerprint='',  # empty — must take raw-submit branch
+            )
+
+        asyncio.run(_drive())
+
+        # L0 must still be filed even with empty fp
+        filed_l0 = eq.get_by_task(workflow.task_id, level=0)
+        assert len(filed_l0) >= 1, (
+            f'L0 escalation must be filed via raw-submit even when fp is empty; '
+            f'got {filed_l0!r}'
+        )
+        esc = filed_l0[0]
+        assert esc.severity == 'blocking', f'severity must be blocking; got {esc.severity}'
+        assert esc.category == 'preexisting_main_break', (
+            f'category must be preexisting_main_break; got {esc.category!r}'
+        )
+        # Empty fp → raw-submit → no fold, dedupe_fingerprint must be falsy
+        assert not esc.dedupe_fingerprint, (
+            f'Raw-submit should leave dedupe_fingerprint falsy; got {esc.dedupe_fingerprint!r}'
         )
