@@ -2362,3 +2362,72 @@ class TestAddMembersToL2Concurrency:
         assert len(result.members) == count * 2, (
             f'Expected {count * 2} total members, got {len(result.members)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: Two-OS-process data-loss test for attach_dedupe_child (RED)
+# ---------------------------------------------------------------------------
+
+class TestAttachDedupeChildConcurrency:
+    """Two-OS-process test: concurrent attach_dedupe_child must not lose any children."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_attaches_preserve_all_children(self, tmp_path: Path):
+        """N=50 attaches from two concurrent processes must produce exactly 100 children and dedupe_count==100.
+
+        Without the sidecar lock, each process reads the same pre-mutation snapshot,
+        appends one child and increments count by 1, then rewrites — the second write
+        clobbers the first, losing children and reverting the count.
+        """
+        # Seed a pending parent escalation
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        parent = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='orchestrator',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent dedupe test',
+            level=0,
+        )
+        queue.submit(parent)
+        parent_id = parent.id
+
+        # Build env with worktree src on PYTHONPATH
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently
+        proc_a = subprocess.Popen(
+            child_args + ['attach', parent_id, 'a', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['attach', parent_id, 'b', str(count)],
+            env=env,
+        )
+
+        rc_a = proc_a.wait(timeout=25)
+        rc_b = proc_b.wait(timeout=25)
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert all 100 children are present
+        result = queue.get(parent_id)
+        assert result is not None, 'Parent escalation disappeared after concurrent attaches'
+        children_set = set(result.dedupe_children)
+        expected = {f'a-{i}' for i in range(count)} | {f'b-{i}' for i in range(count)}
+        missing = expected - children_set
+        assert not missing, (
+            f'Lost {len(missing)} child(ren) to concurrent RMW clobber: '
+            f'{sorted(missing)[:10]}...'
+        )
+        assert result.dedupe_count == count * 2, (
+            f'Expected dedupe_count={count * 2}, got {result.dedupe_count}'
+        )
