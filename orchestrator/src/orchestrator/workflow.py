@@ -15,6 +15,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
+# Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
+# escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
+# type annotation; a separate runtime import is needed here because
+# _is_gating_escalation evaluates the set at call time, not just for type hints.
+# This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
+# nothing in it imports orchestrator.
+from escalation.models import BORN_AT_L2_SEVERITIES
 from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
@@ -53,14 +60,6 @@ from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUS
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
-# Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
-# escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
-# type annotation; a separate runtime import is needed here because
-# _is_gating_escalation evaluates the set at call time, not just for type hints.
-# This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
-# nothing in it imports orchestrator.
-from escalation.models import BORN_AT_L2_SEVERITIES
-
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -76,7 +75,7 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
 )
 
 
-def _is_gating_escalation(e: 'Escalation') -> bool:
+def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
 
     Gating policy — an escalation gates when ANY disjunct fires:

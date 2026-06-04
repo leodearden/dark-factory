@@ -5080,6 +5080,7 @@ class TestIsGatingEscalation:
 
     def test_predicate(self, severity, level, expected):
         from escalation.models import Escalation
+
         from orchestrator.workflow import _is_gating_escalation
 
         e = Escalation(
@@ -5107,6 +5108,7 @@ class TestBornAtL2GatesPostImplementer:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
         from escalation.models import Escalation
+
         from orchestrator.artifacts import TaskArtifacts
 
         stub = AgentStub()
@@ -5170,6 +5172,7 @@ class TestBornAtL2GatesPostDebugger:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
         from escalation.models import Escalation
+
         from orchestrator.artifacts import TaskArtifacts
 
         stub = AgentStub()
