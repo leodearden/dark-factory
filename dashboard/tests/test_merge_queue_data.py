@@ -2376,3 +2376,65 @@ class TestRecentTrainEvents:
 
         assert len(result) == 3, f'Expected 3 results (limit=3), got {len(result)}'
 
+
+# ---------------------------------------------------------------------------
+# Acceptance lock: build_per_project_merge_queue at window=1440 (24h)
+# ---------------------------------------------------------------------------
+
+
+class TestRecentWindow1440AcceptanceLock:
+    """Acceptance-criterion lock for task-1607.
+
+    Validates that with recent_window_minutes=1440, a merge ~5h old appears in
+    result[pid]['recent'] and a merge ~25h old does not.  Exercises the
+    two-layer contract: SQL hour-granular look-back (recent_hours=24) fetches
+    the 5h row and excludes the 25h row, then filter_merges_within(1440) trims
+    to the exact 1440-min boundary (5h is inside; 25h is outside the SQL layer
+    already so it never reaches the Python trim).
+    """
+
+    @pytest.mark.asyncio
+    async def test_recent_window_1440_includes_hours_old_excludes_yesterday(self, tmp_path):
+        """A merge 5h ago appears; one 25h ago does not — at window=1440."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+        pid = '/tmp/test-proj'
+
+        db_path = _make_db(tmp_path, 'acceptance.db', [
+            # Inside 1440-min (24h) window: 5h ago
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(hours=5),
+                'task_id': 'task-recent',
+                'run_id': 'run-recent',
+                'data': {'outcome': 'done'},
+                'duration_ms': 1000,
+            },
+            # Outside 1440-min window: 25h ago (outside the 24h SQL look-back too)
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(hours=25),
+                'task_id': 'task-old',
+                'run_id': 'run-old',
+                'data': {'outcome': 'done'},
+                'duration_ms': 2000,
+            },
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [(pid, conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=1440,
+            )
+
+        recent_task_ids = [row['task_id'] for row in result[pid]['recent']]
+        assert 'task-recent' in recent_task_ids, (
+            f'Expected task-recent (5h old) in recent list at window=1440; got {recent_task_ids}'
+        )
+        assert 'task-old' not in recent_task_ids, (
+            f'Expected task-old (25h old) absent from recent list at window=1440; got {recent_task_ids}'
+        )
