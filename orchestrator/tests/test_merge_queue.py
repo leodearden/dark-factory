@@ -4556,6 +4556,73 @@ class TestEnqueueMergeRequest:
         assert rows[0][2] == 'abandoned'
         assert rows[0][3] is None  # no merge_sha for abandoned
 
+    @pytest.mark.asyncio
+    async def test_retention_records_resolved_outcome(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When retention is passed, resolving the future populates the ring."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_ret.db'
+        event_store = EventStore(db_path, 'run-retention')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        # Build request with snapshot_tip so we can verify it is captured
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        req = MergeRequest(
+            task_id='77',
+            branch='task/77',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+            snapshot_tip='tip-sha-0077',
+        )
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.set_result(MergeOutcome(status='done', merge_sha='sha9'))
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'done'
+        assert stored.merge_sha == 'sha9'
+        assert stored.snapshot_tip == 'tip-sha-0077'
+        assert stored.branch == 'task/77'
+        assert stored.task_id == '77'
+
+    @pytest.mark.asyncio
+    async def test_retention_records_abandoned_outcome(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """When retention is passed, cancelling the future records state=='abandoned'."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_ret2.db'
+        event_store = EventStore(db_path, 'run-retention2')
+        retention = TerminalOutcomeRetention()
+
+        wt = tmp_path / 'wt2'
+        wt.mkdir()
+        req = _make_request('88', 'task/88', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store, retention=retention)
+
+        req.result.cancel()
+        await asyncio.sleep(0)
+
+        stored = retention.get(req.request_id)
+        assert stored is not None
+        assert stored.state == 'abandoned'
+        assert stored.merge_sha is None
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
