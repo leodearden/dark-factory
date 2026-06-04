@@ -4730,6 +4730,7 @@ class TestTerminalOutcomeRetention:
         rec = self._make_record('mr-aabbccdd')
         ring.record(rec)
         result = ring.get('mr-aabbccdd')
+        assert result is not None
         assert result is rec
         assert result.state == 'done'
         assert result.task_id == 'task-mr-aabbccdd'
@@ -10182,8 +10183,6 @@ class TestRegisterAndEnqueue:
     ):
         """(e) slot-leak guard: if enqueue_merge_request raises after acquire,
         the slot is released and the exception propagates."""
-        from orchestrator.merge_queue import register_and_enqueue_merge_request
-
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
         req = _make_request('B', 'B', tmp_path, config)
@@ -10213,8 +10212,6 @@ class TestRegisterAndEnqueue:
         coalesce-path test (TestCoalesceOrEnqueueRegistryOnly) for the dominant
         workflow path.
         """
-        from orchestrator.merge_queue import register_and_enqueue_merge_request
-
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
         event_store = self._make_event_store(tmp_path)
