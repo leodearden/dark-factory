@@ -3064,7 +3064,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Each entry dict contains:
           task_id, branch, state, enqueued_at, age_secs, position,
-          waiter_alive, worktree, pre_rebased.
+          waiter_alive, worktree, pre_rebased, request_id.
         State values: queued, merging, awaiting_verify, verifying,
           gate_reverify, finalizing.
         """
@@ -3082,6 +3082,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'waiter_alive': not req.result.cancelled(),
                 'worktree': str(worktree_path) if worktree_path is not None else None,
                 'pre_rebased': req.pre_rebased,
+                'request_id': req.request_id,
             }
 
         # 1. Verifier-current item (head-of-line)
