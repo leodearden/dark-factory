@@ -472,6 +472,11 @@ class _GenerationChainContext:
     queue: asyncio.Queue
     counts: dict  # dict[str, int] — per-branch chain counter
     max_auto_generations: int
+    retention: TerminalOutcomeRetention | None = None
+    """Retention ring to pass to enqueue_merge_request for the chained gen-(n+1)
+    request so its terminal outcome is recorded (provenance: superseded_by resolves).
+    The in-flight-registry SLOT HANDOFF for gen-(n+1) belongs to γ3's ATTACH_AND_CHAIN
+    scope and is the second precondition guarded by AUTO_CHAIN_GENERATIONS_ENABLED."""
 
 
 async def _finalize_advanced_merge(
@@ -559,6 +564,7 @@ async def _finalize_advanced_merge(
                 counts=chain_ctx.counts,
                 queue=chain_ctx.queue,
                 max_auto_generations=chain_ctx.max_auto_generations,
+                retention=chain_ctx.retention,
             )
             if chained is not None:
                 _emit_merge_attempt(
@@ -2125,6 +2131,7 @@ async def _maybe_auto_chain_generation(
     counts: dict[str, int],
     queue: asyncio.Queue,
     max_auto_generations: int,
+    retention: TerminalOutcomeRetention | None = None,
 ) -> MergeOutcome | None:
     """Check whether a post-merge equivalence failure was caused by a tip advance,
     and if so, enqueue a gen-(n+1) MergeRequest for the delta (γ2).
@@ -2197,7 +2204,7 @@ async def _maybe_auto_chain_generation(
         snapshot_tip=current_head,
         pre_rebased=False,
     )
-    await enqueue_merge_request(queue, gen_next, event_store)
+    await enqueue_merge_request(queue, gen_next, event_store, retention=retention)
     counts[req.branch] = new_count
     return MergeOutcome('superseded', superseded_by=gen_next.request_id, merge_sha=advanced_sha)
 
