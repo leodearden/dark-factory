@@ -1237,3 +1237,22 @@ class TestReconReportNullDescDedup:
         assert 'finding_id' in r2, f'run r2 failed: {r2}'
 
         assert r1['finding_id'] != r2['finding_id']
+
+    def test_eviction_clears_desc_index(self):
+        """After TTL eviction via tick(), _run_desc_index must not retain the
+        evicted run's hashes (prevents unbounded growth across runs)."""
+        state, t = self._make_state(ttl=300)
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        self._finding(state, run_id='r1', description='an informational note')
+        state.complete(run_id='r1', summary='done')
+
+        # Advance past TTL and evict
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+
+        # Entry is gone
+        assert state.get_assembled_report('r1', 's1') is None
+
+        # _run_desc_index must not retain r1's hashes
+        assert 'r1' not in state._run_desc_index
