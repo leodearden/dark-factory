@@ -375,9 +375,10 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 ### `review_suggestions` (info)
 
 > **This handler is unreachable at L2.** Review suggestions reach live workflows as curator tickets
-> (workflow.py:5923–6037, no escalation file) and fall back to level-0 steward escalations
-> (steward.py:222–234); they do not reach this queue. This stub is kept only to document why
-> `review_suggestions` must not be re-added here.
+> via `_route_review_suggestions_to_curator` in workflow.py (call site ~line 3064), with no
+> escalation file written; they fall back to level-0 steward escalations filed around
+> workflow.py:6272 and consumed by `_next_escalation` in steward.py. They do not reach this
+> queue. This stub is kept only to document why `review_suggestions` must not be re-added here.
 
 ### `review_issues` (blocking)
 
