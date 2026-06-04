@@ -234,3 +234,160 @@ class TestDispatchLegacyPaths:
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Pair B — resume level>=1 generalization (D7)
+# Step-3: RED until the resume gate is changed from level==1 to level>=1
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestResumeLevelGate:
+    """B7 — D7: resume gate must be level>=1, not level==1."""
+
+    async def test_born_at_l2_resume_flips_blocked(self, harness: Harness):
+        """(a) Born-at-L2 (level=2, resolution_action='resume', direct resolve,
+        NOT in _escalation_events, status='blocked') → set_task_status('pending').
+
+        Currently strands because the resume gate is level==1.  Fails until
+        step-4 widens the gate to level>=1.
+        """
+        task_id = 'task-l2-born'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='resume',
+            status='resolved',
+            resolved_by='interactive',
+            level=2,
+        )
+        # Not in _escalation_events → orphan (no active workflow)
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # RED until step-4: currently no flip because level==2 != 1
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+
+    async def test_level0_resume_no_flip(self, harness: Harness):
+        """(b) level=0 direct resume still does NOT flip — level floor preserved.
+
+        After step-4 changes gate to level>=1, level==0 is still excluded.
+        """
+        task_id = 'task-l0'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='resume',
+            status='resolved',
+            resolved_by='steward',
+            level=0,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_cascade_member_parent_resume_action_flips(self, harness: Harness):
+        """(c) Cascade member (level=1, resolved_by='l2-cascade:<id>') whose
+        parent L2 carries resolution_action='resume' → flips blocked→pending
+        via _resolve_escalation_action parent lookup.
+        """
+        parent_id = 'esc-l2-7'
+        task_id = 'task-member-7'
+        # Wire a mock queue that returns a parent with explicit resolution_action
+        parent_esc = _make_esc(
+            task_id='task-cluster-7',
+            resolution_action='resume',
+            status='resolved',
+            resolved_by='interactive',
+            level=2,
+        )
+        parent_esc = Escalation(
+            id=parent_id,
+            task_id='task-cluster-7',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='infra_issue',
+            summary='L2 parent with resume',
+            level=2,
+            status='resolved',
+            resolved_by='interactive',
+            resolution_action='resume',
+        )
+        mock_queue = MagicMock()
+        mock_queue.get = MagicMock(return_value=parent_esc)
+        harness._escalation_queue = mock_queue
+
+        esc = Escalation(
+            id=f'esc-{task_id}-1',
+            task_id=task_id,
+            agent_role='workflow',
+            severity='blocking',
+            category='infra_issue',
+            summary='L1 cascade member',
+            level=1,
+            status='resolved',
+            resolved_by=f'l2-cascade:{parent_id}',
+            resolution_action=None,  # cascade doesn't copy resolution_action
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Parent lookup returns 'resume' → should flip
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+        # Verify queue.get was called with the parent id
+        mock_queue.get.assert_called_once_with(parent_id)
+
+    async def test_cascade_member_legacy_parent_no_action_still_flips(
+        self, harness: Harness
+    ):
+        """Cascade member whose parent L2 has NO resolution_action → legacy map
+        → status='resolved' → 'resume' → still flips (regression safety).
+        """
+        parent_id = 'esc-l2-legacy'
+        task_id = 'task-member-legacy'
+        parent_esc = Escalation(
+            id=parent_id,
+            task_id='task-cluster-legacy',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='infra_issue',
+            summary='legacy L2 no action',
+            level=2,
+            status='resolved',
+            resolved_by='interactive',
+            resolution_action=None,  # legacy — no action set
+        )
+        mock_queue = MagicMock()
+        mock_queue.get = MagicMock(return_value=parent_esc)
+        harness._escalation_queue = mock_queue
+
+        esc = Escalation(
+            id=f'esc-{task_id}-1',
+            task_id=task_id,
+            agent_role='workflow',
+            severity='blocking',
+            category='infra_issue',
+            summary='L1 cascade member',
+            level=1,
+            status='resolved',
+            resolved_by=f'l2-cascade:{parent_id}',
+            resolution_action=None,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Legacy map: member status='resolved' → 'resume' → flip
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
