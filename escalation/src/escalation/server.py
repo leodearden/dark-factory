@@ -909,7 +909,7 @@ def create_server(
             clamp = min(wait_secs, _MAX_WAIT_SECS)
             try:
                 outcome = await asyncio.wait_for(asyncio.shield(future), clamp)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return _nonblocking_state_response('queued', merge_req)
             # Resolved within clamp → fall through to terminal outcome shape below.
         else:
