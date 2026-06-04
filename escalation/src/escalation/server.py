@@ -697,6 +697,29 @@ def create_server(
             coalesce_or_enqueue_merge_request,
         )
 
+        # Single git_ops handle reused for both the already_merged fast-path
+        # (below) and the coalesce-gate disk-scan (coalesce_or_enqueue call).
+        # git_ops=None means no harness is wired (standalone / tests without
+        # orchestrator) — both paths degrade gracefully to no-op.
+        git_ops_for_scan = getattr(harness, 'git_ops', None)
+
+        # PRD I4 — already_merged fast-path: if the branch tip is already an
+        # ancestor of main, the submission is guaranteed-redundant.  Return
+        # {status:'already_merged', commit} immediately — NO enqueue, NO
+        # merge_queued event, NO asyncio.Future created (avoids an orphan future).
+        # resolve_branch_sha uses the full ref 'task/<branch>' per the worker
+        # convention (merge_queue.py:3796, git_ops.py:1461).  A missing branch
+        # (tip=None) falls through to the normal enqueue so the worker still
+        # emits its unknown_branch outcome, preserving existing semantics.
+        # git_ops=None (standalone) skips the fast-path entirely.
+        if git_ops_for_scan is not None:
+            full_branch = f'{orch_config.git.branch_prefix}{branch}'
+            tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
+            if tip is not None and await git_ops_for_scan.is_ancestor(
+                tip, orch_config.git.main_branch
+            ):
+                return {'status': 'already_merged', 'commit': tip}
+
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
         # See OrchestratorConfig.module_configs_or_empty (config.py) for details.
@@ -718,7 +741,6 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
-        git_ops_for_scan = getattr(harness, 'git_ops', None)
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
