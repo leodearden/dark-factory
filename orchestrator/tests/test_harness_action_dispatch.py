@@ -14,7 +14,6 @@ Step-1 (Pair A) — legacy mapping + close_only no-op + dispatch skeleton:
 from __future__ import annotations
 
 import asyncio
-import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,7 +22,6 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-
 
 # ---------------------------------------------------------------------------
 # Fixture — same pattern as test_cascade_unblock.py
@@ -656,7 +654,7 @@ class TestTeardownKillSequence:
         """resolution_action='park' on live workflow: cancel_workflow called,
         task written to 'deferred'.
         """
-        call_log = self._make_kill_harness(harness)
+        self._make_kill_harness(harness)
         task_id = 'task-kill-park'
         esc = _make_esc(
             task_id=task_id,
@@ -678,7 +676,7 @@ class TestTeardownKillSequence:
         """resolution_action='abandon' on live workflow: cancel_workflow called,
         task written to 'cancelled'.
         """
-        call_log = self._make_kill_harness(harness)
+        self._make_kill_harness(harness)
         task_id = 'task-kill-abandon'
         esc = _make_esc(
             task_id=task_id,
@@ -774,6 +772,7 @@ class TestActionTeardownTasksSet:
             h = Harness(mock_orch_config)
         # h.scheduler is a real Scheduler here (not replaced by the fixture).
         hook = h.scheduler._suppress_blocked_write
+        assert hook is not None, '_suppress_blocked_write must be wired (None before step-12)'
         h._action_teardown_tasks.add('task-X')  # AttributeError before step-12
         assert hook('task-X') is True, 'hook must return True for stamped task_id'
         assert hook('task-Y') is False, 'hook must return False for unstamped task_id'
