@@ -1264,3 +1264,507 @@ class TestMergeRequestDedup:
         assert not registry.is_inflight('Y'), (
             'Registry slot should be released after merge completes'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
+# ---------------------------------------------------------------------------
+
+
+async def _call_get_merge_queue(server) -> dict[str, Any]:
+    """Invoke the get_merge_queue MCP tool directly (sync tool)."""
+    tool = await server.get_tool('get_merge_queue')
+    return tool.fn()
+
+
+@pytest.mark.asyncio
+class TestGetMergeQueue:
+    """Tests for the get_merge_queue escalation MCP tool."""
+
+    def _make_orch_config(self, tmp_path: Path):
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        return OrchestratorConfig(project_root=tmp_path)
+
+    # ── step-1: standalone error ──────────────────────────────────────────
+
+    async def test_standalone_returns_error(self, tmp_path: Path):
+        """get_merge_queue with no merge_queue returns an error dict, no exception."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue)  # NO merge_queue — standalone
+
+        result = await _call_get_merge_queue(server)
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}'
+        assert 'error' in result, f'Expected error key, got: {result}'
+
+    # ── step-3: MergeRequest.enqueued_at default ──────────────────────────
+
+    async def test_merge_request_has_enqueued_at_default(self, tmp_path: Path):
+        """MergeRequest has enqueued_at float default; GroupMergeRequest still builds."""
+        import asyncio
+        import time
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            GroupMergeRequest,
+            MergeRequest,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+
+        req = MergeRequest(
+            task_id='T1',
+            branch='T1',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+
+        assert isinstance(req.enqueued_at, float), (
+            f'enqueued_at must be float, got {type(req.enqueued_at)}'
+        )
+        assert abs(req.enqueued_at - time.time()) < 60, (
+            f'enqueued_at={req.enqueued_at!r} not within 60s of now={time.time()!r}'
+        )
+
+        # Regression guard: GroupMergeRequest must still construct without TypeError
+        async def _noop_status(ids):
+            return {}
+
+        async def _noop_done(tid, sha):
+            pass
+
+        grq = GroupMergeRequest(
+            task_id='G1',
+            branch='G1',
+            worktree=tmp_path / 'wt2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            train_id='train-1',
+            member_task_ids=['G1'],
+            tip_branch='G1',
+            tip_task_id='G1',
+            status_check=_noop_status,
+            mark_member_done=_noop_done,
+        )
+        assert isinstance(grq.enqueued_at, float)
+
+    # ── step-5: queued blind-spot entry visible ───────────────────────────
+
+    async def test_queued_entry_is_visible(self, tmp_path: Path):
+        """A queued MergeRequest (no merge worktree) appears in snapshot — incident blind spot."""
+        import asyncio
+        import types
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id='Q',
+            branch='Q',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        await mq.put(req)
+
+        # Stub harness exposing _merge_worker
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+
+        assert isinstance(result, dict), f'Expected dict, got: {result}'
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result.get('depth', 0) >= 1, f'Expected depth >= 1, got: {result}'
+
+        entries = result.get('entries', [])
+        q_entries = [e for e in entries if e.get('task_id') == 'Q']
+        assert q_entries, f'Entry for task_id Q not found in entries: {entries}'
+        entry = q_entries[0]
+        assert entry['state'] == 'queued', f'Expected queued, got: {entry["state"]}'
+        assert entry['worktree'] is None, f'Expected worktree=None, got: {entry["worktree"]}'
+        assert entry['pre_rebased'] is False
+        assert isinstance(entry['age_secs'], (int, float))
+        assert entry['age_secs'] >= 0
+
+    # ── step-7: waiter_alive reflects cancelled future ────────────────────
+
+    async def test_waiter_alive_reflects_cancelled_future(self, tmp_path: Path):
+        """waiter_alive=True for a live future, False for a cancelled future."""
+        import asyncio
+        import types
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        live_fut = loop.create_future()
+        cancelled_fut = loop.create_future()
+        cancelled_fut.cancel()
+
+        await mq.put(MergeRequest(
+            task_id='LIVE', branch='LIVE', worktree=tmp_path / 'wt1',
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=live_fut,
+        ))
+        await mq.put(MergeRequest(
+            task_id='DEAD', branch='DEAD', worktree=tmp_path / 'wt2',
+            pre_rebased=False, task_files=None, module_configs=[], config=config,
+            result=cancelled_fut,
+        ))
+
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+        entries = result.get('entries', [])
+
+        live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
+        dead_entry = next((e for e in entries if e['task_id'] == 'DEAD'), None)
+
+        assert live_entry is not None, 'LIVE entry missing from snapshot'
+        assert dead_entry is not None, 'DEAD entry missing from snapshot'
+        assert live_entry['waiter_alive'] is True, (
+            f'Expected waiter_alive=True for live future, got: {live_entry}'
+        )
+        assert dead_entry['waiter_alive'] is False, (
+            f'Expected waiter_alive=False for cancelled future, got: {dead_entry}'
+        )
+
+    # ── step-9: verifier/queue-level state mapping ────────────────────────
+
+    @pytest.mark.parametrize('verify_phase', ['verifying', 'gate_reverify', 'finalizing'])
+    async def test_verifier_and_queue_level_state_mapping(
+        self, tmp_path: Path, verify_phase: str
+    ):
+        """snapshot() maps _verify_item/_inflight_req/_verifier_queue to correct states."""
+        import asyncio
+        import types
+
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+        git_ops_stub = types.SimpleNamespace()
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        def _req(tid: str) -> MergeRequest:
+            return MergeRequest(
+                task_id=tid, branch=tid,
+                worktree=tmp_path / f'wt-{tid}',
+                pre_rebased=False, task_files=None, module_configs=[],
+                config=config, result=loop.create_future(),
+            )
+
+        # M — in the merger (merging)
+        req_M = _req('M')
+        worker._inflight_req = req_M
+
+        # A — in the verifier queue (awaiting_verify)
+        merge_wt_A = tmp_path / 'mergeA'
+        merge_wt_A.mkdir()
+        item_A = SpeculativeItem(
+            request=_req('A'),
+            merge_result=None, merge_wt=merge_wt_A,
+            base_sha='base', speculative=False, skip_verify=False,
+        )
+        await worker._verifier_queue.put(item_A)
+
+        # V — currently being verified (phase = verify_phase param)
+        merge_wt_V = tmp_path / 'mergeV'
+        merge_wt_V.mkdir()
+        item_V = SpeculativeItem(
+            request=_req('V'),
+            merge_result=None, merge_wt=merge_wt_V,
+            base_sha='base', speculative=False, skip_verify=False,
+        )
+        worker._verify_item = item_V
+        worker._verify_phase = verify_phase
+
+        # WIP halt
+        worker.halt_for_wip('test-wip')
+        worker.set_halt_owner('esc-9')
+
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
+
+        result = await _call_get_merge_queue(server)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        entries = result['entries']
+
+        # find entries by task_id
+        by_id = {e['task_id']: e for e in entries}
+        assert 'M' in by_id, f'merging entry missing: {by_id}'
+        assert 'A' in by_id, f'awaiting_verify entry missing: {by_id}'
+        assert 'V' in by_id, f'verifying entry missing: {by_id}'
+
+        assert by_id['M']['state'] == 'merging'
+        assert by_id['A']['state'] == 'awaiting_verify'
+        assert by_id['A']['worktree'] == str(merge_wt_A)
+        assert by_id['V']['state'] == verify_phase
+        assert by_id['V']['worktree'] == str(merge_wt_V)
+
+        # head-of-line = V (verifier-current has lowest position)
+        assert result['head_of_line'] == 'V', (
+            f'Expected head_of_line=V, got: {result["head_of_line"]}'
+        )
+        assert by_id['V']['position'] == 0
+
+        # verify_in_progress reflects the current item
+        vip = result.get('verify_in_progress')
+        assert vip is not None, 'verify_in_progress should be set'
+        assert vip['task_id'] == 'V'
+
+        # WIP halt state
+        assert result['is_wip_halted'] is True
+        assert result['halt_owner_esc_id'] == 'esc-9'
+
+    # ── step-11: pipeline instrumentation sets/clears verify_phase ────────
+
+    async def test_pipeline_sets_and_clears_verify_phase(self, tmp_path: Path):
+        """_verify_and_advance sets _verify_phase='verifying' before verify and
+        'finalizing' before advance_main; worker._verify_item is None after.
+        """
+        import asyncio
+        import types
+
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        # Tracking lists so we can record the phase at call time
+        captured_phases: list[str | None] = []
+
+        async def fake_run_scoped_verification(*args, **kwargs):
+            captured_phases.append(worker._verify_phase)
+            return types.SimpleNamespace(passed=True, timed_out=False, enospc=False)
+
+        async def fake_advance_main(*args, **kwargs):
+            captured_phases.append(worker._verify_phase)
+            # Return 'not_descendant' — terminal non-advanced path
+            return 'not_descendant'
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id='P',
+            branch='P',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(success=True, merge_commit='deadbeef0000000', merge_worktree=merge_wt)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base000',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        original_rsv = mq_module.run_scoped_verification
+        mq_module.run_scoped_verification = fake_run_scoped_verification
+        try:
+            await worker._verify_and_advance(item)
+        finally:
+            mq_module.run_scoped_verification = original_rsv
+
+        # Phases: first call (verify) should be 'verifying', second (advance_main) 'finalizing'
+        assert len(captured_phases) >= 2, (
+            f'Expected at least 2 phase captures, got: {captured_phases}'
+        )
+        assert captured_phases[0] == 'verifying', (
+            f'Expected verifying before verify, got: {captured_phases[0]!r}'
+        )
+        assert captured_phases[1] == 'finalizing', (
+            f'Expected finalizing before advance_main, got: {captured_phases[1]!r}'
+        )
+
+        # Request future should be resolved (not_descendant → blocked)
+        assert req.result.done(), 'request future should be resolved after terminal advance_main'
+
+        # _verify_item is None — _verify_and_advance doesn't set it
+        # (that's _verifier_loop's job); just confirm it was never set
+        assert worker._verify_item is None
+
+        # snapshot has no verifying/finalizing entries
+        snap = worker.snapshot()
+        bad_states = {e['state'] for e in snap['entries']} & {'verifying', 'finalizing', 'gate_reverify'}
+        assert not bad_states, f'Snapshot should have no active verifier states, got: {bad_states}'
+
+    # ── amend: gate_reverify phase set/cleared by production code ─────────
+
+    async def test_gate_reverify_phase_set_and_cleared(self, tmp_path: Path):
+        """_verify_and_advance sets _verify_phase='gate_reverify' when advance_main
+        returns 'rebased_pending_reverify', and resets to 'finalizing' after the gate
+        clears (so subsequent advance_main retries report the correct phase).
+        """
+        import asyncio
+        import types
+
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeRequest,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+
+        loop = asyncio.get_running_loop()
+        config = self._make_orch_config(tmp_path / 'repo')
+        mq: asyncio.Queue = asyncio.Queue()
+
+        merge_wt = tmp_path / 'merge'
+        merge_wt.mkdir()
+
+        advance_calls: list[int] = []
+        captured_phases_reverify: list[str | None] = []
+        captured_phases_advance2: list[str | None] = []
+
+        async def fake_advance_main(*args, **kwargs):
+            advance_calls.append(len(advance_calls) + 1)
+            if len(advance_calls) == 1:
+                # First call: trigger rebase path
+                return 'rebased_pending_reverify'
+            else:
+                # Second call (after gate cleared): terminal failure
+                captured_phases_advance2.append(worker._verify_phase)
+                return 'not_descendant'
+
+        async def fake_cleanup_merge_worktree(path):
+            pass
+
+        # Side-channel attributes read by _verify_and_advance after
+        # 'rebased_pending_reverify' to extract the post-rebase SHAs.
+        git_ops_stub = types.SimpleNamespace(
+            advance_main=fake_advance_main,
+            cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            config=config,
+            _last_advanced_sha='rebased0abc',
+            _rebased_from='from0sha',
+            _rebased_onto='onto0sha',
+        )
+        worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
+
+        req = MergeRequest(
+            task_id='GR',
+            branch='GR',
+            worktree=tmp_path / 'wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+        )
+        merge_result = MergeResult(
+            success=True,
+            merge_commit='deadbeef00000001',
+            merge_worktree=merge_wt,
+        )
+        # skip_verify=True: bypass Step 4 and go straight to the advance_main loop,
+        # which is where 'gate_reverify' is triggered.
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base0sha',
+            speculative=False,
+            skip_verify=True,
+        )
+
+        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+
+        async def fake_reverify_rebased_tree(*args, **kwargs):
+            # Capture the phase at the moment _reverify_rebased_tree is invoked.
+            captured_phases_reverify.append(worker._verify_phase)
+            # Return None → gate cleared (disjoint/green), advance proceeds.
+            return None
+
+        original_reverify = mq_module._reverify_rebased_tree
+        mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
+        try:
+            await worker._verify_and_advance(item)
+        finally:
+            mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
+
+        # _reverify_rebased_tree must have been called exactly once
+        assert len(captured_phases_reverify) == 1, (
+            f'Expected _reverify_rebased_tree called once, got: {len(captured_phases_reverify)}'
+        )
+        # Phase must be 'gate_reverify' when _reverify_rebased_tree is invoked
+        assert captured_phases_reverify[0] == 'gate_reverify', (
+            f'Expected gate_reverify at reverify call, got: {captured_phases_reverify[0]!r}'
+        )
+
+        # advance_main must have been called twice
+        assert len(advance_calls) == 2, (
+            f'Expected 2 advance_main calls, got: {advance_calls}'
+        )
+        # After gate cleared, phase must be 'finalizing' when the second advance_main runs
+        assert len(captured_phases_advance2) == 1, (
+            f'Expected phase captured for second advance_main, got: {captured_phases_advance2}'
+        )
+        assert captured_phases_advance2[0] == 'finalizing', (
+            f'Expected finalizing after gate cleared, got: {captured_phases_advance2[0]!r}'
+        )
+
+        # Request future is resolved (not_descendant → blocked)
+        assert req.result.done(), 'request future should be resolved after terminal advance_main'
