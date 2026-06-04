@@ -3860,11 +3860,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            AttachAction,
             MergeOutcome,
             MergeRequest,
+            TipRelation,
+            WaiterRecord,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
+            _emit_merge_coalesced,
+            classify_tip_relation,
+            decide_attach_action,
             register_and_enqueue_merge_request,
+            resolve_divergent,
         )
 
         assert self.worktree is not None
@@ -3949,14 +3956,91 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
         )
-        await register_and_enqueue_merge_request(
-            self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
-        )
+
+        attached = False
+        _registry = self.merge_inflight_registry
+        if _registry is not None and _registry.entry(branch_name) is not None:
+            # Synchronously capture entry state before any await (I10 await-gap).
+            _entry = _registry.entry(branch_name)
+            old_tip = _entry.snapshot_tip if _entry is not None else None
+            verifying = _entry.verifying if _entry is not None else False
+
+            rc_tip, tip_out, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+            )
+            new_tip = tip_out.strip() if rc_tip == 0 and tip_out.strip() else None
+
+            if not (old_tip and new_tip):
+                # Cannot classify topology when either tip is unavailable (e.g.
+                # rev-parse failed or entry has no snapshot_tip yet).  Fall
+                # through to an independent enqueue rather than blindly attaching
+                # — coalescing against an older tip could resolve this workflow
+                # as DONE before its newer commits are included.
+                logger.debug(
+                    f'Task {self.task_id}: coalesce skipped — tips unavailable '
+                    f'(old={old_tip!r}, new={new_tip!r}); enqueueing independently.'
+                )
+            else:
+                # Tip-relation classification.
+                relation = await classify_tip_relation(new_tip, old_tip, self.git_ops)
+                if relation is TipRelation.DIVERGENT:
+                    relation = await resolve_divergent(new_tip, old_tip, self.git_ops)
+                action = decide_attach_action(relation, verifying=verifying)
+                if action is AttachAction.RESNAPSHOT:
+                    _registry.re_snapshot(branch_name, new_tip)
+                elif action is AttachAction.ATTACH_AND_CHAIN:
+                    # ATTACH_AND_CHAIN requires γ2 worker generation chaining
+                    # (task 1640).  verifying is always False until γ2 sets it,
+                    # so this branch is currently unreachable.  Log a warning so
+                    # enabling verifying cannot silently drop new commits.
+                    logger.warning(
+                        f'Task {self.task_id}: ATTACH_AND_CHAIN reached before '
+                        f'γ2 chaining is wired (task 1640); proceeding as plain '
+                        f'attach — new commits may not be re-verified.'
+                    )
+
+                waiter = WaiterRecord(
+                    request_id=merge_request.request_id,
+                    future=merge_request.result,
+                    source='workflow',
+                    submitted_tip=new_tip,
+                )
+                # attach() may return False if the entry was released during the
+                # classify await (I10 await-gap).  Fall through to enqueue in that case.
+                attached = _registry.attach(branch_name, waiter)
+                if attached:
+                    _emit_merge_coalesced(
+                        self.event_store, merge_request, 'workflow',
+                        _registry.eta_seconds(branch_name),
+                    )
+
+        _acquired = False
+        if not attached:
+            _acquired = await register_and_enqueue_merge_request(
+                self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+            )
+
+        # Soft-cancel hook: detach the workflow waiter instead of cancelling
+        # the future so the primary entry (and any remaining peers) stay alive.
+        # detach() cancels primary_future only when the waiter count hits 0,
+        # preserving the existing orphan-avoidance path (merge_queue.py).
+        # Route through detach() only when this request is registered in the
+        # registry (attached as peer OR acquired as sole waiter); otherwise fall
+        # back to future.cancel() to avoid the orphan the old code prevented.
+        _req_id = merge_request.request_id
+        def _on_soft_cancel_detach() -> None:
+            if _registry is not None and (attached or _acquired):
+                _registry.detach(branch_name, _req_id)
+            elif not future.done():
+                future.cancel()
 
         # Race the future against the cancel event so a human marking the
         # task done out-of-band exits the workflow promptly instead of
         # waiting for the merge worker to finish.
-        result = await self._await_cancellable(future)
+        result = await self._await_cancellable(
+            future,
+            on_soft_cancel=_on_soft_cancel_detach,
+        )
         if result is None:
             return await self._handle_soft_cancel('merge')
 
@@ -6346,7 +6430,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self._steward = steward
         await steward.start()
 
-    async def _await_cancellable(self, awaitable):
+    async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.
 
         Returns the awaitable's result, or ``None`` if the cancel event was
@@ -6357,9 +6441,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         If both the awaitable and the cancel event resolve in the same
         ``asyncio.wait`` window, the awaitable's result wins — the work
         already finished, no need to soft-cancel.
+
+        *on_soft_cancel*: optional ``Callable[[], None]`` invoked when the
+        cancel event wins and the future is not yet done.  When provided it
+        takes responsibility for orphan-avoidance (e.g. calling
+        ``registry.detach(branch, request_id)`` which cancels the primary
+        future only when the waiter count hits 0).  When ``None`` (default),
+        the existing ``fut.cancel()`` behaviour is preserved — this keeps the
+        group-merge / train path's blanket cancel untouched (D9).
         """
         fut = asyncio.ensure_future(awaitable)
         cancel_task = asyncio.create_task(self._cancel_event.wait())
+        cancel_won = False
         try:
             done, _pending = await asyncio.wait(
                 {fut, cancel_task},
@@ -6367,6 +6460,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             if fut in done:
                 return fut.result()
+            cancel_won = True
             return None
         finally:
             if not cancel_task.done():
@@ -6379,8 +6473,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # the queue with no workflow left to create the owning escalation.
             # See merge_queue.py: workers check req.result.cancelled() at entry
             # and before each halt_for_wip site.
-            if not fut.done():
-                fut.cancel()
+            if cancel_won and not fut.done():
+                if on_soft_cancel is not None:
+                    on_soft_cancel()
+                else:
+                    fut.cancel()
 
     async def _handle_soft_cancel(self, phase: str) -> WorkflowOutcome:
         """Decide an outcome after ``_cancel_event`` interrupted a long wait.

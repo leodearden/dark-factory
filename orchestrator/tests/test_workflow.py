@@ -624,3 +624,845 @@ class TestSubmitToMergeQueueRegistersInRegistry:
             f'inflight_seen={inflight_seen}'
         )
         assert outcome == WorkflowOutcome.DONE
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueAttachesAsPeer:
+    """_submit_to_merge_queue attaches as a peer waiter when an entry is in-flight."""
+
+    def _make_attach_workflow(self, tmp_path, real_queue, registry):
+        """Build a workflow wired to real_queue + registry (no plan gate)."""
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+        return wf
+
+    async def test_peer_completion_no_duplicate_enqueue(
+        self, tmp_path, monkeypatch,
+    ):
+        """Workflow attaches as peer, primary resolve flows through, no enqueue."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'abc123def456abc1'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+
+        # Stub _run so rev-parse returns TIP (same as snapshot → SAME relation)
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        coalesced_calls: list[int] = []
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: coalesced_calls.append(1),
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        # Let the task run to its blocking await
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # (1) No duplicate enqueue
+        assert real_queue.qsize() == 0, (
+            f'workflow must not enqueue a duplicate; qsize={real_queue.qsize()}'
+        )
+
+        # (2) Two waiters; 2nd belongs to the workflow
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+        assert entry.waiters[1].source == 'workflow'
+
+        # (3) Resolving the primary fans the outcome to the workflow's waiter
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        outcome = await submit_task
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # (4) merge_coalesced event emitted
+        assert len(coalesced_calls) == 1
+
+    async def test_superset_tip_resnapshots_before_attach(
+        self, tmp_path, monkeypatch,
+    ):
+        """SUPERSET new tip → re_snapshot before attach; no classify → RED."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        OLD = 'oldtip000000000001'
+        NEW = 'newtip000000000001'
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=OLD, snapshot_tip=OLD,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        # Stub is_ancestor: OLD is ancestor of NEW → NEW is SUPERSET
+        wf.git_ops.is_ancestor = AsyncMock(side_effect=lambda a, b: a == OLD and b == NEW)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, NEW + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        re_snapshot_calls: list[tuple] = []
+        real_re_snapshot = registry.re_snapshot
+        registry.re_snapshot = lambda branch, tip: (  # type: ignore[method-assign]
+            re_snapshot_calls.append((branch, tip)) or real_re_snapshot(branch, tip)
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # re_snapshot must be called before attach
+        assert ('B', NEW) in re_snapshot_calls, (
+            f're_snapshot not called with (B, {NEW!r}); calls={re_snapshot_calls}'
+        )
+        # Waiter is still attached
+        _entry = registry.entry('B')
+        assert _entry is not None
+        assert len(_entry.waiters) == 2
+
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        await submit_task
+
+    async def test_divergent_tip_resolves_and_attaches(
+        self, tmp_path, monkeypatch,
+    ):
+        """DIVERGENT tip → resolve_divergent yields SUBSET → attach without re_snapshot."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        OLD = 'divold000000000001'
+        NEW = 'divnew000000000001'
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=OLD, snapshot_tip=OLD,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        # Neither is ancestor → DIVERGENT
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        wf.git_ops.project_root = tmp_path
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, NEW + '\n', ''
+            if 'cherry' in cmd:
+                # no '+' lines → all commits in NEW are in OLD → SUBSET
+                return 0, '- abc\n- def\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Attached (ATTACH_CONTAINMENT action for SUBSET); no ValueError escaped
+        assert real_queue.qsize() == 0
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 2
+
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        await submit_task
+
+    async def test_attach_race_fallback_enqueues(
+        self, tmp_path, monkeypatch,
+    ):
+        """attach() returning False (entry released mid-await) → enqueue fallback."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        TIP = 'racetip00000000001'
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            if 'cherry' in cmd:
+                return 0, '- abc\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # Force attach() to return False (entry released during classify await)
+        registry.attach = lambda branch, waiter: False  # type: ignore[method-assign]
+
+        async def _worker():
+            req = await real_queue.get()
+            req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
+
+        worker_task = asyncio.create_task(_worker())
+        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+        await worker_task
+
+        assert outcome == WorkflowOutcome.DONE
+        assert real_queue.qsize() == 0  # worker consumed it
+
+
+@pytest.mark.asyncio
+class TestAttachedWaiterOutcomeMapping:
+    """I8 guard: conflict/blocked from primary flows through existing outcome mapping."""
+
+    async def _setup_attached_workflow(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'guardtip0000000001'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        return wf, P, registry
+
+    async def test_conflict_outcome_routes_to_resolve_and_resubmit(
+        self, tmp_path, monkeypatch,
+    ):
+        """Conflict from primary → _resolve_and_resubmit (as if own merge failed)."""
+        import asyncio
+
+        from orchestrator.merge_queue import MergeOutcome
+
+        wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
+
+        resolve_calls: list[tuple] = []
+        wf._resolve_and_resubmit = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda branch, details, **kw: (
+                resolve_calls.append((branch, details)) or WorkflowOutcome.BLOCKED
+            ),
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        P.set_result(MergeOutcome(status='conflict', conflict_details='conflict_X'))
+        await submit_task
+
+        assert resolve_calls == [('B', 'conflict_X')]
+
+    async def test_blocked_outcome_routes_to_mark_blocked(
+        self, tmp_path, monkeypatch,
+    ):
+        """Blocked from primary → _mark_blocked (as if own merge failed)."""
+        import asyncio
+
+        from orchestrator.merge_queue import MergeOutcome
+
+        wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
+
+        wf._write_merge_failure_review = MagicMock()
+        mark_calls: list[str] = []
+        wf._mark_blocked = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda reason, **kw: (
+                mark_calls.append(reason) or WorkflowOutcome.BLOCKED
+            ),
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        P.set_result(MergeOutcome(status='blocked', reason='verification failed'))
+        await submit_task
+
+        assert len(mark_calls) == 1
+        assert 'verification failed' in mark_calls[0]
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueSoftCancelDetaches:
+    """Soft-cancel detaches the workflow waiter instead of cancelling the primary."""
+
+    async def test_soft_cancel_detaches_waiter_primary_lives(
+        self, tmp_path, monkeypatch,
+    ):
+        """Soft-cancel removes workflow waiter; primary stays alive for the MCP waiter."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip000000000000001'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # Pre-set cancel_event so the workflow soft-cancels after attaching
+        wf._cancel_event.set()
+
+        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+
+        # (1) Workflow waiter was detached; only MCP waiter 'mr-mcp' remains
+        entry = registry.entry('B')
+        assert entry is not None, 'entry must still be in-flight (primary not cancelled)'
+        assert len(entry.waiters) == 1
+        assert entry.waiters[0].request_id == 'mr-mcp'
+
+        # (2) Primary P is NOT cancelled
+        assert not P.cancelled()
+
+        # (3) Outcome is REQUEUED (scheduler says in-progress → _handle_soft_cancel returns REQUEUED)
+        assert outcome == WorkflowOutcome.REQUEUED
+
+    async def test_re_attach_coalesces_after_soft_cancel(
+        self, tmp_path, monkeypatch,
+    ):
+        """A second _submit_to_merge_queue after soft-cancel re-attaches (2 waiters, no enqueue)."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip000000000000002'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, TIP + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: None,
+        )
+
+        # First call: soft-cancel → detach
+        wf._cancel_event.set()
+        await wf._submit_to_merge_queue('B', merge_phase=True)
+        _entry = registry.entry('B')
+        assert _entry is not None
+        assert len(_entry.waiters) == 1  # detached
+
+        # Second call: re-attach (cancel_event still set, but entry still in-flight)
+        # Clear the cancel event so the second call can actually attach and await
+        wf._cancel_event.clear()
+        submit_task = asyncio.create_task(wf._submit_to_merge_queue('B', merge_phase=True))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Re-attached: 2 waiters again, no enqueue
+        assert real_queue.qsize() == 0
+        _entry2 = registry.entry('B')
+        assert _entry2 is not None
+        assert len(_entry2.waiters) == 2
+
+        # Clean up: resolve P so the task can finish
+        P.set_result(MergeOutcome(status='done', merge_sha='sha2'))
+        await submit_task
+
+
+@pytest.mark.asyncio
+class TestAwaitCancellableSoftCancelHook:
+    """_await_cancellable on_soft_cancel hook: detach instead of cancel."""
+
+    async def test_hook_called_future_not_cancelled_on_cancel_win(
+        self, tmp_path: Path,
+    ):
+        """When the cancel event wins the race, hook is called and future is NOT cancelled."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._cancel_event.set()  # cancel wins immediately
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        hook_calls: list[int] = []
+
+        result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result is None
+        assert hook_calls == [1], 'hook must be called exactly once'
+        assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
+
+    async def test_no_hook_future_is_cancelled_on_cancel_win(
+        self, tmp_path: Path,
+    ):
+        """Without a hook (default None), cancel-win still cancels the future."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._cancel_event.set()
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+
+        result = await wf._await_cancellable(fut)
+
+        assert result is None
+        assert fut.cancelled(), 'future must be cancelled when no hook is provided'
+
+    async def test_hook_not_called_when_future_resolves_first(
+        self, tmp_path: Path,
+    ):
+        """When the awaitable resolves first, hook is NOT called and its result is returned."""
+        import asyncio
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        # cancel_event is NOT set
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut.set_result('the_result')
+        hook_calls: list[int] = []
+
+        result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
+
+        assert result == 'the_result'
+        assert hook_calls == [], 'hook must NOT be called when future resolves first'
+
+
+@pytest.mark.asyncio
+class TestGroupMergePathUnchangedByGamma3:
+    """D9 guard: train group-merge soft-cancel cancels future; no registry.attach/detach."""
+
+    async def test_group_merge_soft_cancel_cancels_future_not_detaches(
+        self, tmp_path, monkeypatch,
+    ):
+        """GroupMergeRequest future is cancelled on soft-cancel; attach/detach never called."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        attach_calls: list = []
+        detach_calls: list = []
+        _real_attach = registry.attach
+        _real_detach = registry.detach
+        registry.attach = lambda *a, **kw: (  # type: ignore[method-assign]
+            attach_calls.append(a) or _real_attach(*a, **kw)
+        )
+        registry.detach = lambda *a, **kw: (  # type: ignore[method-assign]
+            detach_calls.append(a) or _real_detach(*a, **kw)
+        )
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {
+            'id': 'B', 'title': 'T', 'description': 'd',
+            'metadata': {'train': {'id': 'T1', 'order': 1, 'members': ['A', 'B']}},
+        }
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        # Both members merge-deferred; 'B' is tip (order=1, highest)
+        scheduler.tasks_by_train = AsyncMock(return_value=[
+            {'id': 'A', 'status': 'merge-deferred'},
+            {'id': 'B', 'status': 'merge-deferred'},
+        ])
+        scheduler.get_status = AsyncMock(return_value='merge-deferred')
+        scheduler.get_statuses = AsyncMock(return_value=({'A': 'merge-deferred', 'B': 'merge-deferred'}, None))
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+
+        # Soft-cancel fires immediately
+        wf._cancel_event.set()
+
+        outcome = await wf._maybe_enqueue_group_merge()
+
+        # D9: the GroupMergeRequest future was cancelled (blanket fut.cancel(), no on_soft_cancel).
+        # fut.cancel() schedules the done_callback (which releases the registry slot) for the
+        # next event-loop iteration — yield a few ticks so the callback fires before asserting.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Registry slot (for 'B') is released by the done_callback on cancellation
+        assert registry.entry('B') is None, 'entry must be released after cancel'
+
+        # No attach or detach calls — train path uses acquire/release, not attach/detach
+        assert attach_calls == [], f'registry.attach must not be called for train; got {attach_calls}'
+        assert detach_calls == [], f'registry.detach must not be called for train; got {detach_calls}'
+
+        # Soft-cancel → REQUEUED (non-terminal scheduler status)
+        assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueEnqueuePathEdgeCases:
+    """Coverage for soft-cancel on the enqueue (non-attach) path and rev-parse failures."""
+
+    def _make_wf(self, tmp_path, *, registry):
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock()
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        import asyncio
+        real_queue: asyncio.Queue = asyncio.Queue()
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}
+        wf._base_commit = None
+        wf._module_configs = []
+        return wf, real_queue
+
+    async def test_enqueue_path_soft_cancel_cancels_future(
+        self, tmp_path, monkeypatch,
+    ):
+        """When registry is present but branch slot is free, acquire succeeds and
+        soft-cancel routes through detach() → count-0 → primary_future.cancel()."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry
+
+        registry = InFlightMergeRegistry()
+        wf, real_queue = self._make_wf(tmp_path, registry=registry)
+
+        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_coalesced', lambda *a, **kw: None)
+
+        # Pre-set cancel_event; soft-cancel fires as soon as _await_cancellable runs.
+        wf._cancel_event.set()
+
+        outcome = await wf._submit_to_merge_queue('B', merge_phase=True)
+
+        # Enqueued (branch slot was free).
+        assert real_queue.qsize() == 1
+
+        # The sole registry waiter was detached (count→0) → primary_future cancelled.
+        # The done_callback fires async — yield a few ticks.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert registry.entry('B') is None, 'slot must be released after cancel'
+
+        # Outcome is REQUEUED (scheduler non-terminal).
+        assert outcome == WorkflowOutcome.REQUEUED
+
+    async def test_rev_parse_failure_falls_through_to_enqueue(
+        self, tmp_path, monkeypatch,
+    ):
+        """When rev-parse fails (new_tip=None), coalesce is skipped and the
+        workflow enqueues independently rather than attaching blind."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        registry = InFlightMergeRegistry()
+
+        TIP = 'tip000000000000003'
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=TIP, snapshot_tip=TIP,
+        )
+
+        wf, real_queue = self._make_wf(tmp_path, registry=registry)
+
+        # Stub rev-parse to fail so new_tip=None.
+        async def fake_run_fail(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 1, '', 'fatal: not a git repository'
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run_fail)
+        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_coalesced', lambda *a, **kw: None)
+
+        # Run without cancel so the test can drive completion normally.
+        submit_task = asyncio.create_task(wf._submit_to_merge_queue('B', merge_phase=True))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Fell through to enqueue (did NOT attach as peer).
+        assert real_queue.qsize() == 1, 'must have enqueued independently'
+        entry = registry.entry('B')
+        assert entry is not None
+        assert len(entry.waiters) == 1, 'only the original MCP waiter; workflow not attached'
+
+        # Resolve both futures so the task can finish cleanly.
+        P.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        # The enqueued workflow request needs its result future resolved too.
+        queued_req = real_queue.get_nowait()
+        if not queued_req.result.done():
+            queued_req.result.set_result(MergeOutcome(status='done', merge_sha='sha2'))
+        await submit_task
