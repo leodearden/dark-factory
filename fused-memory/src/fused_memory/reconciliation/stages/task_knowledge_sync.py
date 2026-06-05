@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
+from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -513,6 +514,87 @@ async def _check_stall_guard_freshness(
                     'task_id': task_id,
                     'snapshot_status': snapshot_status,
                     'live_status': live_status,
+                }
+            )
+
+    return violations
+
+
+async def _classify_live_workflow_status_writes(
+    ops: list[dict],
+    project_root: str,
+    agent_id: str,
+    *,
+    now=None,
+) -> list[dict]:
+    """Classify write_journal ops where Stage 2 wrote set_task_status on a live-workflow task.
+
+    For every ``set_task_status`` op authored by *agent_id*, parses the params
+    for task_id, then calls :func:`is_workflow_live_for_task`.  When the task is
+    live, returns a violation record ``{op_id, task_id, reason: 'live_workflow_status_write'}``.
+
+    This is a post-flight observation guard (defence-in-depth): the write already
+    landed (the LLM issued it via MCP), so this helper cannot undo it.  Callers
+    are expected to:
+
+    - increment ``stats['live_workflow_status_writes']`` by ``len(violations)``
+    - decrement ``stats['tasks_modified']`` by ``len(violations)`` (clamped at 0)
+
+    Filter rules (mirror :func:`_classify_terminal_state_violations`):
+
+    * Only ops where ``op['agent_id'] == agent_id`` are inspected.
+    * Only ops where ``op['operation'] == 'set_task_status'`` are inspected.
+    * Detector exceptions are swallowed (treat as not-live — fail toward logging
+      the op as a legitimate action rather than flagging it spuriously).
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        now: Injectable datetime for deterministic tests (forwarded to detector).
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'reason': 'live_workflow_status_write'}``
+        dicts, one per qualifying violation.  Empty list when no violations found.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != agent_id:
+            continue
+        if op.get('operation') != 'set_task_status':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._classify_live_workflow_status_writes: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+        task_id = str(params.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        try:
+            kwargs = {} if now is None else {'now': now}
+            live = is_workflow_live_for_task(task_id, project_root, **kwargs)
+        except Exception:
+            logger.warning(
+                'reconciliation._classify_live_workflow_status_writes: '
+                'detector error for task_id=%s; treating as not-live',
+                task_id,
+            )
+            live = False
+
+        if live:
+            violations.append(
+                {
+                    'op_id': op.get('id'),
+                    'task_id': task_id,
+                    'reason': 'live_workflow_status_write',
                 }
             )
 
@@ -1511,6 +1593,34 @@ class TaskKnowledgeSync(BaseStage):
         # value (including a clamped value written above by Guard 4 or 4b).
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
+
+        # Guard 5 — live-workflow status-write reclassification (task 1655)
+        # Detects set_task_status ops where the target task has a live workflow
+        # (registered worktree / recent branch commits / orchestrator live).
+        # The LLM's write already landed; this guard post-hoc flags the churn
+        # (stats + log) for observability.  Actual prevention is the Stage 2 prompt.
+        if self.project_root:
+            live_workflow_violations = await _classify_live_workflow_status_writes(
+                ops, self.project_root, _stage_agent_id
+            )
+            if live_workflow_violations:
+                report.stats['live_workflow_status_writes'] = report.stats.get(
+                    'live_workflow_status_writes', 0
+                ) + len(live_workflow_violations)
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
+                )
+                for v in live_workflow_violations:
+                    logger.info(
+                        'reconciliation.live_workflow_status_write_suppressed',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'op_id': v['op_id'],
+                        },
+                    )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.

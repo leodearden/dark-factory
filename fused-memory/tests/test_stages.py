@@ -10228,39 +10228,24 @@ class TestApplyPostFlightGuardsLiveWorkflow:
         # Taskmaster returns in-progress for caching (status_cache pre-fetch)
         stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'in-progress'}
 
-        # Stub super().run() via cli_stage_runner; return a report with tasks_modified=2
-        from fused_memory.models.reconciliation import StageId as _SID, StageReport
+        # Stub super().run() via cli_stage_runner; return a report with tasks_modified=2.
+        # Mirror the existing guard integration test pattern: patch assemble_payload to
+        # skip I/O and patch run_stage_via_cli at the module level to return a fake result.
         from unittest.mock import patch as _patch
 
-        initial_report = StageReport(
-            stage=_SID.task_knowledge_sync,
-            started_at=datetime(2026, 6, 5, 0, 0, tzinfo=UTC),
-            completed_at=datetime(2026, 6, 5, 0, 1, tzinfo=UTC),
-            items_flagged=[],
-            stats={'tasks_modified': 2},
-            llm_calls=1,
-            tokens_used=10,
-        )
-
-        from shared.cli_invoke import AgentResult
-
-        with _patch.object(
-            stage,
-            '_run_cli_stage',
-            new=AsyncMock(return_value=AgentResult(
-                success=True,
-                output='',
-                structured_output={
-                    'summary': 'done',
-                    'flagged_items': [],
-                    'stats': {'tasks_modified': 2},
-                },
-            )),
+        with (
+            _patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            _patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 2}
+                )),
+            ),
+            caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.stages.task_knowledge_sync'),
         ):
             from fused_memory.models.reconciliation import Watermark
             wm = Watermark(project_id='dark_factory')
-            with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.stages.task_knowledge_sync'):
-                report = await stage.run([], wm, [], 'test-run-live')
+            report = await stage.run([], wm, [], 'test-run-live')
 
         assert report.stats.get('live_workflow_status_writes', 0) >= 1, (
             f'Expected live_workflow_status_writes >= 1, got stats={report.stats}'
