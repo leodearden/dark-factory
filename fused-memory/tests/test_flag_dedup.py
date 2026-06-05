@@ -5016,3 +5016,101 @@ class TestNormalizerParity:
                 f'  recon_report._normalize_description       → {rr_result!r}'
             )
 
+
+# ---------------------------------------------------------------------------
+# task-1656 step-1 — RED: _is_valid_marker_task_id unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsValidMarkerTaskId:
+    """Unit tests for _is_valid_marker_task_id(tid: str) -> bool.
+
+    The helper must ACCEPT bare non-negative integers and comma-joined
+    lists of them (the cited_tasks fallback shape), and REJECT content-
+    fingerprint keys ('fp:…'), the empty string, non-numeric strings,
+    and malformed comma forms.
+    """
+
+    # ----- ACCEPT cases -----
+
+    def test_accepts_bare_integer(self):
+        """'42' — canonical single-task marker key."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('42') is True, "'42' must be accepted"
+
+    def test_accepts_zero(self):
+        """'0' — smallest valid non-negative integer."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('0') is True, "'0' must be accepted"
+
+    def test_accepts_large_integer(self):
+        """'99999' — large task id within normal range."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('99999') is True, "'99999' must be accepted"
+
+    def test_accepts_comma_joined_two_ids(self):
+        """'12,15' — the cited_tasks fallback shape (multi-task finding)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,15') is True, "'12,15' must be accepted"
+
+    def test_accepts_comma_joined_three_ids(self):
+        """'1,2,3' — three tasks cited by one finding."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('1,2,3') is True, "'1,2,3' must be accepted"
+
+    def test_accepts_comma_joined_with_spaces(self):
+        """'12, 15' — components with surrounding whitespace must be stripped before check."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12, 15') is True, "'12, 15' must be accepted (strip spaces)"
+
+    # ----- REJECT cases -----
+
+    def test_rejects_content_fingerprint_key(self):
+        """'fp:9216e85ac497b68d93043b64684eb049' — the content-fingerprint prefix triggers rejection."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:9216e85ac497b68d93043b64684eb049'
+        assert _is_valid_marker_task_id(tid) is False, f'{tid!r} must be rejected (fp: prefix)'
+
+    def test_rejects_empty_string(self):
+        """'' — falsy input must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('') is False, "'' must be rejected"
+
+    def test_rejects_non_numeric_string(self):
+        """'abc' — plain non-numeric string must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('abc') is False, "'abc' must be rejected"
+
+    def test_rejects_trailing_comma(self):
+        """'12,' — trailing comma produces an empty component, which is non-numeric."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,') is False, "'12,' must be rejected"
+
+    def test_rejects_comma_with_fp_component(self):
+        """'12,fp:abc' — mixed numeric + fp: component must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,fp:abc') is False, "'12,fp:abc' must be rejected"
+
+    def test_rejects_negative_integer_string(self):
+        """'-1' — negative integer: leading minus is not a digit."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('-1') is False, "'-1' must be rejected"
+
+    def test_rejects_float_string(self):
+        """'1.5' — dot is not a digit (mirrors _looks_like_task_id dot-rejecting convention)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('1.5') is False, "'1.5' must be rejected"
+
