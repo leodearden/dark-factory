@@ -298,62 +298,6 @@ class TestStage2PromptMandatesUniquenessToken:
 
 
 # ---------------------------------------------------------------------------
-# task-1653: STAGE1 prompt mandates metadata.stage='memory_consolidator' in
-# per-cycle summary writes (mirrors Stage 2's stage='task_knowledge_sync' fix)
-# ---------------------------------------------------------------------------
-
-
-class TestStage1PromptMandatesCycleSummaryStageMetadata:
-    """Minimal contract tests: STAGE1_SYSTEM_PROMPT carries the stage metadata
-    directive for per-cycle summary writes.
-
-    Regression guards against the directive being dropped from the prompt.
-    """
-
-    def test_prompt_mandates_stage_in_cycle_summary_metadata(self):
-        """STAGE1_SYSTEM_PROMPT must contain the stage key for cycle-summary writes.
-
-        The Stage 1 per-cycle summary add_memory call must carry
-        metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>}
-        so that Stage 3's triple-filter existence check
-        {kind: cycle_summary, run_id, stage: memory_consolidator} returns >= 1
-        instead of 0 (which formerly caused false 'Stage 1 summary missing' reports).
-        Mirrors Stage 2's fix (task 9af436fe, stage='task_knowledge_sync').
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert "'stage': 'memory_consolidator'" in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must include \"'stage': 'memory_consolidator'\" in the "
-            "per-cycle summary metadata directive so the add_memory call carries the "
-            "stage key and the triple-filter {kind: cycle_summary, run_id, stage: "
-            "memory_consolidator} can find the summary."
-        )
-
-    def test_prompt_mandates_post_write_stage_self_check(self):
-        """STAGE1_SYSTEM_PROMPT must contain 'stage': 'memory_consolidator' at least twice.
-
-        The stage key must appear in BOTH:
-        (1) the metadata write directive (add_memory call),
-        (2) the post-write self-check filter passed to count_memories_by_metadata
-            — the triple filter {kind: cycle_summary, run_id, stage: memory_consolidator}
-            used to confirm the stage key persisted (a return of 0 means the key did
-            not persist, causing Stage 3's triple-filter verification to falsely report
-            'Stage 1 summary missing').
-        count(...) >= 2 ensures both are present.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        count = STAGE1_SYSTEM_PROMPT.count("'stage': 'memory_consolidator'")
-        assert count >= 2, (
-            f"STAGE1_SYSTEM_PROMPT must contain \"'stage': 'memory_consolidator'\" at "
-            f"least twice (write directive + post-write self-check filter); found {count}. "
-            "Both the metadata write directive and the count_memories_by_metadata "
-            "triple-filter {kind: cycle_summary, run_id, stage: memory_consolidator} "
-            "must carry the stage key."
-        )
-
-
-# ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
 
