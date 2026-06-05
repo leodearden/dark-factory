@@ -462,6 +462,19 @@ async def _write_and_confirm_marker(
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
+    **Validation guard (task-1656):** before calling ``add_memory``, ``tid`` is
+    checked by :func:`_is_valid_marker_task_id`.  If the check fails (e.g. a
+    content-fingerprint ``fp:…`` key produced by
+    :func:`compute_content_fingerprint_signature`) a WARNING is logged and this
+    helper returns ``False`` immediately — ``add_memory`` and
+    ``_confirm_and_track`` are NOT called.  Returning ``False`` (not raising)
+    ensures:
+
+    - On the HIT path, priors are NOT deleted (best-effort-replacement invariant:
+      never delete priors when no replacement was written).
+    - The confirmation circuit-breaker counter is untouched — a deliberate
+      guard-skip is not a Mem0 brownout signal.
+
     On add_memory exception: logs a unified WARNING and returns ``False``.
 
     On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
@@ -474,6 +487,19 @@ async def _write_and_confirm_marker(
     ``bool(response.memory_ids)`` was False (TRIPPED breaker).  Both templates
     are forwarded verbatim to ``confirm_and_track``.
     """
+    # Validation guard: reject non-numeric task_id keys before writing to Mem0.
+    # Stage 2 cannot process non-integer marker keys (e.g. fp:… content-fingerprint
+    # keys produced by compute_content_fingerprint_signature), which causes perpetual
+    # stale-marker cleanup loops.  Returning False without touching add_memory or
+    # _confirm_and_track preserves the HIT-path best-effort-replacement invariant
+    # and keeps the circuit-breaker counter clean.
+    if not _is_valid_marker_task_id(tid):
+        log.warning(
+            'flag_dedup: skipping stage1_flag_marker write for non-numeric task_id %r'
+            ' flag_type %s — unprocessable by Stage 2',
+            tid, ftype,
+        )
+        return False
     try:
         response = await memory_service.add_memory(
             content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
