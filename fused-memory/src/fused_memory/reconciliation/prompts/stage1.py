@@ -324,11 +324,17 @@ is present.
 
 **Path 2 — Metadata-keyed existence count** (deterministic): \
 `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
-filters={{'kind': 'cycle_summary', 'run_id': '<run_id>'}})` \
-A return value > 0 means the summary is present. This path catches summaries that \
+filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledge_sync'}})` \
+A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
 semantic search misses due to low cosine-similarity ranking (confirmed false negative: \
 run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful reconstruction; \
-task 1588).
+task 1588). \
+**The `stage='task_knowledge_sync'` key is REQUIRED here (task 1653):** this stage \
+(Stage 1) now writes its OWN per-cycle summary under \
+`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}` using \
+the SAME shared run_id. A `stage`-less double filter would match this stage's own summary \
+and falsely report the Stage 2 summary as present, suppressing a genuinely-needed \
+missing-summary finding. Disambiguate the Stage 2 summary by `'stage': 'task_knowledge_sync'`.
 
 **Decision rule**: if EITHER path confirms the summary exists, do NOT emit the \
 missing-summary finding — Stage 2 already wrote the per-cycle summary for that run. \
@@ -347,7 +353,8 @@ Rationale: back-to-back remediation passes otherwise trigger double-reconstructi
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
 up. The two-path approach eliminates the false-negative risk from semantic-search \
 ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
-`metadata.run_id`, so Path 2 returns 0 for them — Path 1 remains their fallback.
+`metadata.run_id`, and Stage 2 summaries written before task 9af436fe lack \
+`metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their fallback.
 
 ## Pre-Check: Existing Task Completion Summary by task_id
 Before emitting a "missing completion summary" finding for a specific task, ALSO \
