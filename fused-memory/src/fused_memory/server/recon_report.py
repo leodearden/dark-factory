@@ -37,6 +37,84 @@ def _description_hash(description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fix 1 helpers — citation identity + same-run echo suppression (task-1654)
+# ---------------------------------------------------------------------------
+
+
+def _citation_identities(finding: dict) -> set[str]:
+    """Return the set of identity strings for a finding's typed citations.
+
+    Flattens all four citation lists into a single flat set of stable identity
+    strings:
+    - ``cited_tasks``    → ``'{project_id}:{task_id}'`` per entry
+    - ``cited_entities`` → ``entity_uuid`` per entry
+    - ``cited_edges``    → ``edge_uuid`` per entry
+    - ``cited_memories`` → ``memory_id`` per entry
+
+    Mirrors :func:`harness._derive_affected_ids` traversal but:
+    - uses ``project_id:task_id`` for tasks (cross-project disambiguation)
+    - returns a ``set`` (not a list) so subset tests are O(n) not O(n²)
+    - lives in server/recon_report.py to avoid a server←reconciliation import
+
+    Used by :func:`_traces_exclusively_to_stage1` and
+    :func:`ReconReportState.get_assembled_report` for Fix-1 echo suppression.
+    Pure, sync, no I/O; safe to call from any context.
+    """
+    ids: set[str] = set()
+    for c in finding.get('cited_tasks') or []:
+        if isinstance(c, dict):
+            pid = c.get('project_id')
+            tid = c.get('task_id')
+            if pid is not None and tid is not None:
+                ids.add(f'{pid}:{tid}')
+    for c in finding.get('cited_entities') or []:
+        if isinstance(c, dict):
+            val = c.get('entity_uuid')
+            if val is not None:
+                ids.add(str(val))
+    for c in finding.get('cited_edges') or []:
+        if isinstance(c, dict):
+            val = c.get('edge_uuid')
+            if val is not None:
+                ids.add(str(val))
+    for c in finding.get('cited_memories') or []:
+        if isinstance(c, dict):
+            val = c.get('memory_id')
+            if val is not None:
+                ids.add(str(val))
+    return ids
+
+
+def _traces_exclusively_to_stage1(
+    finding: dict,
+    stage1_identities: set[str],
+) -> bool:
+    """Return True iff *finding* is a non-actionable echo of Stage-1 citations.
+
+    Predicate: True iff ALL of the following hold:
+    1. ``finding['actionable']`` is False
+    2. The finding's citation identity set is non-empty (has >=1 typed citation)
+    3. The identity set is a SUBSET of *stage1_identities*
+
+    Returning False for condition 2 (empty set) prevents citation-less
+    non-actionable findings from being silently collapsed — they carry no
+    structural evidence that they duplicate Stage 1.  Returning False for
+    partial overlap (condition 3) ensures only *complete* echoes are
+    suppressed; a finding with even one uncovered citation may represent new
+    structural evidence.
+
+    Used by :func:`ReconReportState.get_assembled_report` for Fix-1 read-time
+    suppression.  Pure, sync, no I/O.
+    """
+    if finding.get('actionable') is not False:
+        return False
+    identities = _citation_identities(finding)
+    if not identities:
+        return False
+    return identities <= stage1_identities
+
+
+# ---------------------------------------------------------------------------
 # Internal data model
 # ---------------------------------------------------------------------------
 
