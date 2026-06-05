@@ -4805,3 +4805,143 @@ class TestComputeContentFingerprintSignature:
             f'({_CONTENT_FP_FLAG_TYPE!r}), got {ftype!r}'
         )
 
+
+# ---------------------------------------------------------------------------
+# task-1654 step-3 — RED: dedup_flags cross-cycle dedup via content fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsContentFingerprintPath:
+    """Verify dedup_flags uses compute_content_fingerprint_signature as a fallback
+    for null-task_id, no-cited-tasks flags so they stop re-escalating each cycle.
+
+    Mirrors the _make_search_stub / _make_memory_result / AddMemoryResponse
+    stub pattern from existing dedup_flags tests above.  The search stub is
+    keyed on the fp:… marker query string, computed from the test flag's
+    description at test setup time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self):
+        """Cycle 1 (no prior marker): MISS path writes marker with fp:… task_id."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Stale edge d592ca46 has no known task anchor',
+        }
+        # Derive the expected fp/ftype at test time (same logic as impl).
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: signature must be computable for this flag'
+        expected_fp, expected_ftype = sig
+
+        # All searches return empty: no suppression entries, no prior markers.
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # (a) Flag is NOT annotated with persisted_from_run (MISS path)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0], (
+            f'Fresh null-task_id flag must not have persisted_from_run; got {result[0]}'
+        )
+
+        # (b) add_memory called exactly once with the content-fingerprint marker
+        memory_service.add_memory.assert_called_once()
+        marker_kwargs = memory_service.add_memory.call_args.kwargs
+        assert marker_kwargs.get('category') == 'observations_and_summaries'
+        meta = marker_kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage1_flag_marker', (
+            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
+        )
+        # task_id in the marker must be the content fingerprint (fp:…)
+        assert meta.get('task_id') == expected_fp, (
+            f'Marker task_id must be the content fp {expected_fp!r}; got {meta.get("task_id")!r}'
+        )
+        assert meta.get('flag_type') == expected_ftype, (
+            f'Marker flag_type must be {expected_ftype!r}; got {meta.get("flag_type")!r}'
+        )
+        assert meta.get('run_id') == 'r1', (
+            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cycle2_hit_annotates_flag_with_persisted_from_run(self):
+        """Cycle 2 (prior marker present + confirmation marker for current run): HIT path
+        annotates flag with persisted_from_run and last_seen_run_id."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Stale edge d592ca46 has no known task anchor',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        # Build a prior marker for the fp:… key (run_id='r1' from cycle 1)
+        prior_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r1',
+            'last_seen_run_id': 'r1',
+        })
+        prior_marker.id = 'prior-fp-r1'
+
+        # Confirmation marker for current run r2
+        confirm_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r2',
+        })
+        confirm_marker.id = 'new-fp-r2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[prior_marker], [confirm_marker]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r2',
+            flags=[flag],
+        )
+
+        # (a) Flag IS annotated with persisted_from_run='r1' and last_seen_run_id='r2' (HIT)
+        assert len(result) == 1
+        assert result[0].get('persisted_from_run') == 'r1', (
+            f'HIT: persisted_from_run must be "r1"; got {result[0].get("persisted_from_run")!r}'
+        )
+        assert result[0].get('last_seen_run_id') == 'r2', (
+            f'HIT: last_seen_run_id must be "r2"; got {result[0].get("last_seen_run_id")!r}'
+        )
+
+        # (b) Replacement marker is written (HIT path)
+        memory_service.add_memory.assert_called_once()
+
+        # (c) Prior marker deleted after confirmed write
+        memory_service.delete_memory.assert_called_once()
+        del_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert del_kwargs.get('memory_id') == 'prior-fp-r1'
+
