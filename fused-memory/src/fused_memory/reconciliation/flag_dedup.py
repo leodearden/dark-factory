@@ -462,6 +462,23 @@ async def _write_and_confirm_marker(
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
+    **Validation guard (task-1656, defense-in-depth):** before calling
+    ``add_memory``, ``tid`` is checked by :func:`_is_valid_marker_task_id`.
+    Under normal operation this guard is never reached for invalid keys — the
+    early guard in :func:`dedup_flags` (added in the task-1656 amendment pass)
+    short-circuits before the search+write path for ``fp:…`` and other
+    non-numeric keys.  This guard remains as a defense-in-depth backstop for
+    any future code path that calls ``_write_and_confirm_marker`` directly with
+    an unvalidated ``tid``.  When tripped it logs a WARNING (genuinely unexpected
+    at this call site after the early guard) and returns ``False`` — ``add_memory``
+    and ``_confirm_and_track`` are NOT called.  Returning ``False`` (not raising)
+    ensures:
+
+    - On the HIT path, priors are NOT deleted (best-effort-replacement invariant:
+      never delete priors when no replacement was written).
+    - The confirmation circuit-breaker counter is untouched — a deliberate
+      guard-skip is not a Mem0 brownout signal.
+
     On add_memory exception: logs a unified WARNING and returns ``False``.
 
     On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
@@ -474,6 +491,19 @@ async def _write_and_confirm_marker(
     ``bool(response.memory_ids)`` was False (TRIPPED breaker).  Both templates
     are forwarded verbatim to ``confirm_and_track``.
     """
+    # Validation guard: reject non-numeric task_id keys before writing to Mem0.
+    # Stage 2 cannot process non-integer marker keys (e.g. fp:… content-fingerprint
+    # keys produced by compute_content_fingerprint_signature), which causes perpetual
+    # stale-marker cleanup loops.  Returning False without touching add_memory or
+    # _confirm_and_track preserves the HIT-path best-effort-replacement invariant
+    # and keeps the circuit-breaker counter clean.
+    if not _is_valid_marker_task_id(tid):
+        log.warning(
+            'flag_dedup: skipping stage1_flag_marker write for non-numeric task_id %r'
+            ' flag_type %s — unprocessable by Stage 2',
+            tid, ftype,
+        )
+        return False
     try:
         response = await memory_service.add_memory(
             content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
@@ -523,7 +553,16 @@ async def dedup_flags(
       fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
       Only when BOTH helpers return None is the flag returned unchanged — no
       I/O performed.
-    - If a signature is computable (from either helper), Mem0 is searched for a
+    - If a signature is computable, the resulting ``task_id`` (``tid``) is
+      validated by ``_is_valid_marker_task_id``.  Non-numeric keys — in
+      particular ``fp:…`` content-fingerprint keys produced by
+      ``compute_content_fingerprint_signature`` — are **skipped entirely**:
+      the flag is returned unchanged and no Mem0 I/O is performed.  This
+      prevents the perpetual stale-marker cleanup loop that would result from
+      persisting a marker whose ``task_id`` Stage 2 cannot resolve.
+      Null-task_id/no-cited-tasks findings revert to re-escalating each cycle;
+      this is the intended trade-off (task-1656 design rationale).
+    - For valid (numeric or comma-joined) signatures, Mem0 is searched for a
       prior marker memory with matching ``task_id`` and ``flag_type``.
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
@@ -647,6 +686,22 @@ async def dedup_flags(
             result.append(flag)
             continue
         tid, ftype = sig
+        # Early guard (task-1656 amend): skip search + write for non-numeric keys.
+        # fp:… content-fingerprint keys (produced by compute_content_fingerprint_signature)
+        # are unprocessable by Stage 2 and would — if persisted — cause a perpetual
+        # stale-marker cleanup loop.  Searching Mem0 for them on every cycle is
+        # wasted network I/O since the marker write is blocked downstream anyway.
+        # Logging at DEBUG: this is an expected steady-state condition for
+        # null-task_id/no-cited-tasks findings, not an anomaly.
+        if not _is_valid_marker_task_id(tid):
+            logger.debug(
+                'flag_dedup: skipping stage1 dedup for non-numeric task_id %r'
+                ' (flag_type %s) — Stage 2-unprocessable key; finding will'
+                ' re-escalate each cycle (intentional trade-off)',
+                tid, ftype,
+            )
+            result.append(flag)
+            continue
         # Delegate search+filter to the shared helper.  find_prior_memories logs a
         # WARNING under logger on search failure and returns [] so the else
         # branch below writes a fresh marker (best-effort on transient Mem0 outage).
@@ -908,6 +963,36 @@ def _normalize_content_description(description: str) -> str:
     implementation changes, update this one too.
     """
     return ' '.join(description.split()).casefold()
+
+
+def _is_valid_marker_task_id(tid: str) -> bool:
+    """Return True iff *tid* is a valid stage1_flag_marker key processable by Stage 2.
+
+    Accepts:
+    - A bare non-negative integer string (e.g. ``'42'``, ``'0'``).
+    - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
+      the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
+      fallback for multi-task findings.
+
+    Rejects:
+    - Falsy / empty input.
+    - Content-fingerprint keys (e.g. ``'fp:9216e85ac497b68d93043b64684eb049'``).
+    - Any component that is not a non-negative integer after strip.
+    - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
+
+    Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
+    convention (``_looks_like_task_id`` in task_interceptor.py and
+    sqlite_task_backend.py) while additionally tolerating the comma-joined
+    marker key.  Defined as a LOCAL helper to avoid a
+    server/middleware←reconciliation import inversion; see the local-copy
+    convention in :func:`_normalize_content_description`.
+
+    Pure, sync, no I/O.
+    """
+    if not tid:
+        return False
+    components = tid.split(',')
+    return all(part.strip().isdigit() for part in components)
 
 
 def _content_fingerprint(description: str) -> str:

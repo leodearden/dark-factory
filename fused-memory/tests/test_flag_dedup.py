@@ -4849,8 +4849,15 @@ class TestDedupFlagsContentFingerprintPath:
     """
 
     @pytest.mark.asyncio
-    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self):
-        """Cycle 1 (no prior marker): MISS path writes marker with fp:… task_id."""
+    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self, caplog):
+        """Cycle 1 (no prior marker): fp:… task_id skipped by early guard — no I/O.
+
+        Updated by task-1656 amendment: the early guard in dedup_flags now short-circuits
+        BEFORE find_prior_memories for fp:… keys (moved from _write_and_confirm_marker).
+        No search is performed for the fp: key; no add_memory call; guard logs at DEBUG.
+        """
+        import logging as _logging
+
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
             dedup_flags,
@@ -4866,47 +4873,45 @@ class TestDedupFlagsContentFingerprintPath:
         assert sig is not None, 'Test setup: signature must be computable for this flag'
         expected_fp, expected_ftype = sig
 
-        # All searches return empty: no suppression entries, no prior markers.
+        # All searches return empty: no suppression entries, no marker searches.
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(return_value=[])
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
-        result = await dedup_flags(
-            memory_service=memory_service,
-            project_id='p',
-            run_id='r1',
-            flags=[flag],
-        )
+        with caplog.at_level(_logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
 
-        # (a) Flag is NOT annotated with persisted_from_run (MISS path)
+        # (a) Flag is returned unchanged — no annotation (early guard pass-through)
         assert len(result) == 1
         assert 'persisted_from_run' not in result[0], (
             f'Fresh null-task_id flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # (b) add_memory called exactly once with the content-fingerprint marker
-        memory_service.add_memory.assert_called_once()
-        marker_kwargs = memory_service.add_memory.call_args.kwargs
-        assert marker_kwargs.get('category') == 'observations_and_summaries'
-        meta = marker_kwargs.get('metadata', {})
-        assert meta.get('source') == 'stage1_flag_marker', (
-            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
-        )
-        # task_id in the marker must be the content fingerprint (fp:…)
-        assert meta.get('task_id') == expected_fp, (
-            f'Marker task_id must be the content fp {expected_fp!r}; got {meta.get("task_id")!r}'
-        )
-        assert meta.get('flag_type') == expected_ftype, (
-            f'Marker flag_type must be {expected_ftype!r}; got {meta.get("flag_type")!r}'
-        )
-        assert meta.get('run_id') == 'r1', (
-            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        # (b) add_memory must NOT be called — early guard skips I/O entirely
+        memory_service.add_memory.assert_not_called()
+
+        # (c) Guard logs at DEBUG naming the skipped fp:… task_id (not WARNING —
+        #     this is expected steady-state for null-task_id/no-cited-tasks flags)
+        debug_texts = [r.message for r in caplog.records if r.levelno >= _logging.DEBUG]
+        assert any(expected_fp in t for t in debug_texts), (
+            f'Expected a DEBUG log containing {expected_fp!r}; '
+            f'got DEBUG+ records: {debug_texts!r}'
         )
 
     @pytest.mark.asyncio
     async def test_cycle2_hit_annotates_flag_with_persisted_from_run(self):
-        """Cycle 2 (prior marker present + confirmation marker for current run): HIT path
-        annotates flag with persisted_from_run and last_seen_run_id."""
+        """Cycle 2 (prior fp:… marker present): early guard bypasses I/O entirely.
+
+        Updated by task-1656 amendment: the early guard in dedup_flags now fires BEFORE
+        find_prior_memories for fp:… keys.  No prior search is performed; the flag is
+        returned unchanged (no persisted_from_run annotation); no write or delete occurs.
+        The legacy fp:… prior in Mem0 is untouched and will age out naturally.
+        """
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
             dedup_flags,
@@ -4921,29 +4926,11 @@ class TestDedupFlagsContentFingerprintPath:
         assert sig is not None
         fp, ftype = sig
 
-        # Build a prior marker for the fp:… key (run_id='r1' from cycle 1)
-        prior_marker = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'r1',
-            'last_seen_run_id': 'r1',
-        })
-        prior_marker.id = 'prior-fp-r1'
-
-        # Confirmation marker for current run r2
-        confirm_marker = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'r2',
-        })
-        confirm_marker.id = 'new-fp-r2'
-
+        # Suppression-only stub: early guard skips the marker search entirely,
+        # so no marker queue entry is needed.
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(side_effect=_make_search_stub(
             suppression=[[]],
-            marker={(fp, ftype): [[prior_marker], [confirm_marker]]},
         ))
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -4955,22 +4942,295 @@ class TestDedupFlagsContentFingerprintPath:
             flags=[flag],
         )
 
-        # (a) Flag IS annotated with persisted_from_run='r1' and last_seen_run_id='r2' (HIT)
+        # (a) Flag is returned unchanged — early guard bypasses search+annotate
         assert len(result) == 1
-        assert result[0].get('persisted_from_run') == 'r1', (
-            f'HIT: persisted_from_run must be "r1"; got {result[0].get("persisted_from_run")!r}'
+        assert 'persisted_from_run' not in result[0], (
+            f'fp: flag must not be annotated (early guard passes through unchanged);'
+            f' got {result[0]}'
         )
-        assert result[0].get('last_seen_run_id') == 'r2', (
-            f'HIT: last_seen_run_id must be "r2"; got {result[0].get("last_seen_run_id")!r}'
+        assert 'last_seen_run_id' not in result[0]
+
+        # (b) No write attempted — guard blocks before I/O
+        memory_service.add_memory.assert_not_called()
+
+        # (c) No delete — write never succeeded
+        memory_service.delete_memory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task-1656 step-3 — RED: dedup_flags write-guard integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDedupFlagsWriteGuard:
+    """Integration tests for the _is_valid_marker_task_id guard wired into
+    _write_and_confirm_marker.
+
+    Covers:
+    (a) fp:-signature flag on MISS path — add_memory NOT called, WARNING logged.
+    (b) fp:-signature flag with legacy prior fp: marker — flag still annotated,
+        NO add_memory, NO delete_memory (priors retained because write_succeeded=False).
+    (c) Regression: numeric task_id '42' still writes its marker (guard does not
+        over-reject valid integer keys).
+    (d) Regression: comma-joined cited_tasks signature '12,15' still writes its
+        marker (guard accepts the comma-joined shape).
+    """
+
+    async def test_fp_key_miss_path_skips_write_and_logs_warning(self, caplog):
+        """(a) fp:… task_id — early guard skips I/O entirely, logs at DEBUG."""
+        import logging as _logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
         )
 
-        # (b) Replacement marker is written (HIT path)
+        flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor found for finding abc123',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: fp signature must be computable'
+        fp_tid, _ftype = sig
+        assert fp_tid.startswith('fp:'), f'Expected fp: prefix; got {fp_tid!r}'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(_logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='proj',
+                run_id='run-a',
+                flags=[flag],
+            )
+
+        # Flag returned unchanged (early guard pass-through)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0]
+
+        # Guard must have suppressed the write
+        memory_service.add_memory.assert_not_called()
+
+        # Guard logs at DEBUG (expected steady-state), not WARNING
+        debug_texts = [r.message for r in caplog.records if r.levelno >= _logging.DEBUG]
+        assert any(fp_tid in t for t in debug_texts), (
+            f'Expected DEBUG log containing {fp_tid!r}; got: {debug_texts!r}'
+        )
+
+    async def test_fp_key_hit_path_annotates_but_skips_write_and_delete(self):
+        """(b) fp:… prior exists — early guard bypasses search+annotate; flag unchanged.
+
+        Updated by task-1656 amendment: the early guard fires before find_prior_memories,
+        so no prior search is performed and the flag is NOT annotated.  The legacy fp:…
+        prior in Mem0 is left intact (it will age out naturally).
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor found for finding abc123',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        # Suppression-only stub: early guard skips the marker search entirely.
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-b',
+            flags=[flag],
+        )
+
+        # Flag returned unchanged — no annotation (early guard pass-through)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0], (
+            f'fp: flag must not be annotated (early guard); got {result[0]!r}'
+        )
+        assert 'last_seen_run_id' not in result[0]
+
+        # No write or delete — guard blocked before any I/O
+        memory_service.add_memory.assert_not_called()
+        memory_service.delete_memory.assert_not_called()
+
+    async def test_numeric_task_id_still_writes_marker(self):
+        """(c) Regression: numeric task_id '42' passes guard → add_memory called."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {'task_id': 42, 'flag_type': 'missing_deliverable'}
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Guard accepts numeric key → add_memory called exactly once
         memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('task_id') == '42', (
+            f'Marker task_id must be "42"; got {meta.get("task_id")!r}'
+        )
 
-        # (c) Prior marker deleted after confirmed write
-        memory_service.delete_memory.assert_called_once()
-        del_kwargs = memory_service.delete_memory.call_args.kwargs
-        assert del_kwargs.get('memory_id') == 'prior-fp-r1'
+    async def test_comma_joined_cited_tasks_signature_still_writes_marker(self):
+        """(d) Regression: comma-joined cited_tasks key '12,15' passes guard → add_memory called."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'cross_task_blocker',
+            'cited_tasks': [{'task_id': 15}, {'task_id': 12}],
+        }
+        # compute_flag_signature produces ('12,15', 'cross_task_blocker') via cited_tasks fallback
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('12,15', 'cross_task_blocker'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '12,15',
+                'flag_type': 'cross_task_blocker',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Guard accepts comma-joined integer key → add_memory called exactly once
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('task_id') == '12,15', (
+            f'Marker task_id must be "12,15"; got {meta.get("task_id")!r}'
+        )
+
+    async def test_guard_skip_does_not_advance_confirmation_circuit_breaker(
+        self, caplog, monkeypatch
+    ):
+        """(e) Guard-rejected fp: skip must NOT advance consecutive_confirmation_misses.
+
+        Verifies suggestion 4 from the task-1656 amendment review: the docstring
+        claims a guard-skip leaves the circuit-breaker counter untouched.  This test
+        makes that guarantee explicit and regression-proof.
+
+        Method (threshold=1, flags=[fp_flag, numeric_flag]):
+
+        Scenario A — fp: guard-skip DOES count as a miss (incorrect behavior):
+          - fp_flag: counter increments to 1 → threshold reached → breaker trips
+          - numeric_flag: processed via TRIPPED branch → emits 'confirmation skipped'
+            WARNING; 'MISS marker' WARNING is NOT present for task 77
+
+        Scenario B — fp: guard-skip does NOT count (correct behavior):
+          - fp_flag: counter stays at 0
+          - numeric_flag: processed via ACTIVE branch → confirm_marker_persisted called
+            → returns False → emits 'MISS marker' WARNING for task 77 → counter=1
+            → breaker trips (threshold=1, but only after numeric flag is processed)
+          - 'confirmation skipped' WARNING is NOT present for task 77
+
+        Observable difference: presence of 'MISS marker...77' (active branch) vs.
+        absence of it and presence of 'confirmation skipped...77' (tripped branch).
+        """
+        import logging as _logging
+
+        from fused_memory.reconciliation import flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        # Threshold=1: one genuine confirmation miss trips the breaker.
+        # If the fp: guard-skip counts, the breaker trips BEFORE the numeric flag.
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 1)
+
+        fp_flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor guard-skip circuit-breaker test abc999',
+        }
+        sig = compute_content_fingerprint_signature(fp_flag)
+        assert sig is not None
+        fp_tid, _ = sig
+
+        # Numeric flag on the MISS path whose confirmation search returns [].
+        numeric_flag = {'task_id': 77, 'flag_type': 'stale_edge'}
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={
+                # MISS: no prior; confirmation retry also returns [] → confirmation miss.
+                ('77', 'stale_edge'): [[], [], []],
+            },
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='proj',
+                run_id='r1',
+                flags=[fp_flag, numeric_flag],
+            )
+
+        assert len(result) == 2
+
+        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+
+        # (i) Numeric flag processed via ACTIVE branch (breaker not pre-tripped by fp: skip):
+        #     active_miss WARNING template contains 'MISS marker' and task_id '77'.
+        active_miss = [t for t in warn_texts if 'MISS marker' in t and '77' in t]
+        assert active_miss, (
+            f'Expected ACTIVE-branch confirmation-miss WARNING for numeric flag '
+            f'(proves breaker was not pre-tripped by the fp: guard-skip); '
+            f'got all WARNINGs: {warn_texts!r}'
+        )
+
+        # (ii) TRIPPED-branch skip WARNING must NOT appear for task 77.
+        #      If the fp: skip had counted, numeric_flag would have been processed
+        #      via the TRIPPED branch and emitted "confirmation skipped" instead.
+        tripped_for_77 = [t for t in warn_texts if 'confirmation skipped' in t and '77' in t]
+        assert not tripped_for_77, (
+            f'TRIPPED-branch "confirmation skipped" WARNING must not appear for '
+            f'task 77 — its presence means the breaker was tripped by the fp: '
+            f'guard-skip, advancing the counter when it should not; '
+            f'got: {tripped_for_77!r}'
+        )
+
+        # (iii) add_memory called once (only for numeric flag, not for fp: flag).
+        memory_service.add_memory.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -5015,4 +5275,102 @@ class TestNormalizerParity:
                 f'  flag_dedup._normalize_content_description → {fd_result!r}\n'
                 f'  recon_report._normalize_description       → {rr_result!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# task-1656 step-1 — RED: _is_valid_marker_task_id unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsValidMarkerTaskId:
+    """Unit tests for _is_valid_marker_task_id(tid: str) -> bool.
+
+    The helper must ACCEPT bare non-negative integers and comma-joined
+    lists of them (the cited_tasks fallback shape), and REJECT content-
+    fingerprint keys ('fp:…'), the empty string, non-numeric strings,
+    and malformed comma forms.
+    """
+
+    # ----- ACCEPT cases -----
+
+    def test_accepts_bare_integer(self):
+        """'42' — canonical single-task marker key."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('42') is True, "'42' must be accepted"
+
+    def test_accepts_zero(self):
+        """'0' — smallest valid non-negative integer."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('0') is True, "'0' must be accepted"
+
+    def test_accepts_large_integer(self):
+        """'99999' — large task id within normal range."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('99999') is True, "'99999' must be accepted"
+
+    def test_accepts_comma_joined_two_ids(self):
+        """'12,15' — the cited_tasks fallback shape (multi-task finding)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,15') is True, "'12,15' must be accepted"
+
+    def test_accepts_comma_joined_three_ids(self):
+        """'1,2,3' — three tasks cited by one finding."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('1,2,3') is True, "'1,2,3' must be accepted"
+
+    def test_accepts_comma_joined_with_spaces(self):
+        """'12, 15' — components with surrounding whitespace must be stripped before check."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12, 15') is True, "'12, 15' must be accepted (strip spaces)"
+
+    # ----- REJECT cases -----
+
+    def test_rejects_content_fingerprint_key(self):
+        """'fp:9216e85ac497b68d93043b64684eb049' — the content-fingerprint prefix triggers rejection."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:9216e85ac497b68d93043b64684eb049'
+        assert _is_valid_marker_task_id(tid) is False, f'{tid!r} must be rejected (fp: prefix)'
+
+    def test_rejects_empty_string(self):
+        """'' — falsy input must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('') is False, "'' must be rejected"
+
+    def test_rejects_non_numeric_string(self):
+        """'abc' — plain non-numeric string must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('abc') is False, "'abc' must be rejected"
+
+    def test_rejects_trailing_comma(self):
+        """'12,' — trailing comma produces an empty component, which is non-numeric."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,') is False, "'12,' must be rejected"
+
+    def test_rejects_comma_with_fp_component(self):
+        """'12,fp:abc' — mixed numeric + fp: component must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('12,fp:abc') is False, "'12,fp:abc' must be rejected"
+
+    def test_rejects_negative_integer_string(self):
+        """'-1' — negative integer: leading minus is not a digit."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('-1') is False, "'-1' must be rejected"
+
+    def test_rejects_float_string(self):
+        """'1.5' — dot is not a digit (mirrors _looks_like_task_id dot-rejecting convention)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('1.5') is False, "'1.5' must be rejected"
 
