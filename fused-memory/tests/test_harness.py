@@ -6055,3 +6055,216 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
         f'Expected a "reconciliation.open_escalation_check_failed" warning log record; '
         f'got records: {[r.getMessage() for r in caplog.records]}'
     )
+
+
+# ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
+
+
+def _make_finding_with_cited_task(task_id: str) -> dict:
+    """Return an actionable finding citing *task_id* via the typed cited_tasks field."""
+    return {
+        'description': f'Implementation-complete but not merged: task/{task_id}',
+        'severity': 'urgent',
+        'actionable': True,
+        'category': 'stranded_work',
+        'cited_tasks': [{'project_id': 'test-project', 'task_id': task_id}],
+        'suggested_action': 'Manual merge required',
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_workflow_gate_suppresses_escalation_when_task_is_live(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """_run_remediation_pass must NOT call _escalate when the finding's affected task is live.
+
+    When is_workflow_live_for_task returns True for a finding's cited task, the
+    escalation is downgraded to an INFO log with event name
+    'reconciliation.integrity_escalation_suppressed_live_workflow'.
+
+    Setup mirrors test_unresolved_after_remediation_escalates_when_persistence_meets_threshold:
+    seed N-2 prior runs so total persistence reaches threshold, then run_full_cycle so
+    the persistence-gated branch fires.  With the live-workflow gate active it must
+    suppress rather than escalate.
+    """
+    import uuid as _uuid
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as harness_module
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    task_id = '4321'
+    actionable_finding = _make_finding_with_cited_task(task_id)
+    assert actionable_finding['actionable'] is True
+
+    # Monkeypatch is_workflow_live_for_task as imported in harness module (step-6 wires
+    # the import; step-5 is RED because the attribute doesn't exist in harness yet).
+    monkeypatch.setattr(
+        harness_module,
+        'is_workflow_live_for_task',
+        lambda _tid, _pr, **kw: True,
+    )
+
+    # Seed N-2 prior completed runs containing the finding so persistence reaches threshold.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        rid = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(
+            rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+        )
+        await journal.complete_run(rid, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_returns_finding
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) No escalation for the finding (live-workflow gate suppressed it)
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and ('Persistently unresolved' in e.summary or 'stranded' in e.summary.lower())
+    ]
+    assert stranded_escalations == [], (
+        f'Expected no escalation (live task gate must suppress); '
+        f'got: {[e.summary for e in stranded_escalations]}'
+    )
+
+    # (b) Suppression INFO log emitted with correct metadata
+    suppressed_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+    ]
+    assert len(suppressed_records) >= 1, (
+        f'Expected a "reconciliation.integrity_escalation_suppressed_live_workflow" log; '
+        f'caplog records: {[r.getMessage() for r in caplog.records]}'
+    )
+    rec = suppressed_records[0]
+    # Affected task ID must appear in the log record
+    affected_ids = rec.__dict__.get('affected_ids', [])
+    assert task_id in affected_ids or str(task_id) in str(affected_ids), (
+        f'Expected task_id={task_id!r} in affected_ids, got {affected_ids!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_workflow_gate_allows_escalation_when_task_is_not_live(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    monkeypatch,
+):
+    """_run_remediation_pass MUST call _escalate when no affected task is live.
+
+    This is the genuine stranded case (orchestrator down, no worktree, no recent
+    commits).  The live-workflow gate must not suppress it.
+    """
+    import uuid as _uuid
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as harness_module
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    task_id = '9999'
+    actionable_finding = _make_finding_with_cited_task(task_id)
+
+    # Task is NOT live — all signals False (genuine stranded case)
+    monkeypatch.setattr(
+        harness_module,
+        'is_workflow_live_for_task',
+        lambda _tid, _pr, **kw: False,
+    )
+
+    # Seed N-2 prior runs to reach threshold
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        rid = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(
+            rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+        )
+        await journal.complete_run(rid, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_returns_finding
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # Escalation MUST be emitted — no suppression for genuinely stranded tasks
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and 'Persistently unresolved' in e.summary
+    ]
+    assert len(stranded_escalations) >= 1, (
+        f'Expected escalation for genuinely stranded task (not live); '
+        f'got pending: {[e.summary for e in pending]}'
+    )

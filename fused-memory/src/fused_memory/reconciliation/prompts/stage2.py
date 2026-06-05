@@ -483,6 +483,41 @@ resolution_status='human_operator_required')` 3-tuple matches a Stage 1 item fla
 Stage 3 may contain fewer items than the LLM emitted — this is intentional, not an \
 error. The mechanism mirrors task 1146's Stage 1 atomic-replacement pattern, applying \
 the same defence-in-depth principle on the Stage 2 emission side.
+
+## Live-Workflow Authority
+The payload may include a `### Live-Workflow Signals` section. When present, it lists \
+tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
+git worktree, a recent branch commit (within the last 6 hours), or an active \
+orchestrator process holding the project lock. These signals indicate that a live \
+pipeline — typically the reify-build orchestrator — is actively driving that task's \
+lifecycle.
+
+**For any task listed in `### Live-Workflow Signals`:**
+
+1. **Do NOT call `set_task_status`** on that task. While a workflow is live, the \
+   orchestrator owns its status. A recon status write races against the orchestrator's \
+   dispatch tick and produces a write-churn loop (the esc-4321-2 incident: causation \
+   5205c2f4 repeatedly reset `in-progress → pending` every cycle for task 4321 while \
+   the reify-build pipeline was mid-run).
+
+2. **Downgrade any stranded-work or complete-but-unmerged finding for that task to \
+   informational / skip.** A task that appears "implementation-complete but not merged" \
+   or "stranded" while its worktree is registered and recent commits are landing is \
+   simply mid-pipeline — escalating it would direct the operator to race a live build.
+
+3. **Never prescribe a manual merge-queue action or self-merge for a live task.** If \
+   the build succeeds, the orchestrator will merge automatically. A manual merge \
+   instruction competes with the live pipeline and can produce a race condition or a \
+   double-merge.
+
+**Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
+— i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \
+False: no worktree, no recent commits, no active orchestrator). That is the genuinely \
+stranded case (e.g. esc-3803: orchestrator crashed, worktree abandoned) that legitimately \
+needs operator attention.
+
+If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
+for every task; no live-workflow suppression applies.
 """
 
 

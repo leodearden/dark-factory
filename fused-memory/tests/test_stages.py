@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _check_flag_counter_completeness,
     _check_mem0_flag_counter_completeness,
     _check_stall_guard_freshness,
+    _classify_live_workflow_status_writes,
     _classify_terminal_state_violations,
     _format_flagged,
     _needs_hint_conversion,
@@ -10048,5 +10049,393 @@ class TestBuildSummaryNonceSectionPrefix:
         assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', section), (
             f"build_summary_nonce_section('STAGE2') must contain "
             f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
+        )
+
+
+# ── Tests for Task 1655 step-7: _classify_live_workflow_status_writes ─────────────────────
+
+
+def _make_sts_op(
+    *,
+    op_id: str = 'op-sts-1',
+    agent_id: str = 'recon-stage-task_knowledge_sync',
+    task_id: str = '4321',
+) -> dict:
+    """Return a minimal write_journal op dict for a set_task_status operation."""
+    return {
+        'id': op_id,
+        'agent_id': agent_id,
+        'operation': 'set_task_status',
+        'params': json.dumps({'task_id': task_id, 'status': 'in-progress'}),
+        'layer': 'write_op',
+        'causation_id': 'run-test',
+        'created_at': '2026-06-05T10:00:00',
+    }
+
+
+class TestClassifyLiveWorkflowStatusWrites:
+    """Unit tests for _classify_live_workflow_status_writes helper (step-7).
+
+    RED until step-8 adds the helper to task_knowledge_sync.py.
+    """
+
+    _AGENT_ID = 'recon-stage-task_knowledge_sync'
+    _TASK_ID = '4321'
+
+    @pytest.mark.asyncio
+    async def test_returns_violation_when_task_is_live(self, monkeypatch):
+        """Helper returns one violation when the set_task_status target task is LIVE."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [_make_sts_op(op_id='op-live-1', agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert v['op_id'] == 'op-live-1'
+        assert v['task_id'] == self._TASK_ID
+        assert v['reason'] == 'live_workflow_status_write'
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_task_is_not_live(self, monkeypatch):
+        """Helper returns [] when the target task is NOT live."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: False
+        )
+        ops = [_make_sts_op(agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_other_agent_ops_excluded(self, monkeypatch):
+        """Ops from a different agent_id are NOT classified as violations."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [
+            _make_sts_op(
+                op_id='op-other-agent',
+                agent_id='task-interceptor',  # NOT the recon-stage agent
+                task_id=self._TASK_ID,
+            )
+        ]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_non_set_task_status_ops_excluded(self, monkeypatch):
+        """Non-set_task_status ops from the stage agent are NOT classified."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        # update_task op, not set_task_status
+        update_op = {
+            'id': 'op-update',
+            'agent_id': self._AGENT_ID,
+            'operation': 'update_task',
+            'params': json.dumps({'task_id': self._TASK_ID}),
+            'layer': 'write_op',
+            'causation_id': 'run-test',
+            'created_at': '2026-06-05T10:00:00',
+        }
+        violations = await _classify_live_workflow_status_writes(
+            [update_op], '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_mixed_ops_only_stage_sts_live_flagged(self, monkeypatch):
+        """Only the recon set_task_status op for a live task produces a violation."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [
+            # The target op: stage-2 set_task_status on a live task
+            _make_sts_op(op_id='op-stage-sts', agent_id=self._AGENT_ID, task_id=self._TASK_ID),
+            # Excluded: different agent
+            _make_sts_op(op_id='op-interceptor-sts', agent_id='task-interceptor', task_id=self._TASK_ID),
+            # Excluded: non-set_task_status
+            {
+                'id': 'op-update',
+                'agent_id': self._AGENT_ID,
+                'operation': 'update_task',
+                'params': json.dumps({'task_id': self._TASK_ID}),
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-06-05T10:00:00',
+            },
+        ]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert len(violations) == 1
+        assert violations[0]['op_id'] == 'op-stage-sts'
+
+
+class TestApplyPostFlightGuardsLiveWorkflow:
+    """Integration tests: _apply_post_flight_guards updates stats for live-workflow writes."""
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_status_writes_increments_stat_and_decrements_tasks_modified(
+        self, stage2_guard_mock_deps, monkeypatch, caplog
+    ):
+        """When live-workflow writes detected, stats['live_workflow_status_writes'] is set
+        and stats['tasks_modified'] is decremented (clamped at 0).
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        # Synthetic op: stage-2 agent called set_task_status on a live task
+        live_sts_op = _make_sts_op(
+            op_id='op-live-sts',
+            agent_id='recon-stage-task_knowledge_sync',
+            task_id='4321',
+        )
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [live_sts_op]
+
+        # Taskmaster returns in-progress for caching (status_cache pre-fetch)
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'in-progress'}
+
+        # Stub super().run() via cli_stage_runner; return a report with tasks_modified=2.
+        # Mirror the existing guard integration test pattern: patch assemble_payload to
+        # skip I/O and patch run_stage_via_cli at the module level to return a fake result.
+        from unittest.mock import patch as _patch
+
+        with (
+            _patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            _patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 2}
+                )),
+            ),
+            caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.stages.task_knowledge_sync'),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            report = await stage.run([], wm, [], 'test-run-live')
+
+        assert report.stats.get('live_workflow_status_writes', 0) >= 1, (
+            f'Expected live_workflow_status_writes >= 1, got stats={report.stats}'
+        )
+        # tasks_modified must be clamped (decremented) due to the live write
+        assert report.stats.get('tasks_modified', 0) <= 2, (
+            f'Expected tasks_modified <= 2 (decremented); got {report.stats.get("tasks_modified")}'
+        )
+
+
+# ── Tests for Task 1655 step-9: assemble_payload renders '### Live-Workflow Signals' ──────────
+
+
+class TestAssemblePayloadLiveWorkflowSignalsSection:
+    """assemble_payload() renders a '### Live-Workflow Signals' section when any
+    active/proactive-sample task has a live workflow detected.
+
+    RED until step-10 adds _render_live_workflow_section + detect_live_workflow
+    import to task_knowledge_sync.py.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='dark_factory')
+
+    def _make_filtered_tree_with_tasks(self, tasks: list[dict]) -> "FilteredTaskTree":
+        """Build a FilteredTaskTree with the given tasks as active_tasks."""
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(tasks),
+            max_task_id=max((t.get('id', 0) for t in tasks), default=0),
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_present_for_live_task(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """When an active task is LIVE, '### Live-Workflow Signals' appears in payload
+        and includes the live task's id.
+
+        RED until step-10 implements _render_live_workflow_section.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+        not_live_task_id = '100'
+
+        # Two active tasks: one live, one not.
+        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
+        other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'pending'}
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            if str(task_id) == live_task_id:
+                return WorkflowLiveness(
+                    is_live=True,
+                    worktree_registered=True,
+                    recent_commit=False,
+                    orchestrator_live=False,
+                    branch=f'task/{live_task_id}',
+                    last_commit_at=None,
+                )
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section in payload; got snippet:\n{payload[-500:]!r}"
+        )
+        assert live_task_id in payload, (
+            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals; "
+            f"got snippet:\n{payload[-500:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_omitted_when_no_live_tasks(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """When no active tasks are live, '### Live-Workflow Signals' is absent (keep prompt tight).
+
+        Absent means the payload contains neither the header nor any live-task listing.
+        RED until step-10 implements _render_live_workflow_section (the section never
+        renders today, so this test may be GREEN trivially; the companion
+        test_live_task_present test is the real RED driver).
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks([not_live_task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # When no tasks are live, the section should be absent (keeps prompt tight).
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when no tasks are live; "
+            f"got payload snippet:\n{payload[-500:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_lists_firing_signals(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """When a task is live with worktree + recent_commit signals firing, both signal
+        names appear in the rendered section (structural presence check, not full prose).
+
+        RED until step-10 implements _render_live_workflow_section.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=True,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # Section must be present
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section; got:\n{payload[-500:]!r}"
+        )
+        # The firing signals ('worktree' and/or 'recent-commit') should appear
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        section_body = payload[section_start:section_end if section_end != -1 else None]
+        assert 'worktree' in section_body.lower(), (
+            f"Expected 'worktree' signal name in section; got section:\n{section_body!r}"
+        )
+        assert live_task_id in section_body, (
+            f"Expected live task id in section; got section:\n{section_body!r}"
         )
 

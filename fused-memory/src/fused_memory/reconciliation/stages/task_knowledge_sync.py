@@ -44,6 +44,11 @@ from fused_memory.reconciliation.task_filter import (
     id_key,
     render_active_section,
 )
+from fused_memory.services.live_workflow_detector import (
+    detect_live_workflow,
+    is_workflow_live_for_task,
+)
+from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +518,87 @@ async def _check_stall_guard_freshness(
                     'task_id': task_id,
                     'snapshot_status': snapshot_status,
                     'live_status': live_status,
+                }
+            )
+
+    return violations
+
+
+async def _classify_live_workflow_status_writes(
+    ops: list[dict],
+    project_root: str,
+    agent_id: str,
+    *,
+    now=None,
+) -> list[dict]:
+    """Classify write_journal ops where Stage 2 wrote set_task_status on a live-workflow task.
+
+    For every ``set_task_status`` op authored by *agent_id*, parses the params
+    for task_id, then calls :func:`is_workflow_live_for_task`.  When the task is
+    live, returns a violation record ``{op_id, task_id, reason: 'live_workflow_status_write'}``.
+
+    This is a post-flight observation guard (defence-in-depth): the write already
+    landed (the LLM issued it via MCP), so this helper cannot undo it.  Callers
+    are expected to:
+
+    - increment ``stats['live_workflow_status_writes']`` by ``len(violations)``
+    - decrement ``stats['tasks_modified']`` by ``len(violations)`` (clamped at 0)
+
+    Filter rules (mirror :func:`_classify_terminal_state_violations`):
+
+    * Only ops where ``op['agent_id'] == agent_id`` are inspected.
+    * Only ops where ``op['operation'] == 'set_task_status'`` are inspected.
+    * Detector exceptions are swallowed (treat as not-live — fail toward logging
+      the op as a legitimate action rather than flagging it spuriously).
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        now: Injectable datetime for deterministic tests (forwarded to detector).
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'reason': 'live_workflow_status_write'}``
+        dicts, one per qualifying violation.  Empty list when no violations found.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != agent_id:
+            continue
+        if op.get('operation') != 'set_task_status':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._classify_live_workflow_status_writes: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+        task_id = str(params.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        try:
+            kwargs = {} if now is None else {'now': now}
+            live = is_workflow_live_for_task(task_id, project_root, **kwargs)
+        except Exception:
+            logger.warning(
+                'reconciliation._classify_live_workflow_status_writes: '
+                'detector error for task_id=%s; treating as not-live',
+                task_id,
+            )
+            live = False
+
+        if live:
+            violations.append(
+                {
+                    'op_id': op.get('id'),
+                    'task_id': task_id,
+                    'reason': 'live_workflow_status_write',
                 }
             )
 
@@ -1177,6 +1263,92 @@ async def _write_escalation_markers(
             )
 
 
+def _render_live_workflow_section(
+    tasks: list[dict],
+    project_root: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render the '### Live-Workflow Signals' payload section for *tasks*.
+
+    For each task in *tasks*, calls :func:`detect_live_workflow` and collects
+    tasks whose :attr:`WorkflowLiveness.is_live` is True.  Returns an empty
+    string when no task is live (keeps the payload tight).
+
+    Each live task is listed with the firing signal names so the Stage 2 LLM
+    can see which evidence contributed to the live designation:
+
+    ```
+    ### Live-Workflow Signals
+    - task/4321: worktree, recent-commit
+    ```
+
+    Detector errors per task are swallowed and logged at WARNING level (the task
+    is treated as not-live for that call — fail-safe, matching the harness gate).
+
+    Args:
+        tasks: Task dicts from the active/proactive-sample pool.  Only tasks
+            with a parseable ``id`` are inspected (non-int ids are skipped).
+        project_root: Absolute path to the project root, forwarded to the
+            detector.
+        now: Injectable reference time for deterministic tests.
+
+    Returns:
+        A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
+        or ``''`` when no tasks are live.
+    """
+    if not project_root or not tasks:
+        return ''
+
+    # Hoist the project-level orchestrator check: it is constant for this
+    # project_root (one lock file regardless of how many tasks are inspected).
+    # Swallow any detector errors here — the per-task detect_live_workflow calls
+    # will gracefully degrade on subsequent orchestrator checks.
+    try:
+        project_orch_live: bool | None = is_orchestrator_live_for(project_root)
+    except Exception:
+        project_orch_live = None  # let detect_live_workflow derive it per-task
+
+    kwargs: dict = {} if now is None else {'now': now}
+    if project_orch_live is not None:
+        kwargs['_orchestrator_live'] = project_orch_live
+    live_lines: list[str] = []
+
+    for task in tasks:
+        raw_id = task.get('id')
+        if raw_id is None:
+            continue
+        task_id = str(raw_id)
+        try:
+            liveness = detect_live_workflow(task_id, project_root, **kwargs)
+        except Exception:
+            logger.warning(
+                'reconciliation._render_live_workflow_section: '
+                'detector error for task_id=%s; treating as not-live',
+                task_id,
+            )
+            continue
+
+        if not liveness.is_live:
+            continue
+
+        # Collect which signals fired for human-readable display.
+        signals: list[str] = []
+        if liveness.worktree_registered:
+            signals.append('worktree')
+        if liveness.recent_commit:
+            signals.append('recent-commit')
+        if liveness.orchestrator_live:
+            signals.append('orchestrator')
+        signal_str = ', '.join(signals) if signals else 'live'
+        live_lines.append(f'- {liveness.branch}: {signal_str}')
+
+    if not live_lines:
+        return ''
+
+    return '### Live-Workflow Signals\n' + '\n'.join(live_lines) + '\n'
+
+
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
@@ -1512,6 +1684,34 @@ class TaskKnowledgeSync(BaseStage):
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
+        # Guard 5 — live-workflow status-write reclassification (task 1655)
+        # Detects set_task_status ops where the target task has a live workflow
+        # (registered worktree / recent branch commits / orchestrator live).
+        # The LLM's write already landed; this guard post-hoc flags the churn
+        # (stats + log) for observability.  Actual prevention is the Stage 2 prompt.
+        if self.project_root:
+            live_workflow_violations = await _classify_live_workflow_status_writes(
+                ops, self.project_root, _stage_agent_id
+            )
+            if live_workflow_violations:
+                report.stats['live_workflow_status_writes'] = report.stats.get(
+                    'live_workflow_status_writes', 0
+                ) + len(live_workflow_violations)
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
+                )
+                for v in live_workflow_violations:
+                    logger.info(
+                        'reconciliation.live_workflow_status_write_suppressed',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'op_id': v['op_id'],
+                        },
+                    )
+
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
 
@@ -1661,6 +1861,17 @@ class TaskKnowledgeSync(BaseStage):
             )
             proactive_sample_section = (
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
+            )
+
+        # Live-Workflow Signals section: check active tasks for live workflows so the
+        # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
+        # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
+        # Empty string when no active tasks are live (keeps the payload tight).
+        live_workflow_section = ''
+        if self.project_root and filtered.active_tasks:
+            live_workflow_section = _render_live_workflow_section(
+                filtered.active_tasks,
+                self.project_root,
             )
 
         # Call render_active_section once to get both the visible-task list (for
@@ -1888,7 +2099,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{hint_conversion_section}{summary_nonce_section}
+{provenance_section}{proactive_sample_section}{hint_conversion_section}{live_workflow_section}{summary_nonce_section}
 
 ## Your Task
 Reconcile task state against memory:

@@ -41,6 +41,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
+from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
 from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
@@ -1691,17 +1692,59 @@ class ReconciliationHarness:
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
-                        self._escalate(
-                            'recon_integrity_issue',
-                            run_id,
-                            f'Persistently unresolved after remediation '
-                            f'({persistence} cycles): {finding.get("description", "?")}',
-                            detail=json.dumps(
-                                {**finding, 'persistence': persistence},
-                                default=str,
-                            ),
-                            finding=finding,
-                        )
+                        # Live-workflow gate (task 1655): if any cited task has an active
+                        # workflow (registered worktree, recent branch commits, or live
+                        # orchestrator), suppress this cycle's escalation with an INFO log.
+                        # The finding keeps recurring and will escalate after the workflow
+                        # finishes — so genuine stranded cases (all signals False) still
+                        # escalate.  Guard detector errors as not-live (fail toward escalating
+                        # rather than toward silencing a genuine stranded-work escalation).
+                        affected_ids = _derive_affected_ids(finding)
+                        # For liveness, iterate only cited task ids.
+                        # _derive_affected_ids mixes in entity canonical_names,
+                        # edge_uuids, and memory_ids; passing those to
+                        # is_workflow_live_for_task would build nonsensical
+                        # branch names (e.g. 'task/<canonical_name>') and waste
+                        # git subprocess calls that can never match.
+                        cited_task_ids = [
+                            str(c['task_id'])
+                            for c in finding.get('cited_tasks') or []
+                            if isinstance(c, dict) and 'task_id' in c
+                        ]
+                        any_live = False
+                        for tid in cited_task_ids:
+                            try:
+                                if is_workflow_live_for_task(tid, project_root):
+                                    any_live = True
+                                    break
+                            except Exception as _det_exc:
+                                logger.debug(
+                                    'live_workflow_detector error for task %s; treating as not-live: %s',
+                                    tid, _det_exc,
+                                )
+                        if any_live:
+                            logger.info(
+                                'reconciliation.integrity_escalation_suppressed_live_workflow',
+                                extra={
+                                    'project_id': project_id,
+                                    'run_id': run_id,
+                                    'affected_ids': affected_ids,
+                                    'description': finding.get('description', ''),
+                                    'finding_category': finding.get('category', ''),
+                                },
+                            )
+                        else:
+                            self._escalate(
+                                'recon_integrity_issue',
+                                run_id,
+                                f'Persistently unresolved after remediation '
+                                f'({persistence} cycles): {finding.get("description", "?")}',
+                                detail=json.dumps(
+                                    {**finding, 'persistence': persistence},
+                                    default=str,
+                                ),
+                                finding=finding,
+                            )
                     else:
                         logger.info(
                             'reconciliation.unresolved_after_remediation_suppressed',
