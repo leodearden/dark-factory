@@ -910,6 +910,36 @@ def _normalize_content_description(description: str) -> str:
     return ' '.join(description.split()).casefold()
 
 
+def _is_valid_marker_task_id(tid: str) -> bool:
+    """Return True iff *tid* is a valid stage1_flag_marker key processable by Stage 2.
+
+    Accepts:
+    - A bare non-negative integer string (e.g. ``'42'``, ``'0'``).
+    - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
+      the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
+      fallback for multi-task findings.
+
+    Rejects:
+    - Falsy / empty input.
+    - Content-fingerprint keys (e.g. ``'fp:9216e85ac497b68d93043b64684eb049'``).
+    - Any component that is not a non-negative integer after strip.
+    - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
+
+    Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
+    convention (``_looks_like_task_id`` in task_interceptor.py and
+    sqlite_task_backend.py) while additionally tolerating the comma-joined
+    marker key.  Defined as a LOCAL helper to avoid a
+    server/middleware←reconciliation import inversion; see the local-copy
+    convention in :func:`_normalize_content_description`.
+
+    Pure, sync, no I/O.
+    """
+    if not tid:
+        return False
+    components = tid.split(',')
+    return all(part.strip().isdigit() for part in components)
+
+
 def _content_fingerprint(description: str) -> str:
     """SHA-256 hex (first 32 chars) of the normalised description, prefixed 'fp:'.
 
