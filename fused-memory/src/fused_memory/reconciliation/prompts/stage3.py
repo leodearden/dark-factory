@@ -23,7 +23,7 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_task` — get a single task by ID
 - `mcp__fused-memory__count_memories_by_metadata` — deterministic exact-count query \
   against Qdrant metadata payload (not semantic); use for existence checks such as \
-  confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>}}`
+  confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}}`
 
 You do NOT have write or mutation tools.
 
@@ -73,11 +73,18 @@ Inspect results whose content contains `run_id: <run_id>`.
 
 **Path 2 — Metadata-keyed existence count** (new, deterministic): \
 `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
-filters={{'kind': 'cycle_summary', 'run_id': '<run_id>'}})` \
-A return value > 0 means the summary is present. This path catches summaries that \
+filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledge_sync'}})` \
+A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
 semantic search misses due to low cosine-similarity ranking — confirmed false negative: \
 run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71 and never surfaced in 6-angle \
-general searches, triggering wasteful reconstruction (task 1588).
+general searches, triggering wasteful reconstruction (task 1588). \
+**The `stage` key is REQUIRED in this filter (task 1653):** Stage 1 now also writes a \
+per-cycle summary under `metadata={{'kind': 'cycle_summary', 'run_id': <run_id>, \
+'stage': 'memory_consolidator'}}` using the SAME shared cycle run_id. A double filter \
+of only `{{'kind': 'cycle_summary', 'run_id': <run_id>}}` would therefore return >0 \
+when ONLY the Stage 1 summary exists, falsely concluding the Stage 2 summary is present \
+and suppressing a genuinely-needed reconstruction. Always disambiguate the Stage 2 \
+summary by `'stage': 'task_knowledge_sync'`.
 
 **Decision rule**: if EITHER path finds the summary, do NOT report it as missing. \
 Only report the summary as missing when BOTH Path 1 returns no matching content AND \
@@ -87,7 +94,8 @@ unavailable), treat as inconclusive and do NOT report the summary as missing —
 documented harm is false-positive reconstruction, so bias toward not reconstructing on \
 uncertainty. Note the tool error in your cycle report instead.
 
-Legacy summaries written before task 1588 lack `metadata.run_id`, so Path 2 returns 0 \
+Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 summaries \
+written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
 for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)

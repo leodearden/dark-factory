@@ -143,7 +143,22 @@ timestamps embed nearly identically, causing summaries to be silently dropped \
 (`memory_ids=[]`) in confirmed recurrences (run 899d2dad, summary 1ad1d2f5; task 1574, \
 same pathology as Stage 2 task 1572). \
 Both tokens are required: the nonce supplies structural entropy; the ISO timestamp \
-provides human-readable temporal context.
+provides human-readable temporal context. \
+In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>}}` on the \
+`add_memory` call that writes the per-cycle summary, where `<run_id>` is the exact \
+`run_id` value from the payload context (the same run_id embedded in the content). \
+This mirrors Stage 2's cycle-summary metadata convention \
+(`stage='task_knowledge_sync'`, fixed in task 9af436fe) and makes the summary \
+deterministically findable by a metadata-keyed lookup. \
+The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string. \
+After writing the per-cycle summary, you MUST call \
+`mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}})` — \
+the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
+key persisted. A return of 0 means the stage key did not persist (the same failure that \
+makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing"): \
+retry the `add_memory` write once with the same content and metadata before noting \
+the failure in the cycle report (mirrors the dedup-retry pattern at "Verifying Writes" above).
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
@@ -310,11 +325,17 @@ is present.
 
 **Path 2 — Metadata-keyed existence count** (deterministic): \
 `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
-filters={{'kind': 'cycle_summary', 'run_id': '<run_id>'}})` \
-A return value > 0 means the summary is present. This path catches summaries that \
+filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledge_sync'}})` \
+A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
 semantic search misses due to low cosine-similarity ranking (confirmed false negative: \
 run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71, triggering wasteful reconstruction; \
-task 1588).
+task 1588). \
+**The `stage='task_knowledge_sync'` key is REQUIRED here (task 1653):** this stage \
+(Stage 1) now writes its OWN per-cycle summary under \
+`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}` using \
+the SAME shared run_id. A `stage`-less double filter would match this stage's own summary \
+and falsely report the Stage 2 summary as present, suppressing a genuinely-needed \
+missing-summary finding. Disambiguate the Stage 2 summary by `'stage': 'task_knowledge_sync'`.
 
 **Decision rule**: if EITHER path confirms the summary exists, do NOT emit the \
 missing-summary finding — Stage 2 already wrote the per-cycle summary for that run. \
@@ -333,7 +354,8 @@ Rationale: back-to-back remediation passes otherwise trigger double-reconstructi
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
 up. The two-path approach eliminates the false-negative risk from semantic-search \
 ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
-`metadata.run_id`, so Path 2 returns 0 for them — Path 1 remains their fallback.
+`metadata.run_id`, and Stage 2 summaries written before task 9af436fe lack \
+`metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their fallback.
 
 ## Pre-Check: Existing Task Completion Summary by task_id
 Before emitting a "missing completion summary" finding for a specific task, ALSO \

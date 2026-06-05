@@ -215,9 +215,22 @@ This mirrors the flag-marker metadata convention (`metadata.kind='stage1_flag_ma
 `metadata.run_id=...`) and makes the summary deterministically findable by a \
 metadata-keyed lookup — specifically \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'kind': 'cycle_summary', 'run_id': <run_id>}})` — which Stage 3 and Stage 1 use as a \
-second verification path to avoid false "Stage 2 summary missing" diagnoses. \
-The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string.
+{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` — which \
+Stage 3 and Stage 1 use as a second verification path to avoid false "Stage 2 summary \
+missing" diagnoses. The `stage='task_knowledge_sync'` key in this lookup is REQUIRED \
+(task 1653): Stage 1 now writes its own per-cycle summary under \
+`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}` using \
+the SAME shared run_id, so a `stage`-less double filter would match the Stage 1 summary \
+and falsely report the Stage 2 summary as present. \
+The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string. \
+After writing the per-cycle summary, you MUST call \
+`mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` — \
+the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
+key persisted. A return of 0 means the stage key did not persist (the same failure that \
+would cause cross-stage verification to falsely report this Stage 2 summary as missing): \
+retry the `add_memory` write once with the same content and metadata before noting \
+the failure in the cycle report.
 
 **Per-Cycle Counter Schema** — include all three of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
