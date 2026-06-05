@@ -1,7 +1,7 @@
 """Tests for the per-task live-workflow detector (fused_memory.services.live_workflow_detector).
 
 Step-1 covers the two git-derived signals (worktree_registered, recent_commit) in isolation.
-Step-3 adds the orchestrator_live signal and OR-aggregation.
+Step-3 adds the orchestrator_live signal, OR-aggregation, and the convenience wrapper.
 """
 
 from __future__ import annotations
@@ -13,9 +13,11 @@ from unittest.mock import patch
 import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
+import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
     WorkflowLiveness,
     detect_live_workflow,
+    is_workflow_live_for_task,
 )
 
 
@@ -52,13 +54,12 @@ def _worktree_porcelain_no_branch() -> str:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _patch_orchestrator_live(monkeypatch):
-    """Isolate git signals by making orchestrator always report not-live.
+def _patch_orchestrator_live_default(monkeypatch):
+    """Isolate git signals by making orchestrator always report not-live by default.
 
     Monkeypatches the name as imported *inside* the detector module so the
-    OR-aggregation tests in step-3 can flip it independently.
+    OR-aggregation tests in step-3 can flip it independently per-test.
     """
-    import fused_memory.services.live_workflow_detector as detector_module
     monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: False)
 
 
@@ -253,3 +254,146 @@ class TestRecentCommitSignal:
 
         assert result.recent_commit is False
         # No exception propagated
+
+
+# ---------------------------------------------------------------------------
+# Step-3: orchestrator_live signal and OR-aggregation
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorLiveSignal:
+    """detect_live_workflow.orchestrator_live is sourced from is_orchestrator_live_for."""
+
+    def _all_git_signals_false(self) -> object:
+        """subprocess.run side_effect that makes both git signals False."""
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+        return side_effect
+
+    def test_orchestrator_live_true_when_is_orchestrator_live_for_returns_true(
+        self, tmp_path, monkeypatch
+    ):
+        """orchestrator_live=True and is_live=True when is_orchestrator_live_for returns True.
+
+        Both git signals are False so is_live being True demonstrates the orchestrator
+        signal is the sole contributor.
+        """
+        # Override the default autouse=False patch (both git signals stay False via side_effect)
+        monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.orchestrator_live is True
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is True
+
+    def test_orchestrator_live_false_when_is_orchestrator_live_for_returns_false(
+        self, tmp_path
+    ):
+        """orchestrator_live=False (default autouse patch) and git signals False => is_live=False."""
+        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+
+    def test_is_orchestrator_live_for_is_called_with_project_root(
+        self, tmp_path, monkeypatch
+    ):
+        """is_orchestrator_live_for must be called with project_root as its argument."""
+        captured_roots: list[str | object] = []
+
+        def capturing_detector(pr):
+            captured_roots.append(pr)
+            return False
+
+        monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', capturing_detector)
+
+        project_root = str(tmp_path)
+        with patch('subprocess.run', side_effect=self._all_git_signals_false()):
+            detect_live_workflow(_TASK_ID, project_root)
+
+        assert len(captured_roots) == 1
+        assert str(captured_roots[0]) == project_root
+
+
+class TestAllSignalsFalse:
+    """When all three signals are False, is_live is False — the genuine stranded case."""
+
+    def test_all_false_yields_not_live(self, tmp_path):
+        """is_live=False with all three signals False — genuine stranded work must escalate."""
+        def all_signals_false(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=all_signals_false):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+
+
+class TestConvenienceWrapper:
+    """is_workflow_live_for_task returns the same boolean as detect_live_workflow.is_live."""
+
+    def test_wrapper_returns_true_when_live(self, tmp_path, monkeypatch):
+        """is_workflow_live_for_task returns True when is_live is True."""
+        monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+        def all_git_false(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=all_git_false):
+            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path))
+            expected = detect_live_workflow(_TASK_ID, str(tmp_path)).is_live
+
+        assert live is True
+        assert live == expected
+
+    def test_wrapper_returns_false_when_not_live(self, tmp_path):
+        """is_workflow_live_for_task returns False when all signals are False."""
+        def all_git_false(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=all_git_false):
+            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path))
+
+        assert live is False
+
+    def test_wrapper_accepts_same_kwargs_as_detect(self, tmp_path):
+        """is_workflow_live_for_task forwards kwargs (e.g. now, max_commit_age_hours)."""
+        now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+        # Recent commit (1h ago)
+        ts = (now - timedelta(hours=1)).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_no_branch(), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=ts, stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), now=now, max_commit_age_hours=6.0
+            )
+
+        assert live is True
