@@ -4850,11 +4850,11 @@ class TestDedupFlagsContentFingerprintPath:
 
     @pytest.mark.asyncio
     async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self, caplog):
-        """Cycle 1 (no prior marker): MISS path skips write for fp:… task_id (guard rejects it).
+        """Cycle 1 (no prior marker): fp:… task_id skipped by early guard — no I/O.
 
-        Updated by task-1656: the validation guard in _write_and_confirm_marker now
-        rejects fp:… keys before calling add_memory.  The guard logs a WARNING and
-        returns False — add_memory must NOT be called.
+        Updated by task-1656 amendment: the early guard in dedup_flags now short-circuits
+        BEFORE find_prior_memories for fp:… keys (moved from _write_and_confirm_marker).
+        No search is performed for the fp: key; no add_memory call; guard logs at DEBUG.
         """
         import logging as _logging
 
@@ -4873,12 +4873,12 @@ class TestDedupFlagsContentFingerprintPath:
         assert sig is not None, 'Test setup: signature must be computable for this flag'
         expected_fp, expected_ftype = sig
 
-        # All searches return empty: no suppression entries, no prior markers.
+        # All searches return empty: no suppression entries, no marker searches.
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(return_value=[])
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
-        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        with caplog.at_level(_logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
             result = await dedup_flags(
                 memory_service=memory_service,
                 project_id='p',
@@ -4886,30 +4886,31 @@ class TestDedupFlagsContentFingerprintPath:
                 flags=[flag],
             )
 
-        # (a) Flag is NOT annotated with persisted_from_run (MISS path)
+        # (a) Flag is returned unchanged — no annotation (early guard pass-through)
         assert len(result) == 1
         assert 'persisted_from_run' not in result[0], (
             f'Fresh null-task_id flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # (b) add_memory must NOT be called — guard rejects fp:… key before writing
+        # (b) add_memory must NOT be called — early guard skips I/O entirely
         memory_service.add_memory.assert_not_called()
 
-        # (c) Guard must have logged a WARNING naming the skipped fp:… task_id
-        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
-        assert any(expected_fp in t for t in warn_texts), (
-            f'Expected a WARNING containing {expected_fp!r}; '
-            f'got WARNING records: {warn_texts!r}'
+        # (c) Guard logs at DEBUG naming the skipped fp:… task_id (not WARNING —
+        #     this is expected steady-state for null-task_id/no-cited-tasks flags)
+        debug_texts = [r.message for r in caplog.records if r.levelno >= _logging.DEBUG]
+        assert any(expected_fp in t for t in debug_texts), (
+            f'Expected a DEBUG log containing {expected_fp!r}; '
+            f'got DEBUG+ records: {debug_texts!r}'
         )
 
     @pytest.mark.asyncio
     async def test_cycle2_hit_annotates_flag_with_persisted_from_run(self):
-        """Cycle 2 (prior fp:… marker present): HIT path annotates flag but skips write.
+        """Cycle 2 (prior fp:… marker present): early guard bypasses I/O entirely.
 
-        Updated by task-1656: the validation guard in _write_and_confirm_marker rejects
-        the fp:… replacement write, so write_succeeded=False and priors are NOT deleted.
-        The flag is still annotated with persisted_from_run/last_seen_run_id (annotation
-        happens before the write attempt on the HIT path).
+        Updated by task-1656 amendment: the early guard in dedup_flags now fires BEFORE
+        find_prior_memories for fp:… keys.  No prior search is performed; the flag is
+        returned unchanged (no persisted_from_run annotation); no write or delete occurs.
+        The legacy fp:… prior in Mem0 is untouched and will age out naturally.
         """
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
@@ -4925,22 +4926,11 @@ class TestDedupFlagsContentFingerprintPath:
         assert sig is not None
         fp, ftype = sig
 
-        # Build a prior marker for the fp:… key (run_id='r1' from cycle 1)
-        prior_marker = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'r1',
-            'last_seen_run_id': 'r1',
-        })
-        prior_marker.id = 'prior-fp-r1'
-
+        # Suppression-only stub: early guard skips the marker search entirely,
+        # so no marker queue entry is needed.
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(side_effect=_make_search_stub(
             suppression=[[]],
-            # Only one search entry needed: find_prior_memories.
-            # The guard returns False before confirmation search is reached.
-            marker={(fp, ftype): [[prior_marker]]},
         ))
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -4952,20 +4942,18 @@ class TestDedupFlagsContentFingerprintPath:
             flags=[flag],
         )
 
-        # (a) Flag IS still annotated with persisted_from_run='r1' and last_seen_run_id='r2'
-        #     (annotation happens before the write on the HIT path)
+        # (a) Flag is returned unchanged — early guard bypasses search+annotate
         assert len(result) == 1
-        assert result[0].get('persisted_from_run') == 'r1', (
-            f'HIT: persisted_from_run must be "r1"; got {result[0].get("persisted_from_run")!r}'
+        assert 'persisted_from_run' not in result[0], (
+            f'fp: flag must not be annotated (early guard passes through unchanged);'
+            f' got {result[0]}'
         )
-        assert result[0].get('last_seen_run_id') == 'r2', (
-            f'HIT: last_seen_run_id must be "r2"; got {result[0].get("last_seen_run_id")!r}'
-        )
+        assert 'last_seen_run_id' not in result[0]
 
-        # (b) Replacement write is SKIPPED — guard rejects fp:… key
+        # (b) No write attempted — guard blocks before I/O
         memory_service.add_memory.assert_not_called()
 
-        # (c) Prior is NOT deleted — write_succeeded=False preserves priors
+        # (c) No delete — write never succeeded
         memory_service.delete_memory.assert_not_called()
 
 
@@ -4990,7 +4978,7 @@ class TestDedupFlagsWriteGuard:
     """
 
     async def test_fp_key_miss_path_skips_write_and_logs_warning(self, caplog):
-        """(a) MISS path: fp:… task_id → add_memory NOT called, WARNING logged."""
+        """(a) fp:… task_id — early guard skips I/O entirely, logs at DEBUG."""
         import logging as _logging
 
         from fused_memory.reconciliation.flag_dedup import (
@@ -5012,7 +5000,7 @@ class TestDedupFlagsWriteGuard:
         memory_service.search = AsyncMock(return_value=[])
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
-        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        with caplog.at_level(_logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
             result = await dedup_flags(
                 memory_service=memory_service,
                 project_id='proj',
@@ -5020,21 +5008,26 @@ class TestDedupFlagsWriteGuard:
                 flags=[flag],
             )
 
-        # Flag returned unchanged (no persisted_from_run on MISS)
+        # Flag returned unchanged (early guard pass-through)
         assert len(result) == 1
         assert 'persisted_from_run' not in result[0]
 
         # Guard must have suppressed the write
         memory_service.add_memory.assert_not_called()
 
-        # Guard must have logged a WARNING naming the skipped task_id
-        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
-        assert any(fp_tid in t for t in warn_texts), (
-            f'Expected WARNING containing {fp_tid!r}; got: {warn_texts!r}'
+        # Guard logs at DEBUG (expected steady-state), not WARNING
+        debug_texts = [r.message for r in caplog.records if r.levelno >= _logging.DEBUG]
+        assert any(fp_tid in t for t in debug_texts), (
+            f'Expected DEBUG log containing {fp_tid!r}; got: {debug_texts!r}'
         )
 
     async def test_fp_key_hit_path_annotates_but_skips_write_and_delete(self):
-        """(b) HIT path: fp:… prior exists → flag annotated, NO add_memory, NO delete_memory."""
+        """(b) fp:… prior exists — early guard bypasses search+annotate; flag unchanged.
+
+        Updated by task-1656 amendment: the early guard fires before find_prior_memories,
+        so no prior search is performed and the flag is NOT annotated.  The legacy fp:…
+        prior in Mem0 is left intact (it will age out naturally).
+        """
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
             dedup_flags,
@@ -5049,20 +5042,10 @@ class TestDedupFlagsWriteGuard:
         assert sig is not None
         fp, ftype = sig
 
-        prior = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'run-prev',
-            'last_seen_run_id': 'run-prev',
-        })
-        prior.id = 'legacy-fp-prior'
-
+        # Suppression-only stub: early guard skips the marker search entirely.
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(side_effect=_make_search_stub(
             suppression=[[]],
-            # Guard returns False before confirmation search → only 1 marker search.
-            marker={(fp, ftype): [[prior]]},
         ))
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -5074,17 +5057,15 @@ class TestDedupFlagsWriteGuard:
             flags=[flag],
         )
 
-        # Flag is annotated (annotation precedes write on the HIT path)
+        # Flag returned unchanged — no annotation (early guard pass-through)
         assert len(result) == 1
-        assert result[0].get('persisted_from_run') == 'run-prev', (
-            f'persisted_from_run must be "run-prev"; got {result[0].get("persisted_from_run")!r}'
+        assert 'persisted_from_run' not in result[0], (
+            f'fp: flag must not be annotated (early guard); got {result[0]!r}'
         )
-        assert result[0].get('last_seen_run_id') == 'run-b'
+        assert 'last_seen_run_id' not in result[0]
 
-        # Write skipped — guard rejected the fp: key
+        # No write or delete — guard blocked before any I/O
         memory_service.add_memory.assert_not_called()
-
-        # Prior NOT deleted — write_succeeded=False preserves priors
         memory_service.delete_memory.assert_not_called()
 
     async def test_numeric_task_id_still_writes_marker(self):
@@ -5155,6 +5136,101 @@ class TestDedupFlagsWriteGuard:
         assert meta.get('task_id') == '12,15', (
             f'Marker task_id must be "12,15"; got {meta.get("task_id")!r}'
         )
+
+    async def test_guard_skip_does_not_advance_confirmation_circuit_breaker(
+        self, caplog, monkeypatch
+    ):
+        """(e) Guard-rejected fp: skip must NOT advance consecutive_confirmation_misses.
+
+        Verifies suggestion 4 from the task-1656 amendment review: the docstring
+        claims a guard-skip leaves the circuit-breaker counter untouched.  This test
+        makes that guarantee explicit and regression-proof.
+
+        Method (threshold=1, flags=[fp_flag, numeric_flag]):
+
+        Scenario A — fp: guard-skip DOES count as a miss (incorrect behavior):
+          - fp_flag: counter increments to 1 → threshold reached → breaker trips
+          - numeric_flag: processed via TRIPPED branch → emits 'confirmation skipped'
+            WARNING; 'MISS marker' WARNING is NOT present for task 77
+
+        Scenario B — fp: guard-skip does NOT count (correct behavior):
+          - fp_flag: counter stays at 0
+          - numeric_flag: processed via ACTIVE branch → confirm_marker_persisted called
+            → returns False → emits 'MISS marker' WARNING for task 77 → counter=1
+            → breaker trips (threshold=1, but only after numeric flag is processed)
+          - 'confirmation skipped' WARNING is NOT present for task 77
+
+        Observable difference: presence of 'MISS marker...77' (active branch) vs.
+        absence of it and presence of 'confirmation skipped...77' (tripped branch).
+        """
+        import logging as _logging
+
+        from fused_memory.reconciliation import flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        # Threshold=1: one genuine confirmation miss trips the breaker.
+        # If the fp: guard-skip counts, the breaker trips BEFORE the numeric flag.
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 1)
+
+        fp_flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor guard-skip circuit-breaker test abc999',
+        }
+        sig = compute_content_fingerprint_signature(fp_flag)
+        assert sig is not None
+        fp_tid, _ = sig
+
+        # Numeric flag on the MISS path whose confirmation search returns [].
+        numeric_flag = {'task_id': 77, 'flag_type': 'stale_edge'}
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={
+                # MISS: no prior; confirmation retry also returns [] → confirmation miss.
+                ('77', 'stale_edge'): [[], [], []],
+            },
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='proj',
+                run_id='r1',
+                flags=[fp_flag, numeric_flag],
+            )
+
+        assert len(result) == 2
+
+        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+
+        # (i) Numeric flag processed via ACTIVE branch (breaker not pre-tripped by fp: skip):
+        #     active_miss WARNING template contains 'MISS marker' and task_id '77'.
+        active_miss = [t for t in warn_texts if 'MISS marker' in t and '77' in t]
+        assert active_miss, (
+            f'Expected ACTIVE-branch confirmation-miss WARNING for numeric flag '
+            f'(proves breaker was not pre-tripped by the fp: guard-skip); '
+            f'got all WARNINGs: {warn_texts!r}'
+        )
+
+        # (ii) TRIPPED-branch skip WARNING must NOT appear for task 77.
+        #      If the fp: skip had counted, numeric_flag would have been processed
+        #      via the TRIPPED branch and emitted "confirmation skipped" instead.
+        tripped_for_77 = [t for t in warn_texts if 'confirmation skipped' in t and '77' in t]
+        assert not tripped_for_77, (
+            f'TRIPPED-branch "confirmation skipped" WARNING must not appear for '
+            f'task 77 — its presence means the breaker was tripped by the fp: '
+            f'guard-skip, advancing the counter when it should not; '
+            f'got: {tripped_for_77!r}'
+        )
+
+        # (iii) add_memory called once (only for numeric flag, not for fp: flag).
+        memory_service.add_memory.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

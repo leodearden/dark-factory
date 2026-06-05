@@ -462,12 +462,16 @@ async def _write_and_confirm_marker(
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
-    **Validation guard (task-1656):** before calling ``add_memory``, ``tid`` is
-    checked by :func:`_is_valid_marker_task_id`.  If the check fails (e.g. a
-    content-fingerprint ``fp:…`` key produced by
-    :func:`compute_content_fingerprint_signature`) a WARNING is logged and this
-    helper returns ``False`` immediately — ``add_memory`` and
-    ``_confirm_and_track`` are NOT called.  Returning ``False`` (not raising)
+    **Validation guard (task-1656, defense-in-depth):** before calling
+    ``add_memory``, ``tid`` is checked by :func:`_is_valid_marker_task_id`.
+    Under normal operation this guard is never reached for invalid keys — the
+    early guard in :func:`dedup_flags` (added in the task-1656 amendment pass)
+    short-circuits before the search+write path for ``fp:…`` and other
+    non-numeric keys.  This guard remains as a defense-in-depth backstop for
+    any future code path that calls ``_write_and_confirm_marker`` directly with
+    an unvalidated ``tid``.  When tripped it logs a WARNING (genuinely unexpected
+    at this call site after the early guard) and returns ``False`` — ``add_memory``
+    and ``_confirm_and_track`` are NOT called.  Returning ``False`` (not raising)
     ensures:
 
     - On the HIT path, priors are NOT deleted (best-effort-replacement invariant:
@@ -549,7 +553,16 @@ async def dedup_flags(
       fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
       Only when BOTH helpers return None is the flag returned unchanged — no
       I/O performed.
-    - If a signature is computable (from either helper), Mem0 is searched for a
+    - If a signature is computable, the resulting ``task_id`` (``tid``) is
+      validated by ``_is_valid_marker_task_id``.  Non-numeric keys — in
+      particular ``fp:…`` content-fingerprint keys produced by
+      ``compute_content_fingerprint_signature`` — are **skipped entirely**:
+      the flag is returned unchanged and no Mem0 I/O is performed.  This
+      prevents the perpetual stale-marker cleanup loop that would result from
+      persisting a marker whose ``task_id`` Stage 2 cannot resolve.
+      Null-task_id/no-cited-tasks findings revert to re-escalating each cycle;
+      this is the intended trade-off (task-1656 design rationale).
+    - For valid (numeric or comma-joined) signatures, Mem0 is searched for a
       prior marker memory with matching ``task_id`` and ``flag_type``.
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
@@ -673,6 +686,22 @@ async def dedup_flags(
             result.append(flag)
             continue
         tid, ftype = sig
+        # Early guard (task-1656 amend): skip search + write for non-numeric keys.
+        # fp:… content-fingerprint keys (produced by compute_content_fingerprint_signature)
+        # are unprocessable by Stage 2 and would — if persisted — cause a perpetual
+        # stale-marker cleanup loop.  Searching Mem0 for them on every cycle is
+        # wasted network I/O since the marker write is blocked downstream anyway.
+        # Logging at DEBUG: this is an expected steady-state condition for
+        # null-task_id/no-cited-tasks findings, not an anomaly.
+        if not _is_valid_marker_task_id(tid):
+            logger.debug(
+                'flag_dedup: skipping stage1 dedup for non-numeric task_id %r'
+                ' (flag_type %s) — Stage 2-unprocessable key; finding will'
+                ' re-escalate each cycle (intentional trade-off)',
+                tid, ftype,
+            )
+            result.append(flag)
+            continue
         # Delegate search+filter to the shared helper.  find_prior_memories logs a
         # WARNING under logger on search failure and returns [] so the else
         # branch below writes a fresh marker (best-effort on transient Mem0 outage).
