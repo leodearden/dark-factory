@@ -4849,8 +4849,15 @@ class TestDedupFlagsContentFingerprintPath:
     """
 
     @pytest.mark.asyncio
-    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self):
-        """Cycle 1 (no prior marker): MISS path writes marker with fp:… task_id."""
+    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self, caplog):
+        """Cycle 1 (no prior marker): MISS path skips write for fp:… task_id (guard rejects it).
+
+        Updated by task-1656: the validation guard in _write_and_confirm_marker now
+        rejects fp:… keys before calling add_memory.  The guard logs a WARNING and
+        returns False — add_memory must NOT be called.
+        """
+        import logging as _logging
+
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
             dedup_flags,
@@ -4871,12 +4878,13 @@ class TestDedupFlagsContentFingerprintPath:
         memory_service.search = AsyncMock(return_value=[])
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
-        result = await dedup_flags(
-            memory_service=memory_service,
-            project_id='p',
-            run_id='r1',
-            flags=[flag],
-        )
+        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
 
         # (a) Flag is NOT annotated with persisted_from_run (MISS path)
         assert len(result) == 1
@@ -4884,29 +4892,25 @@ class TestDedupFlagsContentFingerprintPath:
             f'Fresh null-task_id flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # (b) add_memory called exactly once with the content-fingerprint marker
-        memory_service.add_memory.assert_called_once()
-        marker_kwargs = memory_service.add_memory.call_args.kwargs
-        assert marker_kwargs.get('category') == 'observations_and_summaries'
-        meta = marker_kwargs.get('metadata', {})
-        assert meta.get('source') == 'stage1_flag_marker', (
-            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
-        )
-        # task_id in the marker must be the content fingerprint (fp:…)
-        assert meta.get('task_id') == expected_fp, (
-            f'Marker task_id must be the content fp {expected_fp!r}; got {meta.get("task_id")!r}'
-        )
-        assert meta.get('flag_type') == expected_ftype, (
-            f'Marker flag_type must be {expected_ftype!r}; got {meta.get("flag_type")!r}'
-        )
-        assert meta.get('run_id') == 'r1', (
-            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        # (b) add_memory must NOT be called — guard rejects fp:… key before writing
+        memory_service.add_memory.assert_not_called()
+
+        # (c) Guard must have logged a WARNING naming the skipped fp:… task_id
+        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any(expected_fp in t for t in warn_texts), (
+            f'Expected a WARNING containing {expected_fp!r}; '
+            f'got WARNING records: {warn_texts!r}'
         )
 
     @pytest.mark.asyncio
     async def test_cycle2_hit_annotates_flag_with_persisted_from_run(self):
-        """Cycle 2 (prior marker present + confirmation marker for current run): HIT path
-        annotates flag with persisted_from_run and last_seen_run_id."""
+        """Cycle 2 (prior fp:… marker present): HIT path annotates flag but skips write.
+
+        Updated by task-1656: the validation guard in _write_and_confirm_marker rejects
+        the fp:… replacement write, so write_succeeded=False and priors are NOT deleted.
+        The flag is still annotated with persisted_from_run/last_seen_run_id (annotation
+        happens before the write attempt on the HIT path).
+        """
         from fused_memory.reconciliation.flag_dedup import (
             compute_content_fingerprint_signature,
             dedup_flags,
@@ -4931,19 +4935,12 @@ class TestDedupFlagsContentFingerprintPath:
         })
         prior_marker.id = 'prior-fp-r1'
 
-        # Confirmation marker for current run r2
-        confirm_marker = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'r2',
-        })
-        confirm_marker.id = 'new-fp-r2'
-
         memory_service = AsyncMock()
         memory_service.search = AsyncMock(side_effect=_make_search_stub(
             suppression=[[]],
-            marker={(fp, ftype): [[prior_marker], [confirm_marker]]},
+            # Only one search entry needed: find_prior_memories.
+            # The guard returns False before confirmation search is reached.
+            marker={(fp, ftype): [[prior_marker]]},
         ))
         memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -4955,7 +4952,8 @@ class TestDedupFlagsContentFingerprintPath:
             flags=[flag],
         )
 
-        # (a) Flag IS annotated with persisted_from_run='r1' and last_seen_run_id='r2' (HIT)
+        # (a) Flag IS still annotated with persisted_from_run='r1' and last_seen_run_id='r2'
+        #     (annotation happens before the write on the HIT path)
         assert len(result) == 1
         assert result[0].get('persisted_from_run') == 'r1', (
             f'HIT: persisted_from_run must be "r1"; got {result[0].get("persisted_from_run")!r}'
@@ -4964,13 +4962,199 @@ class TestDedupFlagsContentFingerprintPath:
             f'HIT: last_seen_run_id must be "r2"; got {result[0].get("last_seen_run_id")!r}'
         )
 
-        # (b) Replacement marker is written (HIT path)
-        memory_service.add_memory.assert_called_once()
+        # (b) Replacement write is SKIPPED — guard rejects fp:… key
+        memory_service.add_memory.assert_not_called()
 
-        # (c) Prior marker deleted after confirmed write
-        memory_service.delete_memory.assert_called_once()
-        del_kwargs = memory_service.delete_memory.call_args.kwargs
-        assert del_kwargs.get('memory_id') == 'prior-fp-r1'
+        # (c) Prior is NOT deleted — write_succeeded=False preserves priors
+        memory_service.delete_memory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task-1656 step-3 — RED: dedup_flags write-guard integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDedupFlagsWriteGuard:
+    """Integration tests for the _is_valid_marker_task_id guard wired into
+    _write_and_confirm_marker.
+
+    Covers:
+    (a) fp:-signature flag on MISS path — add_memory NOT called, WARNING logged.
+    (b) fp:-signature flag with legacy prior fp: marker — flag still annotated,
+        NO add_memory, NO delete_memory (priors retained because write_succeeded=False).
+    (c) Regression: numeric task_id '42' still writes its marker (guard does not
+        over-reject valid integer keys).
+    (d) Regression: comma-joined cited_tasks signature '12,15' still writes its
+        marker (guard accepts the comma-joined shape).
+    """
+
+    async def test_fp_key_miss_path_skips_write_and_logs_warning(self, caplog):
+        """(a) MISS path: fp:… task_id → add_memory NOT called, WARNING logged."""
+        import logging as _logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor found for finding abc123',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: fp signature must be computable'
+        fp_tid, _ftype = sig
+        assert fp_tid.startswith('fp:'), f'Expected fp: prefix; got {fp_tid!r}'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='proj',
+                run_id='run-a',
+                flags=[flag],
+            )
+
+        # Flag returned unchanged (no persisted_from_run on MISS)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0]
+
+        # Guard must have suppressed the write
+        memory_service.add_memory.assert_not_called()
+
+        # Guard must have logged a WARNING naming the skipped task_id
+        warn_texts = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any(fp_tid in t for t in warn_texts), (
+            f'Expected WARNING containing {fp_tid!r}; got: {warn_texts!r}'
+        )
+
+    async def test_fp_key_hit_path_annotates_but_skips_write_and_delete(self):
+        """(b) HIT path: fp:… prior exists → flag annotated, NO add_memory, NO delete_memory."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'missing_deliverable',
+            'description': 'No task anchor found for finding abc123',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'run-prev',
+            'last_seen_run_id': 'run-prev',
+        })
+        prior.id = 'legacy-fp-prior'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            # Guard returns False before confirmation search → only 1 marker search.
+            marker={(fp, ftype): [[prior]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-b',
+            flags=[flag],
+        )
+
+        # Flag is annotated (annotation precedes write on the HIT path)
+        assert len(result) == 1
+        assert result[0].get('persisted_from_run') == 'run-prev', (
+            f'persisted_from_run must be "run-prev"; got {result[0].get("persisted_from_run")!r}'
+        )
+        assert result[0].get('last_seen_run_id') == 'run-b'
+
+        # Write skipped — guard rejected the fp: key
+        memory_service.add_memory.assert_not_called()
+
+        # Prior NOT deleted — write_succeeded=False preserves priors
+        memory_service.delete_memory.assert_not_called()
+
+    async def test_numeric_task_id_still_writes_marker(self):
+        """(c) Regression: numeric task_id '42' passes guard → add_memory called."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {'task_id': 42, 'flag_type': 'missing_deliverable'}
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Guard accepts numeric key → add_memory called exactly once
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('task_id') == '42', (
+            f'Marker task_id must be "42"; got {meta.get("task_id")!r}'
+        )
+
+    async def test_comma_joined_cited_tasks_signature_still_writes_marker(self):
+        """(d) Regression: comma-joined cited_tasks key '12,15' passes guard → add_memory called."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'cross_task_blocker',
+            'cited_tasks': [{'task_id': 15}, {'task_id': 12}],
+        }
+        # compute_flag_signature produces ('12,15', 'cross_task_blocker') via cited_tasks fallback
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('12,15', 'cross_task_blocker'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '12,15',
+                'flag_type': 'cross_task_blocker',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # Guard accepts comma-joined integer key → add_memory called exactly once
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('task_id') == '12,15', (
+            f'Marker task_id must be "12,15"; got {meta.get("task_id")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
