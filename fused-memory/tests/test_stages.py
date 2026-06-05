@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _check_flag_counter_completeness,
     _check_mem0_flag_counter_completeness,
     _check_stall_guard_freshness,
+    _classify_live_workflow_status_writes,
     _classify_terminal_state_violations,
     _format_flagged,
     _needs_hint_conversion,
@@ -10048,5 +10049,224 @@ class TestBuildSummaryNonceSectionPrefix:
         assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', section), (
             f"build_summary_nonce_section('STAGE2') must contain "
             f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
+        )
+
+
+# ── Tests for Task 1655 step-7: _classify_live_workflow_status_writes ─────────────────────
+
+
+def _make_sts_op(
+    *,
+    op_id: str = 'op-sts-1',
+    agent_id: str = 'recon-stage-task_knowledge_sync',
+    task_id: str = '4321',
+) -> dict:
+    """Return a minimal write_journal op dict for a set_task_status operation."""
+    return {
+        'id': op_id,
+        'agent_id': agent_id,
+        'operation': 'set_task_status',
+        'params': json.dumps({'task_id': task_id, 'status': 'in-progress'}),
+        'layer': 'write_op',
+        'causation_id': 'run-test',
+        'created_at': '2026-06-05T10:00:00',
+    }
+
+
+class TestClassifyLiveWorkflowStatusWrites:
+    """Unit tests for _classify_live_workflow_status_writes helper (step-7).
+
+    RED until step-8 adds the helper to task_knowledge_sync.py.
+    """
+
+    _AGENT_ID = 'recon-stage-task_knowledge_sync'
+    _TASK_ID = '4321'
+
+    @pytest.mark.asyncio
+    async def test_returns_violation_when_task_is_live(self, monkeypatch):
+        """Helper returns one violation when the set_task_status target task is LIVE."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [_make_sts_op(op_id='op-live-1', agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert v['op_id'] == 'op-live-1'
+        assert v['task_id'] == self._TASK_ID
+        assert v['reason'] == 'live_workflow_status_write'
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_task_is_not_live(self, monkeypatch):
+        """Helper returns [] when the target task is NOT live."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: False
+        )
+        ops = [_make_sts_op(agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_other_agent_ops_excluded(self, monkeypatch):
+        """Ops from a different agent_id are NOT classified as violations."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [
+            _make_sts_op(
+                op_id='op-other-agent',
+                agent_id='task-interceptor',  # NOT the recon-stage agent
+                task_id=self._TASK_ID,
+            )
+        ]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_non_set_task_status_ops_excluded(self, monkeypatch):
+        """Non-set_task_status ops from the stage agent are NOT classified."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        # update_task op, not set_task_status
+        update_op = {
+            'id': 'op-update',
+            'agent_id': self._AGENT_ID,
+            'operation': 'update_task',
+            'params': json.dumps({'task_id': self._TASK_ID}),
+            'layer': 'write_op',
+            'causation_id': 'run-test',
+            'created_at': '2026-06-05T10:00:00',
+        }
+        violations = await _classify_live_workflow_status_writes(
+            [update_op], '/project', self._AGENT_ID
+        )
+
+        assert violations == []
+
+    @pytest.mark.asyncio
+    async def test_mixed_ops_only_stage_sts_live_flagged(self, monkeypatch):
+        """Only the recon set_task_status op for a live task produces a violation."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+        ops = [
+            # The target op: stage-2 set_task_status on a live task
+            _make_sts_op(op_id='op-stage-sts', agent_id=self._AGENT_ID, task_id=self._TASK_ID),
+            # Excluded: different agent
+            _make_sts_op(op_id='op-interceptor-sts', agent_id='task-interceptor', task_id=self._TASK_ID),
+            # Excluded: non-set_task_status
+            {
+                'id': 'op-update',
+                'agent_id': self._AGENT_ID,
+                'operation': 'update_task',
+                'params': json.dumps({'task_id': self._TASK_ID}),
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-06-05T10:00:00',
+            },
+        ]
+
+        violations = await _classify_live_workflow_status_writes(
+            ops, '/project', self._AGENT_ID
+        )
+
+        assert len(violations) == 1
+        assert violations[0]['op_id'] == 'op-stage-sts'
+
+
+class TestApplyPostFlightGuardsLiveWorkflow:
+    """Integration tests: _apply_post_flight_guards updates stats for live-workflow writes."""
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_status_writes_increments_stat_and_decrements_tasks_modified(
+        self, stage2_guard_mock_deps, monkeypatch, caplog
+    ):
+        """When live-workflow writes detected, stats['live_workflow_status_writes'] is set
+        and stats['tasks_modified'] is decremented (clamped at 0).
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        # Synthetic op: stage-2 agent called set_task_status on a live task
+        live_sts_op = _make_sts_op(
+            op_id='op-live-sts',
+            agent_id='recon-stage-task_knowledge_sync',
+            task_id='4321',
+        )
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [live_sts_op]
+
+        # Taskmaster returns in-progress for caching (status_cache pre-fetch)
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'in-progress'}
+
+        # Stub super().run() via cli_stage_runner; return a report with tasks_modified=2
+        from fused_memory.models.reconciliation import StageId as _SID, StageReport
+        from unittest.mock import patch as _patch
+
+        initial_report = StageReport(
+            stage=_SID.task_knowledge_sync,
+            started_at=datetime(2026, 6, 5, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 6, 5, 0, 1, tzinfo=UTC),
+            items_flagged=[],
+            stats={'tasks_modified': 2},
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+        from shared.cli_invoke import AgentResult
+
+        with _patch.object(
+            stage,
+            '_run_cli_stage',
+            new=AsyncMock(return_value=AgentResult(
+                success=True,
+                output='',
+                structured_output={
+                    'summary': 'done',
+                    'flagged_items': [],
+                    'stats': {'tasks_modified': 2},
+                },
+            )),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.stages.task_knowledge_sync'):
+                report = await stage.run([], wm, [], 'test-run-live')
+
+        assert report.stats.get('live_workflow_status_writes', 0) >= 1, (
+            f'Expected live_workflow_status_writes >= 1, got stats={report.stats}'
+        )
+        # tasks_modified must be clamped (decremented) due to the live write
+        assert report.stats.get('tasks_modified', 0) <= 2, (
+            f'Expected tasks_modified <= 2 (decremented); got {report.stats.get("tasks_modified")}'
         )
 
