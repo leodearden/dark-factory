@@ -23,7 +23,7 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_task` — get a single task by ID
 - `mcp__fused-memory__count_memories_by_metadata` — deterministic exact-count query \
   against Qdrant metadata payload (not semantic); use for existence checks such as \
-  confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>}}`
+  confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}}`
 
 You do NOT have write or mutation tools.
 
