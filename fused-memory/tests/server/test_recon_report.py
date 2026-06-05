@@ -1549,3 +1549,219 @@ class TestTracesExclusivelyToStage1:
         stage1_ids = {'reify:3803', 'ent-1'}  # exact match
         assert _traces_exclusively_to_stage1(finding, stage1_ids) is True
 
+
+# ---------------------------------------------------------------------------
+# task-1654 step-7 — RED: get_assembled_report integration test for Fix 1
+# suppression (non-actionable same-run echoes of Stage-1 citations)
+# ---------------------------------------------------------------------------
+
+
+class TestGetAssembledReportNonActionableEchoSuppression:
+    """Integration test: Fix 1 read-time suppression in get_assembled_report.
+
+    Build a run with Stage 1 (memory_consolidator) and Stage 2
+    (task_knowledge_sync).  After cite_task is attached, get_assembled_report
+    for Stage 2 must suppress non-actionable findings whose citations trace
+    exclusively to Stage-1 findings (same run), while keeping:
+    (a) actionable findings citing Stage-1 targets
+    (b) non-actionable findings with at least one citation NOT in Stage-1
+    (c) Stage-1 findings are NOT suppressed by their own citations
+        (self-exclusion by finding_id)
+
+    Tests import from server.recon_report; they will fail until step-8 wires
+    the suppression filter into get_assembled_report.
+    """
+
+    def _build_state(self) -> 'ReconReportState':
+        """Build a ReconReportState with 'reify' registered and task_interceptor."""
+        from unittest.mock import AsyncMock
+        from fused_memory.server.recon_report import ReconReportState
+
+        task_interceptor = AsyncMock()
+        task_interceptor.get_task = AsyncMock(return_value={
+            'title': 'Task from reify project',
+            'data': {},
+        })
+
+        state = ReconReportState(
+            ttl_seconds=3600,
+            clock=lambda: 0.0,
+            task_interceptor=task_interceptor,
+        )
+        state.known_projects['reify'] = '/tmp/reify'
+        return state
+
+    @pytest.mark.asyncio
+    async def test_non_actionable_finding_citing_only_stage1_target_is_suppressed(self):
+        """A non-actionable Stage-2 finding whose citations all trace to a Stage-1
+        finding is ABSENT from get_assembled_report for Stage 2.
+
+        Stage 1 uses flag_type='cross_project'; Stage 2 uses flag_type='stale_edge'
+        to avoid the in-run cross-stage sig dedup (they share run_id so (task_id,
+        flag_type) must differ).  Both cite reify/3803 — the suppression check
+        operates on citation identities, not flag_type.
+        """
+        state = self._build_state()
+        run_id = 'r1654-fix1'
+
+        # Stage 1: add finding + cite reify/3803
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='cross_project',
+            description='Stage 1 cross-project finding about reify/3803',
+            suggested_action='Check reify project',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'Stage 1 add_finding failed: {r}'
+        stage1_finding_id = r['finding_id']
+
+        await state.cite_task(run_id=run_id, finding_id=stage1_finding_id,
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: add non-actionable finding + cite SAME target reify/3803.
+        # Use flag_type='stale_edge' (different from Stage 1's 'cross_project') to
+        # avoid the cross-stage in-run sig dedup for null task_id findings.
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='cross_project',
+            description='Stage 2 echo of the same cross-project finding',
+            suggested_action='Check reify project (echo)',
+            actionable=False,
+            task_id=None,
+            flag_type='stale_edge',  # different flag_type to avoid in-run sig collision
+        )
+        assert 'error' not in r2, f'Stage 2 add_finding failed: {r2}'
+        stage2_echo_id = r2['finding_id']
+
+        await state.cite_task(run_id=run_id, finding_id=stage2_echo_id,
+                              project_id='reify', task_id='3803')
+
+        # The echo must be ABSENT from Stage-2 assembled report (suppressed)
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None, 'get_assembled_report returned None'
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert stage2_echo_id not in finding_ids, (
+            f'Non-actionable Stage-2 echo citing only Stage-1 target must be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_actionable_finding_citing_stage1_target_is_kept(self):
+        """(a) An ACTIONABLE Stage-2 finding citing only Stage-1 targets REMAINS."""
+        state = self._build_state()
+        run_id = 'r1654-fix1-a'
+
+        # Stage 1: cites reify/3803 with flag_type='cross_project'
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage 1 finding', suggested_action='act',
+            actionable=False, task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        await state.cite_task(run_id=run_id, finding_id=r['finding_id'],
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: ACTIONABLE finding with flag_type='stale_metadata' (different from
+        # Stage 1 to avoid in-run sig collision) — must NOT be suppressed even though
+        # it cites the same Stage-1 target.
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id, severity='high', category='cross_project',
+            description='Actionable finding about reify/3803',
+            suggested_action='Fix this', actionable=True,  # actionable!
+            task_id=None, flag_type='stale_metadata',
+        )
+        assert 'error' not in r2
+        actionable_id = r2['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=actionable_id,
+                              project_id='reify', task_id='3803')
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert actionable_id in finding_ids, (
+            f'Actionable finding must REMAIN even when citing a Stage-1 target; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_actionable_with_uncovered_citation_is_kept(self):
+        """(b) A non-actionable finding with an additional uncovered citation REMAINS."""
+        state = self._build_state()
+        run_id = 'r1654-fix1-b'
+
+        # Stage 1: cites reify/3803 with flag_type='cross_project'
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage 1 finding', suggested_action='act',
+            actionable=False, task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        await state.cite_task(run_id=run_id, finding_id=r['finding_id'],
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: non-actionable finding (flag_type='missing_deliverable') citing
+        # BOTH reify/3803 AND reify/9999 (9999 is not covered by Stage 1 →
+        # partial overlap → must remain).
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id, severity='moderate', category='cross_project',
+            description='Non-actionable finding also involving reify/9999',
+            suggested_action='Review both tasks', actionable=False,
+            task_id=None, flag_type='missing_deliverable',
+        )
+        assert 'error' not in r2
+        partial_id = r2['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=partial_id,
+                              project_id='reify', task_id='3803')
+        await state.cite_task(run_id=run_id, finding_id=partial_id,
+                              project_id='reify', task_id='9999')
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert partial_id in finding_ids, (
+            f'Non-actionable finding with uncovered citation (reify/9999) must REMAIN; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage1_finding_not_suppressed_by_own_citation(self):
+        """(c) Stage-1 findings are NOT suppressed when assembling Stage-1 report.
+
+        Self-exclusion: the candidate finding_id is excluded from the
+        stage1_identities set, so it cannot be suppressed by its own citations.
+        """
+        state = self._build_state()
+        run_id = 'r1654-fix1-c'
+
+        # Stage 1: add a single non-actionable finding + cite reify/3803
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Unique Stage-1 cross-project finding',
+            suggested_action='Check reify', actionable=False,
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        stage1_id = r['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=stage1_id,
+                              project_id='reify', task_id='3803')
+
+        # Stage-1 assembled report must still contain this finding
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert stage1_id in finding_ids, (
+            f'Stage-1 finding must NOT be suppressed by its own citation '
+            f'(self-exclusion); flagged_items finding_ids: {finding_ids}'
+        )
+
