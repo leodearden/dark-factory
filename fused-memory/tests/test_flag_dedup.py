@@ -80,14 +80,37 @@ class TestComputeFlagSignature:
 
 @pytest.mark.asyncio
 async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
-    """Flags without task_id/flag_type pass through with exactly one I/O call (suppression filter); add_memory never called."""
+    """Flags with no computable signature pass through with exactly one I/O call (suppression filter); add_memory never called.
+
+    After task-1654 Fix 2, compute_content_fingerprint_signature is tried as a
+    fallback for null-task_id flags.  The four "no-sig" cases that survive both
+    helpers are:
+    - Has a non-None task_id but missing flag_type (content-fp returns None
+      because task_id is not None; compute_flag_signature returns None because
+      flag_type is missing).
+    - Has task_id=None + flag_type but a blank/whitespace-only description
+      (content-fp returns None because the normalised description is empty).
+    - Has task_id=None with non-empty cited_tasks whose task_id is None
+      (compute_flag_signature's cited_tasks scan yields no usable ids;
+      content-fp returns None because cited_tasks technically present but task_id
+      is None — both helpers return None).
+    - Empty dict: trivially no-sig.
+    """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
     flags = [
-        {'description': 'some flag without task_id'},
-        {'description': 'another flag without flag_type', 'task_id': '42'},
-        {'description': 'flag without task_id', 'flag_type': 'missing_deliverable'},
+        # (1) has task_id but missing flag_type — compute_flag_signature None;
+        #     content-fp None because task_id is not None.
+        {'description': 'no flag_type present', 'task_id': '42'},
+        # (2) task_id=None + flag_type but blank description — content-fp None.
+        {'task_id': None, 'flag_type': 'missing_deliverable', 'description': '   '},
+        # (3) task_id=None + cited_tasks whose task_id is None (no usable cited id
+        #     for compute_flag_signature; content-fp also None: no non-None task_id
+        #     in cited_tasks means the cited_tasks guard doesn't block, BUT then
+        #     we'd need a description — omit it to force both helpers to None).
+        {'task_id': None, 'flag_type': 'cross_project', 'cited_tasks': [{'project_id': 'x'}]},
+        # (4) empty dict — trivially no-sig.
         {},
     ]
     original_flags = [dict(f) for f in flags]
@@ -2750,7 +2773,8 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
     the search-call sequence.
 
     Flags:
-    - flag_A: no task_id/flag_type → no-signature, pass-through unchanged
+    - flag_A: has task_id but no flag_type → no-signature under both helpers
+      (task-1654: content-fp returns None because task_id is not None), pass-through
     - flag_B: MISS-happy (no prior); confirmation search finds the new marker
     - flag_C: HIT-happy (prior exists); confirmation search confirms replacement
 
@@ -2808,7 +2832,10 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
-    flag_A = {'description': 'no-signature flag'}
+    # flag_A: has task_id but no flag_type → no-sig under both helpers (task-1654:
+    # content-fp returns None because task_id is not None; compute_flag_signature
+    # returns None because flag_type is missing).
+    flag_A = {'task_id': '5', 'description': 'no-signature: missing flag_type'}
     flag_B = {'task_id': '10', 'flag_type': 'stale_metadata', 'description': 'B'}
     flag_C = {'task_id': '20', 'flag_type': 'missing_deliverable', 'description': 'C'}
 
@@ -2819,7 +2846,7 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
         flags=[flag_A, flag_B, flag_C],
     )
 
-    # (a) flag_A unchanged (no-signature)
+    # (a) flag_A unchanged (no-signature — has task_id but missing flag_type)
     assert len(result) == 3
     assert result[0] == flag_A
 

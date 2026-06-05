@@ -517,10 +517,14 @@ async def dedup_flags(
 
     For each flag in *flags*:
 
-    - If the flag has no computable signature (missing ``task_id`` or
-      ``flag_type``), it is returned unchanged — no I/O performed.
-    - If a signature is computable, Mem0 is searched for a prior marker memory
-      with matching ``task_id`` and ``flag_type``.
+    - Signature is computed first via ``compute_flag_signature(flag)``
+      (keyed on top-level task_id or cited_tasks fallback).  When that returns
+      None, ``compute_content_fingerprint_signature(flag)`` is tried as a
+      fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
+      Only when BOTH helpers return None is the flag returned unchanged — no
+      I/O performed.
+    - If a signature is computable (from either helper), Mem0 is searched for a
+      prior marker memory with matching ``task_id`` and ``flag_type``.
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
         succeeds and Mem0 confirms it, delete the prior marker
@@ -632,6 +636,13 @@ async def dedup_flags(
     result: list[dict[str, Any]] = []
     for flag in flags:
         sig = compute_flag_signature(flag)
+        # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
+        # that lack cited_tasks, compute_flag_signature returns None.  Route them
+        # through the content-fingerprint path so dedup_flags writes/matches a
+        # marker and the finding stops re-escalating every cycle.
+        # Only appended unchanged (pass-through) when BOTH helpers return None.
+        if sig is None:
+            sig = compute_content_fingerprint_signature(flag)
         if sig is None:
             result.append(flag)
             continue
