@@ -37,6 +37,84 @@ def _description_hash(description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fix 1 helpers — citation identity + same-run echo suppression (task-1654)
+# ---------------------------------------------------------------------------
+
+
+def _citation_identities(finding: dict) -> set[str]:
+    """Return the set of identity strings for a finding's typed citations.
+
+    Flattens all four citation lists into a single flat set of stable identity
+    strings:
+    - ``cited_tasks``    → ``'{project_id}:{task_id}'`` per entry
+    - ``cited_entities`` → ``entity_uuid`` per entry
+    - ``cited_edges``    → ``edge_uuid`` per entry
+    - ``cited_memories`` → ``memory_id`` per entry
+
+    Mirrors :func:`harness._derive_affected_ids` traversal but:
+    - uses ``project_id:task_id`` for tasks (cross-project disambiguation)
+    - returns a ``set`` (not a list) so subset tests are O(n) not O(n²)
+    - lives in server/recon_report.py to avoid a server←reconciliation import
+
+    Used by :func:`_traces_exclusively_to_stage1` and
+    :func:`ReconReportState.get_assembled_report` for Fix-1 echo suppression.
+    Pure, sync, no I/O; safe to call from any context.
+    """
+    ids: set[str] = set()
+    for c in finding.get('cited_tasks') or []:
+        if isinstance(c, dict):
+            pid = c.get('project_id')
+            tid = c.get('task_id')
+            if pid is not None and tid is not None:
+                ids.add(f'{pid}:{tid}')
+    for c in finding.get('cited_entities') or []:
+        if isinstance(c, dict):
+            val = c.get('entity_uuid')
+            if val is not None:
+                ids.add(str(val))
+    for c in finding.get('cited_edges') or []:
+        if isinstance(c, dict):
+            val = c.get('edge_uuid')
+            if val is not None:
+                ids.add(str(val))
+    for c in finding.get('cited_memories') or []:
+        if isinstance(c, dict):
+            val = c.get('memory_id')
+            if val is not None:
+                ids.add(str(val))
+    return ids
+
+
+def _traces_exclusively_to_stage1(
+    finding: dict,
+    stage1_identities: set[str],
+) -> bool:
+    """Return True iff *finding* is a non-actionable echo of Stage-1 citations.
+
+    Predicate: True iff ALL of the following hold:
+    1. ``finding['actionable']`` is False
+    2. The finding's citation identity set is non-empty (has >=1 typed citation)
+    3. The identity set is a SUBSET of *stage1_identities*
+
+    Returning False for condition 2 (empty set) prevents citation-less
+    non-actionable findings from being silently collapsed — they carry no
+    structural evidence that they duplicate Stage 1.  Returning False for
+    partial overlap (condition 3) ensures only *complete* echoes are
+    suppressed; a finding with even one uncovered citation may represent new
+    structural evidence.
+
+    Used by :func:`ReconReportState.get_assembled_report` for Fix-1 read-time
+    suppression.  Pure, sync, no I/O.
+    """
+    if finding.get('actionable') is not False:
+        return False
+    identities = _citation_identities(finding)
+    if not identities:
+        return False
+    return identities <= stage1_identities
+
+
+# ---------------------------------------------------------------------------
 # Internal data model
 # ---------------------------------------------------------------------------
 
@@ -424,13 +502,58 @@ class ReconReportState:
         run_id: str,
         stage: str,
     ) -> dict[str, Any] | None:
-        """Return the §9.3 assembled report dict, or None if unknown."""
+        """Return the §9.3 assembled report dict, or None if unknown.
+
+        Fix 1 (task-1654): read-time suppression of non-actionable same-run
+        echoes.  Before returning flagged_items, collect the union of
+        _citation_identities over ALL same-run findings whose entry.stage ==
+        'memory_consolidator', EXCLUDING the candidate finding by finding_id
+        (self-exclusion so a Stage-1 finding is never suppressed by its own
+        citations — closes the aba1ac28 null-null desc-hash bypass).  Any
+        finding for which _traces_exclusively_to_stage1 returns True is dropped
+        from flagged_items.  Finding rows remain in _state/_run_finding_index so
+        cross-stage cite_* resolution is unaffected by the read-time filter.
+
+        Suppression is skipped entirely when ``stage == 'memory_consolidator'``
+        to prevent two sibling non-actionable Stage-1 findings that cite the
+        same target from mutually suppressing each other.
+        """
         entry = self._state.get((run_id, stage))
         if entry is None:
             return None
 
-        flagged_items = [
-            {
+        # --- Fix 1: build stage-1 citation identity set for this run ---
+        # Collect _citation_identities from all memory_consolidator findings
+        # across this run (may be spread across multiple start_report calls for
+        # the same stage, though in practice there is one entry per stage).
+        #
+        # Skipped entirely when stage IS memory_consolidator: applying the
+        # filter there would let two sibling non-actionable Stage-1 findings
+        # that cite the same target mutually suppress each other.  Fix 1 only
+        # targets cross-stage echoes, not intra-Stage-1 duplicates.
+        stage1_identities_by_finding: dict[str, set[str]] = {}
+        if stage != 'memory_consolidator':
+            for (r_id, s), other_entry in self._state.items():
+                if r_id == run_id and s == 'memory_consolidator':
+                    for f in other_entry.findings:
+                        stage1_identities_by_finding[f.finding_id] = _citation_identities({
+                            'cited_tasks': list(f.cited_tasks),
+                            'cited_entities': list(f.cited_entities),
+                            'cited_edges': list(f.cited_edges),
+                            'cited_memories': list(f.cited_memories),
+                        })
+
+        # Pre-compute full union of all stage-1 identity sets once; per-candidate
+        # we subtract only that finding's own identities — O(F+S) instead of O(F·S).
+        _stage1_full_union: set[str] = (
+            set().union(*stage1_identities_by_finding.values())
+            if stage1_identities_by_finding
+            else set()
+        )
+
+        flagged_items: list[dict[str, Any]] = []
+        for f in entry.findings:
+            finding_dict = {
                 'finding_id': f.finding_id,
                 'severity': f.severity,
                 'category': f.category,
@@ -445,8 +568,20 @@ class ReconReportState:
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
             }
-            for f in entry.findings
-        ]
+            # Fix 1 suppression: stage1_ids = full union minus this candidate's
+            # own identities (self-exclusion so Stage-1 findings are not
+            # suppressed by their own citations).
+            stage1_ids = (
+                _stage1_full_union
+                - stage1_identities_by_finding.get(f.finding_id, set())
+            )
+            if _traces_exclusively_to_stage1(finding_dict, stage1_ids):
+                # Drop: non-actionable finding whose citations trace exclusively
+                # to a same-run Stage-1 finding.  Finding row remains in _state
+                # so cite_* resolution is unaffected.
+                continue
+            flagged_items.append(finding_dict)
+
         return {
             'summary': entry.summary,
             'stats': dict(entry.stats),

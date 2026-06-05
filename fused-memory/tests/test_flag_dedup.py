@@ -80,14 +80,37 @@ class TestComputeFlagSignature:
 
 @pytest.mark.asyncio
 async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
-    """Flags without task_id/flag_type pass through with exactly one I/O call (suppression filter); add_memory never called."""
+    """Flags with no computable signature pass through with exactly one I/O call (suppression filter); add_memory never called.
+
+    After task-1654 Fix 2, compute_content_fingerprint_signature is tried as a
+    fallback for null-task_id flags.  The four "no-sig" cases that survive both
+    helpers are:
+    - Has a non-None task_id but missing flag_type (content-fp returns None
+      because task_id is not None; compute_flag_signature returns None because
+      flag_type is missing).
+    - Has task_id=None + flag_type but a blank/whitespace-only description
+      (content-fp returns None because the normalised description is empty).
+    - Has task_id=None with non-empty cited_tasks whose task_id is None
+      (compute_flag_signature's cited_tasks scan yields no usable ids;
+      content-fp returns None because cited_tasks technically present but task_id
+      is None — both helpers return None).
+    - Empty dict: trivially no-sig.
+    """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
     flags = [
-        {'description': 'some flag without task_id'},
-        {'description': 'another flag without flag_type', 'task_id': '42'},
-        {'description': 'flag without task_id', 'flag_type': 'missing_deliverable'},
+        # (1) has task_id but missing flag_type — compute_flag_signature None;
+        #     content-fp None because task_id is not None.
+        {'description': 'no flag_type present', 'task_id': '42'},
+        # (2) task_id=None + flag_type but blank description — content-fp None.
+        {'task_id': None, 'flag_type': 'missing_deliverable', 'description': '   '},
+        # (3) task_id=None + cited_tasks whose task_id is None (no usable cited id
+        #     for compute_flag_signature; content-fp also None: no non-None task_id
+        #     in cited_tasks means the cited_tasks guard doesn't block, BUT then
+        #     we'd need a description — omit it to force both helpers to None).
+        {'task_id': None, 'flag_type': 'cross_project', 'cited_tasks': [{'project_id': 'x'}]},
+        # (4) empty dict — trivially no-sig.
         {},
     ]
     original_flags = [dict(f) for f in flags]
@@ -2750,7 +2773,8 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
     the search-call sequence.
 
     Flags:
-    - flag_A: no task_id/flag_type → no-signature, pass-through unchanged
+    - flag_A: has task_id but no flag_type → no-signature under both helpers
+      (task-1654: content-fp returns None because task_id is not None), pass-through
     - flag_B: MISS-happy (no prior); confirmation search finds the new marker
     - flag_C: HIT-happy (prior exists); confirmation search confirms replacement
 
@@ -2808,7 +2832,10 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
-    flag_A = {'description': 'no-signature flag'}
+    # flag_A: has task_id but no flag_type → no-sig under both helpers (task-1654:
+    # content-fp returns None because task_id is not None; compute_flag_signature
+    # returns None because flag_type is missing).
+    flag_A = {'task_id': '5', 'description': 'no-signature: missing flag_type'}
     flag_B = {'task_id': '10', 'flag_type': 'stale_metadata', 'description': 'B'}
     flag_C = {'task_id': '20', 'flag_type': 'missing_deliverable', 'description': 'C'}
 
@@ -2819,7 +2846,7 @@ async def test_dedup_flags_end_to_end_confirmation_wired():
         flags=[flag_A, flag_B, flag_C],
     )
 
-    # (a) flag_A unchanged (no-signature)
+    # (a) flag_A unchanged (no-signature — has task_id but missing flag_type)
     assert len(result) == 3
     assert result[0] == flag_A
 
@@ -4633,4 +4660,359 @@ class TestFilterFalseAbsenceFlags:
         assert non_absence in result, 'Non-absence flag must be kept'
         assert no_id in result, 'Absence flag without task_id must be kept'
 
+
+# ---------------------------------------------------------------------------
+# task-1654 step-1 — RED: compute_content_fingerprint_signature tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeContentFingerprintSignature:
+    """Tests for compute_content_fingerprint_signature(flag) -> tuple[str, str] | None.
+
+    This function is a NEW helper introduced in task-1654 (Fix 2) to route
+    null-task_id findings that lack cited_tasks through a deterministic content
+    fingerprint so dedup_flags can write/match a stage1_flag_marker and stop
+    re-escalating each cycle.
+
+    All tests import from flag_dedup; they will fail with ImportError until
+    step-2 adds the implementation.
+    """
+
+    def test_returns_deterministic_fp_tuple_for_null_task_id_flag(self):
+        """(a) null task_id + valid description + flag_type set -> non-None (fp:<hex>, flag_type)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'An orphaned edge with no known task anchor',
+        }
+        result = compute_content_fingerprint_signature(flag)
+
+        assert result is not None, 'Expected a 2-tuple, got None'
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f'Expected 2-tuple, got {result!r}'
+        )
+        fp, ftype = result
+        assert fp.startswith('fp:'), (
+            f'Fingerprint must be prefixed with "fp:"; got {fp!r}'
+        )
+        assert ftype == 'stale_edge', (
+            f'flag_type element must equal "stale_edge"; got {ftype!r}'
+        )
+        # Deterministic: calling again with the same flag returns the same result
+        assert compute_content_fingerprint_signature(flag) == result, (
+            'compute_content_fingerprint_signature must be deterministic'
+        )
+
+    def test_whitespace_and_case_variants_produce_identical_signature(self):
+        """(b) Two descriptions differing only by whitespace/case -> identical signature."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag_a = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'orphaned edge found in graph',
+        }
+        flag_b = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': '  Orphaned   EDGE  found   in   Graph  ',  # extra spaces + mixed case
+        }
+        result_a = compute_content_fingerprint_signature(flag_a)
+        result_b = compute_content_fingerprint_signature(flag_b)
+
+        assert result_a is not None and result_b is not None
+        assert result_a == result_b, (
+            f'Whitespace/case variants must produce the same signature; '
+            f'got {result_a!r} vs {result_b!r}'
+        )
+
+    def test_genuinely_different_descriptions_produce_different_signatures(self):
+        """(c) Two genuinely different descriptions -> different signatures."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag_a = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'orphaned edge found in graph',
+        }
+        flag_b = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'completely different finding about missing memory',
+        }
+        result_a = compute_content_fingerprint_signature(flag_a)
+        result_b = compute_content_fingerprint_signature(flag_b)
+
+        assert result_a is not None and result_b is not None
+        assert result_a != result_b, (
+            f'Different descriptions must produce different signatures; '
+            f'both returned {result_a!r}'
+        )
+
+    def test_blank_description_returns_none(self):
+        """(d-a) Blank (whitespace-only) description -> None (not a meaningful dedup key)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {'task_id': None, 'flag_type': 'stale_edge', 'description': '   '}
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Whitespace-only description must return None'
+        )
+
+    def test_missing_description_returns_none(self):
+        """(d-b) Missing description key -> None."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {'task_id': None, 'flag_type': 'stale_edge'}
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Missing description must return None'
+        )
+
+    def test_with_top_level_task_id_returns_none(self):
+        """(e-a) flag with non-None task_id -> None (defers to compute_flag_signature)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'stale_edge',
+            'description': 'Has a task_id — should use compute_flag_signature instead',
+        }
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Non-None task_id must return None (defer to compute_flag_signature)'
+        )
+
+    def test_with_non_empty_cited_tasks_returns_none(self):
+        """(e-b) flag with non-empty cited_tasks -> None (defers to compute_flag_signature)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Has cited_tasks — compute_flag_signature fallback handles this',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+        }
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Non-empty cited_tasks must return None (defer to compute_flag_signature)'
+        )
+
+    def test_null_flag_type_uses_sentinel_constant(self):
+        """(f) flag_type=None + valid description -> 2nd element is _CONTENT_FP_FLAG_TYPE sentinel."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _CONTENT_FP_FLAG_TYPE,
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': None,
+            'description': 'Finding without a flag_type — use sentinel',
+        }
+        result = compute_content_fingerprint_signature(flag)
+
+        assert result is not None, 'Should still return a tuple even when flag_type is None'
+        fp, ftype = result
+        assert fp.startswith('fp:'), f'fp must start with "fp:"; got {fp!r}'
+        assert ftype == _CONTENT_FP_FLAG_TYPE, (
+            f'When flag_type is None, the 2nd element must be _CONTENT_FP_FLAG_TYPE '
+            f'({_CONTENT_FP_FLAG_TYPE!r}), got {ftype!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1654 step-3 — RED: dedup_flags cross-cycle dedup via content fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsContentFingerprintPath:
+    """Verify dedup_flags uses compute_content_fingerprint_signature as a fallback
+    for null-task_id, no-cited-tasks flags so they stop re-escalating each cycle.
+
+    Mirrors the _make_search_stub / _make_memory_result / AddMemoryResponse
+    stub pattern from existing dedup_flags tests above.  The search stub is
+    keyed on the fp:… marker query string, computed from the test flag's
+    description at test setup time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cycle1_miss_writes_marker_keyed_by_content_fingerprint(self):
+        """Cycle 1 (no prior marker): MISS path writes marker with fp:… task_id."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Stale edge d592ca46 has no known task anchor',
+        }
+        # Derive the expected fp/ftype at test time (same logic as impl).
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: signature must be computable for this flag'
+        expected_fp, expected_ftype = sig
+
+        # All searches return empty: no suppression entries, no prior markers.
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        # (a) Flag is NOT annotated with persisted_from_run (MISS path)
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0], (
+            f'Fresh null-task_id flag must not have persisted_from_run; got {result[0]}'
+        )
+
+        # (b) add_memory called exactly once with the content-fingerprint marker
+        memory_service.add_memory.assert_called_once()
+        marker_kwargs = memory_service.add_memory.call_args.kwargs
+        assert marker_kwargs.get('category') == 'observations_and_summaries'
+        meta = marker_kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage1_flag_marker', (
+            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
+        )
+        # task_id in the marker must be the content fingerprint (fp:…)
+        assert meta.get('task_id') == expected_fp, (
+            f'Marker task_id must be the content fp {expected_fp!r}; got {meta.get("task_id")!r}'
+        )
+        assert meta.get('flag_type') == expected_ftype, (
+            f'Marker flag_type must be {expected_ftype!r}; got {meta.get("flag_type")!r}'
+        )
+        assert meta.get('run_id') == 'r1', (
+            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cycle2_hit_annotates_flag_with_persisted_from_run(self):
+        """Cycle 2 (prior marker present + confirmation marker for current run): HIT path
+        annotates flag with persisted_from_run and last_seen_run_id."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Stale edge d592ca46 has no known task anchor',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        # Build a prior marker for the fp:… key (run_id='r1' from cycle 1)
+        prior_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r1',
+            'last_seen_run_id': 'r1',
+        })
+        prior_marker.id = 'prior-fp-r1'
+
+        # Confirmation marker for current run r2
+        confirm_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r2',
+        })
+        confirm_marker.id = 'new-fp-r2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[prior_marker], [confirm_marker]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r2',
+            flags=[flag],
+        )
+
+        # (a) Flag IS annotated with persisted_from_run='r1' and last_seen_run_id='r2' (HIT)
+        assert len(result) == 1
+        assert result[0].get('persisted_from_run') == 'r1', (
+            f'HIT: persisted_from_run must be "r1"; got {result[0].get("persisted_from_run")!r}'
+        )
+        assert result[0].get('last_seen_run_id') == 'r2', (
+            f'HIT: last_seen_run_id must be "r2"; got {result[0].get("last_seen_run_id")!r}'
+        )
+
+        # (b) Replacement marker is written (HIT path)
+        memory_service.add_memory.assert_called_once()
+
+        # (c) Prior marker deleted after confirmed write
+        memory_service.delete_memory.assert_called_once()
+        del_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert del_kwargs.get('memory_id') == 'prior-fp-r1'
+
+
+# ---------------------------------------------------------------------------
+# amend: normalizer parity — _normalize_content_description must stay aligned
+# with recon_report._normalize_description (Suggestion 3).
+# A shared test set pins both implementations to identical output so silent
+# drift between the local copies is caught by CI.
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerParity:
+    """Both _normalize_content_description (flag_dedup) and _normalize_description
+    (recon_report) must produce identical output for the same inputs.
+
+    The implementations are kept as local copies to avoid a server<-reconciliation
+    import inversion.  This test class pins them to the same behaviour so that a
+    future edit to one is immediately flagged when the other diverges.
+    """
+
+    # Shared inputs that exercise whitespace collapse, casefold, and
+    # combinations of both.
+    _CASES = [
+        'Stale edge d592ca46 has no known task anchor',
+        '  Leading  and   trailing  whitespace  ',
+        'UPPERCASE DESCRIPTION',
+        'MiXeD CaSe  with  extra  spaces',
+        'single',
+        '',
+    ]
+
+    def test_identical_output_for_all_cases(self):
+        from fused_memory.reconciliation.flag_dedup import (
+            _normalize_content_description,
+        )
+        from fused_memory.server.recon_report import _normalize_description
+
+        for raw in self._CASES:
+            fd_result = _normalize_content_description(raw)
+            rr_result = _normalize_description(raw)
+            assert fd_result == rr_result, (
+                f'Normaliser drift detected for input {raw!r}:\n'
+                f'  flag_dedup._normalize_content_description → {fd_result!r}\n'
+                f'  recon_report._normalize_description       → {rr_result!r}'
+            )
 

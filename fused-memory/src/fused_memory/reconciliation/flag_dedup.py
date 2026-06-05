@@ -147,6 +147,7 @@ Public API
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any, Literal, TypedDict
 
@@ -516,10 +517,14 @@ async def dedup_flags(
 
     For each flag in *flags*:
 
-    - If the flag has no computable signature (missing ``task_id`` or
-      ``flag_type``), it is returned unchanged — no I/O performed.
-    - If a signature is computable, Mem0 is searched for a prior marker memory
-      with matching ``task_id`` and ``flag_type``.
+    - Signature is computed first via ``compute_flag_signature(flag)``
+      (keyed on top-level task_id or cited_tasks fallback).  When that returns
+      None, ``compute_content_fingerprint_signature(flag)`` is tried as a
+      fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
+      Only when BOTH helpers return None is the flag returned unchanged — no
+      I/O performed.
+    - If a signature is computable (from either helper), Mem0 is searched for a
+      prior marker memory with matching ``task_id`` and ``flag_type``.
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
         succeeds and Mem0 confirms it, delete the prior marker
@@ -631,6 +636,13 @@ async def dedup_flags(
     result: list[dict[str, Any]] = []
     for flag in flags:
         sig = compute_flag_signature(flag)
+        # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
+        # that lack cited_tasks, compute_flag_signature returns None.  Route them
+        # through the content-fingerprint path so dedup_flags writes/matches a
+        # marker and the finding stops re-escalating every cycle.
+        # Only appended unchanged (pass-through) when BOTH helpers return None.
+        if sig is None:
+            sig = compute_content_fingerprint_signature(flag)
         if sig is None:
             result.append(flag)
             continue
@@ -874,6 +886,83 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     if task_id is None or flag_type is None:
         return None
     return (str(task_id), str(flag_type))
+
+
+# --------------------------------------------------------------------------- #
+# Content-fingerprint helpers (task-1654 Fix 2)
+# --------------------------------------------------------------------------- #
+
+#: Sentinel flag_type used in the content-fingerprint (fp:…) signature when
+#: the flag's own flag_type is None.  A stable string avoids a None value
+#: breaking str-coercion in find_prior_memories / marker metadata writes.
+#: Do NOT change without a marker migration — existing markers keyed by this
+#: sentinel must remain findable by the new value.
+_CONTENT_FP_FLAG_TYPE: str = '__content_fp__'
+
+
+def _normalize_content_description(description: str) -> str:
+    """Casefold + collapse internal whitespace (mirrors recon_report._normalize_description).
+
+    A local copy avoids a server<-reconciliation import that would invert the
+    package layering.  Both normalizers must stay aligned — if recon_report's
+    implementation changes, update this one too.
+    """
+    return ' '.join(description.split()).casefold()
+
+
+def _content_fingerprint(description: str) -> str:
+    """SHA-256 hex (first 32 chars) of the normalised description, prefixed 'fp:'.
+
+    Deterministic across processes and PYTHONHASHSEED (unlike builtin hash()).
+    Truncation to 32 hex chars (128 bits of SHA-256) is sufficient collision
+    resistance for a dedup key over recon findings.
+    """
+    digest = hashlib.sha256(
+        _normalize_content_description(description).encode('utf-8')
+    ).hexdigest()
+    return f'fp:{digest[:32]}'
+
+
+def compute_content_fingerprint_signature(
+    flag: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return a content-fingerprint (fp:<hex>, flag_type_or_sentinel) or None.
+
+    Activated ONLY when ALL of the following hold:
+    - ``task_id`` is None (no top-level task anchor)
+    - ``cited_tasks`` yields no task_id values (empty list, absent, or all None)
+    - The normalized ``description`` is non-blank
+
+    Returns None when any condition fails so callers can fall through to
+    ``compute_flag_signature`` (which handles the cited_tasks path) or pass
+    the flag through unchanged (when both helpers return None).
+
+    When ``flag_type`` is None, the sentinel :data:`_CONTENT_FP_FLAG_TYPE` is
+    used so the 2-tuple shape is preserved for marker write/match in
+    ``dedup_flags``.
+
+    Pure, sync, no I/O — safe to call from any context.
+    """
+    # Condition 1: top-level task_id must be None.
+    if flag.get('task_id') is not None:
+        return None
+
+    # Condition 2: no usable task_id in cited_tasks.
+    cited_tasks = flag.get('cited_tasks')
+    if cited_tasks and isinstance(cited_tasks, list) and any(
+        isinstance(c, dict) and c.get('task_id') is not None
+        for c in cited_tasks
+    ):
+        return None
+
+    # Condition 3: non-blank normalized description.
+    description = flag.get('description') or ''
+    if not _normalize_content_description(description):
+        return None
+
+    fp = _content_fingerprint(description)
+    ftype = flag.get('flag_type') or _CONTENT_FP_FLAG_TYPE
+    return (fp, str(ftype))
 
 
 # --------------------------------------------------------------------------- #

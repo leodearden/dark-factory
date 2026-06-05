@@ -1325,3 +1325,496 @@ class TestReconReportNullDescDedup:
         # The cleanup guard (guard against removing a hash a later entry re-registered)
         # must not block the delete here, since stage_two never registered any hash.
         assert 'r1' not in state._run_desc_index
+
+
+# ---------------------------------------------------------------------------
+# task-1654 step-5 — RED: Fix 1 pure helpers — _citation_identities and
+# _traces_exclusively_to_stage1 (module-level functions in recon_report.py)
+# ---------------------------------------------------------------------------
+
+
+class TestCitationIdentities:
+    """Tests for _citation_identities(finding) -> set[str].
+
+    Expects the helper to flatten all typed citation lists into a set of
+    identity strings:
+    - cited_tasks  → 'project_id:task_id' per entry
+    - cited_entities → entity_uuid per entry
+    - cited_edges   → edge_uuid per entry
+    - cited_memories → memory_id per entry
+
+    All tests import from server.recon_report; they will fail with ImportError
+    until step-6 adds the implementation.
+    """
+
+    def test_cited_tasks_yields_project_colon_task_id(self):
+        """cited_tasks entries → 'project_id:task_id' identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [
+                {'project_id': 'reify', 'task_id': '3803', 'title': 'Some task'},
+                {'project_id': 'dark_factory', 'task_id': '42'},
+            ],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'reify:3803', 'dark_factory:42'}, (
+            f'Expected project_id:task_id identities; got {result!r}'
+        )
+
+    def test_cited_entities_yields_entity_uuid(self):
+        """cited_entities entries → entity_uuid identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [
+                {'entity_uuid': 'ent-uuid-1', 'canonical_name': 'EntityA'},
+                {'entity_uuid': 'ent-uuid-2', 'canonical_name': 'EntityB'},
+            ],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'ent-uuid-1', 'ent-uuid-2'}, (
+            f'Expected entity_uuid identities; got {result!r}'
+        )
+
+    def test_cited_edges_yields_edge_uuid(self):
+        """cited_edges entries → edge_uuid identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [
+                {'edge_uuid': 'edge-uuid-1', 'fact_text_snapshot': 'fact A'},
+            ],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'edge-uuid-1'}, (
+            f'Expected edge_uuid identities; got {result!r}'
+        )
+
+    def test_cited_memories_yields_memory_id(self):
+        """cited_memories entries → memory_id identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [
+                {'memory_id': 'mem-id-abc'},
+                {'memory_id': 'mem-id-xyz'},
+            ],
+        }
+        result = _citation_identities(finding)
+        assert result == {'mem-id-abc', 'mem-id-xyz'}, (
+            f'Expected memory_id identities; got {result!r}'
+        )
+
+    def test_all_four_types_flattened_into_one_set(self):
+        """All four citation types are combined into a single set."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'cited_entities': [{'entity_uuid': 'ent-1'}],
+            'cited_edges': [{'edge_uuid': 'edge-1'}],
+            'cited_memories': [{'memory_id': 'mem-1'}],
+        }
+        result = _citation_identities(finding)
+        assert result == {'reify:3803', 'ent-1', 'edge-1', 'mem-1'}, (
+            f'Expected all four types in result; got {result!r}'
+        )
+
+    def test_empty_citations_returns_empty_set(self):
+        """Finding with no citations returns an empty set."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == set(), f'Expected empty set; got {result!r}'
+
+    def test_missing_citation_lists_returns_empty_set(self):
+        """Finding dict without any citation keys returns an empty set (no crash)."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding: dict = {}
+        result = _citation_identities(finding)
+        assert result == set(), f'Expected empty set for missing keys; got {result!r}'
+
+
+class TestTracesExclusivelyToStage1:
+    """Tests for _traces_exclusively_to_stage1(finding, stage1_identities) -> bool.
+
+    Predicate returns True iff:
+    - finding's actionable is False
+    - its identity set is non-empty (has at least one typed citation)
+    - its identity set is a subset of stage1_identities
+
+    Returns False for any deviation.
+    """
+
+    def _finding_dict(
+        self,
+        *,
+        actionable: bool,
+        cited_tasks: list | None = None,
+        cited_entities: list | None = None,
+        cited_edges: list | None = None,
+        cited_memories: list | None = None,
+    ) -> dict:
+        return {
+            'actionable': actionable,
+            'cited_tasks': cited_tasks or [],
+            'cited_entities': cited_entities or [],
+            'cited_edges': cited_edges or [],
+            'cited_memories': cited_memories or [],
+        }
+
+    def test_returns_true_when_all_conditions_met(self):
+        """True: actionable=False, non-empty ids, ids are a subset of stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        stage1_ids = {'reify:3803', 'reify:9999'}  # superset — still True (subset test)
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is True
+
+    def test_returns_false_when_actionable_is_true(self):
+        """False: actionable=True, even if ids are covered by stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=True,  # actionable!
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        stage1_ids = {'reify:3803'}
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_identity_set_is_empty(self):
+        """False: no citations → identity set empty → not a meaningful echo of Stage 1."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(actionable=False)  # no citations
+        stage1_ids = {'reify:3803'}
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_partial_overlap(self):
+        """False: some ids covered but at least one is absent from stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[
+                {'project_id': 'reify', 'task_id': '3803'},  # covered
+                {'project_id': 'reify', 'task_id': '9999'},  # NOT covered
+            ],
+        )
+        stage1_ids = {'reify:3803'}  # 9999 absent → partial overlap → False
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_stage1_identities_empty(self):
+        """False: stage1_identities is empty — no coverage possible."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        assert _traces_exclusively_to_stage1(finding, set()) is False
+
+    def test_returns_true_for_exact_match(self):
+        """True: identity set equals stage1_identities exactly (subset test passes)."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+            cited_entities=[{'entity_uuid': 'ent-1'}],
+        )
+        stage1_ids = {'reify:3803', 'ent-1'}  # exact match
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is True
+
+
+# ---------------------------------------------------------------------------
+# task-1654 step-7 — RED: get_assembled_report integration test for Fix 1
+# suppression (non-actionable same-run echoes of Stage-1 citations)
+# ---------------------------------------------------------------------------
+
+
+class TestGetAssembledReportNonActionableEchoSuppression:
+    """Integration test: Fix 1 read-time suppression in get_assembled_report.
+
+    Build a run with Stage 1 (memory_consolidator) and Stage 2
+    (task_knowledge_sync).  After cite_task is attached, get_assembled_report
+    for Stage 2 must suppress non-actionable findings whose citations trace
+    exclusively to Stage-1 findings (same run), while keeping:
+    (a) actionable findings citing Stage-1 targets
+    (b) non-actionable findings with at least one citation NOT in Stage-1
+    (c) Stage-1 findings are NOT suppressed by their own citations
+        (self-exclusion by finding_id)
+
+    Tests import from server.recon_report; they will fail until step-8 wires
+    the suppression filter into get_assembled_report.
+    """
+
+    def _build_state(self):
+        """Build a ReconReportState with 'reify' registered and task_interceptor."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.server.recon_report import ReconReportState
+
+        task_interceptor = AsyncMock()
+        task_interceptor.get_task = AsyncMock(return_value={
+            'title': 'Task from reify project',
+            'data': {},
+        })
+
+        state = ReconReportState(
+            ttl_seconds=3600,
+            clock=lambda: 0.0,
+            task_interceptor=task_interceptor,
+        )
+        state.known_projects['reify'] = '/tmp/reify'
+        return state
+
+    @pytest.mark.asyncio
+    async def test_non_actionable_finding_citing_only_stage1_target_is_suppressed(self):
+        """A non-actionable Stage-2 finding whose citations all trace to a Stage-1
+        finding is ABSENT from get_assembled_report for Stage 2.
+
+        Stage 1 uses flag_type='cross_project'; Stage 2 uses flag_type='stale_edge'
+        to avoid the in-run cross-stage sig dedup (they share run_id so (task_id,
+        flag_type) must differ).  Both cite reify/3803 — the suppression check
+        operates on citation identities, not flag_type.
+        """
+        state = self._build_state()
+        run_id = 'r1654-fix1'
+
+        # Stage 1: add finding + cite reify/3803
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='cross_project',
+            description='Stage 1 cross-project finding about reify/3803',
+            suggested_action='Check reify project',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'Stage 1 add_finding failed: {r}'
+        stage1_finding_id = r['finding_id']
+
+        await state.cite_task(run_id=run_id, finding_id=stage1_finding_id,
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: add non-actionable finding + cite SAME target reify/3803.
+        # Use flag_type='stale_edge' (different from Stage 1's 'cross_project') to
+        # avoid the cross-stage in-run sig dedup for null task_id findings.
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='cross_project',
+            description='Stage 2 echo of the same cross-project finding',
+            suggested_action='Check reify project (echo)',
+            actionable=False,
+            task_id=None,
+            flag_type='stale_edge',  # different flag_type to avoid in-run sig collision
+        )
+        assert 'error' not in r2, f'Stage 2 add_finding failed: {r2}'
+        stage2_echo_id = r2['finding_id']
+
+        await state.cite_task(run_id=run_id, finding_id=stage2_echo_id,
+                              project_id='reify', task_id='3803')
+
+        # The echo must be ABSENT from Stage-2 assembled report (suppressed)
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None, 'get_assembled_report returned None'
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert stage2_echo_id not in finding_ids, (
+            f'Non-actionable Stage-2 echo citing only Stage-1 target must be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_actionable_finding_citing_stage1_target_is_kept(self):
+        """(a) An ACTIONABLE Stage-2 finding citing only Stage-1 targets REMAINS."""
+        state = self._build_state()
+        run_id = 'r1654-fix1-a'
+
+        # Stage 1: cites reify/3803 with flag_type='cross_project'
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage 1 finding', suggested_action='act',
+            actionable=False, task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        await state.cite_task(run_id=run_id, finding_id=r['finding_id'],
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: ACTIONABLE finding with flag_type='stale_metadata' (different from
+        # Stage 1 to avoid in-run sig collision) — must NOT be suppressed even though
+        # it cites the same Stage-1 target.
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id, severity='high', category='cross_project',
+            description='Actionable finding about reify/3803',
+            suggested_action='Fix this', actionable=True,  # actionable!
+            task_id=None, flag_type='stale_metadata',
+        )
+        assert 'error' not in r2
+        actionable_id = r2['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=actionable_id,
+                              project_id='reify', task_id='3803')
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert actionable_id in finding_ids, (
+            f'Actionable finding must REMAIN even when citing a Stage-1 target; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_actionable_with_uncovered_citation_is_kept(self):
+        """(b) A non-actionable finding with an additional uncovered citation REMAINS."""
+        state = self._build_state()
+        run_id = 'r1654-fix1-b'
+
+        # Stage 1: cites reify/3803 with flag_type='cross_project'
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage 1 finding', suggested_action='act',
+            actionable=False, task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        await state.cite_task(run_id=run_id, finding_id=r['finding_id'],
+                              project_id='reify', task_id='3803')
+
+        # Stage 2: non-actionable finding (flag_type='missing_deliverable') citing
+        # BOTH reify/3803 AND reify/9999 (9999 is not covered by Stage 1 →
+        # partial overlap → must remain).
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r2 = state.add_finding(
+            run_id=run_id, severity='moderate', category='cross_project',
+            description='Non-actionable finding also involving reify/9999',
+            suggested_action='Review both tasks', actionable=False,
+            task_id=None, flag_type='missing_deliverable',
+        )
+        assert 'error' not in r2
+        partial_id = r2['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=partial_id,
+                              project_id='reify', task_id='3803')
+        await state.cite_task(run_id=run_id, finding_id=partial_id,
+                              project_id='reify', task_id='9999')
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert partial_id in finding_ids, (
+            f'Non-actionable finding with uncovered citation (reify/9999) must REMAIN; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage1_finding_not_suppressed_by_own_citation(self):
+        """(c) Stage-1 findings are NOT suppressed when assembling Stage-1 report.
+
+        Self-exclusion: the candidate finding_id is excluded from the
+        stage1_identities set, so it cannot be suppressed by its own citations.
+        """
+        state = self._build_state()
+        run_id = 'r1654-fix1-c'
+
+        # Stage 1: add a single non-actionable finding + cite reify/3803
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Unique Stage-1 cross-project finding',
+            suggested_action='Check reify', actionable=False,
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r
+        stage1_id = r['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=stage1_id,
+                              project_id='reify', task_id='3803')
+
+        # Stage-1 assembled report must still contain this finding
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert stage1_id in finding_ids, (
+            f'Stage-1 finding must NOT be suppressed by its own citation '
+            f'(self-exclusion); flagged_items finding_ids: {finding_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sibling_stage1_findings_not_mutually_suppressed(self):
+        """Two sibling non-actionable Stage-1 findings citing the same target both remain.
+
+        Regression guard for the mutual-suppression bug: when two Stage-1
+        findings both cite reify/3803, the original implementation would use
+        each one's citations to build stage1_ids for the other, causing both
+        to satisfy _traces_exclusively_to_stage1 and be suppressed.  The fix
+        skips suppression entirely when stage == 'memory_consolidator'.
+        """
+        state = self._build_state()
+        run_id = 'r1654-amend-sibling'
+
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+
+        # Finding A — non-actionable, cites reify/3803 with flag_type='cross_project'
+        r_a = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage-1 sibling A about reify/3803',
+            suggested_action='Check reify', actionable=False,
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r_a
+        id_a = r_a['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=id_a,
+                              project_id='reify', task_id='3803')
+
+        # Finding B — non-actionable, also cites reify/3803 with a different flag_type
+        # (to avoid the in-run sig dedup which keys on (task_id, flag_type)).
+        r_b = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage-1 sibling B also about reify/3803',
+            suggested_action='Check reify again', actionable=False,
+            task_id=None, flag_type='stale_edge',
+        )
+        assert 'error' not in r_b
+        id_b = r_b['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=id_b,
+                              project_id='reify', task_id='3803')
+
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert id_a in finding_ids, (
+            f'Sibling Stage-1 finding A must NOT be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+        assert id_b in finding_ids, (
+            f'Sibling Stage-1 finding B must NOT be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
