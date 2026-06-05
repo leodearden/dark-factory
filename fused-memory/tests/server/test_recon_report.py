@@ -1325,3 +1325,227 @@ class TestReconReportNullDescDedup:
         # The cleanup guard (guard against removing a hash a later entry re-registered)
         # must not block the delete here, since stage_two never registered any hash.
         assert 'r1' not in state._run_desc_index
+
+
+# ---------------------------------------------------------------------------
+# task-1654 step-5 — RED: Fix 1 pure helpers — _citation_identities and
+# _traces_exclusively_to_stage1 (module-level functions in recon_report.py)
+# ---------------------------------------------------------------------------
+
+
+class TestCitationIdentities:
+    """Tests for _citation_identities(finding) -> set[str].
+
+    Expects the helper to flatten all typed citation lists into a set of
+    identity strings:
+    - cited_tasks  → 'project_id:task_id' per entry
+    - cited_entities → entity_uuid per entry
+    - cited_edges   → edge_uuid per entry
+    - cited_memories → memory_id per entry
+
+    All tests import from server.recon_report; they will fail with ImportError
+    until step-6 adds the implementation.
+    """
+
+    def test_cited_tasks_yields_project_colon_task_id(self):
+        """cited_tasks entries → 'project_id:task_id' identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [
+                {'project_id': 'reify', 'task_id': '3803', 'title': 'Some task'},
+                {'project_id': 'dark_factory', 'task_id': '42'},
+            ],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'reify:3803', 'dark_factory:42'}, (
+            f'Expected project_id:task_id identities; got {result!r}'
+        )
+
+    def test_cited_entities_yields_entity_uuid(self):
+        """cited_entities entries → entity_uuid identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [
+                {'entity_uuid': 'ent-uuid-1', 'canonical_name': 'EntityA'},
+                {'entity_uuid': 'ent-uuid-2', 'canonical_name': 'EntityB'},
+            ],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'ent-uuid-1', 'ent-uuid-2'}, (
+            f'Expected entity_uuid identities; got {result!r}'
+        )
+
+    def test_cited_edges_yields_edge_uuid(self):
+        """cited_edges entries → edge_uuid identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [
+                {'edge_uuid': 'edge-uuid-1', 'fact_text_snapshot': 'fact A'},
+            ],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == {'edge-uuid-1'}, (
+            f'Expected edge_uuid identities; got {result!r}'
+        )
+
+    def test_cited_memories_yields_memory_id(self):
+        """cited_memories entries → memory_id identity strings."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [
+                {'memory_id': 'mem-id-abc'},
+                {'memory_id': 'mem-id-xyz'},
+            ],
+        }
+        result = _citation_identities(finding)
+        assert result == {'mem-id-abc', 'mem-id-xyz'}, (
+            f'Expected memory_id identities; got {result!r}'
+        )
+
+    def test_all_four_types_flattened_into_one_set(self):
+        """All four citation types are combined into a single set."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+            'cited_entities': [{'entity_uuid': 'ent-1'}],
+            'cited_edges': [{'edge_uuid': 'edge-1'}],
+            'cited_memories': [{'memory_id': 'mem-1'}],
+        }
+        result = _citation_identities(finding)
+        assert result == {'reify:3803', 'ent-1', 'edge-1', 'mem-1'}, (
+            f'Expected all four types in result; got {result!r}'
+        )
+
+    def test_empty_citations_returns_empty_set(self):
+        """Finding with no citations returns an empty set."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding = {
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        result = _citation_identities(finding)
+        assert result == set(), f'Expected empty set; got {result!r}'
+
+    def test_missing_citation_lists_returns_empty_set(self):
+        """Finding dict without any citation keys returns an empty set (no crash)."""
+        from fused_memory.server.recon_report import _citation_identities
+
+        finding: dict = {}
+        result = _citation_identities(finding)
+        assert result == set(), f'Expected empty set for missing keys; got {result!r}'
+
+
+class TestTracesExclusivelyToStage1:
+    """Tests for _traces_exclusively_to_stage1(finding, stage1_identities) -> bool.
+
+    Predicate returns True iff:
+    - finding's actionable is False
+    - its identity set is non-empty (has at least one typed citation)
+    - its identity set is a subset of stage1_identities
+
+    Returns False for any deviation.
+    """
+
+    def _finding_dict(
+        self,
+        *,
+        actionable: bool,
+        cited_tasks: list | None = None,
+        cited_entities: list | None = None,
+        cited_edges: list | None = None,
+        cited_memories: list | None = None,
+    ) -> dict:
+        return {
+            'actionable': actionable,
+            'cited_tasks': cited_tasks or [],
+            'cited_entities': cited_entities or [],
+            'cited_edges': cited_edges or [],
+            'cited_memories': cited_memories or [],
+        }
+
+    def test_returns_true_when_all_conditions_met(self):
+        """True: actionable=False, non-empty ids, ids are a subset of stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        stage1_ids = {'reify:3803', 'reify:9999'}  # superset — still True (subset test)
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is True
+
+    def test_returns_false_when_actionable_is_true(self):
+        """False: actionable=True, even if ids are covered by stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=True,  # actionable!
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        stage1_ids = {'reify:3803'}
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_identity_set_is_empty(self):
+        """False: no citations → identity set empty → not a meaningful echo of Stage 1."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(actionable=False)  # no citations
+        stage1_ids = {'reify:3803'}
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_partial_overlap(self):
+        """False: some ids covered but at least one is absent from stage1_identities."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[
+                {'project_id': 'reify', 'task_id': '3803'},  # covered
+                {'project_id': 'reify', 'task_id': '9999'},  # NOT covered
+            ],
+        )
+        stage1_ids = {'reify:3803'}  # 9999 absent → partial overlap → False
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is False
+
+    def test_returns_false_when_stage1_identities_empty(self):
+        """False: stage1_identities is empty — no coverage possible."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+        )
+        assert _traces_exclusively_to_stage1(finding, set()) is False
+
+    def test_returns_true_for_exact_match(self):
+        """True: identity set equals stage1_identities exactly (subset test passes)."""
+        from fused_memory.server.recon_report import _traces_exclusively_to_stage1
+
+        finding = self._finding_dict(
+            actionable=False,
+            cited_tasks=[{'project_id': 'reify', 'task_id': '3803'}],
+            cited_entities=[{'entity_uuid': 'ent-1'}],
+        )
+        stage1_ids = {'reify:3803', 'ent-1'}  # exact match
+        assert _traces_exclusively_to_stage1(finding, stage1_ids) is True
+
