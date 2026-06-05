@@ -156,8 +156,9 @@ After writing the per-cycle summary, you MUST call \
 {{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}})` — \
 the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
 key persisted. A return of 0 means the stage key did not persist (the same failure that \
-makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing") and \
-should be noted in the cycle report.
+makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing"): \
+retry the `add_memory` write once with the same content and metadata before noting \
+the failure in the cycle report (mirrors the dedup-retry pattern at "Verifying Writes" above).
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
