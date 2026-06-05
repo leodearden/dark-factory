@@ -18,7 +18,10 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    detect_live_workflow,
+    is_workflow_live_for_task,
+)
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -1259,6 +1262,81 @@ async def _write_escalation_markers(
             )
 
 
+def _render_live_workflow_section(
+    tasks: list[dict],
+    project_root: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render the '### Live-Workflow Signals' payload section for *tasks*.
+
+    For each task in *tasks*, calls :func:`detect_live_workflow` and collects
+    tasks whose :attr:`WorkflowLiveness.is_live` is True.  Returns an empty
+    string when no task is live (keeps the payload tight).
+
+    Each live task is listed with the firing signal names so the Stage 2 LLM
+    can see which evidence contributed to the live designation:
+
+    ```
+    ### Live-Workflow Signals
+    - task/4321: worktree, recent-commit
+    ```
+
+    Detector errors per task are swallowed and logged at WARNING level (the task
+    is treated as not-live for that call — fail-safe, matching the harness gate).
+
+    Args:
+        tasks: Task dicts from the active/proactive-sample pool.  Only tasks
+            with a parseable ``id`` are inspected (non-int ids are skipped).
+        project_root: Absolute path to the project root, forwarded to the
+            detector.
+        now: Injectable reference time for deterministic tests.
+
+    Returns:
+        A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
+        or ``''`` when no tasks are live.
+    """
+    if not project_root or not tasks:
+        return ''
+
+    kwargs: dict = {} if now is None else {'now': now}
+    live_lines: list[str] = []
+
+    for task in tasks:
+        raw_id = task.get('id')
+        if raw_id is None:
+            continue
+        task_id = str(raw_id)
+        try:
+            liveness = detect_live_workflow(task_id, project_root, **kwargs)
+        except Exception:
+            logger.warning(
+                'reconciliation._render_live_workflow_section: '
+                'detector error for task_id=%s; treating as not-live',
+                task_id,
+            )
+            continue
+
+        if not liveness.is_live:
+            continue
+
+        # Collect which signals fired for human-readable display.
+        signals: list[str] = []
+        if liveness.worktree_registered:
+            signals.append('worktree')
+        if liveness.recent_commit:
+            signals.append('recent-commit')
+        if liveness.orchestrator_live:
+            signals.append('orchestrator')
+        signal_str = ', '.join(signals) if signals else 'live'
+        live_lines.append(f'- {liveness.branch}: {signal_str}')
+
+    if not live_lines:
+        return ''
+
+    return '### Live-Workflow Signals\n' + '\n'.join(live_lines) + '\n'
+
+
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
@@ -1773,6 +1851,17 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Live-Workflow Signals section: check active tasks for live workflows so the
+        # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
+        # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
+        # Empty string when no active tasks are live (keeps the payload tight).
+        live_workflow_section = ''
+        if self.project_root and filtered.active_tasks:
+            live_workflow_section = _render_live_workflow_section(
+                filtered.active_tasks,
+                self.project_root,
+            )
+
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
         # Task Tree string (for the prompt template slot) — single rendering pass.
@@ -1998,7 +2087,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{hint_conversion_section}{summary_nonce_section}
+{provenance_section}{proactive_sample_section}{hint_conversion_section}{live_workflow_section}{summary_nonce_section}
 
 ## Your Task
 Reconcile task state against memory:
