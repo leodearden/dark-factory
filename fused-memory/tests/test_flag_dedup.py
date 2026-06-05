@@ -4972,3 +4972,47 @@ class TestDedupFlagsContentFingerprintPath:
         del_kwargs = memory_service.delete_memory.call_args.kwargs
         assert del_kwargs.get('memory_id') == 'prior-fp-r1'
 
+
+# ---------------------------------------------------------------------------
+# amend: normalizer parity — _normalize_content_description must stay aligned
+# with recon_report._normalize_description (Suggestion 3).
+# A shared test set pins both implementations to identical output so silent
+# drift between the local copies is caught by CI.
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerParity:
+    """Both _normalize_content_description (flag_dedup) and _normalize_description
+    (recon_report) must produce identical output for the same inputs.
+
+    The implementations are kept as local copies to avoid a server<-reconciliation
+    import inversion.  This test class pins them to the same behaviour so that a
+    future edit to one is immediately flagged when the other diverges.
+    """
+
+    # Shared inputs that exercise whitespace collapse, casefold, and
+    # combinations of both.
+    _CASES = [
+        'Stale edge d592ca46 has no known task anchor',
+        '  Leading  and   trailing  whitespace  ',
+        'UPPERCASE DESCRIPTION',
+        'MiXeD CaSe  with  extra  spaces',
+        'single',
+        '',
+    ]
+
+    def test_identical_output_for_all_cases(self):
+        from fused_memory.reconciliation.flag_dedup import (
+            _normalize_content_description,
+        )
+        from fused_memory.server.recon_report import _normalize_description
+
+        for raw in self._CASES:
+            fd_result = _normalize_content_description(raw)
+            rr_result = _normalize_description(raw)
+            assert fd_result == rr_result, (
+                f'Normaliser drift detected for input {raw!r}:\n'
+                f'  flag_dedup._normalize_content_description → {fd_result!r}\n'
+                f'  recon_report._normalize_description       → {rr_result!r}'
+            )
+

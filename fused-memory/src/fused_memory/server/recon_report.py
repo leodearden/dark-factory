@@ -513,6 +513,10 @@ class ReconReportState:
         finding for which _traces_exclusively_to_stage1 returns True is dropped
         from flagged_items.  Finding rows remain in _state/_run_finding_index so
         cross-stage cite_* resolution is unaffected by the read-time filter.
+
+        Suppression is skipped entirely when ``stage == 'memory_consolidator'``
+        to prevent two sibling non-actionable Stage-1 findings that cite the
+        same target from mutually suppressing each other.
         """
         entry = self._state.get((run_id, stage))
         if entry is None:
@@ -522,18 +526,30 @@ class ReconReportState:
         # Collect _citation_identities from all memory_consolidator findings
         # across this run (may be spread across multiple start_report calls for
         # the same stage, though in practice there is one entry per stage).
-        # The candidate finding_id is EXCLUDED so Stage-1 findings are never
-        # suppressed by their own citations (self-exclusion).
+        #
+        # Skipped entirely when stage IS memory_consolidator: applying the
+        # filter there would let two sibling non-actionable Stage-1 findings
+        # that cite the same target mutually suppress each other.  Fix 1 only
+        # targets cross-stage echoes, not intra-Stage-1 duplicates.
         stage1_identities_by_finding: dict[str, set[str]] = {}
-        for (r_id, s), other_entry in self._state.items():
-            if r_id == run_id and s == 'memory_consolidator':
-                for f in other_entry.findings:
-                    stage1_identities_by_finding[f.finding_id] = _citation_identities({
-                        'cited_tasks': list(f.cited_tasks),
-                        'cited_entities': list(f.cited_entities),
-                        'cited_edges': list(f.cited_edges),
-                        'cited_memories': list(f.cited_memories),
-                    })
+        if stage != 'memory_consolidator':
+            for (r_id, s), other_entry in self._state.items():
+                if r_id == run_id and s == 'memory_consolidator':
+                    for f in other_entry.findings:
+                        stage1_identities_by_finding[f.finding_id] = _citation_identities({
+                            'cited_tasks': list(f.cited_tasks),
+                            'cited_entities': list(f.cited_entities),
+                            'cited_edges': list(f.cited_edges),
+                            'cited_memories': list(f.cited_memories),
+                        })
+
+        # Pre-compute full union of all stage-1 identity sets once; per-candidate
+        # we subtract only that finding's own identities — O(F+S) instead of O(F·S).
+        _stage1_full_union: set[str] = (
+            set().union(*stage1_identities_by_finding.values())
+            if stage1_identities_by_finding
+            else set()
+        )
 
         flagged_items: list[dict[str, Any]] = []
         for f in entry.findings:
@@ -552,11 +568,13 @@ class ReconReportState:
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
             }
-            # Fix 1 suppression: build stage1_identities EXCLUDING this candidate.
-            stage1_ids = set().union(*(
-                ids for fid, ids in stage1_identities_by_finding.items()
-                if fid != f.finding_id
-            ))
+            # Fix 1 suppression: stage1_ids = full union minus this candidate's
+            # own identities (self-exclusion so Stage-1 findings are not
+            # suppressed by their own citations).
+            stage1_ids = (
+                _stage1_full_union
+                - stage1_identities_by_finding.get(f.finding_id, set())
+            )
             if _traces_exclusively_to_stage1(finding_dict, stage1_ids):
                 # Drop: non-actionable finding whose citations trace exclusively
                 # to a same-run Stage-1 finding.  Finding row remains in _state

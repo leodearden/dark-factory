@@ -1766,3 +1766,55 @@ class TestGetAssembledReportNonActionableEchoSuppression:
             f'(self-exclusion); flagged_items finding_ids: {finding_ids}'
         )
 
+    @pytest.mark.asyncio
+    async def test_sibling_stage1_findings_not_mutually_suppressed(self):
+        """Two sibling non-actionable Stage-1 findings citing the same target both remain.
+
+        Regression guard for the mutual-suppression bug: when two Stage-1
+        findings both cite reify/3803, the original implementation would use
+        each one's citations to build stage1_ids for the other, causing both
+        to satisfy _traces_exclusively_to_stage1 and be suppressed.  The fix
+        skips suppression entirely when stage == 'memory_consolidator'.
+        """
+        state = self._build_state()
+        run_id = 'r1654-amend-sibling'
+
+        state.start_report(run_id, 'memory_consolidator', 'dark_factory')
+
+        # Finding A — non-actionable, cites reify/3803 with flag_type='cross_project'
+        r_a = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage-1 sibling A about reify/3803',
+            suggested_action='Check reify', actionable=False,
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'error' not in r_a
+        id_a = r_a['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=id_a,
+                              project_id='reify', task_id='3803')
+
+        # Finding B — non-actionable, also cites reify/3803 with a different flag_type
+        # (to avoid the in-run sig dedup which keys on (task_id, flag_type)).
+        r_b = state.add_finding(
+            run_id=run_id, severity='low', category='cross_project',
+            description='Stage-1 sibling B also about reify/3803',
+            suggested_action='Check reify again', actionable=False,
+            task_id=None, flag_type='stale_edge',
+        )
+        assert 'error' not in r_b
+        id_b = r_b['finding_id']
+        await state.cite_task(run_id=run_id, finding_id=id_b,
+                              project_id='reify', task_id='3803')
+
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        finding_ids = [f['finding_id'] for f in assembled['flagged_items']]
+        assert id_a in finding_ids, (
+            f'Sibling Stage-1 finding A must NOT be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+        assert id_b in finding_ids, (
+            f'Sibling Stage-1 finding B must NOT be suppressed; '
+            f'flagged_items finding_ids: {finding_ids}'
+        )
+
