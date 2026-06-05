@@ -48,6 +48,7 @@ from fused_memory.services.live_workflow_detector import (
     detect_live_workflow,
     is_workflow_live_for_task,
 )
+from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 
 logger = logging.getLogger(__name__)
 
@@ -1299,7 +1300,18 @@ def _render_live_workflow_section(
     if not project_root or not tasks:
         return ''
 
+    # Hoist the project-level orchestrator check: it is constant for this
+    # project_root (one lock file regardless of how many tasks are inspected).
+    # Swallow any detector errors here — the per-task detect_live_workflow calls
+    # will gracefully degrade on subsequent orchestrator checks.
+    try:
+        project_orch_live: bool | None = is_orchestrator_live_for(project_root)
+    except Exception:
+        project_orch_live = None  # let detect_live_workflow derive it per-task
+
     kwargs: dict = {} if now is None else {'now': now}
+    if project_orch_live is not None:
+        kwargs['_orchestrator_live'] = project_orch_live
     live_lines: list[str] = []
 
     for task in tasks:

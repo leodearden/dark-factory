@@ -1700,8 +1700,19 @@ class ReconciliationHarness:
                         # escalate.  Guard detector errors as not-live (fail toward escalating
                         # rather than toward silencing a genuine stranded-work escalation).
                         affected_ids = _derive_affected_ids(finding)
+                        # For liveness, iterate only cited task ids.
+                        # _derive_affected_ids mixes in entity canonical_names,
+                        # edge_uuids, and memory_ids; passing those to
+                        # is_workflow_live_for_task would build nonsensical
+                        # branch names (e.g. 'task/<canonical_name>') and waste
+                        # git subprocess calls that can never match.
+                        cited_task_ids = [
+                            str(c['task_id'])
+                            for c in finding.get('cited_tasks') or []
+                            if isinstance(c, dict) and 'task_id' in c
+                        ]
                         any_live = False
-                        for tid in affected_ids:
+                        for tid in cited_task_ids:
                             try:
                                 if is_workflow_live_for_task(tid, project_root):
                                     any_live = True

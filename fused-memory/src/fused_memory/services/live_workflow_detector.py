@@ -17,6 +17,16 @@ Fail-safe contract: a missing branch, subprocess error, or unparseable timestamp
 makes *that individual signal* False without raising.  OR-aggregation means a
 transient git glitch never flips a genuinely live task to 'not live'.
 
+**Important — orchestrator_live is project-wide, not per-task.**
+``is_orchestrator_live_for(project_root)`` holds one PID lock for the entire
+project.  When it is True, *every* task in the project will have ``is_live=True``
+regardless of its worktree or commit recency.  This is intentional: while any
+task in the project is being actively dispatched, recon cannot distinguish which
+specific task the orchestrator is acting on without deeper orchestrator coupling,
+so it conservatively treats all tasks as owned.  Consequence: while the project
+orchestrator is alive, stranded-work escalations are suppressed project-wide,
+not just for the task the orchestrator is currently processing.
+
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
@@ -76,6 +86,7 @@ def detect_live_workflow(
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+    _orchestrator_live: bool | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
 
@@ -88,6 +99,13 @@ def detect_live_workflow(
         max_commit_age_hours: Commits newer than this many hours count as recent.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
+        _orchestrator_live: Pre-computed project-level orchestrator-lock result.
+            When provided, skips the ``is_orchestrator_live_for(project_root)``
+            call — use this to hoist the constant project-level check out of
+            per-task loops (e.g. in :func:`_render_live_workflow_section`).
+            ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
+            call.  Tests monkeypatch the module attribute directly; this
+            parameter is only for performance hoisting, not test isolation.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -99,9 +117,15 @@ def detect_live_workflow(
     last_commit_at, recent_commit = _check_recent_commit(
         root, branch, now=now, max_commit_age_hours=max_commit_age_hours
     )
-    # NOTE: orchestrator_live is wired in step-4; left False here so step-1/2
-    # tests (which monkeypatch the name) pass before step-4.
-    orchestrator_live = is_orchestrator_live_for(project_root)
+    # orchestrator_live is the project-level lock signal (True when the
+    # orchestrator process holds an active lock for this project_root, regardless
+    # of which task it is currently dispatching).  Pre-computed callers may pass
+    # it via _orchestrator_live to avoid redundant per-task subprocess calls.
+    orchestrator_live = (
+        _orchestrator_live
+        if _orchestrator_live is not None
+        else is_orchestrator_live_for(project_root)
+    )
 
     is_live = worktree_registered or recent_commit or orchestrator_live
 
@@ -122,7 +146,8 @@ def is_workflow_live_for_task(
 ) -> bool:
     """Convenience wrapper — returns :attr:`WorkflowLiveness.is_live`.
 
-    Accepts the same keyword arguments as :func:`detect_live_workflow`.
+    Accepts the same keyword arguments as :func:`detect_live_workflow`,
+    including the ``_orchestrator_live`` performance hint.
     """
     return detect_live_workflow(task_id, project_root, **kwargs).is_live
 
