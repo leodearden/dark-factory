@@ -949,12 +949,11 @@ def compute_content_fingerprint_signature(
 
     # Condition 2: no usable task_id in cited_tasks.
     cited_tasks = flag.get('cited_tasks')
-    if cited_tasks and isinstance(cited_tasks, list):
-        if any(
-            isinstance(c, dict) and c.get('task_id') is not None
-            for c in cited_tasks
-        ):
-            return None
+    if cited_tasks and isinstance(cited_tasks, list) and any(
+        isinstance(c, dict) and c.get('task_id') is not None
+        for c in cited_tasks
+    ):
+        return None
 
     # Condition 3: non-blank normalized description.
     description = flag.get('description') or ''

@@ -1572,9 +1572,10 @@ class TestGetAssembledReportNonActionableEchoSuppression:
     the suppression filter into get_assembled_report.
     """
 
-    def _build_state(self) -> 'ReconReportState':
+    def _build_state(self):
         """Build a ReconReportState with 'reify' registered and task_interceptor."""
         from unittest.mock import AsyncMock
+
         from fused_memory.server.recon_report import ReconReportState
 
         task_interceptor = AsyncMock()
