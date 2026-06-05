@@ -4634,3 +4634,174 @@ class TestFilterFalseAbsenceFlags:
         assert no_id in result, 'Absence flag without task_id must be kept'
 
 
+# ---------------------------------------------------------------------------
+# task-1654 step-1 — RED: compute_content_fingerprint_signature tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeContentFingerprintSignature:
+    """Tests for compute_content_fingerprint_signature(flag) -> tuple[str, str] | None.
+
+    This function is a NEW helper introduced in task-1654 (Fix 2) to route
+    null-task_id findings that lack cited_tasks through a deterministic content
+    fingerprint so dedup_flags can write/match a stage1_flag_marker and stop
+    re-escalating each cycle.
+
+    All tests import from flag_dedup; they will fail with ImportError until
+    step-2 adds the implementation.
+    """
+
+    def test_returns_deterministic_fp_tuple_for_null_task_id_flag(self):
+        """(a) null task_id + valid description + flag_type set -> non-None (fp:<hex>, flag_type)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'An orphaned edge with no known task anchor',
+        }
+        result = compute_content_fingerprint_signature(flag)
+
+        assert result is not None, 'Expected a 2-tuple, got None'
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f'Expected 2-tuple, got {result!r}'
+        )
+        fp, ftype = result
+        assert fp.startswith('fp:'), (
+            f'Fingerprint must be prefixed with "fp:"; got {fp!r}'
+        )
+        assert ftype == 'stale_edge', (
+            f'flag_type element must equal "stale_edge"; got {ftype!r}'
+        )
+        # Deterministic: calling again with the same flag returns the same result
+        assert compute_content_fingerprint_signature(flag) == result, (
+            'compute_content_fingerprint_signature must be deterministic'
+        )
+
+    def test_whitespace_and_case_variants_produce_identical_signature(self):
+        """(b) Two descriptions differing only by whitespace/case -> identical signature."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag_a = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'orphaned edge found in graph',
+        }
+        flag_b = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': '  Orphaned   EDGE  found   in   Graph  ',  # extra spaces + mixed case
+        }
+        result_a = compute_content_fingerprint_signature(flag_a)
+        result_b = compute_content_fingerprint_signature(flag_b)
+
+        assert result_a is not None and result_b is not None
+        assert result_a == result_b, (
+            f'Whitespace/case variants must produce the same signature; '
+            f'got {result_a!r} vs {result_b!r}'
+        )
+
+    def test_genuinely_different_descriptions_produce_different_signatures(self):
+        """(c) Two genuinely different descriptions -> different signatures."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag_a = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'orphaned edge found in graph',
+        }
+        flag_b = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'completely different finding about missing memory',
+        }
+        result_a = compute_content_fingerprint_signature(flag_a)
+        result_b = compute_content_fingerprint_signature(flag_b)
+
+        assert result_a is not None and result_b is not None
+        assert result_a != result_b, (
+            f'Different descriptions must produce different signatures; '
+            f'both returned {result_a!r}'
+        )
+
+    def test_blank_description_returns_none(self):
+        """(d-a) Blank (whitespace-only) description -> None (not a meaningful dedup key)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {'task_id': None, 'flag_type': 'stale_edge', 'description': '   '}
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Whitespace-only description must return None'
+        )
+
+    def test_missing_description_returns_none(self):
+        """(d-b) Missing description key -> None."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {'task_id': None, 'flag_type': 'stale_edge'}
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Missing description must return None'
+        )
+
+    def test_with_top_level_task_id_returns_none(self):
+        """(e-a) flag with non-None task_id -> None (defers to compute_flag_signature)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'stale_edge',
+            'description': 'Has a task_id — should use compute_flag_signature instead',
+        }
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Non-None task_id must return None (defer to compute_flag_signature)'
+        )
+
+    def test_with_non_empty_cited_tasks_returns_none(self):
+        """(e-b) flag with non-empty cited_tasks -> None (defers to compute_flag_signature)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'stale_edge',
+            'description': 'Has cited_tasks — compute_flag_signature fallback handles this',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': '3803'}],
+        }
+        assert compute_content_fingerprint_signature(flag) is None, (
+            'Non-empty cited_tasks must return None (defer to compute_flag_signature)'
+        )
+
+    def test_null_flag_type_uses_sentinel_constant(self):
+        """(f) flag_type=None + valid description -> 2nd element is _CONTENT_FP_FLAG_TYPE sentinel."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _CONTENT_FP_FLAG_TYPE,
+            compute_content_fingerprint_signature,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': None,
+            'description': 'Finding without a flag_type — use sentinel',
+        }
+        result = compute_content_fingerprint_signature(flag)
+
+        assert result is not None, 'Should still return a tuple even when flag_type is None'
+        fp, ftype = result
+        assert fp.startswith('fp:'), f'fp must start with "fp:"; got {fp!r}'
+        assert ftype == _CONTENT_FP_FLAG_TYPE, (
+            f'When flag_type is None, the 2nd element must be _CONTENT_FP_FLAG_TYPE '
+            f'({_CONTENT_FP_FLAG_TYPE!r}), got {ftype!r}'
+        )
+
