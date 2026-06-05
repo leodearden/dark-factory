@@ -31,7 +31,6 @@ import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 
@@ -67,14 +66,14 @@ class WorkflowLiveness:
     recent_commit: bool
     orchestrator_live: bool
     branch: str
-    last_commit_at: Optional[datetime]
+    last_commit_at: datetime | None
 
 
 def detect_live_workflow(
     task_id: str,
     project_root: str | Path,
     *,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
 ) -> WorkflowLiveness:
@@ -158,19 +157,16 @@ def _check_worktree_registered(project_root: str, branch: str) -> bool:
         return False
 
     target = f'branch refs/heads/{branch}'
-    for line in result.stdout.splitlines():
-        if line.strip() == target:
-            return True
-    return False
+    return any(line.strip() == target for line in result.stdout.splitlines())
 
 
 def _check_recent_commit(
     project_root: str,
     branch: str,
     *,
-    now: Optional[datetime],
+    now: datetime | None,
     max_commit_age_hours: float,
-) -> tuple[Optional[datetime], bool]:
+) -> tuple[datetime | None, bool]:
     """Return (last_commit_at, recent_commit) for *branch*.
 
     ``last_commit_at`` is the parsed commit timestamp, or ``None`` if unavailable.
@@ -213,7 +209,7 @@ def _check_recent_commit(
     return last_commit_at, recent_commit
 
 
-def _parse_iso_timestamp(ts_str: str) -> Optional[datetime]:
+def _parse_iso_timestamp(ts_str: str) -> datetime | None:
     """Parse an ISO-8601 timestamp string from ``git log --format=%cI``.
 
     Returns ``None`` on any parse error.

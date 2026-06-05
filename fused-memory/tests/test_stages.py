@@ -10303,8 +10303,8 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         RED until step-10 implements _render_live_workflow_section.
         """
-        from fused_memory.services.live_workflow_detector import WorkflowLiveness
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
         not_live_task_id = '100'
@@ -10360,8 +10360,8 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         renders today, so this test may be GREEN trivially; the companion
         test_live_task_present test is the real RED driver).
         """
-        from fused_memory.services.live_workflow_detector import WorkflowLiveness
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
 
@@ -10399,8 +10399,8 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         RED until step-10 implements _render_live_workflow_section.
         """
-        from fused_memory.services.live_workflow_detector import WorkflowLiveness
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
 

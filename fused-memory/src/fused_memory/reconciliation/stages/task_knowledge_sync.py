@@ -18,10 +18,6 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
-from fused_memory.services.live_workflow_detector import (
-    detect_live_workflow,
-    is_workflow_live_for_task,
-)
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -47,6 +43,10 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+)
+from fused_memory.services.live_workflow_detector import (
+    detect_live_workflow,
+    is_workflow_live_for_task,
 )
 
 logger = logging.getLogger(__name__)

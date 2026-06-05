@@ -20,7 +20,6 @@ from fused_memory.services.live_workflow_detector import (
     is_workflow_live_for_task,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -140,11 +139,6 @@ class TestWorktreeSignal:
 
     def test_worktree_signal_false_on_non_zero_returncode(self, tmp_path):
         """A non-zero returncode from worktree list => worktree_registered=False (fail-safe)."""
-        side_effect = self._run_side_effect(
-            worktree_stdout='',
-            log_stdout='',
-            log_rc=1,
-        )
         # Override: make worktree list return non-zero
         def failing_side_effect(args, **kwargs):
             if '--porcelain' in args:
