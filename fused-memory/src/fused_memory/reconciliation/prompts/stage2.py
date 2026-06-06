@@ -397,13 +397,14 @@ problems. Each retry costs one tool call; skipping them forces the next Stage 1 
 to re-discover the failed entity by scanning all entity summaries heuristically.
 
 ## Mem0 Active-Query Flag Deletion (FIX C)
-Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
-active-query path (identified by a `_source: mem0_active_query` marker or a `flag_id` \
-UUID field). These flags are live Mem0 memories written by Stage 1 with \
-`metadata.flag_for_stage2=true`. After you record your action for such a flag \
-(memory_hint write, task update, or a no-action note explaining why no action is \
-needed), you MUST immediately delete that flag from Mem0 to prevent it from being \
-re-surfaced in future reconciliation cycles:
+Some flagged items in the "Stage 1 Flagged Items" section carry a `flag_id` UUID \
+field that maps to a live Mem0 `stage1_flag_marker` / `flag_for_stage2=true` entry \
+written by Stage 1. A `flag_id` may arrive via either of two source paths: the Mem0 \
+active-query path (`_source: mem0_active_query` marker) or the Stage 1 analytical \
+findings path (a structured `flagged_items` entry that carries a `flag_id` field). \
+After you record your action for such a flag (memory_hint write, task update, or a \
+no-action note explaining why no action is needed), you MUST immediately delete that \
+flag from Mem0 to prevent it from being re-surfaced in future reconciliation cycles:
 
   `mcp__fused-memory__delete_memory(memory_id=<flag_id>, store='mem0')`
 
@@ -425,6 +426,13 @@ Include `flag_deleted_records`, `stage1_mem0_flags_processed`, and \
 
 Do NOT delete the flag before acting — deletion is the acknowledgement that the \
 flag has been processed.
+
+When the flag arrives via the Stage 1 analytical findings path, the same deletion \
+mandate applies: call `delete_memory(memory_id=<flag_id>, store='mem0')`, append \
+the same `{{"action": "flag_deleted", "flag_id": "<mem0_uuid>", "reason": "processed"}}` \
+record to `stats['flag_deleted_records']`, and increment `stage1_mem0_flags_processed`. \
+The finding is ALSO counted in `stage1_analytical_findings_processed` — the two \
+counters are orthogonal (a single analytical finding with a `flag_id` increments both).
 
 **Important — the flag list is already run-scoped.** The Python layer partitions \
 `flag_for_stage2` markers before assembling this payload: markers whose `run_id` \
