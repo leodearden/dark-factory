@@ -1582,6 +1582,14 @@ class TaskKnowledgeSync(BaseStage):
         # --- post-flight guards (task 1137) ---
         await self._apply_post_flight_guards(report, prior_reports, run_id)
 
+        # --- stage2 cycle-summary pool cap enforcement (task 1657) ---
+        # Runs unconditionally (NOT gated by remediation_mode) so both full-cycle
+        # and remediation runs trim the pool.  Best-effort: helper never raises.
+        trimmed = await _enforce_stage2_summary_pool_cap(
+            self.memory, self.project_id, run_id
+        )
+        report.stats['stage2_cycle_summary_pool_trimmed'] = trimmed
+
         return report
 
     async def _apply_post_flight_guards(
