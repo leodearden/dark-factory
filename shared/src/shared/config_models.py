@@ -25,9 +25,40 @@ class AccountConfig(BaseModel):
 class UsageCapConfig(BaseModel):
     """Usage cap detection and handling."""
 
+    @model_validator(mode='before')
+    @classmethod
+    def _reject_legacy_pause_threshold(cls, data: object) -> object:
+        """Detect the removed ``pause_threshold`` key and raise a clear error.
+
+        The proactive "pause at N% of quota" path that consumed this field was
+        removed when the claude.ai usage API became unavailable.  Cap detection
+        is now entirely reactive — usage limits surface via stderr pattern
+        matching (see UsageGate.check_at_startup).  The field no longer maps to
+        any runtime behaviour.
+
+        Without this validator, pydantic's ``extra='ignore'`` default would
+        silently drop a ``pause_threshold:`` key from an operator's YAML,
+        leaving them with no indication that their tuning had no effect.
+
+        .. note::
+            **Breaking change for operators**: any config file (orchestrator YAML,
+            fused-memory ``config.yaml``, or a shared accounts file) that still
+            contains ``usage_cap.pause_threshold`` will fail to load after this
+            validator is present.  Remove the key before deploying.
+        """
+        if isinstance(data, dict) and 'pause_threshold' in data:
+            raise ValueError(
+                "UsageCapConfig: 'pause_threshold' is no longer a valid field. "
+                "The proactive 'pause at N% of quota' path was removed when the "
+                "claude.ai usage API became unavailable; cap detection is now "
+                "reactive via stderr pattern matching (see UsageGate.check_at_startup). "
+                "Remove 'usage_cap.pause_threshold' from your config — it would "
+                "otherwise be silently ignored (extra='ignore')."
+            )
+        return data
+
     enabled: bool = Field(default=True)
     session_budget_usd: float | None = Field(default=None)
-    pause_threshold: float = Field(default=0.96)
     wait_for_reset: bool = Field(default=True)
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)

@@ -148,7 +148,6 @@ class TestReifyConfigLoadsUsageCap:
             'project_root': str(tmp_path),
             'usage_cap': {
                 'enabled': True,
-                'pause_threshold': 0.96,
                 'wait_for_reset': True,
                 'probe_interval_secs': 300,
                 'max_probe_interval_secs': 1800,
@@ -161,7 +160,6 @@ class TestReifyConfigLoadsUsageCap:
         config = load_config(config_path)
 
         assert config.usage_cap.enabled is True
-        assert config.usage_cap.pause_threshold == pytest.approx(0.96)
         assert config.usage_cap.wait_for_reset is True
         assert config.usage_cap.probe_interval_secs == 300
         assert config.usage_cap.max_probe_interval_secs == 1800
@@ -189,6 +187,46 @@ class TestReifyConfigLoadsUsageCap:
 
         env_keys = [a.oauth_token_env for a in config.usage_cap.accounts]
         assert env_keys == REIFY_ENV_VARS
+
+
+# ---------------------------------------------------------------------------
+# step-4b: Validate that setting pause_threshold raises a clear error
+# ---------------------------------------------------------------------------
+
+
+class TestPauseThresholdRejected:
+    """pause_threshold was removed — setting it must raise ValueError, not silently no-op.
+
+    ``pytest.raises(ValueError)`` catches the error because pydantic v2's
+    ``ValidationError`` is a subclass of ``ValueError``
+    (``ValidationError.__mro__`` includes ``ValueError``).  The exact type
+    raised at the boundary is ``pydantic.ValidationError``; catching as
+    ``ValueError`` is intentional and matches how the rest of this test suite
+    handles pydantic validation failures.
+    """
+
+    def test_direct_construction_with_pause_threshold_raises(self):
+        """UsageCapConfig({'pause_threshold': ...}) raises ValueError naming the removed field."""
+        with pytest.raises(ValueError, match='pause_threshold'):
+            UsageCapConfig.model_validate({'pause_threshold': 0.96})
+
+    def test_load_config_with_pause_threshold_in_yaml_raises(self, tmp_path):
+        """An orchestrator YAML whose usage_cap sets pause_threshold fails at load time."""
+        from orchestrator.config import load_config
+
+        config_data = {
+            'project_root': str(tmp_path),
+            'usage_cap': {
+                'enabled': True,
+                'pause_threshold': 0.96,
+                'wait_for_reset': True,
+            },
+        }
+        config_path = tmp_path / 'orchestrator.yaml'
+        config_path.write_text(yaml.dump(config_data))
+
+        with pytest.raises(ValueError, match='pause_threshold'):
+            load_config(config_path)
 
 
 # ---------------------------------------------------------------------------

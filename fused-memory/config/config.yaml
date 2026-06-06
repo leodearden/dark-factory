@@ -123,7 +123,6 @@ reconciliation:
   context_fetch_batch_size: 10
   usage_cap:
     enabled: true
-    pause_threshold: 0.96
     wait_for_reset: true
     probe_interval_secs: 300
     max_probe_interval_secs: 1800
