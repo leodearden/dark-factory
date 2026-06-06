@@ -125,7 +125,7 @@ async def delete_orphan_markers(
 
     deleted = 0
     failed: list[str] = []
-    for orphan, result in zip(orphans, results):
+    for orphan, result in zip(orphans, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(
                 'sweep_orphan_flag_markers: failed to delete memory %s: %s',
