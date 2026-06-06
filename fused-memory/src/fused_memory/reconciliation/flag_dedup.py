@@ -458,7 +458,8 @@ async def _write_and_confirm_marker(
     Single source of truth for the canonical marker payload contract:
     - ``content``: ``f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}'``
     - ``category='observations_and_summaries'``
-    - ``metadata={'source':'stage1_flag_marker', 'task_id':tid, 'flag_type':ftype,
+    - ``metadata={'source':'stage1_flag_marker', 'kind':'stage1_flag_marker',
+                  'task_id':tid, 'flag_type':ftype,
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
@@ -511,6 +512,7 @@ async def _write_and_confirm_marker(
             project_id=project_id,
             metadata={
                 'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
                 'task_id': tid,
                 'flag_type': ftype,
                 'run_id': run_id,
