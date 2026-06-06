@@ -10931,3 +10931,81 @@ class TestStage2PromptCycleSummaryPoolTag:
             f"(task 1657 — producer/consumer contract)."
         )
 
+
+class TestInjectFlagId:
+    """Unit tests for _inject_flag_id — the normalization helper that promotes
+    Mem0 id fields on Stage 1 analytical-findings-path items to the canonical
+    ``flag_id`` key consumed by Stage 2's FIX C deletion (task 1660).
+
+    This enforces the Python-layer producer/consumer contract: Stage 2 always
+    sees ``flag_id`` on any analytical item that carries a Mem0 id, regardless
+    of which field name Stage 1 used.
+    """
+
+    def _fn(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _inject_flag_id
+        return _inject_flag_id
+
+    def test_memory_id_promoted_to_flag_id(self):
+        """An analytical item with memory_id but no flag_id gets flag_id injected.
+
+        Stage 1 FIX B may emit the confirmed canonical Mem0 id under 'memory_id'
+        (consistent with older prompt wording).  _inject_flag_id must promote it
+        so Stage 2 FIX C can locate and delete the backing marker (task 1660).
+        """
+        inject = self._fn()
+        item = {'task_id': '42', 'memory_id': 'abc-uuid-123', 'flag_type': 'stale'}
+        result = inject(item)
+        assert result['flag_id'] == 'abc-uuid-123', (
+            "_inject_flag_id must set flag_id from memory_id so Stage 2 FIX C "
+            "can delete the backing Mem0 marker (task 1660)."
+        )
+
+    def test_flag_id_passthrough_when_already_present(self):
+        """An item that already carries flag_id is returned unchanged.
+
+        The active-query path injects flag_id explicitly; _inject_flag_id must
+        not overwrite it (task 1660).
+        """
+        inject = self._fn()
+        item = {'flag_id': 'existing-uuid', 'task_id': '99'}
+        result = inject(item)
+        assert result['flag_id'] == 'existing-uuid', (
+            "_inject_flag_id must not overwrite an existing flag_id (task 1660)."
+        )
+        assert result is item, (
+            "_inject_flag_id should return the original dict unchanged when "
+            "flag_id is already set (task 1660)."
+        )
+
+    def test_no_injection_without_known_id_field(self):
+        """An item with no known id field is returned as-is without flag_id.
+
+        Not all Stage 1 analytical items carry a Mem0 marker — those without
+        any id field must not have a fabricated flag_id injected (task 1660).
+        """
+        inject = self._fn()
+        item = {'task_id': '42', 'flag_type': 'missing_memory', 'description': 'x'}
+        result = inject(item)
+        assert 'flag_id' not in result, (
+            "_inject_flag_id must not fabricate a flag_id when no known id "
+            "field is present (task 1660)."
+        )
+        assert result is item, (
+            "_inject_flag_id should return the original dict unchanged when "
+            "there is nothing to inject (task 1660)."
+        )
+
+    def test_memory_id_plus_existing_flag_id_preserves_flag_id(self):
+        """When both memory_id and flag_id are present, flag_id wins.
+
+        The flag_id takes priority over memory_id; _inject_flag_id must not
+        overwrite it even if memory_id differs (task 1660).
+        """
+        inject = self._fn()
+        item = {'flag_id': 'correct-uuid', 'memory_id': 'other-uuid', 'task_id': '7'}
+        result = inject(item)
+        assert result['flag_id'] == 'correct-uuid', (
+            "_inject_flag_id must preserve flag_id when already set, even if "
+            "memory_id is also present (task 1660)."
+        )
