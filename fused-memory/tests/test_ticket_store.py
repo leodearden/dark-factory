@@ -569,3 +569,50 @@ async def test_list_tickets_filters_by_project(store):
         assert {r['ticket_id'] for r in b_rows} == {b_id}
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_pending_failed_for_project_returns_reaped_ids(store):
+    """mark_pending_failed_for_project returns the list of reaped ticket_ids.
+
+    Verifies:
+    * Return value is exactly the pending ticket_ids in project A (not an int).
+    * Reaped rows are now status='failed'/reason='worker_dead' with resolved_at set.
+    * A ticket in project B (different project) is NOT reaped.
+    * An already-terminal ticket in A (forced to failed) is excluded from the result.
+    """
+    # Pending tickets for project A.
+    a1 = await store.submit(project_id='proj-a', candidate_json='{}')
+    a2 = await store.submit(project_id='proj-a', candidate_json='{}')
+    a3 = await store.submit(project_id='proj-a', candidate_json='{}')
+
+    # Already-terminal ticket in A — must NOT appear in the return value.
+    a_already_failed = await store.submit(project_id='proj-a', candidate_json='{}')
+    await _force_failed(store, a_already_failed, reason='curator_failed')
+
+    # Pending ticket in project B — must NOT be reaped.
+    b1 = await store.submit(project_id='proj-b', candidate_json='{}')
+
+    # Call under test.
+    reaped = await store.mark_pending_failed_for_project('proj-a', reason='worker_dead')
+
+    # Return type must be a list of strings, not an int.
+    assert isinstance(reaped, list), f'expected list, got {type(reaped).__name__}'
+    assert set(reaped) == {a1, a2, a3}, (
+        f'expected exactly the 3 pending A ticket_ids, got {reaped}'
+    )
+
+    # Reaped rows are terminal with correct fields.
+    for tid in (a1, a2, a3):
+        row = await store.get(tid)
+        assert row['status'] == 'failed', f'{tid}: {row}'
+        assert row['reason'] == 'worker_dead', f'{tid}: {row["reason"]!r}'
+        assert row['resolved_at'] is not None, f'{tid}: resolved_at not set'
+
+    # Already-terminal row in A is untouched (reason remains curator_failed).
+    row_af = await store.get(a_already_failed)
+    assert row_af['reason'] == 'curator_failed'
+
+    # Project B ticket stays pending.
+    row_b = await store.get(b1)
+    assert row_b['status'] == 'pending', f'B ticket was unexpectedly reaped: {row_b}'
