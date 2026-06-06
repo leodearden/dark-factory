@@ -113,6 +113,7 @@ class TestMem0BackendScrollByMetadata:
         # scroll_filter must be a Qdrant Filter with one FieldCondition
         scroll_filter = call_kwargs.get('scroll_filter')
         assert isinstance(scroll_filter, qmodels.Filter)
+        assert isinstance(scroll_filter.must, list)
         assert len(scroll_filter.must) == 1
         cond = scroll_filter.must[0]
         assert isinstance(cond, qmodels.FieldCondition)
@@ -176,12 +177,12 @@ class TestMem0BackendScrollByMetadata:
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
 
-        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
-            with caplog.at_level(logging.WARNING, logger='fused_memory.backends.mem0_client'):
-                result = await backend.scroll_by_metadata(
-                    scope=Scope(project_id='p'),
-                    filters={'recon_pool': 'stage2_cycle_summary'},
-                )
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                caplog.at_level(logging.WARNING, logger='fused_memory.backends.mem0_client'):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'recon_pool': 'stage2_cycle_summary'},
+            )
 
         assert result == []
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
