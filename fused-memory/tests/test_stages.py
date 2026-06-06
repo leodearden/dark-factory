@@ -10439,3 +10439,142 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected live task id in section; got section:\n{section_body!r}"
         )
 
+
+class TestEnforceStage2SummaryPoolCap:
+    """_enforce_stage2_summary_pool_cap trims oldest pool members to cap=2."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_two_oldest_when_four_members_exist(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        members = [
+            {'id': 'oldest', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'second', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'third',  'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'newest', 'created_at': '2026-04-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-123',
+        )
+
+        # Two oldest deleted
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'oldest', 'second'}
+        # Two newest kept
+        assert 'third' not in deleted_ids
+        assert 'newest' not in deleted_ids
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_called_with_correct_kwargs(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        members = [
+            {'id': 'm1', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'm2', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'm3', 'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-xyz',
+        )
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'dark_factory'
+            assert kwargs.get('causation_id') == 'run-xyz'
+            assert kwargs.get('_source') == 'stage2_cycle_summary_trim'
+
+    @pytest.mark.asyncio
+    async def test_get_memories_called_with_correct_filter_and_project(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='my_project',
+            run_id='run-abc',
+        )
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        kwargs = call.kwargs
+        assert kwargs.get('project_id') == 'my_project'
+        filters = kwargs.get('filters') or {}
+        assert filters.get('recon_pool') == 'stage2_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_at_cap_deletes_nothing_returns_zero(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        # Exactly 2 members (== default cap)
+        members = [
+            {'id': 'a', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'b', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-abc',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_below_cap_deletes_nothing_returns_zero(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        members = [
+            {'id': 'only', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-abc',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    def test_stage2_cycle_summary_pool_cap_constant_equals_2(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
+        )
+
+        assert STAGE2_CYCLE_SUMMARY_POOL_CAP == 2
