@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _fm_helpers import pydantic_spec
+from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
@@ -20,7 +21,6 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import TicketJanitor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 
 def _stub_prepare_candidate(mock_curator) -> None:
