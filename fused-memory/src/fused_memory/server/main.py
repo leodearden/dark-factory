@@ -19,9 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from functools import partial  # noqa: E402
 
+from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
