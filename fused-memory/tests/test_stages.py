@@ -10711,3 +10711,146 @@ class TestEnforceStage2SummaryPoolCapResilience:
         assert deleted_ids == {'datable', 'also-datable'}
         assert 'bad-date-1' not in deleted_ids
         assert 'bad-date-2' not in deleted_ids
+
+
+class TestTaskKnowledgeSyncCycleSummaryPoolCap:
+    """TaskKnowledgeSync.run() calls _enforce_stage2_summary_pool_cap and sets
+    report.stats['stage2_cycle_summary_pool_trimmed'] after super().run()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _pool_members(self, count: int) -> list:
+        """Create count pool members with distinct created_at strings."""
+        return [
+            {
+                'id': f'summary-{i}',
+                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
+                'metadata': {'recon_pool': 'stage2_cycle_summary'},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
+        """run() injects stage2_cycle_summary_pool_trimmed into report.stats.
+
+        3 pool members (one over cap=2) → 1 trimmed.
+        """
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(3)
+        )
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='dark_factory')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='run-cap'
+            )
+
+        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_when_pool_at_or_below_cap(self, mock_deps):
+        """When pool has <= 2 members, stat is 0 (explicitly set, not absent)."""
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(2)
+        )
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='dark_factory')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='run-cap'
+            )
+
+        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 0
+
+    @pytest.mark.asyncio
+    async def test_trim_runs_in_remediation_mode(self, mock_deps):
+        """Trim runs and stat is set even when remediation_mode=True."""
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+        stage.remediation_mode = True
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(3)
+        )
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='dark_factory')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='run-remediation'
+            )
+
+        # Trim must run in remediation mode too
+        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
+        # delete_memory was called (oldest trimmed)
+        mock_deps['memory_service'].delete_memory.assert_awaited()
