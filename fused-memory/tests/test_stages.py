@@ -10854,3 +10854,54 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
         # delete_memory was called (oldest trimmed)
         mock_deps['memory_service'].delete_memory.assert_awaited()
+
+
+class TestStage2PromptCycleSummaryPoolTag:
+    """Stage 2 prompt must instruct the agent to tag per-cycle summaries with
+    recon_pool='stage2_cycle_summary' so the deterministic Python trim can
+    enumerate the pool by metadata key.
+
+    Task 1657 step-11: minimal key-presence assertions only (no prose-wording
+    pins).  Mirrors TestStage2PromptNonceMechanism.
+
+    These tests are the producer-contract guard: the Python trim
+    (_enforce_stage2_summary_pool_cap) identifies pool members by the filter
+    {'recon_pool': 'stage2_cycle_summary'}.  If the prompt omits the tag
+    instruction the producer never sets the key and the consumer (trim) finds
+    an empty pool — silently leaving the pool uncapped.
+    """
+
+    def test_stage2_prompt_contains_recon_pool_key(self):
+        """build_stage2_system_prompt('dark_factory') must include 'recon_pool'.
+
+        The Stage 2 agent must be instructed to pass recon_pool in the
+        add_memory metadata for the per-cycle summary.  Without this key the
+        Python trim (which filters by {'recon_pool': ...}) finds no members.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        assert 'recon_pool' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include 'recon_pool' "
+            "in the per-cycle summary metadata guidance so the Stage 2 agent "
+            "tags writes with the pool key (task 1657 — producer contract for "
+            "_enforce_stage2_summary_pool_cap)."
+        )
+
+    def test_stage2_prompt_contains_stage2_cycle_summary_value(self):
+        """build_stage2_system_prompt('dark_factory') must include 'stage2_cycle_summary'.
+
+        This is the pool key value that Python's _enforce_stage2_summary_pool_cap
+        uses as the filter.  Both the key name ('recon_pool') and value
+        ('stage2_cycle_summary') must appear in the prompt so the agent writes
+        the exact tag the consumer expects.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        assert 'stage2_cycle_summary' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include "
+            "'stage2_cycle_summary' — the recon_pool value the Python trim "
+            "filters on (task 1657 — without this, _enforce_stage2_summary_pool_cap "
+            "silently finds an empty pool and never trims)."
+        )
