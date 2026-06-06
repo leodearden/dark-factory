@@ -151,6 +151,101 @@ async def test_collect_targets_filters_to_those_with_checkpoint(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Step 3 — override-target collection + cycle integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_includes_override_dbs(tmp_path: Path) -> None:
+    """_collect_checkpoint_targets appends one overrides:{pid} target per known project."""
+
+    class _NoAttr:
+        """Fake object with no durable_queue / planned_episode_registry."""
+
+    targets = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+        known_projects={
+            'proj_a': str(tmp_path / 'a'),
+            'proj_b': str(tmp_path / 'b'),
+        },
+    )
+    names = {name for name, _ in targets}
+    assert {'overrides:proj_a', 'overrides:proj_b'} <= names
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_cycle_integration(tmp_path: Path) -> None:
+    """Collected override targets flow through _run_checkpoint_cycle correctly."""
+
+    class _NoAttr:
+        pass
+
+    # Create proj_a's DB; leave proj_b's absent.
+    proj_a_root = str(tmp_path / 'a')
+    proj_b_root = str(tmp_path / 'b')
+    db = await _open_overrides_db(proj_a_root)
+    await db.close()
+
+    targets = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+        known_projects={
+            'proj_a': proj_a_root,
+            'proj_b': proj_b_root,
+        },
+    )
+
+    # Run the cycle over both targets.
+    await server_main._run_checkpoint_cycle(targets)
+
+    # proj_a: DB exists → real checkpoint → busy==0, detail==None (tuple path).
+    a_status = server_main._CHECKPOINT_STATUS['overrides:proj_a']
+    assert a_status['busy'] == 0
+    assert a_status['detail'] is None
+
+    # proj_b: DB absent → CheckpointResult(0,0,0) → busy==0, detail==None.
+    b_status = server_main._CHECKPOINT_STATUS['overrides:proj_b']
+    assert b_status['busy'] == 0
+    assert b_status['detail'] is None
+
+    # Guard must not have created proj_b's DB.
+    proj_b_db = Path(proj_b_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    assert not proj_b_db.exists()
+
+
+def test_collect_targets_omits_overrides_when_no_known_projects() -> None:
+    """With known_projects=None (default), no overrides: targets are added."""
+
+    class _NoAttr:
+        pass
+
+    targets = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+    )
+    names = {name for name, _ in targets}
+    assert not any(n.startswith('overrides:') for n in names)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — existence-guarded override-DB checkpoint helper
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_checkpoint_overrides_db_if_exists_noop_when_absent(
     tmp_path: Path,
