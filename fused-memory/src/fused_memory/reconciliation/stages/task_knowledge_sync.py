@@ -1012,6 +1012,15 @@ _STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
 _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
 _STAGE2_STALE_FIXC_SWEEP_SOURCE = 'stage2_stale_fixc_sweep'
 
+# Stage 2 per-cycle summary pool cap and related constants.
+# Every per-cycle summary add_memory call is tagged recon_pool='stage2_cycle_summary'
+# (producer contract: Stage 2 prompt).  After the LLM writes its summary,
+# _enforce_stage2_summary_pool_cap trims the pool to at most this many members by
+# deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
+_STAGE2_CYCLE_SUMMARY_RECON_POOL = 'stage2_cycle_summary'
+STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
+_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
+
 
 async def _sweep_stale_fixc_markers(
     memory_service,
@@ -1061,6 +1070,100 @@ async def _sweep_stale_fixc_markers(
                 'reconciliation._sweep_stale_fixc_markers: delete failed for memory_id=%s; not counted',
                 mid,
                 extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+    return success_count
+
+
+async def _enforce_stage2_summary_pool_cap(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    cap: int = STAGE2_CYCLE_SUMMARY_POOL_CAP,
+) -> int:
+    """Trim the stage2_cycle_summary pool to at most *cap* members (default 2).
+
+    Enumerates all Mem0 memories tagged
+    ``{'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL}`` via
+    ``get_memories_by_metadata`` (deterministic Qdrant scroll — NOT semantic
+    search), sorts oldest-first by ``created_at``, then deletes the oldest
+    ``len - cap`` via parallel ``delete_memory`` calls.
+
+    Best-effort posture (mirrors ``_sweep_stale_fixc_markers``):
+    - Enumeration failure → logs WARNING, returns 0, does NOT raise.
+    - Individual delete failure → logs WARNING, excluded from count.
+
+    Created_at ordering: uses ``_assume_utc + datetime.fromisoformat``
+    convention.  Members with missing/unparseable ``created_at`` sort LAST
+    (treated as newest/kept) so an undatable summary is never preferentially
+    deleted.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        cap: Maximum pool size to enforce (default
+            ``STAGE2_CYCLE_SUMMARY_POOL_CAP == 2``).
+
+    Returns:
+        Number of memories successfully deleted (0 if pool <= cap or on
+        enumeration failure).
+    """
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._enforce_stage2_summary_pool_cap: '
+            'get_memories_by_metadata failed for project_id=%s; skipping trim',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) <= cap:
+        return 0
+
+    def _sort_key(item: dict) -> tuple:
+        raw = item.get('created_at')
+        if raw is None:
+            return (1, 0)
+        try:
+            dt = _assume_utc(datetime.fromisoformat(raw))
+            return (0, dt)
+        except (ValueError, TypeError):
+            return (1, 0)
+
+    sorted_members = sorted(members, key=_sort_key)
+    to_delete = sorted_members[: len(sorted_members) - cap]
+
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=m['id'],
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            )
+            for m in to_delete
+        ),
+        return_exceptions=True,
+    )
+
+    success_count = 0
+    for m, result in zip(to_delete, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._enforce_stage2_summary_pool_cap: '
+                'delete failed for memory_id=%s; not counted',
+                m['id'],
+                extra={'project_id': project_id, 'memory_id': m['id'], 'run_id': run_id},
             )
         else:
             success_count += 1
