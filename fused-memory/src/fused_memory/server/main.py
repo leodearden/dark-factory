@@ -745,6 +745,10 @@ async def run_server():
                 task_interceptor.is_worker_alive
                 if task_interceptor is not None else None
             ),
+            signal_ticket_resolved=(
+                task_interceptor._signal_ticket_event
+                if task_interceptor is not None else None
+            ),
             known_projects=_known_projects_map,
         )
         janitor_task = asyncio.create_task(
