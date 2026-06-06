@@ -318,6 +318,97 @@ def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> l
 
 
 # --------------------------------------------------------------------------- #
+# Task-dump contamination detector
+# --------------------------------------------------------------------------- #
+# Complements detect_census_inconsistency (numeric census) with two additional
+# project-identity + title-plausibility signals:
+#
+#  1. Stamped project_id mismatch — the primary signal.  Added to get_tasks /
+#     get_task results by server/tools.py (task 1661) so any consumer can verify
+#     at a glance which project a dump came from.
+#
+#  2. Decompose-PRD step-pattern title — corroborating heuristic that fired in
+#     the 2026-06 incident: reify's 'impl(step-N)' subtask titles appearing for
+#     dark_factory task IDs.  Exact substring matching is deterministic and
+#     testable; no fragile numeric threshold.
+#
+# detect_task_dump_contamination is purely a read/classification helper — it
+# never writes or modifies its inputs.  The caller decides what to do with a
+# contaminated result (log a WARNING, record a stat, raise a finding).
+
+
+# Substrings that identify decompose-PRD step-pattern titles (lower-cased check).
+_STEP_PATTERN_MARKERS: tuple[str, ...] = ('impl(step', 'test(step')
+
+
+def detect_task_dump_contamination(
+    tasks_data: object,
+    expected_project_id: str,
+) -> dict:
+    """Detect cross-project contamination in a raw get_tasks dump.
+
+    Returns a dict with the following fields:
+
+    - stamped_project_id (str | None): tasks_data.get('project_id') when
+      tasks_data is a dict, else None.  None means the dump is unstamped
+      (legacy or pre-task-1661 server).
+
+    - project_mismatch (str | None): the stamped_project_id when it is
+      present AND differs from expected_project_id.  None otherwise (clean
+      or unstamped).
+
+    - step_pattern_title_ids (list): ids of tasks whose title, lowercased and
+      stripped, contains 'impl(step' or 'test(step' — the decompose-PRD
+      signature from the 2026-06 incident.  Empty list when none match.
+
+    - contaminated (bool): True when project_mismatch is non-empty OR
+      step_pattern_title_ids is non-empty.  False otherwise (including on
+      empty/None input).
+
+    Defensive handling:
+    - Non-dict tasks_data (None, list, …) → all fields empty/False, no crash.
+    - Missing 'tasks' key → same.
+    - Non-dict task entries inside the list → silently skipped.
+    """
+    result: dict = {
+        'stamped_project_id': None,
+        'project_mismatch': None,
+        'step_pattern_title_ids': [],
+        'contaminated': False,
+    }
+
+    if not isinstance(tasks_data, dict):
+        return result
+
+    stamped = tasks_data.get('project_id')
+    result['stamped_project_id'] = stamped
+
+    if stamped is not None and stamped != expected_project_id:
+        result['project_mismatch'] = stamped
+
+    raw_tasks = tasks_data.get('tasks')
+    if isinstance(raw_tasks, list):
+        offending: list = []
+        for task in raw_tasks:
+            if not isinstance(task, dict):
+                continue
+            title = task.get('title')
+            if not isinstance(title, str):
+                continue
+            lowered = title.lower().strip()
+            if any(marker in lowered for marker in _STEP_PATTERN_MARKERS):
+                tid = task.get('id')
+                if tid is not None:
+                    offending.append(tid)
+        result['step_pattern_title_ids'] = offending
+
+    result['contaminated'] = bool(result['project_mismatch']) or bool(
+        result['step_pattern_title_ids']
+    )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Task-line rendering helpers
 # --------------------------------------------------------------------------- #
 
