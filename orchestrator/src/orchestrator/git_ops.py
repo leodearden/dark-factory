@@ -1673,6 +1673,28 @@ class GitOps:
             # commits pushed to the task branch cannot silently land on main.
             # Fall back to full_branch only if M^2 was unresolvable (defensive).
             _remerge_target = verified_branch_tip if verified_branch_tip else full_branch
+
+            # Divergence canary: if the live branch ref has advanced past
+            # verified M^2, emit a structured WARNING so any future stale-tip
+            # mismatch is self-evident in logs.  Fail-open: a rev-parse error
+            # must not block the advance.
+            if verified_branch_tip and full_branch:
+                _live_rc, _live_sha, _ = await _run(
+                    ['git', 'rev-parse', full_branch],
+                    cwd=self.project_root,
+                )
+                if _live_rc == 0:
+                    _live_tip = _live_sha.strip()
+                    if _live_tip != verified_branch_tip:
+                        logger.warning(
+                            'advance_main: branch ref diverged from verified M^2 '
+                            'during re-merge fallback — pinning to verified tip. '
+                            'branch=%s verified_tip=%s live_ref_tip=%s',
+                            branch or full_branch,
+                            verified_branch_tip[:8],
+                            _live_tip[:8],
+                        )
+
             await _run(
                 ['git', 'reset', '--hard', self.config.main_branch],
                 cwd=merge_worktree,
