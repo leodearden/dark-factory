@@ -10905,3 +10905,28 @@ class TestStage2PromptCycleSummaryPoolTag:
             "filters on (task 1657 — without this, _enforce_stage2_summary_pool_cap "
             "silently finds an empty pool and never trims)."
         )
+
+    def test_stage2_prompt_contains_literal_recon_pool_metadata_fragment(self):
+        """The prompt must contain the literal key=value metadata fragment 'recon_pool': 'stage2_cycle_summary'.
+
+        Stronger than bare token checks: verifies the key and value co-occur as
+        the exact add_memory metadata fragment the producer must emit, not just
+        anywhere in unrelated prose.  If the producer instruction is removed or
+        the value changes, this test catches it immediately.
+
+        The consumer (_enforce_stage2_summary_pool_cap) filters by exactly
+        {'recon_pool': 'stage2_cycle_summary'} — so the prompt must instruct
+        the agent to write that exact key-value pair in the metadata dict.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        # The literal metadata fragment the producer must emit.  This ties the
+        # test to the actual contract rather than token presence anywhere.
+        fragment = "recon_pool': 'stage2_cycle_summary'"
+        assert fragment in prompt, (
+            f"build_stage2_system_prompt('dark_factory') must contain the literal "
+            f"metadata fragment {fragment!r} so the Stage 2 agent writes the exact "
+            f"key-value pair that _enforce_stage2_summary_pool_cap filters on "
+            f"(task 1657 — producer/consumer contract)."
+        )

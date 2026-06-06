@@ -355,6 +355,17 @@ class Mem0Backend:
                 'created_at': payload.get('created_at'),
                 'metadata': payload,
             })
+
+        if len(points) == limit:
+            logger.warning(
+                'Mem0 scroll_by_metadata returned exactly limit=%d points '
+                '(collection=%s, filters=%s); results may be truncated — '
+                'if the pool exceeds this limit, some members will not be enumerated.',
+                limit,
+                collection_name,
+                filters,
+            )
+
         return result
 
     async def close(self) -> None:

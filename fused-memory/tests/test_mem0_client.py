@@ -187,3 +187,37 @@ class TestMem0BackendScrollByMetadata:
         assert result == []
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_limit_reached_logs_truncation_warning(self, backend, caplog):
+        """When Qdrant returns exactly `limit` points, logs a WARNING about possible truncation.
+
+        Per the no-silent-caps convention: if scroll returns exactly the requested
+        limit it may have hit the page boundary and silently dropped members.  A
+        WARNING makes this visible so operators know to investigate.
+        """
+        import logging
+
+        # Three points returned for limit=3 — triggers the boundary warning.
+        points = [
+            self._make_mock_point(f'id-{i}', f'2026-0{i+1}-01T00:00:00+00:00')
+            for i in range(3)
+        ]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=(points, 'some-offset'))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                caplog.at_level(logging.WARNING, logger='fused_memory.backends.mem0_client'):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'recon_pool': 'stage2_cycle_summary'},
+                limit=3,
+            )
+
+        # All three points are still returned — the warning does not suppress results.
+        assert len(result) == 3
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('truncated' in m or 'limit' in m for m in warning_msgs), (
+            'Expected a truncation WARNING when len(points)==limit; '
+            f'got warning messages: {warning_msgs}'
+        )
