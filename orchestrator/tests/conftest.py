@@ -151,6 +151,13 @@ def _clear_probe_cache():
 
     Production is unaffected: main_sha advances on every merge so real
     keys never collide across separate runs.
+
+    **Maintainer note — adding new verify.py process-globals:**
+    If ``orchestrator/src/orchestrator/verify.py`` gains additional
+    module-level caches (e.g. a sibling result cache), add a matching
+    ``.clear()`` call here so they are also reset between tests.  The
+    relevant globals are defined near ``_PROBE_CACHE`` (verify.py ~line 391)
+    and ``_PROBE_CACHE_TTL`` (~line 392).
     """
     from orchestrator import verify
     verify._PROBE_CACHE.clear()

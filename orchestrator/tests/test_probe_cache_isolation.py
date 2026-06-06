@@ -34,6 +34,18 @@ class TestProbeCacheIsolation:
 
     RED before conftest adds _clear_probe_cache: test_b finds the sentinel.
     GREEN after conftest adds _clear_probe_cache: test_b finds an empty cache.
+
+    *** Isolation note ***
+    This regression test is only meaningful when BOTH of the following hold:
+      1. The full suite (or at least this file) runs under ``--dist loadgroup``
+         so xdist_group keeps both methods on the SAME worker process (same
+         _PROBE_CACHE global).
+      2. test_a executes before test_b on that worker (definition order).
+
+    If you select ONLY test_b (e.g. ``pytest -k test_b_probe_cache``), nothing
+    seeds the sentinel, so test_b trivially passes even with the fixture
+    removed — that is a false GREEN, not a fix.  Run the whole class (or the
+    whole file) to get meaningful coverage.
     """
 
     def test_a_seeds_probe_cache(self) -> None:
