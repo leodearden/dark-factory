@@ -133,6 +133,31 @@ def _restore_sandbox_backend():
     sandbox_dispatch.set_backend(saved)
 
 
+@pytest.fixture(autouse=True)
+def _clear_probe_cache():
+    """Clear verify._PROBE_CACHE before and after every test.
+
+    ``verify_failure_is_preexisting_on_main`` stores results in the
+    process-global ``_PROBE_CACHE`` dict keyed by
+    ``(main_sha, category, normalized_cause_hint)`` with a 300 s TTL.
+    When two tests on the same xdist worker share an identical key (same
+    MAIN_SHA + FAILING_RESULT), the earlier test's cached True entry
+    short-circuits the probe path in the later test — causing it to skip
+    worktree creation / cleanup and return the wrong result.
+
+    Clearing the cache before *and* after each test ensures:
+    - every test starts with an empty cache regardless of prior teardown;
+    - this suite's pollution cannot escape to any later consumer.
+
+    Production is unaffected: main_sha advances on every merge so real
+    keys never collide across separate runs.
+    """
+    from orchestrator import verify
+    verify._PROBE_CACHE.clear()
+    yield
+    verify._PROBE_CACHE.clear()
+
+
 @pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
     """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.
