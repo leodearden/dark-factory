@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import fcntl
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +18,7 @@ from fused_memory.middleware.task_curator import (
     RewrittenTask,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.ticket_janitor import TicketJanitor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -2379,3 +2382,89 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
         assert res.get('status') == 'failed', res
 
 
+# ---------------------------------------------------------------------------
+# task-1666: janitor reap wakes blocked resolve_ticket promptly
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_janitor_reap_wakes_blocked_resolve_ticket_promptly(
+    interceptor_with_store, ticket_store, tmp_path,
+):
+    """End-to-end regression: a blocked resolve_ticket caller is woken
+    promptly (well under the 30s timeout) when the TicketJanitor reaps the
+    ticket for a dead worker, returning failed/worker_dead instead of timing out.
+
+    Exercises the full signal path:
+      janitor.tick() → _signal_ticket_event → resolve_ticket event.wait() wakes
+                                                → re-reads terminal failed/worker_dead row
+    """
+    # 1) Set up the orchestrator layout so the janitor can route escalations.
+    lock_dir = tmp_path / 'data' / 'orchestrator'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / 'orchestrator.lock'
+    lock_path.write_text('')
+    handle = lock_path.open('r+b')
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # project_id mirrors _project_id_for() from test_ticket_janitor.py.
+    project_id = tmp_path.name.lower().replace('-', '_')
+    candidate_json = json.dumps({
+        'project_root': str(tmp_path),
+        'kwargs': {'title': 'Pending task'},
+        'metadata': {'task_id': 'task-42'},
+    })
+
+    try:
+        # 2) Submit the ticket directly to the store — no real worker picks it up.
+        ticket_id = await ticket_store.submit(
+            project_id=project_id,
+            candidate_json=candidate_json,
+        )
+
+        # 3) Start resolve_ticket as a background task (it will block on event.wait()).
+        resolve_task = asyncio.create_task(
+            interceptor_with_store.resolve_ticket(
+                ticket_id, str(tmp_path), timeout_seconds=30.0,
+            )
+        )
+
+        # 4) Yield control so resolve_ticket can register its event and start waiting.
+        #    Poll (bounded) until ticket_id appears in _ticket_events to guarantee
+        #    we're exercising the WAKE path, not the already-terminal fast path.
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if ticket_id in interceptor_with_store._ticket_events:
+                break
+        assert ticket_id in interceptor_with_store._ticket_events, (
+            'resolve_ticket did not register its event in _ticket_events — '
+            'the wait path is not exercised'
+        )
+
+        # 5) Build the janitor wired to the interceptor's signal callback.
+        janitor = TicketJanitor(
+            ticket_store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: False,   # project is always dead
+            signal_ticket_resolved=interceptor_with_store._signal_ticket_event,
+        )
+
+        # 6) Run the janitor — it reaps the ticket and signals the waiter.
+        start = time.monotonic()
+        await janitor.tick()
+
+        # 7) The resolve_task should complete promptly now that the event is set.
+        result = await asyncio.wait_for(resolve_task, timeout=5.0)
+        elapsed = time.monotonic() - start
+
+    finally:
+        handle.close()
+
+    # Assertions: correct terminal status and prompt wake (not the 30s timeout).
+    assert result['status'] == 'failed', f'Expected failed, got: {result}'
+    assert result.get('reason') == 'worker_dead', (
+        f'Expected reason=worker_dead, got: {result.get("reason")!r}'
+    )
+    assert elapsed < 3.0, (
+        f'resolve_ticket took {elapsed:.2f}s — expected prompt wake, not ~30s timeout'
+    )
