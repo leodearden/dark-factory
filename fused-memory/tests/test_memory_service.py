@@ -3205,3 +3205,77 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
             )
             mock_edge.save.assert_awaited_once()
 
+
+class TestGetMemoriesByMetadata:
+    """MemoryService.get_memories_by_metadata delegates to mem0.scroll_by_metadata."""
+
+    @pytest.mark.asyncio
+    async def test_returns_scroll_result_unchanged(self, mock_config):
+        """get_memories_by_metadata returns the list from mem0.scroll_by_metadata verbatim."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        expected = [
+            {
+                'id': 'a',
+                'created_at': '2026-01-01T00:00:00+00:00',
+                'metadata': {'recon_pool': 'stage2_cycle_summary'},
+            }
+        ]
+        svc.mem0 = MagicMock()
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=expected)
+
+        result = await svc.get_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'recon_pool': 'stage2_cycle_summary'},
+        )
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_calls_scroll_with_correct_scope_and_filters(self, mock_config):
+        """get_memories_by_metadata builds Scope(project_id=...) and passes filters+limit."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        filters = {'recon_pool': 'stage2_cycle_summary'}
+        await svc.get_memories_by_metadata(
+            project_id='dark_factory',
+            filters=filters,
+            limit=42,
+        )
+
+        svc.mem0.scroll_by_metadata.assert_awaited_once()
+        call_args = svc.mem0.scroll_by_metadata.call_args
+
+        # scope must match project_id
+        scope = call_args.args[0] if call_args.args else call_args.kwargs.get('scope')
+        assert scope.project_id == 'dark_factory'
+
+        # filters forwarded
+        passed_filters = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('filters')
+        assert passed_filters == filters
+
+        # limit forwarded
+        passed_limit = call_args.args[2] if len(call_args.args) > 2 else call_args.kwargs.get('limit')
+        assert passed_limit == 42
+
+    @pytest.mark.asyncio
+    async def test_does_not_use_semantic_search(self, mock_config):
+        """get_memories_by_metadata must NOT call mem0.search (semantic search path)."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.search = AsyncMock(return_value={'results': []})
+        svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await svc.get_memories_by_metadata(
+            project_id='dark_factory',
+            filters={'recon_pool': 'stage2_cycle_summary'},
+        )
+
+        svc.mem0.search.assert_not_awaited()
