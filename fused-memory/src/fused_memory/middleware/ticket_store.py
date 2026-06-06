@@ -261,16 +261,29 @@ class TicketStore:
 
     async def mark_pending_failed_for_project(
         self, project_id: str, *, reason: str,
-    ) -> int:
+    ) -> list[str]:
         """Bulk-terminalise every pending ticket in a project.
 
         Used by the worker-liveness reaper when the project's curator worker
         is gone. ``resolved_at`` is stamped so downstream consumers can
-        attribute failure timing. Returns rows updated.
+        attribute failure timing.
+
+        Returns the list of ``ticket_id`` values that were pending (and are
+        now terminalised as ``failed``).  Both the SELECT and the UPDATE run
+        inside the same ``_txn()`` so the returned ids exactly match the rows
+        that were changed — no TOCTOU gap on the store's single shared
+        aiosqlite connection.
         """
         now = datetime.now(UTC).isoformat()
         async with self._txn() as db:
             cursor = await db.execute(
+                "SELECT ticket_id FROM tickets "
+                "WHERE project_id = ? AND status = 'pending'",
+                (project_id,),
+            )
+            rows = await cursor.fetchall()
+            reaped_ids = [row['ticket_id'] for row in rows]
+            await db.execute(
                 """
                 UPDATE tickets
                 SET status = 'failed', reason = ?, resolved_at = ?
@@ -278,7 +291,7 @@ class TicketStore:
                 """,
                 (reason, now, project_id),
             )
-        return cursor.rowcount
+        return reaped_ids
 
     async def list_tickets(
         self,

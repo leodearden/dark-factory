@@ -353,7 +353,7 @@ class TicketJanitor:
                     self._probe_failures.pop(pid, None)
                 if not alive:
                     try:
-                        n = await self._store.mark_pending_failed_for_project(
+                        reaped_ids = await self._store.mark_pending_failed_for_project(
                             pid, reason='worker_dead',
                         )
                     except Exception:
@@ -362,10 +362,10 @@ class TicketJanitor:
                             'failed for %s', pid,
                         )
                         continue
-                    if n:
+                    if reaped_ids:
                         logger.warning(
                             'ticket_janitor: reaped %d pending ticket(s) for '
-                            'dead worker on project %s', n, pid,
+                            'dead worker on project %s', len(reaped_ids), pid,
                         )
             # Prune project IDs that no longer appear in the pending list so
             # _probe_failures doesn't grow without bound when projects are
