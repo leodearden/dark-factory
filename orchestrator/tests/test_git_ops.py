@@ -1412,6 +1412,169 @@ class TestAdvanceMainRemergedBranchTip:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainDivergenceWarning:
+    """Regression canary: advance_main must emit a structured WARNING when the
+    live branch ref has moved past the verified M^2 tip during the re-merge
+    fallback (stale-tip divergence is self-evident in logs).
+
+    Reference: esc-1657-26.
+    """
+
+    async def test_advance_main_warns_on_stale_branch_ref_divergence(
+        self, git_ops: GitOps, caplog,
+    ):
+        """When the live branch ref has advanced past verified M^2, a WARNING
+        is emitted recording both verified_branch_tip and the live ref tip.
+
+        Fails today: no such log line is emitted.
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        wt_a = await git_ops.create_worktree('div-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('div-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'div-b', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+        _, verified_tip_raw, _ = await _run(
+            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+            cwd=merge_b.merge_worktree,
+        )
+        verified_tip = verified_tip_raw.strip()
+
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'div-a')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        # Post-verify commit advances live ref past M^2 — triggers divergence.
+        (wt_b.path / 'stale.py').write_text('stale = True\n')
+        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
+
+        # Resolve the live ref tip for assertion.
+        _, live_tip_raw, _ = await _run(
+            ['git', 'rev-parse', 'task/div-b'],
+            cwd=git_ops.project_root,
+        )
+        live_tip = live_tip_raw.strip()
+        assert live_tip != verified_tip, 'Live tip must have moved past M^2 for this test'
+
+        original_run = _run
+
+        async def failing_rebase_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'rebase', 'main']:
+                return (1, '', 'forced rebase failure for test')
+            return await original_run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='div-b',
+            )
+
+        assert result == 'advanced'
+
+        # A WARNING must record both the verified tip and the live ref tip.
+        divergence_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and verified_tip[:8] in r.getMessage()
+        ]
+        assert divergence_warnings, (
+            f'Expected a WARNING recording verified_tip={verified_tip[:8]} '
+            f'when live ref ({live_tip[:8]}) diverged from M^2. '
+            f'All warnings: {[r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]}'
+        )
+        # The warning must also mention the live ref tip.
+        assert any(live_tip[:8] in r.getMessage() for r in divergence_warnings), (
+            f'Divergence WARNING must include live ref tip {live_tip[:8]}. '
+            f'Warning messages: {[r.getMessage() for r in divergence_warnings]}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+    async def test_no_divergence_warning_when_branch_did_not_move(
+        self, git_ops: GitOps, caplog,
+    ):
+        """When the live branch ref matches M^2 (no post-verify commits),
+        no divergence WARNING is emitted.
+
+        Fails today: the divergence-check logic does not exist at all
+        (AttributeError or the warning never fires — both are failures).
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        wt_a = await git_ops.create_worktree('nodiv-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('nodiv-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'nodiv-b', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+        _, verified_tip_raw, _ = await _run(
+            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+            cwd=merge_b.merge_worktree,
+        )
+        verified_tip = verified_tip_raw.strip()
+
+        # Land A so B is not a descendant; NO post-verify commit to B.
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'nodiv-a')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        original_run = _run
+
+        async def failing_rebase_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'rebase', 'main']:
+                return (1, '', 'forced rebase failure for test')
+            return await original_run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='nodiv-b',
+            )
+
+        assert result == 'advanced'
+
+        # No divergence WARNING: live ref == M^2, nothing moved.
+        divergence_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'diverge' in r.getMessage().lower()
+        ]
+        assert not divergence_warnings, (
+            f'No divergence WARNING expected (branch did not move). '
+            f'Got: {[r.getMessage() for r in divergence_warnings]}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+
+@pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
         wt_info = await git_ops.create_worktree('clean-wt')
