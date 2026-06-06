@@ -1125,9 +1125,9 @@ async def test_get_tasks_stamps_project_provenance(mcp_server_with_tasks, task_i
 
 @pytest.mark.asyncio
 async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_interceptor):
-    """get_task result dict carries a project_id provenance stamp.
+    """get_task result dict carries project_id and project_root provenance stamps.
 
-    Symmetry with get_tasks lets callers cross-check single-task and bulk reads.
+    Full symmetry with get_tasks lets callers cross-check single-task and bulk reads.
     The existing id/title/status fields must be preserved intact.
     """
     task_interceptor.get_task = AsyncMock(
@@ -1137,9 +1137,12 @@ async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_intercepto
         'get_task',
         {'id': '1654', 'project_root': '/home/leo/src/dark-factory'},
     )
-    # Provenance stamp must be present
+    # Provenance stamps must be present (symmetric with get_tasks)
     assert result.get('project_id') == 'dark_factory', (
         f"Expected project_id='dark_factory', got: {result.get('project_id')!r}"
+    )
+    assert result.get('project_root') == '/home/leo/src/dark-factory', (
+        f"Expected project_root='/home/leo/src/dark-factory', got: {result.get('project_root')!r}"
     )
     # Existing fields must be preserved
     assert result.get('id') == 1654

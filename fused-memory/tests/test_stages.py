@@ -11047,7 +11047,13 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         )
 
     def test_contaminated_tree_records_stat(self, mock_deps):
-        """When filtered_task_tree contains step-pattern titles, stats key is recorded."""
+        """When filtered_task_tree contains step-pattern titles, stats key is recorded.
+
+        Limitation: project_mismatch is always None through this path because the
+        synthetic dump is stamped with self.project_id and compared against the same
+        value.  The mismatch signal is delegated to the Stage-3 LLM (prompt guard);
+        the direct-path coverage for mismatch is in TestDetectTaskDumpContamination.
+        """
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
         stage.project_id = 'dark_factory'
         stage.filtered_task_tree = FilteredTaskTree(
@@ -11067,6 +11073,13 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         assert spot.get('contaminated') is True
         ids = spot.get('step_pattern_title_ids', [])
         assert ids, 'Expected at least one offending task id'
+        # project_mismatch is always None through record_task_dump_spot_check: dump is
+        # stamped with self.project_id and compared against self.project_id (always ==).
+        assert spot.get('project_mismatch') is None, (
+            'project_mismatch cannot fire via record_task_dump_spot_check — delegated to '
+            'Stage-3 LLM; see test_task_filter.py::TestDetectTaskDumpContamination for '
+            'direct mismatch coverage'
+        )
 
     def test_clean_tree_does_not_record_stat(self, mock_deps):
         """When filtered_task_tree contains normal titles, no stat is recorded (non-destructive)."""

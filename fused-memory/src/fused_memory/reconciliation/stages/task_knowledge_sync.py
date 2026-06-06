@@ -2376,10 +2376,17 @@ class IntegrityCheck(BaseStage):
             return
 
         tree = self.filtered_task_tree
-        # Build a synthetic dump from the tree's task lists (same source used by
-        # Stage 3's spot-check — mirrors what get_tasks would return for this project).
+        # Build a synthetic dump from the tree's task lists, stamping self.project_id so
+        # the dump mirrors what get_tasks now returns (task-1661 envelope stamp).
+        #
+        # Note on project_mismatch signal: through this code path the dump is always
+        # stamped with self.project_id and compared against the same value, so
+        # project_mismatch can never be non-None here.  The stamped-project_id mismatch
+        # signal is delegated to the Stage-3 LLM via the prompt's cross_project_routing
+        # guard (stage3.py).  The title-plausibility heuristic (step_pattern_title_ids)
+        # remains the active in-process signal.
         raw_tasks = list(tree.active_tasks) + list(tree.done_tasks) + list(tree.cancelled_tasks)
-        dump: dict = {'tasks': raw_tasks}
+        dump: dict = {'project_id': self.project_id, 'tasks': raw_tasks}
 
         result = detect_task_dump_contamination(dump, expected_project_id=self.project_id)
         if not result['contaminated']:

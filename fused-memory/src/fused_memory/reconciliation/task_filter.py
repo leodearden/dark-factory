@@ -338,6 +338,14 @@ def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> l
 
 
 # Substrings that identify decompose-PRD step-pattern titles (lower-cased check).
+#
+# Heuristic note: plain substring matching may occasionally false-positive on
+# legitimate task titles that happen to contain these substrings (e.g. a task
+# discussing the decompose-PRD pattern, or "fix impl(step parser) crash").
+# Since this signal is observability-only (records a stat / WARNING; never mutates
+# state), the impact is a spurious operator-triage alert rather than a correctness
+# issue.  If false positives become noisy, tighten to anchor on the title start or
+# require the full 'impl(step-<n>)' shape via a regex.
 _STEP_PATTERN_MARKERS: tuple[str, ...] = ('impl(step', 'test(step')
 
 

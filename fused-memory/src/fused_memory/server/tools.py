@@ -1944,8 +1944,8 @@ def create_mcp_server(
             result = await task_interceptor.get_tasks(project_root=project_root, tag=tag)
             if isinstance(result, dict) and 'error' not in result:
                 pid = resolve_project_id(project_root)
-                result['project_id'] = pid
-                result['project_root'] = project_root
+                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+                result = {**result, 'project_id': pid, 'project_root': project_root}
                 await _log_read(
                     'get_tasks',
                     project_id=pid,
@@ -2094,7 +2094,14 @@ def create_mcp_server(
         try:
             result = await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
             if isinstance(result, dict) and 'error' not in result:
-                result['project_id'] = resolve_project_id(project_root)
+                pid = resolve_project_id(project_root)
+                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+                result = {**result, 'project_id': pid, 'project_root': project_root}
+                await _log_read(
+                    'get_task',
+                    project_id=pid,
+                    result_summary={'project_id': pid, 'task_id': id},
+                )
             return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
