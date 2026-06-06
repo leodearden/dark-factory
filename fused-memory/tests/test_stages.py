@@ -10578,3 +10578,136 @@ class TestEnforceStage2SummaryPoolCap:
         )
 
         assert STAGE2_CYCLE_SUMMARY_POOL_CAP == 2
+
+
+class TestEnforceStage2SummaryPoolCapResilience:
+    """_enforce_stage2_summary_pool_cap resilience: enumeration failure, partial delete failure,
+    and created_at ordering edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
+        """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _enforce_stage2_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-fail',
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_excluded_from_count_logs_warning(self, caplog):
+        """If one delete raises, that delete is excluded from count; others counted; logs WARNING."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        # 4 members → 2 to delete (oldest two)
+        members = [
+            {'id': 'oldest', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'second', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'third',  'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'newest', 'created_at': '2026-04-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        # First delete (oldest) succeeds; second delete (second) fails
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[None, RuntimeError('delete failed')]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _enforce_stage2_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-partial',
+            )
+
+        # Does not raise; only 1 success counted
+        assert result == 1
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_missing_created_at_sorted_last_and_kept(self):
+        """Members with None/missing created_at sort LAST (treated as newest) and are kept."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        # 4 members: 2 datable + 2 undatable; cap=2 → delete 2 oldest
+        # The 2 undatable should be kept; the 2 datable should be the ones deleted
+        members = [
+            {'id': 'datable-old',  'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'datable-new',  'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'no-date-1',    'created_at': None,                          'metadata': {}},
+            {'id': 'no-date-2',    'created_at': None,                          'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-order',
+        )
+
+        assert result == 2
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'datable-old', 'datable-new'}
+        assert 'no-date-1' not in deleted_ids
+        assert 'no-date-2' not in deleted_ids
+
+    @pytest.mark.asyncio
+    async def test_unparseable_created_at_sorted_last_and_kept(self):
+        """Members with unparseable created_at sort LAST (treated as newest) and are kept."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _enforce_stage2_summary_pool_cap,
+        )
+
+        members = [
+            {'id': 'datable',      'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'also-datable', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'bad-date-1',   'created_at': 'not-a-date',                'metadata': {}},
+            {'id': 'bad-date-2',   'created_at': 12345,                       'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _enforce_stage2_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-order2',
+        )
+
+        assert result == 2
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'datable', 'also-datable'}
+        assert 'bad-date-1' not in deleted_ids
+        assert 'bad-date-2' not in deleted_ids
