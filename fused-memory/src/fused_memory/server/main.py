@@ -771,6 +771,7 @@ async def run_server():
         ticket_store=ticket_store if 'ticket_store' in locals() else None,
         write_journal=write_journal,
         memory_service=memory_service,
+        known_projects=_known_projects_map,
     )
     if _checkpoint_targets:
         checkpoint_task = asyncio.create_task(
