@@ -1296,6 +1296,7 @@ class TestAdvanceMainRemergePin:
         merge_b, verified_tip, wt_b = await _build_remerge_scenario(
             git_ops, 'pin-a', 'pin-b',
         )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
 
         # Post-verify commit: moves live ref (task/pin-b) past M^2.
         (wt_b.path / 'stale.py').write_text('stale = True\n')
@@ -1343,6 +1344,7 @@ class TestAdvanceMainDivergenceWarning:
         merge_b, verified_tip, wt_b = await _build_remerge_scenario(
             git_ops, 'div-a', 'div-b',
         )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
 
         # Post-verify commit advances live ref past M^2 — triggers divergence.
         (wt_b.path / 'stale.py').write_text('stale = True\n')
@@ -1393,6 +1395,7 @@ class TestAdvanceMainDivergenceWarning:
         merge_b, *_ = await _build_remerge_scenario(
             git_ops, 'nodiv-a', 'nodiv-b',
         )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
         # Deliberately omit the post-verify commit — live ref == M^2.
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
