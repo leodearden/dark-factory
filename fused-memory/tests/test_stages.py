@@ -10930,3 +10930,112 @@ class TestStage2PromptCycleSummaryPoolTag:
             f"key-value pair that _enforce_stage2_summary_pool_cap filters on "
             f"(task 1657 — producer/consumer contract)."
         )
+
+
+class TestStage2PromptFixCAnalyticalFindingsDeletion:
+    """Stage 2 FIX C block must instruct deletion of stage1_flag_marker Mem0
+    entries when the flag arrives via the analytical findings path (not just
+    via the Mem0 active-query path).
+
+    Task 1660: minimal key-presence/fragment assertions only (no prose-wording
+    pins).  Mirrors TestStage2PromptCycleSummaryPoolTag (task 1657).
+
+    These tests are the producer-contract guard: Stage 2's Mem0 marker cleanup
+    currently fires only for _source=mem0_active_query items.  Analytical
+    findings that carry a flag_id must also trigger deletion — otherwise the
+    Mem0 marker is orphaned and Stage 1 has to sweep it manually (cycle
+    92904d26, memory 45396f92).  The prompt instruction is the ONLY mechanism;
+    there is no Python-layer guard for the analytical-findings sub-path.
+    """
+
+    def _get_fixc_section(self) -> str:
+        """Return the FIX C section of the Stage 2 system prompt.
+
+        Slices from the '(FIX C)' heading marker to the next top-level
+        '\\n## ' heading (start of '## Stale Flag Escalation (FIX D)').
+        Asserts both markers are present so a missing slice is caught
+        immediately rather than silently matching an empty string.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+
+        fixc_marker = '(FIX C)'
+        fixd_marker = '\n## Stale Flag Escalation (FIX D)'
+
+        assert fixc_marker in prompt, (
+            "build_stage2_system_prompt('dark_factory') must contain '(FIX C)' "
+            "so the FIX C section can be sliced for targeted assertions "
+            "(task 1660 — slice anchor missing)."
+        )
+        assert fixd_marker in prompt, (
+            "build_stage2_system_prompt('dark_factory') must contain "
+            "'\\n## Stale Flag Escalation (FIX D)' so the FIX C slice has a "
+            "known end boundary (task 1660 — slice end anchor missing)."
+        )
+
+        start = prompt.index(fixc_marker)
+        end = prompt.index(fixd_marker)
+        return prompt[start:end]
+
+    def test_fixc_section_names_analytical_findings_path_as_deletion_trigger(self):
+        """FIX C block must explicitly name the analytical findings path as a
+        deletion trigger.
+
+        The phrase 'analytical findings path' must appear inside the FIX C
+        section.  It is absent today — this is the RED assertion that the impl
+        step turns GREEN (task 1660).
+
+        Producer contract: the Stage 2 agent reads this section to decide WHEN
+        to call delete_memory for a flag.  Without an explicit instruction
+        covering the analytical findings path, the agent only deletes markers
+        for _source=mem0_active_query items — leaving analytical-path flags
+        orphaned in Mem0.
+        """
+        fixc_section = self._get_fixc_section()
+        assert 'analytical findings path' in fixc_section, (
+            "The FIX C section of build_stage2_system_prompt('dark_factory') "
+            "must contain 'analytical findings path' to instruct the Stage 2 "
+            "agent to delete the backing Mem0 marker when a flagged item with "
+            "a flag_id arrives via the analytical findings path (task 1660 — "
+            "producer contract for stage1_flag_marker cleanup on analytical "
+            "findings path)."
+        )
+
+    def test_fixc_section_retains_delete_memory_call(self):
+        """FIX C block must retain the delete_memory tool call instruction.
+
+        Both the active-query path and the analytical findings path use the
+        same deletion mechanism: delete_memory(memory_id=<flag_id>, store='mem0').
+        This assertion verifies the call is still present after the impl edit.
+        """
+        fixc_section = self._get_fixc_section()
+        assert 'delete_memory' in fixc_section, (
+            "The FIX C section must retain 'delete_memory' — the Mem0 marker "
+            "deletion tool call (task 1660 — producer contract)."
+        )
+        assert "store='mem0'" in fixc_section, (
+            "The FIX C section must retain \"store='mem0'\" — the store "
+            "parameter for delete_memory (task 1660 — producer contract)."
+        )
+
+    def test_fixc_section_retains_dual_acknowledgement_counters(self):
+        """FIX C block must still require both flag_deleted record and
+        stage1_mem0_flags_processed increment for any deletion.
+
+        The Python framework cross-checks flag_deleted_records against
+        stage1_mem0_flags_processed (Guard 4b in task_knowledge_sync.py).
+        Both must be mentioned in the FIX C section so the agent emits
+        them for analytical-findings-path deletions too.
+        """
+        fixc_section = self._get_fixc_section()
+        assert 'flag_deleted' in fixc_section, (
+            "The FIX C section must retain 'flag_deleted' — the action record "
+            "appended to stats['flag_deleted_records'] after each deletion "
+            "(task 1660 — producer contract for Guard 4b cross-check)."
+        )
+        assert 'stage1_mem0_flags_processed' in fixc_section, (
+            "The FIX C section must retain 'stage1_mem0_flags_processed' — "
+            "the counter incremented after each successful FIX C deletion "
+            "(task 1660 — producer contract for Guard 4b cross-check)."
+        )
