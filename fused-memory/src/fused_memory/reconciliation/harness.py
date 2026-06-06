@@ -1150,6 +1150,10 @@ class ReconciliationHarness:
                 if isinstance(stage, TaskKnowledgeSync):
                     self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
 
+                # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
+                if isinstance(stage, IntegrityCheck):
+                    stage.filtered_task_tree = filtered_task_tree
+
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
                 )

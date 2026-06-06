@@ -39,6 +39,7 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    detect_task_dump_contamination,
     filter_task_tree,
     format_task_list,
     id_key,
@@ -2324,6 +2325,10 @@ For cross-project routing see "Known Projects" above.
 class IntegrityCheck(BaseStage):
     """Stage 3: Read-only cross-system consistency verification."""
 
+    # Active task tree — injected by harness before run() (mirrors Stage 1/2 wiring).
+    # Used by record_task_dump_spot_check to spot-check the cached task dump source.
+    filtered_task_tree: FilteredTaskTree | None = None
+
     def get_system_prompt(self) -> str:
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
@@ -2334,6 +2339,66 @@ class IntegrityCheck(BaseStage):
 
     def get_report_schema(self) -> dict:
         return STAGE3_REPORT_SCHEMA
+
+    async def run(
+        self,
+        events: list[ReconciliationEvent],
+        watermark: Watermark,
+        prior_reports: list[StageReport],
+        run_id: str,
+        model: str | None = None,
+    ) -> StageReport:
+        """Execute Stage 3 and post-process with task-dump spot-check.
+
+        Calls super().run() first (LLM agent + report extraction), then
+        record_task_dump_spot_check() to record a non-destructive observability
+        stat when the cached task tree contains contamination signals.
+
+        Mirrors MemoryConsolidator.run() override structure (Stage 1).
+        """
+        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+        self.record_task_dump_spot_check(report)
+        return report
+
+    def record_task_dump_spot_check(self, report: StageReport) -> None:
+        """Spot-check the harness-injected filtered_task_tree for contamination signals.
+
+        If self.filtered_task_tree is set, builds a synthetic raw-dump dict from the
+        tree's task lists, runs detect_task_dump_contamination against it, and — when
+        contamination is detected — records report.stats['task_dump_spot_check'] and
+        emits a WARNING for operator triage.
+
+        Non-destructive: never empties the task tree or affects subsequent stages.
+        Only records the stat key when contaminated=True (clean cycles leave stats
+        untouched, matching the Stage 1 census-inconsistency pattern).
+        """
+        if self.filtered_task_tree is None:
+            return
+
+        tree = self.filtered_task_tree
+        # Build a synthetic dump from the tree's task lists (same source used by
+        # Stage 3's spot-check — mirrors what get_tasks would return for this project).
+        raw_tasks = list(tree.active_tasks) + list(tree.done_tasks) + list(tree.cancelled_tasks)
+        dump: dict = {'tasks': raw_tasks}
+
+        result = detect_task_dump_contamination(dump, expected_project_id=self.project_id)
+        if not result['contaminated']:
+            return
+
+        stat_payload = {
+            'contaminated': True,
+            'project_mismatch': result.get('project_mismatch'),
+            'step_pattern_title_ids': result.get('step_pattern_title_ids', []),
+        }
+        report.stats['task_dump_spot_check'] = stat_payload
+        logger.warning(
+            'reconciliation.task_dump_contamination',
+            extra={
+                'project_id': self.project_id,
+                'project_mismatch': result.get('project_mismatch'),
+                'step_pattern_title_ids': result.get('step_pattern_title_ids', []),
+            },
+        )
 
     async def assemble_payload(
         self,
