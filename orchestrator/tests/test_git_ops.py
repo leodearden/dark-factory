@@ -1212,6 +1212,216 @@ class TestAdvanceMainCasRetrySha:
         assert git_ops._last_advanced_sha == merge.merge_commit
 
 
+# -- Shared helpers for re-merge-fallback tests --------------------------------
+
+
+async def _build_remerge_scenario(
+    git_ops: GitOps,
+    branch_a: str,
+    branch_b: str,
+):
+    """Set up the 'A lands, B not a descendant' re-merge fallback scenario.
+
+    Creates two non-conflicting branches (a.py / b.py), builds B's merge
+    worktree against the ORIGINAL main (so B is not a descendant of main
+    after A lands), captures verified_tip = M^2, lands A, and returns
+    (merge_b, verified_tip, wt_b).  The caller may add a post-verify commit
+    to wt_b.path before calling advance_main to simulate a moved branch ref.
+    """
+    _, original_main_sha, _ = await _run(
+        ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+    )
+    original_main_sha = original_main_sha.strip()
+
+    wt_a = await git_ops.create_worktree(branch_a)
+    (wt_a.path / 'a.py').write_text('a = 1\n')
+    await git_ops.commit(wt_a.path, 'Add a')
+
+    wt_b = await git_ops.create_worktree(branch_b)
+    (wt_b.path / 'b.py').write_text('b = 1\n')
+    await git_ops.commit(wt_b.path, 'Add b')
+
+    merge_b = await git_ops.merge_to_main(
+        wt_b.path, branch_b, base_sha=original_main_sha,
+    )
+    assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+    _, verified_tip_raw, _ = await _run(
+        ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+        cwd=merge_b.merge_worktree,
+    )
+    verified_tip = verified_tip_raw.strip()
+    assert verified_tip, 'M^2 must be resolvable from the merge worktree'
+
+    merge_a = await git_ops.merge_to_main(wt_a.path, branch_a)
+    assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+    assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+    await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+    return merge_b, verified_tip, wt_b
+
+
+async def _failing_rebase_run(cmd, cwd=None):
+    """Selective _run wrapper: forces 'git rebase main' to return rc=1.
+
+    Used to deterministically route advance_main into the re-merge fallback.
+    All other git commands are delegated to the real _run.
+    """
+    if cmd[:3] == ['git', 'rebase', 'main']:
+        return (1, '', 'forced rebase failure for test')
+    return await _run(cmd, cwd=cwd)
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainRemergePin:
+    """Regression: the re-merge fallback must pin to M^2 (verified branch tip),
+    not the live branch ref, to prevent post-verify commits from landing on main.
+
+    Reference: esc-1657-26 — advance_main's fallback re-merged a moving branch
+    ref incorporating unverified commits committed during the verify/advance window.
+    """
+
+    async def test_advance_main_remerge_pins_to_verified_branch_tip(
+        self, git_ops: GitOps,
+    ):
+        """When the rebase fallback runs, the landed tree must match M^2 (the
+        verified branch tip), not the current live branch ref.
+
+        Post-verify commit (stale.py) is pushed to B's branch, moving the live
+        ref past M^2.  The rebase is forced to fail (deterministic fallback path).
+
+        Assert: result == 'advanced' AND stale.py is absent from main
+        (the advance must pin to M^2, not pick up the moved live ref).
+        """
+        merge_b, verified_tip, wt_b = await _build_remerge_scenario(
+            git_ops, 'pin-a', 'pin-b',
+        )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
+
+        # Post-verify commit: moves live ref (task/pin-b) past M^2.
+        (wt_b.path / 'stale.py').write_text('stale = True\n')
+        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
+
+        with patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='pin-b',
+            )
+
+        assert result == 'advanced', f'Expected advanced, got {result!r}'
+
+        # KEY assertion: stale.py must NOT be in main — the advance must have
+        # used M^2, not the moved live ref (which includes stale.py).
+        _, tree_out, _ = await _run(
+            ['git', 'ls-tree', '-r', 'main', '--name-only'],
+            cwd=git_ops.project_root,
+        )
+        assert 'stale.py' not in tree_out, (
+            f'stale.py must NOT land on main. '
+            f'verified_tip={verified_tip[:8]}, '
+            f'main tree: {tree_out!r}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainDivergenceWarning:
+    """Regression canary: advance_main must emit a structured WARNING when the
+    live branch ref has moved past the verified M^2 tip during the re-merge
+    fallback (stale-tip divergence is self-evident in logs).
+
+    Reference: esc-1657-26.
+    """
+
+    async def test_advance_main_warns_on_stale_branch_ref_divergence(
+        self, git_ops: GitOps, caplog,
+    ):
+        """When the live branch ref has advanced past verified M^2, a WARNING
+        is emitted recording both verified_branch_tip and the live ref tip.
+        """
+        merge_b, verified_tip, wt_b = await _build_remerge_scenario(
+            git_ops, 'div-a', 'div-b',
+        )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
+
+        # Post-verify commit advances live ref past M^2 — triggers divergence.
+        (wt_b.path / 'stale.py').write_text('stale = True\n')
+        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
+
+        # Resolve the live ref tip for assertion.
+        _, live_tip_raw, _ = await _run(
+            ['git', 'rev-parse', 'task/div-b'],
+            cwd=git_ops.project_root,
+        )
+        live_tip = live_tip_raw.strip()
+        assert live_tip != verified_tip, 'Live tip must have moved past M^2 for this test'
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='div-b',
+            )
+
+        assert result == 'advanced'
+
+        # A WARNING must record both the verified tip and the live ref tip.
+        divergence_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and verified_tip[:8] in r.getMessage()
+        ]
+        assert divergence_warnings, (
+            f'Expected a WARNING recording verified_tip={verified_tip[:8]} '
+            f'when live ref ({live_tip[:8]}) diverged from M^2. '
+            f'All warnings: {[r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]}'
+        )
+        # The warning must also mention the live ref tip.
+        assert any(live_tip[:8] in r.getMessage() for r in divergence_warnings), (
+            f'Divergence WARNING must include live ref tip {live_tip[:8]}. '
+            f'Warning messages: {[r.getMessage() for r in divergence_warnings]}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+    async def test_no_divergence_warning_when_branch_did_not_move(
+        self, git_ops: GitOps, caplog,
+    ):
+        """When the live branch ref matches M^2 (no post-verify commits),
+        no divergence WARNING is emitted.
+        """
+        merge_b, *_ = await _build_remerge_scenario(
+            git_ops, 'nodiv-a', 'nodiv-b',
+        )
+        assert merge_b.merge_commit is not None and merge_b.merge_worktree is not None
+        # Deliberately omit the post-verify commit — live ref == M^2.
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='nodiv-b',
+            )
+
+        assert result == 'advanced'
+
+        # No divergence WARNING: live ref == M^2, nothing moved.
+        divergence_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'diverge' in r.getMessage().lower()
+        ]
+        assert not divergence_warnings, (
+            f'No divergence WARNING expected (branch did not move). '
+            f'Got: {[r.getMessage() for r in divergence_warnings]}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+
 @pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
