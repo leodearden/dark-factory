@@ -1599,6 +1599,19 @@ class GitOps:
         full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
         rebased = False  # Track whether any rebase/re-merge occurred this call
 
+        # Derive the verified branch tip from M^2 — the exact branch commit
+        # that merge_to_main incorporated (--no-ff guarantees M^2 is the
+        # branch commit verify ran against).  Captured ONCE here, before the
+        # CAS loop, so the re-merge fallback can pin to this SHA rather than
+        # re-resolving the moving full_branch ref.
+        verified_branch_tip: str | None = None
+        _vbt_rc, _vbt_sha, _ = await _run(
+            ['git', 'rev-parse', f'{merge_sha}^2'],
+            cwd=self.project_root,
+        )
+        if _vbt_rc == 0 and _vbt_sha.strip():
+            verified_branch_tip = _vbt_sha.strip()
+
         for attempt in range(max_attempts):
             # ── .task/ contamination gate (FINAL DEFENSE) ─────────────
             try:
@@ -1654,13 +1667,17 @@ class GitOps:
                 # No branch to re-merge from — cannot recover
                 continue
 
-            # Reset merge worktree to current main and re-merge
+            # Reset merge worktree to current main and re-merge.
+            # Pin to the verified branch tip (M^2) so that post-verify
+            # commits pushed to the task branch cannot silently land on main.
+            # Fall back to full_branch only if M^2 was unresolvable (defensive).
+            _remerge_target = verified_branch_tip if verified_branch_tip else full_branch
             await _run(
                 ['git', 'reset', '--hard', self.config.main_branch],
                 cwd=merge_worktree,
             )
             merge_rc, merge_out, merge_err = await _run(
-                ['git', 'merge', '--no-ff', full_branch,
+                ['git', 'merge', '--no-ff', _remerge_target,
                  '-m', _merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_worktree,
             )
