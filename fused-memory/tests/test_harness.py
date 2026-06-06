@@ -6268,3 +6268,110 @@ async def test_live_workflow_gate_allows_escalation_when_task_is_not_live(
         f'Expected escalation for genuinely stranded task (not live); '
         f'got pending: {[e.summary for e in pending]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness injects filtered_task_tree into IntegrityCheck (task 1661 step-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
+    journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle must inject the harness-fetched filtered_task_tree into IntegrityCheck.
+
+    This mirrors the existing injection into MemoryConsolidator (Stage 1) and
+    TaskKnowledgeSync (Stage 2).  IntegrityCheck.record_task_dump_spot_check uses
+    the tree to spot-check the dump source — it needs the same once-per-cycle
+    tree that Stage 1/2 receive.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.models.reconciliation import StageReport
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+
+    await event_buffer.push(_make_event_with_root())
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+    harness._make_stages = lambda: harness.stages
+    harness._known_projects['dark_factory'] = '/home/leo/src/dark-factory'
+
+    # Give the harness a known tree to inject
+    fake_tree = FilteredTaskTree(
+        active_tasks=[{'id': '99', 'title': 'Injected task', 'status': 'pending'}],
+        done_tasks=[],
+        cancelled_tasks=[],
+        total_count=1,
+    )
+
+    # Patch _fetch_filtered_task_tree to return our fake tree
+    async def _fake_fetch(project_root):
+        return fake_tree
+
+    harness._fetch_filtered_task_tree = _fake_fetch
+
+    # Track the tree seen by IntegrityCheck at run() call time
+    captured_tree = {}
+    for stage in harness.stages:
+        if isinstance(stage, IntegrityCheck):
+            original_run = stage.run
+
+            async def mock_stage3_run(
+                events, watermark, prior_reports, run_id, model=None, _s=stage
+            ):
+                captured_tree['tree'] = _s.filtered_task_tree
+                return StageReport(
+                    stage=_s.stage_id,
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={},
+                    llm_calls=0,
+                    tokens_used=0,
+                )
+
+            stage.run = mock_stage3_run
+        else:
+            original_stage = stage
+
+            async def mock_run(
+                events, watermark, prior_reports, run_id, model=None, _s=original_stage
+            ):
+                return StageReport(
+                    stage=_s.stage_id,
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={},
+                    llm_calls=0,
+                    tokens_used=0,
+                )
+
+            stage.run = mock_run
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:1')
+
+    assert 'tree' in captured_tree, (
+        'IntegrityCheck.run was never called or captured_tree was not populated'
+    )
+    assert captured_tree['tree'] is fake_tree, (
+        f'IntegrityCheck did not receive the harness-fetched filtered_task_tree. '
+        f'Got: {captured_tree["tree"]!r}'
+    )

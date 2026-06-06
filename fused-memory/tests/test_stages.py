@@ -11009,3 +11009,88 @@ class TestInjectFlagId:
             "_inject_flag_id must preserve flag_id when already set, even if "
             "memory_id is also present (task 1660)."
         )
+
+
+# ---------------------------------------------------------------------------
+# IntegrityCheck.record_task_dump_spot_check (task 1661 step-7)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityCheckRecordTaskDumpSpotCheck:
+    """Unit tests for IntegrityCheck.record_task_dump_spot_check(report).
+
+    All tests call the method directly — no live LLM is required.  The stat is
+    recorded on the passed StageReport instance; the method does not return a value.
+    """
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fresh_report(self):
+        now = datetime.now(UTC)
+        return StageReport(
+            stage=StageId.integrity_check,
+            started_at=now,
+            completed_at=now,
+            items_flagged=[],
+            stats={},
+        )
+
+    def test_contaminated_tree_records_stat(self, mock_deps):
+        """When filtered_task_tree contains step-pattern titles, stats key is recorded."""
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[
+                {'id': '1654', 'title': 'impl(step-1)', 'status': 'in-progress'},
+                {'id': '1655', 'title': 'test(step-2) write failing test', 'status': 'pending'},
+            ],
+            done_tasks=[],
+            cancelled_tasks=[],
+        )
+        report = self._fresh_report()
+        stage.record_task_dump_spot_check(report)
+        assert 'task_dump_spot_check' in report.stats, (
+            'Expected task_dump_spot_check stat to be recorded when tree is contaminated'
+        )
+        spot = report.stats['task_dump_spot_check']
+        assert spot.get('contaminated') is True
+        ids = spot.get('step_pattern_title_ids', [])
+        assert ids, 'Expected at least one offending task id'
+
+    def test_clean_tree_does_not_record_stat(self, mock_deps):
+        """When filtered_task_tree contains normal titles, no stat is recorded (non-destructive)."""
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[
+                {'id': '1654', 'title': 'Fix authentication bug', 'status': 'in-progress'},
+                {'id': '1655', 'title': 'Add retry logic', 'status': 'pending'},
+            ],
+            done_tasks=[],
+            cancelled_tasks=[],
+        )
+        report = self._fresh_report()
+        stage.record_task_dump_spot_check(report)
+        assert 'task_dump_spot_check' not in report.stats, (
+            'Clean tree must not record task_dump_spot_check stat (non-destructive)'
+        )
+
+    def test_no_filtered_task_tree_is_noop(self, mock_deps):
+        """When filtered_task_tree is None, the method is a no-op."""
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        # filtered_task_tree defaults to None (not yet set by harness)
+        report = self._fresh_report()
+        stage.record_task_dump_spot_check(report)
+        assert 'task_dump_spot_check' not in report.stats
