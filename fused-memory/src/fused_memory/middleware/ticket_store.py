@@ -270,9 +270,15 @@ class TicketStore:
 
         Returns the list of ``ticket_id`` values that were pending (and are
         now terminalised as ``failed``).  Both the SELECT and the UPDATE run
-        inside the same ``_txn()`` so the returned ids exactly match the rows
-        that were changed — no TOCTOU gap on the store's single shared
-        aiosqlite connection.
+        inside the same ``_txn()``.  On the store's single shared aiosqlite
+        connection the ids will exactly match the rows changed absent concurrent
+        writers; if another coroutine (e.g. a worker calling ``mark_resolved``)
+        races between the SELECT and the UPDATE, the UPDATE's ``WHERE
+        status='pending'`` guard silently skips that ticket, so ``reaped_ids``
+        may contain an id whose terminal status is not ``worker_dead``.  The
+        practical impact is benign: any woken ``resolve_ticket`` caller
+        re-reads the persisted terminal row (whatever it is), so correctness is
+        preserved — only the log count is off by the number of raced tickets.
         """
         now = datetime.now(UTC).isoformat()
         async with self._txn() as db:

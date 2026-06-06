@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +20,7 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import TicketJanitor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 
 def _stub_prepare_candidate(mock_curator) -> None:
@@ -2400,15 +2400,8 @@ async def test_janitor_reap_wakes_blocked_resolve_ticket_promptly(
                                                 → re-reads terminal failed/worker_dead row
     """
     # 1) Set up the orchestrator layout so the janitor can route escalations.
-    lock_dir = tmp_path / 'data' / 'orchestrator'
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / 'orchestrator.lock'
-    lock_path.write_text('')
-    handle = lock_path.open('r+b')
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    # project_id mirrors _project_id_for() from test_ticket_janitor.py.
-    project_id = tmp_path.name.lower().replace('-', '_')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    project_id = _project_id_for(tmp_path)
     candidate_json = json.dumps({
         'project_root': str(tmp_path),
         'kwargs': {'title': 'Pending task'},
