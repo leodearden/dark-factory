@@ -837,6 +837,7 @@ def create_mcp_server(
     async def get_memories_by_metadata(
         project_id: str,
         filters: dict,
+        limit: int = 1000,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Enumerate memories matching exact metadata equality filters (deterministic scroll, not semantic).
@@ -850,6 +851,12 @@ def create_mcp_server(
         **Mem0/Qdrant-only scope:** This tool enumerates only memories stored in the
         Mem0/Qdrant backend (categories: observations_and_summaries, preferences_and_norms,
         procedural_knowledge). It does NOT query Graphiti.
+
+        **Bounded enumeration:** Results are capped at *limit* records (default 1000).
+        If the total matching record count (from ``count_memories_by_metadata``) exceeds
+        *limit*, this tool silently returns only the first *limit* records.  Pass an
+        explicit *limit* value or cross-check the returned list length against the count
+        tool to detect truncation.
 
         Primary use-case: enumerating stage1_flag_markers to detect orphans that have
         ``source='stage1_flag_marker'`` but are missing ``kind='stage1_flag_marker'``.
@@ -868,9 +875,10 @@ def create_mcp_server(
         Args:
             project_id: Project scope (required)
             filters: Exact metadata key-value pairs to match (e.g. {'source': 'stage1_flag_marker'})
+            limit: Maximum records to return (default 1000; service-level cap).
 
         Returns:
-            {'memories': [...], 'project_id': ..., 'filters': ...} on success,
+            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
             or {'error': ..., 'error_type': ...} on failure.
         """
         if err := validate_project_id(project_id):
@@ -879,11 +887,13 @@ def create_mcp_server(
             memories = await memory_service.get_memories_by_metadata(
                 project_id=project_id,
                 filters=filters,
+                limit=limit,
             )
             return {
                 'memories': memories,
                 'project_id': project_id,
                 'filters': filters,
+                'limit': limit,
             }
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise

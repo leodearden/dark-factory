@@ -252,6 +252,42 @@ class TestRun:
         assert report.get('deleted') == 2
 
     @pytest.mark.asyncio
+    async def test_apply_partial_failure_populates_failed_list(self):
+        """Apply with one delete failure: report['failed'] is populated,
+        report['deleted'] reflects only successes, and after-counts are re-fetched
+        (reflecting residual orphans that were not deleted).
+        """
+        memory_service = AsyncMock()
+        # before: total=3, kind=1 → 2 orphans by count; after: total=2, kind=1 → 1 residual
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=[3, 1, 2, 1]
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'),
+            _orphan('o1'),   # this delete will fail
+            _orphan('o2'),   # this delete succeeds
+        ])
+        # id-o1's delete raises; id-o2's delete succeeds
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('Qdrant timeout'), None]
+        )
+
+        report = await _mod.run(self._args(apply=True), memory_service)
+
+        assert report['dry_run'] is False
+        # Both orphans were found
+        assert set(report['orphan_ids']) == {'o1', 'o2'}
+        assert report['orphan_count'] == 2
+        # Only one deletion succeeded
+        assert report['deleted'] == 1
+        # The failed id is reported
+        assert 'o1' in report['failed']
+        # After-counts are present (second count pass was done)
+        assert 'after' in report
+        assert report['after']['total_source'] == 2
+        assert report['after']['total_with_kind'] == 1
+
+    @pytest.mark.asyncio
     async def test_enumeration_uses_get_memories_by_metadata_not_search(self):
         """get_memories_by_metadata is called with filters={'source':'stage1_flag_marker'};
         semantic search (memory_service.search) is never called.

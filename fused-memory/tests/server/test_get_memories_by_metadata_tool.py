@@ -57,6 +57,7 @@ class TestGetMemoriesByMetadataTool:
         mock_service.get_memories_by_metadata.assert_called_once_with(
             project_id=_PROJECT_ID,
             filters=_FILTERS,
+            limit=1000,
         )
 
     @pytest.mark.asyncio
@@ -103,6 +104,32 @@ class TestGetMemoriesByMetadataTool:
         )
         # Service must NOT have been called
         mock_service.get_memories_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_custom_limit_is_forwarded_to_service(self):
+        """An explicit limit value is forwarded to the service call."""
+        mock_service = AsyncMock()
+        mock_service.get_memories_by_metadata = AsyncMock(return_value=_SAMPLE_MEMORIES)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'get_memories_by_metadata',
+            {
+                'project_id': _PROJECT_ID,
+                'filters': _FILTERS,
+                'limit': 5000,
+            },
+        )
+
+        assert 'memories' in result, f"Expected 'memories' key: {result!r}"
+        # Service must have been called with the custom limit
+        mock_service.get_memories_by_metadata.assert_called_once_with(
+            project_id=_PROJECT_ID,
+            filters=_FILTERS,
+            limit=5000,
+        )
+        # limit is echoed back in the response
+        assert result.get('limit') == 5000, f"Expected limit=5000 in response: {result!r}"
 
     @pytest.mark.asyncio
     async def test_service_exception_is_caught_and_returned_as_error_dict(self):

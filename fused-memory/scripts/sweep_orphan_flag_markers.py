@@ -176,9 +176,20 @@ async def run(args: Any, memory_service: Any) -> dict:
     before = {'total_source': total_source, 'total_with_kind': total_with_kind}
 
     # --- Enumerate via scroll (NOT semantic search) ---
+    scroll_limit: int = getattr(args, 'limit', 1000)
     members = await memory_service.get_memories_by_metadata(
-        project_id=project_id, filters=source_filter,
+        project_id=project_id, filters=source_filter, limit=scroll_limit,
     )
+    # Cross-check: if the scroll returned fewer records than the count, enumeration
+    # was capped and some markers were silently skipped — log a warning per the
+    # no-silent-caps convention so the operator knows the sweep is incomplete.
+    if len(members) < total_source:
+        logger.warning(
+            'sweep_orphan_flag_markers: enumerated %d of %d source markers '
+            '(scroll limit=%d) — scroll cap reached; re-run with a higher '
+            '--limit value to ensure all orphans are covered.',
+            len(members), total_source, scroll_limit,
+        )
     orphans = find_orphan_markers(members)
     orphan_ids = [o['id'] for o in orphans]
 
@@ -229,6 +240,11 @@ def main() -> int:
         '--project-id', dest='project_id', default='dark_factory',
         help='Project to sweep (default: dark_factory).',
     )
+    parser.add_argument(
+        '--limit', type=int, default=1000,
+        help='Maximum records to enumerate per scroll (default: 1000). '
+             'Increase if count_memories_by_metadata shows >1000 source markers.',
+    )
     args = parser.parse_args()
 
     async def _run_live() -> dict:
@@ -237,8 +253,8 @@ def main() -> int:
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)
-        await memory.initialize()
         try:
+            await memory.initialize()
             return await run(args, memory)
         finally:
             if hasattr(memory, 'close'):
