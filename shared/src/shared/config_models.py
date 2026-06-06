@@ -39,6 +39,12 @@ class UsageCapConfig(BaseModel):
         Without this validator, pydantic's ``extra='ignore'`` default would
         silently drop a ``pause_threshold:`` key from an operator's YAML,
         leaving them with no indication that their tuning had no effect.
+
+        .. note::
+            **Breaking change for operators**: any config file (orchestrator YAML,
+            fused-memory ``config.yaml``, or a shared accounts file) that still
+            contains ``usage_cap.pause_threshold`` will fail to load after this
+            validator is present.  Remove the key before deploying.
         """
         if isinstance(data, dict) and 'pause_threshold' in data:
             raise ValueError(

@@ -195,7 +195,15 @@ class TestReifyConfigLoadsUsageCap:
 
 
 class TestPauseThresholdRejected:
-    """pause_threshold was removed — setting it must raise ValueError, not silently no-op."""
+    """pause_threshold was removed — setting it must raise ValueError, not silently no-op.
+
+    ``pytest.raises(ValueError)`` catches the error because pydantic v2's
+    ``ValidationError`` is a subclass of ``ValueError``
+    (``ValidationError.__mro__`` includes ``ValueError``).  The exact type
+    raised at the boundary is ``pydantic.ValidationError``; catching as
+    ``ValueError`` is intentional and matches how the rest of this test suite
+    handles pydantic validation failures.
+    """
 
     def test_direct_construction_with_pause_threshold_raises(self):
         """UsageCapConfig({'pause_threshold': ...}) raises ValueError naming the removed field."""
