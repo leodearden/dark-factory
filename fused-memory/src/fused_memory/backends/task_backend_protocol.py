@@ -105,7 +105,21 @@ class TaskBackendProtocol(Protocol):
         priority: str | None = None,
         status: str | None = None,
         dependencies: list[str] | None = None,
-    ) -> UpdateTaskResult: ...
+    ) -> UpdateTaskResult:
+        """Update task metadata fields (title, description, details, priority, metadata, dependencies).
+
+        **Implementations MUST reject a non-None ``status`` by raising** (e.g.
+        ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
+        is the only sanctioned status writer — it enforces the terminal-exit,
+        phantom-done, and done-provenance gates.  Accepting ``status`` here
+        would silently bypass all three.
+
+        The ``status`` param is kept in the signature as a **reject-trap**: it
+        preserves the ``status=None`` passthrough that ``server/tools.py`` and
+        ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
+        reject-only contract explicit for future backend authors.
+        """
+        ...
 
     async def remove_tasks(
         self,

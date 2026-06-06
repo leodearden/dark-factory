@@ -684,7 +684,20 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
-        # Structured fields (title/description/details/priority/status/dependencies)
+        # Backend floor mirroring the server/tools.py + interceptor ceiling
+        # (2026-05-08 forensics). set_task_status is the only sanctioned status
+        # writer — it enforces the terminal-exit, phantom-done, and
+        # done-provenance gates. Reject unconditionally, before ensure_connected()
+        # and the task SELECT, so status rejection takes precedence over any
+        # existence or connection error.
+        if status is not None:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                'update_task is metadata-only and cannot write status. '
+                'Use set_task_status(status=…) instead — it enforces the '
+                'terminal-exit, phantom-done, and done-provenance gates.',
+            )
+        # Structured fields (title/description/details/priority/dependencies)
         # land deterministically — any non-None value overrides the current row.
         # ``prompt`` is kept for backward compatibility: when no explicit
         # ``details`` is passed it feeds the details path (replace, or append
@@ -720,9 +733,8 @@ class SqliteTaskBackend:
             if priority is not None:
                 set_columns.append('priority = ?')
                 set_values.append(priority)
-            if status is not None:
-                set_columns.append('status = ?')
-                set_values.append(status)
+            # NOTE: status is intentionally absent — the guard at the top of
+            # this method unconditionally raises before reaching this point.
 
             # details: explicit param wins over prompt. Both honor ``append``.
             existing_details = row['details'] or ''

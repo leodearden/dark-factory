@@ -247,6 +247,53 @@ async def test_set_task_status_unknown_id_raises(backend, project_root):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked', ''])
+async def test_update_task_rejects_non_none_status(backend, project_root, status):
+    """Backend floor: update_task must raise TaskmasterError for any non-None status.
+
+    (a) Seeded-task rejection — the write is blocked and the task stays 'pending'.
+    (b) Empty-string '' pins is-not-None semantics over truthiness.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task('1', project_root=project_root, status=status)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'set_task_status' in exc.value.message
+    # Confirm the write was blocked — status must still be 'pending'
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_rejection_precedes_existence_check(backend, project_root):
+    """Status guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task('999', project_root=project_root, status='done')
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'set_task_status' in exc.value.message
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_rejection_precedes_connection_error(tmp_path, project_root):
+    """Status guard runs BEFORE ensure_connected(), so rejection beats a connection error.
+
+    Uses a closed backend (ensure_connected() would raise RuntimeError) to prove
+    the ordering comment in the guard is accurate — not just implied by the code
+    position.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    closed_backend = SqliteTaskBackend(cfg)
+    await closed_backend.start()
+    await closed_backend.close()  # ensure_connected() now raises RuntimeError
+
+    with pytest.raises(TaskmasterError) as exc:
+        await closed_backend.update_task('1', project_root=project_root, status='done')
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'set_task_status' in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_update_task_appends_metadata(backend, project_root):
     await backend.add_task(
         project_root=project_root,
