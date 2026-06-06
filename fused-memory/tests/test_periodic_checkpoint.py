@@ -40,6 +40,7 @@ def _clear_checkpoint_status():
 @pytest.mark.asyncio
 async def test_cycle_records_tuple_results():
     """Tuple ``(busy, log, checkpointed)`` returns land in _CHECKPOINT_STATUS."""
+
     async def ok_checkpoint():
         return (0, 5, 5)
 
@@ -56,15 +57,14 @@ async def test_cycle_records_tuple_results():
 @pytest.mark.asyncio
 async def test_cycle_aggregates_dict_results():
     """SqliteTaskBackend.checkpoint_all dict shape is aggregated across projects."""
+
     async def task_backend_checkpoint_all():
         return {
             '/p/a': {'busy': 0, 'log': 3, 'checkpointed': 3},
             '/p/b': {'busy': 0, 'log': 7, 'checkpointed': 7},
         }
 
-    await server_main._run_checkpoint_cycle(
-        [('task_backend', task_backend_checkpoint_all)]
-    )
+    await server_main._run_checkpoint_cycle([('task_backend', task_backend_checkpoint_all)])
 
     status = server_main._CHECKPOINT_STATUS['task_backend']
     assert status['busy'] == 0
@@ -76,6 +76,7 @@ async def test_cycle_aggregates_dict_results():
 @pytest.mark.asyncio
 async def test_cycle_warns_on_busy(caplog):
     """A busy>0 row should produce a WARN log so stalls are visible."""
+
     async def busy_checkpoint():
         return (1, 50, 0)
 
@@ -92,6 +93,7 @@ async def test_cycle_warns_on_busy(caplog):
 @pytest.mark.asyncio
 async def test_cycle_continues_past_raising_target(caplog):
     """One failing target must not abort the cycle for the others."""
+
     async def raising_checkpoint():
         raise RuntimeError('boom')
 
@@ -116,6 +118,7 @@ async def test_cycle_continues_past_raising_target(caplog):
 @pytest.mark.asyncio
 async def test_collect_targets_filters_to_those_with_checkpoint(monkeypatch):
     """_collect_checkpoint_targets must skip objects that don't expose checkpoint()."""
+
     class HasCheckpoint:
         async def checkpoint(self):
             return (0, 0, 0)
@@ -149,6 +152,70 @@ async def test_collect_targets_filters_to_those_with_checkpoint(monkeypatch):
 # ---------------------------------------------------------------------------
 # Step 1 — existence-guarded override-DB checkpoint helper
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_overrides_db_if_exists_noop_when_absent(
+    tmp_path: Path,
+) -> None:
+    """Returns CheckpointResult(0,0,0) and does NOT create the DB when absent."""
+    project_root = str(tmp_path / 'proj')
+
+    result = await _checkpoint_overrides_db_if_exists(project_root)
+
+    assert result == CheckpointResult(0, 0, 0)
+    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    assert not db_file.exists(), 'guard must not create the DB file'
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_overrides_db_if_exists_delegates_when_present(
+    tmp_path: Path,
+) -> None:
+    """Delegates to _checkpoint_overrides_db when the DB file exists."""
+    project_root = str(tmp_path / 'proj')
+
+    # Create the DB via the canonical opener.
+    db = await _open_overrides_db(project_root)
+    await db.close()
+
+    result = await _checkpoint_overrides_db_if_exists(project_root)
+
+    assert isinstance(result, CheckpointResult)
+    assert result.busy == 0
+    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    assert db_file.exists(), 'DB file must still exist after checkpoint'
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_overrides_db_if_exists_picks_up_db_created_after_first_call(
+    tmp_path: Path,
+) -> None:
+    """A DB created after the first (no-op) call is picked up on the next call.
+
+    Exercises the transition the docstring promises: the existence check is
+    re-evaluated on every call, so a project that lazily creates its override
+    DB after server startup is covered on the very next 300s tick without a
+    restart.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
+    # First call: DB absent — must be a no-op and must not create the file.
+    first_result = await _checkpoint_overrides_db_if_exists(project_root)
+    assert first_result == CheckpointResult(0, 0, 0)
+    assert not db_file.exists(), 'first call must not create the DB file'
+
+    # Simulate the orchestrator lazily initialising the override DB after startup.
+    db = await _open_overrides_db(project_root)
+    await db.close()
+    assert db_file.exists()
+
+    # Second call: DB now present — must delegate to the real checkpoint.
+    second_result = await _checkpoint_overrides_db_if_exists(project_root)
+    assert isinstance(second_result, CheckpointResult)
+    assert second_result.busy == 0
+    assert db_file.exists(), 'DB file must still exist after checkpoint'
 
 
 # ---------------------------------------------------------------------------
@@ -241,39 +308,33 @@ def test_collect_targets_omits_overrides_when_no_known_projects() -> None:
     assert not any(n.startswith('overrides:') for n in names)
 
 
-# ---------------------------------------------------------------------------
-# Step 1 — existence-guarded override-DB checkpoint helper
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_checkpoint_overrides_db_if_exists_noop_when_absent(
-    tmp_path: Path,
-) -> None:
-    """Returns CheckpointResult(0,0,0) and does NOT create the DB when absent."""
-    project_root = str(tmp_path / 'proj')
+async def test_override_target_error_does_not_abort_cycle() -> None:
+    """An override target that raises records busy=-1 and does not block other targets.
 
-    result = await _checkpoint_overrides_db_if_exists(project_root)
+    Confirms that the generic per-target error isolation in _run_checkpoint_cycle
+    applies to dynamically-registered override targets — a bad WAL on one project
+    cannot suppress checkpoints on other stores in the same cycle.
+    """
 
-    assert result == CheckpointResult(0, 0, 0)
-    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
-    assert not db_file.exists(), 'guard must not create the DB file'
+    async def _raising_override():
+        raise RuntimeError('simulated override checkpoint failure')
 
+    async def _ok_store():
+        return (0, 2, 2)
 
-@pytest.mark.asyncio
-async def test_checkpoint_overrides_db_if_exists_delegates_when_present(
-    tmp_path: Path,
-) -> None:
-    """Delegates to _checkpoint_overrides_db when the DB file exists."""
-    project_root = str(tmp_path / 'proj')
+    targets = [
+        ('overrides:bad_proj', _raising_override),
+        ('other_store', _ok_store),
+    ]
 
-    # Create the DB via the canonical opener.
-    db = await _open_overrides_db(project_root)
-    await db.close()
+    await server_main._run_checkpoint_cycle(targets)
 
-    result = await _checkpoint_overrides_db_if_exists(project_root)
+    # Broken override target: busy=-1, detail contains the error message.
+    bad_status = server_main._CHECKPOINT_STATUS['overrides:bad_proj']
+    assert bad_status['busy'] == -1
+    assert isinstance(bad_status['detail'], str)
+    assert 'simulated' in bad_status['detail']
 
-    assert isinstance(result, CheckpointResult)
-    assert result.busy == 0
-    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
-    assert db_file.exists(), 'DB file must still exist after checkpoint'
+    # Subsequent target still ran and was recorded normally.
+    assert server_main._CHECKPOINT_STATUS['other_store']['busy'] == 0
