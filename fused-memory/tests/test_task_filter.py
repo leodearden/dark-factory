@@ -2524,3 +2524,81 @@ class TestCountSnapshotPrimitives:
             'Sentence with , separator and two tokens must still be detected; '
             'regression check for the delimiter requirement.'
         )
+
+
+# ---------------------------------------------------------------------------
+# detect_task_dump_contamination (task 1661)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectTaskDumpContamination:
+    """Tests for detect_task_dump_contamination() in task_filter.py.
+
+    The helper complements detect_census_inconsistency (numeric census) with
+    two additional signals:
+    - Stamped project_id mismatch (primary signal, added by step-2/4 of task 1661)
+    - Title plausibility via decompose-PRD step pattern 'impl(step'/'test(step'
+    """
+
+    def _helper(self):
+        from fused_memory.reconciliation.task_filter import detect_task_dump_contamination
+        return detect_task_dump_contamination
+
+    def test_clean_stamped_dump_is_not_contaminated(self):
+        """A stamped dump whose project_id matches expected + normal titles is clean."""
+        detect = self._helper()
+        tasks_data = {
+            'project_id': 'dark_factory',
+            'project_root': '/home/leo/src/dark-factory',
+            'tasks': [
+                {'id': '1', 'title': 'Fix authentication flow', 'status': 'done'},
+                {'id': '2', 'title': 'Add retry logic', 'status': 'pending'},
+            ],
+        }
+        result = detect(tasks_data, expected_project_id='dark_factory')
+        assert result['contaminated'] is False
+        assert not result['project_mismatch']
+        assert result['step_pattern_title_ids'] == []
+
+    def test_project_id_mismatch_is_contaminated(self):
+        """A stamped dump whose project_id != expected is contaminated (primary signal)."""
+        detect = self._helper()
+        tasks_data = {
+            'project_id': 'reify',
+            'tasks': [
+                {'id': '1654', 'title': 'Fix bug', 'status': 'done'},
+            ],
+        }
+        result = detect(tasks_data, expected_project_id='dark_factory')
+        assert result['contaminated'] is True
+        assert result['project_mismatch'] == 'reify'
+        assert result['stamped_project_id'] == 'reify'
+
+    def test_step_pattern_titles_trigger_contamination(self):
+        """An unstamped dump containing decompose-PRD step titles fires title-plausibility signal."""
+        detect = self._helper()
+        tasks_data = {
+            # No 'project_id' key (legacy/unstamped)
+            'tasks': [
+                {'id': '1654', 'title': 'impl(step-3)', 'status': 'in-progress'},
+                {'id': '1655', 'title': 'test(step-3) write failing test', 'status': 'pending'},
+                {'id': '1656', 'title': 'Normal task title', 'status': 'done'},
+            ],
+        }
+        result = detect(tasks_data, expected_project_id='dark_factory')
+        assert result['contaminated'] is True
+        assert '1654' in result['step_pattern_title_ids'] or 1654 in result['step_pattern_title_ids']
+        assert '1655' in result['step_pattern_title_ids'] or 1655 in result['step_pattern_title_ids']
+        # Normal title must NOT appear
+        offending_ids_str = [str(x) for x in result['step_pattern_title_ids']]
+        assert '1656' not in offending_ids_str
+
+    def test_empty_tasks_data_is_not_contaminated(self):
+        """Empty or None tasks_data returns contaminated=False without crashing."""
+        detect = self._helper()
+        for bad_input in (None, {}, {'tasks': []}, []):
+            result = detect(bad_input, expected_project_id='dark_factory')
+            assert result['contaminated'] is False, (
+                f'Expected contaminated=False for input {bad_input!r}, got {result}'
+            )
+            assert result['step_pattern_title_ids'] == []
