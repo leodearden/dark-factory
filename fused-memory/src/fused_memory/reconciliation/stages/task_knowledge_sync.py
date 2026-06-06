@@ -2117,8 +2117,13 @@ class TaskKnowledgeSync(BaseStage):
         stale_ids = newly_stale_ids
 
         # Build the combined flags list: Stage 1 structured-output first, then
-        # surviving Mem0 active-query results.
-        combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
+        # surviving Mem0 active-query results.  Normalise each Stage 1 item via
+        # _inject_flag_id so that Stage 2's FIX C deletion can always find
+        # flag_id regardless of which field name Stage 1 used for the Mem0 id.
+        combined_flags: list[dict] = [
+            _inject_flag_id(item)
+            for item in (stage1_report.items_flagged if stage1_report else [])
+        ]
         for f in surviving:
             combined_flags.append(
                 {
@@ -2387,6 +2392,31 @@ def _format_report(report: StageReport | None) -> str:
 
 
 _FLAGGED_ITEMS_CHAR_BUDGET = 40_000
+
+
+def _inject_flag_id(flag: dict) -> dict:
+    """Promote a Mem0 id to the canonical ``flag_id`` key if absent.
+
+    Stage 1's FIX B instructs the LLM to emit the confirmed canonical Mem0 id
+    in each ``flagged_items`` entry under the field name ``flag_id``.  As a
+    defensive normalisation, if the LLM instead used the alternative key
+    ``memory_id`` (consistent with the prompt's prior wording), this function
+    promotes it so Stage 2's FIX C deletion can always locate ``flag_id``.
+
+    The active-query path already injects ``flag_id`` explicitly at
+    ``assemble_payload``; this function only acts on analytical-findings-path
+    items (those without a ``_source`` key set by Python).
+
+    Returns:
+        The original dict unchanged when ``flag_id`` is already set, or when
+        no known id key is present.  A shallow copy with ``flag_id`` injected
+        from ``memory_id`` when that key is present and ``flag_id`` is absent.
+    """
+    if 'flag_id' in flag:
+        return flag
+    if 'memory_id' in flag:
+        return {**flag, 'flag_id': flag['memory_id']}
+    return flag
 
 
 def _format_flagged(

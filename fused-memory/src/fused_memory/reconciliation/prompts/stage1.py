@@ -477,8 +477,9 @@ confirmed canonical memory_id — NOT `memory_ids[0]` from the add_memory respon
 (b) If the search returns no result, log a note and retry the search exactly once before \
 proceeding. \
 (c) Emit the CONFIRMED canonical memory_id (from the successful search result) in the \
-`flagged_items` entry rather than the unverified `memory_ids[0]`. If confirmation fails \
-after the retry, emit a sentinel such as `"unconfirmed"` and proceed — do not raise or abort. \
+`flagged_items` entry as a field named **`flag_id`** (not `memory_id` or `memory_ids[0]`). \
+If confirmation fails after the retry, emit `"unconfirmed"` as the `flag_id` value and \
+proceed — do not raise or abort. \
 `flag_dedup.confirm_marker_persisted` performs the analogous code-side findability check for \
 Python-written markers, but returns a bool (post-task-1413) rather than a canonical id — it \
 gates prior-deletion on findability without surfacing the canonical id at all. This prompt \
