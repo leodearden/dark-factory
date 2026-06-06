@@ -18,10 +18,16 @@ We test ``_run_checkpoint_cycle`` (the single-pass extraction) directly:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
+from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.server import main as server_main
+from fused_memory.server.tools import (
+    _checkpoint_overrides_db_if_exists,
+    _open_overrides_db,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -138,3 +144,41 @@ async def test_collect_targets_filters_to_those_with_checkpoint(monkeypatch):
     assert 'durable_queue' in names
     assert 'ticket_store' not in names
     assert 'planned_episode_registry' not in names
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — existence-guarded override-DB checkpoint helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_overrides_db_if_exists_noop_when_absent(
+    tmp_path: Path,
+) -> None:
+    """Returns CheckpointResult(0,0,0) and does NOT create the DB when absent."""
+    project_root = str(tmp_path / 'proj')
+
+    result = await _checkpoint_overrides_db_if_exists(project_root)
+
+    assert result == CheckpointResult(0, 0, 0)
+    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    assert not db_file.exists(), 'guard must not create the DB file'
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_overrides_db_if_exists_delegates_when_present(
+    tmp_path: Path,
+) -> None:
+    """Delegates to _checkpoint_overrides_db when the DB file exists."""
+    project_root = str(tmp_path / 'proj')
+
+    # Create the DB via the canonical opener.
+    db = await _open_overrides_db(project_root)
+    await db.close()
+
+    result = await _checkpoint_overrides_db_if_exists(project_root)
+
+    assert isinstance(result, CheckpointResult)
+    assert result.busy == 0
+    db_file = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    assert db_file.exists(), 'DB file must still exist after checkpoint'
