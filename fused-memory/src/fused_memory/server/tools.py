@@ -84,6 +84,17 @@ _PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish
 _VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
 
 
+def _overrides_db_path(project_root: str) -> Path:
+    """Return the canonical path to ``scheduler_overrides.db`` for *project_root*.
+
+    Single source of truth for ``<root>/data/orchestrator/scheduler_overrides.db``
+    so that :func:`_open_overrides_db`, :func:`_connect_overrides_db`,
+    :func:`_checkpoint_overrides_db`, and the existence guard
+    :func:`_checkpoint_overrides_db_if_exists` can never drift from each other.
+    """
+    return Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
+
 async def _open_overrides_db(
     project_root: str,
     *,
@@ -106,7 +117,7 @@ async def _open_overrides_db(
     orchestrator/src/orchestrator/overrides.py:177-195 which documents
     why ``set_override`` MUST use this pattern.
     """
-    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path = _overrides_db_path(project_root)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if autocommit:
         db = await connect_daemon(str(db_path), timeout=30, isolation_level=None)
@@ -138,7 +149,7 @@ async def _connect_overrides_db(
     ``isolation_level=None`` and ``timeout=30``, matching the semantics of
     :func:`_open_overrides_db`.
     """
-    db_path = Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path = _overrides_db_path(project_root)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if autocommit:
         db = await connect_daemon(str(db_path), timeout=30, isolation_level=None)
@@ -162,12 +173,11 @@ async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
     would be wasted IO and could produce spurious write-lock contention in a
     periodic-checkpoint loop.
 
-    Callers (e.g. a future periodic-checkpoint wiring task) drive this helper
-    to bound WAL growth on the override DB.  Wiring into
-    ``server.main._collect_checkpoint_targets`` / ``_periodic_checkpoint_loop``
-    is intentionally deferred: the override DB is per-project_root whereas the
-    periodic loop currently operates on singleton stores, so adding multi-project
-    iteration is a separate design decision outside this task's scope.
+    Callers drive this helper to bound WAL growth on the override DB.  It is
+    invoked from the periodic checkpoint loop via the existence-guarded wrapper
+    :func:`_checkpoint_overrides_db_if_exists`, which is registered per known
+    project in ``server.main._collect_checkpoint_targets`` and driven by
+    ``_periodic_checkpoint_loop`` on the standard ``_CHECKPOINT_INTERVAL`` cadence.
 
     Returns:
         ``CheckpointResult(busy, log, checkpointed)`` — same shape as
@@ -188,6 +198,30 @@ async def _checkpoint_overrides_db(project_root: str) -> CheckpointResult:
         return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
     finally:
         await db.close()
+
+
+async def _checkpoint_overrides_db_if_exists(project_root: str) -> CheckpointResult:
+    """Checkpoint the override DB only if it already exists on disk.
+
+    Returns ``CheckpointResult(0, 0, 0)`` immediately when
+    ``scheduler_overrides.db`` is absent — preventing the periodic checkpoint
+    loop from creating empty DB files (+ WAL + SHM side-cars) for projects that
+    have never set an override.  When the file exists, delegates to
+    :func:`_checkpoint_overrides_db`.
+
+    The existence check is re-evaluated on every call (every
+    ``_CHECKPOINT_INTERVAL`` cycle) so a DB created after startup is picked up
+    on the next tick.  The TOCTOU window between ``exists()`` and
+    ``_connect_overrides_db`` is benign: a racing create yields a harmless
+    empty-DB checkpoint.
+
+    Returns:
+        ``CheckpointResult(busy, log, checkpointed)`` — ``(0, 0, 0)`` if absent;
+        otherwise the result of :func:`_checkpoint_overrides_db`.
+    """
+    if not _overrides_db_path(project_root).exists():
+        return CheckpointResult(0, 0, 0)
+    return await _checkpoint_overrides_db(project_root)
 
 
 FUSED_MEMORY_INSTRUCTIONS = """\

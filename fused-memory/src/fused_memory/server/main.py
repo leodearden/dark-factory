@@ -19,8 +19,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from functools import partial  # noqa: E402
+
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
-from fused_memory.server.tools import create_mcp_server  # noqa: E402
+from fused_memory.server.tools import (  # noqa: E402
+    _checkpoint_overrides_db_if_exists,
+    create_mcp_server,
+)
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
@@ -766,6 +771,7 @@ async def run_server():
         ticket_store=ticket_store if 'ticket_store' in locals() else None,
         write_journal=write_journal,
         memory_service=memory_service,
+        known_projects=_known_projects_map,
     )
     if _checkpoint_targets:
         checkpoint_task = asyncio.create_task(
@@ -949,12 +955,20 @@ def _collect_checkpoint_targets(
     ticket_store,
     write_journal,
     memory_service,
+    known_projects: dict[str, str] | None = None,
 ) -> list[tuple[str, object]]:
     """Gather every live SQLite store that exposes a ``checkpoint`` method.
 
     Returns ``[(name, callable)]`` pairs. ``SqliteTaskBackend.checkpoint_all``
     returns a per-project dict; the others return ``(busy, log, checkpointed)``.
     The loop in :func:`_periodic_checkpoint_loop` normalises both.
+
+    When *known_projects* is provided (a ``{project_id: project_root}`` map),
+    one ``overrides:{project_id}`` target is appended per project.  Each target
+    calls :func:`~fused_memory.server.tools._checkpoint_overrides_db_if_exists`,
+    which is a no-op when the DB file is absent (preventing phantom DB creation
+    for projects that have never set an override).  Passing ``None`` (the
+    default) leaves existing callers unchanged.
     """
     targets: list[tuple[str, object]] = []
     if taskmaster is not None and hasattr(taskmaster, 'checkpoint_all'):
@@ -973,6 +987,12 @@ def _collect_checkpoint_targets(
     pe = getattr(memory_service, 'planned_episode_registry', None)
     if pe is not None and hasattr(pe, 'checkpoint'):
         targets.append(('planned_episode_registry', pe.checkpoint))
+    if known_projects:
+        for project_id, root in known_projects.items():
+            targets.append((
+                f'overrides:{project_id}',
+                partial(_checkpoint_overrides_db_if_exists, root),
+            ))
     return targets
 
 
