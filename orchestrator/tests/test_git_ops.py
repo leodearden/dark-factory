@@ -1531,12 +1531,6 @@ class TestAdvanceMainDivergenceWarning:
         )
         assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
 
-        _, verified_tip_raw, _ = await _run(
-            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
-            cwd=merge_b.merge_worktree,
-        )
-        verified_tip = verified_tip_raw.strip()
-
         # Land A so B is not a descendant; NO post-verify commit to B.
         merge_a = await git_ops.merge_to_main(wt_a.path, 'nodiv-a')
         assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
