@@ -237,7 +237,6 @@ unblock_auto:
 # Usage cap handling — multi-account failover
 usage_cap:
   enabled: true
-  pause_threshold: 0.96
   wait_for_reset: true
   probe_interval_secs: 300
   max_probe_interval_secs: 1800
