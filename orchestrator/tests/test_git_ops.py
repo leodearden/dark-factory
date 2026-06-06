@@ -1213,6 +1213,107 @@ class TestAdvanceMainCasRetrySha:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainRemergePin:
+    """Regression: the re-merge fallback must pin to M^2 (verified branch tip),
+    not the live branch ref, to prevent post-verify commits from landing on main.
+
+    Reference: esc-1657-26 — advance_main's fallback re-merged a moving branch
+    ref incorporating unverified commits committed during the verify/advance window.
+    """
+
+    async def test_advance_main_remerge_pins_to_verified_branch_tip(
+        self, git_ops: GitOps,
+    ):
+        """When the rebase fallback runs, the landed tree must match M^2 (the
+        verified branch tip), not the current live branch ref.
+
+        Scenario:
+          A's merge lands first (so B's merge commit M is not a descendant
+          of current main — advance_main must retry via the re-merge fallback).
+          B's merge worktree is built first against the original main capturing
+          branch tip V0 as M^2.  A post-verify commit (stale.py) is pushed to
+          B's branch (V1), moving the live ref past V0.  The rebase is forced
+          to fail (deterministic fallback path).
+
+          Assert: result == 'advanced' AND stale.py is absent from main
+          (the advance must pin to V0=M^2, not pick up V1's stale.py).
+
+          This fails today: the fallback merges ``full_branch`` (live ref)
+          and stale.py lands on main.
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        # Two branches touching different files — conflict-free re-merge.
+        wt_a = await git_ops.create_worktree('pin-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('pin-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        # Build B's merge worktree against the ORIGINAL main so that after A
+        # lands M is not a descendant of current main → advance_main retries.
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'pin-b', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+        # Capture the verified branch tip = M^2.
+        _, verified_tip_raw, _ = await _run(
+            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+            cwd=merge_b.merge_worktree,
+        )
+        verified_tip = verified_tip_raw.strip()
+        assert verified_tip, 'M^2 must be resolvable from the merge worktree'
+
+        # Land A on main so B's merge commit is no longer a descendant.
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'pin-a')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        # Post-verify commit: add stale.py to B's branch AFTER the merge
+        # worktree was built — moves live ref (task/pin-b) past V0=M^2.
+        (wt_b.path / 'stale.py').write_text('stale = True\n')
+        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
+
+        # Force git rebase to fail deterministically so the re-merge fallback runs.
+        original_run = _run
+
+        async def failing_rebase_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'rebase', 'main']:
+                return (1, '', 'forced rebase failure for test')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='pin-b',
+            )
+
+        assert result == 'advanced', f'Expected advanced, got {result!r}'
+
+        # KEY assertion: stale.py must NOT be in main — the advance must have
+        # used V0=M^2, not the moved live ref V1 (which includes stale.py).
+        _, tree_out, _ = await _run(
+            ['git', 'ls-tree', '-r', 'main', '--name-only'],
+            cwd=git_ops.project_root,
+        )
+        assert 'stale.py' not in tree_out, (
+            f'stale.py must NOT land on main. '
+            f'verified_tip={verified_tip[:8]}, '
+            f'main tree: {tree_out!r}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+
+@pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
         wt_info = await git_ops.create_worktree('clean-wt')
