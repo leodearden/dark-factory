@@ -251,6 +251,7 @@ def _assert_valid_stage1_marker(
     assert call_kwargs.get('category') == 'observations_and_summaries'
     meta = call_kwargs.get('metadata', {})
     assert meta.get('source') == 'stage1_flag_marker'
+    assert meta.get('kind') == 'stage1_flag_marker'
     assert meta.get('task_id') == task_id
     assert meta.get('flag_type') == flag_type
     assert meta.get('run_id') == run_id
@@ -424,6 +425,39 @@ async def test_dedup_flags_no_prior_marker_writes_new_marker():
     _assert_valid_stage1_marker(
         memory_service.add_memory.call_args.kwargs,
         task_id='99', flag_type='stale_metadata', run_id='r1',
+    )
+
+
+@pytest.mark.asyncio
+async def test_marker_metadata_includes_source_and_kind():
+    """Stage1 flag marker add_memory call must carry BOTH source and kind keys.
+
+    Regression test for task-1659: earlier writes set source='stage1_flag_marker'
+    but omitted kind='stage1_flag_marker', breaking dual-filter queries that key
+    on both fields.  This test drives a MISS path (no prior marker) through
+    dedup_flags and asserts both keys are present in the written metadata.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # no prior marker
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    flags = [{'task_id': '7', 'flag_type': 'missing_deliverable', 'description': 'x'}]
+    await dedup_flags(
+        memory_service=memory_service,
+        project_id='proj',
+        run_id='r99',
+        flags=flags,
+    )
+
+    memory_service.add_memory.assert_called_once()
+    written_meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+    assert written_meta.get('source') == 'stage1_flag_marker', (
+        f"metadata.source must be 'stage1_flag_marker', got: {written_meta!r}"
+    )
+    assert written_meta.get('kind') == 'stage1_flag_marker', (
+        f"metadata.kind must be 'stage1_flag_marker', got: {written_meta!r}"
     )
 
 
