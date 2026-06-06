@@ -148,6 +148,7 @@ class TicketJanitor:
         batch_limit: int = 100,
         primary_project_root: str = '',
         liveness_probe: Callable[[str], bool] | None = None,
+        signal_ticket_resolved: Callable[[str], None] | None = None,
         known_projects: dict[str, str] | None = None,
         probe_defect_threshold: int = 3,
     ) -> None:
@@ -160,6 +161,13 @@ class TicketJanitor:
         # for projects whose worker is dead are terminalised as
         # ``failed/worker_dead``. None disables the reaper (legacy behaviour).
         self._liveness_probe = liveness_probe
+        # Optional callback invoked once per reaped ticket id after the
+        # terminalising UPDATE commits.  Mirrors the liveness_probe injection
+        # pattern.  Wired in server/main.py to
+        # task_interceptor._signal_ticket_event so blocked resolve_ticket
+        # waiters are woken promptly instead of waiting for their own timeout.
+        # None = legacy no-signal behaviour (default).
+        self._signal_ticket_resolved = signal_ticket_resolved
         # Consecutive probe raises before a probe-defect escalation is surfaced.
         # Default 3 keeps a single transient blip silent.  Reset per-project
         # whenever the probe returns cleanly.
@@ -353,7 +361,7 @@ class TicketJanitor:
                     self._probe_failures.pop(pid, None)
                 if not alive:
                     try:
-                        n = await self._store.mark_pending_failed_for_project(
+                        reaped_ids = await self._store.mark_pending_failed_for_project(
                             pid, reason='worker_dead',
                         )
                     except Exception:
@@ -362,11 +370,26 @@ class TicketJanitor:
                             'failed for %s', pid,
                         )
                         continue
-                    if n:
+                    if reaped_ids:
                         logger.warning(
                             'ticket_janitor: reaped %d pending ticket(s) for '
-                            'dead worker on project %s', n, pid,
+                            'dead worker on project %s', len(reaped_ids), pid,
                         )
+                        # Signal blocked resolve_ticket waiters so they wake
+                        # promptly with failed/worker_dead instead of waiting
+                        # for their own timeout.  Strictly after the
+                        # terminalising UPDATE so the woken caller re-reads a
+                        # terminal row (not still-pending).  Best-effort:
+                        # a buggy callback must not crash the janitor loop.
+                        if self._signal_ticket_resolved is not None:
+                            for tid in reaped_ids:
+                                try:
+                                    self._signal_ticket_resolved(tid)
+                                except Exception:
+                                    logger.exception(
+                                        'ticket_janitor: signal_ticket_resolved '
+                                        'raised for %s', tid,
+                                    )
             # Prune project IDs that no longer appear in the pending list so
             # _probe_failures doesn't grow without bound when projects are
             # deleted, renamed, or have all tickets terminalised elsewhere.

@@ -838,3 +838,75 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
     )
 
 
+@pytest.mark.asyncio
+async def test_worker_dead_reap_invokes_signal_callback_per_ticket(store, tmp_path):
+    """When the reaper terminalises pending tickets for a dead worker, the
+    injected signal_ticket_resolved callback is invoked exactly once per
+    reaped ticket id — no more, no less.
+
+    RED until TicketJanitor accepts signal_ticket_resolved and invokes it.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='Ticket-A'),
+        )
+        b = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='Ticket-B'),
+        )
+
+        signalled: list[str] = []
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: False,  # always dead
+            signal_ticket_resolved=signalled.append,
+        )
+        await janitor.tick()
+
+        # Callback must have been called once per reaped ticket id.
+        assert set(signalled) == {a, b}, (
+            f'Expected callback for both ticket ids; got {signalled}'
+        )
+        assert len(signalled) == 2, (
+            f'Expected exactly 2 callback invocations; got {len(signalled)}'
+        )
+
+        # Rows are terminal failed/worker_dead.
+        for tid in (a, b):
+            row = await store.get(tid)
+            assert row['status'] == 'failed', f'{tid}: {row}'
+            assert row['reason'] == 'worker_dead', f'{tid}: {row["reason"]!r}'
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_dead_reap_no_signal_callback_is_safe(store, tmp_path):
+    """With the default signal_ticket_resolved=None, the reaper still
+    terminalises pending tickets and tick() does not raise — back-compat.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='Ticket-A'),
+        )
+
+        # signal_ticket_resolved defaults to None — must not raise.
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: False,
+        )
+        await janitor.tick()  # must not raise
+
+        row = await store.get(a)
+        assert row['status'] == 'failed'
+        assert row['reason'] == 'worker_dead'
+    finally:
+        handle.close()

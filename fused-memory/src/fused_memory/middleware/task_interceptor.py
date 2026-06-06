@@ -1719,12 +1719,15 @@ class TaskInterceptor:
         If the ticket is already terminal, returns immediately.  Otherwise
         registers an asyncio.Event and awaits it (optionally with
         *timeout_seconds*).  On timeout, returns a synthetic failed dict
-        WITHOUT mutating the ticket row — the worker may still resolve it later,
-        and the worker-liveness reaper (TicketJanitor.tick) terminalises
+        WITHOUT mutating the ticket row — the worker may still resolve it later.
+
+        The worker-liveness reaper (:meth:`TicketJanitor.tick`) terminalises
         pending tickets whose project's curator worker has died, marking them
-        failed with reason='worker_dead' (the retired wall-clock TTL janitor
-        no longer runs; ``expires_at`` is a non-load-bearing far-future
-        placeholder).
+        ``failed/worker_dead``, AND signals blocked resolve_ticket waiters via
+        the injected ``signal_ticket_resolved`` callback so they wake promptly
+        instead of waiting for their own timeout (wired in server/main.py to
+        :meth:`_signal_ticket_event`).  The retired wall-clock TTL janitor no
+        longer runs; ``expires_at`` is a non-load-bearing far-future placeholder.
 
         Returns ``{status, task_id?, reason?}`` — does NOT expose ``result_json``.
 
