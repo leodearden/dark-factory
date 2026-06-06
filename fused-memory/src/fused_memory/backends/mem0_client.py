@@ -279,6 +279,84 @@ class Mem0Backend:
         )
         return result.count
 
+    async def scroll_by_metadata(
+        self,
+        scope: Scope,
+        filters: dict[str, Any],
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Deterministic enumeration of memories whose payload matches all *filters*.
+
+        Goes straight to Qdrant's scroll API with a payload ``Filter`` —
+        a key-equality lookup, NOT semantic search.  Use this when you need
+        the full list of memories tagged with specific metadata (e.g. to find
+        the oldest pool members for GC) rather than a top-N similarity ranking
+        that can silently drop matches off the bottom.
+
+        Closes the standing TODO in task_knowledge_sync.py that requested this
+        primitive for GC-correct pool enumeration.
+
+        Mem0 stores ``add_memory(metadata=...)`` fields as top-level keys on the
+        Qdrant payload, so ``filters={'recon_pool': 'stage2_cycle_summary'}``
+        matches against ``payload.recon_pool == 'stage2_cycle_summary'``.
+
+        Args:
+            scope: Project/agent/session scope.
+            filters: Non-empty dict of key→value equality filters (same as
+                count_by_metadata).  Empty dict is rejected to avoid silently
+                enumerating every memory in the collection.
+            limit: Maximum number of points to return (default 1000).
+
+        Returns:
+            List of dicts ``{'id': ..., 'created_at': ..., 'metadata': {...}}``
+            where ``created_at`` is the raw string from the Qdrant payload (or
+            ``None`` if absent) and ``metadata`` is the full payload dict.
+            Returns ``[]`` on timeout (logs WARNING, does not raise).
+
+        Raises:
+            ValueError: If *filters* is empty.
+        """
+        if not filters:
+            raise ValueError(
+                'scroll_by_metadata requires at least one filter; '
+                'use get_all() to retrieve all memories in the collection',
+            )
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in filters.items()
+        ]
+        qdrant_filter = qmodels.Filter(must=must)
+        try:
+            points, _next_offset = await asyncio.wait_for(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=qdrant_filter,
+                    with_payload=True,
+                    limit=limit,
+                ),
+                timeout=self._read_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                f'Mem0 scroll_by_metadata timed out after {self._read_timeout}s '
+                f'(collection={collection_name}, filters={filters})'
+            )
+            return []
+
+        result = []
+        for point in points:
+            payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+            result.append({
+                'id': point.id,
+                'created_at': payload.get('created_at'),
+                'metadata': payload,
+            })
+        return result
+
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""
         import contextlib
