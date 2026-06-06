@@ -1598,7 +1598,6 @@ class GitOps:
         """
         full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
         rebased = False  # Track whether any rebase/re-merge occurred this call
-        self._last_remerged_branch_tip: str | None = None  # set when re-merge fallback runs
 
         # Derive the verified branch tip from M^2 — the exact branch commit
         # that merge_to_main incorporated (--no-ff guarantees M^2 is the
@@ -1720,10 +1719,6 @@ class GitOps:
                     'be contaminated; _assert_no_task_dir will catch it.%s',
                     attempt + 1, scrub_result.format_error(prefix=' Error: '),
                 )
-            # Record the branch tip that was actually re-merged (side channel
-            # mirrors _last_advanced_sha — callers/tests can observe which
-            # branch SHA was merged vs. the live ref tip).
-            self._last_remerged_branch_tip = _remerge_target
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )

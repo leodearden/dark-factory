@@ -1212,6 +1212,66 @@ class TestAdvanceMainCasRetrySha:
         assert git_ops._last_advanced_sha == merge.merge_commit
 
 
+# -- Shared helpers for re-merge-fallback tests --------------------------------
+
+
+async def _build_remerge_scenario(
+    git_ops: GitOps,
+    branch_a: str,
+    branch_b: str,
+):
+    """Set up the 'A lands, B not a descendant' re-merge fallback scenario.
+
+    Creates two non-conflicting branches (a.py / b.py), builds B's merge
+    worktree against the ORIGINAL main (so B is not a descendant of main
+    after A lands), captures verified_tip = M^2, lands A, and returns
+    (merge_b, verified_tip, wt_b).  The caller may add a post-verify commit
+    to wt_b.path before calling advance_main to simulate a moved branch ref.
+    """
+    _, original_main_sha, _ = await _run(
+        ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+    )
+    original_main_sha = original_main_sha.strip()
+
+    wt_a = await git_ops.create_worktree(branch_a)
+    (wt_a.path / 'a.py').write_text('a = 1\n')
+    await git_ops.commit(wt_a.path, 'Add a')
+
+    wt_b = await git_ops.create_worktree(branch_b)
+    (wt_b.path / 'b.py').write_text('b = 1\n')
+    await git_ops.commit(wt_b.path, 'Add b')
+
+    merge_b = await git_ops.merge_to_main(
+        wt_b.path, branch_b, base_sha=original_main_sha,
+    )
+    assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+    _, verified_tip_raw, _ = await _run(
+        ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+        cwd=merge_b.merge_worktree,
+    )
+    verified_tip = verified_tip_raw.strip()
+    assert verified_tip, 'M^2 must be resolvable from the merge worktree'
+
+    merge_a = await git_ops.merge_to_main(wt_a.path, branch_a)
+    assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+    assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+    await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+    return merge_b, verified_tip, wt_b
+
+
+async def _failing_rebase_run(cmd, cwd=None):
+    """Selective _run wrapper: forces 'git rebase main' to return rc=1.
+
+    Used to deterministically route advance_main into the re-merge fallback.
+    All other git commands are delegated to the real _run.
+    """
+    if cmd[:3] == ['git', 'rebase', 'main']:
+        return (1, '', 'forced rebase failure for test')
+    return await _run(cmd, cwd=cwd)
+
+
 @pytest.mark.asyncio
 class TestAdvanceMainRemergePin:
     """Regression: the re-merge fallback must pin to M^2 (verified branch tip),
@@ -1227,69 +1287,21 @@ class TestAdvanceMainRemergePin:
         """When the rebase fallback runs, the landed tree must match M^2 (the
         verified branch tip), not the current live branch ref.
 
-        Scenario:
-          A's merge lands first (so B's merge commit M is not a descendant
-          of current main — advance_main must retry via the re-merge fallback).
-          B's merge worktree is built first against the original main capturing
-          branch tip V0 as M^2.  A post-verify commit (stale.py) is pushed to
-          B's branch (V1), moving the live ref past V0.  The rebase is forced
-          to fail (deterministic fallback path).
+        Post-verify commit (stale.py) is pushed to B's branch, moving the live
+        ref past M^2.  The rebase is forced to fail (deterministic fallback path).
 
-          Assert: result == 'advanced' AND stale.py is absent from main
-          (the advance must pin to V0=M^2, not pick up V1's stale.py).
-
-          This fails today: the fallback merges ``full_branch`` (live ref)
-          and stale.py lands on main.
+        Assert: result == 'advanced' AND stale.py is absent from main
+        (the advance must pin to M^2, not pick up the moved live ref).
         """
-        _, original_main_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        merge_b, verified_tip, wt_b = await _build_remerge_scenario(
+            git_ops, 'pin-a', 'pin-b',
         )
-        original_main_sha = original_main_sha.strip()
 
-        # Two branches touching different files — conflict-free re-merge.
-        wt_a = await git_ops.create_worktree('pin-a')
-        (wt_a.path / 'a.py').write_text('a = 1\n')
-        await git_ops.commit(wt_a.path, 'Add a')
-
-        wt_b = await git_ops.create_worktree('pin-b')
-        (wt_b.path / 'b.py').write_text('b = 1\n')
-        await git_ops.commit(wt_b.path, 'Add b')
-
-        # Build B's merge worktree against the ORIGINAL main so that after A
-        # lands M is not a descendant of current main → advance_main retries.
-        merge_b = await git_ops.merge_to_main(
-            wt_b.path, 'pin-b', base_sha=original_main_sha,
-        )
-        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
-
-        # Capture the verified branch tip = M^2.
-        _, verified_tip_raw, _ = await _run(
-            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
-            cwd=merge_b.merge_worktree,
-        )
-        verified_tip = verified_tip_raw.strip()
-        assert verified_tip, 'M^2 must be resolvable from the merge worktree'
-
-        # Land A on main so B's merge commit is no longer a descendant.
-        merge_a = await git_ops.merge_to_main(wt_a.path, 'pin-a')
-        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
-        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
-
-        # Post-verify commit: add stale.py to B's branch AFTER the merge
-        # worktree was built — moves live ref (task/pin-b) past V0=M^2.
+        # Post-verify commit: moves live ref (task/pin-b) past M^2.
         (wt_b.path / 'stale.py').write_text('stale = True\n')
         await git_ops.commit(wt_b.path, 'Post-verify stale commit')
 
-        # Force git rebase to fail deterministically so the re-merge fallback runs.
-        original_run = _run
-
-        async def failing_rebase_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'rebase', 'main']:
-                return (1, '', 'forced rebase failure for test')
-            return await original_run(cmd, cwd=cwd)
-
-        with patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+        with patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
             result = await git_ops.advance_main(
                 merge_b.merge_commit,
                 merge_worktree=merge_b.merge_worktree,
@@ -1299,7 +1311,7 @@ class TestAdvanceMainRemergePin:
         assert result == 'advanced', f'Expected advanced, got {result!r}'
 
         # KEY assertion: stale.py must NOT be in main — the advance must have
-        # used V0=M^2, not the moved live ref V1 (which includes stale.py).
+        # used M^2, not the moved live ref (which includes stale.py).
         _, tree_out, _ = await _run(
             ['git', 'ls-tree', '-r', 'main', '--name-only'],
             cwd=git_ops.project_root,
@@ -1311,104 +1323,6 @@ class TestAdvanceMainRemergePin:
         )
 
         await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
-
-
-@pytest.mark.asyncio
-class TestAdvanceMainRemergedBranchTip:
-    """Regression canary: advance_main must expose _last_remerged_branch_tip when
-    the re-merge fallback executes, and None when it does not.
-
-    Mirrors the _last_advanced_sha side-channel pattern.
-    """
-
-    async def test_advance_main_records_remerged_branch_tip(
-        self, git_ops: GitOps,
-    ):
-        """When the re-merge fallback runs, _last_remerged_branch_tip must be set
-        to the pinned verified branch tip (M^2).
-
-        Fails today: the attribute does not exist (AttributeError).
-        """
-        _, original_main_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
-        )
-        original_main_sha = original_main_sha.strip()
-
-        wt_a = await git_ops.create_worktree('rbt-a')
-        (wt_a.path / 'a.py').write_text('a = 1\n')
-        await git_ops.commit(wt_a.path, 'Add a')
-
-        wt_b = await git_ops.create_worktree('rbt-b')
-        (wt_b.path / 'b.py').write_text('b = 1\n')
-        await git_ops.commit(wt_b.path, 'Add b')
-
-        merge_b = await git_ops.merge_to_main(
-            wt_b.path, 'rbt-b', base_sha=original_main_sha,
-        )
-        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
-
-        _, verified_tip_raw, _ = await _run(
-            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
-            cwd=merge_b.merge_worktree,
-        )
-        verified_tip = verified_tip_raw.strip()
-
-        merge_a = await git_ops.merge_to_main(wt_a.path, 'rbt-a')
-        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
-        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
-
-        (wt_b.path / 'stale.py').write_text('stale = True\n')
-        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
-
-        original_run = _run
-
-        async def failing_rebase_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'rebase', 'main']:
-                return (1, '', 'forced rebase failure for test')
-            return await original_run(cmd, cwd=cwd)
-
-        with patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
-            result = await git_ops.advance_main(
-                merge_b.merge_commit,
-                merge_worktree=merge_b.merge_worktree,
-                branch='rbt-b',
-            )
-
-        assert result == 'advanced'
-        # Side channel must record the pinned verified branch tip.
-        assert hasattr(git_ops, '_last_remerged_branch_tip'), (
-            '_last_remerged_branch_tip attribute missing — not yet implemented'
-        )
-        assert git_ops._last_remerged_branch_tip == verified_tip, (
-            f'Expected _last_remerged_branch_tip={verified_tip[:8]}, '
-            f'got {git_ops._last_remerged_branch_tip!r}'
-        )
-
-        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
-
-    async def test_last_remerged_branch_tip_is_none_when_no_remerge(
-        self, git_ops: GitOps,
-    ):
-        """When no re-merge fallback runs (fast-forward, no CAS retry),
-        _last_remerged_branch_tip must be None.
-
-        Fails today: the attribute does not exist (AttributeError).
-        """
-        wt = await git_ops.create_worktree('rbt-ff')
-        (wt.path / 'x.py').write_text('x = 1\n')
-        await git_ops.commit(wt.path, 'Add x')
-        merge = await git_ops.merge_to_main(wt.path, 'rbt-ff')
-        assert merge.success and merge.merge_commit
-        assert await git_ops.advance_main(merge.merge_commit) == 'advanced'
-
-        assert hasattr(git_ops, '_last_remerged_branch_tip'), (
-            '_last_remerged_branch_tip attribute missing — not yet implemented'
-        )
-        assert git_ops._last_remerged_branch_tip is None, (
-            f'Expected None (no re-merge ran), '
-            f'got {git_ops._last_remerged_branch_tip!r}'
-        )
 
 
 @pytest.mark.asyncio
@@ -1425,37 +1339,10 @@ class TestAdvanceMainDivergenceWarning:
     ):
         """When the live branch ref has advanced past verified M^2, a WARNING
         is emitted recording both verified_branch_tip and the live ref tip.
-
-        Fails today: no such log line is emitted.
         """
-        _, original_main_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        merge_b, verified_tip, wt_b = await _build_remerge_scenario(
+            git_ops, 'div-a', 'div-b',
         )
-        original_main_sha = original_main_sha.strip()
-
-        wt_a = await git_ops.create_worktree('div-a')
-        (wt_a.path / 'a.py').write_text('a = 1\n')
-        await git_ops.commit(wt_a.path, 'Add a')
-
-        wt_b = await git_ops.create_worktree('div-b')
-        (wt_b.path / 'b.py').write_text('b = 1\n')
-        await git_ops.commit(wt_b.path, 'Add b')
-
-        merge_b = await git_ops.merge_to_main(
-            wt_b.path, 'div-b', base_sha=original_main_sha,
-        )
-        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
-
-        _, verified_tip_raw, _ = await _run(
-            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
-            cwd=merge_b.merge_worktree,
-        )
-        verified_tip = verified_tip_raw.strip()
-
-        merge_a = await git_ops.merge_to_main(wt_a.path, 'div-a')
-        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
-        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
 
         # Post-verify commit advances live ref past M^2 — triggers divergence.
         (wt_b.path / 'stale.py').write_text('stale = True\n')
@@ -1469,15 +1356,8 @@ class TestAdvanceMainDivergenceWarning:
         live_tip = live_tip_raw.strip()
         assert live_tip != verified_tip, 'Live tip must have moved past M^2 for this test'
 
-        original_run = _run
-
-        async def failing_rebase_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'rebase', 'main']:
-                return (1, '', 'forced rebase failure for test')
-            return await original_run(cmd, cwd=cwd)
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
-             patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+             patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
             result = await git_ops.advance_main(
                 merge_b.merge_commit,
                 merge_worktree=merge_b.merge_worktree,
@@ -1509,43 +1389,14 @@ class TestAdvanceMainDivergenceWarning:
     ):
         """When the live branch ref matches M^2 (no post-verify commits),
         no divergence WARNING is emitted.
-
-        Fails today: the divergence-check logic does not exist at all
-        (AttributeError or the warning never fires — both are failures).
         """
-        _, original_main_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        merge_b, *_ = await _build_remerge_scenario(
+            git_ops, 'nodiv-a', 'nodiv-b',
         )
-        original_main_sha = original_main_sha.strip()
-
-        wt_a = await git_ops.create_worktree('nodiv-a')
-        (wt_a.path / 'a.py').write_text('a = 1\n')
-        await git_ops.commit(wt_a.path, 'Add a')
-
-        wt_b = await git_ops.create_worktree('nodiv-b')
-        (wt_b.path / 'b.py').write_text('b = 1\n')
-        await git_ops.commit(wt_b.path, 'Add b')
-
-        merge_b = await git_ops.merge_to_main(
-            wt_b.path, 'nodiv-b', base_sha=original_main_sha,
-        )
-        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
-
-        # Land A so B is not a descendant; NO post-verify commit to B.
-        merge_a = await git_ops.merge_to_main(wt_a.path, 'nodiv-a')
-        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
-        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
-
-        original_run = _run
-
-        async def failing_rebase_run(cmd, cwd=None):
-            if cmd[:3] == ['git', 'rebase', 'main']:
-                return (1, '', 'forced rebase failure for test')
-            return await original_run(cmd, cwd=cwd)
+        # Deliberately omit the post-verify commit — live ref == M^2.
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
-             patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+             patch('orchestrator.git_ops._run', side_effect=_failing_rebase_run):
             result = await git_ops.advance_main(
                 merge_b.merge_commit,
                 merge_worktree=merge_b.merge_worktree,
