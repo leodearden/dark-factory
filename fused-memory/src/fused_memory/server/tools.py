@@ -2092,7 +2092,10 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
         try:
-            return await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
+            result = await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
+            if isinstance(result, dict) and 'error' not in result:
+                result['project_id'] = resolve_project_id(project_root)
+            return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
