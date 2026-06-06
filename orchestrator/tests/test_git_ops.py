@@ -1314,6 +1314,104 @@ class TestAdvanceMainRemergePin:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainRemergedBranchTip:
+    """Regression canary: advance_main must expose _last_remerged_branch_tip when
+    the re-merge fallback executes, and None when it does not.
+
+    Mirrors the _last_advanced_sha side-channel pattern.
+    """
+
+    async def test_advance_main_records_remerged_branch_tip(
+        self, git_ops: GitOps,
+    ):
+        """When the re-merge fallback runs, _last_remerged_branch_tip must be set
+        to the pinned verified branch tip (M^2).
+
+        Fails today: the attribute does not exist (AttributeError).
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        wt_a = await git_ops.create_worktree('rbt-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('rbt-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'rbt-b', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+
+        _, verified_tip_raw, _ = await _run(
+            ['git', 'rev-parse', f'{merge_b.merge_commit}^2'],
+            cwd=merge_b.merge_worktree,
+        )
+        verified_tip = verified_tip_raw.strip()
+
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'rbt-a')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        (wt_b.path / 'stale.py').write_text('stale = True\n')
+        await git_ops.commit(wt_b.path, 'Post-verify stale commit')
+
+        original_run = _run
+
+        async def failing_rebase_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'rebase', 'main']:
+                return (1, '', 'forced rebase failure for test')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=failing_rebase_run):
+            result = await git_ops.advance_main(
+                merge_b.merge_commit,
+                merge_worktree=merge_b.merge_worktree,
+                branch='rbt-b',
+            )
+
+        assert result == 'advanced'
+        # Side channel must record the pinned verified branch tip.
+        assert hasattr(git_ops, '_last_remerged_branch_tip'), (
+            '_last_remerged_branch_tip attribute missing — not yet implemented'
+        )
+        assert git_ops._last_remerged_branch_tip == verified_tip, (
+            f'Expected _last_remerged_branch_tip={verified_tip[:8]}, '
+            f'got {git_ops._last_remerged_branch_tip!r}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+    async def test_last_remerged_branch_tip_is_none_when_no_remerge(
+        self, git_ops: GitOps,
+    ):
+        """When no re-merge fallback runs (fast-forward, no CAS retry),
+        _last_remerged_branch_tip must be None.
+
+        Fails today: the attribute does not exist (AttributeError).
+        """
+        wt = await git_ops.create_worktree('rbt-ff')
+        (wt.path / 'x.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add x')
+        merge = await git_ops.merge_to_main(wt.path, 'rbt-ff')
+        assert merge.success and merge.merge_commit
+        assert await git_ops.advance_main(merge.merge_commit) == 'advanced'
+
+        assert hasattr(git_ops, '_last_remerged_branch_tip'), (
+            '_last_remerged_branch_tip attribute missing — not yet implemented'
+        )
+        assert git_ops._last_remerged_branch_tip is None, (
+            f'Expected None (no re-merge ran), '
+            f'got {git_ops._last_remerged_branch_tip!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
         wt_info = await git_ops.create_worktree('clean-wt')
