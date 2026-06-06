@@ -1256,6 +1256,29 @@ class MemoryService:
         scope = Scope(project_id=project_id)
         return await self.mem0.count_by_metadata(scope, filters)
 
+    async def get_memories_by_metadata(
+        self,
+        project_id: str,
+        filters: dict,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Deterministic (non-semantic) enumeration of Mem0 memories matching *filters*.
+
+        Counterpart to ``count_memories_by_metadata``: where that returns only
+        an int, this returns the full list of matching memory dicts so callers
+        can inspect IDs, timestamps, and metadata for GC or pool-cap enforcement.
+
+        Goes through ``Mem0Backend.scroll_by_metadata`` which talks to Qdrant's
+        scroll API directly with a payload filter — NOT semantic search.  Using
+        semantic search for pool GC is the failure mode that caused the
+        stage2_cycle_summary pool to grow unboundedly (tasks 20e8c2f1, 45489c2b,
+        db2ea69e).
+
+        Returns a list of ``{'id', 'created_at', 'metadata'}`` dicts.
+        """
+        scope = Scope(project_id=project_id)
+        return await self.mem0.scroll_by_metadata(scope, filters, limit)
+
     # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
