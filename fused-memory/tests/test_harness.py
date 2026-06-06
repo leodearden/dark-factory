@@ -6331,8 +6331,6 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
     captured_tree = {}
     for stage in harness.stages:
         if isinstance(stage, IntegrityCheck):
-            original_run = stage.run
-
             async def mock_stage3_run(
                 events, watermark, prior_reports, run_id, model=None, _s=stage
             ):
