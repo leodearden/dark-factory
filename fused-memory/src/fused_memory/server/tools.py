@@ -834,6 +834,74 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_memories_by_metadata(
+        project_id: str,
+        filters: dict,
+        limit: int = 1000,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Enumerate memories matching exact metadata equality filters (deterministic scroll, not semantic).
+
+        Deterministic-scroll counterpart to ``count_memories_by_metadata``: instead of
+        returning a count, returns the full list of matching memory records so callers
+        can inspect each record's metadata fields.  Like ``count_memories_by_metadata``,
+        this tool queries Qdrant's payload-filter API directly — it does NOT rank by
+        vector similarity, so it will not silently drop low-similarity matches.
+
+        **Mem0/Qdrant-only scope:** This tool enumerates only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries, preferences_and_norms,
+        procedural_knowledge). It does NOT query Graphiti.
+
+        **Bounded enumeration:** Results are capped at *limit* records (default 1000).
+        If the total matching record count (from ``count_memories_by_metadata``) exceeds
+        *limit*, this tool silently returns only the first *limit* records.  Pass an
+        explicit *limit* value or cross-check the returned list length against the count
+        tool to detect truncation.
+
+        Primary use-case: enumerating stage1_flag_markers to detect orphans that have
+        ``source='stage1_flag_marker'`` but are missing ``kind='stage1_flag_marker'``.
+        Semantic search is unsuitable for this because its top-N cutoff silently drops
+        low-similarity records — the exact failure mode documented in ``_query_stage2_flags``.
+        Example call:
+            get_memories_by_metadata(
+                project_id="dark_factory",
+                filters={"source": "stage1_flag_marker"},
+            )
+
+        This tool is intentionally read-only and is NOT included in any DISALLOW_* list,
+        so it is auto-allowed in Stage 3's read-only integrity-check mode (the same
+        property that ``count_memories_by_metadata`` documents).
+
+        Args:
+            project_id: Project scope (required)
+            filters: Exact metadata key-value pairs to match (e.g. {'source': 'stage1_flag_marker'})
+            limit: Maximum records to return (default 1000; service-level cap).
+
+        Returns:
+            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
+            or {'error': ..., 'error_type': ...} on failure.
+        """
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            memories = await memory_service.get_memories_by_metadata(
+                project_id=project_id,
+                filters=filters,
+                limit=limit,
+            )
+            return {
+                'memories': memories,
+                'project_id': project_id,
+                'filters': filters,
+                'limit': limit,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_memories_by_metadata error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_entity(
         name: str,
         project_id: str,
