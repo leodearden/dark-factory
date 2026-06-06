@@ -275,6 +275,25 @@ async def test_update_task_status_rejection_precedes_existence_check(backend, pr
 
 
 @pytest.mark.asyncio
+async def test_update_task_status_rejection_precedes_connection_error(tmp_path, project_root):
+    """Status guard runs BEFORE ensure_connected(), so rejection beats a connection error.
+
+    Uses a closed backend (ensure_connected() would raise RuntimeError) to prove
+    the ordering comment in the guard is accurate — not just implied by the code
+    position.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    closed_backend = SqliteTaskBackend(cfg)
+    await closed_backend.start()
+    await closed_backend.close()  # ensure_connected() now raises RuntimeError
+
+    with pytest.raises(TaskmasterError) as exc:
+        await closed_backend.update_task('1', project_root=project_root, status='done')
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'set_task_status' in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_update_task_appends_metadata(backend, project_root):
     await backend.add_task(
         project_root=project_root,

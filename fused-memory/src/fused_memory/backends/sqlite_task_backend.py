@@ -733,9 +733,8 @@ class SqliteTaskBackend:
             if priority is not None:
                 set_columns.append('priority = ?')
                 set_values.append(priority)
-            if status is not None:
-                set_columns.append('status = ?')
-                set_values.append(status)
+            # NOTE: status is intentionally absent — the guard at the top of
+            # this method unconditionally raises before reaching this point.
 
             # details: explicit param wins over prompt. Both honor ``append``.
             existing_details = row['details'] or ''
