@@ -1124,6 +1124,30 @@ async def test_get_tasks_stamps_project_provenance(mcp_server_with_tasks, task_i
 
 
 @pytest.mark.asyncio
+async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_interceptor):
+    """get_task result dict carries a project_id provenance stamp.
+
+    Symmetry with get_tasks lets callers cross-check single-task and bulk reads.
+    The existing id/title/status fields must be preserved intact.
+    """
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': 1654, 'title': 'real df task', 'status': 'done'}
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task',
+        {'id': '1654', 'project_root': '/home/leo/src/dark-factory'},
+    )
+    # Provenance stamp must be present
+    assert result.get('project_id') == 'dark_factory', (
+        f"Expected project_id='dark_factory', got: {result.get('project_id')!r}"
+    )
+    # Existing fields must be preserved
+    assert result.get('id') == 1654
+    assert result.get('title') == 'real df task'
+    assert result.get('status') == 'done'
+
+
+@pytest.mark.asyncio
 async def test_remove_dependency_qualified_not_ticket_rejected_and_forwarded(
     mcp_server_with_tasks, task_interceptor,
 ):
