@@ -198,9 +198,9 @@ class TestPauseThresholdRejected:
     """pause_threshold was removed — setting it must raise ValueError, not silently no-op."""
 
     def test_direct_construction_with_pause_threshold_raises(self):
-        """UsageCapConfig(pause_threshold=...) raises ValueError naming the removed field."""
+        """UsageCapConfig({'pause_threshold': ...}) raises ValueError naming the removed field."""
         with pytest.raises(ValueError, match='pause_threshold'):
-            UsageCapConfig(pause_threshold=0.96)
+            UsageCapConfig.model_validate({'pause_threshold': 0.96})
 
     def test_load_config_with_pause_threshold_in_yaml_raises(self, tmp_path):
         """An orchestrator YAML whose usage_cap sets pause_threshold fails at load time."""
