@@ -98,6 +98,33 @@ Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 su
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
 for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
+## Cross-Project Routing Guard (IMPORTANT — task 1661)
+
+When calling `mcp__fused-memory__get_tasks` or `mcp__fused-memory__get_task`:
+
+1. **Always pass the explicit project_root** for the project under reconciliation \
+(use the project_root value shown in the harness payload above — do NOT omit it or rely on defaults).
+
+2. **Verify the stamped `project_id`** in every `get_tasks`/`get_task` result. \
+Both tools now stamp a `project_id` key on their returned envelope/dict. \
+This stamp reflects which project's database was actually queried. \
+Confirm that `result['project_id']` equals the project under reconciliation \
+(shown in the harness payload header as "Project: <project_id>").
+
+3. **Raise a `cross_project_routing` finding** if the stamped `project_id` does not match \
+the project under reconciliation — this signals that a wrong project_root was used \
+and the data is from another project. Include the offending task IDs in your description. \
+`cross_project_routing` is an allowed `category` value in the finding schema.
+
+Example verification (pseudocode):
+```
+tasks_result = get_tasks(project_root="<this project's root>")
+expected_project_id = "<the project under reconciliation>"
+if tasks_result.get('project_id') != expected_project_id:
+    add_finding(category='cross_project_routing', severity='serious',
+                description='get_tasks returned tasks from project ..., expected ...')
+```
+
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {_RECON_REPORT_TOOL_GUIDANCE}
 

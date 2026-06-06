@@ -1941,7 +1941,20 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
         try:
-            return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+            result = await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+            if isinstance(result, dict) and 'error' not in result:
+                pid = resolve_project_id(project_root)
+                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+                result = {**result, 'project_id': pid, 'project_root': project_root}
+                await _log_read(
+                    'get_tasks',
+                    project_id=pid,
+                    result_summary={
+                        'project_id': pid,
+                        'count': len(result.get('tasks', [])),
+                    },
+                )
+            return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
@@ -2079,7 +2092,17 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
         try:
-            return await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
+            result = await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
+            if isinstance(result, dict) and 'error' not in result:
+                pid = resolve_project_id(project_root)
+                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+                result = {**result, 'project_id': pid, 'project_root': project_root}
+                await _log_read(
+                    'get_task',
+                    project_id=pid,
+                    result_summary={'project_id': pid, 'task_id': id},
+                )
+            return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
