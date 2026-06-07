@@ -9796,6 +9796,91 @@ class TestSpeculationRaceRetry:
             '(skip_verify=False); verification was skipped.'
         )
 
+    @pytest.mark.asyncio
+    async def test_remerge_force_verify_overrides_skip_verify(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ):
+        """force_verify=True overrides skip_verify for pre_rebased items; default False preserves it.
+
+        Mirrors test_remerge_retry_success_skip_verify to pin the force_verify
+        parameter semantics of _remerge.
+
+        (a) force_verify=True: even though pre_rebased=True and main is unchanged
+            (pre_merge_sha == actual_main would normally yield skip_verify=True),
+            force_verify forces skip_verify=False so verification runs.
+            Behavioural check: _verify_and_advance must invoke run_scoped_verification.
+
+        (b) Default-preservation guard (force_verify omitted / False): with an
+            identical second request (pre_rebased=True, main unchanged), calling
+            _remerge without force_verify yields skip_verify=True — the existing
+            computation (req.pre_rebased AND pre_merge_sha==actual_main) is preserved
+            for the chain-invalidation/default path (invariant 3).
+
+        RED on base: _remerge has no force_verify kwarg → TypeError.
+        """
+        # (a) force_verify=True must override skip_verify for a pre_rebased request
+        wt_a = await _make_branch_with_file(
+            git_ops, 'fv-a', 'file_fv_a.py', 'a = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # pre_rebased=True would normally yield skip_verify=True (existing computation)
+        req_a = _make_request('fv-a', 'fv-a', wt_a, config, pre_rebased=True)
+
+        item_a = await worker._remerge(req_a, None, force_verify=True)
+
+        assert item_a.immediate_outcome is None, (
+            f'Expected flowing item (no immediate_outcome); '
+            f'got {item_a.immediate_outcome}'
+        )
+        assert item_a.merge_result is not None
+        assert item_a.merge_result.success, (
+            f'Expected successful re-merge; got {item_a.merge_result}'
+        )
+        # SAFETY CONTRACT: force_verify=True must override the pre_rebased
+        # skip_verify computation — verification must run.
+        assert item_a.skip_verify is False, (
+            f'Expected skip_verify=False with force_verify=True '
+            f'(main_advanced re-merge must always verify), '
+            f'but got skip_verify={item_a.skip_verify}.'
+        )
+
+        # Behavioural check: _verify_and_advance must invoke run_scoped_verification
+        mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            advanced_a = await worker._verify_and_advance(item_a)
+
+        assert advanced_a is True
+        assert mock_verify.called, (
+            'run_scoped_verification must be invoked when skip_verify=False '
+            '(force_verify=True overrides the pre_rebased skip path); '
+            'verification was skipped.'
+        )
+
+        # (b) Default-preservation: force_verify omitted → existing computation applies
+        wt_b = await _make_branch_with_file(
+            git_ops, 'fv-b', 'file_fv_b.py', 'b = 2\n',
+        )
+        req_b = _make_request('fv-b', 'fv-b', wt_b, config, pre_rebased=True)
+
+        item_b = await worker._remerge(req_b, None)  # force_verify NOT passed
+
+        assert item_b.immediate_outcome is None, (
+            f'Expected flowing item; got {item_b.immediate_outcome}'
+        )
+        assert item_b.merge_result is not None
+        assert item_b.merge_result.success
+        # With force_verify=False (default), existing computation applies:
+        # pre_rebased=True AND pre_merge_sha==actual_main → skip_verify=True.
+        assert item_b.skip_verify is True, (
+            f'Expected skip_verify=True with force_verify=False (default) and '
+            f'pre_rebased=True when main is unchanged — existing computation must '
+            f'be preserved for chain-invalidation/default path (invariant 3), '
+            f'but got skip_verify={item_b.skip_verify}.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestTrainLifecycleEvents — train_* event emission integration
