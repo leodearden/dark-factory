@@ -13,7 +13,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **NO interactive `/unblock` sessions.** Do not spawn Claude Code sessions or any interactive tool.
 - **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, and `mcp__escalation__promote_to_l2`. Nothing else mutates state.
 - **No code edits.** Do not use `Edit`, `Write`, or any tool that modifies source files.
-- **No merge-queue interaction.** Do not call merge-queue or git-merge tools.
+- **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
 
 When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Leaving items pending at L1 indefinitely is not acceptable; if the tool is unavailable fall back to the legacy digest (see [Graceful Degradation](#graceful-degradation)).
@@ -41,7 +41,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 | **fused-memory** (MCP :8002) | Graphiti KG + Mem0 vectors + Taskmaster behind one interface; task store, reconciliation, curator | MCP calls failing; `recon_*` / `curator_failure` escalations; tasks not updating |
 | **orchestrator** | Harness (lifecycle + supervisors), scheduler (parks/module-locks/preemption), per-task steward (L0), workflow (TDD phases), agents (architect/implementer/reviewer) | Task agents failing, verify failures, merge conflicts, scope violations |
 | **escalation** | File-backed queue + MCP server + inotify watcher; the L0→L1→L2 ladder | Orphaned pending escalations; duplicate resolver races (pre-tiering symptom) |
-| **merge queue** | Serialized merges via `mcp__escalation__merge_request` | `wip_conflict` / halt-owner escalations; queue stall |
+| **merge queue** | Serialized merges via `mcp__escalation__merge_request` (bounded submit→poll; this skill never calls it) | `wip_conflict` / halt-owner escalations; queue stall |
 | **per-project targets** | reify (Rust CAD kernel), know-live, etc. — each has its own queue dir | Project-specific failures isolated to one queue; cross-project bursts suggest shared infra |
 
 ### Root-cause classes and where they surface

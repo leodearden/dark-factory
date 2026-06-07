@@ -302,6 +302,7 @@ Labels are PRD-local; IDs assigned at decompose time. Modules: `esc` =
 - **β7 — Migrate skill: escalation-watcher-auto (L1 retry-land path).**
   [skills/escalation-watcher-auto/SKILL.md] Same shape, including its retry-land flow.
   *Leaf.* Signal: as β6 for the auto-watcher. Prereqs: β1, β2.
+  *(Erratum 2026-06-04: false premise — the auto-watcher never contained a merge_request call or retry-land flow; those are β6's, in skills/escalation-watcher/SKILL.md. β7 satisfied by making the auto-watcher's no-merge invariant explicit. See task 1637 / esc-1637-9.)*
 - **β8 — The flip: default wait_secs=0, delete the unbounded branch.** [esc]
   Remove `None`-compat; clamp is the only wait path (I1 complete). *Leaf.* Signal:
   boundary tests 1+2 — `merge_request(wait_secs=600)` against a busy queue returns
