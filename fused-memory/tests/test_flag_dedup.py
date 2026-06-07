@@ -5365,12 +5365,14 @@ class TestIsValidMarkerTaskId:
 
     # ----- REJECT cases -----
 
-    def test_rejects_content_fingerprint_key(self):
-        """'fp:9216e85ac497b68d93043b64684eb049' — the content-fingerprint prefix triggers rejection."""
+    def test_accepts_content_fingerprint_key(self):
+        """'fp:9216e85ac497b68d93043b64684eb049' — canonical fp:+32 lowercase hex must be accepted."""
         from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
 
         tid = 'fp:9216e85ac497b68d93043b64684eb049'
-        assert _is_valid_marker_task_id(tid) is False, f'{tid!r} must be rejected (fp: prefix)'
+        assert _is_valid_marker_task_id(tid) is True, (
+            f'{tid!r} must be accepted (canonical fp:+32 lowercase hex)'
+        )
 
     def test_rejects_empty_string(self):
         """'' — falsy input must be rejected."""
@@ -5407,4 +5409,72 @@ class TestIsValidMarkerTaskId:
         from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
 
         assert _is_valid_marker_task_id('1.5') is False, "'1.5' must be rejected"
+
+    # ----- Anti-drift: guard accept-pattern tied to the real emitter -----
+
+    def test_accepts_anti_drift_roundtrip(self):
+        """_is_valid_marker_task_id(_content_fingerprint(x)) must be True for any non-blank x.
+
+        Ties the guard's accept-pattern to _content_fingerprint's actual output so that
+        accept/emit drift is caught as a test failure rather than a silent dedup outage.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            _content_fingerprint,
+            _is_valid_marker_task_id,
+        )
+
+        description = 'Any non-blank description for anti-drift validation'
+        fp = _content_fingerprint(description)
+        assert _is_valid_marker_task_id(fp) is True, (
+            f'_content_fingerprint output {fp!r} must be accepted by '
+            f'_is_valid_marker_task_id (anti-drift invariant)'
+        )
+
+    # ----- REJECT: malformed fp: forms -----
+
+    def test_rejects_fp_empty_hex(self):
+        """'fp:' (no hex digits) — prefix alone is not a valid fp: key."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        assert _is_valid_marker_task_id('fp:') is False, "'fp:' must be rejected (no hex digits)"
+
+    def test_rejects_fp_too_short_hex(self):
+        """'fp:' + 30 hex chars — too short (canonical format requires exactly 32 lowercase hex)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:' + 'a' * 30
+        assert _is_valid_marker_task_id(tid) is False, (
+            f'{tid!r} must be rejected (30 hex chars, need 32)'
+        )
+
+    def test_rejects_fp_too_long_hex(self):
+        """'fp:' + 64 hex chars — too long; the spec's /^fp:[0-9a-f]{64}$/ shape is wrong.
+
+        The real emitter (_content_fingerprint) produces only 32 hex chars (digest[:32]).
+        A 64-hex key would never be emitted, so accepting it would silently break dedup.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:' + 'a' * 64
+        assert _is_valid_marker_task_id(tid) is False, (
+            f'{tid!r} must be rejected (64 hex chars — too long; real emitter produces 32)'
+        )
+
+    def test_rejects_fp_uppercase_hex(self):
+        """'fp:' + uppercase 32 hex chars — fp: keys must use lowercase hex (SHA-256 hexdigest)."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:' + 'A' * 32
+        assert _is_valid_marker_task_id(tid) is False, (
+            f'{tid!r} must be rejected (uppercase hex; fp: must be lowercase)'
+        )
+
+    def test_rejects_fp_nonhex_char(self):
+        """'fp:' + 31 hex chars + 'g' — non-hex character in the body must be rejected."""
+        from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
+
+        tid = 'fp:' + 'a' * 31 + 'g'
+        assert _is_valid_marker_task_id(tid) is False, (
+            f'{tid!r} must be rejected (non-hex char "g" at position 35)'
+        )
 
