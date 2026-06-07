@@ -3621,7 +3621,11 @@ class MergeWorker(_WipHaltMixin):
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
         _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
-        _emit_merge_queued(self._event_store, req, reason='cas_retry')
+        _emit_merge_queued(
+            self._event_store, req, reason='cas_retry',
+            queue_depth=self._queue.qsize() + len(self._urgent) + 1,
+            position=0,
+        )
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 
