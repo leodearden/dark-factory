@@ -4601,8 +4601,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             f"branch_ref_in_worktree={diag['branch_ref_in_worktree']}"
         )
 
-    async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
-        """Re-merge a request against actual main after speculation invalidation."""
+    async def _remerge(
+        self,
+        req: MergeRequest,
+        started_monotonic: float | None,
+        *,
+        force_verify: bool = False,
+    ) -> SpeculativeItem:
+        """Re-merge a request against actual main after speculation invalidation.
+
+        ``force_verify`` overrides the normal skip_verify computation in the
+        normal-success return.  Set it to True when the re-merge is triggered
+        by 'main_advanced': the branch was pre-rebased onto an old main while
+        _remerge merges it against the current (newer) main, integrating commits
+        the branch never incorporated.  The documented skip_verify invariant
+        ('pre_rebased AND main unchanged') does NOT hold; skipping verification
+        would let semantically-unverified main commits land on the protected
+        branch.  Always verify — same reasoning as the speculation-race retry
+        sub-path (merge_queue.py:4653-4665).
+
+        Passing force_verify=False (the default) preserves the existing
+        computation for chain-invalidation re-merges ('previous_failed' /
+        'chain_invalidated'), keeping their skip_verify semantics unchanged
+        (invariant 3).
+        """
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
@@ -4762,11 +4784,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 failure_diagnostic=diag,
                 started_monotonic=started_monotonic,
             )
-        skip_verify = (
-            req.pre_rebased
-            and merge_result.pre_merge_sha is not None
-            and merge_result.pre_merge_sha == actual_main
-        )
+        # When force_verify is set (main_advanced re-merge), skip_verify is
+        # unconditionally False — same 'Always verify' rule as the race-retry
+        # sub-path above (merge_queue.py:4653-4665):  main advanced since the
+        # branch was pre-rebased, so the invariant ('pre_rebased AND main
+        # unchanged') does not hold and verification must run.
+        if force_verify:
+            skip_verify = False
+        else:
+            skip_verify = (
+                req.pre_rebased
+                and merge_result.pre_merge_sha is not None
+                and merge_result.pre_merge_sha == actual_main
+            )
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
