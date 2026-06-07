@@ -14635,3 +14635,127 @@ class TestCasRetryMergeQueuedDepthPosition:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestMaybeLogQueueHeartbeat — task-1675 step-9
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeLogQueueHeartbeat:
+    """Unit tests for SpeculativeMergeWorker._maybe_log_queue_heartbeat(now)."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_fires_once_rate_limits_and_skips_idle(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps, caplog,
+    ):
+        """_maybe_log_queue_heartbeat: fires, rate-limits, re-fires, idles correctly.
+
+        Scenario (incident-4156 multi-hour shape):
+          (a) First call at t0: depth>0, past interval (last=0) → returns True,
+              emits a logger.info line with depth and age in thousands of seconds,
+              writes exactly one merge_heartbeat event (task_id IS NULL).
+          (b) Immediate second call at t0: within interval → returns False (rate-limited),
+              no new log line, no new event.
+          (c) Call at t0 + interval + 1: past interval → returns True, emits again.
+          (d) After draining the queue (depth==0): returns False (idle), no emission.
+
+        Fails today because _maybe_log_queue_heartbeat and EventType.merge_heartbeat
+        do not exist.
+        """
+        db_path = tmp_path / 'hb.db'
+        event_store = EventStore(db_path=db_path, run_id='hb-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+
+        # Small override so test controls the rate-limit boundary precisely
+        worker._heartbeat_interval_s = 1.0
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        # Build a request that looks like it has been queued for 3 hours
+        old_enqueued_at = time.time() - 3 * 3600
+        req = _make_request('hb-task', 'hb-task', wt, config)
+        req.enqueued_at = old_enqueued_at  # inject multi-hour age
+
+        # Put directly into the worker's queue (no running worker needed)
+        worker._queue.put_nowait(req)
+
+        t0 = time.time()
+
+        # (a) First call — should fire
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            result_a = worker._maybe_log_queue_heartbeat(t0)
+
+        assert result_a is True, 'First heartbeat call must return True'
+
+        # Verify log line contains depth and large age
+        hb_records = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+        assert len(hb_records) >= 1, (
+            f'Expected at least one heartbeat log record, got: {[r.message for r in caplog.records]}'
+        )
+        msg = hb_records[0].message
+        # Must mention depth (1 item in queue) and an age measured in thousands of secs
+        assert '1' in msg, f'Log must mention depth=1, got: {msg!r}'
+        # The oldest age must be in the thousands range (3h = 10800s)
+        assert any(
+            int(tok) > 1000
+            for tok in re.findall(r'\d+', msg)
+        ), f'Log must mention an age > 1000s (3h ≈ 10800s), got: {msg!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_rows_a = conn.execute(
+            "SELECT task_id, json_extract(data, '$.depth') AS depth, "
+            "json_extract(data, '$.oldest_age_secs') AS age "
+            "FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchall()
+        conn.close()
+        assert len(hb_rows_a) == 1, f'Expected 1 merge_heartbeat event, got: {hb_rows_a}'
+        assert hb_rows_a[0][0] is None, 'merge_heartbeat task_id must be NULL (queue-scoped)'
+        assert hb_rows_a[0][1] == 1, f'depth must be 1, got: {hb_rows_a[0][1]}'
+        assert hb_rows_a[0][2] is not None and hb_rows_a[0][2] > 1000, (
+            f'oldest_age_secs must be > 1000 (3h shape), got: {hb_rows_a[0][2]}'
+        )
+
+        # (b) Rate-limited: immediate second call at same t0
+        caplog.clear()
+        result_b = worker._maybe_log_queue_heartbeat(t0)
+        assert result_b is False, 'Second call within interval must return False (rate-limited)'
+        hb_records_b = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+        assert len(hb_records_b) == 0, 'Rate-limited call must not emit a log record'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_b = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_b == 1, 'Rate-limited call must not write a new event'
+
+        # (c) Past interval: advance now by interval + 1
+        caplog.clear()
+        t1 = t0 + worker._heartbeat_interval_s + 1.0
+        result_c = worker._maybe_log_queue_heartbeat(t1)
+        assert result_c is True, 'Call past interval must return True'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_c = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_c == 2, f'Expected 2 merge_heartbeat events after re-fire, got: {hb_count_c}'
+
+        # (d) Drain queue → depth == 0 → idle, must not fire
+        worker._queue.get_nowait()  # remove the one item
+        caplog.clear()
+        t2 = t1 + worker._heartbeat_interval_s + 1.0
+        result_d = worker._maybe_log_queue_heartbeat(t2)
+        assert result_d is False, 'Call with depth==0 must return False (idle)'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_d = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_d == 2, 'Idle call must not write a new event'
