@@ -3379,6 +3379,69 @@ async def test_recover_stale_runs_does_not_release_live_lock(
     assert await event_buffer.get_lock_holder_instance_id(project_id) == live_iid
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
+    journal, event_buffer, mock_memory_service,
+):
+    """Reaper must reap a run whose lock owner is provably dead (heartbeat too old).
+
+    Scenario: the owning instance died.  Its lock row is still present because
+    heartbeat_at < stale_lock_seconds (7200s) so it was not swept, BUT the
+    heartbeat is older than stale_run_recovery_seconds (1800s) — 30+ missed
+    beats — which is an unambiguous death signal.
+
+    The current identity-only guard (lock_holder == run.instance_id) shields this
+    orphan.  The liveness check fixes it: same iid + stale heartbeat → reap.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+
+    # Orphan run owned by the same instance_id as our EventBuffer.
+    run = ReconciliationRun(
+        id='run-dead-owner',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    # Acquire the lock so the identity check would have shielded it before.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    # Backdate heartbeat_at to now - (cutoff + 100)s — dead, but still within
+    # stale_lock_seconds (7200s) so the row is NOT swept by the stale-lock sweep.
+    dead_heartbeat = (
+        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat, project_id),
+        )
+
+    await harness._recover_stale_runs()
+
+    after = await journal.get_run('run-dead-owner')
+    assert after is not None
+    assert after.status == RunStatus.failed, (
+        'Dead-owner orphan (stale heartbeat) must be reaped'
+    )
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    # The dead owner's own lock must be released — not a live lock's.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None, (
+        'Dead owner lock must be released after reaping'
+    )
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
