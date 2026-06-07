@@ -647,14 +647,17 @@ class ReconciliationHarness:
             ):
                 continue
 
+            diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
-                f'(started {run.started_at.isoformat()}, lock expired)'
+                f'(started {run.started_at.isoformat()}, lock expired, '
+                f'instance={run.instance_id}, disposition={diag["disposition"]})'
             )
             run.stage_reports['_error'] = {
                 'error_type': 'StaleRunRecovery',
                 'error_message': f'Run stale (>{cutoff}s, lock expired), recovered by harness',
                 'failed_stage': None,
+                **diag,
             }
             await self.journal.update_run_stage_reports(run.id, run.stage_reports)
             await self.journal.complete_run(run.id, 'failed')
@@ -681,7 +684,17 @@ class ReconciliationHarness:
                     run.project_id, instance_id=run.instance_id,
                 )
             await self._replay_deferred_writes(run.project_id)
-            self._escalate('recon_stale_run', run.id, f'Run stale (>{cutoff}s, lock expired), recovered')
+            detail = (
+                f"project={diag['project_id']} run_type={diag['run_type']} "
+                f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
+                f"disposition={diag['disposition']}"
+            )
+            self._escalate(
+                'recon_stale_run',
+                run.id,
+                f'Run stale (>{cutoff}s, lock expired), recovered',
+                detail,
+            )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
