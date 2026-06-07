@@ -178,7 +178,7 @@ async def test_terminal_task_not_parked(queue):
 
 @pytest.mark.asyncio
 async def test_release_workflow_real_slot_exit_parks_blocked(
-    queue: 'EscalationQueue',
+    queue: EscalationQueue,
 ) -> None:
     """AC4: release_workflow clears the slot via real _run_slot plumbing.
 
