@@ -4510,7 +4510,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'Task {req.task_id}: discarding stale merge '
                         f'({remerge_reason}), re-merging against actual main'
                     )
-                    item = await self._remerge(req, item.started_monotonic)
+                    # force_verify for 'main_advanced': same precondition as the
+                    # speculation-race retry — main advanced since the branch was
+                    # pre-rebased, so the skip_verify invariant ('pre_rebased AND
+                    # main unchanged') does not hold.  Always verify.
+                    # chain-invalidation triggers ('previous_failed' /
+                    # 'chain_invalidated') pass force_verify=False.  Those
+                    # triggers fire when a PRIOR item failed, meaning main has
+                    # NOT advanced since this branch was pre-rebased — the
+                    # skip_verify invariant genuinely holds for those cases.
+                    item = await self._remerge(
+                        req, item.started_monotonic,
+                        force_verify=(remerge_reason == 'main_advanced'),
+                    )
                     # Update _verify_item to the freshly re-merged item; phase stays
                     # 'remerging' until _verify_and_advance transitions it.
                     self._verify_item = item
@@ -4601,8 +4613,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             f"branch_ref_in_worktree={diag['branch_ref_in_worktree']}"
         )
 
-    async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
-        """Re-merge a request against actual main after speculation invalidation."""
+    async def _remerge(
+        self,
+        req: MergeRequest,
+        started_monotonic: float | None,
+        *,
+        force_verify: bool = False,
+    ) -> SpeculativeItem:
+        """Re-merge a request against actual main after speculation invalidation.
+
+        ``force_verify`` overrides the normal skip_verify computation in the
+        normal-success return.  Set it to True when the re-merge is triggered
+        by 'main_advanced': the branch was pre-rebased onto an old main while
+        _remerge merges it against the current (newer) main, integrating commits
+        the branch never incorporated.  The documented skip_verify invariant
+        ('pre_rebased AND main unchanged') does NOT hold; skipping verification
+        would let semantically-unverified main commits land on the protected
+        branch.  Always verify — same reasoning as the speculation-race retry
+        success return in this method (see the 'Always verify' comment below).
+
+        Passing force_verify=False (the default) preserves the existing
+        computation for chain-invalidation re-merges ('previous_failed' /
+        'chain_invalidated'), keeping their skip_verify semantics unchanged
+        (invariant 3).
+        """
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
@@ -4762,11 +4796,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 failure_diagnostic=diag,
                 started_monotonic=started_monotonic,
             )
-        skip_verify = (
-            req.pre_rebased
-            and merge_result.pre_merge_sha is not None
-            and merge_result.pre_merge_sha == actual_main
-        )
+        # When force_verify is set (main_advanced re-merge), skip_verify is
+        # unconditionally False — same 'Always verify' rule as the race-retry
+        # success return above:  main advanced since the branch was pre-rebased,
+        # so the invariant ('pre_rebased AND main unchanged') does not hold and
+        # verification must run.
+        if force_verify:
+            skip_verify = False
+        else:
+            skip_verify = (
+                req.pre_rebased
+                and merge_result.pre_merge_sha is not None
+                and merge_result.pre_merge_sha == actual_main
+            )
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
