@@ -127,6 +127,14 @@ Cap invariants (all verified by integration tests):
 - Released by stop() (over-release of a plain Semaphore is safe) so a merger
   blocked at acquire() unblocks cleanly at shutdown."""
 
+_HEARTBEAT_POLL_S: float = 30.0
+"""How often _heartbeat_loop wakes up to call _maybe_log_queue_heartbeat.
+
+The heartbeat loop polls this frequently; the actual emission rate is governed
+by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
+period short (30 s) ensures the first post-enqueue heartbeat fires promptly once
+_heartbeat_interval_s elapses, without adding measurable overhead."""
+
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
 
@@ -3888,18 +3896,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._last_heartbeat_at = now
         return True
 
+    async def _heartbeat_loop(self) -> None:
+        """Periodically emit merge-queue depth heartbeats while the worker runs.
+
+        Runs independently of the merger and verifier loops so it continues to
+        fire even when those are blocked on ``queue.get()`` or semaphores (the
+        exact silence window that caused the 2026-06-04 dead-slot misdiagnosis).
+
+        Wakes every ``_HEARTBEAT_POLL_S`` seconds and delegates the
+        fire/rate-limit/format/emit decision to the synchronous, clock-injectable
+        :meth:`_maybe_log_queue_heartbeat`.  Any unexpected exception is logged
+        and swallowed so a heartbeat bug can never crash the worker.
+        """
+        while self._running:
+            await asyncio.sleep(_HEARTBEAT_POLL_S)
+            try:
+                self._maybe_log_queue_heartbeat(time.time())
+            except Exception:
+                logger.exception('merge queue heartbeat: unexpected error')
+
     async def run(self) -> None:
-        """Start merger and verifier coroutines and wait for both to finish."""
+        """Start merger, verifier, and heartbeat coroutines; wait for merge tasks."""
         self._merger_task = asyncio.create_task(self._merger_loop())
         self._verifier_task = asyncio.create_task(self._verifier_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             await asyncio.gather(self._merger_task, self._verifier_task)
         except BaseException:
-            for t in (self._merger_task, self._verifier_task):
+            for t in (self._merger_task, self._verifier_task, self._heartbeat_task):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task, return_exceptions=True,
+                self._merger_task, self._verifier_task, self._heartbeat_task,
+                return_exceptions=True,
             )
             raise
 
@@ -3978,6 +4007,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Future now so the caller doesn't hang forever.
         if self._inflight_req is not None and not self._inflight_req.result.done():
             self._inflight_req.result.set_result(shutdown)
+
+        # Cancel the heartbeat task — it loops independently (no sentinel path).
+        # _running is already False so the loop will not re-enter after the
+        # cancellation; we await it to ensure the task is done before stop() returns.
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
 
     # ------------------------------------------------------------------
     # Event helpers
