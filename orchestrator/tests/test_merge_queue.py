@@ -11132,7 +11132,7 @@ class TestFinalizeAdvancedMerge:
 
     async def _run_chaining_driver(
         self, tmp_path: Path, config: OrchestratorConfig,
-    ) -> tuple[asyncio.Queue, dict, object]:
+    ) -> tuple[asyncio.Queue[MergeRequest], dict[str, int], MergeRequest]:
         """Shared driver: run the SUPERSET chain path, return (queue, counts, gen_next).
 
         Replicates the setup from test_chain_ctx_superset_advance_returns_superseded_and_enqueues.
