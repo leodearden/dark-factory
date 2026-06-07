@@ -11,7 +11,7 @@ import traceback
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -103,6 +103,13 @@ logger = logging.getLogger(__name__)
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
+# Task 1669: suppress re-firing of a finding whose matching escalation was
+# resolved within this window.  Beyond it, a recurrence re-escalates so a
+# re-emerging problem is not hidden forever.  Value is a policy threshold —
+# the exact constant is not load-bearing for tests (60s vs 8d test points sit
+# robustly inside/outside any reasonable 24h window).
+_RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
 
 def _derive_affected_ids(finding: dict) -> list[str]:
@@ -1549,6 +1556,8 @@ class ReconciliationHarness:
         if _RECON_DEDUP_CONFIG is None or category not in _RECON_DEDUP_CONFIG.infra_dedupe_categories:
             return False
         try:
+            effective_now = now if now is not None else datetime.now(UTC)
+            window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
             for path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
                 self._escalation_queue.queue_dir
             ):
@@ -1556,11 +1565,21 @@ class ReconciliationHarness:
                     esc = Escalation.from_json(path.read_text())  # type: ignore[possibly-undefined]
                 except Exception:
                     continue
-                if (
+                if not (
                     esc.status in ('resolved', 'dismissed')
                     and esc.category == category
                     and esc.dedupe_fingerprint == fingerprint
                 ):
+                    continue
+                if not esc.resolved_at:
+                    continue
+                try:
+                    resolved = datetime.fromisoformat(esc.resolved_at)
+                except (ValueError, TypeError):
+                    continue
+                if resolved.tzinfo is None:
+                    resolved = resolved.replace(tzinfo=UTC)
+                if effective_now - resolved <= window:
                     return True
             return False
         except Exception as e:
