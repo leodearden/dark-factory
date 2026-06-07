@@ -3231,7 +3231,9 @@ Output JSON matching the schema. Every task must appear in the output.
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_queue import SpeculativeMergeWorker, check_merge_liveness_margin
+
+        check_merge_liveness_margin(self.config)
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 
