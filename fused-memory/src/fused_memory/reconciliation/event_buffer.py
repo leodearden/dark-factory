@@ -350,13 +350,18 @@ class EventBuffer:
         ) as cursor:
             return await cursor.fetchone() is not None
 
-    async def get_lock_holder_instance_id(self, project_id: str) -> str | None:
-        """Return the instance_id of the live lock holder for project_id, or None.
+    async def get_lock_status(
+        self, project_id: str
+    ) -> tuple[str | None, float | None]:
+        """Return (instance_id, heartbeat_age_seconds) for the live lock holder.
 
-        Mirrors the stale-lock cleanup in _is_run_locked so callers see a fresh
-        view: rows whose heartbeat_at is older than stale_lock_seconds are
-        deleted before the SELECT.  Used by the harness reaper to compare
-        against a stale run's owning instance — see _recover_stale_runs.
+        Runs the same stale-lock sweep as _is_run_locked (DELETE rows with
+        heartbeat_at older than stale_lock_seconds), then SELECTs instance_id
+        and heartbeat_at for the surviving row.
+
+        Returns:
+            (instance_id, age_seconds) when a live lock row exists.
+            (None, None) when no lock row exists or the row was swept.
         """
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
@@ -370,11 +375,26 @@ class EventBuffer:
 
         db = self._require_db()
         async with db.execute(
-            'SELECT instance_id FROM reconciliation_locks WHERE project_id = ?',
+            'SELECT instance_id, heartbeat_at FROM reconciliation_locks WHERE project_id = ?',
             (project_id,),
         ) as cursor:
             row = await cursor.fetchone()
-        return row['instance_id'] if row is not None else None
+        if row is None:
+            return (None, None)
+        hb = datetime.fromisoformat(row['heartbeat_at'])
+        if hb.tzinfo is None:
+            hb = hb.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - hb).total_seconds()
+        return (row['instance_id'], age)
+
+    async def get_lock_holder_instance_id(self, project_id: str) -> str | None:
+        """Return the instance_id of the live lock holder for project_id, or None.
+
+        Delegates to get_lock_status for the stale-lock sweep and SELECT.
+        Used by the harness reaper to compare against a stale run's owning
+        instance — see _recover_stale_runs.
+        """
+        return (await self.get_lock_status(project_id))[0]
 
     async def expire_stale_bursts(self) -> int:
         """Transition 'bursting' agents to 'idle' when cooldown has elapsed."""
