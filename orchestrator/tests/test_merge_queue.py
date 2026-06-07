@@ -14437,3 +14437,79 @@ class TestEnqueueMergeQueuedDepth:
         assert depths == [1, 2, 3], (
             f'Expected queue_depth sequence [1, 2, 3], got: {depths}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCasRetryMergeQueuedDepthPosition — task-1675 step-3
+# ---------------------------------------------------------------------------
+
+
+class TestCasRetryMergeQueuedDepthPosition:
+    """MergeWorker CAS-retry emits merge_queued with queue_depth and position==0."""
+
+    @pytest.mark.asyncio
+    async def test_cas_retry_merge_queued_carries_depth_and_position_zero(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """CAS-retry re-enqueue merge_queued row must carry queue_depth>=1 and position==0.
+
+        On a CAS failure, the request is re-inserted into the urgent buffer
+        (front-of-line).  queue_depth must reflect the total pending count
+        (main queue + urgent + the item itself) and position must be 0.
+
+        Fails today because _emit_merge_queued at the CAS-retry site passes no
+        queue_depth or position.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='cas-depth-test')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'cas-depth', 'cas_depth.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_advance = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_once),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cas-depth', 'cas-depth', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        cas_retry_row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth, "
+            "       json_extract(data, '$.position') AS position, "
+            "       json_extract(data, '$.reason') AS reason "
+            "FROM events WHERE event_type = 'merge_queued' AND "
+            "json_extract(data, '$.reason') = 'cas_retry'"
+        ).fetchone()
+        conn.close()
+
+        assert cas_retry_row is not None, 'No merge_queued(cas_retry) row found'
+        depth, position, reason = cas_retry_row
+        assert depth is not None, 'queue_depth must not be NULL on cas_retry merge_queued'
+        assert depth >= 1, f'Expected queue_depth >= 1, got {depth}'
+        assert position == 0, f'Expected position == 0 (front-of-line), got {position}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
