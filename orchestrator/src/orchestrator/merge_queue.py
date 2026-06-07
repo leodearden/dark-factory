@@ -4515,8 +4515,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # pre-rebased, so the skip_verify invariant ('pre_rebased AND
                     # main unchanged') does not hold.  Always verify.
                     # chain-invalidation triggers ('previous_failed' /
-                    # 'chain_invalidated') pass force_verify=False and retain
-                    # their existing skip_verify semantics (invariant 3).
+                    # 'chain_invalidated') pass force_verify=False.  Those
+                    # triggers fire when a PRIOR item failed, meaning main has
+                    # NOT advanced since this branch was pre-rebased — the
+                    # skip_verify invariant genuinely holds for those cases.
                     item = await self._remerge(
                         req, item.started_monotonic,
                         force_verify=(remerge_reason == 'main_advanced'),
@@ -4628,7 +4630,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ('pre_rebased AND main unchanged') does NOT hold; skipping verification
         would let semantically-unverified main commits land on the protected
         branch.  Always verify — same reasoning as the speculation-race retry
-        sub-path (merge_queue.py:4653-4665).
+        success return in this method (see the 'Always verify' comment below).
 
         Passing force_verify=False (the default) preserves the existing
         computation for chain-invalidation re-merges ('previous_failed' /
@@ -4796,9 +4798,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
         # When force_verify is set (main_advanced re-merge), skip_verify is
         # unconditionally False — same 'Always verify' rule as the race-retry
-        # sub-path above (merge_queue.py:4653-4665):  main advanced since the
-        # branch was pre-rebased, so the invariant ('pre_rebased AND main
-        # unchanged') does not hold and verification must run.
+        # success return above:  main advanced since the branch was pre-rebased,
+        # so the invariant ('pre_rebased AND main unchanged') does not hold and
+        # verification must run.
         if force_verify:
             skip_verify = False
         else:
