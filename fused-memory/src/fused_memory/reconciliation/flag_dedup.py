@@ -149,6 +149,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any, Literal, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
@@ -463,22 +464,21 @@ async def _write_and_confirm_marker(
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
-    **Validation guard (task-1656, defense-in-depth):** before calling
-    ``add_memory``, ``tid`` is checked by :func:`_is_valid_marker_task_id`.
-    Under normal operation this guard is never reached for invalid keys — the
-    early guard in :func:`dedup_flags` (added in the task-1656 amendment pass)
-    short-circuits before the search+write path for ``fp:…`` and other
-    non-numeric keys.  This guard remains as a defense-in-depth backstop for
-    any future code path that calls ``_write_and_confirm_marker`` directly with
-    an unvalidated ``tid``.  When tripped it logs a WARNING (genuinely unexpected
-    at this call site after the early guard) and returns ``False`` — ``add_memory``
-    and ``_confirm_and_track`` are NOT called.  Returning ``False`` (not raising)
-    ensures:
+    **Validation guard (defense-in-depth):** before calling ``add_memory``,
+    ``tid`` is checked by :func:`_is_valid_marker_task_id`.  Under normal
+    operation this guard is never tripped — the early guard in
+    :func:`dedup_flags` already validates ``tid`` before reaching this helper,
+    so all real signatures (numeric, comma-joined, or canonical ``fp:+32-hex``)
+    pass both guards.  This backstop exists for any future direct caller that
+    bypasses the early guard.  When tripped for a genuinely-invalid ``tid``
+    (e.g. ``'abc'``, malformed ``fp:`` variants, empty string) it logs a WARNING
+    and returns ``False`` — ``add_memory`` and ``_confirm_and_track`` are NOT
+    called.  Returning ``False`` (not raising) ensures:
 
     - On the HIT path, priors are NOT deleted (best-effort-replacement invariant:
       never delete priors when no replacement was written).
-    - The confirmation circuit-breaker counter is untouched — a deliberate
-      guard-skip is not a Mem0 brownout signal.
+    - The confirmation circuit-breaker counter is untouched — a guard-skip for
+      a genuinely-invalid ``tid`` is not a Mem0 brownout signal.
 
     On add_memory exception: logs a unified WARNING and returns ``False``.
 
@@ -492,16 +492,18 @@ async def _write_and_confirm_marker(
     ``bool(response.memory_ids)`` was False (TRIPPED breaker).  Both templates
     are forwarded verbatim to ``confirm_and_track``.
     """
-    # Validation guard: reject non-numeric task_id keys before writing to Mem0.
-    # Stage 2 cannot process non-integer marker keys (e.g. fp:… content-fingerprint
-    # keys produced by compute_content_fingerprint_signature), which causes perpetual
-    # stale-marker cleanup loops.  Returning False without touching add_memory or
-    # _confirm_and_track preserves the HIT-path best-effort-replacement invariant
-    # and keeps the circuit-breaker counter clean.
+    # Defense-in-depth guard: reject genuinely-invalid task_id keys before writing
+    # to Mem0.  Under normal operation the early guard in dedup_flags already validated
+    # tid (numeric, comma-joined, or canonical fp:+32-hex), so this branch is not
+    # reached for any real signature.  It stays cheap and silent for correct callers;
+    # logging at WARNING here is appropriate because reaching this branch means an
+    # unvalidated tid was passed directly to this helper — genuinely unexpected.
+    # Returning False (not raising) preserves the HIT-path best-effort-replacement
+    # invariant and keeps the circuit-breaker counter clean.
     if not _is_valid_marker_task_id(tid):
         log.warning(
-            'flag_dedup: skipping stage1_flag_marker write for non-numeric task_id %r'
-            ' flag_type %s — unprocessable by Stage 2',
+            'flag_dedup: skipping stage1_flag_marker write for invalid task_id %r'
+            ' flag_type %s — rejected by _is_valid_marker_task_id (defense-in-depth)',
             tid, ftype,
         )
         return False
@@ -556,16 +558,18 @@ async def dedup_flags(
       Only when BOTH helpers return None is the flag returned unchanged — no
       I/O performed.
     - If a signature is computable, the resulting ``task_id`` (``tid``) is
-      validated by ``_is_valid_marker_task_id``.  Non-numeric keys — in
-      particular ``fp:…`` content-fingerprint keys produced by
-      ``compute_content_fingerprint_signature`` — are **skipped entirely**:
-      the flag is returned unchanged and no Mem0 I/O is performed.  This
-      prevents the perpetual stale-marker cleanup loop that would result from
-      persisting a marker whose ``task_id`` Stage 2 cannot resolve.
-      Null-task_id/no-cited-tasks findings revert to re-escalating each cycle;
-      this is the intended trade-off (task-1656 design rationale).
-    - For valid (numeric or comma-joined) signatures, Mem0 is searched for a
-      prior marker memory with matching ``task_id`` and ``flag_type``.
+      validated by ``_is_valid_marker_task_id``.  This guard accepts numeric
+      keys, comma-joined integer lists, and canonical ``fp:+32-hex`` content-
+      fingerprint keys (task-1670 Option A); it rejects only genuinely-invalid
+      tids (empty string, malformed ``fp:`` variants, non-numeric strings, etc.).
+      When rejected the flag is returned unchanged and no Mem0 I/O is performed.
+    - For valid signatures (numeric, comma-joined, or canonical ``fp:``), Mem0
+      is searched for a prior marker memory with matching ``task_id`` and
+      ``flag_type``.  ``fp:``-keyed markers are a **Stage-1-internal dedup
+      artifact**: they are never consumed or swept by Stage 2's
+      ``_query_stage2_flags`` (which processes only ``flag_for_stage2=True``
+      records) and are therefore safe to persist without triggering a Stage 2
+      cleanup loop (task-1670 step-2 verification).
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
         succeeds and Mem0 confirms it, delete the prior marker
@@ -688,18 +692,18 @@ async def dedup_flags(
             result.append(flag)
             continue
         tid, ftype = sig
-        # Early guard (task-1656 amend): skip search + write for non-numeric keys.
-        # fp:… content-fingerprint keys (produced by compute_content_fingerprint_signature)
-        # are unprocessable by Stage 2 and would — if persisted — cause a perpetual
-        # stale-marker cleanup loop.  Searching Mem0 for them on every cycle is
-        # wasted network I/O since the marker write is blocked downstream anyway.
-        # Logging at DEBUG: this is an expected steady-state condition for
-        # null-task_id/no-cited-tasks findings, not an anomaly.
+        # Guard: skip search + write for genuinely-invalid tids.
+        # Canonical fp:+32-hex keys produced by compute_content_fingerprint_signature
+        # PASS this guard (task-1670 Option A): they are Stage-1-internal dedup
+        # artifacts that are safe to persist because Stage 2's _query_stage2_flags
+        # processes only flag_for_stage2=True records and never touches stage1_flag_marker
+        # rows regardless of task_id format.  Only truly-invalid tids (empty string,
+        # malformed fp: variants, non-numeric/non-fp: strings) are rejected here and
+        # logged at DEBUG (not a brownout signal, just an unexpected key shape).
         if not _is_valid_marker_task_id(tid):
             logger.debug(
-                'flag_dedup: skipping stage1 dedup for non-numeric task_id %r'
-                ' (flag_type %s) — Stage 2-unprocessable key; finding will'
-                ' re-escalate each cycle (intentional trade-off)',
+                'flag_dedup: skipping stage1 dedup for invalid task_id %r'
+                ' (flag_type %s) — rejected by _is_valid_marker_task_id',
                 tid, ftype,
             )
             result.append(flag)
@@ -800,6 +804,24 @@ async def dedup_flags(
             # per-(task_id, flag_type) bound.  The best-effort replacement
             # pattern on the HIT path ensures that once search recovers, the
             # next cycle collapses any accumulated duplicates back to a single row.
+            #
+            # Orphan-growth caveat (task-1670, Option-A trade-off): accepting
+            # fp: keys means a stage1_flag_marker row is written for every
+            # distinct normalized-description fingerprint.  These rows live in
+            # category 'observations_and_summaries' and are only ever collapsed
+            # back to one row on the HIT path for the *same* fingerprint.  A
+            # finding that stops recurring permanently leaves an orphaned marker
+            # that is never garbage-collected — Stage 2 never sweeps
+            # stage1_flag_marker records (flag_for_stage2-only filter), and
+            # sweep_orphan_flag_markers.py only purges rows missing
+            # kind='stage1_flag_marker' (so fp: markers with kind set survive).
+            # Because _query_stage2_flags uses a limit=100 top-N semantic search,
+            # an accumulating population of fp: markers competing for those 100
+            # slots can push genuine flag_for_stage2 records below the cutoff.
+            # Mitigation: a follow-up task should either (a) age out orphaned
+            # markers by last_seen_run_id staleness, or (b) migrate
+            # _query_stage2_flags off the limit=100 semantic search to
+            # scroll_by_metadata (already noted in its docstring).
             #
             # Post-write confirmation (task-1400): after writing, confirm the
             # marker is findable via a read-back search.  The WARNING is driven
@@ -967,10 +989,36 @@ def _normalize_content_description(description: str) -> str:
     return ' '.join(description.split()).casefold()
 
 
+#: Prefix emitted by :func:`_content_fingerprint`.  Used as a single source of
+#: truth so :func:`_is_valid_marker_task_id` and :func:`_content_fingerprint`
+#: cannot drift apart silently.
+_CONTENT_FP_PREFIX: str = 'fp:'
+
+#: Number of hex characters kept from SHA-256 hexdigest (``digest[:32]``).
+#: 128 bits of SHA-256 provides sufficient collision resistance for a dedup key
+#: over recon findings.  Must match :func:`_content_fingerprint`'s slice length.
+_CONTENT_FP_HEXLEN: int = 32
+
+#: Compiled regex that matches ONLY canonical content-fingerprint marker keys:
+#: ``fp:`` followed by exactly :data:`_CONTENT_FP_HEXLEN` lowercase hex digits.
+#: Uppercase hex is excluded because :func:`hashlib.sha256().hexdigest` always
+#: returns lowercase; accepting uppercase would widen the accept-set beyond what
+#: the emitter can produce and introduce false positives.
+_CONTENT_FP_RE: re.Pattern[str] = re.compile(
+    rf'{re.escape(_CONTENT_FP_PREFIX)}[0-9a-f]{{{_CONTENT_FP_HEXLEN}}}\Z'
+)
+
+
 def _is_valid_marker_task_id(tid: str) -> bool:
-    """Return True iff *tid* is a valid stage1_flag_marker key processable by Stage 2.
+    """Return True iff *tid* is a valid stage1_flag_marker key.
 
     Accepts:
+    - A canonical content-fingerprint key: ``'fp:'`` followed by exactly
+      :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits, e.g.
+      ``'fp:9216e85ac497b68d93043b64684eb049'``.  This is the ONLY shape
+      emitted by :func:`_content_fingerprint`; the regex :data:`_CONTENT_FP_RE`
+      enforces the exact length and character set so accept-pattern and
+      emit-pattern cannot drift independently.
     - A bare non-negative integer string (e.g. ``'42'``, ``'0'``).
     - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
       the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
@@ -978,14 +1026,15 @@ def _is_valid_marker_task_id(tid: str) -> bool:
 
     Rejects:
     - Falsy / empty input.
-    - Content-fingerprint keys (e.g. ``'fp:9216e85ac497b68d93043b64684eb049'``).
-    - Any component that is not a non-negative integer after strip.
+    - Malformed fp: forms: ``'fp:'`` (no hex), too-short or too-long hex bodies,
+      uppercase hex, non-hex characters in the body.
+    - Any component that is not a non-negative integer after strip (numeric path).
     - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
 
     Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
     convention (``_looks_like_task_id`` in task_interceptor.py and
     sqlite_task_backend.py) while additionally tolerating the comma-joined
-    marker key.  Defined as a LOCAL helper to avoid a
+    marker key and canonical fp: keys.  Defined as a LOCAL helper to avoid a
     server/middleware←reconciliation import inversion; see the local-copy
     convention in :func:`_normalize_content_description`.
 
@@ -993,21 +1042,29 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     """
     if not tid:
         return False
+    # Canonical content-fingerprint branch: fp: + exactly 32 lowercase hex chars.
+    if _CONTENT_FP_RE.fullmatch(tid):
+        return True
+    # Numeric / comma-joined branch (existing convention, unchanged).
     components = tid.split(',')
     return all(part.strip().isdigit() for part in components)
 
 
 def _content_fingerprint(description: str) -> str:
-    """SHA-256 hex (first 32 chars) of the normalised description, prefixed 'fp:'.
+    """SHA-256 hex (first :data:`_CONTENT_FP_HEXLEN` chars) of the normalised description.
 
+    Output format: :data:`_CONTENT_FP_PREFIX` + ``digest[:_CONTENT_FP_HEXLEN]``.
     Deterministic across processes and PYTHONHASHSEED (unlike builtin hash()).
-    Truncation to 32 hex chars (128 bits of SHA-256) is sufficient collision
-    resistance for a dedup key over recon findings.
+    Truncation to :data:`_CONTENT_FP_HEXLEN` hex chars (128 bits of SHA-256) is
+    sufficient collision resistance for a dedup key over recon findings.
+
+    The emitted key is always accepted by :func:`_is_valid_marker_task_id` (the
+    anti-drift invariant tested by ``TestIsValidMarkerTaskId.test_accepts_anti_drift_roundtrip``).
     """
     digest = hashlib.sha256(
         _normalize_content_description(description).encode('utf-8')
     ).hexdigest()
-    return f'fp:{digest[:32]}'
+    return f'{_CONTENT_FP_PREFIX}{digest[:_CONTENT_FP_HEXLEN]}'
 
 
 def compute_content_fingerprint_signature(
