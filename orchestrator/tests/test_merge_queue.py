@@ -14454,6 +14454,64 @@ class TestSpeculativeWorkerDequeueDepth:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeWorkerDequeueDepth — task-1675 step-7
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerDequeueDepth:
+    """Deprecated MergeWorker emits merge_dequeued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_merge_worker_dequeued_carries_queue_depth(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ):
+        """merge_dequeued emitted by MergeWorker must carry queue_depth (not NULL).
+
+        Uses the _fast_done path so no real git operations run.
+
+        Fails today because MergeWorker.run() emit payload is only {branch}.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='mw-depth-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        async def _fast_done(r):
+            return MergeOutcome('done')
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(worker, '_do_merge', side_effect=_fast_done):
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_dequeued'"
+        ).fetchone()
+        conn.close()
+
+        assert row is not None, 'No merge_dequeued row found'
+        assert row[0] is not None, (
+            'queue_depth must not be NULL on merge_dequeued from MergeWorker'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
 # TestEnqueueMergeQueuedDepth — task-1675 step-1
 # ---------------------------------------------------------------------------
 
