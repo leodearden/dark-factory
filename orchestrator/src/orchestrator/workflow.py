@@ -6513,6 +6513,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         3. Otherwise (cancel event cleared or spurious wakeup) → ``REQUEUED``
            Defensive fallback: re-run the slot once the cancel condition clears.
            Preserves the original REQUEUED semantics for non-soft-cancel callers.
+
+        **Watcher-race note** — ``_scan_for_terminal_active_tasks`` fires a soft-
+        cancel when it observes a terminal status, but by the time this method
+        re-reads status the task may have transitioned back to a live state
+        (terminal → non-terminal race).  In that window the read above returns
+        non-terminal, ``_cancel_event`` is set, and we return ``SOFT_CANCELLED``
+        (slot exits with ``requeued=False``) rather than the prior ``REQUEUED``
+        (which would have re-dispatched the now-live task).  Recovery for watcher-
+        triggered soft-cancels therefore relies on the scheduler's stranded-in-
+        progress sweep or normal re-dispatch of a ``pending`` task rather than
+        immediate requeue.  The ``release_workflow`` MCP path (human-initiated
+        takeover) is unaffected — ``release_workflow`` always follows a
+        ``SOFT_CANCELLED`` exit with an explicit ``set_task_status`` park.
         """
         try:
             status = await self.scheduler.get_status(self.task_id)

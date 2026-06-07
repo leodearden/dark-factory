@@ -309,6 +309,10 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     )
     # The real scheduler.set_task_status must have been called once with 'blocked'.
     h.scheduler.set_task_status.assert_awaited_once_with(tid, 'blocked')
+    # No-requeue contract: SOFT_CANCELLED exits the slot with requeued=False.
+    # A regression that re-treated SOFT_CANCELLED as requeue-triggering would call
+    # scheduler.release(tid, requeued=True) — this assertion catches that.
+    h.scheduler.release.assert_called_once_with(tid, requeued=False)
     # And the slot is truly cleared from the harness registry.
     assert not h.is_workflow_active(tid), (
         'Slot must be cleared from _workflow_cancel_events by _run_slot finally'
