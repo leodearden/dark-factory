@@ -6577,3 +6577,302 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
         f'IntegrityCheck did not receive the harness-fetched filtered_task_tree. '
         f'Got: {captured_tree["tree"]!r}'
     )
+
+
+# ── Task 1669: resolved-escalation recurrence suppression ─────────────────
+
+
+def test_escalate_suppressed_when_recently_resolved(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """_escalate() must be suppressed when a matching escalation was recently resolved.
+
+    If a recon_integrity_issue escalation for the same content fingerprint was
+    resolved within the recurrence window, the harness must NOT submit a new
+    pending escalation — it should emit a structured INFO log instead.
+
+    RED on base branch: base submits a fresh pending escalation because
+    get_pending() is empty (the seeded resolved escalation is invisible to it).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Use the first finding: category='memory_stale', has affected_ids
+    finding = _make_s3_findings()[0]
+    assert finding['category'] == 'memory_stale'
+
+    # Compute the SAME fingerprint _escalate will compute
+    fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding['category'],
+        _derive_affected_ids(finding),
+        finding['description'],
+    )
+
+    # Seed a RESOLVED escalation with this fingerprint, resolved 60s ago (within window)
+    seed = Escalation(
+        id='esc-recon-seed-1',
+        task_id='recon-seed',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='prior resolved finding',
+        status='resolved',
+        resolved_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        dedupe_fingerprint=fp,
+    )
+    esc_queue.submit(seed)
+
+    # Confirm the seeded escalation is NOT in get_pending() (it's resolved)
+    assert esc_queue.get_pending() == [], 'Seeded resolved escalation should not be pending'
+
+    # Call _escalate — should be suppressed
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        harness._escalate(
+            'recon_integrity_issue',
+            'run-xyz12345',
+            'Persistently unresolved: Stale edge',
+            detail='stale edge detail',
+            finding=finding,
+        )
+
+    # Assert: no NEW pending escalation carries the fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == fp]
+    assert pending_with_fp == [], (
+        f'Expected suppression — no new pending escalation, got: {pending_with_fp}'
+    )
+
+    # Assert: a structured suppression log was emitted
+    suppression_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.escalation_suppressed_recently_resolved'
+    ]
+    assert len(suppression_records) >= 1, (
+        f'Expected a suppression log record, got: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+def test_escalate_refires_when_resolved_outside_recurrence_window(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """_escalate() must re-fire when the matching resolved escalation is older than the window.
+
+    A finding whose prior escalation was resolved 8 days ago is beyond the
+    finite recurrence window (~24h), so a new pending escalation MUST be created.
+
+    RED after step-2's match-only impl (suppresses regardless of age).
+    GREEN after step-4 adds the window bound.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    finding = _make_s3_findings()[0]
+    fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding['category'],
+        _derive_affected_ids(finding),
+        finding['description'],
+    )
+
+    # Seed a RESOLVED escalation that is OLD (8 days ago — outside any ~24h window)
+    old_seed = Escalation(
+        id='esc-recon-old-1',
+        task_id='recon-old',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='old resolved finding',
+        status='resolved',
+        resolved_at=(datetime.now(UTC) - timedelta(days=8)).isoformat(),
+        dedupe_fingerprint=fp,
+    )
+    esc_queue.submit(old_seed)
+
+    harness._escalate(
+        'recon_integrity_issue',
+        'run-old00001',
+        'Persistently unresolved: Stale edge',
+        detail='stale edge detail',
+        finding=finding,
+    )
+
+    # A NEW pending escalation must be created (old resolved finding does NOT suppress)
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == fp]
+    assert len(pending_with_fp) == 1, (
+        f'Expected re-fire — 1 new pending escalation, got: {pending_with_fp}'
+    )
+
+
+def test_finding_recently_resolved_respects_window(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """_finding_recently_resolved respects the finite recurrence window.
+
+    With a fixed 'now', a resolved escalation ~60s ago is inside the window
+    (returns True) while one 8 days ago is outside (returns False).
+
+    RED after step-2's match-only impl (returns True regardless of age).
+    GREEN after step-4 adds the window bound.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    now = datetime(2026, 6, 7, 12, 0, 0, tzinfo=UTC)
+
+    # Two distinct fingerprints: one for in-window, one for out-of-window
+    fp_in = compute_content_fingerprint('recon_integrity_issue', 'memory_stale', ['a'], 'x')
+    fp_out = compute_content_fingerprint('recon_integrity_issue', 'memory_stale', ['b'], 'y')
+
+    # Seed: in-window (60s ago)
+    seed_in = Escalation(
+        id='esc-recon-in-1',
+        task_id='recon-in',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='in-window resolved',
+        status='resolved',
+        resolved_at=(now - timedelta(seconds=60)).isoformat(),
+        dedupe_fingerprint=fp_in,
+    )
+    esc_queue.submit(seed_in)
+
+    # Seed: out-of-window (8 days ago)
+    seed_out = Escalation(
+        id='esc-recon-out-1',
+        task_id='recon-out',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='out-of-window resolved',
+        status='resolved',
+        resolved_at=(now - timedelta(days=8)).isoformat(),
+        dedupe_fingerprint=fp_out,
+    )
+    esc_queue.submit(seed_out)
+
+    # In-window match → True
+    assert harness._finding_recently_resolved('recon_integrity_issue', fp_in, now=now) is True, (
+        'Expected in-window resolved escalation to be detected'
+    )
+    # Out-of-window → False  (RED after step-2: match-only returns True ignoring age)
+    assert harness._finding_recently_resolved('recon_integrity_issue', fp_out, now=now) is False, (
+        'Expected out-of-window resolved escalation to NOT suppress (beyond recurrence window)'
+    )
+    # Unknown fingerprint → False
+    assert harness._finding_recently_resolved('recon_integrity_issue', 'unknown-fp', now=now) is False
+    # None fingerprint → False (fast-path guard)
+    assert harness._finding_recently_resolved('recon_integrity_issue', None, now=now) is False
+
+
+def test_escalate_suppressed_when_dismissed_within_window(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """_escalate() is suppressed when a matching escalation was recently dismissed.
+
+    status='dismissed' is treated the same as status='resolved' — both suppress
+    re-firing within the recurrence window.  This test makes that intent explicit
+    so the 'dismissed' branch in _finding_recently_resolved is covered.
+
+    Task 1669 amend — reviewer suggestion 2.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    finding = _make_s3_findings()[0]
+    fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding['category'],
+        _derive_affected_ids(finding),
+        finding['description'],
+    )
+
+    # Seed a DISMISSED escalation with this fingerprint, dismissed 60s ago (within window)
+    dismissed_seed = Escalation(
+        id='esc-recon-dismissed-1',
+        task_id='recon-dismissed',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='prior dismissed finding',
+        status='dismissed',
+        resolved_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        dedupe_fingerprint=fp,
+    )
+    esc_queue.submit(dismissed_seed)
+
+    # The dismissed escalation must NOT appear in pending
+    assert esc_queue.get_pending() == [], 'Seeded dismissed escalation should not be pending'
+
+    # Call _escalate — must be suppressed (same as resolved)
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        harness._escalate(
+            'recon_integrity_issue',
+            'run-dismissed1',
+            'Persistently unresolved: Stale edge',
+            detail='stale edge detail',
+            finding=finding,
+        )
+
+    # No NEW pending escalation carries the fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == fp]
+    assert pending_with_fp == [], (
+        f'Expected suppression for dismissed — no new pending escalation, got: {pending_with_fp}'
+    )
+
+    # A structured suppression log was emitted
+    suppression_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.escalation_suppressed_recently_resolved'
+    ]
+    assert len(suppression_records) >= 1, (
+        f'Expected a suppression log for dismissed status, got: {[r.getMessage() for r in caplog.records]}'
+    )
