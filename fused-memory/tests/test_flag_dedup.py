@@ -5037,140 +5037,19 @@ class TestDedupFlagsWriteGuard:
     """Integration tests for the _is_valid_marker_task_id guard wired into
     _write_and_confirm_marker.
 
-    Covers:
-    (a) fp:-signature flag on MISS path — add_memory NOT called, WARNING logged.
-    (b) fp:-signature flag with legacy prior fp: marker — flag still annotated,
-        NO add_memory, NO delete_memory (priors retained because write_succeeded=False).
-    (c) Regression: numeric task_id '42' still writes its marker (guard does not
+    fp: MISS and HIT path coverage lives in TestDedupFlagsContentFingerprintPath
+    (focused single-cycle variants) and test_cross_cycle_fp_roundtrip (end-to-end
+    two-cycle variant) below.  This class focuses on the remaining contract:
+
+    (a) Regression: numeric task_id '42' still writes its marker (guard does not
         over-reject valid integer keys).
-    (d) Regression: comma-joined cited_tasks signature '12,15' still writes its
+    (b) Regression: comma-joined cited_tasks signature '12,15' still writes its
         marker (guard accepts the comma-joined shape).
+    (c) Defense-in-depth: genuinely-invalid tid 'abc' → _write_and_confirm_marker
+        returns False, no add_memory call, circuit-breaker counter untouched.
+    (d) Cross-cycle round-trip: fp: marker written on cycle-1 MISS, found and used
+        to annotate on cycle-2 HIT (persisted_from_run → no re-escalation).
     """
-
-    async def test_fp_key_miss_path_writes_marker(self):
-        """(a) fp:… task_id MISS — guard accepted, marker is written via add_memory."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
-
-        flag = {
-            'task_id': None,
-            'flag_type': 'missing_deliverable',
-            'description': 'No task anchor found for finding abc123',
-        }
-        sig = compute_content_fingerprint_signature(flag)
-        assert sig is not None, 'Test setup: fp signature must be computable'
-        fp_tid, fp_ftype = sig
-        assert fp_tid.startswith('fp:'), f'Expected fp: prefix; got {fp_tid!r}'
-
-        # MISS: prior search returns []; confirm search returns written marker.
-        written = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
-            'task_id': fp_tid,
-            'flag_type': fp_ftype,
-            'run_id': 'run-a',
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(side_effect=_make_search_stub(
-            suppression=[[]],
-            marker={(fp_tid, fp_ftype): [[], [written]]},
-        ))
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-
-        result = await dedup_flags(
-            memory_service=memory_service,
-            project_id='proj',
-            run_id='run-a',
-            flags=[flag],
-        )
-
-        # Flag returned unchanged on MISS (no persisted_from_run)
-        assert len(result) == 1
-        assert 'persisted_from_run' not in result[0]
-
-        # Guard accepted the fp: key → add_memory called with fp: task_id in metadata
-        memory_service.add_memory.assert_called_once()
-        _assert_valid_stage1_marker(
-            memory_service.add_memory.call_args.kwargs,
-            task_id=fp_tid,
-            flag_type=fp_ftype,
-            run_id='run-a',
-        )
-
-    async def test_fp_key_hit_path_annotates_and_writes_replacement(self):
-        """(b) fp:… prior exists — flag annotated, replacement written, prior deleted."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_content_fingerprint_signature,
-            dedup_flags,
-        )
-
-        flag = {
-            'task_id': None,
-            'flag_type': 'missing_deliverable',
-            'description': 'No task anchor found for finding abc123',
-        }
-        sig = compute_content_fingerprint_signature(flag)
-        assert sig is not None
-        fp, ftype = sig
-
-        # Prior marker from run-a.
-        fp_prior = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'run-a',
-            'last_seen_run_id': 'run-a',
-        })
-        fp_prior.id = 'fp-prior-run-a'
-
-        # Replacement confirmed by run-b confirm search.
-        replacement = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'run-b',
-        })
-        replacement.id = 'fp-replacement-run-b'
-
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(side_effect=_make_search_stub(
-            suppression=[[]],
-            marker={(fp, ftype): [[fp_prior], [replacement]]},
-        ))
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await dedup_flags(
-            memory_service=memory_service,
-            project_id='proj',
-            run_id='run-b',
-            flags=[flag],
-        )
-
-        # (a) Flag annotated with persisted_from_run (HIT)
-        assert len(result) == 1
-        assert result[0]['persisted_from_run'] == 'run-a', (
-            f'persisted_from_run must be "run-a"; got {result[0].get("persisted_from_run")!r}'
-        )
-        assert result[0]['last_seen_run_id'] == 'run-b', (
-            f'last_seen_run_id must be "run-b"; got {result[0].get("last_seen_run_id")!r}'
-        )
-
-        # (b) Replacement written
-        memory_service.add_memory.assert_called_once()
-
-        # (c) Prior deleted after confirmed replacement
-        memory_service.delete_memory.assert_called_once_with(
-            memory_id='fp-prior-run-a',
-            store='mem0',
-            project_id='proj',
-            causation_id='run-b',
-            _source='stage1_flag_dedup',
-        )
 
     async def test_numeric_task_id_still_writes_marker(self):
         """(c) Regression: numeric task_id '42' passes guard → add_memory called."""

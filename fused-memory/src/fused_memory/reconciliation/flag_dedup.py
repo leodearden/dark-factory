@@ -805,6 +805,24 @@ async def dedup_flags(
             # pattern on the HIT path ensures that once search recovers, the
             # next cycle collapses any accumulated duplicates back to a single row.
             #
+            # Orphan-growth caveat (task-1670, Option-A trade-off): accepting
+            # fp: keys means a stage1_flag_marker row is written for every
+            # distinct normalized-description fingerprint.  These rows live in
+            # category 'observations_and_summaries' and are only ever collapsed
+            # back to one row on the HIT path for the *same* fingerprint.  A
+            # finding that stops recurring permanently leaves an orphaned marker
+            # that is never garbage-collected — Stage 2 never sweeps
+            # stage1_flag_marker records (flag_for_stage2-only filter), and
+            # sweep_orphan_flag_markers.py only purges rows missing
+            # kind='stage1_flag_marker' (so fp: markers with kind set survive).
+            # Because _query_stage2_flags uses a limit=100 top-N semantic search,
+            # an accumulating population of fp: markers competing for those 100
+            # slots can push genuine flag_for_stage2 records below the cutoff.
+            # Mitigation: a follow-up task should either (a) age out orphaned
+            # markers by last_seen_run_id staleness, or (b) migrate
+            # _query_stage2_flags off the limit=100 semantic search to
+            # scroll_by_metadata (already noted in its docstring).
+            #
             # Post-write confirmation (task-1400): after writing, confirm the
             # marker is findable via a read-back search.  The WARNING is driven
             # off the bool return from _confirm_and_track (False = unfindable in
