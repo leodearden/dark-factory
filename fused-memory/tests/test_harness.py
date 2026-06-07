@@ -3502,6 +3502,79 @@ def test_build_stale_run_diagnostics_classifies_disposition():
         assert 'age_seconds' in d
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_emits_diagnostics(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """Reaper must emit rich diagnostics when it reaps a stale run.
+
+    Contract:
+    (a) stage_reports['_error'] includes project_id, instance_id, age_seconds,
+        disposition alongside existing error_type/error_message/failed_stage.
+    (b) _escalate is called once with a non-empty detail string that contains
+        the project_id and disposition.  The summary (for dedup) is unchanged.
+    (c) The WARNING log line includes project_id and disposition.
+    """
+    import logging
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan from a dead instance — a different live instance holds the lock.
+    orphan = ReconciliationRun(
+        id='run-handed-off-diag',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-diag',
+    )
+    await journal.start_run(orphan)
+
+    # Live instance acquires the lock — different iid → disposition='handed_off'.
+    assert await event_buffer.mark_run_active(project_id) is True
+    assert event_buffer.instance_id != 'dead-instance-diag'
+
+    # Patch _escalate to intercept the call without needing a live queue.
+    from unittest.mock import patch as _patch
+    with _patch.object(harness, '_escalate') as mock_escalate, \
+         caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        await harness._recover_stale_runs()
+
+    # (a) stage_reports['_error'] now carries diagnostic fields.
+    after = await journal.get_run('run-handed-off-diag')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+    assert err.get('project_id') == project_id
+    assert err.get('instance_id') == 'dead-instance-diag'
+    assert err.get('age_seconds') is not None
+    assert err.get('disposition') == 'handed_off'
+
+    # (b) _escalate called once; detail is non-empty and contains key info.
+    mock_escalate.assert_called_once()
+    call_kwargs = mock_escalate.call_args
+    summary_arg = call_kwargs.args[2] if len(call_kwargs.args) >= 3 else call_kwargs.kwargs.get('summary', '')
+    detail_arg = call_kwargs.args[3] if len(call_kwargs.args) >= 4 else call_kwargs.kwargs.get('detail', '')
+    assert project_id in detail_arg, f'detail must contain project_id; got: {detail_arg!r}'
+    assert 'handed_off' in detail_arg, f'detail must contain disposition; got: {detail_arg!r}'
+    # Summary unchanged (for dedupe fingerprint).
+    assert 'lock expired' in summary_arg, f'summary must be the generic template; got: {summary_arg!r}'
+
+    # (c) WARNING log includes project_id and disposition.
+    warning_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(project_id in line for line in warning_lines), (
+        f'WARNING log must mention project_id; got: {warning_lines!r}'
+    )
+    assert any('handed_off' in line for line in warning_lines), (
+        f'WARNING log must mention disposition; got: {warning_lines!r}'
+    )
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
