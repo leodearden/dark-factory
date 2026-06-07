@@ -11132,6 +11132,7 @@ class TestFinalizeAdvancedMerge:
 
     async def _run_chaining_driver(
         self, tmp_path: Path, config: OrchestratorConfig,
+        retention: TerminalOutcomeRetention | None = None,
     ) -> tuple[asyncio.Queue[MergeRequest], dict[str, int], MergeRequest]:
         """Shared driver: run the SUPERSET chain path, return (queue, counts, gen_next).
 
@@ -11140,6 +11141,10 @@ class TestFinalizeAdvancedMerge:
         - counts['task/t-chain'] == 1 (incremented by _maybe_auto_chain_generation)
         - queue.qsize() == 1 (gen_next request enqueued)
         - gen_next = queue.get_nowait() has its own result future
+
+        *retention* is forwarded to _GenerationChainContext so enqueue_merge_request
+        registers the _on_finalized callback with the same ring — enabling coexistence
+        tests that verify both callbacks fire on the same future.
         """
         from orchestrator.merge_queue import (
             MergeRequest,
@@ -11165,7 +11170,7 @@ class TestFinalizeAdvancedMerge:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         counts: dict[str, int] = {}
         chain_ctx = _GenerationChainContext(
-            queue=queue, counts=counts, max_auto_generations=2,
+            queue=queue, counts=counts, max_auto_generations=2, retention=retention,
         )
 
         with (
@@ -11255,6 +11260,52 @@ class TestFinalizeAdvancedMerge:
 
         assert counts.get('task/t-chain') == 1, (
             f"superseded must NOT pop the chain counter (lineage continues); counts={counts!r}"
+        )
+
+    async def test_both_callbacks_coexist_on_gen_next_result(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(g) COEXISTENCE: _cleanup_chain_counter and _on_finalized (retention) both fire.
+
+        Both done-callbacks are registered on gen_next.result independently:
+        - _cleanup_chain_counter pops counts[branch] on non-'superseded' terminals
+        - _on_finalized (from enqueue_merge_request) records the outcome into retention
+
+        This test verifies they coexist on the same future — a regression that
+        accidentally *replaced* rather than *added* the callback would leave
+        retention empty (or the counter un-popped) and be caught here.
+
+        Strategy: pass a real TerminalOutcomeRetention into the driver so
+        enqueue_merge_request wires _on_finalized to it, then resolve gen_next
+        'blocked' and assert both side-effects are observed.
+        """
+        from orchestrator.merge_queue import MergeOutcome, TerminalOutcomeRetention
+
+        retention = TerminalOutcomeRetention()
+        _queue, counts, gen_next = await self._run_chaining_driver(
+            tmp_path, config, retention=retention,
+        )
+
+        # Resolve gen_next with a non-'superseded' terminal so _cleanup fires.
+        gen_next.result.set_result(MergeOutcome('blocked', reason='equivalence drop'))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # _cleanup_chain_counter must have fired: counter popped.
+        assert 'task/t-chain' not in counts, (
+            f'coexistence: _cleanup_chain_counter did not fire; counts={counts!r}'
+        )
+        # _on_finalized must have fired: retention recorded the outcome.
+        rec = retention.get(gen_next.request_id)
+        assert rec is not None, (
+            f'coexistence: _on_finalized did not fire; '
+            f'retention ring is empty for request_id={gen_next.request_id!r}'
+        )
+        assert rec.state == 'blocked', (
+            f'coexistence: retention recorded wrong state; got {rec.state!r}'
+        )
+        assert rec.branch == 'task/t-chain', (
+            f'coexistence: retention recorded wrong branch; got {rec.branch!r}'
         )
 
 
