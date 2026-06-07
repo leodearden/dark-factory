@@ -1347,8 +1347,24 @@ class TaskWorkflow:
                             if merge_outcome == WorkflowOutcome.DONE:
                                 break
                             if merge_outcome != WorkflowOutcome.REQUEUED:
-                                # BLOCKED — steward gave up, terminal
+                                # SOFT_CANCELLED / BLOCKED / ESCALATED — exit slot.
+                                # SOFT_CANCELLED arrives when _handle_soft_cancel
+                                # detected a pending soft-cancel; BLOCKED when the
+                                # steward gave up; other non-REQUEUED outcomes are
+                                # terminal and must also exit.
                                 return merge_outcome
+
+                            # Defense-in-depth (root cause #2): _cancel_event is
+                            # never cleared during a run, so each retry iteration
+                            # would re-win the cancellable race instantly and burn
+                            # another pre-merge rebase+verify before exhausting
+                            # max_merge_retries.  Checking here — immediately after
+                            # the REQUEUED guard and BEFORE the anti-thrash/retry
+                            # path — ensures a soft-cancel that arrived concurrently
+                            # with a legitimate steward-resolved REQUEUED exits on
+                            # first detection without any further rebase or log.
+                            if self._cancel_event.is_set():
+                                return await self._handle_soft_cancel('merge')
 
                             # Fix 3 — anti-thrash guard for repeated
                             # steward-resolved merge-phase loops on the same
