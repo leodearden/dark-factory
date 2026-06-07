@@ -54,7 +54,10 @@ try:
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue, iter_all_escalation_paths  # type: ignore[import-untyped]
+    from escalation.queue import (  # type: ignore[import-untyped]
+        EscalationQueue,
+        iter_all_escalation_paths,
+    )
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
