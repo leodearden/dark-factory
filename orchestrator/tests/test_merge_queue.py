@@ -10979,6 +10979,47 @@ class TestMapAdvanceFailure:
         halt.assert_not_called()
         assert task_id not in cas_retries
 
+    async def test_pop_conflict_push_raise_does_not_strand_halt(self) -> None:
+        """(f) pop_conflict + push_main raises → RuntimeError propagates, queue NOT left halted.
+
+        Regression for task 1671: the post-halt push_main call in _map_advance_failure's
+        pop_conflict branch could raise (git failure, CancelledError) AFTER halt() was
+        already called. Without an unhalt-on-raise guard the queue remained silently halted
+        with owner=None -- a state that force_unhalt_merge_queue is required to clear.
+
+        RED today: _map_advance_failure has no unhalt parameter (TypeError on the call below).
+        GREEN after fix: unhalt is wired; except BaseException calls it before re-raising.
+        """
+        from orchestrator.merge_queue import _map_advance_failure
+
+        # Real MergeWorker for genuine _WipHaltMixin halt machinery.
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(MagicMock(), queue)
+        assert not worker.is_wip_halted, 'precondition: worker starts un-halted'
+        assert worker.halt_owner_esc_id is None
+
+        # MagicMock git_ops whose push_main raises.
+        failing_git = self._make_git_ops()
+        failing_git.push_main = AsyncMock(side_effect=RuntimeError('push boom'))
+
+        task_id = 'task-push-raise'
+        cas_retries = {task_id: 1}
+
+        with pytest.raises(RuntimeError, match='push boom'):
+            await _map_advance_failure(
+                failing_git, 'pop_conflict',
+                task_id=task_id,
+                merge_commit_fallback='fallback-sha',
+                halt=worker.halt_for_wip,
+                unhalt=worker.unhalt_wip,
+                cas_retries=cas_retries,
+            )
+
+        # PRIMARY discriminator: halt() was called (pop_conflict always halts),
+        # but unhalt-on-raise must have restored the queue to un-halted.
+        assert not worker.is_wip_halted, 'queue must be un-halted after push raises'
+        assert worker.halt_owner_esc_id is None
+
 
 # ---------------------------------------------------------------------------
 # TestWipHaltMixin — unit tests pinning the _WipHaltMixin shared contract
