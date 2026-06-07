@@ -14387,3 +14387,53 @@ class TestCheckMergeLivenessMarginBoundCoupling:
         assert high.safe is False, (
             f'bound=20,timeout=100,factor=0.5 must not be safe; got .safe={high.safe!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEnqueueMergeQueuedDepth — task-1675 step-1
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueMergeQueuedDepth:
+    """enqueue_merge_request emits merge_queued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_enqueue_emits_merge_queued_with_queue_depth(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """merge_queued payload carries queue_depth == qsize after put.
+
+        Enqueue 3 requests without a consumer running; each merge_queued row
+        must report queue_depth equal to the queue size at that enqueue point
+        (1, 2, 3 respectively).  The last row's queue_depth must be 3.
+
+        Fails today because _emit_merge_queued payload is only {branch}.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-depth-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        reqs = [
+            _make_request(str(i), f'task/{i}', wt, config)
+            for i in range(1, 4)
+        ]
+
+        for req in reqs:
+            await enqueue_merge_request(queue, req, event_store)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_queued' ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 3, f'Expected 3 merge_queued rows, got: {rows}'
+        depths = [r[1] for r in rows]
+        assert depths == [1, 2, 3], (
+            f'Expected queue_depth sequence [1, 2, 3], got: {depths}'
+        )
