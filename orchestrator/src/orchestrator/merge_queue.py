@@ -127,6 +127,16 @@ Cap invariants (all verified by integration tests):
 - Released by stop() (over-release of a plain Semaphore is safe) so a merger
   blocked at acquire() unblocks cleanly at shutdown."""
 
+_HEARTBEAT_POLL_S: float = 30.0
+"""How often _heartbeat_loop wakes up to call _maybe_log_queue_heartbeat.
+
+The heartbeat loop polls this frequently; the actual emission rate is governed
+by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
+period short (30 s) means the first heartbeat fires within ~30 s of startup
+when depth > 0 (because _last_heartbeat_at is initialised to 0.0, making the
+rate-limit check pass immediately on the first poll), then subsequently no
+more often than _heartbeat_interval_s, without adding measurable overhead."""
+
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
 
@@ -2159,18 +2169,31 @@ def _emit_merge_queued(
     event_store: EventStore | None,
     req: MergeRequest,
     reason: str | None = None,
+    *,
+    queue_depth: int | None = None,
+    position: int | None = None,
 ) -> None:
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
     Centralises the emit payload so both :func:`enqueue_merge_request` and
     the ``MergeWorker`` CAS-retry path use an identical record shape.  If
     *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
+
+    *queue_depth* (when provided) records how deep the main queue was at the
+    moment of enqueue — O(1) qsize() from the call site.  *position* (when
+    provided) records the front-of-line position for urgent re-inserts (0 ==
+    head).  Each key is omitted when None so the shape remains backward-
+    compatible with existing consumers.
     """
     if event_store is None:
         return
     data: dict = {'branch': req.branch}
     if reason is not None:
         data['reason'] = reason
+    if queue_depth is not None:
+        data['queue_depth'] = queue_depth
+    if position is not None:
+        data['position'] = position
     event_store.emit(
         EventType.merge_queued,
         task_id=req.task_id,
@@ -2359,7 +2382,7 @@ async def enqueue_merge_request(
 
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
-    _emit_merge_queued(event_store, req)
+    _emit_merge_queued(event_store, req, queue_depth=queue.qsize())
 
 
 async def register_and_enqueue_merge_request(
@@ -3337,7 +3360,7 @@ class MergeWorker(_WipHaltMixin):
                     EventType.merge_dequeued,
                     task_id=req.task_id,
                     phase='merge',
-                    data={'branch': req.branch},
+                    data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
                 )
 
             outcome = await self._process(req)
@@ -3608,7 +3631,11 @@ class MergeWorker(_WipHaltMixin):
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
         _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
-        _emit_merge_queued(self._event_store, req, reason='cas_retry')
+        _emit_merge_queued(
+            self._event_store, req, reason='cas_retry',
+            queue_depth=self._queue.qsize() + len(self._urgent) + 1,
+            position=0,
+        )
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 
@@ -3693,6 +3720,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -3709,6 +3737,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verify_started_at: float | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
+        # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
+        # first emission fires within one poll period after startup when depth > 0
+        # (the very-large now - 0.0 gap always exceeds _heartbeat_interval_s).
+        self._last_heartbeat_at: float = 0.0
+        # Default interval ~5 min; override in tests for deterministic rate-limit checks.
+        # Mirrors the _shutdown_timeout override precedent.
+        self._heartbeat_interval_s: float = 300.0
 
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
@@ -3813,20 +3848,100 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'halt_owner_esc_id': self.halt_owner_esc_id,
         }
 
+    def _maybe_log_queue_heartbeat(self, now: float) -> bool:
+        """Emit a queue-depth heartbeat log line and event if conditions are met.
+
+        Synchronous and clock-injectable (``now`` parameter) so tests can drive
+        firing/rate-limiting deterministically without relying on real sleep.
+
+        Returns True when a heartbeat was emitted, False otherwise.
+
+        No-ops when:
+          - ``snapshot()['depth'] == 0`` (idle pipeline — no journal spam)
+          - ``now - self._last_heartbeat_at < self._heartbeat_interval_s``
+            (rate-limit — respects the overridable interval)
+        """
+        snap = self.snapshot()
+        if snap['depth'] == 0:
+            return False
+        if now - self._last_heartbeat_at < self._heartbeat_interval_s:
+            return False
+
+        entries = snap['entries']
+        oldest_age = max(e['age_secs'] for e in entries)
+        head = entries[0]
+        head_of_line = {
+            'task_id': head['task_id'],
+            'state': head['state'],
+            'age_secs': head['age_secs'],
+        }
+
+        logger.info(
+            'merge queue heartbeat: %d in pipeline, oldest age=%.0fs, '
+            'head=task %s (state=%s, age=%.0fs)',
+            snap['depth'], oldest_age,
+            head['task_id'], head['state'], head['age_secs'],
+        )
+
+        if self._event_store is not None:
+            self._event_store.emit(
+                EventType.merge_heartbeat,
+                task_id=None,
+                phase='merge',
+                data={
+                    'depth': snap['depth'],
+                    'oldest_age_secs': oldest_age,
+                    'head_of_line': head_of_line,
+                    'verify_in_progress': snap['verify_in_progress'],
+                },
+            )
+
+        self._last_heartbeat_at = now
+        return True
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically emit merge-queue depth heartbeats while the worker runs.
+
+        Runs independently of the merger and verifier loops so it continues to
+        fire even when those are blocked on ``queue.get()`` or semaphores (the
+        exact silence window that caused the 2026-06-04 dead-slot misdiagnosis).
+
+        Wakes every ``_HEARTBEAT_POLL_S`` seconds and delegates the
+        fire/rate-limit/format/emit decision to the synchronous, clock-injectable
+        :meth:`_maybe_log_queue_heartbeat`.  Any unexpected exception is logged
+        and swallowed so a heartbeat bug can never crash the worker.
+        """
+        while self._running:
+            await asyncio.sleep(_HEARTBEAT_POLL_S)
+            try:
+                self._maybe_log_queue_heartbeat(time.time())
+            except Exception:
+                logger.exception('merge queue heartbeat: unexpected error')
+
     async def run(self) -> None:
-        """Start merger and verifier coroutines and wait for both to finish."""
+        """Start merger, verifier, and heartbeat coroutines; wait for merge tasks."""
         self._merger_task = asyncio.create_task(self._merger_loop())
         self._verifier_task = asyncio.create_task(self._verifier_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             await asyncio.gather(self._merger_task, self._verifier_task)
         except BaseException:
-            for t in (self._merger_task, self._verifier_task):
+            for t in (self._merger_task, self._verifier_task, self._heartbeat_task):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task, return_exceptions=True,
+                self._merger_task, self._verifier_task, self._heartbeat_task,
+                return_exceptions=True,
             )
             raise
+        finally:
+            # Cancel the heartbeat on both normal and exceptional exit so its
+            # lifetime is self-contained regardless of why the merge loops exit.
+            # On the exception path the except block already cleaned it up, so
+            # _heartbeat_task.done() is True and this is a no-op.
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
@@ -3903,6 +4018,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Future now so the caller doesn't hang forever.
         if self._inflight_req is not None and not self._inflight_req.result.done():
             self._inflight_req.result.set_result(shutdown)
+
+        # Cancel the heartbeat task — it loops independently (no sentinel path).
+        # _running is already False so the loop will not re-enter after the
+        # cancellation; we await it to ensure the task is done before stop() returns.
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
 
     # ------------------------------------------------------------------
     # Event helpers
@@ -4006,7 +4129,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         EventType.merge_dequeued,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': req.branch},
+                        data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
                     )
                 t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None

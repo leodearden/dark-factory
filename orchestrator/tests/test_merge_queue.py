@@ -14387,3 +14387,445 @@ class TestCheckMergeLivenessMarginBoundCoupling:
         assert high.safe is False, (
             f'bound=20,timeout=100,factor=0.5 must not be safe; got .safe={high.safe!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeWorkerDequeueDepth — task-1675 step-5
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeWorkerDequeueDepth:
+    """SpeculativeMergeWorker emits merge_dequeued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_speculative_worker_merge_dequeued_carries_queue_depth(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """merge_dequeued emitted by SpeculativeMergeWorker must carry queue_depth.
+
+        Uses the immediate-conflict path (no real merge work) so the test is
+        fast.  queue_depth at dequeue time == remaining main-queue size (0
+        since only one request was enqueued).  We only assert it is not NULL.
+
+        Fails today because _merger_loop emit payload is only {branch}.
+        """
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='spec-depth-test')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-depth', 'spec_depth.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker._shutdown_timeout = 2.0
+
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('spec-depth', 'spec-depth', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'conflict'
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_dequeued'"
+        ).fetchone()
+        conn.close()
+
+        assert row is not None, 'No merge_dequeued row found'
+        assert row[0] is not None, (
+            'queue_depth must not be NULL on merge_dequeued from SpeculativeMergeWorker'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerDequeueDepth — task-1675 step-7
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerDequeueDepth:
+    """Deprecated MergeWorker emits merge_dequeued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_merge_worker_dequeued_carries_queue_depth(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ):
+        """merge_dequeued emitted by MergeWorker must carry queue_depth (not NULL).
+
+        Uses the _fast_done path so no real git operations run.
+
+        Fails today because MergeWorker.run() emit payload is only {branch}.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='mw-depth-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        async def _fast_done(r):
+            return MergeOutcome('done')
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(worker, '_do_merge', side_effect=_fast_done):
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_dequeued'"
+        ).fetchone()
+        conn.close()
+
+        assert row is not None, 'No merge_dequeued row found'
+        assert row[0] is not None, (
+            'queue_depth must not be NULL on merge_dequeued from MergeWorker'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestEnqueueMergeQueuedDepth — task-1675 step-1
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueMergeQueuedDepth:
+    """enqueue_merge_request emits merge_queued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_enqueue_emits_merge_queued_with_queue_depth(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """merge_queued payload carries queue_depth == qsize after put.
+
+        Enqueue 3 requests without a consumer running; each merge_queued row
+        must report queue_depth equal to the queue size at that enqueue point
+        (1, 2, 3 respectively).  The last row's queue_depth must be 3.
+
+        Fails today because _emit_merge_queued payload is only {branch}.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-depth-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        reqs = [
+            _make_request(str(i), f'task/{i}', wt, config)
+            for i in range(1, 4)
+        ]
+
+        for req in reqs:
+            await enqueue_merge_request(queue, req, event_store)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_queued' ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 3, f'Expected 3 merge_queued rows, got: {rows}'
+        depths = [r[1] for r in rows]
+        assert depths == [1, 2, 3], (
+            f'Expected queue_depth sequence [1, 2, 3], got: {depths}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestCasRetryMergeQueuedDepthPosition — task-1675 step-3
+# ---------------------------------------------------------------------------
+
+
+class TestCasRetryMergeQueuedDepthPosition:
+    """MergeWorker CAS-retry emits merge_queued with queue_depth and position==0."""
+
+    @pytest.mark.asyncio
+    async def test_cas_retry_merge_queued_carries_depth_and_position_zero(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """CAS-retry re-enqueue merge_queued row must carry queue_depth>=1 and position==0.
+
+        On a CAS failure, the request is re-inserted into the urgent buffer
+        (front-of-line).  queue_depth must reflect the total pending count
+        (main queue + urgent + the item itself) and position must be 0.
+
+        Fails today because _emit_merge_queued at the CAS-retry site passes no
+        queue_depth or position.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='cas-depth-test')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'cas-depth', 'cas_depth.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_advance = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_once),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cas-depth', 'cas-depth', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        cas_retry_row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth, "
+            "       json_extract(data, '$.position') AS position, "
+            "       json_extract(data, '$.reason') AS reason "
+            "FROM events WHERE event_type = 'merge_queued' AND "
+            "json_extract(data, '$.reason') = 'cas_retry'"
+        ).fetchone()
+        conn.close()
+
+        assert cas_retry_row is not None, 'No merge_queued(cas_retry) row found'
+        depth, position, reason = cas_retry_row
+        assert depth is not None, 'queue_depth must not be NULL on cas_retry merge_queued'
+        assert depth >= 1, f'Expected queue_depth >= 1, got {depth}'
+        assert position == 0, f'Expected position == 0 (front-of-line), got {position}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestMaybeLogQueueHeartbeat — task-1675 step-9
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeLogQueueHeartbeat:
+    """Unit tests for SpeculativeMergeWorker._maybe_log_queue_heartbeat(now)."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_fires_once_rate_limits_and_skips_idle(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps, caplog,
+    ):
+        """_maybe_log_queue_heartbeat: fires, rate-limits, re-fires, idles correctly.
+
+        Scenario (incident-4156 multi-hour shape):
+          (a) First call at t0: depth>0, past interval (last=0) → returns True,
+              emits a logger.info line with depth and age in thousands of seconds,
+              writes exactly one merge_heartbeat event (task_id IS NULL).
+          (b) Immediate second call at t0: within interval → returns False (rate-limited),
+              no new log line, no new event.
+          (c) Call at t0 + interval + 1: past interval → returns True, emits again.
+          (d) After draining the queue (depth==0): returns False (idle), no emission.
+
+        Fails today because _maybe_log_queue_heartbeat and EventType.merge_heartbeat
+        do not exist.
+        """
+        db_path = tmp_path / 'hb.db'
+        event_store = EventStore(db_path=db_path, run_id='hb-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+
+        # Small override so test controls the rate-limit boundary precisely
+        worker._heartbeat_interval_s = 1.0
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        # Build a request that looks like it has been queued for 3 hours
+        old_enqueued_at = time.time() - 3 * 3600
+        req = _make_request('hb-task', 'hb-task', wt, config)
+        req.enqueued_at = old_enqueued_at  # inject multi-hour age
+
+        # Put directly into the worker's queue (no running worker needed)
+        worker._queue.put_nowait(req)
+
+        t0 = time.time()
+
+        # (a) First call — should fire
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            result_a = worker._maybe_log_queue_heartbeat(t0)
+
+        assert result_a is True, 'First heartbeat call must return True'
+
+        # Verify log line contains depth and large age
+        hb_records = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+        assert len(hb_records) >= 1, (
+            f'Expected at least one heartbeat log record, got: {[r.message for r in caplog.records]}'
+        )
+        msg = hb_records[0].message
+        # Must mention depth (1 item in queue) and an age measured in thousands of secs
+        assert '1' in msg, f'Log must mention depth=1, got: {msg!r}'
+        # The oldest age must be in the thousands range (3h = 10800s)
+        assert any(
+            int(tok) > 1000
+            for tok in re.findall(r'\d+', msg)
+        ), f'Log must mention an age > 1000s (3h ≈ 10800s), got: {msg!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_rows_a = conn.execute(
+            "SELECT task_id, json_extract(data, '$.depth') AS depth, "
+            "json_extract(data, '$.oldest_age_secs') AS age "
+            "FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchall()
+        conn.close()
+        assert len(hb_rows_a) == 1, f'Expected 1 merge_heartbeat event, got: {hb_rows_a}'
+        assert hb_rows_a[0][0] is None, 'merge_heartbeat task_id must be NULL (queue-scoped)'
+        assert hb_rows_a[0][1] == 1, f'depth must be 1, got: {hb_rows_a[0][1]}'
+        assert hb_rows_a[0][2] is not None and hb_rows_a[0][2] > 1000, (
+            f'oldest_age_secs must be > 1000 (3h shape), got: {hb_rows_a[0][2]}'
+        )
+
+        # (b) Rate-limited: immediate second call at same t0
+        caplog.clear()
+        result_b = worker._maybe_log_queue_heartbeat(t0)
+        assert result_b is False, 'Second call within interval must return False (rate-limited)'
+        hb_records_b = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+        assert len(hb_records_b) == 0, 'Rate-limited call must not emit a log record'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_b = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_b == 1, 'Rate-limited call must not write a new event'
+
+        # (c) Past interval: advance now by interval + 1
+        caplog.clear()
+        t1 = t0 + worker._heartbeat_interval_s + 1.0
+        result_c = worker._maybe_log_queue_heartbeat(t1)
+        assert result_c is True, 'Call past interval must return True'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_c = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_c == 2, f'Expected 2 merge_heartbeat events after re-fire, got: {hb_count_c}'
+
+        # (d) Drain queue → depth == 0 → idle, must not fire
+        worker._queue.get_nowait()  # remove the one item
+        caplog.clear()
+        t2 = t1 + worker._heartbeat_interval_s + 1.0
+        result_d = worker._maybe_log_queue_heartbeat(t2)
+        assert result_d is False, 'Call with depth==0 must return False (idle)'
+
+        conn = sqlite3.connect(str(db_path))
+        hb_count_d = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()[0]
+        conn.close()
+        assert hb_count_d == 2, 'Idle call must not write a new event'
+
+
+# ---------------------------------------------------------------------------
+# TestHeartbeatTaskLifecycle — task-1675 step-11
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatTaskLifecycle:
+    """Heartbeat loop is wired into SpeculativeMergeWorker run()/stop() lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_task_started_by_run_and_cancelled_by_stop(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """run() creates _heartbeat_task; stop() cancels it cleanly.
+
+        Uses an immediate-conflict path (no real merge) so the test is fast.
+        After run() yields control, worker._heartbeat_task must be a non-done
+        asyncio.Task.  After stop() the task must be done/cancelled with no leak.
+
+        Fails today because _heartbeat_loop and _heartbeat_task do not exist.
+        """
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker._shutdown_timeout = 2.0
+        # Large interval so heartbeat never fires during this test
+        worker._heartbeat_interval_s = 9999.0
+
+        # Assert _heartbeat_task not set before run()
+        assert worker._heartbeat_task is None, (
+            '_heartbeat_task must be None before run() is called'
+        )
+
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        # Yield control so run() can create its tasks
+        await asyncio.sleep(0)
+
+        # After run() starts, _heartbeat_task must be a live Task
+        assert worker._heartbeat_task is not None, (
+            '_heartbeat_task must not be None after run() starts'
+        )
+        assert not worker._heartbeat_task.done(), (
+            '_heartbeat_task must not be done immediately after run() starts'
+        )
+
+        # Enqueue one request and let it resolve so the worker can proceed to stop
+        wt = await _make_branch_with_file(
+            git_ops, 'hb-lc', 'hb_lc.py', 'x = 1\n',
+        )
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('hb-lc', 'hb-lc', wt, config)
+            await enqueue_merge_request(queue, req, None)
+            await asyncio.wait_for(req.result, timeout=10)
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # After stop(), _heartbeat_task must be done/cancelled
+        assert worker._heartbeat_task.done(), (
+            '_heartbeat_task must be done after stop()'
+        )

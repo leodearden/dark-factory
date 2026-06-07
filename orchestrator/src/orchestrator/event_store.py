@@ -63,9 +63,16 @@ class EventType(StrEnum):
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
     merge_attempt = 'merge_attempt'
+    # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
+    # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'
+    # data.queue_depth = remaining depth AFTER removal (excludes the dequeued item)
     merge_dequeued = 'merge_dequeued'
     merge_coalesced = 'merge_coalesced'
+    # Periodic queue-depth heartbeat: emitted while items wait in the pipeline.
+    # Queue-scoped (task_id=None). Payload: {depth, oldest_age_secs, head_of_line,
+    # verify_in_progress}.  Closes the journalctl blind spot during long queue waits.
+    merge_heartbeat = 'merge_heartbeat'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
