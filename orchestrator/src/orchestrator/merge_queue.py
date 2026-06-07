@@ -2159,18 +2159,31 @@ def _emit_merge_queued(
     event_store: EventStore | None,
     req: MergeRequest,
     reason: str | None = None,
+    *,
+    queue_depth: int | None = None,
+    position: int | None = None,
 ) -> None:
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
     Centralises the emit payload so both :func:`enqueue_merge_request` and
     the ``MergeWorker`` CAS-retry path use an identical record shape.  If
     *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
+
+    *queue_depth* (when provided) records how deep the main queue was at the
+    moment of enqueue — O(1) qsize() from the call site.  *position* (when
+    provided) records the front-of-line position for urgent re-inserts (0 ==
+    head).  Each key is omitted when None so the shape remains backward-
+    compatible with existing consumers.
     """
     if event_store is None:
         return
     data: dict = {'branch': req.branch}
     if reason is not None:
         data['reason'] = reason
+    if queue_depth is not None:
+        data['queue_depth'] = queue_depth
+    if position is not None:
+        data['position'] = position
     event_store.emit(
         EventType.merge_queued,
         task_id=req.task_id,
@@ -2359,7 +2372,7 @@ async def enqueue_merge_request(
 
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
-    _emit_merge_queued(event_store, req)
+    _emit_merge_queued(event_store, req, queue_depth=queue.qsize())
 
 
 async def register_and_enqueue_merge_request(
