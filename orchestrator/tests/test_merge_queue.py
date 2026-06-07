@@ -14759,3 +14759,73 @@ class TestMaybeLogQueueHeartbeat:
         ).fetchone()[0]
         conn.close()
         assert hb_count_d == 2, 'Idle call must not write a new event'
+
+
+# ---------------------------------------------------------------------------
+# TestHeartbeatTaskLifecycle — task-1675 step-11
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatTaskLifecycle:
+    """Heartbeat loop is wired into SpeculativeMergeWorker run()/stop() lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_task_started_by_run_and_cancelled_by_stop(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """run() creates _heartbeat_task; stop() cancels it cleanly.
+
+        Uses an immediate-conflict path (no real merge) so the test is fast.
+        After run() yields control, worker._heartbeat_task must be a non-done
+        asyncio.Task.  After stop() the task must be done/cancelled with no leak.
+
+        Fails today because _heartbeat_loop and _heartbeat_task do not exist.
+        """
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker._shutdown_timeout = 2.0
+        # Large interval so heartbeat never fires during this test
+        worker._heartbeat_interval_s = 9999.0
+
+        # Assert _heartbeat_task not set before run()
+        assert worker._heartbeat_task is None, (
+            '_heartbeat_task must be None before run() is called'
+        )
+
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        # Yield control so run() can create its tasks
+        await asyncio.sleep(0)
+
+        # After run() starts, _heartbeat_task must be a live Task
+        assert worker._heartbeat_task is not None, (
+            '_heartbeat_task must not be None after run() starts'
+        )
+        assert not worker._heartbeat_task.done(), (
+            '_heartbeat_task must not be done immediately after run() starts'
+        )
+
+        # Enqueue one request and let it resolve so the worker can proceed to stop
+        wt = await _make_branch_with_file(
+            git_ops, 'hb-lc', 'hb_lc.py', 'x = 1\n',
+        )
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('hb-lc', 'hb-lc', wt, config)
+            await enqueue_merge_request(queue, req, None)
+            await asyncio.wait_for(req.result, timeout=10)
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # After stop(), _heartbeat_task must be done/cancelled
+        assert worker._heartbeat_task.done(), (
+            '_heartbeat_task must be done after stop()'
+        )
