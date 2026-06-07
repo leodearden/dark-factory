@@ -3379,6 +3379,210 @@ async def test_recover_stale_runs_does_not_release_live_lock(
     assert await event_buffer.get_lock_holder_instance_id(project_id) == live_iid
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
+    journal, event_buffer, mock_memory_service,
+):
+    """Reaper must reap a run whose lock owner is provably dead (heartbeat too old).
+
+    Scenario: the owning instance died.  Its lock row is still present because
+    heartbeat_at < stale_lock_seconds (7200s) so it was not swept, BUT the
+    heartbeat is older than stale_run_recovery_seconds (1800s) — 30+ missed
+    beats — which is an unambiguous death signal.
+
+    The current identity-only guard (lock_holder == run.instance_id) shields this
+    orphan.  The liveness check fixes it: same iid + stale heartbeat → reap.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+
+    # Orphan run owned by the same instance_id as our EventBuffer.
+    run = ReconciliationRun(
+        id='run-dead-owner',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    # Acquire the lock so the identity check would have shielded it before.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    # Backdate heartbeat_at to now - (cutoff + 100)s — dead, but still within
+    # stale_lock_seconds (7200s) so the row is NOT swept by the stale-lock sweep.
+    dead_heartbeat = (
+        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat, project_id),
+        )
+
+    await harness._recover_stale_runs()
+
+    after = await journal.get_run('run-dead-owner')
+    assert after is not None
+    assert after.status == RunStatus.failed, (
+        'Dead-owner orphan (stale heartbeat) must be reaped'
+    )
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    # The dead owner's own lock must be released — not a live lock's.
+    lock_holder = await event_buffer.get_lock_holder_instance_id(project_id)
+    assert lock_holder is None, (
+        'Dead owner lock must be released after reaping'
+    )
+
+
+# ── build_stale_run_diagnostics unit tests ────────────────────────────────────
+
+
+def test_build_stale_run_diagnostics_classifies_disposition():
+    """build_stale_run_diagnostics returns the correct disposition for each branch.
+
+    Five cases:
+      1. instance_id=None                             → 'pre_migration'
+      2. lock_holder=None                             → 'no_lock'
+      3. lock_holder != run.instance_id               → 'handed_off'
+      4. lock_holder == run.instance_id, lock_age > cutoff → 'dead_owner_shielded'
+      5. lock_holder == run.instance_id, lock_age <= cutoff → 'live'
+
+    Cases 4 and 5 exercise the heartbeat-age comparison so the dead vs live
+    distinction is actually enforced.
+
+    All cases must include project_id, run_type, instance_id, age_seconds keys.
+    """
+    from fused_memory.reconciliation.harness import build_stale_run_diagnostics
+
+    cutoff = 1800.0
+    base_run = ReconciliationRun(
+        id='run-diag',
+        project_id='diag-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='iid-A',
+    )
+
+    # Case 1: pre_migration — instance_id is None
+    run_null = ReconciliationRun(
+        id='run-null-iid',
+        project_id='diag-project',
+        run_type=RunType.remediation,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=None,
+    )
+    d1 = build_stale_run_diagnostics(run_null, lock_holder='some-holder', lock_age=10.0, cutoff=cutoff)
+    assert d1['disposition'] == 'pre_migration'
+
+    # Case 2: no_lock — lock_holder is None
+    d2 = build_stale_run_diagnostics(base_run, lock_holder=None, lock_age=None, cutoff=cutoff)
+    assert d2['disposition'] == 'no_lock'
+
+    # Case 3: handed_off — lock held by a different instance
+    d3 = build_stale_run_diagnostics(base_run, lock_holder='iid-B', lock_age=30.0, cutoff=cutoff)
+    assert d3['disposition'] == 'handed_off'
+
+    # Case 4: dead_owner_shielded — same iid, heartbeat OLDER than cutoff
+    d4 = build_stale_run_diagnostics(base_run, lock_holder='iid-A', lock_age=cutoff + 100, cutoff=cutoff)
+    assert d4['disposition'] == 'dead_owner_shielded'
+
+    # Case 5: live — same iid, heartbeat FRESH (within cutoff); must NOT be 'dead_owner_shielded'
+    d5 = build_stale_run_diagnostics(base_run, lock_holder='iid-A', lock_age=cutoff - 100, cutoff=cutoff)
+    assert d5['disposition'] == 'live'
+
+    # All results must contain required fields
+    for d in (d1, d2, d3, d4, d5):
+        assert 'project_id' in d
+        assert 'run_type' in d
+        assert 'instance_id' in d
+        assert 'age_seconds' in d
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_emits_diagnostics(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """Reaper must emit rich diagnostics when it reaps a stale run.
+
+    Contract:
+    (a) stage_reports['_error'] includes project_id, instance_id, age_seconds,
+        disposition alongside existing error_type/error_message/failed_stage.
+    (b) _escalate is called once with a non-empty detail string that contains
+        the project_id and disposition.  The summary (for dedup) is unchanged.
+    (c) The WARNING log line includes project_id and disposition.
+    """
+    import logging
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Orphan from a dead instance — a different live instance holds the lock.
+    orphan = ReconciliationRun(
+        id='run-handed-off-diag',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-diag',
+    )
+    await journal.start_run(orphan)
+
+    # Live instance acquires the lock — different iid → disposition='handed_off'.
+    assert await event_buffer.mark_run_active(project_id) is True
+    assert event_buffer.instance_id != 'dead-instance-diag'
+
+    # Patch _escalate to intercept the call without needing a live queue.
+    from unittest.mock import patch as _patch
+    with _patch.object(harness, '_escalate') as mock_escalate, \
+         caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        await harness._recover_stale_runs()
+
+    # (a) stage_reports['_error'] now carries diagnostic fields.
+    after = await journal.get_run('run-handed-off-diag')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+    assert err.get('project_id') == project_id
+    assert err.get('instance_id') == 'dead-instance-diag'
+    assert err.get('age_seconds') is not None
+    assert err.get('disposition') == 'handed_off'
+
+    # (b) _escalate called once; detail is non-empty and contains key info.
+    mock_escalate.assert_called_once()
+    call_kwargs = mock_escalate.call_args
+    summary_arg = call_kwargs.args[2] if len(call_kwargs.args) >= 3 else call_kwargs.kwargs.get('summary', '')
+    detail_arg = call_kwargs.args[3] if len(call_kwargs.args) >= 4 else call_kwargs.kwargs.get('detail', '')
+    assert project_id in detail_arg, f'detail must contain project_id; got: {detail_arg!r}'
+    assert 'handed_off' in detail_arg, f'detail must contain disposition; got: {detail_arg!r}'
+    # Summary unchanged (for dedupe fingerprint).
+    assert 'lock expired' in summary_arg, f'summary must be the generic template; got: {summary_arg!r}'
+
+    # (c) WARNING log includes project_id and disposition.
+    warning_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(project_id in line for line in warning_lines), (
+        f'WARNING log must mention project_id; got: {warning_lines!r}'
+    )
+    assert any('handed_off' in line for line in warning_lines), (
+        f'WARNING log must mention disposition; got: {warning_lines!r}'
+    )
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 

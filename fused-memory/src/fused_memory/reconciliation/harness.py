@@ -180,6 +180,54 @@ class TierConfig:
     memory_limit: int = 250
 
 
+def build_stale_run_diagnostics(
+    run: ReconciliationRun,
+    lock_holder: str | None,
+    lock_age: float | None,
+    cutoff: float,
+) -> dict:
+    """Return a diagnostic dict for a stale run's lock disposition.
+
+    Classifies the disposition into one of five cases:
+
+    - ``pre_migration``       — run.instance_id is None (legacy row)
+    - ``no_lock``             — no lock row exists for the project
+    - ``handed_off``          — lock held by a different instance
+    - ``dead_owner_shielded`` — same iid as run, heartbeat older than cutoff
+    - ``live``                — same iid as run, heartbeat fresh (within cutoff)
+
+    Also includes: project_id, run_type (str), instance_id, age_seconds
+    (seconds since run.started_at), lock_holder, lock_heartbeat_age.
+    """
+    now = datetime.now(UTC)
+    # Normalize naive datetimes before subtracting — mirrors the guard in get_lock_status.
+    started = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=UTC)
+    age_seconds = (now - started).total_seconds()
+
+    if run.instance_id is None:
+        disposition = 'pre_migration'
+    elif lock_holder is None:
+        disposition = 'no_lock'
+    elif lock_holder != run.instance_id:
+        disposition = 'handed_off'
+    elif lock_age is not None and lock_age > cutoff:
+        # Same iid, but heartbeat is older than the liveness threshold.
+        disposition = 'dead_owner_shielded'
+    else:
+        # Same iid, heartbeat is fresh — owner is still alive.
+        disposition = 'live'
+
+    return {
+        'disposition': disposition,
+        'project_id': run.project_id,
+        'run_type': str(run.run_type.value) if isinstance(run.run_type, RunType) else str(run.run_type),
+        'instance_id': run.instance_id,
+        'age_seconds': age_seconds,
+        'lock_holder': lock_holder,
+        'lock_heartbeat_age': lock_age,
+    }
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
@@ -589,26 +637,33 @@ class ReconciliationHarness:
         cutoff = self.config.stale_run_recovery_seconds
         stale_runs = await self.journal.get_stale_runs(cutoff)
         for run in stale_runs:
-            # Only skip when the *same* instance that started the run still
-            # holds the lock — that's a legitimate long-running cycle.  A lock
-            # held by a different instance, or no lock at all, means the
-            # original owner is gone and the run is an orphan.
-            lock_holder = await self.buffer.get_lock_holder_instance_id(run.project_id)
+            # Skip only when the *same* instance that started the run still
+            # holds the lock AND the lock is freshly heartbeated (within cutoff).
+            # A dead owner's lock row satisfies the identity check but its
+            # heartbeat_at will be > cutoff seconds old — treat that as an orphan.
+            # A lock held by a different instance, or no lock at all, also means
+            # the original owner is gone and the run is an orphan.
+            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
             if (
                 lock_holder is not None
                 and run.instance_id is not None
                 and lock_holder == run.instance_id
+                and lock_age is not None
+                and lock_age <= cutoff
             ):
                 continue
 
+            diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
-                f'(started {run.started_at.isoformat()}, lock expired)'
+                f'(started {run.started_at.isoformat()}, lock expired, '
+                f'instance={run.instance_id}, disposition={diag["disposition"]})'
             )
             run.stage_reports['_error'] = {
                 'error_type': 'StaleRunRecovery',
                 'error_message': f'Run stale (>{cutoff}s, lock expired), recovered by harness',
                 'failed_stage': None,
+                **diag,
             }
             await self.journal.update_run_stage_reports(run.id, run.stage_reports)
             await self.journal.complete_run(run.id, 'failed')
@@ -635,7 +690,17 @@ class ReconciliationHarness:
                     run.project_id, instance_id=run.instance_id,
                 )
             await self._replay_deferred_writes(run.project_id)
-            self._escalate('recon_stale_run', run.id, f'Run stale (>{cutoff}s, lock expired), recovered')
+            detail = (
+                f"project={diag['project_id']} run_type={diag['run_type']} "
+                f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
+                f"disposition={diag['disposition']}"
+            )
+            self._escalate(
+                'recon_stale_run',
+                run.id,
+                f'Run stale (>{cutoff}s, lock expired), recovered',
+                detail,
+            )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
