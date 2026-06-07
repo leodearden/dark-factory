@@ -1101,8 +1101,8 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         # (2) Primary P is NOT cancelled
         assert not P.cancelled()
 
-        # (3) Outcome is REQUEUED (scheduler says in-progress → _handle_soft_cancel returns REQUEUED)
-        assert outcome == WorkflowOutcome.REQUEUED
+        # (3) Outcome is SOFT_CANCELLED (scheduler says in-progress + cancel_event set)
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
     async def test_re_attach_coalesces_after_soft_cancel(
         self, tmp_path, monkeypatch,
@@ -1339,8 +1339,8 @@ class TestGroupMergePathUnchangedByGamma3:
         assert attach_calls == [], f'registry.attach must not be called for train; got {attach_calls}'
         assert detach_calls == [], f'registry.detach must not be called for train; got {detach_calls}'
 
-        # Soft-cancel → REQUEUED (non-terminal scheduler status)
-        assert outcome == WorkflowOutcome.REQUEUED
+        # Soft-cancel → SOFT_CANCELLED (non-terminal scheduler status + cancel_event set)
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1415,8 +1415,8 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
             await asyncio.sleep(0)
         assert registry.entry('B') is None, 'slot must be released after cancel'
 
-        # Outcome is REQUEUED (scheduler non-terminal).
-        assert outcome == WorkflowOutcome.REQUEUED
+        # Outcome is SOFT_CANCELLED (scheduler non-terminal + cancel_event set).
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED
 
     async def test_rev_parse_failure_falls_through_to_enqueue(
         self, tmp_path, monkeypatch,
@@ -1579,8 +1579,8 @@ class TestBoundaryTableWorkflow:
             f'Remaining waiter must be mr-mcp, got: {entry.waiters[0].request_id!r}'
         )
         assert not P.cancelled(), 'Primary P must NOT be cancelled after workflow soft-cancel'
-        assert outcome1 == WorkflowOutcome.REQUEUED, (
-            f'Expected REQUEUED outcome after soft-cancel, got: {outcome1}'
+        assert outcome1 == WorkflowOutcome.SOFT_CANCELLED, (
+            f'Expected SOFT_CANCELLED outcome after soft-cancel, got: {outcome1}'
         )
 
         # ── (3) Re-attach: coalesces back to 2 waiters ──────────────────────
@@ -1611,3 +1611,68 @@ class TestBoundaryTableWorkflow:
         assert outcome2 == WorkflowOutcome.DONE, (
             f'Workflow re-attach outcome must be DONE, got: {outcome2}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestHandleSoftCancelOutcome — unit tests for the 3-way decision in
+# _handle_soft_cancel: terminal → DONE, cancel_event set → SOFT_CANCELLED,
+# cancel cleared (spurious) → REQUEUED.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHandleSoftCancelOutcome:
+    """Three-way decision contract for _handle_soft_cancel."""
+
+    def _make_wf(self, tmp_path: Path, *, status: str) -> TaskWorkflow:
+        assignment = MagicMock()
+        assignment.task_id = '99'
+        assignment.task = {'id': '99', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        from _orch_helpers import pydantic_spec  # noqa: PLC0415
+
+        _spec = pydantic_spec(OrchestratorConfig)
+        config = MagicMock(spec_set=_spec)
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path / 'proj'
+
+        scheduler = MagicMock()
+        scheduler.get_status = AsyncMock(return_value=status)
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+        )
+        return wf
+
+    async def test_terminal_status_returns_done(self, tmp_path: Path):
+        """Scheduler status 'done' → DONE regardless of cancel_event."""
+        wf = self._make_wf(tmp_path, status='done')
+        wf._cancel_event.set()  # even with event set, terminal wins
+        outcome = await wf._handle_soft_cancel('merge')
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_non_terminal_cancel_set_returns_soft_cancelled(self, tmp_path: Path):
+        """Scheduler status non-terminal + cancel_event.is_set() → SOFT_CANCELLED."""
+        wf = self._make_wf(tmp_path, status='in-progress')
+        wf._cancel_event.set()
+        outcome = await wf._handle_soft_cancel('merge')
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED
+
+    async def test_non_terminal_cancel_not_set_returns_requeued(self, tmp_path: Path):
+        """Scheduler status non-terminal + cancel_event NOT set → REQUEUED (spurious)."""
+        wf = self._make_wf(tmp_path, status='in-progress')
+        # cancel_event is NOT set — simulates a spurious/cleared cancel
+        assert not wf._cancel_event.is_set()
+        outcome = await wf._handle_soft_cancel('merge')
+        assert outcome == WorkflowOutcome.REQUEUED

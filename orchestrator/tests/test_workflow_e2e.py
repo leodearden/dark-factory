@@ -6658,6 +6658,169 @@ class TestCleanupNoOverreach:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeRetryLoopSoftCancelExits — step 3: RED merge-retry-loop e2e tests
+#
+# AC2/AC3: drives the FULL merge-retry loop and asserts that a soft-cancel
+# during the merge phase exits the slot (SOFT_CANCELLED) without retrying.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestMergeRetryLoopSoftCancelExits:
+    """Full merge-retry-loop e2e: soft-cancel must exit, not retry.
+
+    Both tests use _build_workflow + AgentStub + FakeScheduler (same pattern
+    as TestHappyPath) to drive run() through PLAN→EXECUTE→VERIFY→REVIEW into
+    the merge phase, then replace _submit_to_merge_queue with a counting
+    wrapper that sets _cancel_event.
+
+    ``@pytest.mark.mocks_dry_run_unblock`` is required because test (2) drives
+    BLOCKED (before step-4) and the file-local guard would otherwise fail on
+    the run_dry_run_unblock invocation.
+    """
+
+    async def test_soft_cancel_during_merge_exits_not_retry(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """AC3/AC2 headline: soft-cancel during merge exits slot immediately.
+
+        Wrapper delegates to the REAL _handle_soft_cancel('merge') which returns
+        SOFT_CANCELLED (FakeScheduler.get_status → 'in-progress' set by workflow
+        startup + cancel_event.is_set() True).  The merge-retry loop's existing
+        ``!= REQUEUED`` guard exits on SOFT_CANCELLED without logging
+        "retrying merge" or calling _mark_blocked.
+
+        GREEN once step-2 lands (SOFT_CANCELLED enum + _handle_soft_cancel update).
+        """
+        import logging as _logging  # noqa: PLC0415
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        submit_calls = 0
+        # Capture the bound _handle_soft_cancel BEFORE replacing _submit_to_merge_queue
+        # so the wrapper can delegate to the real implementation.
+        original_handle_soft_cancel = workflow._handle_soft_cancel  # type: ignore[method-assign]
+
+        async def soft_cancel_wrapper(
+            branch_name: str, pre_rebased: bool = False, *, merge_phase: bool = False,
+        ) -> WorkflowOutcome:
+            nonlocal submit_calls
+            submit_calls += 1
+            workflow._cancel_event.set()
+            # Delegate to the REAL _handle_soft_cancel: returns SOFT_CANCELLED
+            # (scheduler 'in-progress', cancel_event set) or DONE if terminal.
+            return await original_handle_soft_cancel('merge')
+
+        workflow._submit_to_merge_queue = soft_cancel_wrapper  # type: ignore[method-assign]
+
+        with caplog.at_level(_logging.INFO, logger='orchestrator.workflow'):
+            outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED, (
+            f'Expected SOFT_CANCELLED, got {outcome!r}'
+        )
+        assert submit_calls == 1, (
+            f'_submit_to_merge_queue must be called exactly once (no retry), got {submit_calls}'
+        )
+        assert 'retrying merge' not in caplog.text, (
+            'soft-cancel must NOT trigger "retrying merge" log'
+        )
+        # _mark_blocked was NOT called → no 'blocked' or 'done' status written
+        statuses = scheduler.statuses.get('42', [])
+        assert 'blocked' not in statuses, (
+            f'_mark_blocked must NOT have been called; statuses={statuses}'
+        )
+        assert 'done' not in statuses, (
+            f'DONE must NOT have been written; statuses={statuses}'
+        )
+
+    async def test_requeued_with_pending_cancel_exits_loop(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """AC3/AC2 root-cause-2: REQUEUED + pending cancel_event exits the loop.
+
+        Wrapper returns REQUEUED (simulating steward-resolved) but also sets
+        _cancel_event. Before step-4: the loop's ``!= REQUEUED`` guard does NOT
+        exit on REQUEUED, so the loop retries, submit_calls > 1, and
+        "retrying merge" appears in the log — test is RED. After step-4: the
+        new cancel re-check after the guard calls _handle_soft_cancel → exits
+        with SOFT_CANCELLED on the first REQUEUED with pending cancel.
+
+        Uses max_merge_retries=2 to limit pre-step-4 retries without affecting
+        the GREEN behavior (which exits after 1 call regardless).
+
+        RED before step-4 (loop retries on REQUEUED regardless of cancel_event).
+        GREEN after step-4 (cancel re-check exits before "retrying merge" log).
+        """
+        import logging as _logging  # noqa: PLC0415
+
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        # Use max_merge_retries=2 so the RED path exhausts in 2 iters, not 3.
+        config_2 = OrchestratorConfig(
+            project_root=config.project_root,
+            max_merge_retries=2,
+            git=config.git,
+        )
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config_2, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        submit_calls = 0
+
+        async def requeued_with_cancel_wrapper(
+            branch_name: str, pre_rebased: bool = False, *, merge_phase: bool = False,
+        ) -> WorkflowOutcome:
+            nonlocal submit_calls
+            submit_calls += 1
+            # Simulate: steward resolved, REQUEUED — but a soft-cancel also arrived.
+            workflow._cancel_event.set()
+            return WorkflowOutcome.REQUEUED
+
+        workflow._submit_to_merge_queue = requeued_with_cancel_wrapper  # type: ignore[method-assign]
+
+        with caplog.at_level(_logging.INFO, logger='orchestrator.workflow'):
+            outcome = await workflow.run()
+
+        # After step-4: cancel re-check fires immediately after REQUEUED + cancel_event.
+        # submit_calls == 1 (no retry), no "retrying merge" log, outcome SOFT_CANCELLED.
+        assert submit_calls == 1, (
+            f'Expected exactly 1 submit call (cancel re-check exits before retry), '
+            f'got {submit_calls} — "retrying merge" path not blocked'
+        )
+        assert 'retrying merge' not in caplog.text, (
+            f'REQUEUED + pending cancel must NOT log "retrying merge"; '
+            f'log tail: {caplog.text[-500:]!r}'
+        )
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED, (
+            f'Expected SOFT_CANCELLED via cancel re-check, got {outcome!r}'
+        )
+        assert 'Merge retries exhausted' not in caplog.text, (
+            '_mark_blocked("Merge retries exhausted") must NOT have been called'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestDryRunUnblockE2EGuard — pins the two modes of the file-local autouse guard
 # ---------------------------------------------------------------------------
 
