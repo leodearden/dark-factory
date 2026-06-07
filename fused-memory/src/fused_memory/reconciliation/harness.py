@@ -188,18 +188,21 @@ def build_stale_run_diagnostics(
 ) -> dict:
     """Return a diagnostic dict for a stale run's lock disposition.
 
-    Classifies the disposition into one of four cases:
+    Classifies the disposition into one of five cases:
 
     - ``pre_migration``       — run.instance_id is None (legacy row)
     - ``no_lock``             — no lock row exists for the project
     - ``handed_off``          — lock held by a different instance
-    - ``dead_owner_shielded`` — same iid as run but heartbeat older than cutoff
+    - ``dead_owner_shielded`` — same iid as run, heartbeat older than cutoff
+    - ``live``                — same iid as run, heartbeat fresh (within cutoff)
 
     Also includes: project_id, run_type (str), instance_id, age_seconds
     (seconds since run.started_at), lock_holder, lock_heartbeat_age.
     """
     now = datetime.now(UTC)
-    age_seconds = (now - run.started_at.replace(tzinfo=UTC) if run.started_at.tzinfo is None else now - run.started_at).total_seconds()
+    # Normalize naive datetimes before subtracting — mirrors the guard in get_lock_status.
+    started = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=UTC)
+    age_seconds = (now - started).total_seconds()
 
     if run.instance_id is None:
         disposition = 'pre_migration'
@@ -207,9 +210,12 @@ def build_stale_run_diagnostics(
         disposition = 'no_lock'
     elif lock_holder != run.instance_id:
         disposition = 'handed_off'
-    else:
-        # lock_holder == run.instance_id — check liveness
+    elif lock_age is not None and lock_age > cutoff:
+        # Same iid, but heartbeat is older than the liveness threshold.
         disposition = 'dead_owner_shielded'
+    else:
+        # Same iid, heartbeat is fresh — owner is still alive.
+        disposition = 'live'
 
     return {
         'disposition': disposition,

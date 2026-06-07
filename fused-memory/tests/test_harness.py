@@ -3448,11 +3448,15 @@ async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
 def test_build_stale_run_diagnostics_classifies_disposition():
     """build_stale_run_diagnostics returns the correct disposition for each branch.
 
-    Four cases:
-      1. instance_id=None               → 'pre_migration'
-      2. lock_holder=None               → 'no_lock'
-      3. lock_holder != run.instance_id → 'handed_off'
+    Five cases:
+      1. instance_id=None                             → 'pre_migration'
+      2. lock_holder=None                             → 'no_lock'
+      3. lock_holder != run.instance_id               → 'handed_off'
       4. lock_holder == run.instance_id, lock_age > cutoff → 'dead_owner_shielded'
+      5. lock_holder == run.instance_id, lock_age <= cutoff → 'live'
+
+    Cases 4 and 5 exercise the heartbeat-age comparison so the dead vs live
+    distinction is actually enforced.
 
     All cases must include project_id, run_type, instance_id, age_seconds keys.
     """
@@ -3490,12 +3494,16 @@ def test_build_stale_run_diagnostics_classifies_disposition():
     d3 = build_stale_run_diagnostics(base_run, lock_holder='iid-B', lock_age=30.0, cutoff=cutoff)
     assert d3['disposition'] == 'handed_off'
 
-    # Case 4: dead_owner_shielded — same iid, lock_age > cutoff
+    # Case 4: dead_owner_shielded — same iid, heartbeat OLDER than cutoff
     d4 = build_stale_run_diagnostics(base_run, lock_holder='iid-A', lock_age=cutoff + 100, cutoff=cutoff)
     assert d4['disposition'] == 'dead_owner_shielded'
 
+    # Case 5: live — same iid, heartbeat FRESH (within cutoff); must NOT be 'dead_owner_shielded'
+    d5 = build_stale_run_diagnostics(base_run, lock_holder='iid-A', lock_age=cutoff - 100, cutoff=cutoff)
+    assert d5['disposition'] == 'live'
+
     # All results must contain required fields
-    for d in (d1, d2, d3, d4):
+    for d in (d1, d2, d3, d4, d5):
         assert 'project_id' in d
         assert 'run_type' in d
         assert 'instance_id' in d
