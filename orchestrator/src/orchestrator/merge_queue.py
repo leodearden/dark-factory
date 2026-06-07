@@ -3350,7 +3350,7 @@ class MergeWorker(_WipHaltMixin):
                     EventType.merge_dequeued,
                     task_id=req.task_id,
                     phase='merge',
-                    data={'branch': req.branch},
+                    data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
                 )
 
             outcome = await self._process(req)
