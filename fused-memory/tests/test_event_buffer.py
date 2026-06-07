@@ -867,6 +867,48 @@ async def test_claim_deferred_writes_project_isolation(buf):
 
 
 @pytest.mark.asyncio
+async def test_get_lock_status_returns_instance_and_heartbeat_age(tmp_path):
+    """get_lock_status returns (instance_id, age_seconds) for a live lock,
+    (None, None) when no lock exists, and (None, None) when the lock row is
+    swept because heartbeat_at is older than stale_lock_seconds."""
+    buf = EventBuffer(
+        db_path=tmp_path / 'lock_status.db',
+        buffer_size_threshold=5,
+        max_staleness_seconds=300,
+        stale_lock_seconds=7200,
+    )
+    await buf.initialize()
+    try:
+        # No lock → (None, None)
+        iid, age = await buf.get_lock_status('test-project')
+        assert iid is None
+        assert age is None
+
+        # Acquire lock → instance_id returned with a small age
+        assert await buf.mark_run_active('test-project') is True
+        iid, age = await buf.get_lock_status('test-project')
+        assert iid == buf.instance_id
+        assert age is not None
+        assert 0.0 <= age < 5.0  # freshly acquired, age should be near-zero
+
+        # Backdate heartbeat_at past stale_lock_seconds → swept → (None, None)
+        db = buf._require_db()
+        very_old = (
+            datetime.now(UTC) - timedelta(seconds=buf.stale_lock_seconds + 100)
+        ).isoformat()
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (very_old, 'test-project'),
+        )
+        await db.commit()
+        iid, age = await buf.get_lock_status('test-project')
+        assert iid is None
+        assert age is None
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
 async def test_is_full_recon_active_no_lock(buf):
     """Returns False when no lock is held."""
     assert await buf.is_full_recon_active('test-project') is False
