@@ -10985,15 +10985,26 @@ class TestMapAdvanceFailure:
         halt.assert_not_called()
         assert task_id not in cas_retries
 
-    async def test_pop_conflict_push_raise_does_not_strand_halt(self) -> None:
-        """(f) pop_conflict + push_main raises → RuntimeError propagates, queue NOT left halted.
+    @pytest.mark.parametrize('exc', [
+        RuntimeError('push boom'),
+        asyncio.CancelledError(),
+    ], ids=['RuntimeError', 'CancelledError'])
+    async def test_pop_conflict_push_raise_does_not_strand_halt(
+        self, exc: BaseException,
+    ) -> None:
+        """(f) pop_conflict + push_main raises → exception propagates, queue NOT left halted.
 
         Regression for task 1671: the post-halt push_main call in _map_advance_failure's
         pop_conflict branch could raise (git failure, CancelledError) AFTER halt() was
         already called. Without an unhalt-on-raise guard the queue remained silently halted
         with owner=None -- a state that force_unhalt_merge_queue is required to clear.
 
-        RED today: _map_advance_failure has no unhalt parameter (TypeError on the call below).
+        Parametrized over RuntimeError and asyncio.CancelledError to pin the
+        ``except BaseException`` choice: narrowing the handler to ``except Exception``
+        would re-open the orphan-halt window for cancellations (the most likely
+        real-world trigger during worker shutdown), while still passing a
+        RuntimeError-only test.
+
         GREEN after fix: unhalt is wired; except BaseException calls it before re-raising.
         """
         from orchestrator.merge_queue import _map_advance_failure
@@ -11004,14 +11015,14 @@ class TestMapAdvanceFailure:
         assert not worker.is_wip_halted, 'precondition: worker starts un-halted'
         assert worker.halt_owner_esc_id is None
 
-        # MagicMock git_ops whose push_main raises.
+        # MagicMock git_ops whose push_main raises the parametrized exception.
         failing_git = self._make_git_ops()
-        failing_git.push_main = AsyncMock(side_effect=RuntimeError('push boom'))
+        failing_git.push_main = AsyncMock(side_effect=exc)
 
         task_id = 'task-push-raise'
         cas_retries = {task_id: 1}
 
-        with pytest.raises(RuntimeError, match='push boom'):
+        with pytest.raises(type(exc)):
             await _map_advance_failure(
                 failing_git, 'pop_conflict',
                 task_id=task_id,
