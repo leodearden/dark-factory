@@ -248,6 +248,7 @@ class WorkflowOutcome(enum.Enum):
     ESCALATED = 'escalated'
     CANCELLED = 'cancelled'
     MERGE_DEFERRED = 'merge-deferred'
+    SOFT_CANCELLED = 'soft-cancelled'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
@@ -6482,11 +6483,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _handle_soft_cancel(self, phase: str) -> WorkflowOutcome:
         """Decide an outcome after ``_cancel_event`` interrupted a long wait.
 
-        Re-reads the scheduler's view of task status: if terminal, exit
-        ``DONE`` (typically a human marked the task done); if not terminal,
-        the cancel was likely spurious (or the workflow should be requeued)
-        — fall back to ``REQUEUED`` so the harness re-runs the slot once
-        the cancel condition clears.
+        Three-way decision based on scheduler status and cancel-event state:
+
+        1. ``status in TERMINAL_STATUSES`` → ``DONE``
+           A human marked the task done out-of-band; exit cleanly.
+
+        2. ``self._cancel_event.is_set()`` (pending soft-cancel, non-terminal)
+           → ``SOFT_CANCELLED``
+           The slot exits immediately; the harness clears the slot just like
+           ``CANCELLED`` (hard-cancel).  The ``release_workflow`` MCP tool then
+           parks the task as ``blocked``.
+
+        3. Otherwise (cancel event cleared or spurious wakeup) → ``REQUEUED``
+           Defensive fallback: re-run the slot once the cancel condition clears.
+           Preserves the original REQUEUED semantics for non-soft-cancel callers.
         """
         try:
             status = await self.scheduler.get_status(self.task_id)
@@ -6501,6 +6511,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         if status in TERMINAL_STATUSES:
             return WorkflowOutcome.DONE
+        if self._cancel_event.is_set():
+            return WorkflowOutcome.SOFT_CANCELLED
         return WorkflowOutcome.REQUEUED
 
     async def _await_steward_completion(self) -> None:
