@@ -149,6 +149,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any, Literal, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
@@ -967,10 +968,36 @@ def _normalize_content_description(description: str) -> str:
     return ' '.join(description.split()).casefold()
 
 
+#: Prefix emitted by :func:`_content_fingerprint`.  Used as a single source of
+#: truth so :func:`_is_valid_marker_task_id` and :func:`_content_fingerprint`
+#: cannot drift apart silently.
+_CONTENT_FP_PREFIX: str = 'fp:'
+
+#: Number of hex characters kept from SHA-256 hexdigest (``digest[:32]``).
+#: 128 bits of SHA-256 provides sufficient collision resistance for a dedup key
+#: over recon findings.  Must match :func:`_content_fingerprint`'s slice length.
+_CONTENT_FP_HEXLEN: int = 32
+
+#: Compiled regex that matches ONLY canonical content-fingerprint marker keys:
+#: ``fp:`` followed by exactly :data:`_CONTENT_FP_HEXLEN` lowercase hex digits.
+#: Uppercase hex is excluded because :func:`hashlib.sha256().hexdigest` always
+#: returns lowercase; accepting uppercase would widen the accept-set beyond what
+#: the emitter can produce and introduce false positives.
+_CONTENT_FP_RE: re.Pattern[str] = re.compile(
+    rf'{re.escape(_CONTENT_FP_PREFIX)}[0-9a-f]{{{_CONTENT_FP_HEXLEN}}}\Z'
+)
+
+
 def _is_valid_marker_task_id(tid: str) -> bool:
-    """Return True iff *tid* is a valid stage1_flag_marker key processable by Stage 2.
+    """Return True iff *tid* is a valid stage1_flag_marker key.
 
     Accepts:
+    - A canonical content-fingerprint key: ``'fp:'`` followed by exactly
+      :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits, e.g.
+      ``'fp:9216e85ac497b68d93043b64684eb049'``.  This is the ONLY shape
+      emitted by :func:`_content_fingerprint`; the regex :data:`_CONTENT_FP_RE`
+      enforces the exact length and character set so accept-pattern and
+      emit-pattern cannot drift independently.
     - A bare non-negative integer string (e.g. ``'42'``, ``'0'``).
     - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
       the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
@@ -978,14 +1005,15 @@ def _is_valid_marker_task_id(tid: str) -> bool:
 
     Rejects:
     - Falsy / empty input.
-    - Content-fingerprint keys (e.g. ``'fp:9216e85ac497b68d93043b64684eb049'``).
-    - Any component that is not a non-negative integer after strip.
+    - Malformed fp: forms: ``'fp:'`` (no hex), too-short or too-long hex bodies,
+      uppercase hex, non-hex characters in the body.
+    - Any component that is not a non-negative integer after strip (numeric path).
     - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
 
     Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
     convention (``_looks_like_task_id`` in task_interceptor.py and
     sqlite_task_backend.py) while additionally tolerating the comma-joined
-    marker key.  Defined as a LOCAL helper to avoid a
+    marker key and canonical fp: keys.  Defined as a LOCAL helper to avoid a
     server/middleware←reconciliation import inversion; see the local-copy
     convention in :func:`_normalize_content_description`.
 
@@ -993,21 +1021,29 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     """
     if not tid:
         return False
+    # Canonical content-fingerprint branch: fp: + exactly 32 lowercase hex chars.
+    if _CONTENT_FP_RE.fullmatch(tid):
+        return True
+    # Numeric / comma-joined branch (existing convention, unchanged).
     components = tid.split(',')
     return all(part.strip().isdigit() for part in components)
 
 
 def _content_fingerprint(description: str) -> str:
-    """SHA-256 hex (first 32 chars) of the normalised description, prefixed 'fp:'.
+    """SHA-256 hex (first :data:`_CONTENT_FP_HEXLEN` chars) of the normalised description.
 
+    Output format: :data:`_CONTENT_FP_PREFIX` + ``digest[:_CONTENT_FP_HEXLEN]``.
     Deterministic across processes and PYTHONHASHSEED (unlike builtin hash()).
-    Truncation to 32 hex chars (128 bits of SHA-256) is sufficient collision
-    resistance for a dedup key over recon findings.
+    Truncation to :data:`_CONTENT_FP_HEXLEN` hex chars (128 bits of SHA-256) is
+    sufficient collision resistance for a dedup key over recon findings.
+
+    The emitted key is always accepted by :func:`_is_valid_marker_task_id` (the
+    anti-drift invariant tested by ``TestIsValidMarkerTaskId.test_accepts_anti_drift_roundtrip``).
     """
     digest = hashlib.sha256(
         _normalize_content_description(description).encode('utf-8')
     ).hexdigest()
-    return f'fp:{digest[:32]}'
+    return f'{_CONTENT_FP_PREFIX}{digest[:_CONTENT_FP_HEXLEN]}'
 
 
 def compute_content_fingerprint_signature(
