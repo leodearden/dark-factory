@@ -14167,3 +14167,223 @@ class TestBoundaryTableWorkerEntry:
         assert subset_outcome.status in {'done', 'already_merged'}, (
             f'subset waiter must resolve to done/already_merged, got: {subset_outcome.status!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCheckMergeLivenessMargin — startup runtime guard (task 1674)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckMergeLivenessMarginTimeoutResolution:
+    """(a) The guard reuses _resolve_verify_timeout for the cold merge-verify cascade."""
+
+    def test_explicit_merge_verify_cold_timeout(self, tmp_path: Path):
+        """Config with merge_verify_cold_command_timeout_secs=7200 → timeout_secs == 7200."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
+        result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+        assert result.timeout_secs == 7200.0, (
+            f'Expected timeout_secs=7200.0, got {result.timeout_secs}'
+        )
+
+    def test_warm_fallback_timeout(self, tmp_path: Path):
+        """Config with only verify_command_timeout_secs=120 (no cold overrides) → timeout_secs == 120.
+
+        Explicitly sets both cold fields to None so the bundled defaults.yaml
+        merge_verify_cold_command_timeout_secs=7200 does not shadow the warm default.
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_command_timeout_secs=120.0,
+            merge_verify_cold_command_timeout_secs=None,
+            verify_cold_command_timeout_secs=None,
+        )
+        result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+        assert result.timeout_secs == 120.0, (
+            f'Expected timeout_secs=120.0, got {result.timeout_secs}'
+        )
+
+
+class TestCheckMergeLivenessMarginInvariant:
+    """(b) Definitional threshold + formula-agnostic invariant."""
+
+    def test_threshold_equals_safety_factor_times_liveness(self, tmp_path: Path):
+        """threshold_secs == safety_factor * liveness_secs (injected)."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        # Explicitly clear cold overrides so only the warm timeout is active;
+        # bundled defaults.yaml ships merge_verify_cold=7200 which would shadow
+        # verify_command_timeout_secs otherwise.
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_command_timeout_secs=300.0,
+            merge_verify_cold_command_timeout_secs=None,
+            verify_cold_command_timeout_secs=None,
+        )
+        liveness = 4000.0
+        result = check_merge_liveness_margin(
+            cfg, safety_factor=0.5, liveness_secs=liveness,
+        )
+        assert result.threshold_secs == 0.5 * liveness, (
+            f'Expected threshold_secs=={0.5 * liveness}, got {result.threshold_secs}'
+        )
+
+    def test_safe_flag_matches_comparison(self, tmp_path: Path):
+        """assessment.safe, worst_case_secs, and threshold_secs are pinned to literals.
+
+        Formula: worst_case = merge_ahead_bound * timeout  (bound=1 default)
+        Threshold: safety_factor * liveness = 0.5 * 3600 = 1800.0
+
+        Use merge_verify_cold_command_timeout_secs to drive various timeout values
+        so the bundled defaults.yaml warm value doesn't interfere.
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        # (timeout, expected_worst_case, expected_threshold, expected_safe)
+        # worst_case = 1 * timeout (bound=1 default); threshold = 0.5 * 3600 = 1800.0
+        cases = [
+            (100.0,  100.0,  1800.0, True),
+            (500.0,  500.0,  1800.0, True),
+            (1800.0, 1800.0, 1800.0, False),  # 1800 < 1800 is False
+            (7200.0, 7200.0, 1800.0, False),
+        ]
+        for timeout, exp_wc, exp_thresh, exp_safe in cases:
+            cfg = OrchestratorConfig(
+                project_root=tmp_path,
+                merge_verify_cold_command_timeout_secs=timeout,
+            )
+            result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+            assert result.worst_case_secs == exp_wc, (
+                f'timeout={timeout}: expected worst_case={exp_wc}, got {result.worst_case_secs}'
+            )
+            assert result.threshold_secs == exp_thresh, (
+                f'timeout={timeout}: expected threshold={exp_thresh}, got {result.threshold_secs}'
+            )
+            assert result.safe is exp_safe, (
+                f'timeout={timeout}: expected safe={exp_safe!r}, got {result.safe!r} '
+                f'(worst_case={result.worst_case_secs}, threshold={result.threshold_secs})'
+            )
+
+    def test_worst_case_at_least_timeout(self, tmp_path: Path):
+        """worst_case_secs >= timeout_secs (bound >= 1 guarantees this)."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=500.0,
+        )
+        result = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=1)
+        assert result.worst_case_secs >= result.timeout_secs, (
+            f'worst_case_secs={result.worst_case_secs} must be >= timeout_secs={result.timeout_secs}'
+        )
+
+
+class TestCheckMergeLivenessMarginClassificationAndLogging:
+    """(c) Classification + logging: WARNING fires iff not safe."""
+
+    def test_unsafe_config_returns_not_safe_and_logs_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """merge_verify_cold=7200 with safety_factor=0.5 → .safe False + WARNING logged."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+
+        assert result.safe is False, (
+            f'Expected .safe=False for merge_verify_cold=7200 + safety_factor=0.5, '
+            f'got .safe={result.safe!r}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING, got {len(warnings)}: {[r.message for r in warnings]!r}'
+        )
+        msg = warnings[0].message
+        # Message must name worst-case, liveness, and the offending config key.
+        assert str(int(result.worst_case_secs)) in msg or f'{result.worst_case_secs:.0f}' in msg, (
+            f'WARNING must mention worst_case_secs ({result.worst_case_secs}); got: {msg!r}'
+        )
+        assert 'merge_verify_cold_command_timeout_secs' in msg, (
+            f'WARNING must name offending key merge_verify_cold_command_timeout_secs; got: {msg!r}'
+        )
+
+    def test_safe_config_returns_safe_and_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """verify_command_timeout_secs=120 (cold overrides cleared) with safety_factor=0.5 → .safe True, no WARNING."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        # Clear cold overrides so the warm 120s wins (bundled defaults.yaml has
+        # merge_verify_cold=7200 which would otherwise shadow verify_command_timeout_secs).
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_command_timeout_secs=120.0,
+            merge_verify_cold_command_timeout_secs=None,
+            verify_cold_command_timeout_secs=None,
+        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+
+        assert result.safe is True, (
+            f'Expected .safe=True for verify_command_timeout_secs=120 + safety_factor=0.5, '
+            f'got .safe={result.safe!r}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 0, (
+            f'Expected no WARNINGs for safe config, got {len(warnings)}: '
+            f'{[r.message for r in warnings]!r}'
+        )
+
+
+class TestCheckMergeLivenessMarginBoundCoupling:
+    """(d) Injectable merge_ahead_bound coupling (formula-agnostic)."""
+
+    def test_higher_bound_increases_worst_case_and_flips_safe(self, tmp_path: Path):
+        """merge_ahead_bound=1 → safe; merge_ahead_bound=20 → not safe (timeout=100, factor=0.5)."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        # Use merge_verify_cold_command_timeout_secs=100 directly; if we only set
+        # verify_command_timeout_secs=100 the bundled defaults.yaml merge_verify_cold=7200
+        # would win and the safety computation would be wrong.
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=100.0,
+        )
+        low = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=1)
+        high = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=20)
+
+        # Pinned literals: formula worst_case = bound * timeout; threshold = 0.5 * 3600 = 1800
+        assert low.worst_case_secs == 100.0, (
+            f'bound=1,timeout=100: expected worst_case=100.0, got {low.worst_case_secs}'
+        )
+        assert high.worst_case_secs == 2000.0, (
+            f'bound=20,timeout=100: expected worst_case=2000.0, got {high.worst_case_secs}'
+        )
+        assert low.threshold_secs == high.threshold_secs == 1800.0, (
+            f'threshold must equal 0.5*3600=1800 for both; '
+            f'got low={low.threshold_secs}, high={high.threshold_secs}'
+        )
+        assert high.worst_case_secs > low.worst_case_secs, (
+            f'Higher bound must yield larger worst_case_secs: '
+            f'bound=1 → {low.worst_case_secs}, bound=20 → {high.worst_case_secs}'
+        )
+        assert low.safe is True, (
+            f'bound=1,timeout=100,factor=0.5 must be safe; got .safe={low.safe!r}'
+        )
+        assert high.safe is False, (
+            f'bound=20,timeout=100,factor=0.5 must not be safe; got .safe={high.safe!r}'
+        )

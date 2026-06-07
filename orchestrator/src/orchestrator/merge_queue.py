@@ -28,7 +28,12 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
-from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
+from orchestrator.verify import (
+    VerifyResult,
+    _resolve_verify_timeout,
+    run_scoped_verification,
+    run_verification,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -98,6 +103,10 @@ outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not conf
 _MERGE_AHEAD_BOUND = 1
 """Maximum number of counted (non-speculative, non-train) items that may sit in
 the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
+
+.. note:: This constant is an input to the startup liveness-margin guard.
+   See :func:`check_merge_liveness_margin` for the coupling between this bound,
+   the verify timeout, and :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
 
 With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
 Verifier: after enqueuing a counted item the Merger blocks at
@@ -1801,6 +1810,11 @@ def _emit_train_event(
 INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
 """Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
 to be considered actively in-flight rather than abandoned.
+
+.. note:: Raising this value (or raising :data:`_MERGE_AHEAD_BOUND`, or
+   increasing the merge-verify cold timeout) affects the safety margin computed
+   by :func:`check_merge_liveness_margin`.  Run that guard after changing any
+   of these three values.
 
 The evidence shows a cold npm+cargo verify can run for 10–20 minutes on the
 first run; the scheduler's /unblock backoff is ~1 hour.  A 1-hour window:
@@ -5126,3 +5140,155 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'{self.MAX_CAS_RETRIES}), retrying'
             )
             _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+
+
+# ---------------------------------------------------------------------------
+# Startup liveness-margin guard (task 1674)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class MergeLivenessAssessment:
+    """Return value from :func:`check_merge_liveness_margin`.
+
+    All fields are informational; callers should treat :attr:`safe` as the
+    primary decision bit and log/display the numeric fields for triage.
+
+    Attributes:
+        worst_case_secs: Computed worst-case time (seconds) a counted
+            ``_merge-*`` worktree can legitimately remain queued without
+            having its mtime updated, under the given config.
+        threshold_secs: Safety threshold (``safety_factor * liveness_secs``);
+            the guard fires when ``worst_case_secs >= threshold_secs``.
+        liveness_secs: The reaper's liveness window passed to the guard.
+        timeout_secs: Effective per-command merge-verify cold timeout resolved
+            from the config (the primary knob that drives the worst-case).
+        merge_ahead_bound: Injected (or defaulted) merge-ahead cap value.
+        max_verify_timeouts: Injected (or defaulted) consecutive-timeout
+            limit; included for informational display in log messages.
+        safe: True iff ``worst_case_secs < threshold_secs``.
+    """
+
+    worst_case_secs: float
+    threshold_secs: float
+    liveness_secs: float
+    timeout_secs: float
+    merge_ahead_bound: int
+    max_verify_timeouts: int
+    safe: bool
+
+
+def check_merge_liveness_margin(
+    config: OrchestratorConfig,
+    *,
+    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+    liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    safety_factor: float = 0.75,
+    logger: logging.Logger = logger,
+) -> MergeLivenessAssessment:
+    """Evaluate whether the merge-verify cold timeout fits safely within the
+    reaper's liveness window and emit a WARNING when it does not.
+
+    Called once at orchestrator startup (from ``Harness._start_merge_worker``)
+    against the live per-project :class:`OrchestratorConfig`.
+
+    **Physical model**
+
+    With ``_MERGE_AHEAD_BOUND=N``, up to *N* counted ``_merge-*`` worktrees
+    can sit in the :class:`SpeculativeMergeWorker` verifier queue while the
+    verifier is busy with an earlier item.  Those queued worktrees have their
+    mtime frozen at merge time and are NOT updated until the verifier picks
+    them up.  The worst-case stale interval for a queued worktree is therefore
+    bounded by the longest a single verify can run — the cold merge-verify
+    timeout resolved from *config*.
+
+    The reaper in :func:`coalesce_or_enqueue_merge_request` treats any
+    ``_merge-*`` worktree whose mtime age exceeds
+    :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` as abandoned and reaps it.
+    A queued-but-legitimate worktree is indistinguishable from an abandoned
+    one once its mtime age exceeds that window.
+
+    **Formula**
+
+    .. code-block:: text
+
+        worst_case = merge_ahead_bound * timeout
+        threshold  = safety_factor * liveness_secs
+        safe       = worst_case < threshold
+
+    The formula uses a multiplier of 1 (not ``max_verify_timeouts + 1``)
+    because each verify attempt creates and cleans up its own ``_merge-*``
+    worktree; the per-task timeout-retry counter does not extend any single
+    worktree's on-disk lifetime.  ``max_verify_timeouts`` is carried in the
+    return value for operator context.
+
+    **Default calibration**
+
+    With ``safety_factor=0.75`` and ``liveness_secs=3600``:
+    - threshold = 2700 s
+    - A warm-only deployment (``verify_command_timeout_secs=1800``, no cold
+      overrides) resolves timeout=1800 s → worst_case=1800 s < 2700 s → safe.
+    - The shipped ``defaults.yaml`` (``merge_verify_cold_command_timeout_secs
+      =7200``) resolves timeout=7200 s → worst_case=7200 s ≥ 2700 s → WARN.
+
+    Args:
+        config: Live per-project orchestrator config.
+        merge_ahead_bound: Override for :data:`_MERGE_AHEAD_BOUND` (injectable
+            for tests and future tuning).
+        max_verify_timeouts: Override for
+            :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`
+            (informational; not part of the worst-case formula).
+        liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
+        safety_factor: Fraction of *liveness_secs* that constitutes the
+            "comfortably below" threshold.  Default 0.75.
+        logger: Logger to use for the WARNING (default: module logger, captured
+            by ``pytest caplog`` as ``orchestrator.merge_queue``).
+
+    Returns:
+        :class:`MergeLivenessAssessment` with all computed values and the
+        ``safe`` verdict.
+    """
+    # Resolve the effective per-command merge-verify cold timeout.
+    # Merge worktrees are always cold (merge_queue.py:379-384), so we pass
+    # is_cold=True and is_merge_verify=True to get the full cold cascade:
+    #   merge_verify_cold_command_timeout_secs
+    #   → verify_cold_command_timeout_secs
+    #   → verify_command_timeout_secs (warm fallback)
+    # module_config=None: no per-module override exists at startup.
+    timeout_secs = _resolve_verify_timeout(
+        config, None, is_cold=True, is_merge_verify=True,
+    )
+
+    worst_case_secs = merge_ahead_bound * timeout_secs
+    threshold_secs = safety_factor * liveness_secs
+    safe = worst_case_secs < threshold_secs
+
+    assessment = MergeLivenessAssessment(
+        worst_case_secs=worst_case_secs,
+        threshold_secs=threshold_secs,
+        liveness_secs=liveness_secs,
+        timeout_secs=timeout_secs,
+        merge_ahead_bound=merge_ahead_bound,
+        max_verify_timeouts=max_verify_timeouts,
+        safe=safe,
+    )
+
+    if not safe:
+        logger.warning(
+            'check_merge_liveness_margin: queued _merge-* worktree worst-case '
+            'age (%.0fs) is not comfortably below the reaper liveness window '
+            '(%.0fs, threshold=%.0fs, factor=%.2f). '
+            'Reduce merge_verify_cold_command_timeout_secs (currently %.0fs) '
+            'or raise INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS '
+            '(merge_ahead_bound=%d, max_verify_timeouts=%d).',
+            worst_case_secs,
+            liveness_secs,
+            threshold_secs,
+            safety_factor,
+            timeout_secs,
+            merge_ahead_bound,
+            max_verify_timeouts,
+        )
+
+    return assessment
