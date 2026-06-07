@@ -10878,13 +10878,14 @@ class TestMapAdvanceFailure:
 
         git_ops = self._make_git_ops()
         halt = MagicMock()
+        unhalt = MagicMock()
         task_id = 'task-adv-fail'
         cas_retries = {task_id: 1}
 
         outcome = await _map_advance_failure(
             git_ops, 'wip_overlap',
             task_id=task_id, merge_commit_fallback='fallback-sha',
-            halt=halt, cas_retries=cas_retries,
+            halt=halt, unhalt=unhalt, cas_retries=cas_retries,
         )
 
         assert outcome.status == 'wip_halted'
@@ -10900,13 +10901,14 @@ class TestMapAdvanceFailure:
 
         git_ops = self._make_git_ops()
         halt = MagicMock()
+        unhalt = MagicMock()
         task_id = 'task-pop-conf'
         cas_retries = {task_id: 1}
 
         outcome = await _map_advance_failure(
             git_ops, 'pop_conflict',
             task_id=task_id, merge_commit_fallback='fallback-sha',
-            halt=halt, cas_retries=cas_retries,
+            halt=halt, unhalt=unhalt, cas_retries=cas_retries,
         )
 
         assert outcome.status == 'done_wip_recovery'
@@ -10915,6 +10917,7 @@ class TestMapAdvanceFailure:
         assert outcome.merge_sha == git_ops._last_advanced_sha
         halt.assert_called_once_with('advance_main: pop_conflict')
         git_ops.push_main.assert_awaited_once()
+        unhalt.assert_not_called()  # success path must NOT un-halt
 
     async def test_unmerged_state_halts_pops_retries(self) -> None:
         """(c) unmerged_state → halt with unmerged message, cas_retries popped."""
@@ -10922,13 +10925,14 @@ class TestMapAdvanceFailure:
 
         git_ops = self._make_git_ops()
         halt = MagicMock()
+        unhalt = MagicMock()
         task_id = 'task-unmerged'
         cas_retries = {task_id: 2}
 
         outcome = await _map_advance_failure(
             git_ops, 'unmerged_state',
             task_id=task_id, merge_commit_fallback='fallback-sha',
-            halt=halt, cas_retries=cas_retries,
+            halt=halt, unhalt=unhalt, cas_retries=cas_retries,
         )
 
         assert outcome.status == 'unmerged_state'
@@ -10944,13 +10948,14 @@ class TestMapAdvanceFailure:
 
         git_ops = self._make_git_ops()
         halt = MagicMock()
+        unhalt = MagicMock()
         task_id = 'task-no-adv'
         cas_retries = {task_id: 1}
 
         outcome = await _map_advance_failure(
             git_ops, 'pop_conflict_no_advance',
             task_id=task_id, merge_commit_fallback='fallback-sha',
-            halt=halt, cas_retries=cas_retries,
+            halt=halt, unhalt=unhalt, cas_retries=cas_retries,
         )
 
         assert outcome.status == 'wip_recovery_no_advance'
@@ -10965,13 +10970,14 @@ class TestMapAdvanceFailure:
 
         git_ops = self._make_git_ops()
         halt = MagicMock()
+        unhalt = MagicMock()
         task_id = 'task-terminal'
         cas_retries = {task_id: 3}
 
         outcome = await _map_advance_failure(
             git_ops, result,
             task_id=task_id, merge_commit_fallback='fallback-sha',
-            halt=halt, cas_retries=cas_retries,
+            halt=halt, unhalt=unhalt, cas_retries=cas_retries,
         )
 
         assert outcome.status == 'blocked'
