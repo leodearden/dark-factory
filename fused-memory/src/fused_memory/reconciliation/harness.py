@@ -180,6 +180,48 @@ class TierConfig:
     memory_limit: int = 250
 
 
+def build_stale_run_diagnostics(
+    run: ReconciliationRun,
+    lock_holder: str | None,
+    lock_age: float | None,
+    cutoff: float,
+) -> dict:
+    """Return a diagnostic dict for a stale run's lock disposition.
+
+    Classifies the disposition into one of four cases:
+
+    - ``pre_migration``       — run.instance_id is None (legacy row)
+    - ``no_lock``             — no lock row exists for the project
+    - ``handed_off``          — lock held by a different instance
+    - ``dead_owner_shielded`` — same iid as run but heartbeat older than cutoff
+
+    Also includes: project_id, run_type (str), instance_id, age_seconds
+    (seconds since run.started_at), lock_holder, lock_heartbeat_age.
+    """
+    now = datetime.now(UTC)
+    age_seconds = (now - run.started_at.replace(tzinfo=UTC) if run.started_at.tzinfo is None else now - run.started_at).total_seconds()
+
+    if run.instance_id is None:
+        disposition = 'pre_migration'
+    elif lock_holder is None:
+        disposition = 'no_lock'
+    elif lock_holder != run.instance_id:
+        disposition = 'handed_off'
+    else:
+        # lock_holder == run.instance_id — check liveness
+        disposition = 'dead_owner_shielded'
+
+    return {
+        'disposition': disposition,
+        'project_id': run.project_id,
+        'run_type': str(run.run_type.value) if isinstance(run.run_type, RunType) else str(run.run_type),
+        'instance_id': run.instance_id,
+        'age_seconds': age_seconds,
+        'lock_holder': lock_holder,
+        'lock_heartbeat_age': lock_age,
+    }
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
