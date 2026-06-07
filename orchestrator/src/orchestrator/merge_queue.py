@@ -4023,7 +4023,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         EventType.merge_dequeued,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': req.branch},
+                        data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
                     )
                 t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None
