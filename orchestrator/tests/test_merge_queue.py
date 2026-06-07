@@ -14235,24 +14235,39 @@ class TestCheckMergeLivenessMarginInvariant:
         )
 
     def test_safe_flag_matches_comparison(self, tmp_path: Path):
-        """assessment.safe == (worst_case_secs < threshold_secs).
+        """assessment.safe, worst_case_secs, and threshold_secs are pinned to literals.
+
+        Formula: worst_case = merge_ahead_bound * timeout  (bound=1 default)
+        Threshold: safety_factor * liveness = 0.5 * 3600 = 1800.0
 
         Use merge_verify_cold_command_timeout_secs to drive various timeout values
         so the bundled defaults.yaml warm value doesn't interfere.
         """
         from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
 
-        for timeout in (100.0, 500.0, 1800.0, 7200.0):
+        # (timeout, expected_worst_case, expected_threshold, expected_safe)
+        # worst_case = 1 * timeout (bound=1 default); threshold = 0.5 * 3600 = 1800.0
+        cases = [
+            (100.0,  100.0,  1800.0, True),
+            (500.0,  500.0,  1800.0, True),
+            (1800.0, 1800.0, 1800.0, False),  # 1800 < 1800 is False
+            (7200.0, 7200.0, 1800.0, False),
+        ]
+        for timeout, exp_wc, exp_thresh, exp_safe in cases:
             cfg = OrchestratorConfig(
                 project_root=tmp_path,
                 merge_verify_cold_command_timeout_secs=timeout,
             )
             result = check_merge_liveness_margin(cfg, safety_factor=0.5)
-            expected_safe = result.worst_case_secs < result.threshold_secs
-            assert result.safe == expected_safe, (
-                f'timeout={timeout}: safe={result.safe!r} but '
-                f'worst_case={result.worst_case_secs} < threshold={result.threshold_secs} '
-                f'is {expected_safe!r}'
+            assert result.worst_case_secs == exp_wc, (
+                f'timeout={timeout}: expected worst_case={exp_wc}, got {result.worst_case_secs}'
+            )
+            assert result.threshold_secs == exp_thresh, (
+                f'timeout={timeout}: expected threshold={exp_thresh}, got {result.threshold_secs}'
+            )
+            assert result.safe is exp_safe, (
+                f'timeout={timeout}: expected safe={exp_safe!r}, got {result.safe!r} '
+                f'(worst_case={result.worst_case_secs}, threshold={result.threshold_secs})'
             )
 
     def test_worst_case_at_least_timeout(self, tmp_path: Path):
@@ -14351,6 +14366,17 @@ class TestCheckMergeLivenessMarginBoundCoupling:
         low = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=1)
         high = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=20)
 
+        # Pinned literals: formula worst_case = bound * timeout; threshold = 0.5 * 3600 = 1800
+        assert low.worst_case_secs == 100.0, (
+            f'bound=1,timeout=100: expected worst_case=100.0, got {low.worst_case_secs}'
+        )
+        assert high.worst_case_secs == 2000.0, (
+            f'bound=20,timeout=100: expected worst_case=2000.0, got {high.worst_case_secs}'
+        )
+        assert low.threshold_secs == high.threshold_secs == 1800.0, (
+            f'threshold must equal 0.5*3600=1800 for both; '
+            f'got low={low.threshold_secs}, high={high.threshold_secs}'
+        )
         assert high.worst_case_secs > low.worst_case_secs, (
             f'Higher bound must yield larger worst_case_secs: '
             f'bound=1 → {low.worst_case_secs}, bound=20 → {high.worst_case_secs}'

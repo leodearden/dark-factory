@@ -192,10 +192,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
 
             await h._start_merge_worker()
 
-        mock_guard.assert_called_once_with(h.config), (
-            f'check_merge_liveness_margin must be called once with h.config; '
-            f'actual calls: {mock_guard.call_args_list!r}'
-        )
+        mock_guard.assert_called_once_with(h.config)
 
 
 @pytest.mark.asyncio
