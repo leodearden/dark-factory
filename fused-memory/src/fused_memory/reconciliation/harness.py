@@ -54,7 +54,7 @@ try:
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue, iter_all_escalation_paths  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
@@ -852,6 +852,17 @@ class ReconciliationHarness:
                     [],
                     summary,
                 )
+            if self._finding_recently_resolved(category, fingerprint):
+                logger.info(
+                    'reconciliation.escalation_suppressed_recently_resolved',
+                    extra={
+                        'category': category,
+                        'run_id': run_id,
+                        'fingerprint': fingerprint,
+                        'summary': summary,
+                    },
+                )
+                return
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(f'recon-{run_id[:8]}'),
                 task_id=f'recon-{run_id[:8]}',
@@ -1510,6 +1521,54 @@ class ReconciliationHarness:
                 },
             )
             return False  # fail-open: proceed with remediation
+
+    def _finding_recently_resolved(
+        self,
+        category: str,
+        fingerprint: str | None,
+        *,
+        now=None,
+    ) -> bool:
+        """Return True iff a recently-resolved escalation matches category + fingerprint.
+
+        Mirrors _finding_has_open_escalation but scans resolved/dismissed escalations
+        in the full queue root + archive via iter_all_escalation_paths.  Used by
+        _escalate() to suppress re-firing of a finding whose matching escalation was
+        resolved within _RESOLVED_RECURRENCE_WINDOW_SECONDS (task 1669).
+
+        Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
+        matching the category gate used by submit_or_dedupe.
+
+        Fail-open: any exception (or HAS_ESCALATION False / queue None / no fingerprint)
+        returns False so a transient read glitch costs at most one extra escalation
+        rather than silently suppressing a needed one.  Same philosophy as
+        _finding_has_open_escalation.
+        """
+        if not HAS_ESCALATION or self._escalation_queue is None or not fingerprint:
+            return False
+        if _RECON_DEDUP_CONFIG is None or category not in _RECON_DEDUP_CONFIG.infra_dedupe_categories:
+            return False
+        try:
+            for path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
+                self._escalation_queue.queue_dir
+            ):
+                try:
+                    esc = Escalation.from_json(path.read_text())  # type: ignore[possibly-undefined]
+                except Exception:
+                    continue
+                if (
+                    esc.status in ('resolved', 'dismissed')
+                    and esc.category == category
+                    and esc.dedupe_fingerprint == fingerprint
+                ):
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(
+                'reconciliation.recently_resolved_check_failed',
+                extra={'category': category, 'error': str(e)},
+            )
+            return False
 
     async def _maybe_remediate(
         self,
