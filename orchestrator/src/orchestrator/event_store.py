@@ -66,6 +66,10 @@ class EventType(StrEnum):
     merge_queued = 'merge_queued'
     merge_dequeued = 'merge_dequeued'
     merge_coalesced = 'merge_coalesced'
+    # Periodic queue-depth heartbeat: emitted while items wait in the pipeline.
+    # Queue-scoped (task_id=None). Payload: {depth, oldest_age_secs, head_of_line,
+    # verify_in_progress}.  Closes the journalctl blind spot during long queue waits.
+    merge_heartbeat = 'merge_heartbeat'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,

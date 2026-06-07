@@ -3710,6 +3710,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -3726,6 +3727,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verify_started_at: float | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
+        # Heartbeat: wall-clock time of last emission (0.0 = never fired).
+        # Checked by _maybe_log_queue_heartbeat to rate-limit emissions.
+        self._last_heartbeat_at: float = 0.0
+        # Default interval ~5 min; override in tests for deterministic rate-limit checks.
+        # Mirrors the _shutdown_timeout override precedent.
+        self._heartbeat_interval_s: float = 300.0
 
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
@@ -3829,6 +3836,57 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
         }
+
+    def _maybe_log_queue_heartbeat(self, now: float) -> bool:
+        """Emit a queue-depth heartbeat log line and event if conditions are met.
+
+        Synchronous and clock-injectable (``now`` parameter) so tests can drive
+        firing/rate-limiting deterministically without relying on real sleep.
+
+        Returns True when a heartbeat was emitted, False otherwise.
+
+        No-ops when:
+          - ``snapshot()['depth'] == 0`` (idle pipeline — no journal spam)
+          - ``now - self._last_heartbeat_at < self._heartbeat_interval_s``
+            (rate-limit — respects the overridable interval)
+        """
+        snap = self.snapshot()
+        if snap['depth'] == 0:
+            return False
+        if now - self._last_heartbeat_at < self._heartbeat_interval_s:
+            return False
+
+        entries = snap['entries']
+        oldest_age = max(e['age_secs'] for e in entries)
+        head = entries[0]
+        head_of_line = {
+            'task_id': head['task_id'],
+            'state': head['state'],
+            'age_secs': head['age_secs'],
+        }
+
+        logger.info(
+            'merge queue heartbeat: %d in pipeline, oldest age=%.0fs, '
+            'head=task %s (state=%s, age=%.0fs)',
+            snap['depth'], oldest_age,
+            head['task_id'], head['state'], head['age_secs'],
+        )
+
+        if self._event_store is not None:
+            self._event_store.emit(
+                EventType.merge_heartbeat,
+                task_id=None,
+                phase='merge',
+                data={
+                    'depth': snap['depth'],
+                    'oldest_age_secs': oldest_age,
+                    'head_of_line': head_of_line,
+                    'verify_in_progress': snap['verify_in_progress'],
+                },
+            )
+
+        self._last_heartbeat_at = now
+        return True
 
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""
