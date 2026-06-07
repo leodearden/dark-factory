@@ -2190,7 +2190,7 @@ class TestSpeculativeMergeWorker:
         # N fails verification → n_failed=True; _remerge then raises for N+1
         mock_verify = AsyncMock(return_value=MagicMock(passed=False, summary='tests failed'))
 
-        async def raise_on_remerge(req, started_monotonic: float | None = None):  # type: ignore[no-untyped-def]
+        async def raise_on_remerge(req, started_monotonic: float | None = None, **kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError('_remerge failed unexpectedly')
 
         worker._remerge = raise_on_remerge  # type: ignore[method-assign]
@@ -4093,6 +4093,83 @@ class TestSpeculativeMergeWorker:
         assert 'file_rb_n.py' in n1_verify_calls[0], (
             f"N+1 re-verify must see N's file (fresh M1 tree includes N's commit); "
             f'got files: {n1_verify_calls[0]}'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    # ── Invariant (1) guard: build-time skip_verify fast path is undisturbed ──
+
+    async def test_pickup_pre_rebased_main_unchanged_skips_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Invariant (1) guard: skip_verify fast path is intact when main does NOT advance.
+
+        A single non-train pre_rebased request is submitted while main remains
+        at M0.  The merger builds it with skip_verify=True (build-time fast path,
+        merge_queue.py:4256-4260 — pre_rebased=True, pre_merge_sha==M0==current main).
+        The verifier's Mechanism-2 elif sees base_sha==M0==current_main, so no
+        re-merge fires; skip_verify stays True and verification is skipped.
+
+        Assertions:
+          (1) outcome.status == 'done'.
+          (2) run_scoped_verification was NEVER called (skip_verify fast path intact).
+          (3) NO speculative_discard event with reason='main_advanced' in EventStore.
+
+        This is a guard test — GREEN before AND after the fix.  It locks
+        invariant (1): a future change that unconditionally forces verify would
+        break assertion (2) and be caught here.
+
+        TEST EXPECTATION coverage note:
+          #3 (non-pre_rebased main_advanced still verifies) is covered by
+             the existing test_verify_pickup_rebases_when_main_advanced
+             (default pre_rebased=False).
+          #4 (train no-op) is covered by
+             test_train_exempt_from_cap_and_pickup_rebase.
+        """
+        db_path = tmp_path / 'events_unchanged.db'
+        event_store = EventStore(db_path=db_path, run_id='test-unchanged-main')
+
+        wt = await _make_branch_with_file(git_ops, 'fp', 'file_fp.py', 'fp = 0\n')
+
+        verify_call_count = 0
+
+        async def spy_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            nonlocal verify_call_count
+            verify_call_count += 1
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=spy_verify):
+            # pre_rebased=True: build-time fast path sets skip_verify=True when
+            # main does not advance between merge and verify pickup.
+            req = _make_request('fp', 'fp', wt, config, pre_rebased=True)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        # (1) Task must land on main
+        assert outcome.status == 'done', f'Expected done, got {outcome}'
+
+        # (2) Verify must NOT have been called (skip_verify fast path intact)
+        assert verify_call_count == 0, (
+            f'run_scoped_verification must NOT be called when main is unchanged '
+            f'and pre_rebased=True (build-time skip_verify fast path); '
+            f'got {verify_call_count} call(s).  A change broke invariant (1).'
+        )
+
+        # (3) No main_advanced discard event (Mechanism 2 did not fire)
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
+        assert 'main_advanced' not in discard_reasons, (
+            f'speculative_discard(reason=main_advanced) must NOT fire when main '
+            f'is unchanged; got discard_reasons={discard_reasons}  (all events: {rows})'
         )
 
         await worker.stop()
