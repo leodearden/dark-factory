@@ -4510,7 +4510,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'Task {req.task_id}: discarding stale merge '
                         f'({remerge_reason}), re-merging against actual main'
                     )
-                    item = await self._remerge(req, item.started_monotonic)
+                    # force_verify for 'main_advanced': same precondition as the
+                    # speculation-race retry — main advanced since the branch was
+                    # pre-rebased, so the skip_verify invariant ('pre_rebased AND
+                    # main unchanged') does not hold.  Always verify.
+                    # chain-invalidation triggers ('previous_failed' /
+                    # 'chain_invalidated') pass force_verify=False and retain
+                    # their existing skip_verify semantics (invariant 3).
+                    item = await self._remerge(
+                        req, item.started_monotonic,
+                        force_verify=(remerge_reason == 'main_advanced'),
+                    )
                     # Update _verify_item to the freshly re-merged item; phase stays
                     # 'remerging' until _verify_and_advance transitions it.
                     self._verify_item = item
