@@ -661,6 +661,7 @@ async def _map_advance_failure(
     task_id: str,
     merge_commit_fallback: str,
     halt: Callable[[str], None],
+    unhalt: Callable[[str], None],
     cas_retries: dict[str, int],
 ) -> MergeOutcome:
     """Advance-failure result → MergeOutcome mapping shared by both workers.
@@ -673,29 +674,49 @@ async def _map_advance_failure(
     differ on what to clean up).  Does **not** touch *merge_wt* — callers
     must clean it up separately.
 
-    *halt* is the worker's ``halt_for_wip`` callable; *cas_retries* is
-    mutated for the terminal result codes (popped) but NOT for
-    ``wip_overlap`` (which is a recoverable halt, not a terminal outcome).
+    *halt* is the worker's ``halt_for_wip`` callable; *unhalt* is the
+    worker's ``unhalt_wip`` callable.  *unhalt* is invoked in an
+    ``except BaseException`` guard around the post-halt ``push_main`` call
+    in the ``pop_conflict`` branch so that a push failure (including
+    ``CancelledError``) never leaves the queue silently halted with no
+    escalation owner registered (task 1671 orphan-halt window).
+    *cas_retries* is mutated for the terminal result codes (popped) but
+    NOT for ``wip_overlap`` (which is a recoverable halt, not a terminal
+    outcome).
     """
     if result in ('wip_overlap', 'pop_conflict'):
         halt(f'advance_main: {result}')
         if result == 'pop_conflict':
             # Main was advanced — push origin even though stash pop failed.
-            push_status = await git_ops.push_main()
-            recovery = getattr(git_ops, '_last_recovery_branch', None)
-            # Main IS on the post-rebase SHA — propagate it so workflow's
-            # _handle_wip_recovery → set_task_status('done') has valid
-            # done_provenance (otherwise the call hits "kind required").
-            advanced_sha = (
-                getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
-            )
-            return MergeOutcome(
-                'done_wip_recovery',
-                reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
-                recovery_branch=recovery,
-                push_status=push_status,
-                merge_sha=advanced_sha,
-            )
+            # Guard: if push_main raises (git failure, CancelledError) AFTER
+            # halt() above, the done_wip_recovery outcome is never produced and
+            # no halt-owner escalation is registered downstream — leaving the
+            # queue silently halted with owner=None (task 1671 orphan-halt
+            # window).  unhalt-on-raise restores the queue before re-raising.
+            try:
+                push_status = await git_ops.push_main()
+                recovery = getattr(git_ops, '_last_recovery_branch', None)
+                # Main IS on the post-rebase SHA — propagate it so workflow's
+                # _handle_wip_recovery → set_task_status('done') has valid
+                # done_provenance (otherwise the call hits "kind required").
+                advanced_sha = (
+                    getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
+                )
+                return MergeOutcome(
+                    'done_wip_recovery',
+                    reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
+                    recovery_branch=recovery,
+                    push_status=push_status,
+                    merge_sha=advanced_sha,
+                )
+            except BaseException:
+                # pop_conflict push_main raised — unhalt to avoid orphan halt
+                # (task 1671): the done_wip_recovery outcome was never returned
+                # so no halt-owner escalation will be registered; un-halt here
+                # so the queue can accept new work without requiring
+                # force_unhalt_merge_queue.
+                unhalt('pop_conflict push_main raised — unhalting to avoid orphan halt')
+                raise
         else:
             overlap = getattr(git_ops, '_last_overlap_files', None)
             return MergeOutcome(
@@ -2736,6 +2757,7 @@ class _TrainMergeHost(Protocol):
 
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
+    def unhalt_wip(self, reason: str | None = None) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
 
 
@@ -3037,6 +3059,7 @@ async def _do_train_merge(
             task_id=req.task_id,
             merge_commit_fallback=merge_commit,
             halt=worker.halt_for_wip,
+            unhalt=worker.unhalt_wip,
             cas_retries=worker._cas_retries,
         )
         _emit_train_event(
@@ -3544,6 +3567,7 @@ class MergeWorker(_WipHaltMixin):
                 task_id=req.task_id,
                 merge_commit_fallback=merge_result.merge_commit,
                 halt=self.halt_for_wip,
+                unhalt=self.unhalt_wip,
                 cas_retries=self._cas_retries,
             )
 
@@ -5015,6 +5039,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     task_id=req.task_id,
                     merge_commit_fallback=merge_commit,
                     halt=self.halt_for_wip,
+                    unhalt=self.unhalt_wip,
                     cas_retries=self._cas_retries,
                 )
                 if not req.result.done():
