@@ -6577,3 +6577,90 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
         f'IntegrityCheck did not receive the harness-fetched filtered_task_tree. '
         f'Got: {captured_tree["tree"]!r}'
     )
+
+
+# ── Task 1669: resolved-escalation recurrence suppression ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_escalate_suppressed_when_recently_resolved(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """_escalate() must be suppressed when a matching escalation was recently resolved.
+
+    If a recon_integrity_issue escalation for the same content fingerprint was
+    resolved within the recurrence window, the harness must NOT submit a new
+    pending escalation — it should emit a structured INFO log instead.
+
+    RED on base branch: base submits a fresh pending escalation because
+    get_pending() is empty (the seeded resolved escalation is invisible to it).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Use the first finding: category='memory_stale', has affected_ids
+    finding = _make_s3_findings()[0]
+    assert finding['category'] == 'memory_stale'
+
+    # Compute the SAME fingerprint _escalate will compute
+    fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding['category'],
+        _derive_affected_ids(finding),
+        finding['description'],
+    )
+
+    # Seed a RESOLVED escalation with this fingerprint, resolved 60s ago (within window)
+    seed = Escalation(
+        id='esc-recon-seed-1',
+        task_id='recon-seed',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='prior resolved finding',
+        status='resolved',
+        resolved_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        dedupe_fingerprint=fp,
+    )
+    esc_queue.submit(seed)
+
+    # Confirm the seeded escalation is NOT in get_pending() (it's resolved)
+    assert esc_queue.get_pending() == [], 'Seeded resolved escalation should not be pending'
+
+    # Call _escalate — should be suppressed
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        harness._escalate(
+            'recon_integrity_issue',
+            'run-xyz12345',
+            'Persistently unresolved: Stale edge',
+            detail='stale edge detail',
+            finding=finding,
+        )
+
+    # Assert: no NEW pending escalation carries the fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == fp]
+    assert pending_with_fp == [], (
+        f'Expected suppression — no new pending escalation, got: {pending_with_fp}'
+    )
+
+    # Assert: a structured suppression log was emitted
+    suppression_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.escalation_suppressed_recently_resolved'
+    ]
+    assert len(suppression_records) >= 1, (
+        f'Expected a suppression log record, got: {[r.getMessage() for r in caplog.records]}'
+    )
