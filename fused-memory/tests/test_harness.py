@@ -3442,6 +3442,66 @@ async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
     )
 
 
+# ── build_stale_run_diagnostics unit tests ────────────────────────────────────
+
+
+def test_build_stale_run_diagnostics_classifies_disposition():
+    """build_stale_run_diagnostics returns the correct disposition for each branch.
+
+    Four cases:
+      1. instance_id=None               → 'pre_migration'
+      2. lock_holder=None               → 'no_lock'
+      3. lock_holder != run.instance_id → 'handed_off'
+      4. lock_holder == run.instance_id, lock_age > cutoff → 'dead_owner_shielded'
+
+    All cases must include project_id, run_type, instance_id, age_seconds keys.
+    """
+    from fused_memory.reconciliation.harness import build_stale_run_diagnostics
+
+    cutoff = 1800.0
+    base_run = ReconciliationRun(
+        id='run-diag',
+        project_id='diag-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='iid-A',
+    )
+
+    # Case 1: pre_migration — instance_id is None
+    run_null = ReconciliationRun(
+        id='run-null-iid',
+        project_id='diag-project',
+        run_type=RunType.remediation,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=None,
+    )
+    d1 = build_stale_run_diagnostics(run_null, lock_holder='some-holder', lock_age=10.0, cutoff=cutoff)
+    assert d1['disposition'] == 'pre_migration'
+
+    # Case 2: no_lock — lock_holder is None
+    d2 = build_stale_run_diagnostics(base_run, lock_holder=None, lock_age=None, cutoff=cutoff)
+    assert d2['disposition'] == 'no_lock'
+
+    # Case 3: handed_off — lock held by a different instance
+    d3 = build_stale_run_diagnostics(base_run, lock_holder='iid-B', lock_age=30.0, cutoff=cutoff)
+    assert d3['disposition'] == 'handed_off'
+
+    # Case 4: dead_owner_shielded — same iid, lock_age > cutoff
+    d4 = build_stale_run_diagnostics(base_run, lock_holder='iid-A', lock_age=cutoff + 100, cutoff=cutoff)
+    assert d4['disposition'] == 'dead_owner_shielded'
+
+    # All results must contain required fields
+    for d in (d1, d2, d3, d4):
+        assert 'project_id' in d
+        assert 'run_type' in d
+        assert 'instance_id' in d
+        assert 'age_seconds' in d
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
