@@ -11130,6 +11130,133 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'done'
         assert 'task/t-done-pop' not in counts  # popped on clean landing
 
+    async def _run_chaining_driver(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> tuple[asyncio.Queue, dict, object]:
+        """Shared driver: run the SUPERSET chain path, return (queue, counts, gen_next).
+
+        Replicates the setup from test_chain_ctx_superset_advance_returns_superseded_and_enqueues.
+        After this returns:
+        - counts['task/t-chain'] == 1 (incremented by _maybe_auto_chain_generation)
+        - queue.qsize() == 1 (gen_next request enqueued)
+        - gen_next = queue.get_nowait() has its own result future
+        """
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-chain',
+            branch='task/t-chain',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2,
+        )
+
+        with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded', f'driver: expected superseded; got {outcome.status!r}'
+        assert queue.qsize() == 1, f'driver: expected 1 item on queue; got {queue.qsize()}'
+        assert counts.get('task/t-chain') == 1, (
+            f'driver: expected counts[task/t-chain]==1; got {counts!r}'
+        )
+        gen_next = queue.get_nowait()
+        return queue, counts, gen_next
+
+    async def test_chained_request_blocked_terminal_pops_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(d) gen_next resolves 'blocked' → counts[branch] must be popped (counter leaked today).
+
+        RED today: no cleanup callback on gen_next.result, so counts persists
+        on non-'done'/non-bound-exceeded terminals.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        # Resolve gen_next's own future with a non-'done', non-'superseded' terminal
+        gen_next.result.set_result(MergeOutcome('blocked', reason='equivalence drop'))
+        # Pump the event loop so any done-callbacks fire
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert 'task/t-chain' not in counts, (
+            f'blocked terminal must pop the chain counter; counts={counts!r}'
+        )
+
+    async def test_chained_request_cancelled_terminal_pops_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(e) gen_next.result cancelled → counts[branch] must be popped.
+
+        RED today: no cleanup callback on gen_next.result.
+        """
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        gen_next.result.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert 'task/t-chain' not in counts, (
+            f'cancellation must pop the chain counter; counts={counts!r}'
+        )
+
+    async def test_chained_request_superseded_terminal_keeps_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(f) NEGATIVE: gen_next resolves 'superseded' → counter must NOT be popped.
+
+        'superseded' hands the lineage to a gen-(n+2) successor that inherits the
+        counter; popping here would reset the MAX_AUTO_CHAINED_GENERATIONS bound to 0
+        every generation.  This test guards against an over-broad fix.
+
+        PASSES today (no cleanup callback) and must STILL PASS after the fix.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        gen_next.result.set_result(MergeOutcome('superseded', superseded_by='mr-next', merge_sha='s'))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert counts.get('task/t-chain') == 1, (
+            f"superseded must NOT pop the chain counter (lineage continues); counts={counts!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
