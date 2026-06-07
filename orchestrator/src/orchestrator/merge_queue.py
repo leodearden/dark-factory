@@ -132,8 +132,10 @@ _HEARTBEAT_POLL_S: float = 30.0
 
 The heartbeat loop polls this frequently; the actual emission rate is governed
 by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
-period short (30 s) ensures the first post-enqueue heartbeat fires promptly once
-_heartbeat_interval_s elapses, without adding measurable overhead."""
+period short (30 s) means the first heartbeat fires within ~30 s of startup
+when depth > 0 (because _last_heartbeat_at is initialised to 0.0, making the
+rate-limit check pass immediately on the first poll), then subsequently no
+more often than _heartbeat_interval_s, without adding measurable overhead."""
 
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
@@ -3735,8 +3737,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verify_started_at: float | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
-        # Heartbeat: wall-clock time of last emission (0.0 = never fired).
-        # Checked by _maybe_log_queue_heartbeat to rate-limit emissions.
+        # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
+        # first emission fires within one poll period after startup when depth > 0
+        # (the very-large now - 0.0 gap always exceeds _heartbeat_interval_s).
         self._last_heartbeat_at: float = 0.0
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
@@ -3931,6 +3934,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return_exceptions=True,
             )
             raise
+        finally:
+            # Cancel the heartbeat on both normal and exceptional exit so its
+            # lifetime is self-contained regardless of why the merge loops exit.
+            # On the exception path the except block already cleaned it up, so
+            # _heartbeat_task.done() is True and this is a no-op.
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
