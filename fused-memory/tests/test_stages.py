@@ -5355,6 +5355,72 @@ class TestQueryStage2Flags:
                 f'stale_mismatched_run_id_ids (normalization must preserve ordering)'
             )
 
+    @pytest.mark.asyncio
+    async def test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2(self):
+        """Regression guard: stage1_flag_marker records with fp:-keyed task_id are discarded.
+
+        task-1670 step-2 verification: _query_stage2_flags processes ONLY records
+        with metadata.flag_for_stage2=True and silently discards all others.
+        stage1_flag_marker dedup markers (fp: or numeric task_id) carry no
+        flag_for_stage2 key and are therefore NEVER routed to partition.current
+        or either stale bucket — they are a Stage-1-internal dedup artifact.
+
+        This test directly guards against the regression that 1656's original
+        diagnosis warned about ('fp: marker unprocessable by Stage 2 → perpetual
+        cleanup loop'): accepting fp: keys in the guard does NOT cause Stage 2
+        to sweep them, because Stage 2 never reads them in the first place.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        # Canonical fp:+32 lowercase hex key (the exact shape emitted by _content_fingerprint).
+        fp_task_id = 'fp:' + 'a' * 32
+
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # (a) A stage1_flag_marker dedup record — NO flag_for_stage2 key.
+            self._make_result(
+                'stage1-marker-fp',
+                'Stage 1 flag marker: task=fp:aaaaa... type=stale_edge from run=r1',
+                {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': fp_task_id,
+                    'flag_type': 'stale_edge',
+                    'run_id': 'r1',
+                    'last_seen_run_id': 'r1',
+                },
+            ),
+            # (b) Control: a legitimate flag_for_stage2 record to prove search worked.
+            self._make_result(
+                'stage2-flag-ok',
+                'real stage-2 flag',
+                {'flag_for_stage2': True, 'task_id': '42', 'run_id': 'r-current'},
+            ),
+        ]
+
+        partition = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+
+        # (a) The fp: dedup marker must be absent from ALL partition buckets.
+        current_ids = {f['id'] for f in partition.current}
+        assert 'stage1-marker-fp' not in current_ids, (
+            "stage1_flag_marker (fp: key) must never be routed to partition.current "
+            "— Stage 2 only processes flag_for_stage2=True records"
+        )
+        assert 'stage1-marker-fp' not in partition.stale_missing_run_id_ids, (
+            "stage1_flag_marker must not appear in stale_missing_run_id_ids "
+            "(it is not a Stage-2-consumable record)"
+        )
+        assert 'stage1-marker-fp' not in partition.stale_mismatched_run_id_ids, (
+            "stage1_flag_marker must not appear in stale_mismatched_run_id_ids "
+            "(accepting fp: keys in the guard does not create a Stage-2 sweep loop)"
+        )
+
+        # (b) Control: the real flag_for_stage2 record IS in partition.current.
+        assert any(f['id'] == 'stage2-flag-ok' for f in partition.current), (
+            "The control stage-2 flag must be routed to partition.current "
+            "(confirms the search stub was reached)"
+        )
+
 
 class TestSweepStaleFixcMarkers:
     """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
