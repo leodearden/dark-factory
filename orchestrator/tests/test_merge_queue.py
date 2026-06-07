@@ -14390,6 +14390,70 @@ class TestCheckMergeLivenessMarginBoundCoupling:
 
 
 # ---------------------------------------------------------------------------
+# TestSpeculativeWorkerDequeueDepth — task-1675 step-5
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeWorkerDequeueDepth:
+    """SpeculativeMergeWorker emits merge_dequeued with queue_depth in payload."""
+
+    @pytest.mark.asyncio
+    async def test_speculative_worker_merge_dequeued_carries_queue_depth(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """merge_dequeued emitted by SpeculativeMergeWorker must carry queue_depth.
+
+        Uses the immediate-conflict path (no real merge work) so the test is
+        fast.  queue_depth at dequeue time == remaining main-queue size (0
+        since only one request was enqueued).  We only assert it is not NULL.
+
+        Fails today because _merger_loop emit payload is only {branch}.
+        """
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='spec-depth-test')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-depth', 'spec_depth.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker._shutdown_timeout = 2.0
+
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('spec-depth', 'spec-depth', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'conflict'
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT json_extract(data, '$.queue_depth') AS depth "
+            "FROM events WHERE event_type = 'merge_dequeued'"
+        ).fetchone()
+        conn.close()
+
+        assert row is not None, 'No merge_dequeued row found'
+        assert row[0] is not None, (
+            'queue_depth must not be NULL on merge_dequeued from SpeculativeMergeWorker'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
 # TestEnqueueMergeQueuedDepth — task-1675 step-1
 # ---------------------------------------------------------------------------
 
