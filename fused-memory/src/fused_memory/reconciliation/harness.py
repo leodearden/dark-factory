@@ -589,15 +589,19 @@ class ReconciliationHarness:
         cutoff = self.config.stale_run_recovery_seconds
         stale_runs = await self.journal.get_stale_runs(cutoff)
         for run in stale_runs:
-            # Only skip when the *same* instance that started the run still
-            # holds the lock — that's a legitimate long-running cycle.  A lock
-            # held by a different instance, or no lock at all, means the
-            # original owner is gone and the run is an orphan.
-            lock_holder = await self.buffer.get_lock_holder_instance_id(run.project_id)
+            # Skip only when the *same* instance that started the run still
+            # holds the lock AND the lock is freshly heartbeated (within cutoff).
+            # A dead owner's lock row satisfies the identity check but its
+            # heartbeat_at will be > cutoff seconds old — treat that as an orphan.
+            # A lock held by a different instance, or no lock at all, also means
+            # the original owner is gone and the run is an orphan.
+            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
             if (
                 lock_holder is not None
                 and run.instance_id is not None
                 and lock_holder == run.instance_id
+                and lock_age is not None
+                and lock_age <= cutoff
             ):
                 continue
 
