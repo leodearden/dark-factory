@@ -2285,8 +2285,48 @@ async def _maybe_auto_chain_generation(
         snapshot_tip=current_head,
         pre_rebased=False,
     )
-    await enqueue_merge_request(queue, gen_next, event_store, retention=retention)
+
+    # Set the counter BEFORE enqueue so the cleanup callback can safely
+    # pop it on any terminal path — including if the worker finalizes
+    # gen_next before the post-await resumes (closes the set-after-pop race).
     counts[req.branch] = new_count
+
+    # Register a fire-and-forget cleanup callback that pops the per-branch
+    # lineage counter on EVERY terminal outcome EXCEPT 'superseded'.
+    # 'superseded' means _maybe_auto_chain_generation already enqueued a
+    # gen-(n+2) successor and incremented counts[branch] for it; popping
+    # there would reset the MAX_AUTO_CHAINED_GENERATIONS bound to 0 every
+    # generation.  This is a SECOND, independent add_done_callback alongside
+    # the retention _on_finalized registered by enqueue_merge_request — both
+    # coexist on gen_next.result.  The callback fires regardless of which
+    # worker (MergeWorker or SpeculativeMergeWorker) finalizes gen_next.
+    _branch = req.branch  # close over the branch name
+    def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
+        try:
+            if fut.cancelled():
+                # Cancellation — lineage ends; pop the counter.
+                counts.pop(_branch, None)
+            elif fut.exception() is not None:
+                # Unhandled exception — lineage ends; pop the counter.
+                counts.pop(_branch, None)
+            else:
+                outcome: MergeOutcome = fut.result()
+                if outcome.status != 'superseded':
+                    # Terminal that doesn't hand off to a gen-(n+2) successor
+                    # (e.g. 'done', 'blocked', 'conflict', 'cancelled', …):
+                    # release the lineage counter.  'done' is also caught here
+                    # but is already popped by _finalize_advanced_merge — the
+                    # pop() is idempotent so both callbacks are harmless.
+                    counts.pop(_branch, None)
+                # 'superseded': lineage continues; keep the counter.
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                '_maybe_auto_chain_generation: _cleanup_chain_counter failed '
+                'for branch=%s', _branch, exc_info=True,
+            )
+
+    gen_next.result.add_done_callback(_cleanup_chain_counter)
+    await enqueue_merge_request(queue, gen_next, event_store, retention=retention)
     return MergeOutcome('superseded', superseded_by=gen_next.request_id, merge_sha=advanced_sha)
 
 
