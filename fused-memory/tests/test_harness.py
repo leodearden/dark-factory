@@ -6582,8 +6582,7 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
 # ── Task 1669: resolved-escalation recurrence suppression ─────────────────
 
 
-@pytest.mark.asyncio
-async def test_escalate_suppressed_when_recently_resolved(
+def test_escalate_suppressed_when_recently_resolved(
     journal,
     event_buffer,
     mock_memory_service,
@@ -6666,8 +6665,7 @@ async def test_escalate_suppressed_when_recently_resolved(
     )
 
 
-@pytest.mark.asyncio
-async def test_escalate_refires_when_resolved_outside_recurrence_window(
+def test_escalate_refires_when_resolved_outside_recurrence_window(
     journal,
     event_buffer,
     mock_memory_service,
@@ -6730,8 +6728,7 @@ async def test_escalate_refires_when_resolved_outside_recurrence_window(
     )
 
 
-@pytest.mark.asyncio
-async def test_finding_recently_resolved_respects_window(
+def test_finding_recently_resolved_respects_window(
     journal,
     event_buffer,
     mock_memory_service,
@@ -6801,3 +6798,81 @@ async def test_finding_recently_resolved_respects_window(
     assert harness._finding_recently_resolved('recon_integrity_issue', 'unknown-fp', now=now) is False
     # None fingerprint → False (fast-path guard)
     assert harness._finding_recently_resolved('recon_integrity_issue', None, now=now) is False
+
+
+def test_escalate_suppressed_when_dismissed_within_window(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    caplog,
+):
+    """_escalate() is suppressed when a matching escalation was recently dismissed.
+
+    status='dismissed' is treated the same as status='resolved' — both suppress
+    re-firing within the recurrence window.  This test makes that intent explicit
+    so the 'dismissed' branch in _finding_recently_resolved is covered.
+
+    Task 1669 amend — reviewer suggestion 2.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _derive_affected_ids
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    finding = _make_s3_findings()[0]
+    fp = compute_content_fingerprint(
+        'recon_integrity_issue',
+        finding['category'],
+        _derive_affected_ids(finding),
+        finding['description'],
+    )
+
+    # Seed a DISMISSED escalation with this fingerprint, dismissed 60s ago (within window)
+    dismissed_seed = Escalation(
+        id='esc-recon-dismissed-1',
+        task_id='recon-dismissed',
+        agent_role='reconciliation-harness',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='prior dismissed finding',
+        status='dismissed',
+        resolved_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        dedupe_fingerprint=fp,
+    )
+    esc_queue.submit(dismissed_seed)
+
+    # The dismissed escalation must NOT appear in pending
+    assert esc_queue.get_pending() == [], 'Seeded dismissed escalation should not be pending'
+
+    # Call _escalate — must be suppressed (same as resolved)
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        harness._escalate(
+            'recon_integrity_issue',
+            'run-dismissed1',
+            'Persistently unresolved: Stale edge',
+            detail='stale edge detail',
+            finding=finding,
+        )
+
+    # No NEW pending escalation carries the fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == fp]
+    assert pending_with_fp == [], (
+        f'Expected suppression for dismissed — no new pending escalation, got: {pending_with_fp}'
+    )
+
+    # A structured suppression log was emitted
+    suppression_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.escalation_suppressed_recently_resolved'
+    ]
+    assert len(suppression_records) >= 1, (
+        f'Expected a suppression log for dismissed status, got: {[r.getMessage() for r in caplog.records]}'
+    )

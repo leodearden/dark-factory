@@ -824,6 +824,7 @@ class ReconciliationHarness:
         detail: str = '',
         *,
         finding: dict | None = None,
+        resolved_fps: frozenset[str] | None = None,
     ) -> None:
         """Submit an escalation to the queue (fire-and-forget).
 
@@ -862,7 +863,7 @@ class ReconciliationHarness:
                     [],
                     summary,
                 )
-            if self._finding_recently_resolved(category, fingerprint):
+            if self._finding_recently_resolved(category, fingerprint, resolved_fps=resolved_fps):
                 logger.info(
                     'reconciliation.escalation_suppressed_recently_resolved',
                     extra={
@@ -1538,6 +1539,7 @@ class ReconciliationHarness:
         fingerprint: str | None,
         *,
         now=None,
+        resolved_fps: frozenset[str] | None = None,
     ) -> bool:
         """Return True iff a recently-resolved escalation matches category + fingerprint.
 
@@ -1545,6 +1547,12 @@ class ReconciliationHarness:
         in the full queue root + archive via iter_all_escalation_paths.  Used by
         _escalate() to suppress re-firing of a finding whose matching escalation was
         resolved within _RESOLVED_RECURRENCE_WINDOW_SECONDS (task 1669).
+
+        resolved_fps: pre-fetched frozenset of dedupe_fingerprints for resolved/dismissed
+        escalations within the recurrence window (filtered to recon categories by the
+        caller).  When supplied (built once by _run_remediation_pass), the check is an
+        O(1) set membership test — no archive scan.  Pass None to fall back to the full
+        iter_all_escalation_paths scan per-call (direct / unit-test use).
 
         Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
         matching the category gate used by submit_or_dedupe.
@@ -1558,6 +1566,9 @@ class ReconciliationHarness:
             return False
         if _RECON_DEDUP_CONFIG is None or category not in _RECON_DEDUP_CONFIG.infra_dedupe_categories:
             return False
+        if resolved_fps is not None:
+            # Pre-fetched set: O(1) membership test — no archive scan needed.
+            return fingerprint in resolved_fps
         try:
             effective_now = now if now is not None else datetime.now(UTC)
             window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
@@ -1839,6 +1850,54 @@ class ReconciliationHarness:
                 # contract as the parent pass in _maybe_remediate.
                 for finding in non_actionable_remaining:
                     self._log_non_actionable_finding(project_id, run_id, finding)
+
+                # Task 1669: pre-build the in-window resolved fingerprints set ONCE
+                # (single archive scan per remediation pass) so the per-finding
+                # _escalate call is an O(1) membership test rather than an O(archive)
+                # full scan.  Mirrors the pending_fps pattern in _maybe_remediate.
+                # Fail-open: on any scan error, leave resolved_fps empty (no
+                # suppressions) and proceed with full escalation — same philosophy
+                # as the pending_fps build in _maybe_remediate.
+                resolved_fps: frozenset[str] = frozenset()
+                if (
+                    HAS_ESCALATION
+                    and self._escalation_queue is not None
+                    and _RECON_DEDUP_CONFIG is not None
+                ):
+                    try:
+                        _now = datetime.now(UTC)
+                        _window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
+                        _rfps: set[str] = set()
+                        for _path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
+                            self._escalation_queue.queue_dir
+                        ):
+                            try:
+                                _esc = Escalation.from_json(_path.read_text())  # type: ignore[possibly-undefined]
+                            except Exception:
+                                continue
+                            if not (
+                                _esc.status in ('resolved', 'dismissed')
+                                and _esc.category in _RECON_DEDUP_CONFIG.infra_dedupe_categories
+                                and _esc.dedupe_fingerprint
+                                and _esc.resolved_at
+                            ):
+                                continue
+                            try:
+                                _resolved = datetime.fromisoformat(_esc.resolved_at)
+                            except (ValueError, TypeError):
+                                continue
+                            if _resolved.tzinfo is None:
+                                _resolved = _resolved.replace(tzinfo=UTC)
+                            if _now - _resolved <= _window:
+                                _rfps.add(_esc.dedupe_fingerprint)
+                        resolved_fps = frozenset(_rfps)
+                    except Exception as _rfps_err:
+                        logger.warning(
+                            'reconciliation.recently_resolved_check_failed',
+                            extra={'category': '', 'error': str(_rfps_err)},
+                        )
+                        # resolved_fps stays empty → no suppressions → fail-open
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -1894,6 +1953,7 @@ class ReconciliationHarness:
                                     default=str,
                                 ),
                                 finding=finding,
+                                resolved_fps=resolved_fps,
                             )
                     else:
                         logger.info(
