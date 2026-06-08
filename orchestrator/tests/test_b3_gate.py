@@ -966,3 +966,107 @@ class TestTwoWayBoundary:
         assert 'status' not in entry, (
             f'success entry must not carry status key: {entry.keys()}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-1 (task 1680): post-merge red-main hard-abort in check_proposal
+# ---------------------------------------------------------------------------
+
+class TestPostMergeRedMainAbort:
+    """check_proposal hard-ABORTs any entry whose block_reason starts with
+    POST_MERGE_RED_MAIN_REASON_PREFIX — before risk_label and git checks.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+    # Prefix used in all cases (constant not yet defined — tests fail initially)
+    _PM_REASON = 'Post-merge unscoped type-check failed on main: foo.py (error E001)'
+
+    def test_low_risk_post_merge_reason_aborts_without_git(self):
+        """Case 1: low-risk entry with post-merge block_reason -> ABORT, no git called."""
+        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_reason': self._PM_REASON}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        reason_lower = result['reason'].lower()
+        assert 'post-merge' in reason_lower or 'red-main' in reason_lower, (
+            f'expected "post-merge" or "red-main" in reason: {result["reason"]!r}'
+        )
+        # Sanity: prefix match is correct
+        assert self._PM_REASON.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX)
+
+    def test_human_review_post_merge_reason_also_aborts(self):
+        """Case 2: risk_label='human-review-required' with post-merge reason -> ABORT.
+
+        Documents that the post-merge abort branch fires regardless of risk_label.
+        """
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {
+            **_LOW_RISK_ENTRY,
+            'risk_label': 'human-review-required',
+            'block_reason': self._PM_REASON,
+        }
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, (
+            f'expected ABORT for human-review-required post-merge entry, got {result}'
+        )
+
+    def test_non_post_merge_reason_not_aborted_by_post_merge_branch(self):
+        """Case 3 (regression): block_reason='verify exhausted' does NOT trigger the
+        post-merge abort — reaches FRESH exactly as before this change.
+        """
+        from orchestrator.b3_gate import FRESH, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'verify exhausted'}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, (
+            f'non-post-merge reason must NOT be caught by post-merge branch; got {result}'
+        )
+
+    def test_boundary_low_risk_post_merge_entry_aborts_without_git(self, tmp_path):
+        """Case 4 (end-to-end boundary): build a genuine _build_entry output with
+        block_reason=POST_MERGE_RED_MAIN_REASON_PREFIX + ' ...', stamp head/main sha,
+        then assert check_proposal aborts without consulting git.
+        """
+        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
+        from orchestrator.dry_run_unblock import _build_entry
+
+        reason = POST_MERGE_RED_MAIN_REASON_PREFIX + ' on main: foo.py'
+        agent_result = _make_agent_result(
+            success=True,
+            structured_output={
+                'proposal_text': 'Fix the type error in foo.py',
+                'risk_label': 'low',
+                'files_referenced': ['foo.py'],
+            },
+        )
+        entry = _build_entry(agent_result, reason=reason, budget_usd=5.0)
+        # Mirror T1 sha-stamping (dry_run_unblock.py)
+        entry['head_sha'] = 'aaabbbccc'
+        entry['main_sha'] = 'dddeeefff'
+
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, (
+            f'expected ABORT for post-merge low-risk boundary entry, got {result}'
+        )
+
+    def test_coherence_prefix_matches_merge_queue_constant(self):
+        """Case 5 (coherence): b3_gate re-declares the prefix; assert it stays in sync
+        with the canonical merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+        """
+        from orchestrator.b3_gate import POST_MERGE_RED_MAIN_REASON_PREFIX
+        from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        assert POST_MERGE_RED_MAIN_REASON_PREFIX == POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX, (
+            f'b3_gate prefix {POST_MERGE_RED_MAIN_REASON_PREFIX!r} '
+            f'!= merge_queue prefix {POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX!r}'
+        )
