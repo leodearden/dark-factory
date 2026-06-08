@@ -836,7 +836,10 @@ class GraphitiBackend:
 
         Returns:
             Audit dict with keys: deleted_uuid, deleted_name, active_edge_count,
-            forced, connected_refreshed (list of refreshed neighbour UUIDs).
+            forced, connected_refreshed (list of successfully refreshed neighbour UUIDs),
+            refresh_errors (list of neighbour UUIDs whose summary refresh failed).
+            The node is already gone when refresh runs, so refresh failures are
+            non-fatal — callers should inspect refresh_errors for partial outcomes.
 
         Raises:
             NodeNotFoundError: if the node does not exist.
@@ -860,20 +863,36 @@ class GraphitiBackend:
         # 4. Delete the node
         await self.delete_entity_node(uuid, group_id=group_id)
 
-        # 5. Refresh each neighbour's summary
+        # 5. Refresh each neighbour's summary — best-effort.
+        # The node is already deleted (irreversible), so a refresh failure must not
+        # propagate as a top-level error and must not abort remaining refreshes.
+        # Collect both the successful and failed sets for the audit dict.
+        refreshed: list[str] = []
+        refresh_errors: list[str] = []
         for nbr in neighbours:
-            await self.refresh_entity_summary(nbr, group_id=group_id)
+            try:
+                await self.refresh_entity_summary(nbr, group_id=group_id)
+                refreshed.append(nbr)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'delete_entity: refresh_entity_summary failed for nbr=%s '
+                    '(deleted node uuid=%s): %s',
+                    nbr, uuid, exc,
+                )
+                refresh_errors.append(nbr)
 
         logger.info(
-            'delete_entity: deleted uuid=%s name=%r active_edges=%d force=%s refreshed=%d',
-            uuid, name, len(active_edges), force, len(neighbours),
+            'delete_entity: deleted uuid=%s name=%r active_edges=%d force=%s '
+            'refreshed=%d errors=%d',
+            uuid, name, len(active_edges), force, len(refreshed), len(refresh_errors),
         )
         return {
             'deleted_uuid': uuid,
             'deleted_name': name,
             'active_edge_count': len(active_edges),
             'forced': force,
-            'connected_refreshed': neighbours,
+            'connected_refreshed': refreshed,
+            'refresh_errors': refresh_errors,
         }
 
     async def delete_entity_node(self, uuid: str, *, group_id: str) -> None:

@@ -139,6 +139,7 @@ class TestDeleteEntityBackend:
         assert result['active_edge_count'] == 0
         assert result['forced'] is False
         assert result['connected_refreshed'] == []
+        assert result['refresh_errors'] == []
 
     @pytest.mark.asyncio
     async def test_guard_raises_active_edges_error_when_force_false(self, mock_config, make_backend):
@@ -175,6 +176,7 @@ class TestDeleteEntityBackend:
         assert result['forced'] is True
         assert result['active_edge_count'] == 2
         assert result['connected_refreshed'] == ['nbr-a', 'nbr-b']
+        assert result['refresh_errors'] == []
 
     @pytest.mark.asyncio
     async def test_order_collect_before_delete_before_refresh(self, mock_config, make_backend):
@@ -195,6 +197,45 @@ class TestDeleteEntityBackend:
         )
         await backend.delete_entity('target-uuid', group_id='test')
         assert call_order == ['collect', 'delete', 'refresh']
+
+    @pytest.mark.asyncio
+    async def test_partial_refresh_failure_best_effort(self, mock_config, make_backend):
+        """PARTIAL FAILURE: node deleted, one neighbour refresh raises.
+
+        The exception must NOT propagate (node is already gone — irreversible).
+        Remaining neighbours must still be refreshed.
+        Audit dict must split outcome into connected_refreshed and refresh_errors.
+        """
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('NodeName', ''))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.get_connected_entity_uuids = AsyncMock(return_value=['nbr-ok', 'nbr-fail', 'nbr-ok2'])
+        backend.delete_entity_node = AsyncMock()
+
+        # First and third succeed; second raises
+        call_count = [0]
+        async def selective_refresh(nbr_uuid, *, group_id):
+            call_count[0] += 1
+            if nbr_uuid == 'nbr-fail':
+                raise RuntimeError('transient graph write error')
+            return {'uuid': nbr_uuid, 'name': 'N', 'old_summary': '', 'new_summary': '', 'edge_count': 0}
+        backend.refresh_entity_summary = selective_refresh
+
+        result = await backend.delete_entity('target-uuid', group_id='test')
+
+        # The delete itself must succeed (not raise)
+        backend.delete_entity_node.assert_awaited_once_with('target-uuid', group_id='test')
+
+        # All three refresh attempts were made (best-effort, not short-circuited)
+        assert call_count[0] == 3
+
+        # Audit dict reflects partial outcome
+        assert result['connected_refreshed'] == ['nbr-ok', 'nbr-ok2']
+        assert result['refresh_errors'] == ['nbr-fail']
+
+        # Core delete fields still correct
+        assert result['deleted_uuid'] == 'target-uuid'
+        assert result['deleted_name'] == 'NodeName'
 
 
 # ---------------------------------------------------------------------------
