@@ -1890,6 +1890,28 @@ class GitOps:
             update_cmd.append(expected_main)
         rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
+            # ── Main-gate unmark (best-effort cleanup) ────────────────────
+            # A mark written immediately before this failed/aborted update-ref
+            # may not have been consumed by the aborted reference-transaction;
+            # clear it now so it cannot falsely sanction a later non-
+            # orchestrator move.  Runs at the TOP of rc!=0 so it covers both
+            # the 'cas_failed' and 'pop_conflict_no_advance' return paths.
+            #
+            # When main_gate_unmark_command is unset the residual exposure is
+            # bounded: a lingering mark sanctions at most ONE intervening move
+            # before the next advance_main invocation re-marks+consumes it.
+            # This is documented and accepted ("prefer explicit cleanup").
+            if self.config.main_gate_unmark_command:
+                unmark_rc, _, unmark_err = await _run(
+                    ['sh', '-c', self.config.main_gate_unmark_command],
+                    cwd=self.project_root,
+                )
+                if unmark_rc != 0:
+                    logger.warning(
+                        'main_gate_unmark_command returned non-zero rc=%d: %s',
+                        unmark_rc, unmark_err,
+                    )
+
             # Restore stash before returning — ref didn't move.
             # Use _safe_stash_pop_with_recovery so that a pop conflict here
             # does NOT leave UU markers in project_root and is escalated to
