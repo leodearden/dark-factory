@@ -2342,6 +2342,106 @@ class TestWorkingTreeSync:
             f'commands: {commands}'
         )
 
+    async def test_advance_main_no_unmark_on_success(self, git_repo: Path):
+        """unmark command is NOT invoked when update-ref succeeds.
+
+        With both mark and unmark configured, a successful advance must fire
+        mark (before update-ref) but must NOT fire unmark — that is failure
+        cleanup only.  A regression that accidentally called unmark on success
+        would clear a sentinel the hook should have consumed, or re-clear it
+        after it was already consumed by the reference-transaction hook.
+        """
+        mark_cmd = 'echo mark-success-path'
+        unmark_cmd = 'echo unmark-should-not-fire'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+            ),
+            git_repo,
+        )
+
+        wt = await mark_ops.create_worktree('no-unmark-success')
+        (wt.path / 'success_test.py').write_text('s = 1\n')
+        await mark_ops.commit(wt.path, 'Add success_test')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'no-unmark-success')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'advanced', f'Expected advanced, got {result!r}'
+
+        commands = [cmd for cmd, _ in recorded]
+        # mark must have fired on the success path
+        assert any(c == ['sh', '-c', mark_cmd] for c in commands), (
+            f'No mark call recorded on success path; commands: {commands}'
+        )
+        # unmark must NOT have fired — it is failure cleanup only
+        assert not any(c == ['sh', '-c', unmark_cmd] for c in commands), (
+            f'Unexpected unmark call on success path; commands: {commands}'
+        )
+
+    async def test_advance_main_mark_failure_still_advances(self, git_repo: Path):
+        """A non-zero mark command is best-effort: advance_main continues to
+        update-ref and returns 'advanced' even when the mark exits non-zero.
+
+        Prevents regressions where a logged WARNING becomes an early abort —
+        the exact failure mode this task was written to prevent (bricking the
+        merge queue because the sentinel write failed).
+        """
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command='exit 1',  # always fails non-zero
+            ),
+            git_repo,
+        )
+
+        wt = await mark_ops.create_worktree('mark-fail-advance')
+        (wt.path / 'mark_fail.py').write_text('f = 1\n')
+        await mark_ops.commit(wt.path, 'Add mark_fail')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'mark-fail-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # A failed mark must not abort the advance
+        assert result == 'advanced', (
+            f'Mark failure must not abort advance_main; got {result!r}'
+        )
+        # update-ref was still called despite the failed mark
+        assert any(
+            c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+            for c in recorded
+        ), f'update-ref not called after failed mark; commands: {recorded}'
+
 
 @pytest.mark.asyncio
 class TestUnmergedDetection:

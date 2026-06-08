@@ -1879,6 +1879,13 @@ class GitOps:
         # existing 'cas_failed' handling.  Re-runs on every invocation
         # that reaches this point so the one-shot sentinel is refreshed on
         # caller-level CAS retries.
+        #
+        # SUCCESS PATH: the project's reference-transaction hook is
+        # responsible for consuming the sentinel after the successful
+        # update-ref.  A missing or non-consuming hook (absent hook, or
+        # git < 2.28) leaves the mark stale; the exposure is bounded to
+        # at most ONE intervening non-orchestrator move before the next
+        # advance_main invocation re-marks + consumes it.
         if self.config.main_gate_mark_command:
             mark_rc, _, mark_err = await _run(
                 ['sh', '-c', self.config.main_gate_mark_command],
