@@ -1858,6 +1858,29 @@ class GitOps:
                     did_stash = True
                     logger.info('Stashed uncommitted changes before advance_main')
 
+        # ── Main-gate mark (best-effort) ─────────────────────────────────
+        # Run the project-configurable sentinel command immediately before
+        # the update-ref so that reify's reference-transaction hook
+        # (git>=2.28, which DOES fire on update-ref) sees the one-shot
+        # marker and records this advance as SANCTIONED.  Skipped when the
+        # field is unset (feature off — other projects unaffected).
+        # Non-zero return is logged as WARNING but never aborts the advance:
+        # the task's whole purpose is to prevent queue bricking; under
+        # reify ENFORCE a failed mark simply lets update-ref abort →
+        # existing 'cas_failed' handling.  Re-runs on every invocation
+        # that reaches this point so the one-shot sentinel is refreshed on
+        # caller-level CAS retries.
+        if self.config.main_gate_mark_command:
+            mark_rc, _, mark_err = await _run(
+                ['sh', '-c', self.config.main_gate_mark_command],
+                cwd=self.project_root,
+            )
+            if mark_rc != 0:
+                logger.warning(
+                    'main_gate_mark_command returned non-zero rc=%d: %s',
+                    mark_rc, mark_err,
+                )
+
         # All checks passed — advance the ref (CAS when expected_main provided)
         update_cmd = [
             'git', 'update-ref',
