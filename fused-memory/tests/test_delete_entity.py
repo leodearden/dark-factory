@@ -305,3 +305,141 @@ class TestMemoryServiceDeleteEntity:
             project_id='dark_factory',
         )
         assert result['deleted_uuid'] == 'e-uuid'
+
+
+# ---------------------------------------------------------------------------
+# step-7: MCP tool delete_entity
+# ---------------------------------------------------------------------------
+
+class TestDeleteEntityMcpTool:
+    """MCP tool delete_entity is registered and delegates correctly."""
+
+    @pytest.fixture
+    def mock_service(self):
+        """Mock MemoryService for tool registration."""
+        svc = AsyncMock()
+        svc.delete_entity = AsyncMock(return_value={
+            'deleted_uuid': 'e-uuid',
+            'deleted_name': 'N',
+            'active_edge_count': 0,
+            'forced': False,
+            'connected_refreshed': [],
+        })
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        """MCP server with mock memory service."""
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        """delete_entity is registered as an MCP tool."""
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'delete_entity' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        """Tool calls memory_service.delete_entity with entity_uuid and project_id."""
+        await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {
+                'entity_uuid': 'e-uuid',
+                'project_id': 'dark_factory',
+            },
+        )
+        mock_service.delete_entity.assert_awaited_once()
+        call_kwargs = mock_service.delete_entity.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'e-uuid'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_force_defaults_to_false(self, mcp_server, mock_service):
+        """force defaults to False when omitted by the caller."""
+        await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': 'e-uuid', 'project_id': 'dark_factory'},
+        )
+        call_kwargs = mock_service.delete_entity.call_args[1]
+        assert call_kwargs.get('force') is False
+
+    @pytest.mark.asyncio
+    async def test_force_true_passed_through(self, mcp_server, mock_service):
+        """force=True is passed through to the service."""
+        await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': 'e-uuid', 'project_id': 'dark_factory', 'force': True},
+        )
+        call_kwargs = mock_service.delete_entity.call_args[1]
+        assert call_kwargs.get('force') is True
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        """Empty project_id returns validation error dict and service NOT called."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': 'e-uuid', 'project_id': ''},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_entity_uuid_returns_error(self, mcp_server, mock_service):
+        """Empty entity_uuid returns validation error dict and service NOT called."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': '', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_whitespace_entity_uuid_returns_error(self, mcp_server, mock_service):
+        """Whitespace-only entity_uuid returns validation error dict."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': '   ', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        """Exception from memory_service returns error dict (not raised)."""
+        import json
+        mock_service.delete_entity = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'delete_entity',
+            {'entity_uuid': 'e-uuid', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
