@@ -15267,3 +15267,114 @@ class TestSoftCancelMidVerify:
         assert stored.state == 'abandoned', (
             f'retention.state must be "abandoned", got {stored.state!r}'
         )
+
+    async def test_mid_verify_cancel_aborts_verify(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Scenario A (step-3 RED): mid-verify cancel aborts the wasted verify.
+
+        With VERIFY_ABANDON_POLL_SECS=0.01, after detach() fires while
+        run_scoped_verification is blocked, _verify_and_advance must:
+          - cancel the verify task (abort the wasted compute),
+          - clean up merge_wt,
+          - return False without advancing main.
+
+        RED today (pre-impl): no abort poll — the verify runs to completion
+        (completed becomes True, main advances) so assertions (a)/(b)/(d) fail.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'sc-a', 'sc_a.py', 'y = 2\n',
+        )
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'sc-a')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        merge_wt_path = merge_result.merge_worktree
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # Fast poll so the test doesn't take seconds — abort within ~0.01 s.
+        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+
+        req = _make_request('sc-a', 'sc-a', wt, config)
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+        await register_and_enqueue_merge_request(
+            queue, req, None, registry, retention=retention,
+        )
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        verify_started = asyncio.Event()
+        release_event = asyncio.Event()
+        completed = False
+
+        async def _blocking_verify(_merge_wt, _cfg, _module_configs, **_kwargs):
+            nonlocal completed
+            verify_started.set()
+            await release_event.wait()
+            completed = True
+            return MagicMock(passed=True, summary='')
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=_blocking_verify,
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            task = asyncio.create_task(worker._verify_and_advance(item))
+            # Wait until the blocking verify has started.
+            await asyncio.wait_for(verify_started.wait(), timeout=5)
+
+            # Simulate sole-waiter detach: cancels req.result.
+            registry.detach(req.branch, req.request_id)
+
+            # Sleep > 2 poll cycles (0.05 s >> 2 × 0.01 s).
+            await asyncio.sleep(0.05)
+
+            # Unblock the mock — on the post-impl path the task is already done
+            # (aborted); on the pre-impl path this lets the verify complete.
+            release_event.set()
+            result = await asyncio.wait_for(task, timeout=5)
+
+        # (a) result must be False — no advance.
+        assert result is False, (
+            f'Expected False (no advance after abort); got {result!r}'
+        )
+        # (b) verify must NOT have completed — wasted compute was aborted.
+        assert not completed, (
+            'Verify must be aborted before completion; completed flag must remain False'
+        )
+        # (c) abandoned log must appear.
+        assert 'abandoned by waiter' in caplog.text, (
+            f'Expected "abandoned by waiter" log; got: {caplog.text!r}'
+        )
+        # (d) main SHA must be unchanged — advance_main was never reached.
+        current_main = await git_ops.get_main_sha()
+        assert current_main == pre_merge_sha, (
+            f'main must NOT have advanced; expected {pre_merge_sha[:8]}, '
+            f'got {current_main[:8]}'
+        )
+        # (e) retention must reflect 'abandoned' (via existing _on_finalized callback).
+        await asyncio.sleep(0)  # let callbacks drain
+        stored = retention.get(req.request_id)
+        assert stored is not None, 'TerminalOutcomeRetention must contain a record'
+        assert stored.state == 'abandoned', (
+            f'retention.state must be "abandoned", got {stored.state!r}'
+        )
+        # (f) merge worktree must have been cleaned up.
+        assert not merge_wt_path.exists(), (
+            f'merge_wt {merge_wt_path} must be removed after abort'
+        )
