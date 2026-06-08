@@ -3150,6 +3150,83 @@ class TestMarkBlockedFalseDoneGuard:
             f'got kwargs={kwargs!r}'
         )
 
+    async def test_post_merge_pyright_routes_to_l1_and_captures_dry_run(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """A POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX outcome must call
+        _mark_blocked with spawn_dry_run=True so a sha-anchored dry-run
+        proposal is captured for the B3 low-risk auto-unblock gate.
+
+        Spies on ``_mark_blocked`` (so the real hook never fires — no dry-run
+        marker needed) and asserts the three kwargs that matter:
+        - escalate_to_human=True  (L1-direct, not steward)
+        - merge_phase=True        (status-transition suppressed)
+        - spawn_dry_run=True      (the new opt-in that captures the proposal)
+
+        RED today: the POST_MERGE_PYRIGHT branch at workflow.py doesn't yet
+        pass spawn_dry_run=True.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from orchestrator.merge_queue import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            MergeOutcome,
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # Spy replaces _mark_blocked so the real hook never fires.
+        spy_mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
+
+        # Deliver a blocked MergeOutcome whose reason matches the post-merge
+        # unscoped type-check prefix.
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
+            request.result.set_result(MergeOutcome(
+                'blocked',
+                reason=(
+                    f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+                    f'post-merge unscoped type-check failed for shared '
+                    f'on deadbeef. pyright found 3 errors'
+                ),
+            ))
+
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            outcome = await workflow._submit_to_merge_queue(
+                task_assignment.task_id, pre_rebased=False, merge_phase=True,
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED, got {outcome!r}'
+        )
+        spy_mark_blocked.assert_awaited_once()
+        assert spy_mark_blocked.await_args is not None
+        _args, kwargs = spy_mark_blocked.await_args
+        assert kwargs.get('escalate_to_human') is True, (
+            'post_merge_pyright must call _mark_blocked(escalate_to_human=True); '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('merge_phase') is True, (
+            'merge_phase flag must be threaded through to _mark_blocked; '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('spawn_dry_run') is True, (
+            'post_merge_pyright must pass spawn_dry_run=True so a dry-run '
+            'proposal is captured for the B3 auto-unblock gate; '
+            f'got kwargs={kwargs!r}'
+        )
+
     async def test_transient_infra_routes_to_l1_as_infra_issue(
         self, config, git_ops, task_assignment, tmp_path
     ):

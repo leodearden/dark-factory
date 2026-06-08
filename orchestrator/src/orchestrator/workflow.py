@@ -4140,6 +4140,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Post-merge unscoped type-check short-circuit: a union break caught
         # after the merge landed is also a human-judgement fix-forward case;
         # same L1-not-steward routing so the steward cannot mask the signal.
+        # spawn_dry_run=True captures a sha-anchored dry-run proposal for the
+        # B3 low-risk auto-unblock gate: advance_main has already moved
+        # refs/heads/main to advanced_sha before this path runs, so
+        # _capture_worktree_shas reflects post-merge reality at spawn time.
         if result.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
             self._write_merge_failure_review(
                 'post_merge_pyright_broken', result.reason,
@@ -4148,6 +4152,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 result.reason,
                 merge_phase=merge_phase,
                 escalate_to_human=True,
+                spawn_dry_run=True,
             )
         # Transient-infra short-circuit: the merge worker already pruned stale
         # merge worktrees and retried the verify, and it still hit ENOSPC.  Go
@@ -5585,6 +5590,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         suggested_action: str = 'investigate_and_retry',
         category: str = 'task_failure',
         dedupe_fingerprint: str | None = None,
+        spawn_dry_run: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5605,6 +5611,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         submission through submit_or_dedupe so N tasks seeing the same
         inherited-from-main break collapse to a single parent escalation.
         All existing callers (no fingerprint) keep the raw-submit path.
+        *spawn_dry_run* opts in to run_dry_run_unblock even when
+        *merge_phase* is True.  Use ONLY for the post-merge red-main class
+        (POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX): main is already advanced
+        before this path runs, so _capture_worktree_shas naturally reflects
+        post-merge reality and the B3 gate can act on the resulting proposal.
+        All other merge_phase=True escalation paths (dropped_plan_targets,
+        post_merge_equivalence, transient_infra, plan_files_not_touched) are
+        human-judgement/infra cases and must NOT receive a proposal — leave
+        their callers with spawn_dry_run=False (the default).
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -5634,6 +5649,40 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
                 self._spawn_dry_run_unblock(reason, detail or reason)
+        elif spawn_dry_run:
+            # Post-merge red-main class: merge_phase suppressed the status
+            # transition and the spawn above, but this IS the mechanically
+            # auto-unblockable class.  _spawn_dry_run_unblock is idempotent
+            # (enabled/worktree/in-flight-dedup guards) and captures SHAs
+            # from the task worktree at spawn time — by then advance_main
+            # has already moved refs/heads/main to advanced_sha, so the
+            # proposal reflects post-merge reality for b3_gate.check_proposal.
+            #
+            # ORDERING INVARIANT: spawn_dry_run=True is only valid when
+            # advance_main has already committed main.  The only reason prefix
+            # in this category is POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX —
+            # _check_post_merge_pyright is invoked exclusively from
+            # _finalize_advanced_merge, which runs AFTER a successful
+            # advance_main.  Asserting the prefix here enforces the contract
+            # so a future caller on a pre-advance path fails loudly rather
+            # than silently anchoring a dry-run proposal to a stale SHA that
+            # would cause b3_gate.check_proposal to act on incorrect data.
+            # If you need to add a second post-advance class, extend this
+            # check rather than removing it.
+            from orchestrator.merge_queue import (
+                POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            )
+            if not reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
+                raise AssertionError(
+                    f'spawn_dry_run=True requires advance_main to have already '
+                    f'moved refs/heads/main (post-merge red-main class only). '
+                    f'Reason prefix {reason[:80]!r} does not match '
+                    f'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX; this path may '
+                    f'be pre-advance and would produce a stale-SHA proposal '
+                    f'that causes b3_gate to act on incorrect data.  Update '
+                    f'this guard if adding a new post-advance class.'
+                )
+            self._spawn_dry_run_unblock(reason, detail or reason)
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
