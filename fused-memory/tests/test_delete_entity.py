@@ -20,7 +20,6 @@ from fused_memory.backends.graphiti_client import (
     NodeNotFoundError,
 )
 
-
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.get_connected_entity_uuids
 # ---------------------------------------------------------------------------
@@ -144,7 +143,6 @@ class TestDeleteEntityBackend:
     @pytest.mark.asyncio
     async def test_guard_raises_active_edges_error_when_force_false(self, mock_config, make_backend):
         """GUARD: active edges + force=False raises ActiveEdgesError, delete NOT called."""
-        from _fm_helpers import make_rebuild_detail
         backend = make_backend(mock_config)
         backend.get_node_text = AsyncMock(return_value=('NodeName', ''))
         # Return 2 active edges
