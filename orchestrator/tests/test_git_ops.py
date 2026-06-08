@@ -2267,6 +2267,81 @@ class TestWorkingTreeSync:
         assert marks_first == 1, f'Expected 1 mark in first advance, got {marks_first}'
         assert marks_second == 1, f'Expected 1 mark in second advance, got {marks_second}'
 
+    async def test_advance_main_unmarks_on_cas_failure(self, git_repo: Path):
+        """main_gate_unmark_command fires after a failed update-ref, clearing the sentinel.
+
+        Setup:
+        - GitOps with both mark and unmark commands set.
+        - Patch _run: returns (1,'','CAS mismatch') for update-ref, delegates
+          everything else to the real _run so merge setup runs normally.
+        - After advance_main, assert:
+          (1) result == 'cas_failed'
+          (2) mark call occurred BEFORE the failed update-ref
+          (3) unmark call occurred AFTER the failed update-ref (no lingering mark)
+        """
+        mark_cmd = 'echo mark-unmark'
+        unmark_cmd = 'echo unmark-cleanup'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+            ),
+            git_repo,
+        )
+
+        # Create a merge commit
+        wt = await mark_ops.create_worktree('unmark-cas-fail')
+        (wt.path / 'unmark_test.py').write_text('u = 1\n')
+        await mark_ops.commit(wt.path, 'Add unmark_test')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'unmark-cas-fail')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            # Fail on update-ref to simulate CAS mismatch
+            if cmd[:2] == ['git', 'update-ref']:
+                recorded.append((list(cmd), cwd))
+                return (1, '', 'CAS mismatch: refs/heads/main has been updated')
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+
+        commands = [cmd for cmd, _ in recorded]
+        mark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', mark_cmd]]
+        unmark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', unmark_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(commands)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+
+        assert len(mark_indices) >= 1, f'No mark call; commands: {commands}'
+        assert len(unmark_indices) >= 1, f'No unmark call; commands: {commands}'
+        assert len(update_ref_indices) >= 1, f'No update-ref call; commands: {commands}'
+
+        mark_idx = mark_indices[-1]
+        unmark_idx = unmark_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+
+        assert mark_idx < update_ref_idx, (
+            f'mark (idx={mark_idx}) must precede failed update-ref (idx={update_ref_idx})'
+        )
+        assert unmark_idx > update_ref_idx, (
+            f'unmark (idx={unmark_idx}) must come AFTER failed update-ref (idx={update_ref_idx}); '
+            f'commands: {commands}'
+        )
+
 
 @pytest.mark.asyncio
 class TestUnmergedDetection:
