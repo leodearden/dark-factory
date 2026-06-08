@@ -34,6 +34,17 @@ FRESH = 'fresh'
 DRIFT = 'drift'
 ABORT = 'abort'
 
+POST_MERGE_RED_MAIN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
+"""Prefix that identifies the post-merge-red-main fix-forward class.
+
+Canonical source: merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+Re-declared here (not imported) to keep b3_gate dependency-light — b3_gate
+uses stdlib sqlite3 only and imports orchestrator.config lazily; importing
+from merge_queue would pull event_store / git_ops / verify at module load.
+A coherence test in test_b3_gate.py asserts these two constants stay in sync
+so they cannot silently drift (see TestPostMergeRedMainAbort.test_coherence_*).
+"""
+
 DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
@@ -227,6 +238,9 @@ def check_proposal(
 
     Precedence:
       1. entry falsy -> abort 'no proposal to gate'
+      1b. block_reason starts with POST_MERGE_RED_MAIN_REASON_PREFIX -> abort
+          (highest-blast-radius class; hard-aborted before risk_label/git checks —
+          defense-in-depth against a mislabeled-low investigator result; see task 1680)
       2. risk_label != 'low' -> abort
       3. 'status' key present (failure entry) -> abort
       4. category not in B3_CATEGORIES (when not None) -> abort
@@ -270,6 +284,19 @@ def check_proposal(
             'main_sha': main_sha,
             'age_seconds': age,
         }
+
+    # --- (1b) Post-merge red-main fix-forward class ---
+    # Hard-abort regardless of risk_label — fires before the git checks so it
+    # consumes no git and cannot be bypassed by a mislabeled-low investigation
+    # result (the 1643 failure mode).  Both consumers already route a non-fresh
+    # verdict to abort-to-human with no code change.
+    block_reason = entry.get('block_reason') or ''
+    if block_reason.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX):
+        return _result(
+            ABORT,
+            'post-merge red-main fix-forward class — highest-blast-radius '
+            'unattended-edit scenario; routed to human (B3 never auto-acts on this class)',
+        )
 
     # --- (2) Risk label ---
     if entry.get('risk_label') != 'low':
