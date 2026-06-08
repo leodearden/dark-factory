@@ -172,7 +172,11 @@ async def scrub_task_dir_from_tree(
                                   (git rm or git commit returned non-zero).
 
     DO NOT REMOVE THIS FUNCTION.  It is the last reliable defense before
-    .task/ reaches main via update-ref (which bypasses all git hooks).
+    .task/ reaches main via update-ref.  Note: git's ``reference-transaction``
+    hook (git>=2.28) is the exception — it DOES fire on update-ref — and
+    advance_main's main_gate mark (added in task 1678) sanctions that hook.
+    All other git hooks (pre-commit, etc.) are still bypassed by update-ref.
+    See also task 7 for the same stale "bypasses ALL hooks" assumption.
     """
     rc, tracked, _ = await _run(
         ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
@@ -1587,8 +1591,13 @@ class GitOps:
         and this method returns ``'cas_failed'``.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
-        main.  update-ref bypasses ALL git hooks (including pre-commit),
+        main.  update-ref bypasses most git hooks (including pre-commit),
         so the .task/ contamination gate here is the final defense.
+        Exception: git's ``reference-transaction`` hook (git>=2.28) DOES
+        fire on update-ref — advance_main's main_gate mark (task 1678)
+        sanctions that hook by writing a sentinel immediately before the
+        CAS so reify-style projects record the move as SANCTIONED rather
+        than UNSANCTIONED.  See also task 7 for the same stale assumption.
 
         On a successful 'advanced' return, ``self._last_advanced_sha`` holds
         the SHA actually placed on main.  When CAS retry rebases the merge
