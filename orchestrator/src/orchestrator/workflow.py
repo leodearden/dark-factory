@@ -4140,6 +4140,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Post-merge unscoped type-check short-circuit: a union break caught
         # after the merge landed is also a human-judgement fix-forward case;
         # same L1-not-steward routing so the steward cannot mask the signal.
+        # spawn_dry_run=True captures a sha-anchored dry-run proposal for the
+        # B3 low-risk auto-unblock gate: advance_main has already moved
+        # refs/heads/main to advanced_sha before this path runs, so
+        # _capture_worktree_shas reflects post-merge reality at spawn time.
         if result.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
             self._write_merge_failure_review(
                 'post_merge_pyright_broken', result.reason,
@@ -4148,6 +4152,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 result.reason,
                 merge_phase=merge_phase,
                 escalate_to_human=True,
+                spawn_dry_run=True,
             )
         # Transient-infra short-circuit: the merge worker already pruned stale
         # merge worktrees and retried the verify, and it still hit ENOSPC.  Go
