@@ -157,6 +157,26 @@ async def _push_n_commits_to_origin(
         assert rc == 0, f'push to bare origin failed: {err}'
 
 
+def test_git_config_accepts_main_gate_commands():
+    """GitConfig.main_gate_mark_command and main_gate_unmark_command default to None and round-trip."""
+    # Defaults — feature off (unset => no-op, other projects unaffected)
+    cfg_default = GitConfig()
+    assert cfg_default.main_gate_mark_command is None
+    assert cfg_default.main_gate_unmark_command is None
+
+    # Both set — values round-trip correctly
+    cfg = GitConfig(
+        main_gate_mark_command='touch /tmp/sentinel',
+        main_gate_unmark_command='rm -f /tmp/sentinel',
+    )
+    assert cfg.main_gate_mark_command == 'touch /tmp/sentinel'
+    assert cfg.main_gate_unmark_command == 'rm -f /tmp/sentinel'
+
+    # Only mark set — unmark stays None
+    cfg_mark_only = GitConfig(main_gate_mark_command='echo mark')
+    assert cfg_mark_only.main_gate_mark_command == 'echo mark'
+    assert cfg_mark_only.main_gate_unmark_command is None
+
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
@@ -2099,6 +2119,328 @@ class TestWorkingTreeSync:
             f'Unexpected result: {result2!r} (fully controlled path: no CAS injection, '
             f'no mocks, no dirty WIP \u2014 cas_failed indicates an environmental regression)'
         )
+
+    async def test_advance_main_mark_before_update_ref(self, git_repo: Path):
+        """main_gate_mark_command fires immediately before the update-ref CAS call."""
+        mark_cmd = 'echo mark-test'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+            ),
+            git_repo,
+        )
+
+        # Create a merge commit to advance
+        wt = await mark_ops.create_worktree('mark-test-a')
+        (wt.path / 'mark_a.py').write_text('a = 1\n')
+        await mark_ops.commit(wt.path, 'Add mark_a')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'mark-test-a')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'advanced'
+
+        # Find the mark call and update-ref call in the recorded sequence
+        mark_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd == ['sh', '-c', mark_cmd]
+        ]
+        update_ref_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd[:2] == ['git', 'update-ref'] and 'refs/heads/main' in cmd
+        ]
+        assert len(mark_indices) >= 1, f'No mark call recorded; calls: {[c for c, _ in recorded]}'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+
+        # The last mark before update-ref must be immediately adjacent (no other
+        # advance-related command between them)
+        mark_idx = mark_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+        assert mark_idx < update_ref_idx, (
+            f'mark (idx={mark_idx}) must precede update-ref (idx={update_ref_idx})'
+        )
+        # Specifically: mark is at exactly update_ref_idx - 1
+        assert mark_idx == update_ref_idx - 1, (
+            f'mark must be IMMEDIATELY before update-ref; '
+            f'mark_idx={mark_idx}, update_ref_idx={update_ref_idx}, '
+            f'intervening: {[c for c, _ in recorded[mark_idx+1:update_ref_idx]]}'
+        )
+        # Mark runs with cwd=project_root
+        assert recorded[mark_idx][1] == mark_ops.project_root
+
+    async def test_advance_main_no_mark_when_unset(self, git_ops: GitOps):
+        """With default git_config (main_gate_mark_command=None), no sh -c call is recorded."""
+        wt = await git_ops.create_worktree('no-mark-test')
+        (wt.path / 'no_mark.py').write_text('x = 0\n')
+        await git_ops.commit(wt.path, 'Add no_mark')
+        merge_result = await git_ops.merge_to_main(wt.path, 'no-mark-test')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'advanced'
+        # No shell invocation via sh -c
+        assert not any(c[:2] == ['sh', '-c'] for c in recorded), (
+            f'Unexpected sh -c call with feature off; recorded: {recorded}'
+        )
+
+    async def test_advance_main_mark_runs_per_attempt(self, git_repo: Path):
+        """mark command fires once per advance_main invocation (re-runs each attempt)."""
+        mark_cmd = 'echo mark-per-attempt'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+            ),
+            git_repo,
+        )
+
+        # First merge + advance
+        wt1 = await mark_ops.create_worktree('mark-attempt-1')
+        (wt1.path / 'attempt1.py').write_text('a = 1\n')
+        await mark_ops.commit(wt1.path, 'Add attempt1')
+        merge1 = await mark_ops.merge_to_main(wt1.path, 'mark-attempt-1')
+        assert merge1.success and merge1.merge_commit is not None
+
+        original_run = _run
+        all_recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            all_recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result1 = await mark_ops.advance_main(merge1.merge_commit)
+        if merge1.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge1.merge_worktree)
+        assert result1 == 'advanced'
+
+        # Count marks from first advance
+        marks_first = sum(1 for c in all_recorded if c == ['sh', '-c', mark_cmd])
+
+        all_recorded.clear()
+
+        # Second merge + advance
+        wt2 = await mark_ops.create_worktree('mark-attempt-2')
+        (wt2.path / 'attempt2.py').write_text('b = 2\n')
+        await mark_ops.commit(wt2.path, 'Add attempt2')
+        merge2 = await mark_ops.merge_to_main(wt2.path, 'mark-attempt-2')
+        assert merge2.success and merge2.merge_commit is not None
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result2 = await mark_ops.advance_main(merge2.merge_commit)
+        if merge2.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge2.merge_worktree)
+        assert result2 == 'advanced'
+
+        marks_second = sum(1 for c in all_recorded if c == ['sh', '-c', mark_cmd])
+
+        # Each invocation emits exactly one mark call
+        assert marks_first == 1, f'Expected 1 mark in first advance, got {marks_first}'
+        assert marks_second == 1, f'Expected 1 mark in second advance, got {marks_second}'
+
+    async def test_advance_main_unmarks_on_cas_failure(self, git_repo: Path):
+        """main_gate_unmark_command fires after a failed update-ref, clearing the sentinel.
+
+        Setup:
+        - GitOps with both mark and unmark commands set.
+        - Patch _run: returns (1,'','CAS mismatch') for update-ref, delegates
+          everything else to the real _run so merge setup runs normally.
+        - After advance_main, assert:
+          (1) result == 'cas_failed'
+          (2) mark call occurred BEFORE the failed update-ref
+          (3) unmark call occurred AFTER the failed update-ref (no lingering mark)
+        """
+        mark_cmd = 'echo mark-unmark'
+        unmark_cmd = 'echo unmark-cleanup'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+            ),
+            git_repo,
+        )
+
+        # Create a merge commit
+        wt = await mark_ops.create_worktree('unmark-cas-fail')
+        (wt.path / 'unmark_test.py').write_text('u = 1\n')
+        await mark_ops.commit(wt.path, 'Add unmark_test')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'unmark-cas-fail')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            # Fail on update-ref to simulate CAS mismatch
+            if cmd[:2] == ['git', 'update-ref']:
+                recorded.append((list(cmd), cwd))
+                return (1, '', 'CAS mismatch: refs/heads/main has been updated')
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+
+        commands = [cmd for cmd, _ in recorded]
+        mark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', mark_cmd]]
+        unmark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', unmark_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(commands)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+
+        assert len(mark_indices) >= 1, f'No mark call; commands: {commands}'
+        assert len(unmark_indices) >= 1, f'No unmark call; commands: {commands}'
+        assert len(update_ref_indices) >= 1, f'No update-ref call; commands: {commands}'
+
+        mark_idx = mark_indices[-1]
+        unmark_idx = unmark_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+
+        assert mark_idx < update_ref_idx, (
+            f'mark (idx={mark_idx}) must precede failed update-ref (idx={update_ref_idx})'
+        )
+        assert unmark_idx > update_ref_idx, (
+            f'unmark (idx={unmark_idx}) must come AFTER failed update-ref (idx={update_ref_idx}); '
+            f'commands: {commands}'
+        )
+
+    async def test_advance_main_no_unmark_on_success(self, git_repo: Path):
+        """unmark command is NOT invoked when update-ref succeeds.
+
+        With both mark and unmark configured, a successful advance must fire
+        mark (before update-ref) but must NOT fire unmark — that is failure
+        cleanup only.  A regression that accidentally called unmark on success
+        would clear a sentinel the hook should have consumed, or re-clear it
+        after it was already consumed by the reference-transaction hook.
+        """
+        mark_cmd = 'echo mark-success-path'
+        unmark_cmd = 'echo unmark-should-not-fire'
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+            ),
+            git_repo,
+        )
+
+        wt = await mark_ops.create_worktree('no-unmark-success')
+        (wt.path / 'success_test.py').write_text('s = 1\n')
+        await mark_ops.commit(wt.path, 'Add success_test')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'no-unmark-success')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'advanced', f'Expected advanced, got {result!r}'
+
+        commands = [cmd for cmd, _ in recorded]
+        # mark must have fired on the success path
+        assert any(c == ['sh', '-c', mark_cmd] for c in commands), (
+            f'No mark call recorded on success path; commands: {commands}'
+        )
+        # unmark must NOT have fired — it is failure cleanup only
+        assert not any(c == ['sh', '-c', unmark_cmd] for c in commands), (
+            f'Unexpected unmark call on success path; commands: {commands}'
+        )
+
+    async def test_advance_main_mark_failure_still_advances(self, git_repo: Path):
+        """A non-zero mark command is best-effort: advance_main continues to
+        update-ref and returns 'advanced' even when the mark exits non-zero.
+
+        Prevents regressions where a logged WARNING becomes an early abort —
+        the exact failure mode this task was written to prevent (bricking the
+        merge queue because the sentinel write failed).
+        """
+        mark_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command='exit 1',  # always fails non-zero
+            ),
+            git_repo,
+        )
+
+        wt = await mark_ops.create_worktree('mark-fail-advance')
+        (wt.path / 'mark_fail.py').write_text('f = 1\n')
+        await mark_ops.commit(wt.path, 'Add mark_fail')
+        merge_result = await mark_ops.merge_to_main(wt.path, 'mark-fail-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await mark_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # A failed mark must not abort the advance
+        assert result == 'advanced', (
+            f'Mark failure must not abort advance_main; got {result!r}'
+        )
+        # update-ref was still called despite the failed mark
+        assert any(
+            c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+            for c in recorded
+        ), f'update-ref not called after failed mark; commands: {recorded}'
 
 
 @pytest.mark.asyncio

@@ -172,7 +172,11 @@ async def scrub_task_dir_from_tree(
                                   (git rm or git commit returned non-zero).
 
     DO NOT REMOVE THIS FUNCTION.  It is the last reliable defense before
-    .task/ reaches main via update-ref (which bypasses all git hooks).
+    .task/ reaches main via update-ref.  Note: git's ``reference-transaction``
+    hook (git>=2.28) is the exception — it DOES fire on update-ref — and
+    advance_main's main_gate mark (added in task 1678) sanctions that hook.
+    All other git hooks (pre-commit, etc.) are still bypassed by update-ref.
+    See also task 7 for the same stale "bypasses ALL hooks" assumption.
     """
     rc, tracked, _ = await _run(
         ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
@@ -1587,8 +1591,13 @@ class GitOps:
         and this method returns ``'cas_failed'``.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
-        main.  update-ref bypasses ALL git hooks (including pre-commit),
+        main.  update-ref bypasses most git hooks (including pre-commit),
         so the .task/ contamination gate here is the final defense.
+        Exception: git's ``reference-transaction`` hook (git>=2.28) DOES
+        fire on update-ref — advance_main's main_gate mark (task 1678)
+        sanctions that hook by writing a sentinel immediately before the
+        CAS so reify-style projects record the move as SANCTIONED rather
+        than UNSANCTIONED.  See also task 7 for the same stale assumption.
 
         On a successful 'advanced' return, ``self._last_advanced_sha`` holds
         the SHA actually placed on main.  When CAS retry rebases the merge
@@ -1858,6 +1867,36 @@ class GitOps:
                     did_stash = True
                     logger.info('Stashed uncommitted changes before advance_main')
 
+        # ── Main-gate mark (best-effort) ─────────────────────────────────
+        # Run the project-configurable sentinel command immediately before
+        # the update-ref so that reify's reference-transaction hook
+        # (git>=2.28, which DOES fire on update-ref) sees the one-shot
+        # marker and records this advance as SANCTIONED.  Skipped when the
+        # field is unset (feature off — other projects unaffected).
+        # Non-zero return is logged as WARNING but never aborts the advance:
+        # the task's whole purpose is to prevent queue bricking; under
+        # reify ENFORCE a failed mark simply lets update-ref abort →
+        # existing 'cas_failed' handling.  Re-runs on every invocation
+        # that reaches this point so the one-shot sentinel is refreshed on
+        # caller-level CAS retries.
+        #
+        # SUCCESS PATH: the project's reference-transaction hook is
+        # responsible for consuming the sentinel after the successful
+        # update-ref.  A missing or non-consuming hook (absent hook, or
+        # git < 2.28) leaves the mark stale; the exposure is bounded to
+        # at most ONE intervening non-orchestrator move before the next
+        # advance_main invocation re-marks + consumes it.
+        if self.config.main_gate_mark_command:
+            mark_rc, _, mark_err = await _run(
+                ['sh', '-c', self.config.main_gate_mark_command],
+                cwd=self.project_root,
+            )
+            if mark_rc != 0:
+                logger.warning(
+                    'main_gate_mark_command returned non-zero rc=%d: %s',
+                    mark_rc, mark_err,
+                )
+
         # All checks passed — advance the ref (CAS when expected_main provided)
         update_cmd = [
             'git', 'update-ref',
@@ -1867,6 +1906,28 @@ class GitOps:
             update_cmd.append(expected_main)
         rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
+            # ── Main-gate unmark (best-effort cleanup) ────────────────────
+            # A mark written immediately before this failed/aborted update-ref
+            # may not have been consumed by the aborted reference-transaction;
+            # clear it now so it cannot falsely sanction a later non-
+            # orchestrator move.  Runs at the TOP of rc!=0 so it covers both
+            # the 'cas_failed' and 'pop_conflict_no_advance' return paths.
+            #
+            # When main_gate_unmark_command is unset the residual exposure is
+            # bounded: a lingering mark sanctions at most ONE intervening move
+            # before the next advance_main invocation re-marks+consumes it.
+            # This is documented and accepted ("prefer explicit cleanup").
+            if self.config.main_gate_unmark_command:
+                unmark_rc, _, unmark_err = await _run(
+                    ['sh', '-c', self.config.main_gate_unmark_command],
+                    cwd=self.project_root,
+                )
+                if unmark_rc != 0:
+                    logger.warning(
+                        'main_gate_unmark_command returned non-zero rc=%d: %s',
+                        unmark_rc, unmark_err,
+                    )
+
             # Restore stash before returning — ref didn't move.
             # Use _safe_stash_pop_with_recovery so that a pop conflict here
             # does NOT leave UU markers in project_root and is escalated to
