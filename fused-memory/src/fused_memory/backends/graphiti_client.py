@@ -537,6 +537,34 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
+        """Return distinct UUID strings of entities connected to the given node via valid edges.
+
+        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
+        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+
+        Collects neighbours BEFORE deletion so the caller can refresh their
+        summaries after the target node is removed (edges vanish with DETACH DELETE).
+
+        Args:
+            uuid: UUID of the Entity node whose neighbours to find.
+            group_id: Project graph to query.
+
+        Returns:
+            List of distinct neighbour UUID strings. Empty list when isolated.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            'RETURN DISTINCT m.uuid'
+        )
+        result = await graph.ro_query(cypher, {'uuid': uuid})
+        return [row[0] for row in (result.result_set or [])]
+
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
