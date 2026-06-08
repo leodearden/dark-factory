@@ -105,7 +105,8 @@ class TestStartMergeWorkerWiresCallback:
         """After _start_merge_worker, SpeculativeMergeWorker received
         on_merge_landed=coordinator.note_merge."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
-             patch('asyncio.create_task'):
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Coordinator should have been created and stored
