@@ -769,6 +769,13 @@ class TestSubmitToMergeQueueAttachesAsPeer:
             re_snapshot_calls.append((branch, tip)) or real_re_snapshot(branch, tip)
         )
 
+        # Pin this test to the verifying=False (RESNAPSHOT) path.
+        _pre_entry = registry.entry('B')
+        assert _pre_entry is not None and _pre_entry.verifying is False, (
+            'test_superset_tip_resnapshots_before_attach exercises the verifying=False '
+            'RESNAPSHOT path; set_verifying must NOT be called here'
+        )
+
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
         )
@@ -786,6 +793,86 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
         P.set_result(MergeOutcome(status='done', merge_sha='sha'))
         await submit_task
+
+    async def test_attach_and_chain_reenqueues_superset_delta(
+        self, tmp_path, monkeypatch,
+    ):
+        """ATTACH_AND_CHAIN (verifying=True + SUPERSET) → independent re-enqueue, no peer-attach.
+
+        RED today: the code logs a warning then peer-attaches (qsize stays 0, waiters==2,
+        merge_coalesced IS emitted).  GREEN after the fix leaves attached=False so control
+        falls through to register_and_enqueue_merge_request (qsize==1, waiters==1, no event).
+        """
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        OLD = 'oldtip000000000002'
+        NEW = 'newtip000000000002'
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        registry.acquire(
+            'B', 'mcp-task', P,
+            request_id='mr-mcp', source='mcp',
+            submitted_tip=OLD, snapshot_tip=OLD,
+        )
+        # Flip verifying=True so decide_attach_action maps SUPERSET → ATTACH_AND_CHAIN
+        registry.set_verifying('B', True)
+
+        wf = self._make_attach_workflow(tmp_path, real_queue, registry)
+        # Stub is_ancestor: OLD is ancestor of NEW → classify_tip_relation returns SUPERSET
+        wf.git_ops.is_ancestor = AsyncMock(side_effect=lambda a, b: a == OLD and b == NEW)
+
+        async def fake_run(cmd, cwd=None, timeout=None):
+            if 'rev-parse' in cmd:
+                return 0, NEW + '\n', ''
+            return 0, '', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        coalesced_calls: list[int] = []
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_coalesced',
+            lambda *a, **kw: coalesced_calls.append(1),
+        )
+
+        submit_task = asyncio.create_task(
+            wf._submit_to_merge_queue('B', merge_phase=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # (1) Must re-enqueue independently — NOT attach as a peer
+        assert real_queue.qsize() == 1, (
+            f'ATTACH_AND_CHAIN must enqueue independently; qsize={real_queue.qsize()}'
+        )
+
+        # (2) Primary entry must NOT have gained a second (peer) waiter
+        _entry = registry.entry('B')
+        assert _entry is not None
+        assert len(_entry.waiters) == 1, (
+            f'no peer waiter must be added for ATTACH_AND_CHAIN; '
+            f'waiters={_entry.waiters!r}'
+        )
+
+        # (3) No merge_coalesced event for an independent re-enqueue
+        assert len(coalesced_calls) == 0, (
+            f'_emit_merge_coalesced must not be called for ATTACH_AND_CHAIN; '
+            f'calls={coalesced_calls}'
+        )
+
+        # (4) The independently enqueued request is for branch 'B'
+        enqueued_req = real_queue.get_nowait()
+        assert enqueued_req.branch == 'B'
+
+        # Complete the workflow: resolve the independently enqueued request's own future.
+        # (The primary P is unresolved — the workflow must be awaiting its OWN future.)
+        enqueued_req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
+        outcome = await submit_task
+        assert outcome == WorkflowOutcome.DONE
 
     async def test_divergent_tip_resolves_and_attaches(
         self, tmp_path, monkeypatch,

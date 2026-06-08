@@ -11130,6 +11130,184 @@ class TestFinalizeAdvancedMerge:
         assert outcome.status == 'done'
         assert 'task/t-done-pop' not in counts  # popped on clean landing
 
+    async def _run_chaining_driver(
+        self, tmp_path: Path, config: OrchestratorConfig,
+        retention: TerminalOutcomeRetention | None = None,
+    ) -> tuple[asyncio.Queue[MergeRequest], dict[str, int], MergeRequest]:
+        """Shared driver: run the SUPERSET chain path, return (queue, counts, gen_next).
+
+        Replicates the setup from test_chain_ctx_superset_advance_returns_superseded_and_enqueues.
+        After this returns:
+        - counts['task/t-chain'] == 1 (incremented by _maybe_auto_chain_generation)
+        - queue.qsize() == 1 (gen_next request enqueued)
+        - gen_next = queue.get_nowait() has its own result future
+
+        *retention* is forwarded to _GenerationChainContext so enqueue_merge_request
+        registers the _on_finalized callback with the same ring — enabling coexistence
+        tests that verify both callbacks fire on the same future.
+        """
+        from orchestrator.merge_queue import (
+            MergeRequest,
+            TipRelation,
+            _finalize_advanced_merge,
+            _GenerationChainContext,
+        )
+
+        git_ops = self._make_git_ops()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id='task-chain',
+            branch='task/t-chain',
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+            generation=1,
+        )
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        counts: dict[str, int] = {}
+        chain_ctx = _GenerationChainContext(
+            queue=queue, counts=counts, max_auto_generations=2, retention=retention,
+        )
+
+        with (
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                chain_ctx=chain_ctx,
+                merged_branch_tip='oldtip',
+            )
+
+        assert outcome.status == 'superseded', f'driver: expected superseded; got {outcome.status!r}'
+        assert queue.qsize() == 1, f'driver: expected 1 item on queue; got {queue.qsize()}'
+        assert counts.get('task/t-chain') == 1, (
+            f'driver: expected counts[task/t-chain]==1; got {counts!r}'
+        )
+        gen_next = queue.get_nowait()
+        return queue, counts, gen_next
+
+    async def test_chained_request_blocked_terminal_pops_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(d) gen_next resolves 'blocked' → counts[branch] must be popped (counter leaked today).
+
+        RED today: no cleanup callback on gen_next.result, so counts persists
+        on non-'done'/non-bound-exceeded terminals.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        # Resolve gen_next's own future with a non-'done', non-'superseded' terminal
+        gen_next.result.set_result(MergeOutcome('blocked', reason='equivalence drop'))
+        # Pump the event loop so any done-callbacks fire
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert 'task/t-chain' not in counts, (
+            f'blocked terminal must pop the chain counter; counts={counts!r}'
+        )
+
+    async def test_chained_request_cancelled_terminal_pops_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(e) gen_next.result cancelled → counts[branch] must be popped.
+
+        RED today: no cleanup callback on gen_next.result.
+        """
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        gen_next.result.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert 'task/t-chain' not in counts, (
+            f'cancellation must pop the chain counter; counts={counts!r}'
+        )
+
+    async def test_chained_request_superseded_terminal_keeps_counter(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(f) NEGATIVE: gen_next resolves 'superseded' → counter must NOT be popped.
+
+        'superseded' hands the lineage to a gen-(n+2) successor that inherits the
+        counter; popping here would reset the MAX_AUTO_CHAINED_GENERATIONS bound to 0
+        every generation.  This test guards against an over-broad fix.
+
+        PASSES today (no cleanup callback) and must STILL PASS after the fix.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        _queue, counts, gen_next = await self._run_chaining_driver(tmp_path, config)
+
+        gen_next.result.set_result(MergeOutcome('superseded', superseded_by='mr-next', merge_sha='s'))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert counts.get('task/t-chain') == 1, (
+            f"superseded must NOT pop the chain counter (lineage continues); counts={counts!r}"
+        )
+
+    async def test_both_callbacks_coexist_on_gen_next_result(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """(g) COEXISTENCE: _cleanup_chain_counter and _on_finalized (retention) both fire.
+
+        Both done-callbacks are registered on gen_next.result independently:
+        - _cleanup_chain_counter pops counts[branch] on non-'superseded' terminals
+        - _on_finalized (from enqueue_merge_request) records the outcome into retention
+
+        This test verifies they coexist on the same future — a regression that
+        accidentally *replaced* rather than *added* the callback would leave
+        retention empty (or the counter un-popped) and be caught here.
+
+        Strategy: pass a real TerminalOutcomeRetention into the driver so
+        enqueue_merge_request wires _on_finalized to it, then resolve gen_next
+        'blocked' and assert both side-effects are observed.
+        """
+        from orchestrator.merge_queue import MergeOutcome, TerminalOutcomeRetention
+
+        retention = TerminalOutcomeRetention()
+        _queue, counts, gen_next = await self._run_chaining_driver(
+            tmp_path, config, retention=retention,
+        )
+
+        # Resolve gen_next with a non-'superseded' terminal so _cleanup fires.
+        gen_next.result.set_result(MergeOutcome('blocked', reason='equivalence drop'))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # _cleanup_chain_counter must have fired: counter popped.
+        assert 'task/t-chain' not in counts, (
+            f'coexistence: _cleanup_chain_counter did not fire; counts={counts!r}'
+        )
+        # _on_finalized must have fired: retention recorded the outcome.
+        rec = retention.get(gen_next.request_id)
+        assert rec is not None, (
+            f'coexistence: _on_finalized did not fire; '
+            f'retention ring is empty for request_id={gen_next.request_id!r}'
+        )
+        assert rec.state == 'blocked', (
+            f'coexistence: retention recorded wrong state; got {rec.state!r}'
+        )
+        assert rec.branch == 'task/t-chain', (
+            f'coexistence: retention recorded wrong branch; got {rec.branch!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper

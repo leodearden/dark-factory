@@ -4005,31 +4005,36 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 action = decide_attach_action(relation, verifying=verifying)
                 if action is AttachAction.RESNAPSHOT:
                     _registry.re_snapshot(branch_name, new_tip)
-                elif action is AttachAction.ATTACH_AND_CHAIN:
-                    # ATTACH_AND_CHAIN requires γ2 worker generation chaining
-                    # (task 1640).  verifying is always False until γ2 sets it,
-                    # so this branch is currently unreachable.  Log a warning so
-                    # enabling verifying cannot silently drop new commits.
-                    logger.warning(
-                        f'Task {self.task_id}: ATTACH_AND_CHAIN reached before '
-                        f'γ2 chaining is wired (task 1640); proceeding as plain '
-                        f'attach — new commits may not be re-verified.'
-                    )
 
-                waiter = WaiterRecord(
-                    request_id=merge_request.request_id,
-                    future=merge_request.result,
-                    source='workflow',
-                    submitted_tip=new_tip,
-                )
-                # attach() may return False if the entry was released during the
-                # classify await (I10 await-gap).  Fall through to enqueue in that case.
-                attached = _registry.attach(branch_name, waiter)
-                if attached:
-                    _emit_merge_coalesced(
-                        self.event_store, merge_request, 'workflow',
-                        _registry.eta_seconds(branch_name),
+                if action is AttachAction.ATTACH_AND_CHAIN:
+                    # SUPERSET delta arrived while the primary is in its verify
+                    # phase (verifying=True on the OLD snapshot).  Attach-as-peer
+                    # would mirror the primary's terminal outcome without
+                    # independently merging or verifying the SUPERSET delta —
+                    # a silent drop.  Leave attached=False so control falls
+                    # through to register_and_enqueue_merge_request, giving the
+                    # new tip its own merge+verify on its own future.
+                    # Full registry slot-handoff (gen-(n+1) coordination) remains
+                    # γ3 / task-1641 scope; this removes the silent no-op.
+                    logger.info(
+                        f'Task {self.task_id}: ATTACH_AND_CHAIN — SUPERSET delta '
+                        f're-enqueued independently for its own merge+verify pass.'
                     )
+                else:
+                    waiter = WaiterRecord(
+                        request_id=merge_request.request_id,
+                        future=merge_request.result,
+                        source='workflow',
+                        submitted_tip=new_tip,
+                    )
+                    # attach() may return False if the entry was released during the
+                    # classify await (I10 await-gap).  Fall through to enqueue in that case.
+                    attached = _registry.attach(branch_name, waiter)
+                    if attached:
+                        _emit_merge_coalesced(
+                            self.event_store, merge_request, 'workflow',
+                            _registry.eta_seconds(branch_name),
+                        )
 
         _acquired = False
         if not attached:
