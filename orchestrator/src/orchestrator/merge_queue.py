@@ -5036,7 +5036,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Run verification + CAS advance for one item.
 
         Returns True if the item advanced main successfully, False otherwise.
-        Resolves item.request.result in all cases.
+        Resolves item.request.result in all cases, except when detach() has
+        already cancelled req.result (mid-verify abort or post-verify
+        abandonment short-circuit) — in those cases the future is
+        intentionally left cancelled; req.result.cancelled() is True on
+        return.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -5119,6 +5123,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: skipping re-verification '
                 f'(pre-rebased, main unchanged)'
             )
+
+        # Short-circuit: if abandonment landed while (or just as) verify
+        # completed, skip the expensive advance-main CAS loop and
+        # _finalize_advanced_merge work.  req.result is already cancelled by
+        # detach(); _request_abandoned emits the canonical log once and we
+        # clean up merge_wt before returning (task 1681, reviewer suggestion 1).
+        if self._request_abandoned(req):
+            await self._git_ops.cleanup_merge_worktree(merge_wt)
+            return False
 
         # ── Step 5: CAS advance_main ──────────────────────────────────
         # current_sha tracks the merge SHA to pass to advance_main.  After a
@@ -5219,6 +5232,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if gate is not None:
                     # Overlapping delta, verify failed (or disk guard fired).
                     # _run_post_merge_verify already cleaned up merge_wt.
+                    # NOTE: uses the bare guard (not _resolve_or_drop_abandoned)
+                    # because this rebase-gate site is outside the three
+                    # task-1681 resolution sites (disk-skip, verify-fail,
+                    # advance-success); see plan design decision.  A detach
+                    # landing this deep (after advance_main returned
+                    # rebased_pending_reverify) is a very narrow window; the
+                    # bare guard is left intentionally to keep the regression
+                    # surface minimal.
                     if not req.result.done():
                         req.result.set_result(gate)
                     return False

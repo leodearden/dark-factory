@@ -15444,3 +15444,133 @@ class TestSoftCancelMidVerify:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(worker_task, timeout=10)
+
+    async def test_verify_fail_logs_abandoned_when_detached(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Compact B/verify-fail: _resolve_or_drop_abandoned logs at 5061.
+
+        Pre-cancel req.result via detach, then immediately return a failed
+        MergeOutcome from _run_post_merge_verify.  The poll loop breaks with
+        ``out`` and _resolve_or_drop_abandoned must emit 'abandoned by waiter'
+        rather than silently skipping set_result.
+        """
+        wt = await _make_branch_with_file(git_ops, 'sc-vf', 'sc_vf.py', 'a = 1\n')
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'sc-vf')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('sc-vf', 'sc-vf', wt, config)
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+        await register_and_enqueue_merge_request(
+            queue, req, None, registry, retention=retention,
+        )
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
+        registry.detach(req.branch, req.request_id)
+        await asyncio.sleep(0)  # let _on_finalized fire
+        assert req.result.cancelled()
+        assert retention.get(req.request_id).state == 'abandoned'
+
+        with (
+            patch(
+                'orchestrator.merge_queue._run_post_merge_verify',
+                AsyncMock(return_value=MergeOutcome('blocked', reason='test failed')),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            result = await worker._verify_and_advance(item)
+
+        assert result is False
+        assert 'abandoned by waiter' in caplog.text, (
+            f'Expected "abandoned by waiter" at verify-fail site; got: {caplog.text!r}'
+        )
+        assert req.result.cancelled(), (
+            'req.result must remain cancelled — must not be overwritten'
+        )
+        # main must not advance
+        assert await git_ops.get_main_sha() == pre_merge_sha
+
+    async def test_disk_skip_logs_abandoned_when_detached(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Compact B/disk-skip: _resolve_or_drop_abandoned logs at 5053.
+
+        Same as verify-fail but using the disk-skip (verify_skipped=True) path.
+        Pre-cancel req.result via detach, then immediately return a disk-skip
+        MergeOutcome.  The poll loop breaks with ``out`` and
+        _resolve_or_drop_abandoned must emit 'abandoned by waiter'.
+        """
+        wt = await _make_branch_with_file(git_ops, 'sc-ds', 'sc_ds.py', 'b = 2\n')
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'sc-ds')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('sc-ds', 'sc-ds', wt, config)
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+        await register_and_enqueue_merge_request(
+            queue, req, None, registry, retention=retention,
+        )
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
+        registry.detach(req.branch, req.request_id)
+        await asyncio.sleep(0)  # let _on_finalized fire
+        assert req.result.cancelled()
+        assert retention.get(req.request_id).state == 'abandoned'
+
+        with (
+            patch(
+                'orchestrator.merge_queue._run_post_merge_verify',
+                AsyncMock(return_value=MergeOutcome(
+                    'blocked', reason='low disk space', verify_skipped=True,
+                )),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            result = await worker._verify_and_advance(item)
+
+        assert result is False
+        assert 'abandoned by waiter' in caplog.text, (
+            f'Expected "abandoned by waiter" at disk-skip site; got: {caplog.text!r}'
+        )
+        assert req.result.cancelled(), (
+            'req.result must remain cancelled — must not be overwritten'
+        )
+        # main must not advance
+        assert await git_ops.get_main_sha() == pre_merge_sha
