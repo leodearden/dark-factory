@@ -5657,6 +5657,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # from the task worktree at spawn time — by then advance_main
             # has already moved refs/heads/main to advanced_sha, so the
             # proposal reflects post-merge reality for b3_gate.check_proposal.
+            #
+            # ORDERING INVARIANT: spawn_dry_run=True is only valid when
+            # advance_main has already committed main.  The only reason prefix
+            # in this category is POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX —
+            # _check_post_merge_pyright is invoked exclusively from
+            # _finalize_advanced_merge, which runs AFTER a successful
+            # advance_main.  Asserting the prefix here enforces the contract
+            # so a future caller on a pre-advance path fails loudly rather
+            # than silently anchoring a dry-run proposal to a stale SHA that
+            # would cause b3_gate.check_proposal to act on incorrect data.
+            # If you need to add a second post-advance class, extend this
+            # check rather than removing it.
+            from orchestrator.merge_queue import (
+                POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            )
+            if not reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):
+                raise AssertionError(
+                    f'spawn_dry_run=True requires advance_main to have already '
+                    f'moved refs/heads/main (post-merge red-main class only). '
+                    f'Reason prefix {reason[:80]!r} does not match '
+                    f'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX; this path may '
+                    f'be pre-advance and would produce a stale-SHA proposal '
+                    f'that causes b3_gate to act on incorrect data.  Update '
+                    f'this guard if adding a new post-advance class.'
+                )
             self._spawn_dry_run_unblock(reason, detail or reason)
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 

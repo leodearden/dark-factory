@@ -1,12 +1,15 @@
 """Tests for the dry-run unblock hook wired into _mark_blocked.
 
-Pins three contracts:
+Pins four contracts:
 1. When unblock_auto.enabled=True, _mark_blocked schedules a background
    asyncio.create_task for run_dry_run_unblock and returns immediately
    (fire-and-forget — _mark_blocked does NOT await the dry-run).
 2. merge_phase=True suppresses the hook entirely.
 3. unblock_auto.enabled=False suppresses the hook but does NOT suppress the
    real 'blocked' status write.
+4. spawn_dry_run=True with merge_phase=True is only valid for
+   POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (ordering invariant: advance_main
+   has already moved main before this path runs).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -317,10 +321,14 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
             calls.append(kwargs)
             await hang_event.wait()
 
+        _reason = (
+            f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+            f'post-merge unscoped type-check failed for shared on deadbeef. detail'
+        )
         with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
             result = await asyncio.wait_for(
                 wf._mark_blocked(
-                    'post-merge red',
+                    _reason,
                     merge_phase=True,
                     spawn_dry_run=True,
                 ),
@@ -342,12 +350,85 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
         kwargs = calls[0]
         assert kwargs['task_id'] == '47'
-        assert 'post-merge red' in kwargs['reason']
+        assert POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX in kwargs['reason']
         assert 'worktree' in kwargs
         assert kwargs['worktree'] == str(wf.worktree)
 
         # merge_phase=True suppresses the 'blocked' status write — still
         assert 'blocked' not in scheduler.statuses.get('47', [])
+
+
+# ---------------------------------------------------------------------------
+# Amendment 1: ordering invariant — spawn_dry_run=True only valid for
+# POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (the post-advance class).
+# Pins the runtime assertion added to _mark_blocked's elif spawn_dry_run:
+# block so a future caller on a pre-advance path fails loudly rather than
+# silently producing a stale-SHA dry-run proposal.
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedSpawnDryRunOrderingInvariant:
+    @pytest.mark.asyncio
+    async def test_spawn_dry_run_wrong_prefix_raises_assertion_error(
+        self, tmp_path
+    ):
+        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must raise
+        AssertionError when the reason does NOT start with
+        POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+
+        This pins the ordering invariant: spawn_dry_run=True is only safe
+        when advance_main has already moved refs/heads/main, which is
+        guaranteed only for the POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        class (_check_post_merge_pyright is called exclusively from
+        _finalize_advanced_merge, which runs after a successful
+        advance_main).  Any other prefix likely indicates a pre-advance
+        path where SHA capture would reflect stale state, causing
+        b3_gate.check_proposal to act on incorrect data.
+
+        If this test fails because you added a second post-advance class,
+        extend the guard in _mark_blocked rather than removing it.
+        """
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='48', enabled=True)
+
+        with pytest.raises(AssertionError, match='POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX'):
+            await wf._mark_blocked(
+                'some-other-blocked-class: unexpected failure detail',
+                merge_phase=True,
+                spawn_dry_run=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_spawn_dry_run_correct_prefix_does_not_raise(
+        self, tmp_path
+    ):
+        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must NOT
+        raise when the reason starts with POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+
+        This is the counterpart to the wrong-prefix test: confirms the
+        guard is a targeted prefix check, not an unconditional block.
+        """
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='49', enabled=True)
+
+        _reason = (
+            f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+            f'post-merge unscoped type-check failed for shared on cafecafe.'
+        )
+        dry_run_calls = []
+
+        async def _spy(**kwargs):
+            dry_run_calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy):
+            # Must not raise
+            await wf._mark_blocked(_reason, merge_phase=True, spawn_dry_run=True)
+
+        await asyncio.sleep(0)
+        pending = list(wf._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert len(dry_run_calls) == 1, (
+            f'Correct prefix should spawn once, got {len(dry_run_calls)}'
+        )
 
 
 # ---------------------------------------------------------------------------
