@@ -197,3 +197,111 @@ class TestDeleteEntityBackend:
         )
         await backend.delete_entity('target-uuid', group_id='test')
         assert call_order == ['collect', 'delete', 'refresh']
+
+
+# ---------------------------------------------------------------------------
+# step-5: MemoryService.delete_entity
+# ---------------------------------------------------------------------------
+
+class TestMemoryServiceDeleteEntity:
+    """MemoryService.delete_entity() delegates to graphiti backend with journaling."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with mocked graphiti backend."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.graphiti.delete_entity = AsyncMock(return_value={
+            'deleted_uuid': 'e-uuid',
+            'deleted_name': 'N',
+            'active_edge_count': 0,
+            'forced': False,
+            'connected_refreshed': [],
+        })
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graphiti_backend(self, service):
+        """Calls graphiti.delete_entity with entity_uuid, group_id, and force."""
+        result = await service.delete_entity(
+            entity_uuid='e-uuid',
+            project_id='dark_factory',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'e-uuid', group_id='dark_factory', force=False,
+        )
+        assert result['deleted_uuid'] == 'e-uuid'
+
+    @pytest.mark.asyncio
+    async def test_force_threaded_through(self, service):
+        """force=True is passed through to the backend call."""
+        await service.delete_entity(
+            entity_uuid='e-uuid',
+            project_id='dark_factory',
+            force=True,
+        )
+        call_kwargs = service.graphiti.delete_entity.call_args[1]
+        assert call_kwargs.get('force') is True
+
+    @pytest.mark.asyncio
+    async def test_logs_via_write_journal_when_present(self, service):
+        """Logs write op via write journal when journal is set."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.delete_entity(
+            entity_uuid='e-uuid',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('operation') == 'delete_entity'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+        params = call_kwargs.get('params', {})
+        assert params.get('entity_uuid') == 'e-uuid'
+        assert 'force' in params
+
+    @pytest.mark.asyncio
+    async def test_journal_failure_does_not_mask_success(self, service):
+        """Journal failure does not prevent returning the successful result."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock(side_effect=RuntimeError('journal down'))
+        service.set_write_journal(mock_journal)
+        result = await service.delete_entity(
+            entity_uuid='e-uuid',
+            project_id='dark_factory',
+        )
+        assert result['deleted_uuid'] == 'e-uuid'
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_is_journaled_with_success_false(self, service):
+        """When backend raises, journal is still called with success=False."""
+        service.graphiti.delete_entity = AsyncMock(
+            side_effect=ValueError('node not found')
+        )
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        with pytest.raises(ValueError, match='node not found'):
+            await service.delete_entity(
+                entity_uuid='e-uuid',
+                project_id='dark_factory',
+            )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('success') is False
+
+    @pytest.mark.asyncio
+    async def test_works_without_journal(self, service):
+        """Works correctly when no write journal is set."""
+        service._write_journal = None
+        result = await service.delete_entity(
+            entity_uuid='e-uuid',
+            project_id='dark_factory',
+        )
+        assert result['deleted_uuid'] == 'e-uuid'
