@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import extract_cypher, extract_params
 
-from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
+from fused_memory.backends.graphiti_client import (
+    ActiveEdgesError,
+    GraphitiBackend,
+    NodeNotFoundError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,3 +85,115 @@ class TestGetConnectedEntityUuids:
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_connected_entity_uuids('isolated-uuid', group_id='test')
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# step-3: GraphitiBackend.delete_entity
+# ---------------------------------------------------------------------------
+
+class TestDeleteEntityBackend:
+    """GraphitiBackend.delete_entity(uuid, *, group_id, force=False) orchestrates deletion."""
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend):
+        """GraphitiBackend with sub-methods mocked for orchestration testing."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('NodeName', 'some summary'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.get_connected_entity_uuids = AsyncMock(return_value=[])
+        backend.delete_entity_node = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'target-uuid',
+            'name': 'Neighbour',
+            'old_summary': 'old',
+            'new_summary': 'new',
+            'edge_count': 1,
+        })
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_calls_get_node_text_to_validate(self, backend_with_mocks):
+        """Calls get_node_text to validate existence before proceeding."""
+        backend = backend_with_mocks
+        await backend.delete_entity(  'target-uuid', group_id='test')
+        backend.get_node_text.assert_awaited_once()
+        assert backend.get_node_text.call_args[0][0] == 'target-uuid'
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found_when_missing(self, mock_config, make_backend):
+        """Re-raises NodeNotFoundError from get_node_text when node is missing."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=NodeNotFoundError('missing'))
+        backend.delete_entity_node = AsyncMock()
+        with pytest.raises(NodeNotFoundError):
+            await backend.delete_entity('missing-uuid', group_id='test')
+        backend.delete_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_no_edges(self, backend_with_mocks):
+        """HAPPY PATH: no active edges → deletes node, returns audit dict."""
+        backend = backend_with_mocks
+        result = await backend.delete_entity('target-uuid', group_id='test')
+        backend.delete_entity_node.assert_awaited_once_with('target-uuid', group_id='test')
+        assert result['deleted_uuid'] == 'target-uuid'
+        assert result['deleted_name'] == 'NodeName'
+        assert result['active_edge_count'] == 0
+        assert result['forced'] is False
+        assert result['connected_refreshed'] == []
+
+    @pytest.mark.asyncio
+    async def test_guard_raises_active_edges_error_when_force_false(self, mock_config, make_backend):
+        """GUARD: active edges + force=False raises ActiveEdgesError, delete NOT called."""
+        from _fm_helpers import make_rebuild_detail
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('NodeName', ''))
+        # Return 2 active edges
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'fact1', 'name': 'e1'},
+            {'uuid': 'e2', 'fact': 'fact2', 'name': 'e2'},
+        ])
+        backend.delete_entity_node = AsyncMock()
+        with pytest.raises(ActiveEdgesError):
+            await backend.delete_entity('target-uuid', group_id='test', force=False)
+        backend.delete_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_true_deletes_with_active_edges(self, mock_config, make_backend):
+        """FORCE: active edges + force=True proceeds to delete and refreshes neighbours."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('NodeName', ''))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'fact1', 'name': 'e1'},
+            {'uuid': 'e2', 'fact': 'fact2', 'name': 'e2'},
+        ])
+        backend.get_connected_entity_uuids = AsyncMock(return_value=['nbr-a', 'nbr-b'])
+        backend.delete_entity_node = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'nbr-a', 'name': 'N', 'old_summary': '', 'new_summary': '', 'edge_count': 0
+        })
+        result = await backend.delete_entity('target-uuid', group_id='test', force=True)
+        backend.delete_entity_node.assert_awaited_once_with('target-uuid', group_id='test')
+        assert backend.refresh_entity_summary.await_count == 2
+        assert result['forced'] is True
+        assert result['active_edge_count'] == 2
+        assert result['connected_refreshed'] == ['nbr-a', 'nbr-b']
+
+    @pytest.mark.asyncio
+    async def test_order_collect_before_delete_before_refresh(self, mock_config, make_backend):
+        """ORDER: get_connected_entity_uuids called BEFORE delete_entity_node, which is BEFORE refresh."""
+        backend = make_backend(mock_config)
+        call_order: list[str] = []
+
+        backend.get_node_text = AsyncMock(return_value=('N', ''))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.get_connected_entity_uuids = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('collect') or ['nbr-x']
+        )
+        backend.delete_entity_node = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('delete')
+        )
+        backend.refresh_entity_summary = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('refresh') or {}
+        )
+        await backend.delete_entity('target-uuid', group_id='test')
+        assert call_order == ['collect', 'delete', 'refresh']
