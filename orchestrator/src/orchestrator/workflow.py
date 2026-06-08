@@ -5585,6 +5585,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         suggested_action: str = 'investigate_and_retry',
         category: str = 'task_failure',
         dedupe_fingerprint: str | None = None,
+        spawn_dry_run: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5605,6 +5606,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         submission through submit_or_dedupe so N tasks seeing the same
         inherited-from-main break collapse to a single parent escalation.
         All existing callers (no fingerprint) keep the raw-submit path.
+        *spawn_dry_run* opts in to run_dry_run_unblock even when
+        *merge_phase* is True.  Use ONLY for the post-merge red-main class
+        (POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX): main is already advanced
+        before this path runs, so _capture_worktree_shas naturally reflects
+        post-merge reality and the B3 gate can act on the resulting proposal.
+        All other merge_phase=True escalation paths (dropped_plan_targets,
+        post_merge_equivalence, transient_infra, plan_files_not_touched) are
+        human-judgement/infra cases and must NOT receive a proposal — leave
+        their callers with spawn_dry_run=False (the default).
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -5634,6 +5644,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
                 self._spawn_dry_run_unblock(reason, detail or reason)
+        elif spawn_dry_run:
+            # Post-merge red-main class: merge_phase suppressed the status
+            # transition and the spawn above, but this IS the mechanically
+            # auto-unblockable class.  _spawn_dry_run_unblock is idempotent
+            # (enabled/worktree/in-flight-dedup guards) and captures SHAs
+            # from the task worktree at spawn time — by then advance_main
+            # has already moved refs/heads/main to advanced_sha, so the
+            # proposal reflects post-merge reality for b3_gate.check_proposal.
+            self._spawn_dry_run_unblock(reason, detail or reason)
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
