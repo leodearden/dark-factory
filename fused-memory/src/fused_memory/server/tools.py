@@ -259,6 +259,7 @@ Management:
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
+- delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
 - get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
 - replay_dead_letters: Reset dead-lettered queue items to pending for retry (use for retriable transient failures)
@@ -1369,6 +1370,62 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'merge_entities error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def delete_entity(
+        entity_uuid: str,
+        project_id: str,
+        force: bool = False,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete a Graphiti Entity node by UUID, refreshing connected neighbours.
+
+        Performs a DETACH DELETE of the specified entity node from the FalkorDB
+        graph. Before deleting, collects all neighbours connected via valid
+        (non-invalidated) edges and refreshes their summaries afterwards.
+
+        By default, refuses to delete a node that still has valid active edges
+        (raises ActiveEdgesError). Pass force=True to override this guard and
+        delete unconditionally.
+
+        The operation is scoped to the given project_id. The node must exist —
+        a NodeNotFoundError is returned if it does not.
+
+        Args:
+            entity_uuid: UUID of the entity node to delete (required, non-empty)
+            project_id: Project scope (required, must be non-empty)
+            force: When True, bypass the active-edges guard and delete anyway
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        if not entity_uuid or not entity_uuid.strip():
+            return {
+                'error': 'entity_uuid must be a non-empty string',
+                'error_type': 'ValidationError',
+            }
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.delete_entity(
+                entity_uuid=entity_uuid,
+                project_id=project_id,
+                force=force,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'delete_entity error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
