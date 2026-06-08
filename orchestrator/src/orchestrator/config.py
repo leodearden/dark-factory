@@ -413,6 +413,34 @@ class GitConfig(BaseModel):
             'default across model instances.'
         ),
     )
+    main_gate_mark_command: str | None = Field(
+        default=None,
+        description=(
+            'Optional project-configurable shell command run (via ``sh -c`` '
+            'in project_root) immediately before the refs/heads/main '
+            'update-ref CAS in advance_main.  Intended for reify-style '
+            'projects whose ``reference-transaction`` hook (git>=2.28) '
+            'requires a one-shot "sanctioned" sentinel to be written before '
+            'the orchestrator\'s advance so the hook records the move as '
+            'sanctioned rather than UNSANCTIONED.  Set under the ``git:`` '
+            'section of orchestrator.yaml.  None (default) => feature off '
+            '(no-op) so other projects (autopilot-video, know-live, etc.) '
+            'are unaffected.'
+        ),
+    )
+    main_gate_unmark_command: str | None = Field(
+        default=None,
+        description=(
+            'Optional project-configurable shell command run (via ``sh -c`` '
+            'in project_root) at the top of the ``if rc != 0:`` block after '
+            'a failed update-ref CAS in advance_main.  Clears a sentinel '
+            'written by main_gate_mark_command that was not consumed by the '
+            'aborted reference-transaction, preventing it from falsely '
+            'sanctioning a later non-orchestrator move.  Set under the '
+            '``git:`` section of orchestrator.yaml alongside '
+            'main_gate_mark_command.  None (default) => feature off (no-op).'
+        ),
+    )
 
 
 # --- Per-module overrides ---
