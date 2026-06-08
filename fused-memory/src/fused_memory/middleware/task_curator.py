@@ -60,14 +60,20 @@ class CuratorFailureError(RuntimeError):
     errors; instead the interceptor translates this into an L1 escalation or
     a hard failure at the MCP boundary so operators notice breakage.
 
-    Attaches ``timed_out``, ``duration_ms``, and ``subtype`` from the
-    underlying ``AgentResult`` so :class:`CuratorEscalator` can surface them
-    in the L1 escalation detail and so the bisecting fallback in
+    Attaches ``timed_out``, ``duration_ms``, ``subtype``, and
+    ``schema_tool_denied`` from the underlying ``AgentResult`` so
+    :class:`CuratorEscalator` can surface them in the L1 escalation detail and
+    so the bisecting fallback in
     :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
     failure subtype without leaking the underlying ``AgentResult`` outside
     :meth:`TaskCurator._call_llm` / :meth:`TaskCurator._call_llm_batch`.
     Defaults make the attributes safe to read even when the failure
     originates outside those call sites.
+
+    ``schema_tool_denied`` is the CLI-2.1.168 regression signal: the synthetic
+    ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
+    break, not a flaky candidate).  When set, :class:`CuratorEscalator` raises a
+    distinct, un-suppressed escalation so the deny-list gets fixed promptly.
     """
 
     def __init__(
@@ -77,11 +83,13 @@ class CuratorFailureError(RuntimeError):
         timed_out: bool | None = None,
         duration_ms: int | None = None,
         subtype: str | None = None,
+        schema_tool_denied: bool = False,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
         self.duration_ms = duration_ms
         self.subtype = subtype
+        self.schema_tool_denied = schema_tool_denied
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -822,6 +830,7 @@ class TaskCurator:
                     candidate_title=candidate.title,
                     timed_out=exc.timed_out,
                     duration_ms=exc.duration_ms,
+                    schema_tool_denied=exc.schema_tool_denied,
                 )
             else:
                 logger.warning(
@@ -1578,10 +1587,12 @@ class TaskCurator:
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
+                f'schema_tool_denied={agent_result.schema_tool_denied} '
                 f'configured_timeout_secs={self._config.curator.timeout_seconds}',
                 timed_out=agent_result.timed_out,
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
+                schema_tool_denied=agent_result.schema_tool_denied,
             )
 
         return _parse_decision(
@@ -1658,10 +1669,12 @@ class TaskCurator:
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
+                f'schema_tool_denied={agent_result.schema_tool_denied} '
                 f'configured_timeout_secs={timeout}',
                 timed_out=agent_result.timed_out,
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
+                schema_tool_denied=agent_result.schema_tool_denied,
             )
 
         return _parse_batch_decisions(

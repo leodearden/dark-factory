@@ -145,6 +145,52 @@ class AllAccountsCappedException(Exception):
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# StructuredOutput schema-tool deny-list (CLI 2.1.168 regression guard)
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI 2.1.168 delivers ``--json-schema`` structured output through a *synthetic
+# tool* named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard — used
+# by pure-classifier callers (curator single/batch, recon agent_loop) that want
+# no real tool access — now ALSO matches and denies that schema tool, so every
+# structured answer is permission-denied → ``error_max_structured_output_retries``
+# (or ``error_max_budget_usd``) with no salvageable payload.
+#
+# Fix (central, in ``_invoke_claude``): when an ``output_schema`` is requested AND
+# ``'*'`` is in ``disallowed_tools``, expand the ``'*'`` into this explicit
+# deny-list of real built-in tools — which deliberately OMITS ``StructuredOutput``
+# — preserving the "no real (file/bash/web/MCP) tool access" guarantee while
+# letting the schema tool through.  Whitelisting ``StructuredOutput`` while keeping
+# ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
+# removed entirely (confirmed against live CLI 2.1.168).
+#
+# KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
+# would not be auto-denied by this list.  Accepted because (a) these prompts forbid
+# tool use, (b) no ``mcp_config`` is wired for these callers (MCP tools absent), and
+# (c) a future change to the CLI's tool-exclusion semantics is caught loudly by the
+# ``schema_tool_denied`` detection below rather than degrading silently.
+_SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
+_REAL_BUILTIN_TOOLS_DENYLIST = [
+    'Bash',
+    'BashOutput',
+    'KillShell',
+    'KillBash',
+    'Read',
+    'Edit',
+    'Write',
+    'MultiEdit',
+    'NotebookEdit',
+    'Glob',
+    'Grep',
+    'Task',
+    'Agent',
+    'WebFetch',
+    'WebSearch',
+    'TodoWrite',
+    'ExitPlanMode',
+    'SlashCommand',
+]
+
+
 @dataclass
 class AgentResult:
     """Structured result from a CLI agent invocation.
@@ -164,6 +210,12 @@ class AgentResult:
     - ``schema_salvaged``: True when the CLI reported is_error=True but a valid
       ``structured_output`` was present — commonly ``error_max_turns`` paired
       with a completed JSON schema tool-use turn. Callers treat this as success.
+    - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
+      structured payload AND a ``StructuredOutput`` permission denial — i.e. the
+      schema tool itself was blocked.  This is a systemic config break (the
+      cli_invoke deny-list no longer permits the schema tool), NOT a flaky
+      candidate.  ``success`` stays False (NOT salvaged); callers should raise a
+      loud, un-suppressed escalation so the deny-list gets fixed.
     """
 
     success: bool
@@ -182,6 +234,7 @@ class AgentResult:
     cache_create_tokens: int | None = None
     timed_out: bool = False
     schema_salvaged: bool = False
+    schema_tool_denied: bool = False
     api_error_status: int | None = None
 
 
@@ -804,6 +857,18 @@ async def _invoke_claude(
     if allowed_tools:
         cmd.extend(['--allowed-tools', *allowed_tools])
     if disallowed_tools:
+        # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
+        # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
+        # failing every structured-output call.  When a schema IS requested,
+        # expand the wildcard into an explicit real-builtins deny-list that omits
+        # ``StructuredOutput`` — keeping "no real tool access" while letting the
+        # schema tool through.  Callers without an output_schema (e.g. judge.py)
+        # keep ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
+        # constant above for the keep-in-sync caveat.
+        if output_schema and '*' in disallowed_tools:
+            disallowed_tools = [
+                t for t in disallowed_tools if t != '*'
+            ] + _REAL_BUILTIN_TOOLS_DENYLIST
         cmd.extend(['--disallowed-tools', *disallowed_tools])
 
     if mcp_config:
@@ -927,6 +992,22 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         is_success = True
         schema_salvaged = True
 
+    # Schema-tool-denied detection (CLI 2.1.168 regression guard): is_error with
+    # NO structured payload AND a ``StructuredOutput`` permission denial means the
+    # synthetic schema tool itself was blocked — a systemic config break, not a
+    # flaky candidate.  We deliberately do NOT salvage to success: ``success``
+    # stays False and ``schema_tool_denied`` is flagged so callers raise a loud,
+    # un-suppressed escalation to get the cli_invoke deny-list fixed.  Priority is
+    # "get it fixed"; silent recovery is exactly the trap that hid the outage.
+    schema_tool_denied = False
+    if not is_success and not isinstance(structured, dict):
+        denials = data.get('permission_denials')
+        if isinstance(denials, list) and any(
+            isinstance(d, dict) and d.get('tool_name') == _SCHEMA_OUTPUT_TOOL
+            for d in denials
+        ):
+            schema_tool_denied = True
+
     return AgentResult(
         success=is_success,
         output=output_text,
@@ -943,6 +1024,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         cache_create_tokens=cache_create_tokens,
         timed_out=result.timed_out,
         schema_salvaged=schema_salvaged,
+        schema_tool_denied=schema_tool_denied,
         api_error_status=api_error_status,
     )
 

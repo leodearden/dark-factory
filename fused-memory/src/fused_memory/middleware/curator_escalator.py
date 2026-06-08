@@ -124,6 +124,7 @@ class CuratorEscalator:
         candidate_title: str,
         timed_out: bool | None = None,
         duration_ms: int | None = None,
+        schema_tool_denied: bool = False,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
@@ -135,6 +136,15 @@ class CuratorEscalator:
         timestamp so operators can see the burst is ongoing. Subsequent
         failures within the window log a WARNING and return — preventing
         queue spam while keeping diagnostics visible.
+
+        ``schema_tool_denied`` overrides ALL of that: it signals the CLI-2.1.168
+        regression (the synthetic ``StructuredOutput`` schema tool was
+        permission-denied), which is a *systemic config break* — not a flaky
+        candidate. Such failures take a distinct branch that ALWAYS submits a
+        self-describing escalation (bypassing burst suppression, separate from
+        the ordinary cooldown log) so the break is un-missable and immediately
+        diagnosable. Burst suppression is exactly what made the original outage
+        read as sporadic "1 of 3" blips.
         """
         if not HAS_ESCALATION:
             # No escalation package available — fall back to a loud raise so
@@ -151,6 +161,21 @@ class CuratorEscalator:
                 f'project {project_id!r}. No dedupe was applied. '
                 f'justification={justification!r} candidate_title={candidate_title!r}',
             )
+
+        if schema_tool_denied:
+            # Systemic break (CLI tool-exclusion semantics changed): always
+            # surface, never suppress, with a distinct summary + concrete fix
+            # location. A human/code fix is required (update the deny-list), so
+            # this should reach attention rather than be auto-watcher-resolved.
+            await self._submit_schema_tool_denied(
+                project_root=project_root,
+                project_id=project_id,
+                justification=justification,
+                candidate_title=candidate_title,
+                timed_out=timed_out,
+                duration_ms=duration_ms,
+            )
+            return
 
         now = time.monotonic()
         cutoff = now - self._cooldown_secs
@@ -230,4 +255,80 @@ class CuratorEscalator:
             'curator_escalator: queued L1 escalation %s for project %s '
             '(failure %d of %d in window)',
             escalation.id, project_id, count, self._ESCALATE_FIRST_N,
+        )
+
+    async def _submit_schema_tool_denied(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        justification: str,
+        candidate_title: str,
+        timed_out: bool | None,
+        duration_ms: int | None,
+    ) -> None:
+        """Submit a distinct, un-suppressed escalation for the CLI-2.1.168
+        schema-tool-denied break.
+
+        Deliberately bypasses the rolling-window burst suppression (and does not
+        touch ``_failure_log``): a systemic deny-list break must surface on every
+        occurrence. The summary is unmistakable vs the generic "curator LLM
+        failing" escalation, and the detail names the concrete fix location so
+        whoever picks it up can act without re-diagnosing.
+        """
+        detail_lines = [
+            f'candidate_title={candidate_title!r}',
+            f'project_id={project_id!r}',
+        ]
+        if timed_out is not None:
+            detail_lines.append(f'timed_out={timed_out}')
+        if duration_ms is not None:
+            detail_lines.append(f'duration_ms={duration_ms}')
+        detail_lines.append(f'justification={justification}')
+        detail_lines.append('')
+        detail_lines.append(
+            'FIX: the CLI tool-exclusion semantics changed again — the deny-list '
+            'in shared/src/shared/cli_invoke.py (_REAL_BUILTIN_TOOLS_DENYLIST and '
+            "the '*'-expansion in _invoke_claude) no longer permits the synthetic "
+            'StructuredOutput schema tool, so every structured-output curator/recon '
+            'call is permission-denied. Update that deny-list so StructuredOutput '
+            'is NOT blocked, then restart fused-memory.service. Task dedupe is '
+            'DISABLED for this project until the deny-list is fixed.',
+        )
+        detail = '\n'.join(detail_lines)
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id='task-curator',
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_schema_tool_denied',
+            summary=(
+                'CRITICAL: schema StructuredOutput tool DENIED — CLI '
+                'tool-exclusion semantics changed; the cli_invoke deny-list no '
+                'longer permits the schema tool. Dedupe disabled until the '
+                'deny-list is fixed.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit schema-tool-denied '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke. The loud escalation
+            # is best-effort; the degrade-to-create still keeps the system limping.
+            return
+
+        logger.error(
+            'curator_escalator: queued schema-tool-denied L1 escalation %s for '
+            'project %s — StructuredOutput tool blocked by cli_invoke deny-list; '
+            'dedupe disabled until fixed',
+            escalation.id, project_id,
         )

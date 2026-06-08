@@ -510,6 +510,34 @@ class TestCurateFallbacks:
         assert kwargs['candidate_title'] == 'T'
 
     @pytest.mark.asyncio
+    async def test_schema_tool_denied_threads_to_report_failure(self):
+        """CLI 2.1.168 guard: a schema-tool-denied AgentResult routes through to
+        report_failure as ``schema_tool_denied=True`` so the escalation is loud
+        and un-suppressed (the systemic break must always surface)."""
+        config = _make_config()
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        failing_result = AgentResult(
+            success=False, output='StructuredOutput denied',
+            structured_output=None, schema_tool_denied=True,
+        )
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=failing_result)):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+        assert result.action == 'create'
+        escalator.report_failure.assert_awaited_once()
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['schema_tool_denied'] is True
+
+    @pytest.mark.asyncio
     async def test_escalator_raise_propagates_out_of_curate(self):
         """R2: interactive path — escalator re-raise is not swallowed.
 
@@ -1627,6 +1655,66 @@ class TestCuratorFailureErrorSubtype:
         construct a CFE without the subtype kwarg.  Default must be None."""
         err = CuratorFailureError('some other failure')
         assert err.subtype is None
+
+
+class TestCuratorFailureErrorSchemaToolDenied:
+    """CLI 2.1.168 guard — ``CuratorFailureError`` carries the underlying agent
+    result's ``schema_tool_denied`` from both LLM call sites so the curate()
+    handler can route a LOUD, un-suppressed escalation when the synthetic
+    ``StructuredOutput`` schema tool is blocked by the deny-list."""
+
+    @pytest.mark.asyncio
+    async def test_schema_tool_denied_propagated_from_call_llm_single(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed = AgentResult(
+            success=False, output='StructuredOutput denied',
+            subtype='error_max_structured_output_retries',
+            schema_tool_denied=True,
+        )
+        mock = AsyncMock(return_value=failed)
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+        ):
+            await curator._call_llm(
+                CandidateTask(title='X'),
+                pool=[], pool_sizes={'anchor': 0},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert exc_info.value.schema_tool_denied is True
+
+    @pytest.mark.asyncio
+    async def test_schema_tool_denied_propagated_from_call_llm_batch(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed = AgentResult(
+            success=False, output='StructuredOutput denied',
+            subtype='error_max_structured_output_retries',
+            schema_tool_denied=True,
+        )
+        mock = AsyncMock(return_value=failed)
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title='X'), CandidateTask(title='Y')],
+                pools=[[], []], pool_sizes_list=[{}, {}],
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert exc_info.value.schema_tool_denied is True
+
+    def test_schema_tool_denied_defaults_false_when_omitted(self):
+        """Defensive: failures constructed without the kwarg default to False."""
+        err = CuratorFailureError('some other failure')
+        assert err.schema_tool_denied is False
 
 
 # ----------------------------------------------------------------------
