@@ -28,6 +28,11 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
+    # Neutralise merge-worker startup so no real SpeculativeMergeWorker
+    # background task is spawned inside a unit test.  Mirrors the _neutralise
+    # idiom in test_harness_park_stop.py.
+    h._start_merge_worker = AsyncMock()
+
     return h
 
 

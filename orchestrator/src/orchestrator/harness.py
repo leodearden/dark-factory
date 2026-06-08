@@ -3233,7 +3233,14 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker, check_merge_liveness_margin
 
-        check_merge_liveness_margin(self.config)
+        # Advisory check — the harness always starts regardless of the verdict.
+        # Wrapped fail-open (mirrors _dismiss_stale_escalations at :642-645 and
+        # _rehydrate_merge_halt at :650-653) so a misconfigured or mock config
+        # can never crash-loop startup.
+        try:
+            check_merge_liveness_margin(self.config)
+        except Exception as e:
+            logger.warning('check_merge_liveness_margin failed (non-fatal): %s', e)
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 

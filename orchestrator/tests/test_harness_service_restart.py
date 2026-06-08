@@ -15,6 +15,7 @@ Asserts:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -105,7 +106,8 @@ class TestStartMergeWorkerWiresCallback:
         """After _start_merge_worker, SpeculativeMergeWorker received
         on_merge_landed=coordinator.note_merge."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
-             patch('asyncio.create_task'):
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Coordinator should have been created and stored
@@ -118,6 +120,33 @@ class TestStartMergeWorkerWiresCallback:
         assert 'on_merge_landed' in call_kwargs
         assert call_kwargs['on_merge_landed'] == \
             harness._service_restart_coordinator.note_merge
+
+    async def test_start_merge_worker_continues_when_liveness_check_raises(
+        self, harness: Harness, caplog
+    ):
+        """_start_merge_worker must not propagate exceptions from the advisory
+        check_merge_liveness_margin helper; the worker must still be constructed
+        and the background task must still be scheduled.
+        """
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task') as mock_ct, \
+             patch(
+                 'orchestrator.merge_queue.check_merge_liveness_margin',
+                 side_effect=RuntimeError('liveness boom'),
+             ), \
+             caplog.at_level(logging.WARNING):
+            # Must NOT raise — helper is advisory only.
+            await harness._start_merge_worker()
+
+        # Worker still constructed despite the liveness-check failure.
+        mock_smw.assert_called_once()
+        assert harness._service_restart_coordinator is not None
+
+        # Background task still scheduled — startup proceeds past the advisory check.
+        mock_ct.assert_called_once()
+
+        # Swallow is observable: a WARNING is logged.
+        assert 'liveness boom' in caplog.text
 
 
 # ---------------------------------------------------------------------------
