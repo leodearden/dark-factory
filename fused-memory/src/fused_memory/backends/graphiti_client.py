@@ -61,6 +61,14 @@ class NodeNotFoundError(Exception):
     """Raised when a node UUID is not found in FalkorDB."""
 
 
+class ActiveEdgesError(Exception):
+    """Raised when an entity node still has valid active edges and force=False.
+
+    Pass ``force=True`` to ``delete_entity`` to override the guard and delete
+    the node despite its active edges.
+    """
+
+
 class AmbiguousEntityError(Exception):
     """Raised when multiple entity nodes share the same name.
 
@@ -537,6 +545,34 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
+        """Return distinct UUID strings of entities connected to the given node via valid edges.
+
+        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
+        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+
+        Collects neighbours BEFORE deletion so the caller can refresh their
+        summaries after the target node is removed (edges vanish with DETACH DELETE).
+
+        Args:
+            uuid: UUID of the Entity node whose neighbours to find.
+            group_id: Project graph to query.
+
+        Returns:
+            List of distinct neighbour UUID strings. Empty list when isolated.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            'RETURN DISTINCT m.uuid'
+        )
+        result = await graph.ro_query(cypher, {'uuid': uuid})
+        return [row[0] for row in (result.result_set or [])]
+
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
@@ -774,6 +810,89 @@ class GraphitiBackend:
                 'after': refresh_result.get('new_summary', ''),
                 'edge_count': refresh_result.get('edge_count', 0),
             },
+        }
+
+    async def delete_entity(
+        self,
+        uuid: str,
+        *,
+        group_id: str,
+        force: bool = False,
+    ) -> dict:
+        """Delete a Graphiti Entity node, optionally refreshing connected neighbours.
+
+        Orchestrates the full delete workflow:
+        1. Validate the node exists via get_node_text (raises NodeNotFoundError if missing).
+        2. Guard: if the node has any valid active edges and force=False, raises
+           ActiveEdgesError with the edge count.
+        3. Collect valid-edge neighbours BEFORE deletion (edges vanish after DETACH DELETE).
+        4. Delete the node via delete_entity_node.
+        5. Refresh each neighbour's summary via refresh_entity_summary.
+
+        Args:
+            uuid: UUID of the Entity node to delete.
+            group_id: Project graph to target.
+            force: When True, bypass the active-edges guard and delete anyway.
+
+        Returns:
+            Audit dict with keys: deleted_uuid, deleted_name, active_edge_count,
+            forced, connected_refreshed (list of successfully refreshed neighbour UUIDs),
+            refresh_errors (list of neighbour UUIDs whose summary refresh failed).
+            The node is already gone when refresh runs, so refresh failures are
+            non-fatal — callers should inspect refresh_errors for partial outcomes.
+
+        Raises:
+            NodeNotFoundError: if the node does not exist.
+            ActiveEdgesError: if the node has valid active edges and force=False.
+            RuntimeError: if the backend is not initialized.
+        """
+        # 1. Validate existence and capture name
+        name, _ = await self.get_node_text(uuid, group_id=group_id)
+
+        # 2. Guard: check active edges
+        active_edges = await self.get_valid_edges_for_node(uuid, group_id=group_id)
+        if active_edges and not force:
+            raise ActiveEdgesError(
+                f'Entity {uuid} has {len(active_edges)} valid active edge(s); '
+                f'pass force=True to delete'
+            )
+
+        # 3. Collect neighbours BEFORE delete (edges vanish with DETACH DELETE)
+        neighbours = await self.get_connected_entity_uuids(uuid, group_id=group_id)
+
+        # 4. Delete the node
+        await self.delete_entity_node(uuid, group_id=group_id)
+
+        # 5. Refresh each neighbour's summary — best-effort.
+        # The node is already deleted (irreversible), so a refresh failure must not
+        # propagate as a top-level error and must not abort remaining refreshes.
+        # Collect both the successful and failed sets for the audit dict.
+        refreshed: list[str] = []
+        refresh_errors: list[str] = []
+        for nbr in neighbours:
+            try:
+                await self.refresh_entity_summary(nbr, group_id=group_id)
+                refreshed.append(nbr)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'delete_entity: refresh_entity_summary failed for nbr=%s '
+                    '(deleted node uuid=%s): %s',
+                    nbr, uuid, exc,
+                )
+                refresh_errors.append(nbr)
+
+        logger.info(
+            'delete_entity: deleted uuid=%s name=%r active_edges=%d force=%s '
+            'refreshed=%d errors=%d',
+            uuid, name, len(active_edges), force, len(refreshed), len(refresh_errors),
+        )
+        return {
+            'deleted_uuid': uuid,
+            'deleted_name': name,
+            'active_edge_count': len(active_edges),
+            'forced': force,
+            'connected_refreshed': refreshed,
+            'refresh_errors': refresh_errors,
         }
 
     async def delete_entity_node(self, uuid: str, *, group_id: str) -> None:

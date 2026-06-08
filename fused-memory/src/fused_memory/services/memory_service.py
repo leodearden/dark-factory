@@ -1839,6 +1839,78 @@ class MemoryService:
 
         return result
 
+    async def delete_entity(
+        self,
+        entity_uuid: str,
+        project_id: str = 'main',
+        force: bool = False,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Delete a Graphiti entity node by UUID, refreshing connected neighbours.
+
+        Delegates to GraphitiBackend.delete_entity(), which validates the node
+        exists, guards against accidental deletion of nodes with active edges
+        (unless force=True), collects neighbours before deletion, performs
+        DETACH DELETE, then refreshes each neighbour's summary.
+        Logs the operation via write journal if available.
+
+        Args:
+            entity_uuid: UUID of the entity node to delete.
+            project_id: Project scope (for Graphiti group_id and journal logging).
+            force: When True, bypass the active-edges guard.
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Audit dict from backend: {deleted_uuid, deleted_name, active_edge_count,
+            forced, connected_refreshed}.
+
+        Raises:
+            NodeNotFoundError: if the entity does not exist.
+            ActiveEdgesError: if the node has valid active edges and force=False.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        try:
+            result = await self.graphiti.delete_entity(entity_uuid, group_id=project_id, force=force)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='delete_entity',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={
+                            'entity_uuid': entity_uuid,
+                            'force': force,
+                        },
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'delete_entity: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
     # ------------------------------------------------------------------
     # Management
     # ------------------------------------------------------------------
