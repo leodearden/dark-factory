@@ -14590,7 +14590,10 @@ class TestCheckMergeLivenessMarginShippedDefaults:
         defaults.yaml ships merge_verify_cold_command_timeout_secs=7200; with liveness=10800
         and safety_factor=0.75, threshold=8100 → worst_case=7200 < 8100 → safe.
         """
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            check_merge_liveness_margin,
+        )
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -14602,11 +14605,18 @@ class TestCheckMergeLivenessMarginShippedDefaults:
         assert result.worst_case_secs == 7200.0, (
             f'Expected worst_case_secs==7200.0 (bound=1 * 7200), got {result.worst_case_secs}'
         )
-        assert result.threshold_secs == 8100.0, (
-            f'Expected threshold_secs==8100.0 (0.75 * 10800), got {result.threshold_secs}'
+        # Derive threshold from the production constant so a future constant bump updates one
+        # place.  The shipped literals (8100.0, 8000, 8200) in the sibling tests serve as the
+        # explicit calibration anchors.
+        _safety_factor = 0.75  # shipped default; not injected so this reads the production value
+        expected_threshold = _safety_factor * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+        assert result.threshold_secs == expected_threshold, (
+            f'Expected threshold_secs=={expected_threshold} '
+            f'(0.75 * {INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS}), got {result.threshold_secs}'
         )
         assert result.safe is True, (
-            f'Expected safe=True for shipped defaults (7200 < 8100); got safe={result.safe!r}'
+            f'Expected safe=True for shipped defaults (7200 < {expected_threshold}); '
+            f'got safe={result.safe!r}'
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
                     and r.name == 'orchestrator.merge_queue']
@@ -14691,6 +14701,10 @@ class TestCheckMergeLivenessMarginShippedDefaults:
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING for eroded bound=2; '
             f'got {len(warnings)}: {[r.message for r in warnings]!r}'
+        )
+        assert 'merge_ahead_bound' in warnings[0].message, (
+            f'WARNING must surface merge_ahead_bound so operators can identify '
+            f'the bound-driven cause of erosion; got: {warnings[0].message!r}'
         )
 
 
