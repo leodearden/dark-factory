@@ -205,10 +205,10 @@ async def test_cancel_event_during_merge_returns_done_when_terminal(
 
 
 @pytest.mark.asyncio
-async def test_cancel_event_during_merge_requeues_when_nonterminal(
+async def test_cancel_event_during_merge_soft_cancels_when_nonterminal(
     tmp_path: Path, monkeypatch,
 ):
-    """Cancel-event set + status non-terminal → REQUEUED (slot recycles)."""
+    """Cancel-event set + status non-terminal → SOFT_CANCELLED (slot exits, requeued=False)."""
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='in-progress')
 
@@ -226,4 +226,4 @@ async def test_cancel_event_during_merge_requeues_when_nonterminal(
         wf._submit_to_merge_queue('task/x', pre_rebased=False),
         timeout=2,
     )
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome == WorkflowOutcome.SOFT_CANCELLED
