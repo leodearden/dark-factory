@@ -134,10 +134,10 @@ class TestStartMergeWorkerWiresCallback:
              patch(
                  'orchestrator.merge_queue.check_merge_liveness_margin',
                  side_effect=RuntimeError('liveness boom'),
-             ):
-            with caplog.at_level(logging.WARNING):
-                # Must NOT raise — helper is advisory only.
-                await harness._start_merge_worker()
+             ), \
+             caplog.at_level(logging.WARNING):
+            # Must NOT raise — helper is advisory only.
+            await harness._start_merge_worker()
 
         # Worker still constructed despite the liveness-check failure.
         mock_smw.assert_called_once()
