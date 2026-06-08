@@ -2038,3 +2038,140 @@ class TestCapWaitPeriodicLog:
             f'Expected 2 cap_wait logs (first at t=0, second after t=700), '
             f'got {len(lines)}: {lines}'
         )
+
+
+# ── StructuredOutput schema tool must never be blocked (CLI 2.1.168) ───────
+#
+# CLI 2.1.168 delivers --json-schema structured output through a synthetic tool
+# named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard (used by the
+# pure-classifier curator/recon callers) now also denies that tool, so every
+# structured answer is permission-denied → error_max_structured_output_retries.
+# ``_invoke_claude`` must expand the ``'*'`` (only when an ``output_schema`` is
+# set) into an explicit deny-list of real built-ins that OMITS StructuredOutput.
+
+
+def _capture_cmd_exec(captured_cmd):
+    """Fake ``create_subprocess_exec`` that records argv and returns a success."""
+
+    async def fake_exec(*args, **kwargs):
+        captured_cmd.extend(args)
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(
+            _successful_json_output().encode(),
+            b'',
+        ))
+        proc.returncode = 0
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        return proc
+
+    return fake_exec
+
+
+def _disallowed_segment(cmd):
+    """Return the value list rendered after ``--disallowed-tools`` (up to the
+    next ``--flag``)."""
+    assert '--disallowed-tools' in cmd, f'no --disallowed-tools in {cmd}'
+    idx = cmd.index('--disallowed-tools')
+    seg = []
+    for arg in cmd[idx + 1:]:
+        if isinstance(arg, str) and arg.startswith('--'):
+            break
+        seg.append(arg)
+    return seg
+
+
+@pytest.mark.asyncio
+class TestSchemaToolNotDisallowed:
+    """The ``'*'`` deny wildcard must be expanded (excluding StructuredOutput)
+    only when an output schema is requested; otherwise it is preserved verbatim.
+    """
+
+    _SCHEMA = {
+        'type': 'object',
+        'properties': {'answer': {'type': 'string'}},
+        'required': ['answer'],
+        'additionalProperties': False,
+    }
+
+    async def test_wildcard_with_schema_expands_excluding_structuredoutput(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                disallowed_tools=['*'], output_schema=self._SCHEMA,
+            )
+        seg = _disallowed_segment(captured_cmd)
+        # Real built-ins are denied explicitly...
+        assert 'Bash' in seg
+        assert 'Glob' in seg
+        # ...but the wildcard and the schema tool are NOT in the deny-list,
+        # and StructuredOutput must not appear anywhere on the command line.
+        assert '*' not in seg
+        assert 'StructuredOutput' not in captured_cmd
+        # --json-schema is still rendered.
+        assert '--json-schema' in captured_cmd
+
+    async def test_wildcard_without_schema_is_preserved(self, tmp_path):
+        """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                disallowed_tools=['*'], output_schema=None,
+            )
+        seg = _disallowed_segment(captured_cmd)
+        assert seg == ['*']
+        assert '--json-schema' not in captured_cmd
+
+    async def test_specific_list_with_schema_passes_through(self, tmp_path):
+        """A specific deny-list (no '*') is rendered unchanged even with a schema."""
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                disallowed_tools=['Bash', 'Read'], output_schema=self._SCHEMA,
+            )
+        seg = _disallowed_segment(captured_cmd)
+        assert seg == ['Bash', 'Read']
+
+
+class TestSchemaToolDenied:
+    """Detect the schema-tool-denied signature (CLI tool-exclusion semantics
+    changed again): ``is_error`` with no structured payload and a
+    ``StructuredOutput`` permission denial.  This is NOT salvaged to success —
+    it sets ``schema_tool_denied`` so the curator can raise a loud escalation.
+    """
+
+    def _denied_result(self, denials):
+        data = {
+            'subtype': 'error_max_structured_output_retries',
+            'is_error': True,
+            'structured_output': None,
+            'permission_denials': denials,
+            'result': 'tool denied',
+            'cost_usd': 0.0,
+            'num_turns': 4,
+        }
+        return _make_subprocess_result(stdout=json.dumps(data), returncode=1)
+
+    def test_structuredoutput_denial_sets_flag_not_salvaged(self):
+        result = self._denied_result([
+            {'tool_name': 'StructuredOutput',
+             'tool_input': {'action': 'drop', 'justification': 'x'}},
+        ])
+        parsed = _parse_claude_output(result)
+        assert parsed.success is False  # explicitly NOT salvaged to success
+        assert parsed.schema_tool_denied is True
+
+    def test_non_schema_denial_does_not_set_flag(self):
+        result = self._denied_result([
+            {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}},
+        ])
+        parsed = _parse_claude_output(result)
+        assert parsed.success is False
+        assert parsed.schema_tool_denied is False
