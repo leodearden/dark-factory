@@ -3704,6 +3704,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
+    # Poll interval (seconds) used in the _verify_and_advance abort-loop that
+    # checks whether a sole-waiter detach() cancelled req.result mid-verify.
+    # Default ~10 s is negligible over a 10-40 min verify; kept as a class
+    # attribute so tests can monkeypatch (e.g. worker.VERIFY_ABANDON_POLL_SECS
+    # = 0.01) for fast, deterministic abort-path coverage.  Mirrors the MAX_*
+    # monkeypatch convention above.
+    VERIFY_ABANDON_POLL_SECS: float = 10.0
 
     def __init__(
         self,
@@ -5038,13 +5045,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'worktree={merge_wt.name})'
             )
             try:
-                out = await _run_post_merge_verify(
+                # Wrap _run_post_merge_verify in an abort-poll loop so that a
+                # sole-waiter detach() (pf.cancel() → req.result.cancelled())
+                # landing mid-verify aborts the wasted compute instead of
+                # burning one full 10-40 min cycle (task 1681 fix-2).
+                # Poll cost: one cheap req.result.cancelled() check per interval.
+                verify_task = asyncio.ensure_future(_run_post_merge_verify(
                     self._git_ops, req, merge_wt,
                     timeouts=self._post_merge_verify_timeouts,
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                )
+                ))
+                while True:
+                    done, _ = await asyncio.wait(
+                        {verify_task},
+                        timeout=self.VERIFY_ABANDON_POLL_SECS,
+                    )
+                    if verify_task in done:
+                        out = verify_task.result()
+                        break
+                    if self._request_abandoned(req):
+                        verify_task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await verify_task
+                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        return False
             except Exception as exc:
                 logger.info(
                     f'Task {req.task_id}: verify end '
