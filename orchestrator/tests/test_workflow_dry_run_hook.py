@@ -291,6 +291,66 @@ class TestMarkBlockedDeduplicatesDryRun:
 
 
 # ---------------------------------------------------------------------------
+# step-1: merge_phase=True WITH spawn_dry_run=True opts in to the hook
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
+    @pytest.mark.asyncio
+    async def test_mark_blocked_spawns_dry_run_when_merge_phase_and_opt_in(
+        self, tmp_path
+    ):
+        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must schedule
+        run_dry_run_unblock even though merge_phase suppresses the status
+        transition.
+
+        This is the post-merge red-main class: main is already advanced when
+        _mark_blocked runs, so the SHA capture inside run_dry_run_unblock
+        naturally reflects post-merge reality.  The status write is still
+        suppressed (merge_phase=True contract intact).
+        """
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='47', enabled=True)
+
+        calls = []
+        hang_event = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await hang_event.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            result = await asyncio.wait_for(
+                wf._mark_blocked(
+                    'post-merge red',
+                    merge_phase=True,
+                    spawn_dry_run=True,
+                ),
+                timeout=2.0,
+            )
+
+        assert result is not None
+
+        # Give the background task a tick to register its call
+        await asyncio.sleep(0)
+
+        # Capture pending tasks and drain them cleanly
+        pending = list(wf._background_tasks)
+        hang_event.set()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # run_dry_run_unblock was called once with the correct task worktree
+        assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+        kwargs = calls[0]
+        assert kwargs['task_id'] == '47'
+        assert 'post-merge red' in kwargs['reason']
+        assert 'worktree' in kwargs
+        assert kwargs['worktree'] == str(wf.worktree)
+
+        # merge_phase=True suppresses the 'blocked' status write — still
+        assert 'blocked' not in scheduler.statuses.get('47', [])
+
+
+# ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
 # Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
 # bottom of test_workflow_e2e.py.
