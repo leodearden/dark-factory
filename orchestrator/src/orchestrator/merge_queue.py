@@ -3704,6 +3704,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
     # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
+    # Poll interval (seconds) used in the _verify_and_advance abort-loop that
+    # checks whether a sole-waiter detach() cancelled req.result mid-verify.
+    # Default ~10 s is negligible over a 10-40 min verify; kept as a class
+    # attribute so tests can monkeypatch (e.g. worker.VERIFY_ABANDON_POLL_SECS
+    # = 0.01) for fast, deterministic abort-path coverage.  Mirrors the MAX_*
+    # monkeypatch convention above.
+    VERIFY_ABANDON_POLL_SECS: float = 10.0
 
     def __init__(
         self,
@@ -4708,6 +4715,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._verify_item = item
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
+                # GroupMergeRequest/train items (skip_verify=True +
+                # immediate_outcome set) always reach this branch; they never
+                # enter _run_post_merge_verify, so the sole-waiter mid-verify
+                # orphan window fixed in task 1681 does not apply to trains.
+                # A soft-cancel on the group-merge consumer falls to the blanket
+                # fut.cancel() via workflow.py:675 _await_cancellable (no
+                # on_soft_cancel detach hook attached), which is the accepted
+                # PRD D9 decision documented at workflow.py:6522 ('trains stay
+                # on the direct path; blanket cancel untouched').  Residual:
+                # accepted observability-only gap, not a wasted-verify orphan.
                 if item.immediate_outcome is not None:
                     if not item.already_delivered and not req.result.done():
                         req.result.set_result(item.immediate_outcome)
@@ -4996,11 +5013,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             started_monotonic=started_monotonic,
         )
 
+    def _resolve_or_drop_abandoned(
+        self, req: MergeRequest, outcome: MergeOutcome,
+    ) -> None:
+        """Resolve *req.result* with *outcome*, or drop silently if abandoned.
+
+        Used at the three task-1681 resolution sites (disk-skip 5053,
+        verify-fail 5061, advance-success 5111) to emit the canonical
+        'abandoned by waiter' INFO log when detach() has already cancelled
+        req.result, instead of performing a silent no-op.
+
+        Synchronous — no ``await`` between the abandonment check and
+        ``set_result``, preserving the detach resolution-race guard invariant
+        documented at merge_queue.py:2105-2119.
+        """
+        if self._request_abandoned(req):
+            return
+        if not req.result.done():
+            req.result.set_result(outcome)
+
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
 
         Returns True if the item advanced main successfully, False otherwise.
-        Resolves item.request.result in all cases.
+        Resolves item.request.result in all cases, except when detach() has
+        already cancelled req.result (mid-verify abort or post-verify
+        abandonment short-circuit) — in those cases the future is
+        intentionally left cancelled; req.result.cancelled() is True on
+        return.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -5019,13 +5059,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'worktree={merge_wt.name})'
             )
             try:
-                out = await _run_post_merge_verify(
+                # Wrap _run_post_merge_verify in an abort-poll loop so that a
+                # sole-waiter detach() (pf.cancel() → req.result.cancelled())
+                # landing mid-verify aborts the wasted compute instead of
+                # burning one full 10-40 min cycle (task 1681 fix-2).
+                # Poll cost: one cheap req.result.cancelled() check per interval.
+                verify_task = asyncio.ensure_future(_run_post_merge_verify(
                     self._git_ops, req, merge_wt,
                     timeouts=self._post_merge_verify_timeouts,
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                )
+                ))
+                while True:
+                    done, _ = await asyncio.wait(
+                        {verify_task},
+                        timeout=self.VERIFY_ABANDON_POLL_SECS,
+                    )
+                    if verify_task in done:
+                        out = verify_task.result()
+                        break
+                    if self._request_abandoned(req):
+                        verify_task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await verify_task
+                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        return False
             except Exception as exc:
                 logger.info(
                     f'Task {req.task_id}: verify end '
@@ -5050,22 +5109,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: verify skipped: low disk '
                     f'(merge={merge_commit[:8]})'
                 )
-                if not req.result.done():
-                    req.result.set_result(out)
+                self._resolve_or_drop_abandoned(req, out)
                 return False
             else:
                 logger.info(
                     f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                     f'passed=False)'
                 )
-                if not req.result.done():
-                    req.result.set_result(out)
+                self._resolve_or_drop_abandoned(req, out)
                 return False
         else:
             logger.info(
                 f'Task {req.task_id}: skipping re-verification '
                 f'(pre-rebased, main unchanged)'
             )
+
+        # Short-circuit: if abandonment landed while (or just as) verify
+        # completed, skip the expensive advance-main CAS loop and
+        # _finalize_advanced_merge work.  req.result is already cancelled by
+        # detach(); _request_abandoned emits the canonical log once and we
+        # clean up merge_wt before returning (task 1681, reviewer suggestion 1).
+        if self._request_abandoned(req):
+            await self._git_ops.cleanup_merge_worktree(merge_wt)
+            return False
 
         # ── Step 5: CAS advance_main ──────────────────────────────────
         # current_sha tracks the merge SHA to pass to advance_main.  After a
@@ -5108,8 +5174,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ),
                     merged_branch_tip=item.merged_branch_tip,
                 )
-                if not req.result.done():
-                    req.result.set_result(outcome)
+                self._resolve_or_drop_abandoned(req, outcome)
                 # SMW-only post-merge notification hook (task 1592).  Fires only
                 # on a 'done' landing: _finalize_advanced_merge may instead
                 # return a 'blocked' outcome (equivalence/pyright gate), and
@@ -5167,6 +5232,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if gate is not None:
                     # Overlapping delta, verify failed (or disk guard fired).
                     # _run_post_merge_verify already cleaned up merge_wt.
+                    # NOTE: uses the bare guard (not _resolve_or_drop_abandoned)
+                    # because this rebase-gate site is outside the three
+                    # task-1681 resolution sites (disk-skip, verify-fail,
+                    # advance-success); see plan design decision.  A detach
+                    # landing this deep (after advance_main returned
+                    # rebased_pending_reverify) is a very narrow window; the
+                    # bare guard is left intentionally to keep the regression
+                    # surface minimal.
                     if not req.result.done():
                         req.result.set_result(gate)
                     return False
