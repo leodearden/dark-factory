@@ -280,3 +280,59 @@ class TestReportFailure:
         finally:
             handle_a.close()
             handle_b.close()
+
+
+class TestSchemaToolDeniedEscalation:
+    """CLI-semantics-break guard (CLI 2.1.168): a ``schema_tool_denied`` failure
+    is a systemic config break (the cli_invoke deny-list no longer permits the
+    ``StructuredOutput`` schema tool), NOT a flaky candidate.  It must ALWAYS
+    surface — bypassing the first-3/hr burst suppression — with a distinct,
+    self-describing summary that names the concrete fix location.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bypasses_burst_suppression(self, tmp_path):
+        """Even as the 4th+ failure in a window (where ordinary failures are
+        suppressed), a schema-tool-denied failure still enqueues an escalation."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            # Exhaust the window with three ordinary failures (all escalate).
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='ordinary', candidate_title='T',
+                )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 3
+            # A normal 4th would be suppressed; schema-tool-denied must NOT be.
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='StructuredOutput denied x4', candidate_title='T',
+                schema_tool_denied=True,
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_summary_and_fix_location(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='StructuredOutput denied x4', candidate_title='T',
+                schema_tool_denied=True,
+            )
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            # Distinct, self-describing summary naming the schema tool — must be
+            # unmistakable vs the generic 'curator LLM failing' escalation.
+            assert 'StructuredOutput' in body
+            # ...and the concrete fix location for whoever picks it up.
+            assert 'shared/cli_invoke.py' in body
+        finally:
+            handle.close()
