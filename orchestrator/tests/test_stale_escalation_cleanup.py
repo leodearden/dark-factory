@@ -28,9 +28,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
-    # Neutralise merge-worker startup so run(dry_run=True) doesn't reach the
-    # unguarded check_merge_liveness_margin(self.config) call (which crashes
-    # when config is a MagicMock), and so no real SpeculativeMergeWorker
+    # Neutralise merge-worker startup so no real SpeculativeMergeWorker
     # background task is spawned inside a unit test.  Mirrors the _neutralise
     # idiom in test_harness_park_stop.py.
     h._start_merge_worker = AsyncMock()
