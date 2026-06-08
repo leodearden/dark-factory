@@ -2165,7 +2165,7 @@ class TestWorkingTreeSync:
             if cmd[:2] == ['git', 'update-ref'] and 'refs/heads/main' in cmd
         ]
         assert len(mark_indices) >= 1, f'No mark call recorded; calls: {[c for c, _ in recorded]}'
-        assert len(update_ref_indices) >= 1, f'No update-ref call recorded'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
 
         # The last mark before update-ref must be immediately adjacent (no other
         # advance-related command between them)
