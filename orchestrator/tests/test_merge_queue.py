@@ -15148,3 +15148,122 @@ class TestHeartbeatTaskLifecycle:
         assert worker._heartbeat_task.done(), (
             '_heartbeat_task must be done after stop()'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSoftCancelMidVerify — task-1681
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSoftCancelMidVerify:
+    """Sole-waiter soft-cancel mid post-merge-verify (task 1681).
+
+    Covers two residual defects from the 4156 remediation chain after
+    the γ3/1641 detach + 1644 OOB + γ1/1639 narrowing fixes:
+
+    (B) advance-success resolution path (line 5111) silently skips set_result
+        on a cancelled future — no log emitted.  Likewise 5053 (disk-skip)
+        and 5061 (verify-fail).
+
+    (A) _run_post_merge_verify has no abandonment poll, so a detach landing
+        mid-verify burns one full 10-40 min verify cycle (wasted compute).
+
+    (C) Regression guard: normal sole-waiter happy path (no cancel) still
+        advances main and resolves 'done'.
+
+    Note on retention: the _on_finalized done-callback registered by
+    enqueue_merge_request already records state='abandoned' when
+    req.result.cancelled() — so retention['abandoned'] is delivered by
+    existing code when detach() fires.  The genuinely-new behaviours are
+    the abandoned LOG on resolution paths and ABORTING the wasted verify.
+    """
+
+    async def test_advance_success_logs_abandoned_when_detached(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Scenario B (step-1 RED): advance-success resolution logs abandoned.
+
+        When detach() fires inside _finalize_advanced_merge (sole-waiter → 0 →
+        pf.cancel()), the advance-success resolution path must emit the
+        'abandoned by waiter' INFO log instead of silently skipping set_result.
+
+        RED today (pre-impl): line 5111 is a bare `if not req.result.done():
+        req.result.set_result(outcome)` silent skip — no log.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'sc-b', 'sc_b.py', 'x = 1\n',
+        )
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'sc-b')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('sc-b', 'sc-b', wt, config)
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+        await register_and_enqueue_merge_request(
+            queue, req, None, registry, retention=retention,
+        )
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        async def _finalize_detach_and_done(*_args, **_kwargs):
+            """Simulate detach() landing inside _finalize_advanced_merge.
+
+            Sole-waiter → 0 waiters → pf.cancel() → req.result cancelled.
+            One asyncio.sleep(0) tick ensures the done-callback fires so
+            retention records 'abandoned' before the mock returns.
+            """
+            registry.detach(req.branch, req.request_id)
+            # Yield one tick so the done-callback fires.
+            await asyncio.sleep(0)
+            from orchestrator.merge_queue import MergeOutcome as _MO  # noqa: PLC0415
+            return _MO('done', merge_sha=merge_result.merge_commit)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_verify_pass(),
+            ),
+            patch(
+                'orchestrator.merge_queue._finalize_advanced_merge',
+                new=_finalize_detach_and_done,
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            await worker._verify_and_advance(item)
+
+        # (a) The abandoned INFO log must appear.
+        assert 'abandoned by waiter' in caplog.text, (
+            'Expected "abandoned by waiter" from _request_abandoned; '
+            f'got log text: {caplog.text!r}'
+        )
+        # (b) req.result must stay cancelled — set_result must NOT overwrite it.
+        assert req.result.cancelled(), (
+            'req.result must remain cancelled; _resolve_or_drop_abandoned must '
+            'not call set_result on a cancelled future'
+        )
+        # (c) Retention must already reflect "abandoned" (via existing callback).
+        stored = retention.get(req.request_id)
+        assert stored is not None, (
+            'TerminalOutcomeRetention must contain a record '
+            '(enqueue_merge_request _on_finalized callback)'
+        )
+        assert stored.state == 'abandoned', (
+            f'retention.state must be "abandoned", got {stored.state!r}'
+        )
