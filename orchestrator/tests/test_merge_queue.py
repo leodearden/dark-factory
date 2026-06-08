@@ -14436,7 +14436,7 @@ class TestCheckMergeLivenessMarginInvariant:
                 project_root=tmp_path,
                 merge_verify_cold_command_timeout_secs=timeout,
             )
-            result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+            result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600)
             assert result.worst_case_secs == exp_wc, (
                 f'timeout={timeout}: expected worst_case={exp_wc}, got {result.worst_case_secs}'
             )
@@ -14541,8 +14541,8 @@ class TestCheckMergeLivenessMarginBoundCoupling:
             project_root=tmp_path,
             merge_verify_cold_command_timeout_secs=100.0,
         )
-        low = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=1)
-        high = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=20)
+        low = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600, merge_ahead_bound=1)
+        high = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600, merge_ahead_bound=20)
 
         # Pinned literals: formula worst_case = bound * timeout; threshold = 0.5 * 3600 = 1800
         assert low.worst_case_secs == 100.0, (
