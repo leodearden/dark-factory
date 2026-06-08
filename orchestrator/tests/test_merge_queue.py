@@ -15488,7 +15488,9 @@ class TestSoftCancelMidVerify:
         registry.detach(req.branch, req.request_id)
         await asyncio.sleep(0)  # let _on_finalized fire
         assert req.result.cancelled()
-        assert retention.get(req.request_id).state == 'abandoned'
+        _rec_b = retention.get(req.request_id)
+        assert _rec_b is not None
+        assert _rec_b.state == 'abandoned'
 
         with (
             patch(
@@ -15552,7 +15554,9 @@ class TestSoftCancelMidVerify:
         registry.detach(req.branch, req.request_id)
         await asyncio.sleep(0)  # let _on_finalized fire
         assert req.result.cancelled()
-        assert retention.get(req.request_id).state == 'abandoned'
+        _rec_d = retention.get(req.request_id)
+        assert _rec_d is not None
+        assert _rec_d.state == 'abandoned'
 
         with (
             patch(
