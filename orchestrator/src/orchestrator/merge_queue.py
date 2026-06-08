@@ -4715,6 +4715,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._verify_item = item
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
+                # GroupMergeRequest/train items (skip_verify=True +
+                # immediate_outcome set) always reach this branch; they never
+                # enter _run_post_merge_verify, so the sole-waiter mid-verify
+                # orphan window fixed in task 1681 does not apply to trains.
+                # A soft-cancel on the group-merge consumer falls to the blanket
+                # fut.cancel() via workflow.py:675 _await_cancellable (no
+                # on_soft_cancel detach hook attached), which is the accepted
+                # PRD D9 decision documented at workflow.py:6522 ('trains stay
+                # on the direct path; blanket cancel untouched').  Residual:
+                # accepted observability-only gap, not a wasted-verify orphan.
                 if item.immediate_outcome is not None:
                     if not item.already_delivered and not req.result.done():
                         req.result.set_result(item.immediate_outcome)
