@@ -1,6 +1,6 @@
 ---
 name: unblock-low-risk
-description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), or any task without a low-risk dry-run proposal."
+description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
 ---
 
 # Unblock — Low-Risk (autonomous, non-interactive)
@@ -54,6 +54,16 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
 
    This mechanically enforces what was previously heuristic: the recorded `head_sha` hard-stop (P1:
    HEAD moved → `abort`) and file-scoped main drift (P2 → `drift`).
+
+   **Post-merge-red-main class (task 1680):** if the proposal's `block_reason` starts with
+   `'Post-merge unscoped type-check failed'`, `b3_gate.check_proposal` returns `abort` with a
+   `'post-merge red-main fix-forward class'` reason **before** consulting risk_label or git. This
+   hard-abort fires regardless of `risk_label` — defense-in-depth against a mislabeled-`low`
+   proposal (the 1643 incident: an investigator can label a post-merge unscoped break as mechanically
+   low-risk). The post-merge-red-main class is the highest-blast-radius unattended-edit scenario in
+   B3 (an autonomous agent editing a red main); it is intentionally outside B3's autonomous scope and
+   must always be routed to a human. This skill will therefore never reach this class's proposals;
+   the gate aborts them upstream.
 
 ## Procedure
 
@@ -240,6 +250,10 @@ Return ONLY this JSON object (no prose):
 ## Non-negotiable safety rails (summary)
 
 - Only `risk_label == 'low'`; only `task_failure` / `review_issues`.
+- **Never post-merge-red-main:** proposals whose `block_reason` starts with
+  `'Post-merge unscoped type-check failed'` are hard-ABORTed by `b3_gate.check_proposal` before
+  this skill is reached (verdict `abort`, reason `'post-merge red-main fix-forward class'`).
+  This class is intentionally outside B3's autonomous scope — highest blast radius, always human.
 - Edits scoped to `files_referenced`; never main-only / CI / infra / config.
 - **Freshness enforced by `b3_gate check`** (precondition 6): proceed only on `verdict == "fresh"`;
   any `drift` or `abort` verdict → ABORT with the gate's `reason` verbatim.
