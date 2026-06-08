@@ -4996,6 +4996,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             started_monotonic=started_monotonic,
         )
 
+    def _resolve_or_drop_abandoned(
+        self, req: MergeRequest, outcome: MergeOutcome,
+    ) -> None:
+        """Resolve *req.result* with *outcome*, or drop silently if abandoned.
+
+        Used at the three task-1681 resolution sites (disk-skip 5053,
+        verify-fail 5061, advance-success 5111) to emit the canonical
+        'abandoned by waiter' INFO log when detach() has already cancelled
+        req.result, instead of performing a silent no-op.
+
+        Synchronous — no ``await`` between the abandonment check and
+        ``set_result``, preserving the detach resolution-race guard invariant
+        documented at merge_queue.py:2105-2119.
+        """
+        if self._request_abandoned(req):
+            return
+        if not req.result.done():
+            req.result.set_result(outcome)
+
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
 
@@ -5050,16 +5069,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: verify skipped: low disk '
                     f'(merge={merge_commit[:8]})'
                 )
-                if not req.result.done():
-                    req.result.set_result(out)
+                self._resolve_or_drop_abandoned(req, out)
                 return False
             else:
                 logger.info(
                     f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                     f'passed=False)'
                 )
-                if not req.result.done():
-                    req.result.set_result(out)
+                self._resolve_or_drop_abandoned(req, out)
                 return False
         else:
             logger.info(
@@ -5108,8 +5125,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ),
                     merged_branch_tip=item.merged_branch_tip,
                 )
-                if not req.result.done():
-                    req.result.set_result(outcome)
+                self._resolve_or_drop_abandoned(req, outcome)
                 # SMW-only post-merge notification hook (task 1592).  Fires only
                 # on a 'done' landing: _finalize_advanced_merge may instead
                 # return a 'blocked' outcome (equivalence/pyright gate), and
