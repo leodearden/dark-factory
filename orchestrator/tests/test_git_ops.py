@@ -157,6 +157,26 @@ async def _push_n_commits_to_origin(
         assert rc == 0, f'push to bare origin failed: {err}'
 
 
+def test_git_config_accepts_main_gate_commands():
+    """GitConfig.main_gate_mark_command and main_gate_unmark_command default to None and round-trip."""
+    # Defaults — feature off (unset => no-op, other projects unaffected)
+    cfg_default = GitConfig()
+    assert cfg_default.main_gate_mark_command is None
+    assert cfg_default.main_gate_unmark_command is None
+
+    # Both set — values round-trip correctly
+    cfg = GitConfig(
+        main_gate_mark_command='touch /tmp/sentinel',
+        main_gate_unmark_command='rm -f /tmp/sentinel',
+    )
+    assert cfg.main_gate_mark_command == 'touch /tmp/sentinel'
+    assert cfg.main_gate_unmark_command == 'rm -f /tmp/sentinel'
+
+    # Only mark set — unmark stays None
+    cfg_mark_only = GitConfig(main_gate_mark_command='echo mark')
+    assert cfg_mark_only.main_gate_mark_command == 'echo mark'
+    assert cfg_mark_only.main_gate_unmark_command is None
+
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
