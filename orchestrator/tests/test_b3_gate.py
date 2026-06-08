@@ -1070,3 +1070,30 @@ class TestPostMergeRedMainAbort:
             f'b3_gate prefix {POST_MERGE_RED_MAIN_REASON_PREFIX!r} '
             f'!= merge_queue prefix {POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX!r}'
         )
+
+    def test_production_format_reason_aborts_without_git(self):
+        """Case 6 (producer→gate contract): block_reason built with the exact merge_queue
+        production template (PREFIX + ': post-merge unscoped type-check failed for ...')
+        must ABORT.  Locks the ': ' separator format used by merge_queue.py:653-658 so a
+        future regression that drops the prefix from the template is caught here.
+        """
+        from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
+
+        # Exact production format from merge_queue.py:
+        #   f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+        #   f'post-merge unscoped type-check failed for '
+        #   f'{", ".join(pyright_result.failing_subprojects)} '
+        #   f'on {advanced_sha[:12]}. {pyright_result.detail}'
+        production_reason = (
+            POST_MERGE_RED_MAIN_REASON_PREFIX
+            + ': post-merge unscoped type-check failed for orchestrator'
+            + ' on abc123456789. error: Type "int | None" is not assignable to "int"'
+        )
+        entry = {**_LOW_RISK_ENTRY, 'block_reason': production_reason}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, (
+            f'expected ABORT for production-format post-merge reason, got {result}'
+        )
