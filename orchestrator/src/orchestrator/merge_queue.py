@@ -1817,7 +1817,7 @@ def _emit_train_event(
     event_store.emit(event_type, task_id=task_id, phase='merge', data=payload)
 
 
-INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 3600
+INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 10800
 """Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
 to be considered actively in-flight rather than abandoned.
 
@@ -1826,13 +1826,16 @@ to be considered actively in-flight rather than abandoned.
    by :func:`check_merge_liveness_margin`.  Run that guard after changing any
    of these three values.
 
-The evidence shows a cold npm+cargo verify can run for 10–20 minutes on the
-first run; the scheduler's /unblock backoff is ~1 hour.  A 1-hour window:
-- Covers any plausible in-progress verify (cold build < 1 h in practice).
-- Matches the /unblock backoff so a backoff-fired re-request still coalesces
-  rather than races if the original verify is still running.
-- Flags as abandoned any ``_merge-*`` worktree that has not been touched for
-  over an hour — safe to reap and replace with a fresh merger.
+Set to 3 hours (10800 s) so the liveness window comfortably exceeds the cold
+merge-verify budget shipped in ``defaults.yaml``
+(``merge_verify_cold_command_timeout_secs: 7200``).  With ``safety_factor=0.75``
+the guard threshold is ``0.75 × 10800 = 8100 s > 7200 s``, so the shipped
+config is silent and in-flight verifies are never reaped mid-run.
+
+**Tradeoff**: a genuinely-abandoned ``_merge-*`` worktree (e.g. from a crashed
+worker) now lingers up to ~3 hours before the reaper reclaims it.  The cost is
+disk space only — no correctness impact — and is the deliberate, accepted cost
+of closing the merge-verify-vs-reaper race (esc-1674-34 Option 2).
 
 Adjusted at module level or injected via `liveness_secs` in tests."""
 
@@ -2040,7 +2043,7 @@ class InFlightMergeRegistry:
         if remaining <= 0:
             # Estimate exceeded — return None so callers fall back to a fixed
             # backoff rather than busy-polling with a saturated 0 estimate.
-            # (ETA window is 600 s; liveness window is 3600 s — a worktree can
+            # (ETA window is 600 s; liveness window is 10800 s — a worktree can
             # legitimately be in-flight long after the ETA estimate runs out.)
             return None
         return int(remaining)
@@ -5388,12 +5391,14 @@ def check_merge_liveness_margin(
 
     **Default calibration**
 
-    With ``safety_factor=0.75`` and ``liveness_secs=3600``:
-    - threshold = 2700 s
+    With ``safety_factor=0.75`` and ``liveness_secs=10800``:
+    - threshold = 8100 s
     - A warm-only deployment (``verify_command_timeout_secs=1800``, no cold
-      overrides) resolves timeout=1800 s → worst_case=1800 s < 2700 s → safe.
+      overrides) resolves timeout=1800 s → worst_case=1800 s < 8100 s → safe
+      (guard silent).
     - The shipped ``defaults.yaml`` (``merge_verify_cold_command_timeout_secs
-      =7200``) resolves timeout=7200 s → worst_case=7200 s ≥ 2700 s → WARN.
+      =7200``) resolves timeout=7200 s → worst_case=7200 s < 8100 s → safe
+      (guard silent).
 
     Args:
         config: Live per-project orchestrator config.

@@ -14436,7 +14436,7 @@ class TestCheckMergeLivenessMarginInvariant:
                 project_root=tmp_path,
                 merge_verify_cold_command_timeout_secs=timeout,
             )
-            result = check_merge_liveness_margin(cfg, safety_factor=0.5)
+            result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600)
             assert result.worst_case_secs == exp_wc, (
                 f'timeout={timeout}: expected worst_case={exp_wc}, got {result.worst_case_secs}'
             )
@@ -14541,8 +14541,8 @@ class TestCheckMergeLivenessMarginBoundCoupling:
             project_root=tmp_path,
             merge_verify_cold_command_timeout_secs=100.0,
         )
-        low = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=1)
-        high = check_merge_liveness_margin(cfg, safety_factor=0.5, merge_ahead_bound=20)
+        low = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600, merge_ahead_bound=1)
+        high = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600, merge_ahead_bound=20)
 
         # Pinned literals: formula worst_case = bound * timeout; threshold = 0.5 * 3600 = 1800
         assert low.worst_case_secs == 100.0, (
@@ -14564,6 +14564,147 @@ class TestCheckMergeLivenessMarginBoundCoupling:
         )
         assert high.safe is False, (
             f'bound=20,timeout=100,factor=0.5 must not be safe; got .safe={high.safe!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestCheckMergeLivenessMarginShippedDefaults — task-1677 step-1
+# ---------------------------------------------------------------------------
+
+
+class TestCheckMergeLivenessMarginShippedDefaults:
+    """Production-default calibration: liveness=10800, safety_factor=0.75, threshold=8100.
+
+    These tests call check_merge_liveness_margin WITHOUT overriding safety_factor or
+    liveness_secs so they exercise the PRODUCTION constant (10800) and factor (0.75).
+    They fail on main while INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS==3600 (threshold=2700
+    means shipped cold=7200 warns instead of being silent), and go green in step-2 when
+    the constant is raised to 10800.
+    """
+
+    def test_shipped_defaults_are_silent(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Bare OrchestratorConfig (no timeout overrides) → safe=True, threshold=8100, no WARNING.
+
+        defaults.yaml ships merge_verify_cold_command_timeout_secs=7200; with liveness=10800
+        and safety_factor=0.75, threshold=8100 → worst_case=7200 < 8100 → safe.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            check_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.timeout_secs == 7200.0, (
+            f'Expected timeout_secs==7200.0 (defaults.yaml cold), got {result.timeout_secs}'
+        )
+        assert result.worst_case_secs == 7200.0, (
+            f'Expected worst_case_secs==7200.0 (bound=1 * 7200), got {result.worst_case_secs}'
+        )
+        # Derive threshold from the production constant so a future constant bump updates one
+        # place.  The shipped literals (8100.0, 8000, 8200) in the sibling tests serve as the
+        # explicit calibration anchors.
+        _safety_factor = 0.75  # shipped default; not injected so this reads the production value
+        expected_threshold = _safety_factor * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+        assert result.threshold_secs == expected_threshold, (
+            f'Expected threshold_secs=={expected_threshold} '
+            f'(0.75 * {INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS}), got {result.threshold_secs}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for shipped defaults (7200 < {expected_threshold}); '
+            f'got safe={result.safe!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 0, (
+            f'Expected no WARNINGs for shipped defaults; got {len(warnings)}: '
+            f'{[r.message for r in warnings]!r}'
+        )
+
+    def test_boundary_just_under_threshold_is_safe(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """cold=8000 → worst_case=8000 < 8100=threshold → safe=True, silent."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=8000.0,
+        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.worst_case_secs == 8000.0, (
+            f'Expected worst_case_secs==8000.0, got {result.worst_case_secs}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for cold=8000 (8000 < 8100); got safe={result.safe!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 0, (
+            f'Expected no WARNINGs for cold=8000 (below threshold 8100); '
+            f'got {len(warnings)}: {[r.message for r in warnings]!r}'
+        )
+
+    def test_eroded_via_cold_timeout_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """cold=8200 → worst_case=8200 ≥ 8100=threshold → safe=False, WARNING logged."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=8200.0,
+        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.worst_case_secs == 8200.0, (
+            f'Expected worst_case_secs==8200.0, got {result.worst_case_secs}'
+        )
+        assert result.safe is False, (
+            f'Expected safe=False for cold=8200 (8200 ≥ 8100); got safe={result.safe!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING for eroded cold=8200; '
+            f'got {len(warnings)}: {[r.message for r in warnings]!r}'
+        )
+        assert 'merge_verify_cold_command_timeout_secs' in warnings[0].message, (
+            f'WARNING must name offending key; got: {warnings[0].message!r}'
+        )
+
+    def test_eroded_via_merge_ahead_bound_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """bare cfg (cold=7200) + merge_ahead_bound=2 → worst_case=14400 ≥ 8100 → safe=False, WARNING."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = check_merge_liveness_margin(cfg, merge_ahead_bound=2)
+
+        assert result.worst_case_secs == 14400.0, (
+            f'Expected worst_case_secs==14400.0 (bound=2 * 7200), got {result.worst_case_secs}'
+        )
+        assert result.safe is False, (
+            f'Expected safe=False for bound=2 (14400 ≥ 8100); got safe={result.safe!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.name == 'orchestrator.merge_queue']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING for eroded bound=2; '
+            f'got {len(warnings)}: {[r.message for r in warnings]!r}'
+        )
+        assert 'merge_ahead_bound' in warnings[0].message, (
+            f'WARNING must surface merge_ahead_bound so operators can identify '
+            f'the bound-driven cause of erosion; got: {warnings[0].message!r}'
         )
 
 
