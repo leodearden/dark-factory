@@ -15378,3 +15378,69 @@ class TestSoftCancelMidVerify:
         assert not merge_wt_path.exists(), (
             f'merge_wt {merge_wt_path} must be removed after abort'
         )
+
+    async def test_normal_sole_waiter_no_cancel_advances_done(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Scenario C (step-5): regression guard — normal sole-waiter happy path.
+
+        A normal merge with NO soft-cancel must still advance main and resolve
+        req.result as 'done'.  Guards that _resolve_or_drop_abandoned (step-2)
+        and the verify abort-poll (step-4) do not break the happy path.
+
+        Expected green after steps 2 and 4 are in place.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'sc-c', 'sc_c.py', 'z = 3\n',
+        )
+        pre_merge_sha = await git_ops.get_main_sha()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('sc-c', 'sc-c', wt, config)
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_verify_pass(),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            await register_and_enqueue_merge_request(
+                queue, req, None, registry, retention=retention,
+            )
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        # (a) outcome is 'done'
+        assert outcome.status == 'done', (
+            f'Expected done on happy path, got {outcome!r}'
+        )
+        # (b) main SHA must have advanced
+        current_main = await git_ops.get_main_sha()
+        assert current_main != pre_merge_sha, (
+            'main must have advanced on the happy path'
+        )
+        # (c) retention must reflect 'done'
+        await asyncio.sleep(0)  # ensure _on_finalized callback has fired
+        stored = retention.get(req.request_id)
+        assert stored is not None, (
+            'TerminalOutcomeRetention must contain a record on happy path'
+        )
+        assert stored.state == 'done', (
+            f'retention.state must be "done" on happy path, got {stored.state!r}'
+        )
+        # (d) no 'abandoned by waiter' on the happy path
+        assert 'abandoned by waiter' not in caplog.text, (
+            'Regression: "abandoned by waiter" must NOT appear on happy path'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(worker_task, timeout=10)
