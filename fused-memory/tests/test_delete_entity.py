@@ -443,3 +443,28 @@ class TestDeleteEntityMcpTool:
             parsed = result
         assert 'error' in parsed
         assert 'FalkorDB connection failed' in parsed['error']
+
+
+# ---------------------------------------------------------------------------
+# step-9: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
+# ---------------------------------------------------------------------------
+
+class TestDisallowListForDeleteEntity:
+    """delete_entity must be in DISALLOW_MEMORY_WRITES but NOT in STAGE1_DISALLOWED."""
+
+    def test_delete_entity_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__delete_entity' must be in DISALLOW_MEMORY_WRITES
+        so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__delete_entity' in DISALLOW_MEMORY_WRITES
+
+    def test_delete_entity_not_in_stage1_disallowed(self):
+        """Stage 1 must be able to call delete_entity (not in STAGE1_DISALLOWED)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__delete_entity' not in STAGE1_DISALLOWED
+
+    def test_delete_entity_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call delete_entity (in STAGE3_DISALLOWED
+        via DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__delete_entity' in STAGE3_DISALLOWED
