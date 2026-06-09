@@ -4631,3 +4631,65 @@ class TestPersistentMergeWorktree:
         assert not await git_ops._is_registered_worktree(merge_wt), (
             'ephemeral _merge-<uuid> must be unregistered after cleanup'
         )
+
+    # ------------------------------------------------------------------
+    # Step 9 — _iter_merge_worktrees exempts _merge-verify
+    # ------------------------------------------------------------------
+
+    async def test_prune_skips_persistent_worktree(self, git_ops: GitOps):
+        """prune_stale_merge_worktrees removes ephemeral but NOT _merge-verify.
+
+        Step 9 (RED): prune force-removes _merge-verify today.
+        """
+        # Register the warm worktree
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-prune-1', 'warm_prune.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Also create an ephemeral _merge-<uuid> worktree
+        ephemeral_wt, _ = await git_ops._create_merge_worktree()
+        assert ephemeral_wt.exists()
+
+        # Prune: must remove ephemeral, NOT warm
+        removed = await git_ops.prune_stale_merge_worktrees()
+
+        assert any(
+            '_merge-' in r and not r.endswith('_merge-verify')
+            for r in removed
+        ), f'ephemeral worktree must appear in removed list: {removed}'
+        assert not any(
+            r.endswith('_merge-verify') for r in removed
+        ), f'_merge-verify must NOT appear in removed list: {removed}'
+
+        # Warm worktree still on disk and registered
+        assert warm_path.exists(), '_merge-verify must survive prune'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_merge-verify must still be registered after prune'
+        )
+
+        # Ephemeral is gone
+        assert not ephemeral_wt.exists(), (
+            'ephemeral _merge-<uuid> must be gone after prune'
+        )
+
+    async def test_find_inflight_never_returns_persistent_path(
+        self, git_ops: GitOps,
+    ):
+        """find_inflight_merge_worktree never returns _merge-verify.
+
+        Step 9 (RED): _iter_merge_worktrees doesn't yet skip _merge-verify.
+        """
+        # Register the warm worktree at some merge commit
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-inflight-1', 'warm_inflight.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # find_inflight_merge_worktree(any branch) must never return warm_path
+        result = await git_ops.find_inflight_merge_worktree('warm-inflight-1')
+        assert result != warm_path, (
+            'find_inflight_merge_worktree must never return _merge-verify'
+        )
