@@ -4052,6 +4052,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        from orchestrator.merge_queue import lane_for_task_metadata
         merge_request = MergeRequest(
             task_id=self.task_id,
             branch=branch_name,
@@ -4061,6 +4062,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             module_configs=self._module_configs,
             config=self.config,
             result=future,
+            lane=lane_for_task_metadata(self.task.get('metadata')),
         )
 
         attached = False
