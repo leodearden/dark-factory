@@ -286,6 +286,42 @@ def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
     return _normalize_lane(value or '')  # type: ignore[return-value]
 
 
+_FIX_BRIEF_TITLE_MAX = 100
+"""Maximum length for a compose_fix_main_brief title."""
+_FIX_BRIEF_DETAIL_MAX = 800
+"""Maximum bytes of detail to embed in a compose_fix_main_brief description."""
+
+
+def compose_fix_main_brief(
+    category: str, cause_hint: str, detail: str = '',
+) -> tuple[str, str]:
+    """Build a task title and description for a main-health fix task.
+
+    The title follows the pattern ``'fix main: <cause_hint-or-category>'``,
+    truncated to :data:`_FIX_BRIEF_TITLE_MAX` characters.  The description
+    states that this is an automated main-health fix and includes ``category``,
+    ``cause_hint``, and a bounded slice of ``detail``.
+
+    Pure function — no I/O, no side effects.
+    """
+    # Title: use cause_hint when non-empty; fall back to category
+    label = cause_hint.strip() if cause_hint and cause_hint.strip() else category
+    raw_title = f'fix main: {label}'
+    title = raw_title[:_FIX_BRIEF_TITLE_MAX]
+
+    # Description: automated context header + structured fields + truncated detail
+    detail_snippet = (detail or '').strip()[:_FIX_BRIEF_DETAIL_MAX]
+    description = (
+        f'Automated main-health fix task.\n'
+        f'Category: {category}\n'
+        f'Cause: {cause_hint}\n'
+    )
+    if detail_snippet:
+        description += f'\nDetail:\n{detail_snippet}'
+
+    return title, description
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
