@@ -26,6 +26,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
+    MergeRequest,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -291,8 +292,7 @@ class TestMergeRequestLaneWiring:
 
     def _run_and_capture_request(
         self, config: OrchestratorConfig, worktree: Path, task_metadata: dict,
-    ) -> 'MergeRequest':
-        from orchestrator.merge_queue import MergeRequest
+    ) -> MergeRequest:
         workflow = _make_workflow(config, worktree, task_metadata=task_metadata)
         workflow.merge_queue = asyncio.Queue()
 
@@ -366,7 +366,6 @@ def _make_workflow_with_worker(
     escalation_queue = MagicMock()
     escalation_queue.make_id = MagicMock(return_value='esc-auto-heal-001')
     # submit_or_dedupe returns {'status': 'queued'} to simulate parent creation
-    from unittest.mock import patch as _patch
     workflow.escalation_queue = escalation_queue
 
     return workflow, merge_worker
@@ -393,8 +392,6 @@ class TestAutoHealHappyPath:
 
         workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
         workflow._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
-
-        from escalation.dedupe import submit_or_dedupe
 
         with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'}):
             result = asyncio.run(
