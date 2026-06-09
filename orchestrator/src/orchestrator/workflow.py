@@ -298,6 +298,37 @@ def _normalize_cause_hint(hint: str | None) -> str:
     return result.lower().strip()
 
 
+def _compute_merge_outcome_signature(
+    category: str | None,
+    cause_hint: str | None,
+    fallback_reason: str = '',
+) -> str:
+    """Compute a 16-hex-char sha-independent outcome signature from explicit fields.
+
+    Keys on (category, normalised cause_hint) when either field is set; falls
+    back to sha256(normalised_reason) when both are empty — same logic as
+    _merge_outcome_signature() but takes the values directly rather than reading
+    the TaskWorkflow._last_merge_failure_* instance fields.
+
+    Those instance fields are never set on the MAIN_HEALTH_RED_REASON_PREFIX
+    fast-path in _submit_to_merge_queue (the method returns into
+    _auto_heal_main_health before the generic block path that sets them), so
+    calling self._merge_outcome_signature() there would always hash the empty
+    basis — a single constant key for every main-health break.  This helper
+    lets _auto_heal_main_health pass the outcome fields it already holds.
+
+    _merge_outcome_signature() delegates here so the hash algorithm stays in
+    one place; that method's behaviour and the #1688 thrash tests are unchanged.
+    """
+    cat = category or ''
+    hint = cause_hint or ''
+    if cat or hint:
+        basis = (cat + '\x1f' + _normalize_cause_hint(hint)).encode('utf-8')
+    else:
+        basis = _normalize_cause_hint(fallback_reason or '').encode('utf-8')
+    return hashlib.sha256(basis).hexdigest()[:16]
+
+
 def compute_preexisting_main_break_fingerprint(
     category: str,
     cause_hint: str,
@@ -2806,6 +2837,9 @@ class TaskWorkflow:
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
+        Delegates to the module-level _compute_merge_outcome_signature() helper
+        using the instance's _last_merge_failure_* fields.
+
         Keys on (category, normalised cause_hint) when either structured field
         is populated — the same stable shape the in-branch contagion guard uses
         (#1645, workflow.py:3544).  Falls back to sha256(normalised_reason) when
@@ -2818,14 +2852,19 @@ class TaskWorkflow:
         failure prev_signature (old) != current_signature (new), so
         consecutive_merge_thrash resets to 1 — at most one extra thrash cycle
         before the counter re-accumulates. Self-healing and benign.
+
+        NOTE: do NOT call this from _auto_heal_main_health — the
+        MAIN_HEALTH_RED_REASON_PREFIX fast-path returns before the generic blocked
+        path that sets _last_merge_failure_*; those fields are at their __init__
+        defaults, so this method would return a constant hash.  Use
+        _compute_merge_outcome_signature(category, cause_hint, reason) with the
+        outcome's fields instead.
         """
-        category = self._last_merge_failure_category
-        cause_hint = self._last_merge_failure_cause_hint
-        if category or cause_hint:
-            basis = (category + '\x1f' + _normalize_cause_hint(cause_hint)).encode('utf-8')
-        else:
-            basis = _normalize_cause_hint(self._last_merge_block_reason or '').encode('utf-8')
-        return hashlib.sha256(basis).hexdigest()[:16]
+        return _compute_merge_outcome_signature(
+            self._last_merge_failure_category,
+            self._last_merge_failure_cause_hint,
+            self._last_merge_block_reason or '',
+        )
 
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
@@ -4367,13 +4406,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         # Sha-independent signature for attempt-cap / re-break-loop detection.
-        # Use _merge_outcome_signature() as-is (without updating _last_merge_failure_*
-        # here — those fields are set by the generic blocked path in
-        # _submit_to_merge_queue, which runs only for NON-main-health outcomes).
-        # In the re-break scenario the prior heal attempt would have set those
-        # fields; in the initial call they're None and the fallback sha keeps the
-        # counter consistent between the pre-seed and the cap check.
-        sig = self._merge_outcome_signature()
+        # Derived from THIS outcome's (category, cause_hint) — distinct per break,
+        # stable across the heal→re-break loop (same category+cause_hint at a new
+        # main SHA).  Must NOT use self._merge_outcome_signature() here because the
+        # MAIN_HEALTH_RED_REASON_PREFIX fast-path returns before the generic blocked
+        # path that sets _last_merge_failure_*; those fields stay at __init__
+        # defaults, collapsing every break to the same empty-basis constant key.
+        sig = _compute_merge_outcome_signature(category, cause_hint, reason)
 
         registry = (
             self.merge_worker.auto_heal_registry

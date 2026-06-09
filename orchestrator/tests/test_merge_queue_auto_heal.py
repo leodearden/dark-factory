@@ -430,7 +430,10 @@ class TestAutoHealHappyPath:
         )
 
         # (4) registry.attempts(sig) == 1 after the call
-        sig = workflow._merge_outcome_signature()
+        # Use _compute_merge_outcome_signature with the outcome's fields (not
+        # workflow._merge_outcome_signature() which reads stale instance fields).
+        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
+        sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         assert merge_worker.auto_heal_registry.attempts(sig) == 1, (
             f'Expected attempts==1 after happy path; got {merge_worker.auto_heal_registry.attempts(sig)}'
         )
@@ -626,8 +629,10 @@ class TestAutoHealAttemptCap:
 
         workflow, merge_worker = _make_workflow_with_worker(config, worktree)
 
-        # Pre-seed the registry so attempts(sig) >= MAX before the call
-        sig = workflow._merge_outcome_signature()
+        # Pre-seed the registry using the outcome-derived sig (not the stale
+        # instance-field sig which would return the empty-basis constant).
+        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
+        sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         for _ in range(MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS):
             merge_worker.auto_heal_registry.record_attempt(sig)
         assert merge_worker.auto_heal_registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
