@@ -173,6 +173,28 @@ isn't in the recorded commit's diff), call `mcp__fused-memory__update_edge` \
 with `invalid_at=<now>` on that edge's UUID. Do not delete — invalidation \
 preserves the audit trail.
 
+## Completion-Note Suppression Pre-Check (stage2_suppress guard)
+Before writing ANY completion note or "task marked done, no knowledge captured" memory \
+for an already-done task, you MUST first call:
+
+  `mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'task_id': str(task_id), 'stage2_suppress': True}})`
+
+If this call returns `count > 0`, SKIP the completion-note write entirely — one or more \
+guard memories already exist for this task (carrying `stage2_suppress: True` in their \
+metadata, keyed by `task_id`). Proceeding would duplicate knowledge that a prior \
+protective write already captured.
+
+Note that `task_id` MUST be passed as `str(task_id)` — Qdrant exact payload-match \
+requires the stored string form.
+
+This deterministic exact-count check is independent of semantic `search` ranking: \
+an exact Qdrant payload-filter count returns 0 or > 0 unconditionally, eliminating the \
+0.71 false-negative retrieval precedent documented in task 1680 (guard memories \
+492e02ab/e8cb6795 and procedural norm 2fd528f8 ranked below threshold, causing Stage 2 \
+to re-synthesize already-captured knowledge). The count pre-check replaces the unreliable \
+semantic check as the authoritative suppression gate.
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
