@@ -5580,6 +5580,8 @@ class TestMergeVerifyTimeoutLoopBreaker:
             result.summary = 'tests failed'
             result.timed_out = False
             result.failure_report = lambda: ''
+            result.category = None
+            result.cause_hint = None
             return result
 
         try:
@@ -16705,9 +16707,6 @@ class TestDoTrainMergeTrainScope:
         """
         import json
         import sqlite3
-
-        from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _do_train_merge
 
         # Build a real stacked train so GroupMergeRequest has valid worktrees.
         req = await _make_stacked_train(git_ops, config)
