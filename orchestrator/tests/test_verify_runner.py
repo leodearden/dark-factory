@@ -2912,7 +2912,7 @@ class TestDriftDetectorDedup:
 
     async def test_has_open_l1_called_with_drift_sentinel(self):
         """has_open_l1 must be called with the _DRIFT_SENTINEL constant value."""
-        from orchestrator.verify_runner import DriftDetector, _DRIFT_SENTINEL
+        from orchestrator.verify_runner import _DRIFT_SENTINEL, DriftDetector
         pool, _, _ = self._make_diverge_pool()
         escalation_queue = MagicMock()
         escalation_queue.has_open_l1 = MagicMock(return_value=True)
