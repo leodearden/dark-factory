@@ -3325,6 +3325,7 @@ class _WipHaltMixin:
         )
         self._lane_halt[lane].set()
         self._lane_halt_owner[lane] = None
+        self._signal_resume()
 
     def is_lane_halted(self, lane: str) -> bool:
         """True iff the given lane is currently halted."""
@@ -3357,9 +3358,24 @@ class _WipHaltMixin:
         resumed = []
         for lane in MERGE_LANES:
             if self._lane_halt_owner.get(lane) == esc_id:
-                self.unhalt_lane(lane, reason)
+                # Call lane halt setter directly to avoid double-signal; signal once after.
+                self._lane_halt[lane].set()
+                self._lane_halt_owner[lane] = None
+                logger.info('Merge queue lane %r un-halted (owner %r resolved)', lane, esc_id)
                 resumed.append(lane)
+        if resumed:
+            self._signal_resume()
         return resumed
+
+    def _signal_resume(self) -> None:
+        """Set the resume signal if the concrete worker has one (SpeculativeMergeWorker).
+
+        The mixin is shared with MergeWorker which has no _resume_signal; the
+        hasattr guard makes the call a no-op on MergeWorker.
+        """
+        sig = getattr(self, '_resume_signal', None)
+        if sig is not None:
+            sig.set()
 
     # ── legacy all-lanes shims (backward-compatible) ──────────────────────
 
@@ -3404,6 +3420,7 @@ class _WipHaltMixin:
         for lane in MERGE_LANES:
             self._lane_halt[lane].set()
             self._lane_halt_owner[lane] = None
+        self._signal_resume()
 
     @property
     def is_wip_halted(self) -> bool:
@@ -3941,23 +3958,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
             l: collections.deque() for l in MERGE_LANES
         }
+        # Resume signal: set by every unhalt method so a blocked merger
+        # (waiting with no pickable item) wakes up to re-check lanes.
+        # Cleared by the merger before each wait; never cancelled.
+        self._resume_signal = asyncio.Event()
+        # Persistent queue.get() future — kept alive across iterations to
+        # avoid the lost-item hazard of cancelling an in-flight get().
+        # The merger always has at most one of these outstanding.
+        self._pending_get: asyncio.Task | None = None
+        # Set True when the shutdown sentinel (None) has been dequeued so
+        # _acquire_next_request can drain remaining lane-buffer items before
+        # returning None.  Cleared by stop() on full reset.
+        self._shutdown_signaled: bool = False
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
-    def _drain_queue_into_lanes(self) -> bool:
+    def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
 
-        Returns True and stops immediately if the shutdown sentinel (None) is
-        encountered (the sentinel is NOT placed into any buffer).
-        Returns False if the queue was drained to empty normally.
+        When the shutdown sentinel (None) is encountered it sets
+        ``_shutdown_signaled`` so the caller knows shutdown was requested
+        after draining any items that arrived before the sentinel.
         """
         while True:
             try:
                 item = self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                return False
+                return
             if item is None:
-                return True  # shutdown sentinel — signal to stop
+                self._shutdown_signaled = True
+                return  # sentinel consumed — all prior items already buffered
             lane = _normalize_lane(item.lane)
             self._lane_buffers[lane].append(item)
 
@@ -3974,6 +4004,59 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if buf:
                 return buf.popleft()
         return None
+
+    async def _acquire_next_request(self) -> MergeRequest | None:
+        """Return the next pickable request, blocking if nothing is available.
+
+        Drains _queue into lane buffers, then picks the highest-priority
+        non-halted item.  When nothing is pickable it waits on FIRST_COMPLETED
+        of (a) the persistent _pending_get future that will fire when a new
+        item arrives, and (b) the _resume_signal that fires when a lane is
+        un-halted.  Only the _resume_signal.wait() task is ever cancelled;
+        the queue.get() task (_pending_get) persists to avoid the lost-item
+        hazard of cancelling a pending get().
+
+        Returns None when all lane-buffer items have been returned and the
+        shutdown sentinel has been seen.
+        """
+        while True:
+            # Drain any newly arrived items into lane buffers.
+            # Sets _shutdown_signaled if the sentinel is encountered.
+            self._drain_queue_into_lanes()
+
+            req = self._pop_next_pickable()
+            if req is not None:
+                return req
+
+            # Lane buffers empty — check shutdown before blocking.
+            if self._shutdown_signaled:
+                return None
+
+            # Nothing pickable — start (or reuse) the persistent queue getter
+            # and wait for EITHER a new arrival OR a lane resume.
+            if self._pending_get is None or self._pending_get.done():
+                self._pending_get = asyncio.ensure_future(self._queue.get())
+
+            self._resume_signal.clear()
+            resume_task = asyncio.ensure_future(self._resume_signal.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    [self._pending_get, resume_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not resume_task.done():
+                    resume_task.cancel()
+
+            # If _pending_get finished, harvest its result into lane buffers.
+            if self._pending_get in done:
+                item = self._pending_get.result()
+                self._pending_get = None
+                if item is None:
+                    self._shutdown_signaled = True
+                else:
+                    self._lane_buffers[_normalize_lane(item.lane)].append(item)
+            # Loop to try _pop_next_pickable again (maybe the resume unblocked a lane).
 
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
@@ -4333,19 +4416,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
-                await self._wait_until_any_lane_runnable()  # blocks if all lanes halted
-                # Get next request: use pre-fetched item if available, else block.
+                # Get next request: use pre-fetched (speculative) item if available,
+                # otherwise acquire from the lane-priority pick system.
                 if prefetched is not None:
                     req = prefetched
                     prefetched = None
                 else:
-                    req = await self._queue.get()
+                    req = await self._acquire_next_request()
                     if req is None:
                         break  # shutdown sentinel
                     spec_base = None  # fresh dequeue resets speculation chain
-                    # Re-check halt after blocking on queue.get() — the halt
-                    # may have been triggered while we were waiting.
-                    await self._wait_until_any_lane_runnable()
 
                 self._inflight_req = req  # track for stop() race resolution
                 # Drop-on-detection: workflow soft-cancelled before worker
@@ -4666,12 +4746,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Non-blocking peek: if N+1 is already queued, grab it and
                     # merge it against N's commit so the Verifier can CAS it
                     # immediately after N succeeds.
+                    # Route through lane buffers so look-ahead prefers 'high'
+                    # and never speculatively picks from a halted lane.
                     await self._speculation_slot.wait()  # depth-1 cap
-                    try:
-                        next_req = self._queue.get_nowait()
-                        if next_req is None:
-                            # Shutdown sentinel — stop.
-                            break
+                    self._drain_queue_into_lanes()
+                    next_req = self._pop_next_pickable()
+                    if next_req is not None:
                         self._speculation_slot.clear()  # claim the slot
                         prefetched = next_req
                         spec_base = merge_commit  # N+1 will merge against N's commit
@@ -4679,8 +4759,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'Task {req.task_id}: speculative look-ahead for '
                             f'{next_req.task_id} (base={merge_commit[:8]})'
                         )
-                    except asyncio.QueueEmpty:
-                        spec_base = None  # no next item, no speculation
+                    elif self._shutdown_signaled:
+                        break  # shutdown sentinel and nothing left to speculate
+                    else:
+                        spec_base = None  # no pickable item, no speculation
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up

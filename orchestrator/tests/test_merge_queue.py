@@ -117,19 +117,26 @@ def _make_request(
     )
 
 
-def _gated_verify(gate: asyncio.Event, gated_task_id: str):
-    """Return an AsyncMock side_effect that blocks on *gate* for *gated_task_id*.
+def _gated_verify(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event | None = None,
+):
+    """Return a verify patch that blocks the FIRST call until gate_release is set.
 
-    For any other task the verify passes immediately.  Use this to hold a
-    merge pipeline mid-verify while enqueuing additional requests so pick-order
-    tests are deterministic.
+    *gate_entered* (optional): set when the first verify call starts, so the
+    test can await it before enqueuing additional requests.  Subsequent calls
+    (for other tasks after the gate task) pass immediately.
     """
-    async def _side_effect(worktree, *args, **kwargs):
-        task_id = Path(worktree).name if worktree else None
-        if task_id == gated_task_id:
-            await gate.wait()
+    _first_blocked = [False]
+
+    async def _side_effect(*args, **kwargs):
+        if not _first_blocked[0]:
+            _first_blocked[0] = True
+            if gate_entered is not None:
+                gate_entered.set()
+            await gate_release.wait()
         return MagicMock(passed=True, summary='')
-    return _side_effect
+    return AsyncMock(side_effect=_side_effect)
 
 
 def _mock_verify_pass():
@@ -16180,3 +16187,136 @@ class TestLanePickOrderHelpers:
         finally:
             asyncio.set_event_loop(None)
             loop.close()
+
+
+@pytest.mark.asyncio
+class TestLanePickIntegration:
+    """Steps 7-8: full merger loop pick-order and per-lane halt integration."""
+
+    async def test_high_lane_picked_after_current_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Behavior (a): HIGH task is processed before normal backlog after in-flight verify."""
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        wt_gate = await _make_branch_with_file(git_ops, 'ln-gate', 'gate.py', 'g=1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'ln-n1', 'n1.py', 'n1=1\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'ln-n2', 'n2.py', 'n2=1\n')
+        wt_high = await _make_branch_with_file(git_ops, 'ln-high', 'high.py', 'h=1\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_gate = _make_request('ln-gate', 'ln-gate', wt_gate, config, lane='normal')
+        req_n1 = _make_request('ln-n1', 'ln-n1', wt_n1, config, lane='normal')
+        req_n2 = _make_request('ln-n2', 'ln-n2', wt_n2, config, lane='normal')
+        req_high = _make_request('ln-high', 'ln-high', wt_high, config, lane='high')
+
+        verify_order: list[str] = []
+
+        async def _tracking_side_effect(*args, **kwargs):
+            return MagicMock(passed=True, summary='')
+
+        done_order: list[str] = []
+
+        async def _on_landed(task_id, base_sha, advanced_sha):
+            done_order.append(task_id)
+
+        worker._on_merge_landed = _on_landed
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            await queue.put(req_gate)
+
+            # Wait until the gate task's verify has started
+            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+
+            # Now enqueue the normal backlog + one high task
+            await queue.put(req_n1)
+            await queue.put(req_n2)
+            await queue.put(req_high)
+
+            # Give the merger a moment to see the new items
+            await asyncio.sleep(0.1)
+
+            # Release the gate
+            gate_release.set()
+
+            # Wait for high task to complete
+            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+
+        assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
+
+        # HIGH must appear before n1/n2 in done_order
+        assert 'ln-high' in done_order
+        high_pos = done_order.index('ln-high')
+        for normal_id in ('ln-n1', 'ln-n2'):
+            if normal_id in done_order:
+                assert done_order.index(normal_id) > high_pos, (
+                    f'{normal_id} appeared before ln-high in done_order: {done_order}'
+                )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_high_lane_flows_while_normal_halted(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Behavior (b): HIGH task lands while NORMAL lane is halted; un-halt resumes normal."""
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        wt_gate = await _make_branch_with_file(git_ops, 'lh-gate', 'gate.py', 'g=1\n')
+        wt_normal = await _make_branch_with_file(git_ops, 'lh-normal', 'norm.py', 'n=1\n')
+        wt_high = await _make_branch_with_file(git_ops, 'lh-high', 'high.py', 'h=1\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_gate = _make_request('lh-gate', 'lh-gate', wt_gate, config, lane='normal')
+        req_normal = _make_request('lh-normal', 'lh-normal', wt_normal, config, lane='normal')
+        req_high = _make_request('lh-high', 'lh-high', wt_high, config, lane='high')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            await queue.put(req_gate)
+
+            # Wait until gate task is in verify
+            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+
+            # Halt normal lane, enqueue normal task (must stay pending) and high task
+            worker.halt_lane('normal', 'red main')
+            await queue.put(req_normal)
+            await queue.put(req_high)
+            await asyncio.sleep(0.1)
+
+            # Release gate so the gate task's verify finishes
+            gate_release.set()
+
+            # HIGH task must complete even while normal lane is halted
+            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+            assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
+
+            # Normal task must still be pending (normal lane halted)
+            assert not req_normal.result.done(), (
+                'normal task resolved while normal lane was halted'
+            )
+
+            # Un-halt normal lane — normal task should now complete
+            worker.unhalt_lane('normal', 'red main resolved')
+            outcome_normal = await asyncio.wait_for(req_normal.result, timeout=30)
+            assert outcome_normal.status == 'done', f'normal task failed: {outcome_normal}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
