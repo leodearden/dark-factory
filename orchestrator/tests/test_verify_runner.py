@@ -1051,6 +1051,9 @@ class TestRunMergeVerifyOnWorktree:
 # Step-5: run_merge_verify_on_worktree defaults to real merge-path callables
 # ---------------------------------------------------------------------------
 
+# NOTE: The sections below are added by task δ (1696) and test RemoteRunner,
+# VerifyRunnerPool preference, and fail-safe fallback.
+
 
 @pytest.mark.asyncio
 class TestRunMergeVerifyOnWorktreeDefaults:
@@ -1090,3 +1093,28 @@ class TestRunMergeVerifyOnWorktreeDefaults:
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
         assert result is pass_result
+
+
+# ---------------------------------------------------------------------------
+# δ step-1: RunnerUnavailable — exception class + __all__ presence
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerUnavailable:
+    """RunnerUnavailable is an Exception subclass exported in verify_runner.__all__."""
+
+    def test_import_runner_unavailable(self):
+        from orchestrator.verify_runner import RunnerUnavailable  # noqa: F401
+
+    def test_is_exception_subclass(self):
+        from orchestrator.verify_runner import RunnerUnavailable
+        assert issubclass(RunnerUnavailable, Exception)
+
+    def test_constructible_with_message(self):
+        from orchestrator.verify_runner import RunnerUnavailable
+        exc = RunnerUnavailable("host down")
+        assert str(exc) == "host down"
+
+    def test_present_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        assert 'RunnerUnavailable' in vr_mod.__all__
