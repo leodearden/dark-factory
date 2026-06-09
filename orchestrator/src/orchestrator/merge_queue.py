@@ -322,6 +322,40 @@ def compose_fix_main_brief(
     return title, description
 
 
+MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS: int = 1
+"""Maximum number of auto-heal attempts allowed per sha-independent failure signature.
+
+A value of 1 means: attempt the first auto-heal, but if the same signature
+recurs afterwards (heal → re-break loop), hard-escalate instead of spawning
+another fix task.  Promotes to config if tuning is needed.
+"""
+
+
+class MainHealthAutoHealRegistry:
+    """Monotonic per-signature attempt counter for main-health auto-heal.
+
+    Keyed by sha-INDEPENDENT failure signatures (workflow._merge_outcome_signature),
+    so a recurrence at a new main SHA (after a fix advanced main) is detected and
+    the attempt cap trips correctly.
+
+    Thread safety: no synchronisation needed — the registry is owned by the merge
+    worker and accessed only from asyncio tasks in the same event loop.
+    """
+
+    def __init__(self) -> None:
+        self._attempts: dict[str, int] = {}
+
+    def attempts(self, sig: str) -> int:
+        """Return the number of auto-heal attempts recorded for *sig* (0 if none)."""
+        return self._attempts.get(sig, 0)
+
+    def record_attempt(self, sig: str) -> int:
+        """Increment the attempt counter for *sig* and return the new count."""
+        count = self._attempts.get(sig, 0) + 1
+        self._attempts[sig] = count
+        return count
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
@@ -3827,6 +3861,10 @@ class MergeWorker(_WipHaltMixin):
         # clear = no operator halt. MergeWorker has no verifier abort-poll loop,
         # so this is for API parity (operator_halt/unhalt_all_lanes reference it).
         self._operator_halt = asyncio.Event()
+        # Cross-workflow auto-heal attempt counter (shared via self.merge_worker
+        # on TaskWorkflow instances).  Lives on the worker so the counter persists
+        # across the heal→re-break cycle without any harness.py change.
+        self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
 
     # ------------------------------------------------------------------
     # Public API
@@ -4225,6 +4263,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
         # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
         self._operator_halt = asyncio.Event()
+        # Cross-workflow auto-heal attempt counter (mirrors MergeWorker; shared
+        # via self.merge_worker on TaskWorkflow instances).
+        self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
