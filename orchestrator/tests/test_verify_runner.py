@@ -1979,3 +1979,81 @@ class TestCaptureEnvFingerprint:
         ])
         fp = await capture_env_fingerprint(fake_run)
         assert dict(fp.verify_env) == {}
+
+
+# ---------------------------------------------------------------------------
+# ε step-5: compare_env_fingerprints → EnvParityVerdict
+# ---------------------------------------------------------------------------
+
+
+class TestCompareEnvFingerprints:
+    """compare_env_fingerprints(local, remote) -> EnvParityVerdict."""
+
+    def _fp(self, **kwargs):
+        from orchestrator.verify_runner import EnvFingerprint
+        base = dict(
+            toolchain='rustc 1.80.0\ncargo 1.80.0',
+            verify_env={'KEY': 'val'},
+            sccache_reachable=True,
+            extra_probes={'python_version': 'Python 3.11.9'},
+        )
+        base.update(kwargs)
+        return EnvFingerprint(**base)
+
+    def test_identical_fingerprints_is_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        fp = self._fp()
+        verdict = compare_env_fingerprints(fp, fp)
+        assert verdict.is_faithful is True
+        assert verdict.drift_dimensions == ()
+
+    def test_toolchain_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0\ncargo 1.80.0')
+        remote = self._fp(toolchain='rustc 1.79.0\ncargo 1.79.0')
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'toolchain' in verdict.drift_dimensions
+
+    def test_verify_env_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(verify_env={'FOO': 'bar'})
+        remote = self._fp(verify_env={'FOO': 'baz'})
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'verify_env' in verdict.drift_dimensions
+
+    def test_sccache_reachable_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(sccache_reachable=True)
+        remote = self._fp(sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'sccache_reachable' in verdict.drift_dimensions
+
+    def test_extra_probes_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(extra_probes={'python_version': 'Python 3.11.9'})
+        remote = self._fp(extra_probes={'python_version': 'Python 3.12.0'})
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'extra_probes' in verdict.drift_dimensions
+
+    def test_multi_dimension_drift_all_listed(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0', sccache_reachable=True)
+        remote = self._fp(toolchain='rustc 1.79.0', sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'toolchain' in verdict.drift_dimensions
+        assert 'sccache_reachable' in verdict.drift_dimensions
+
+    def test_only_differing_dimensions_listed(self):
+        """Only the fields that differ appear in drift_dimensions."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0')
+        remote = self._fp(toolchain='rustc 1.79.0')
+        verdict = compare_env_fingerprints(local, remote)
+        assert 'verify_env' not in verdict.drift_dimensions
+        assert 'sccache_reachable' not in verdict.drift_dimensions
+        assert 'extra_probes' not in verdict.drift_dimensions
