@@ -314,8 +314,9 @@ class LocalRunner:
        keep intercepting (call-time resolution, not import-time binding).
     2. There is no verify_runner → merge_queue module-level import cycle.
 
-    ``run_merge_verify`` is intentionally minimal in step-2 — full bundle logic
-    (scoped-first short-circuit, unscoped gate, sentinel encoding) lands in step-4.
+    ``run_merge_verify`` runs the combined scoped + unscoped bundle: scoped first,
+    unscoped only if scoped passed (short-circuit), unscoped-gate-broken outcomes
+    encoded as a sentinel-category VerifyResult so callers can branch byte-identically.
     """
 
     name: str = 'local'

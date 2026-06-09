@@ -557,21 +557,10 @@ async def _run_post_merge_verify(
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
 
-        # Persistent ENOSPC after the prune-and-retry → transient infra.
-        if _verify_hit_enospc(verify):
-            detail = verify.failure_report()
-            reason = (
-                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
-                f'still reports no space left on device after pruning '
-                f'stale merge worktrees and retrying. {verify.summary}'
-            )
-            if detail:
-                reason = f'{reason}\n\n{detail}'
-            return MergeOutcome('blocked', reason=reason)
-
-        # Unscoped-gate sentinel: step-12 adds full byte-identical handling.
-        # For now, detect the sentinel and fall through to the generic path
-        # (the step-11 tests will drive the exact routing in step-12).
+        # Unscoped-gate sentinel: check this BEFORE the ENOSPC guard because the
+        # sentinel's type_output field carries type-check output (gate.detail) that
+        # could contain disk-full markers and be misclassified as transient-infra.
+        # Returns blocked directly without running the ENOSPC retry or main-health probe.
         if is_unscoped_gate_failure(verify):
             failing = ', '.join(unscoped_gate_failing_subprojects(verify))
             if verify.category == UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
@@ -595,6 +584,18 @@ async def _run_post_merge_verify(
                 detail = verify.type_output or ''
                 if detail:
                     reason = f'{reason}\n\n{detail}'
+            return MergeOutcome('blocked', reason=reason)
+
+        # Persistent ENOSPC after the prune-and-retry → transient infra.
+        if _verify_hit_enospc(verify):
+            detail = verify.failure_report()
+            reason = (
+                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+                f'still reports no space left on device after pruning '
+                f'stale merge worktrees and retrying. {verify.summary}'
+            )
+            if detail:
+                reason = f'{reason}\n\n{detail}'
             return MergeOutcome('blocked', reason=reason)
 
         # Main-health probe: classify whether this failure is pre-existing on
