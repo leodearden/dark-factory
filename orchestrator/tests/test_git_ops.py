@@ -4583,3 +4583,52 @@ class TestPersistentMergeWorktree:
         assert not stray_txt.exists(), (
             'stray.txt must be cleaned by git clean -xfd'
         )
+
+    # ------------------------------------------------------------------
+    # Step 7 — cleanup_merge_worktree is a no-op on the fixed path
+    # ------------------------------------------------------------------
+
+    async def test_cleanup_merge_worktree_noop_on_persistent_path(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree is a no-op on _merge-verify (warm survives).
+
+        Step 7 (RED): cleanup removes the fixed path today — must fail before
+        the no-op guard is added in step-8.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-cleanup-1', 'warm_cleanup.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Call cleanup on the fixed path — must be a no-op
+        await git_ops.cleanup_merge_worktree(warm_path)
+
+        # Warm worktree still registered and still on disk
+        assert warm_path.exists(), 'warm worktree must survive cleanup_merge_worktree'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            'warm worktree must still be registered after cleanup call'
+        )
+
+    async def test_cleanup_merge_worktree_removes_ephemeral(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree DOES remove an ephemeral _merge-<uuid> worktree.
+
+        Step 7 (RED, control): the ephemeral path must still be removed.
+        """
+        from orchestrator.git_ops import _create_merge_worktree  # noqa: F401
+        # Use the internal helper to create a fresh ephemeral merge worktree
+        merge_wt, _ = await git_ops._create_merge_worktree()
+        assert merge_wt.exists()
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # Ephemeral worktree is gone
+        assert not merge_wt.exists(), (
+            'ephemeral _merge-<uuid> must be removed by cleanup_merge_worktree'
+        )
+        assert not await git_ops._is_registered_worktree(merge_wt), (
+            'ephemeral _merge-<uuid> must be unregistered after cleanup'
+        )
