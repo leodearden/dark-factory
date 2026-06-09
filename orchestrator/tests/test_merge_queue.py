@@ -4321,6 +4321,228 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── BUG #1687: pre_rebased N+2 + chain_invalidated must verify on tree change ─
+
+    async def test_chain_invalidated_pre_rebased_n2_verify_runs(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """RED: pre_rebased N+2 chain_invalidated re-merge must invoke verify.
+
+        Same scenario as test_speculative_follower_chain_invalidated_after_pickup_rebase
+        except N+2 is submitted with pre_rebased=True.  On chain_invalidated,
+        _remerge receives force_verify=False; the non-force skip computation
+        (req.pre_rebased AND pre_merge_sha==actual_main) is a tautology when
+        _remerge always merges against current main → skip_verify=True →
+        _verify_and_advance bypasses _run_post_merge_verify entirely.
+
+        The chain_invalidated re-merge against an advanced main produces a NEW tree
+        (M2 now includes N's and N+1's commits) that was never verified.  Fix #1687
+        keys the skip on the actual merged TREE SHA: tree changed vs. the original
+        merge → skip_verify forced False.
+
+        Assertion (A): run_scoped_verification is called exactly ONCE on N+2's
+        re-merged tree, and that tree contains file_pr_n.py, file_pr_n1.py AND
+        file_pr_n2.py — proving _run_post_merge_verify ran before advance_main.
+        All outcomes 'done'; all files land on main.
+
+        RED on current code: skip_verify=True → verify never called → verify count
+        for N+2 is 0 → 'verified exactly once' assertion fails.
+        """
+        db_path = tmp_path / 'events_1687a.db'
+        event_store = EventStore(db_path=db_path, run_id='test-1687a')
+
+        wt_n = await _make_branch_with_file(git_ops, 'pr-n', 'file_pr_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'pr-n1', 'file_pr_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'pr-n2', 'file_pr_n2.py', 'n2 = 3\n')
+
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+        verify_worktrees: list[frozenset] = []
+
+        async def tracking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            files = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
+            verify_worktrees.append(files)
+            if 'file_pr_n.py' in files and 'file_pr_n1.py' not in files and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
+            req_n = _make_request('pr-n', 'pr-n', wt_n, config)
+            req_n1 = _make_request('pr-n1', 'pr-n1', wt_n1, config)
+            req_n2 = _make_request('pr-n2', 'pr-n2', wt_n2, config, pre_rebased=True)
+
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            queue.put_nowait(req_n1)
+            queue.put_nowait(req_n2)
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail(
+                    'N+1 and N+2 did not both appear in the verifier queue within '
+                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                )
+
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+        assert outcome_n2.status == 'done', f'N+2: {outcome_n2}'
+
+        for fname in ('file_pr_n.py', 'file_pr_n1.py', 'file_pr_n2.py'):
+            _, out, _ = await _run(
+                ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
+            )
+            assert out.strip(), f'{fname} not found on main'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
+        assert 'main_advanced' in discard_reasons, (
+            f'Expected speculative_discard(reason=main_advanced) for N+1; '
+            f'got discard reasons: {discard_reasons}'
+        )
+        assert 'chain_invalidated' in discard_reasons, (
+            f'Expected speculative_discard(reason=chain_invalidated) for N+2; '
+            f'got discard reasons: {discard_reasons}'
+        )
+
+        # (A) N+2 re-verify must run exactly once and see all three files.
+        #     RED on base: skip_verify=True → verify never called → count == 0.
+        n2_verify_calls = [fs for fs in verify_worktrees if 'file_pr_n2.py' in fs]
+        assert len(n2_verify_calls) == 1, (
+            f'N+2 (pre_rebased=True, chain_invalidated) must be verified exactly '
+            f'once after re-merge against advanced main (tree changed: now contains '
+            f"N's and N+1's commits); got {len(n2_verify_calls)} verify call(s) with "
+            f'file_pr_n2.py.  verify_worktrees={verify_worktrees!r}'
+        )
+        assert 'file_pr_n.py' in n2_verify_calls[0], (
+            f"N+2 re-verify must see N's file (fresh M2 tree includes N's commit); "
+            f'got files: {n2_verify_calls[0]}'
+        )
+        assert 'file_pr_n1.py' in n2_verify_calls[0], (
+            f"N+2 re-verify must see N+1's file (fresh M2 tree includes N+1's commit); "
+            f'got files: {n2_verify_calls[0]}'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    async def test_chain_invalidated_pre_rebased_n2_red_tree_blocked(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """RED: pre_rebased N+2 with a tree-changing chain_invalidated re-merge must
+        be blocked when its re-verified tree fails verify.
+
+        Companion to test_chain_invalidated_pre_rebased_n2_verify_runs.  The
+        blocking_verify mock returns passed=False whenever N+2's file is present,
+        simulating a red tree (e.g. tsc-RED StatusBar.tsx) landing via the skip path.
+        With the bug: skip_verify=True → verify never called → N+2 advances 'done'.
+        With the fix: skip_verify=False → _run_post_merge_verify runs → blocked.
+
+        Assertion (B):
+          outcome_n2.status == 'blocked'.
+          file_prb_n2.py is NOT on main (red tree did not advance).
+          file_prb_n.py and file_prb_n1.py ARE on main (unaffected).
+
+        RED on current code: skip_verify=True → verify skipped → N+2 advances 'done'
+        → file_prb_n2.py IS on main → status == 'blocked' assertion fails.
+        """
+        db_path = tmp_path / 'events_1687b.db'
+        event_store = EventStore(db_path=db_path, run_id='test-1687b')
+
+        wt_n = await _make_branch_with_file(git_ops, 'prb-n', 'file_prb_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'prb-n1', 'file_prb_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'prb-n2', 'file_prb_n2.py', 'n2 = 3\n')
+
+        n_verify_entered = asyncio.Event()
+        gate_open = asyncio.Event()
+
+        async def blocking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            files = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
+            if 'file_prb_n.py' in files and 'file_prb_n1.py' not in files and not gate_open.is_set():
+                n_verify_entered.set()
+                await gate_open.wait()
+            if 'file_prb_n2.py' in files:
+                return MagicMock(passed=False, summary='tsc RED in N+2 tree', timed_out=False)
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=blocking_verify):
+            req_n = _make_request('prb-n', 'prb-n', wt_n, config)
+            req_n1 = _make_request('prb-n1', 'prb-n1', wt_n1, config)
+            req_n2 = _make_request('prb-n2', 'prb-n2', wt_n2, config, pre_rebased=True)
+
+            await queue.put(req_n)
+            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+
+            queue.put_nowait(req_n1)
+            queue.put_nowait(req_n2)
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if worker._verifier_queue.qsize() >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail(
+                    'N+1 and N+2 did not both appear in the verifier queue within '
+                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                )
+
+            gate_open.set()
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+
+        # (B) N+2 must be blocked — the re-verified tree failed verify.
+        #     RED on current code: skip_verify=True → N+2 advances 'done'.
+        assert outcome_n2.status == 'blocked', (
+            f'N+2 (pre_rebased=True, chain_invalidated, tree changed) must be '
+            f'blocked when the re-merged tree fails verify; '
+            f'got status={outcome_n2.status!r}'
+        )
+
+        for fname in ('file_prb_n.py', 'file_prb_n1.py'):
+            _, out_b, _ = await _run(
+                ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
+            )
+            assert out_b.strip(), f'{fname} must be on main'
+
+        # N+2's red tree must NOT be on main.
+        rc_n2, _, _ = await _run(
+            ['git', 'show', f'main:file_prb_n2.py'], cwd=git_ops.project_root,
+        )
+        assert rc_n2 != 0, (
+            'file_prb_n2.py must NOT be on main — blocked N+2 must not advance '
+            'the red tree; this is the core safety invariant of task #1687.'
+        )
+
+        await worker.stop()
+        await worker_task
+
     # ── Guard: train path exempt from both mechanisms (task 1646) ────────────
 
     async def test_train_exempt_from_cap_and_pickup_rebase(
