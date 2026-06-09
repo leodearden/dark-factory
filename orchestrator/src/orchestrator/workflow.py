@@ -4461,7 +4461,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             if fp:
                 esc.dedupe_fingerprint = fp
-                submit_or_dedupe(
+                submit_result = submit_or_dedupe(
                     self.escalation_queue,
                     esc,
                     DedupeConfig(
@@ -4471,9 +4471,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         key_fn=content_fingerprint_key,
                     ),
                 )
+                # Derive esc_id from the SURVIVING (parent) escalation.
+                # submit_or_dedupe returns {'id': parent_id, 'status': 'dedup_skipped',
+                # 'parent_id': parent_id, 'child_id': esc.id} when the child folds
+                # into a pending parent — only the parent resolves, so the halt owner
+                # and the fix-task correlation key must reference the parent.
+                # For a fresh (non-dedup) submit the dict has no 'parent_id', so we
+                # fall back to 'id', then to esc.id as the final safety net.
+                submit_result_dict: dict = submit_result if isinstance(submit_result, dict) else {}
+                esc_id = (
+                    submit_result_dict.get('parent_id')
+                    or submit_result_dict.get('id')
+                    or esc.id
+                )
             else:
                 self.escalation_queue.submit(esc)
-            esc_id = esc.id
+                esc_id = esc.id
 
         # Branch (idempotency): lane already halted → adopt the in-flight auto-heal
         if self.merge_worker is not None and self.merge_worker.is_lane_halted('normal'):
