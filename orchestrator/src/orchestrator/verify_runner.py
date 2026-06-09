@@ -621,10 +621,19 @@ class RemoteRunner:
         ref = f'refs/merge-verify/{request_id}'
 
         # Step 1: push the merge sha to the remote
-        _push_rc, _push_out, _push_err = await self._run(
-            ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
-            cwd=self._cwd,
-        )
+        try:
+            push_rc, _push_out, push_stderr = await self._run(
+                ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
+                cwd=self._cwd,
+            )
+        except OSError as exc:
+            raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+
+        if push_rc != 0:
+            raise RunnerUnavailable(
+                f'git push {self._git_remote} {merge_sha}:{ref} failed'
+                f' (rc={push_rc}): {push_stderr}'
+            )
 
         # Step 2: build and issue the ssh command
         argv = [
@@ -636,12 +645,27 @@ class RemoteRunner:
             argv += ['--config', self._config_path]
         remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
-        _ssh_rc, ssh_stdout, _ssh_err = await self._run(
-            ['ssh', self._ssh_host, remote_cmd],
-        )
+        try:
+            ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                ['ssh', self._ssh_host, remote_cmd],
+            )
+        except OSError as exc:
+            raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
+
+        if ssh_rc != 0:
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
+            )
 
         # Step 3: parse the host's stdout
-        return result_from_json(ssh_stdout)
+        # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
+        # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
+        try:
+            return result_from_json(ssh_stdout)
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+            raise RunnerUnavailable(
+                f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
