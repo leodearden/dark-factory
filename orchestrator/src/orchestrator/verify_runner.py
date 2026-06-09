@@ -758,6 +758,13 @@ class VerifyRunnerPool:
         ``attempt`` is 0 for the first dispatch and incremented for each
         ENOSPC-retry re-dispatch.  Included in the event data so consumers
         can deduplicate multiple events for the same logical merge-verify.
+
+        Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
+        RunnerUnavailable, dispatch falls back to the local runner (if
+        distinct), logging exactly one WARNING.  dispatch() never propagates
+        RunnerUnavailable to its caller when a local fallback exists.  A
+        returned VerifyResult (any passed/timed_out value) is passed through
+        without fallback (PRD §A Invariant 5).
         """
         import logging
 
@@ -767,8 +774,22 @@ class VerifyRunnerPool:
 
         selected = self._select_runner()
         t0 = time.monotonic()
-        result = await selected.run_merge_verify(merge_sha, spec)
-        actual_runner = selected
+        try:
+            result = await selected.run_merge_verify(merge_sha, spec)
+            actual_runner = selected
+        except RunnerUnavailable:
+            # Fall back to the local runner if one exists and is not the
+            # runner that just failed.  Log exactly one WARNING; no escalation.
+            if self._local is not None and self._local is not selected:
+                _log.warning(
+                    'runner %r unavailable for %s — falling back to local',
+                    selected.name,
+                    merge_sha,
+                )
+                result = await self._local.run_merge_verify(merge_sha, spec)
+                actual_runner = self._local
+            else:
+                raise
         duration_ms = round((time.monotonic() - t0) * 1000)
 
         if self._event_store is not None:
