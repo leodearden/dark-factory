@@ -1118,3 +1118,96 @@ class TestRunnerUnavailable:
     def test_present_in_dunder_all(self):
         import orchestrator.verify_runner as vr_mod
         assert 'RunnerUnavailable' in vr_mod.__all__
+
+
+# ---------------------------------------------------------------------------
+# δ step-3: RemoteRunner construction + health()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerConstruction:
+    """RemoteRunner construction, VerifyRunner conformance, and health() probe."""
+
+    def _make_fake_run(self, responses):
+        """Return an async callable that returns successive (rc, stdout, stderr) tuples.
+
+        ``responses`` is a list of (rc, stdout, stderr) tuples consumed in order.
+        """
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv)
+            return responses.pop(0)
+
+        fake_run.calls = calls
+        return fake_run
+
+    async def test_name_attribute(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        assert runner.name == 'laptop'
+
+    async def test_isinstance_verify_runner_protocol(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        assert isinstance(runner, VerifyRunner)
+
+    async def test_health_true_when_ssh_rc_zero(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([(0, '', '')])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        result = await runner.health()
+        assert result is True
+        # health issues `ssh <host> true`
+        assert fake_run.calls == [['ssh', 'laptop.local', 'true']]
+
+    async def test_health_false_when_ssh_rc_nonzero(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([(1, '', 'Connection refused')])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        result = await runner.health()
+        assert result is False
+
+    async def test_health_false_when_run_raises(self):
+        from orchestrator.verify_runner import RemoteRunner
+
+        async def raising_run(argv, *, cwd=None):
+            raise OSError("ssh not found")
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=raising_run,
+        )
+        # health() must never raise
+        result = await runner.health()
+        assert result is False
