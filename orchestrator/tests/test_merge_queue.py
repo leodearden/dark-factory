@@ -16755,3 +16755,117 @@ class TestDoTrainMergeTrainScope:
         # Existing keys must still be present (additive, not replacing)
         assert 'member_count' in payload, 'existing member_count key must not be removed'
         assert 'base_sha' in payload, 'existing base_sha key must not be removed'
+
+# ---------------------------------------------------------------------------
+# TestRunPostMergeVerifyRouting — step-9/step-11: pool routing + byte-identical failures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyRouting:
+    """_run_post_merge_verify routes through VerifyRunnerPool and stays byte-identical."""
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-routing-test'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        return req
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'events.db'
+        return EventStore(db_path=db, run_id='test-routing')
+
+    async def test_pass_path_returns_none_and_emits_merge_verify_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """PASS path: returns None and emits one merge_verify event with runner='local'."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        event_store = self._make_event_store(tmp_path)
+
+        passed_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=event_store,
+                merge_sha='sha-abc123',
+            )
+
+        assert result is None, f'expected None on pass, got {result!r}'
+
+        import sqlite3
+        conn = sqlite3.connect(str(tmp_path / 'events.db'))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_verify'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'expected 1 merge_verify event, got {len(rows)}'
+        import json as _json
+        data = _json.loads(rows[0][0])
+        assert data.get('runner') == 'local', f'runner must be "local"; got {data!r}'
+        assert data.get('merge_sha') == 'sha-abc123', f'merge_sha must be forwarded; got {data!r}'
+        assert data.get('passed') is True, f'passed must be True; got {data!r}'
+
+    async def test_existing_patch_point_still_intercepts_after_routing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The existing patch('orchestrator.merge_queue.run_scoped_verification') intercepts.
+
+        Pins that the LocalRunner resolves run_scoped_verification through the
+        merge_queue module namespace at call time (not at import time), so test
+        patches applied BEFORE _run_post_merge_verify is called keep intercepting.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        intercepted: list[dict] = []
+
+        async def capturing_verify(*args, **kwargs):
+            intercepted.append(kwargs)
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        clean_gate = MagicMock(broken=False, failing_subprojects=[], timed_out_subprojects=[])
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=capturing_verify),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
+        ):
+            await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='abc',
+            )
+
+        assert intercepted, 'run_scoped_verification was not intercepted by patch'

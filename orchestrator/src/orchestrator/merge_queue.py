@@ -36,6 +36,14 @@ from orchestrator.verify import (
     run_verification,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_runner import (
+    LocalRunner,
+    VerifyRunnerPool,
+    build_merge_verify_spec,
+    is_unscoped_gate_failure,
+    unscoped_gate_failing_subprojects,
+    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -474,6 +482,7 @@ async def _run_post_merge_verify(
     max_timeouts: int,
     max_enospc: int,
     event_store: EventStore | None = None,
+    merge_sha: str = '',
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -497,6 +506,25 @@ async def _run_post_merge_verify(
     if disk_reason is not None:
         await git_ops.cleanup_merge_worktree(merge_wt)
         return MergeOutcome('blocked', reason=disk_reason, verify_skipped=True)
+
+    # Build the spec (carried for forward-compat with γ/δ remote runners;
+    # the LocalRunner does not use it to drive execution).
+    spec = build_merge_verify_spec(req.config, req.module_configs, req.task_files)
+
+    # Construct a per-call pool with a single LocalRunner.  The verify callables
+    # are the merge_queue module globals resolved at call time so that existing
+    # test patches on 'orchestrator.merge_queue.run_scoped_verification' and
+    # '_run_unscoped_typechecks' keep intercepting after the routing change.
+    pool = VerifyRunnerPool(
+        [LocalRunner(
+            merge_wt, req.config, req.module_configs, req.task_files,
+            run_scoped=run_scoped_verification,
+            run_unscoped=_run_unscoped_typechecks,
+        )],
+        event_store=event_store,
+        task_id=req.task_id,
+    )
+
     # max_retries=0: post-merge verify hangs are usually deterministic
     # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
     # is_merge_verify=True: merge worktrees are freshly created per
@@ -505,18 +533,14 @@ async def _run_post_merge_verify(
     # classifying them as warm.  The per-command cold timeout used here
     # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
     # if set, falling back to `verify_cold_command_timeout_secs` then warm.
-    verify = await run_scoped_verification(
-        merge_wt, req.config, req.module_configs,
-        task_files=req.task_files,
-        max_retries=0,
-        is_merge_verify=True,
-        force_workspace=req.config.merge_verify_workspace,
-        role='merge',
-    )
+    verify = await pool.dispatch(merge_sha, spec)
+
     # Transient-infra (disk pressure) retry: an ENOSPC failure is
     # often a self-healing host condition.  Prune stale _merge-*
     # worktrees (never task worktrees) and retry the verify once in
     # the same merge_wt before escalating.
+    # ENOSPC always comes from the scoped phase (before the unscoped gate
+    # runs), so the sentinel check is not needed here.
     if not verify.passed and _verify_hit_enospc(verify):
         prior_enospc = enospc_retries.get(req.task_id, 0)
         if prior_enospc < max_enospc:
@@ -527,16 +551,11 @@ async def _run_post_merge_verify(
                 'stale merge worktree(s), retrying verify once',
                 req.task_id, len(pruned),
             )
-            verify = await run_scoped_verification(
-                merge_wt, req.config, req.module_configs,
-                task_files=req.task_files,
-                max_retries=0,
-                is_merge_verify=True,
-                force_workspace=req.config.merge_verify_workspace,
-                role='merge',
-            )
+            verify = await pool.dispatch(merge_sha, spec)
+
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
+
         # Persistent ENOSPC after the prune-and-retry → transient infra.
         if _verify_hit_enospc(verify):
             detail = verify.failure_report()
@@ -548,6 +567,35 @@ async def _run_post_merge_verify(
             if detail:
                 reason = f'{reason}\n\n{detail}'
             return MergeOutcome('blocked', reason=reason)
+
+        # Unscoped-gate sentinel: step-12 adds full byte-identical handling.
+        # For now, detect the sentinel and fall through to the generic path
+        # (the step-11 tests will drive the exact routing in step-12).
+        if is_unscoped_gate_failure(verify):
+            failing = ', '.join(unscoped_gate_failing_subprojects(verify))
+            if verify.category == UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
+                reason = (
+                    f'Post-merge verification failed: unscoped type-check timed out '
+                    f'for {failing}.'
+                )
+                new_count = timeouts.get(req.task_id, 0) + 1
+                timeouts[req.task_id] = new_count
+                if new_count >= max_timeouts:
+                    logger.warning(
+                        'Task %s: post-merge unscoped type-check timed out %d times in a '
+                        'row — next submission will be abandoned',
+                        req.task_id, new_count,
+                    )
+            else:
+                reason = (
+                    f'Post-merge verification failed: unscoped type-check failed '
+                    f'for {failing}.'
+                )
+                detail = verify.type_output or ''
+                if detail:
+                    reason = f'{reason}\n\n{detail}'
+            return MergeOutcome('blocked', reason=reason)
+
         # Main-health probe: classify whether this failure is pre-existing on
         # bare main HEAD rather than introduced by this merge.  Inserted after
         # the ENOSPC early-return (ENOSPC is always task-side infra) and before
@@ -581,38 +629,6 @@ async def _run_post_merge_verify(
             failure_category=verify.category,
             failure_cause_hint=verify.cause_hint,
         )
-
-    # Pre-advance, fail-closed unscoped type-check gate.
-    # Runs ONLY type_check_command unscoped against the already-created merge_wt
-    # (before advance_main).  No-op when no module declares a type_check_command.
-    gate = await _run_unscoped_typechecks(
-        merge_wt, req.config, req.module_configs,
-        block_on_timeout=True, task_id=req.task_id,
-    )
-    if gate.broken:
-        await git_ops.cleanup_merge_worktree(merge_wt)
-        failing = ', '.join(gate.failing_subprojects)
-        if gate.timed_out_subprojects:
-            reason = (
-                f'Post-merge verification failed: unscoped type-check timed out '
-                f'for {failing}.'
-            )
-            new_count = timeouts.get(req.task_id, 0) + 1
-            timeouts[req.task_id] = new_count
-            if new_count >= max_timeouts:
-                logger.warning(
-                    'Task %s: post-merge unscoped type-check timed out %d times in a '
-                    'row — next submission will be abandoned',
-                    req.task_id, new_count,
-                )
-        else:
-            reason = (
-                f'Post-merge verification failed: unscoped type-check failed '
-                f'for {failing}.'
-            )
-            if gate.detail:
-                reason = f'{reason}\n\n{gate.detail}'
-        return MergeOutcome('blocked', reason=reason)
 
     return None
 
