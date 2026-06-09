@@ -2494,3 +2494,615 @@ class TestRenderParityReport:
         lines = text.splitlines()
         assert sum(1 for line in lines if 'abc123' in line) == 1
         assert sum(1 for line in lines if 'def456' in line) == 1
+
+
+# ---------------------------------------------------------------------------
+# ι step-1: VerifyRunnerPool quarantine — pool-level runner quarantine
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolQuarantine:
+    """VerifyRunnerPool: quarantine(name) drops a runner from eligible dispatch."""
+
+    def _make_fake_runner(self, name, result=None):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+        fake.run_merge_verify = AsyncMock(return_value=result or _make_pass_result())
+        return fake
+
+    async def test_quarantine_sets_is_quarantined_true(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_is_quarantined_false_for_non_quarantined(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_dispatch_routes_to_local_when_remote_quarantined(self):
+        """After quarantine('laptop'), dispatch runs local, not laptop."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result(summary='local result')
+        local_fake = self._make_fake_runner('local', local_result)
+        laptop_fake = self._make_fake_runner('laptop', _make_pass_result(summary='laptop result'))
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        result = await pool.dispatch('sha1', _make_spec())
+        assert result is local_result
+        local_fake.run_merge_verify.assert_awaited_once()
+        laptop_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_eligible_remote_returns_none_when_quarantined(self):
+        """eligible_remote() returns None when the remote is quarantined."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        assert pool.eligible_remote() is None
+
+    async def test_eligible_remote_returns_runner_after_clear_quarantine(self):
+        """eligible_remote() returns the runner after clear_quarantine."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.clear_quarantine('laptop')
+        assert pool.eligible_remote() is laptop_fake
+
+    async def test_local_runner_property_returns_is_local_runner(self):
+        """pool.local_runner returns the runner with is_local=True."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        assert pool.local_runner is local_fake
+
+    async def test_quarantine_is_idempotent(self):
+        """Quarantining the same runner twice doesn't cause errors."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.quarantine('laptop')
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_clear_quarantine_removes_quarantine(self):
+        """clear_quarantine('laptop') makes is_quarantined('laptop') False."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.clear_quarantine('laptop')
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_dispatch_routes_to_local_when_remote_first_and_quarantined(self):
+        """[remote, local] ordering + quarantined remote → dispatch uses local (not runners[0])."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result(summary='local result')
+        local_fake = self._make_fake_runner('local', local_result)
+        remote_fake = self._make_fake_runner('remote')  # is_local=False (name != 'local')
+        # Adversarial ordering: remote is at index 0; old fallback would return runners[0] = remote.
+        pool = VerifyRunnerPool([remote_fake, local_fake])
+        pool.quarantine('remote')
+        result = await pool.dispatch('sha1', _make_spec())
+        assert result is local_result
+        local_fake.run_merge_verify.assert_awaited_once()
+        remote_fake.run_merge_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# ι step-3: DriftDetector agree path
+# ---------------------------------------------------------------------------
+
+
+def _make_drift_pool(local_result=None, remote_result=None):
+    """Return a VerifyRunnerPool with injected fake runners."""
+    from orchestrator.verify_runner import VerifyRunnerPool
+    local_fake = MagicMock(spec=VerifyRunner)
+    local_fake.name = 'local'
+    local_fake.is_local = True
+    local_fake.run_merge_verify = AsyncMock(return_value=local_result or _make_pass_result())
+    remote_fake = MagicMock(spec=VerifyRunner)
+    remote_fake.name = 'laptop'
+    remote_fake.is_local = False
+    remote_fake.run_merge_verify = AsyncMock(return_value=remote_result or _make_pass_result())
+    pool = VerifyRunnerPool([local_fake, remote_fake])
+    return pool, local_fake, remote_fake
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorAgree:
+    """DriftDetector.check(): agree path — both pass or both fail → AGREE + event."""
+
+    async def test_both_pass_returns_agree_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        event_store = MagicMock()
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue, task_id='t')
+        result = await detector.check('abc123', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+
+    async def test_both_fail_returns_agree_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_fail_result()
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock(), task_id='t')
+        result = await detector.check('abc123', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+
+    async def test_agree_result_carries_local_remote_passed(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock())
+        result = await detector.check('sha1', _make_spec())
+        assert result.local_passed is True
+        assert result.remote_passed is True
+
+    async def test_agree_emits_exactly_one_verdict_parity_ok_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, task_id='t')
+        await detector.check('mysha', _make_spec())
+        assert event_store.emit.call_count == 1
+        call_args = event_store.emit.call_args
+        assert call_args[0][0] == EventType.verdict_parity_ok
+
+    async def test_agree_event_data_contains_merge_sha(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('mysha', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['merge_sha'] == 'mysha'
+
+    async def test_agree_event_data_contains_runner_names(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['local_runner'] == 'local'
+        assert data['remote_runner'] == 'laptop'
+
+    async def test_agree_event_data_contains_agreed_passed(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['passed'] is True
+
+    async def test_both_fail_agree_event_data_passed_false(self):
+        """Both FAIL agree path: event data['passed'] is False."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_fail_result()
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha_both_fail', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['passed'] is False
+
+    async def test_agree_submits_no_escalation(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_agree_does_not_quarantine_remote(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, remote_fake = _make_drift_pool()
+        detector = DriftDetector(pool)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is False
+
+
+# ---------------------------------------------------------------------------
+# ι step-5: DriftDetector diverge path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorDivergence:
+    """DriftDetector.check(): diverge path — local FAIL / remote PASS → DIVERGE + escalation + quarantine."""
+
+    async def test_diverge_returns_diverge_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue, task_id='t')
+        result = await detector.check('divergesha', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+
+    async def test_diverge_submits_escalation(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        escalation_queue.submit.assert_called_once()
+
+    async def test_diverge_escalation_task_id_is_sentinel(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.task_id == '__drift__'
+
+    async def test_diverge_escalation_level_1_severity_blocking(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+
+    async def test_diverge_escalation_category_and_role(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.category == 'verify_drift_divergence'
+        assert esc.agent_role == 'orchestrator-drift-detector'
+
+    async def test_diverge_escalation_summary_mentions_sha(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('mydivergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert 'mydivergesha' in esc.summary
+
+    async def test_diverge_quarantines_remote(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_diverge_emits_no_verdict_parity_ok_event(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        event_store.emit.assert_not_called()
+
+    async def test_diverge_local_pass_remote_fail_returns_diverge(self):
+        """Local PASS / remote FAIL also yields DIVERGE + quarantine + escalation."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_fail_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-2')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        result = await detector.check('sha_local_pass', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert pool.is_quarantined('laptop') is True
+        escalation_queue.submit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ι step-7: DriftDetector dedup — has_open_l1 guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorDedup:
+    """DriftDetector dedup: has_open_l1('__drift__') guard prevents double submission."""
+
+    def _make_diverge_pool(self):
+        """Pool where local fails, remote passes (the load-bearing divergence case)."""
+        pool, local_fake, remote_fake = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        return pool, local_fake, remote_fake
+
+    async def test_dedup_skips_submit_when_open_l1_exists(self):
+        """has_open_l1 True → submit NOT called; quarantine still happens."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_dedup_still_quarantines_when_open_l1_exists(self):
+        """Even when deduped, the remote runner must be quarantined."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_dedup_still_returns_diverge_when_open_l1_exists(self):
+        """Return DIVERGE regardless of dedup state."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+
+    async def test_no_dedup_submits_when_no_open_l1(self):
+        """has_open_l1 False → submit called exactly once."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_called_once()
+
+    async def test_has_open_l1_called_with_drift_sentinel(self):
+        """has_open_l1 must be called with the _DRIFT_SENTINEL constant value."""
+        from orchestrator.verify_runner import _DRIFT_SENTINEL, DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.has_open_l1.assert_called_with(_DRIFT_SENTINEL)
+
+
+# ---------------------------------------------------------------------------
+# ι step-9: DriftDetector INCONCLUSIVE — Invariant 5 (transport ≠ divergence)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorInconclusive:
+    """DriftDetector: transport failure or no eligible remote → INCONCLUSIVE, no side-effects."""
+
+    async def test_runner_unavailable_returns_inconclusive(self):
+        """Remote RunnerUnavailable → INCONCLUSIVE (not DIVERGE)."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('host down'))
+        escalation_queue = MagicMock()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_runner_unavailable_submits_no_escalation(self):
+        """Transport failure must NOT raise a drift alarm."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('gone'))
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_runner_unavailable_emits_no_event(self):
+        """Transport failure must not emit verdict_parity_ok."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('gone'))
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        event_store.emit.assert_not_called()
+
+    async def test_runner_unavailable_does_not_quarantine_remote(self):
+        """A closed/flaky laptop must not quarantine itself via transport failure."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('flaky'))
+        detector = DriftDetector(pool)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_single_local_pool_returns_inconclusive(self):
+        """Pool with only local runner (no eligible remote) → INCONCLUSIVE."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([local_fake])
+        escalation_queue = MagicMock()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_single_local_pool_no_escalation(self):
+        """No eligible remote → no escalation."""
+        from orchestrator.verify_runner import DriftDetector, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([local_fake])
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_quarantined_remote_pool_returns_inconclusive(self):
+        """Pool with remote already quarantined → no eligible remote → INCONCLUSIVE."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool()
+        pool.quarantine('laptop')
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_local_runner_unavailable_returns_inconclusive(self):
+        """Local RunnerUnavailable → INCONCLUSIVE (symmetric with remote, no false alarm)."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, local_fake, _ = _make_drift_pool()
+        local_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('local down'))
+        escalation_queue = MagicMock()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_local_runner_unavailable_submits_no_escalation(self):
+        """Local transport failure must NOT raise a drift alarm."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, local_fake, _ = _make_drift_pool()
+        local_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('local gone'))
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_local_runner_unavailable_does_not_quarantine_remote(self):
+        """Local transport failure must not quarantine the remote runner."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, local_fake, _ = _make_drift_pool()
+        local_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('local flaky'))
+        detector = DriftDetector(pool)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is False
+
+
+# ---------------------------------------------------------------------------
+# ι step-11: DriftDetector cadence predicate — should_sample
+# ---------------------------------------------------------------------------
+
+
+class TestDriftDetectorCadence:
+    """DriftDetector.should_sample: every-Nth-land pure predicate (PRD §10 Open Q2)."""
+
+    def _make_detector(self, every_n_lands=20):
+        from orchestrator.verify_runner import DriftDetector, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        pool = VerifyRunnerPool([local_fake])
+        return DriftDetector(pool, every_n_lands=every_n_lands)
+
+    def test_samples_on_multiples_of_20(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(20) is True
+        assert detector.should_sample(40) is True
+        assert detector.should_sample(60) is True
+
+    def test_does_not_sample_on_non_multiples(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(0) is False
+        assert detector.should_sample(1) is False
+        assert detector.should_sample(19) is False
+        assert detector.should_sample(21) is False
+
+    def test_does_not_sample_on_zero(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(0) is False
+
+    def test_custom_every_n_lands_5(self):
+        detector = self._make_detector(every_n_lands=5)
+        assert detector.should_sample(5) is True
+        assert detector.should_sample(10) is True
+        assert detector.should_sample(15) is True
+        assert detector.should_sample(1) is False
+        assert detector.should_sample(4) is False
+        assert detector.should_sample(6) is False
+
+    def test_every_n_lands_zero_raises(self):
+        """DriftDetector(pool, every_n_lands=0) raises ValueError at construction time."""
+        with pytest.raises(ValueError, match='every_n_lands'):
+            self._make_detector(every_n_lands=0)
+
+    def test_every_n_lands_negative_raises(self):
+        """DriftDetector(pool, every_n_lands=-1) raises ValueError at construction time."""
+        with pytest.raises(ValueError, match='every_n_lands'):
+            self._make_detector(every_n_lands=-1)
+
+
+# ---------------------------------------------------------------------------
+# ι step-13: public-surface __all__ — ι additions present and importable
+# ---------------------------------------------------------------------------
+
+
+class TestDriftDetectorPublicSurface:
+    """All ι-added public names are present in __all__ and importable."""
+
+    def test_all_new_iota_names_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        expected = {'DriftDetector', 'DriftVerdict', 'DriftCheckResult'}
+        missing = expected - set(vr_mod.__all__)
+        assert not missing, f"Missing from __all__: {sorted(missing)}"
+        for name in expected:
+            assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"

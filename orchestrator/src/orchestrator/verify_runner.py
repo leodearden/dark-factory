@@ -42,6 +42,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
@@ -86,6 +87,10 @@ __all__ = [
     "parity_report_from_json",
     "run_verdict_parity",
     "render_parity_report",
+    # ι additions
+    "DriftVerdict",
+    "DriftCheckResult",
+    "DriftDetector",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -764,17 +769,52 @@ class VerifyRunnerPool:
         )
         self._event_store = event_store
         self._task_id = task_id
+        # ι: quarantine set — names of runners dropped from eligible dispatch.
+        # Local (is_local) is the trust anchor and is never quarantined.
+        self._quarantined: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # ι: quarantine API
+    # ------------------------------------------------------------------
+
+    def quarantine(self, name: str) -> None:
+        """Mark runner *name* as quarantined; idempotent."""
+        self._quarantined.add(name)
+
+    def clear_quarantine(self, name: str) -> None:
+        """Remove runner *name* from quarantine; idempotent."""
+        self._quarantined.discard(name)
+
+    def is_quarantined(self, name: str) -> bool:
+        """Return True if runner *name* is currently quarantined."""
+        return name in self._quarantined
+
+    @property
+    def local_runner(self) -> VerifyRunner | None:
+        """The is_local runner, or None if not present."""
+        return self._local
+
+    def eligible_remote(self) -> VerifyRunner | None:
+        """First non-local runner that is not quarantined, or None."""
+        for runner in self._runners:
+            if not runner.is_local and runner.name not in self._quarantined:
+                return runner
+        return None
 
     def _select_runner(self) -> VerifyRunner:
-        """Prefer-remote: return the first non-local runner; fall back to runners[0].
+        """Prefer-remote: return the first non-quarantined non-local runner; fall back to local or runners[0].
 
         The K-permit free/busy refinement (load-based selection) is ζ.
         RemoteRunner.is_local is False, so it is selected over LocalRunner.
+        Quarantined non-local runners are skipped; local is the trust anchor.
+        Delegates to eligible_remote() to avoid duplicating the quarantine predicate,
+        then falls back to self._local rather than self._runners[0] so the quarantine
+        invariant holds regardless of pool construction order.
         """
-        for runner in self._runners:
-            if not runner.is_local:
-                return runner
-        return self._runners[0]
+        eligible = self.eligible_remote()
+        if eligible is not None:
+            return eligible
+        return self._local or self._runners[0]
 
     async def dispatch(
         self,
@@ -1170,6 +1210,169 @@ async def run_verdict_parity(
         all_agree=not bool(divergent_shas),
         divergent_shas=divergent_shas,
     )
+
+
+# ---------------------------------------------------------------------------
+# ι: DriftDetector — dual-host same-SHA verdict parity + divergence escalation
+# ---------------------------------------------------------------------------
+
+# Sentinel task_id used for dedup'd drift escalation (mirrors harness '__scheduler__').
+_DRIFT_SENTINEL = '__drift__'
+
+
+class DriftVerdict(StrEnum):
+    """Outcome of a single DriftDetector.check() call."""
+    AGREE = 'agree'
+    DIVERGE = 'diverge'
+    INCONCLUSIVE = 'inconclusive'
+
+
+@dataclass(frozen=True)
+class DriftCheckResult:
+    """Result of one DriftDetector.check() call.
+
+    Fields
+    ------
+    merge_sha:     The SHA that was checked.
+    verdict:       AGREE / DIVERGE / INCONCLUSIVE.
+    local_passed:  bool verdict from the local runner (None when INCONCLUSIVE).
+    remote_passed: bool verdict from the remote runner (None when INCONCLUSIVE).
+    escalated:     True when a new divergence escalation was submitted.
+    quarantined:   True when the remote runner was quarantined.
+    """
+    merge_sha: str
+    verdict: DriftVerdict
+    local_passed: bool | None = None
+    remote_passed: bool | None = None
+    escalated: bool = False
+    quarantined: bool = False
+
+
+class DriftDetector:
+    """Periodically checks that local + remote return the same verdict for a merge SHA.
+
+    PRD §8 / §B B4/B5 (task ι).
+
+    On agree  → emit EventType.verdict_parity_ok (no escalation).
+    On diverge → dedup'd L1 blocking escalation + quarantine the remote runner.
+    On inconclusive (transport failure or no eligible remote) → no side-effects.
+
+    The detector runs the two runners DIRECTLY (not via run_verdict_parity) so
+    it can distinguish RunnerUnavailable (transport ≠ divergence, Invariant 5)
+    from a genuine two-verdict disagreement.
+    """
+
+    def __init__(
+        self,
+        pool: VerifyRunnerPool,
+        *,
+        event_store: Any = None,
+        escalation_queue: Any = None,
+        task_id: str | None = None,
+        every_n_lands: int = 20,
+    ) -> None:
+        self._pool = pool
+        self._event_store = event_store
+        self._escalation_queue = escalation_queue
+        self._task_id = task_id
+        if every_n_lands <= 0:
+            raise ValueError(
+                f'every_n_lands must be a positive integer, got {every_n_lands!r}'
+            )
+        self._every_n_lands = every_n_lands
+
+    def should_sample(self, land_count: int) -> bool:
+        """Return True when land_count is a positive multiple of every_n_lands.
+
+        Realises PRD §10 Open Q2 as a pure in-code cadence predicate.
+        """
+        return land_count > 0 and land_count % self._every_n_lands == 0
+
+    async def check(self, merge_sha: str, spec: MergeVerifySpec) -> DriftCheckResult:
+        """Run *merge_sha* on both runners and compare verdicts.
+
+        Returns DriftCheckResult.  Side-effects:
+        - AGREE   → emit verdict_parity_ok event (None-safe).
+        - DIVERGE → dedup'd L1 escalation (None-safe) + quarantine remote.
+        - INCONCLUSIVE → no side-effects.
+        """
+        local = self._pool.local_runner
+        remote = self._pool.eligible_remote()
+        if local is None or remote is None:
+            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
+
+        try:
+            local_result = await local.run_merge_verify(merge_sha, spec)
+        except RunnerUnavailable:
+            # Local transport failure also yields INCONCLUSIVE — symmetric with remote.
+            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
+        try:
+            remote_result = await remote.run_merge_verify(merge_sha, spec)
+        except RunnerUnavailable:
+            # Transport failure ≠ divergence (Invariant 5).
+            # A closed/flaky laptop must never raise a false drift alarm.
+            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
+
+        local_passed = local_result.passed
+        remote_passed = remote_result.passed
+
+        if local_passed == remote_passed:
+            # Agree — emit verdict_parity_ok event.
+            if self._event_store is not None:
+                from orchestrator.event_store import EventType
+                self._event_store.emit(
+                    EventType.verdict_parity_ok,
+                    task_id=self._task_id,
+                    data={
+                        'merge_sha': merge_sha,
+                        'local_runner': local.name,
+                        'remote_runner': remote.name,
+                        'passed': local_passed,
+                    },
+                )
+            return DriftCheckResult(
+                merge_sha=merge_sha,
+                verdict=DriftVerdict.AGREE,
+                local_passed=local_passed,
+                remote_passed=remote_passed,
+            )
+
+        # Diverge — dedup'd escalation + quarantine.
+        escalated = False
+        if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
+            from escalation.models import Escalation
+            esc = Escalation(
+                id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
+                task_id=_DRIFT_SENTINEL,
+                agent_role='orchestrator-drift-detector',
+                severity='blocking',
+                level=1,
+                category='verify_drift_divergence',
+                summary=(
+                    f'Drift detected for {merge_sha}: '
+                    f'local={local_passed} remote={remote_passed}'
+                ),
+                detail=(
+                    f'merge_sha={merge_sha!r} local_runner={local.name!r} '
+                    f'({local_passed}) remote_runner={remote.name!r} ({remote_passed}). '
+                    f'A remote PASS / local FAIL split can land unverified code on main.'
+                ),
+                suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
+            )
+            self._escalation_queue.submit(esc)
+            escalated = True
+
+        # Quarantine unconditionally (even if the escalation was deduped).
+        self._pool.quarantine(remote.name)
+
+        return DriftCheckResult(
+            merge_sha=merge_sha,
+            verdict=DriftVerdict.DIVERGE,
+            local_passed=local_passed,
+            remote_passed=remote_passed,
+            escalated=escalated,
+            quarantined=True,
+        )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:
