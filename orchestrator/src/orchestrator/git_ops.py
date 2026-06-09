@@ -295,10 +295,15 @@ class WorktreeInfo:
     N commits.  When local main has diverged (has unpushed commits), the worktree
     is based on local main despite the positive count — check this field together
     with base_commit to determine actual freshness.
+
+    reify_debug_port: per-worktree reify-debug port allocated during provisioning
+    by running scripts/setup-worktree-debug-port.sh in the worktree.  None when
+    no such script is present (non-reify projects) or provisioning failed (fail-open).
     """
     path: Path
     base_commit: str
     stale_commits: int | None = None
+    reify_debug_port: int | None = None
 
 
 class WorktreeMissing(FileNotFoundError):
@@ -318,11 +323,13 @@ class WorktreeMissing(FileNotFoundError):
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    """Run a git command and return (returncode, stdout, stderr).
+    """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
-    Raises :class:`WorktreeMissing` if ``cwd`` is provided but does not exist,
-    so the caller can distinguish a deleted worktree (recoverable race) from
-    other ``FileNotFoundError``\\ s (e.g. missing binary on ``PATH``).
+    Used throughout for git invocations and for any other subprocess call
+    (e.g. project setup scripts).  Raises :class:`WorktreeMissing` if ``cwd``
+    is provided but does not exist, so the caller can distinguish a deleted
+    worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
+    missing binary on ``PATH``).
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
@@ -692,10 +699,17 @@ class GitOps:
                     )
 
                 _ensure_task_gitignore(worktree_path)
+                # Re-run on reuse so the requeued agent re-acquires a free
+                # port and re-patches its .mcp.json.  The script must be
+                # idempotent (return the same port for the same worktree dir)
+                # to avoid leaking ports across requeues — see the docstring
+                # of _provision_reify_debug_port for the full contract.
+                port = await self._provision_reify_debug_port(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,
                     base_commit=actual_base,
                     stale_commits=stale_commits,
+                    reify_debug_port=port,
                 )
             elif worktree_path.exists():
                 # The directory exists but git does not recognize it as a
@@ -827,11 +841,57 @@ class GitOps:
             cwd=worktree_path,
         )
         post_create_base = mb_out.strip() or base_sha.strip()
+        port = await self._provision_reify_debug_port(worktree_path)
         return WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
             stale_commits=stale_commits,
+            reify_debug_port=port,
         )
+
+    async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
+        """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
+
+        Best-effort and fail-open: returns None on any miss or failure so
+        worktree creation is never blocked by a debug-port hiccup.
+
+        **Idempotency contract**: This helper is invoked on *both* the
+        fresh-create and reuse/requeue return paths of ``create_worktree``.
+        On reuse the script is re-run to re-acquire a free port and re-patch
+        ``<worktree>/.mcp.json``.  The script (``scripts/setup-worktree-
+        debug-port.sh`` in the provisioned worktree) is therefore expected to
+        be idempotent with respect to the worktree directory — successive calls
+        for the same worktree must return the same port rather than allocating
+        a new one each time.  If the script is not idempotent it may churn
+        (leak) ports across requeues; the existence guard and ``try/except``
+        wrapper below ensure this function itself is always safe to call, but
+        port stability is the script's responsibility.
+        """
+        try:
+            script = worktree_path / 'scripts' / 'setup-worktree-debug-port.sh'
+            if not script.exists():
+                return None
+            rc, out, err = await _run([str(script), str(worktree_path)], cwd=worktree_path)
+            if rc != 0:
+                logger.warning(
+                    '_provision_reify_debug_port: script exited %d for %s (stderr=%r)',
+                    rc, worktree_path, err,
+                )
+                return None
+            lines = [line for line in out.splitlines() if line.strip()]
+            return int(lines[-1])
+        except (ValueError, IndexError):
+            logger.warning(
+                '_provision_reify_debug_port: could not parse port from stdout for %s',
+                worktree_path,
+            )
+            return None
+        except Exception:
+            logger.warning(
+                '_provision_reify_debug_port: unexpected error for %s',
+                worktree_path, exc_info=True,
+            )
+            return None
 
     async def _worktree_holding_branch(self, full_branch: str) -> Path | None:
         """Path of the registered worktree that has *full_branch* checked out.

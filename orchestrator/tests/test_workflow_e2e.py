@@ -861,6 +861,42 @@ class TestCompletionJudge:
         # Judge must NOT receive env_overrides — it always uses Claude API.
         assert stub.env_overrides_by_role.get('judge') is None
 
+    async def test_implementer_receives_reify_debug_port(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Implementer env includes REIFY_DEBUG_PORT when setup script is present."""
+        # Commit a fake setup-worktree-debug-port.sh into the repo so
+        # _provision_reify_debug_port picks it up during worktree creation.
+        scripts_dir = config.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+        script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=config.project_root)
+        await _run(['git', 'commit', '-m', 'add debug-port script'], cwd=config.project_root)
+
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Implementer must receive REIFY_DEBUG_PORT in its env.
+        impl_env = stub.env_overrides_by_role.get('implementer') or {}
+        assert impl_env.get('REIFY_DEBUG_PORT') == '39411'
+        # Architect must NOT receive REIFY_DEBUG_PORT.
+        arch_env = stub.env_overrides_by_role.get('architect') or {}
+        assert 'REIFY_DEBUG_PORT' not in arch_env
+
 
 # ---------------------------------------------------------------------------
 # Tests: Verify-Debugfix Loop
@@ -907,6 +943,64 @@ class TestVerifyDebugfixLoop:
         # Should see debugger in the call sequence
         assert 'debugger' in stub.calls
         assert workflow.metrics.verify_attempts == 1
+
+    async def test_debugger_receives_reify_debug_port(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Debugger (as well as implementer) must receive REIFY_DEBUG_PORT.
+
+        Architect must NOT receive REIFY_DEBUG_PORT — only the implementer/
+        debugger pair that runs inside the provisioned worktree needs the port.
+        """
+        # Commit a fake setup-worktree-debug-port.sh so _provision_reify_debug_port
+        # populates reify_debug_port during worktree creation.
+        scripts_dir = config.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+        script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=config.project_root)
+        await _run(['git', 'commit', '-m', 'add debug-port script'], cwd=config.project_root)
+
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        # First verify fails (triggering the debugger), second passes.
+        call_count = 0
+
+        async def verify_sequence(worktree, cfg, module_configs=None, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return VerifyResult(
+                    passed=False, test_output='FAILED test_foo',
+                    lint_output='', type_output='',
+                    summary='Failures: tests failed',
+                )
+            return VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_sequence)
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert 'debugger' in stub.calls
+
+        # Both implementer and debugger must receive REIFY_DEBUG_PORT.
+        impl_env = stub.env_overrides_by_role.get('implementer') or {}
+        assert impl_env.get('REIFY_DEBUG_PORT') == '39411'
+
+        debugger_env = stub.env_overrides_by_role.get('debugger') or {}
+        assert debugger_env.get('REIFY_DEBUG_PORT') == '39411'
+
+        # Architect must NOT receive REIFY_DEBUG_PORT.
+        arch_env = stub.env_overrides_by_role.get('architect') or {}
+        assert 'REIFY_DEBUG_PORT' not in arch_env
 
     async def test_verify_exhaustion_blocks(
         self, config, git_ops, task_assignment, monkeypatch

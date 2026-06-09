@@ -190,6 +190,81 @@ class TestWorktreeLifecycle:
         )
         assert info_explicit.stale_commits == 5
 
+    async def test_worktree_info_reify_debug_port_field(self, git_ops: GitOps):
+        """WorktreeInfo.reify_debug_port defaults to None and can be set explicitly."""
+        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
+        assert info_default.reify_debug_port is None
+
+        info_explicit = WorktreeInfo(
+            path=git_ops.project_root, base_commit='a' * 40, reify_debug_port=39411,
+        )
+        assert info_explicit.reify_debug_port == 39411
+
+    async def test_create_worktree_provisions_reify_debug_port(self, git_ops: GitOps):
+        """create_worktree runs setup-worktree-debug-port.sh and stamps the port."""
+        # Commit a fake script into the repo main that just prints the port
+        scripts_dir = git_ops.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+        script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add fake debug-port script'], cwd=git_ops.project_root)
+
+        worktree_info = await git_ops.create_worktree('rdp-1')
+        assert worktree_info.reify_debug_port == 39411
+
+    async def test_create_worktree_reify_debug_port_best_effort(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """_provision_reify_debug_port is fail-open: None for missing/failing/bad-output scripts."""
+        scripts_dir = git_ops.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+
+        # (a) no script present: default repo — reify_debug_port stays None
+        info_no_script = await git_ops.create_worktree('rdp-err-a')
+        assert info_no_script.reify_debug_port is None
+        assert info_no_script.path.exists()
+
+        # (b) script exits non-zero
+        script.write_text('#!/usr/bin/env bash\necho boom >&2\nexit 1\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add failing script'], cwd=git_ops.project_root)
+        info_fail = await git_ops.create_worktree('rdp-err-b')
+        assert info_fail.reify_debug_port is None
+        assert info_fail.path.exists()
+
+        # (c) script prints a non-integer
+        script.write_text('#!/usr/bin/env bash\necho not-a-port\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add non-int script'], cwd=git_ops.project_root)
+        info_bad = await git_ops.create_worktree('rdp-err-c')
+        assert info_bad.reify_debug_port is None
+        assert info_bad.path.exists()
+
+    async def test_create_worktree_reuse_provisions_reify_debug_port(
+        self, git_ops: GitOps,
+    ):
+        """Reuse/requeue path also runs the script and stamps the port."""
+        scripts_dir = git_ops.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+        script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add fake debug-port script'], cwd=git_ops.project_root)
+
+        # First call: fresh-create path
+        info1 = await git_ops.create_worktree('rdp-reuse')
+        assert info1.reify_debug_port == 39411
+
+        # Second call: reuse path
+        info2 = await git_ops.create_worktree('rdp-reuse')
+        assert info2.reify_debug_port == 39411
+
     async def test_create_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-1')
         assert worktree_info.path.exists()
