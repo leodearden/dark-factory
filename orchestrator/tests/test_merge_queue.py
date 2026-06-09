@@ -16405,3 +16405,57 @@ class TestLaneSnapshotAndStop:
         assert outcome_h.status == 'blocked', (
             f'Expected blocked shutdown outcome, got {outcome_h.status!r}'
         )
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestPerLaneOwnerMechanics:
+    """Steps 11-12: per-lane owner methods for owner-tied auto-resume."""
+
+    def test_owner_tied_auto_resume_clears_normal_lane(self, worker_cls, git_ops: GitOps):
+        """Behavior (c): unhalt_lanes_owned_by resumes only the owned lane.
+
+        halt_lane + set_lane_halt_owner establishes ownership;
+        unhalt_lanes_owned_by with wrong esc_id is a no-op;
+        unhalt_lanes_owned_by with correct esc_id un-halts and clears owner.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Halt normal lane and set owner
+        worker.halt_lane('normal', 'red main')
+        worker.set_lane_halt_owner('normal', 'esc-1')
+
+        assert worker.lane_owned_by('esc-1') == 'normal'
+        assert worker.is_halt_owner('esc-1') is True
+        assert worker.halt_owner_esc_id == 'esc-1'
+
+        # Non-owner resume: no-op
+        resumed = worker.unhalt_lanes_owned_by('esc-2')
+        assert resumed == [], f'Expected [], got {resumed}'
+        assert worker.is_lane_halted('normal') is True, 'Normal lane should stay halted'
+
+        # Correct owner resume: clears the lane
+        resumed = worker.unhalt_lanes_owned_by('esc-1')
+        assert resumed == ['normal'], f'Expected [normal], got {resumed}'
+        assert worker.is_lane_halted('normal') is False
+        assert worker.lane_owned_by('esc-1') is None
+
+    def test_different_lane_owner_untouched_by_other_resume(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Resuming esc-1's lane must not affect a different lane owned by esc-2."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Halt high lane under esc-1, normal lane under esc-2
+        worker.halt_lane('high', 'h-reason', owner_esc_id='esc-1')
+        worker.halt_lane('normal', 'n-reason', owner_esc_id='esc-2')
+
+        # Resume esc-1's lane only
+        resumed = worker.unhalt_lanes_owned_by('esc-1')
+        assert 'high' in resumed
+        assert worker.is_lane_halted('high') is False
+
+        # Normal lane (esc-2) must remain halted and owned
+        assert worker.is_lane_halted('normal') is True
+        assert worker.lane_owned_by('esc-2') == 'normal'
