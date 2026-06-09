@@ -386,6 +386,7 @@ class TaskWorkflow:
         self.modules = list(assignment.modules)
         self.worktree: Path | None = None
         self._worktree_external = False  # True when worktree was pre-created (eval mode)
+        self._reify_debug_port: int | None = None
         self.artifacts: TaskArtifacts | None = None
         self.plan: dict = {}
         self.initial_plan = initial_plan
@@ -868,6 +869,7 @@ class TaskWorkflow:
                 train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
             )
             self.worktree = worktree_info.path
+            self._reify_debug_port = worktree_info.reify_debug_port
             base_commit = worktree_info.base_commit
         else:
             self._worktree_external = True
@@ -4755,6 +4757,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         return base_model
 
+    def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
+        """Build the env_overrides dict for this agent invocation.
+
+        Only implementer and debugger inherit env_overrides; other roles get None.
+        REIFY_DEBUG_PORT is merged in per-invocation (never mutating shared config)
+        so concurrent tasks each carry their own worktree-specific port.
+        """
+        if role.name not in ('implementer', 'debugger'):
+            return None
+        merged: dict[str, str] = dict(self.config.env_overrides or {})
+        if self._reify_debug_port is not None:
+            merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
+        return merged or None
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -4888,7 +4904,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
                 # Cap hits on Claude API are handled by UsageGate account failover
                 # (wired in runner.py for eval mode).
-                env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
+                env_overrides=self._build_agent_env(role),
             )
         finally:
             if self.artifacts is not None:
