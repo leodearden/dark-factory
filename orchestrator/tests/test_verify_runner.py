@@ -1828,17 +1828,28 @@ class TestEnvFingerprint:
         fp = self._make_fp()
         assert fingerprint_to_json(fp) == fingerprint_to_json(fp)
 
-    def test_in_dunder_all(self):
+    def test_all_new_epsilon_names_in_dunder_all(self):
+        """All ε-added public names are present in __all__ and importable."""
         import orchestrator.verify_runner as vr_mod
-        assert 'EnvFingerprint' in vr_mod.__all__
-
-    def test_fingerprint_to_json_in_dunder_all(self):
-        import orchestrator.verify_runner as vr_mod
-        assert 'fingerprint_to_json' in vr_mod.__all__
-
-    def test_fingerprint_from_json_in_dunder_all(self):
-        import orchestrator.verify_runner as vr_mod
-        assert 'fingerprint_from_json' in vr_mod.__all__
+        expected = {
+            'EnvFingerprint',
+            'fingerprint_to_json',
+            'fingerprint_from_json',
+            'EnvParityVerdict',
+            'compare_env_fingerprints',
+            'capture_env_fingerprint',
+            'ParityRow',
+            'VerdictParityReport',
+            'parity_report_to_json',
+            'parity_report_from_json',
+            'run_verdict_parity',
+            'render_parity_report',
+        }
+        missing = expected - set(vr_mod.__all__)
+        assert not missing, f"Missing from __all__: {sorted(missing)}"
+        # Also verify each name resolves to a real attribute
+        for name in expected:
+            assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"
 
 
 # ---------------------------------------------------------------------------
@@ -2225,7 +2236,7 @@ class TestRunVerdictParityDivergence:
         assert 'sha1' in report.divergent_shas
         assert 'sha2' not in report.divergent_shas
 
-    async def test_divergent_shas_exactly_the_disagrreeing_ones(self):
+    async def test_divergent_shas_exactly_the_disagreeing_ones(self):
         from orchestrator.verify_runner import run_verdict_parity
         corpus = [('a', None), ('b', None), ('c', None)]
         local_fake = self._make_fake_runner('local', {
@@ -2283,6 +2294,106 @@ class TestRunVerdictParityDivergence:
         row = report.rows[0]
         assert row.agree is True
         assert row.matches_expected is False
+
+    async def test_matches_expected_none_when_runners_disagree(self):
+        """matches_expected is None when agree=False, even if expected_pass is set.
+
+        When runners diverge there is no agreed verdict, so comparing to
+        expected_pass would be semantically meaningless.
+        """
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is False
+        assert row.matches_expected is None  # no agreed verdict to compare
+
+    async def test_runner_error_records_errored_row_not_abort(self):
+        """A runner exception for one SHA records an error row; the rest still run."""
+        from orchestrator.verify_runner import run_verdict_parity
+
+        class BoomRunner:
+            name = 'boom'
+            is_local = False
+
+            async def run_merge_verify(self, sha, spec):
+                if sha == 'bad':
+                    raise RuntimeError("ssh connection refused")
+                return _make_verify_result(passed=True)
+
+        local_fake = self._make_fake_runner('local', {
+            'bad': _make_verify_result(passed=True),
+            'good': _make_verify_result(passed=True),
+        })
+        remote_boom = BoomRunner()
+        corpus = [('bad', None), ('good', None)]
+        report = await run_verdict_parity(corpus, local_fake, remote_boom, _make_spec())
+        # Both SHAs produce rows — the error did NOT abort the run
+        assert len(report.rows) == 2
+        shas = {r.sha for r in report.rows}
+        assert shas == {'bad', 'good'}
+        # The errored row is marked as non-agreeing with error text in category
+        bad_row = next(r for r in report.rows if r.sha == 'bad')
+        assert bad_row.agree is False
+        assert 'runner_error' in bad_row.remote_category
+        # The good row is unaffected
+        good_row = next(r for r in report.rows if r.sha == 'good')
+        assert good_row.agree is True
+
+
+# ---------------------------------------------------------------------------
+# ε: VerdictParityReport JSON codec round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerdictParityReportCodec:
+    """parity_report_to_json / parity_report_from_json round-trip byte-identical."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def _build_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc', True), ('def', None), ('ghi', False)]
+        results = {
+            'abc': _make_verify_result(passed=True),
+            'def': _make_verify_result(passed=False),
+            'ghi': _make_verify_result(passed=False),
+        }
+        local_fake = self._make_fake_runner('local', results)
+        remote_fake = self._make_fake_runner('laptop', results)
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def test_parity_report_json_roundtrip_byte_identical(self):
+        """to_json(from_json(s)) == s — byte-identical re-serialisation."""
+        from orchestrator.verify_runner import parity_report_from_json, parity_report_to_json
+        report = await self._build_report()
+        s = parity_report_to_json(report)
+        assert parity_report_to_json(parity_report_from_json(s)) == s
+
+    async def test_parity_report_json_roundtrip_equals_original(self):
+        """from_json(to_json(report)) == report — structural equality."""
+        from orchestrator.verify_runner import parity_report_from_json, parity_report_to_json
+        report = await self._build_report()
+        assert parity_report_from_json(parity_report_to_json(report)) == report
+
+    async def test_parity_report_to_dict_from_dict_roundtrip(self):
+        """to_dict / from_dict round-trip preserves all rows and aggregates."""
+        report = await self._build_report()
+        restored = report.from_dict(report.to_dict())
+        assert restored == report
+        assert len(restored.rows) == 3
 
 
 # ---------------------------------------------------------------------------

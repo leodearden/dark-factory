@@ -82,6 +82,8 @@ __all__ = [
     "capture_env_fingerprint",
     "ParityRow",
     "VerdictParityReport",
+    "parity_report_to_json",
+    "parity_report_from_json",
     "run_verdict_parity",
     "render_parity_report",
 ]
@@ -1127,15 +1129,30 @@ async def run_verdict_parity(
     """
     rows: list[ParityRow] = []
     for sha, expected_pass in corpus:
-        local_result = await local_runner.run_merge_verify(sha, spec)
-        remote_result = await remote_runner.run_merge_verify(sha, spec)
+        try:
+            local_result = await local_runner.run_merge_verify(sha, spec)
+            remote_result = await remote_runner.run_merge_verify(sha, spec)
+        except Exception as exc:
+            # A runner failure for one SHA must not discard the whole corpus run.
+            # Record an errored row (agree=False, matches_expected=None) and continue.
+            error_msg = f"runner_error: {exc}"
+            rows.append(ParityRow(
+                sha=sha,
+                expected_pass=expected_pass,
+                local_passed=False,
+                remote_passed=False,
+                local_category=error_msg,
+                remote_category=error_msg,
+                agree=False,
+                matches_expected=None,
+            ))
+            continue
         agree = local_result.passed == remote_result.passed
-        if expected_pass is None:
+        if expected_pass is None or not agree:
+            # matches_expected is undefined when there is no agreed verdict to compare.
             matches_expected = None
         else:
-            # Use the agreed verdict when they agree; local verdict when they don't.
-            agreed_verdict = local_result.passed if agree else local_result.passed
-            matches_expected = (agreed_verdict == expected_pass)
+            matches_expected = (local_result.passed == expected_pass)
         rows.append(ParityRow(
             sha=sha,
             expected_pass=expected_pass,
