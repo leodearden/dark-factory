@@ -87,6 +87,10 @@ __all__ = [
     "parity_report_from_json",
     "run_verdict_parity",
     "render_parity_report",
+    # ι additions
+    "DriftVerdict",
+    "DriftCheckResult",
+    "DriftDetector",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
