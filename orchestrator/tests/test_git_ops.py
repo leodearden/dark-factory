@@ -190,6 +190,16 @@ class TestWorktreeLifecycle:
         )
         assert info_explicit.stale_commits == 5
 
+    async def test_worktree_info_reify_debug_port_field(self, git_ops: GitOps):
+        """WorktreeInfo.reify_debug_port defaults to None and can be set explicitly."""
+        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
+        assert info_default.reify_debug_port is None
+
+        info_explicit = WorktreeInfo(
+            path=git_ops.project_root, base_commit='a' * 40, reify_debug_port=39411,
+        )
+        assert info_explicit.reify_debug_port == 39411
+
     async def test_create_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-1')
         assert worktree_info.path.exists()
