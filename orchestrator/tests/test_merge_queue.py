@@ -10241,21 +10241,20 @@ class TestSpeculationRaceRetry:
         git_ops: GitOps,
         config: OrchestratorConfig,
     ):
-        """force_verify=True overrides skip_verify for pre_rebased items; default False preserves it.
+        """force_verify=True overrides skip_verify; no-anchor default fails closed.
 
         Mirrors test_remerge_retry_success_skip_verify to pin the force_verify
         parameter semantics of _remerge.
 
-        (a) force_verify=True: even though pre_rebased=True and main is unchanged
-            (pre_merge_sha == actual_main would normally yield skip_verify=True),
+        (a) force_verify=True: even though pre_rebased=True and main is unchanged,
             force_verify forces skip_verify=False so verification runs.
             Behavioural check: _verify_and_advance must invoke run_scoped_verification.
 
-        (b) Default-preservation guard (force_verify omitted / False): with an
-            identical second request (pre_rebased=True, main unchanged), calling
-            _remerge without force_verify yields skip_verify=True — the existing
-            computation (req.pre_rebased AND pre_merge_sha==actual_main) is preserved
-            for the chain-invalidation/default path (invariant 3).
+        (b) Fail-closed default (force_verify omitted, no prev_skip_verify/prev_merge_tree
+            anchor): calling _remerge(req_b, None) with pre_rebased=True and main
+            unchanged yields skip_verify=False.  With no verified-tree anchor the
+            contract is fail-closed — verify rather than trust a proxy flag.
+            The genuine no-op skip (tree unchanged) is pinned by step-3 case (a).
 
         RED on base: _remerge has no force_verify kwarg → TypeError.
         """
@@ -10298,26 +10297,24 @@ class TestSpeculationRaceRetry:
             'verification was skipped.'
         )
 
-        # (b) Default-preservation: force_verify omitted → existing computation applies
+        # (b) Fail-closed default: no anchor → skip_verify=False regardless of pre_rebased.
         wt_b = await _make_branch_with_file(
             git_ops, 'fv-b', 'file_fv_b.py', 'b = 2\n',
         )
         req_b = _make_request('fv-b', 'fv-b', wt_b, config, pre_rebased=True)
 
-        item_b = await worker._remerge(req_b, None)  # force_verify NOT passed
+        item_b = await worker._remerge(req_b, None)  # no prev_skip_verify / prev_merge_tree
 
         assert item_b.immediate_outcome is None, (
             f'Expected flowing item; got {item_b.immediate_outcome}'
         )
         assert item_b.merge_result is not None
         assert item_b.merge_result.success
-        # With force_verify=False (default), existing computation applies:
-        # pre_rebased=True AND pre_merge_sha==actual_main → skip_verify=True.
-        assert item_b.skip_verify is True, (
-            f'Expected skip_verify=True with force_verify=False (default) and '
-            f'pre_rebased=True when main is unchanged — existing computation must '
-            f'be preserved for chain-invalidation/default path (invariant 3), '
-            f'but got skip_verify={item_b.skip_verify}.'
+        # Without a verified-tree anchor the contract is fail-closed: verify.
+        # The genuine no-op skip (tree unchanged) is locked by step-3 case (a).
+        assert item_b.skip_verify is False, (
+            f'Expected skip_verify=False with no anchor (fail-closed default); '
+            f'got skip_verify={item_b.skip_verify}.'
         )
 
 
