@@ -18,7 +18,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.merge_queue import (
     MERGE_LANES,
     TRAIN_INCOMPLETE_REASON_PREFIX,
@@ -2175,14 +2175,25 @@ class TestSpeculativeMergeWorker:
             )
             assert 'Unexpected verifier error' in outcome_n.reason
 
-            # _speculation_slot must be set (not stuck cleared → deadlock)
-            assert worker._speculation_slot.is_set(), (
-                '_speculation_slot stuck cleared — merger will deadlock on next request'
-            )
-
-            # N+1 must also complete (not hang forever)
+            # N+1 must also complete (not hang forever due to deadlock)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
             assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
+
+        # _speculation_slot must have a free permit after all items drain.
+        # Yield several event-loop iterations so:
+        #   (1) _verify_and_advance completes any awaits it makes after setting
+        #       req.result (the test resumes on a yield inside that function);
+        #   (2) the verifier's finally block runs and releases the slot;
+        #   (3) the merger acquires the just-released permit for its next
+        #       look-ahead, finds the queue empty, and releases it again;
+        #   (4) the merger blocks at _acquire_next_request() — slot is free.
+        # Without these yields the assertion races with the still-running merger.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after all items drained — '
+            'merger will deadlock on next request'
+        )
 
         await worker.stop()
         await worker_task
@@ -2238,10 +2249,16 @@ class TestSpeculativeMergeWorker:
             )
             assert '_remerge failed' in outcome_n1.reason
 
-            # _speculation_slot must be released
-            assert worker._speculation_slot.is_set(), (
-                '_speculation_slot stuck cleared after _remerge exception'
-            )
+        # _speculation_slot must have a free permit after all items drain.
+        # Yield several event-loop iterations: the verifier's finally releases
+        # the slot, the merger acquires it for its next look-ahead, finds the
+        # queue empty, and releases it — all before this assertion runs.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after _remerge exception — '
+            'merger will deadlock on next request'
+        )
 
         await worker.stop()
         await worker_task
@@ -3479,8 +3496,8 @@ class TestSpeculativeMergeWorker:
         await worker._verifier_loop()
 
         worker._remerge.assert_awaited_once()  # type: ignore[attr-defined]
-        assert worker._speculation_slot.is_set(), (
-            '_speculation_slot must be set after verifier drains both tokens'
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot must have a free permit after verifier drains both tokens'
         )
 
     async def test_verifier_no_double_resolve_for_already_delivered_token(
@@ -17131,3 +17148,472 @@ class TestMergeShaThreading:
         assert len(merge_sha) == 40 and all(c in '0123456789abcdef' for c in merge_sha), (
             f'merge_sha must be a 40-char hex SHA; got {merge_sha!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEnforceMergeLivenessMargin — task-1698 step-1/2
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceMergeLivenessMargin:
+    """enforce_merge_liveness_margin: fail-closed liveness wrapper (task-1698 step-1).
+
+    These tests use production defaults (liveness=10800, safety_factor=0.75,
+    threshold=8100) so the numeric premises are identical to the passing
+    TestCheckMergeLivenessMarginShippedDefaults cases.
+    """
+
+    def test_over_budget_raises_config_error(self, tmp_path: Path):
+        """bound=2 with bare cfg (cold=7200) → worst_case=14400 ≥ 8100 → raises MergeLivenessConfigError."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessConfigError,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with pytest.raises(MergeLivenessConfigError) as exc_info:
+            enforce_merge_liveness_margin(cfg, merge_ahead_bound=2)
+
+        # Error message must surface the key numbers for operator triage.
+        msg = str(exc_info.value)
+        assert '14400' in msg or '14400.0' in msg, (
+            f'MergeLivenessConfigError message must mention worst_case (14400); got: {msg!r}'
+        )
+
+    def test_in_budget_returns_assessment(self, tmp_path: Path):
+        """bound=1 with bare cfg (cold=7200) → worst_case=7200 < 8100 → no raise, returns MergeLivenessAssessment."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessAssessment,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        result = enforce_merge_liveness_margin(cfg, merge_ahead_bound=1)
+
+        assert isinstance(result, MergeLivenessAssessment), (
+            f'Expected MergeLivenessAssessment, got {type(result)!r}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for bound=1 (7200 < 8100); got safe={result.safe!r}'
+        )
+        assert result.worst_case_secs == 7200.0, (
+            f'Expected worst_case_secs=7200.0 (bound=1 * 7200); got {result.worst_case_secs}'
+        )
+
+    def test_error_message_contains_threshold(self, tmp_path: Path):
+        """MergeLivenessConfigError message includes threshold and timeout for operator triage."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessConfigError,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with pytest.raises(MergeLivenessConfigError) as exc_info:
+            enforce_merge_liveness_margin(cfg, merge_ahead_bound=2)
+
+        msg = str(exc_info.value)
+        # threshold (8100) and bound (2) and timeout (7200) all present.
+        assert '8100' in msg, (
+            f'MergeLivenessConfigError must mention threshold (8100); got: {msg!r}'
+        )
+        assert '2' in msg, (
+            f'MergeLivenessConfigError must mention merge_ahead_bound (2); got: {msg!r}'
+        )
+        assert '7200' in msg, (
+            f'MergeLivenessConfigError must mention timeout (7200); got: {msg!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationDepthParameter — task-1698 step-3/4
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationDepthParameter:
+    """speculation_depth K-parameter on SpeculativeMergeWorker._merge_ahead_cap (task-1698 step-3)."""
+
+    async def test_k2_cap_allows_two_concurrent_items(self):
+        """speculation_depth=2 sizes _merge_ahead_cap to 2: one acquire leaves room, two locks it."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue, speculation_depth=2)
+        cap = worker._merge_ahead_cap
+
+        # First acquire: cap still has 1 slot free → not locked yet.
+        await cap.acquire()
+        assert not cap.locked(), (
+            'After 1 acquire of K=2 _merge_ahead_cap, cap should not be locked '
+            '(1 slot still free); cap is prematurely full.'
+        )
+
+        # Second acquire: cap is now full → locked.
+        await cap.acquire()
+        assert cap.locked(), (
+            'After 2 acquires of K=2 _merge_ahead_cap, cap must be locked '
+            '(all 2 slots exhausted).'
+        )
+
+    async def test_default_cap_preserves_bound_one(self):
+        """Default SpeculativeMergeWorker (no speculation_depth) preserves _MERGE_AHEAD_BOUND=1."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue)
+        cap = worker._merge_ahead_cap
+
+        # Single acquire must lock the cap immediately (bound=1 regression).
+        assert _cap_is_full(cap, 1), (
+            'Fresh K=1 (default) _merge_ahead_cap should report full (no slots taken); '
+            '_cap_is_full uses not-locked so this checks initial state is correct.'
+        )
+        await cap.acquire()
+        assert cap.locked(), (
+            'After 1 acquire of K=1 (default) _merge_ahead_cap, cap must be locked.'
+        )
+
+    async def test_k3_cap_allows_three_concurrent_items(self):
+        """speculation_depth=3 sizes _merge_ahead_cap to 3."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue, speculation_depth=3)
+        cap = worker._merge_ahead_cap
+
+        await cap.acquire()
+        assert not cap.locked(), 'After 1/3 acquires, K=3 cap should not be locked.'
+        await cap.acquire()
+        assert not cap.locked(), 'After 2/3 acquires, K=3 cap should not be locked.'
+        await cap.acquire()
+        assert cap.locked(), 'After 3/3 acquires, K=3 cap must be locked.'
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationSlotSemaphoreDepth — task-1698 step-5/6
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationSlotSemaphoreDepth:
+    """Generalized _speculation_slot (Event→Semaphore) depth and release tests (task-1698 step-5).
+
+    Parts (a) and (c) fail RED against the current asyncio.Event _speculation_slot;
+    part (b) is the K=1 regression guard that already passes.
+    """
+
+    async def test_k2_builds_two_speculative_ahead(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ):
+        """(a) K=2 depth: with speculation_depth=2 and verifier gated, the merger builds
+        N+1 AND N+2 speculatively before blocking on N+3.  Peak concurrent active merge
+        worktrees must be ≤ 3 (1 verifying + 2 speculative) AND ≥ 3 to confirm both
+        speculative slots were used.
+
+        Fails RED because _speculation_slot is still an Event (depth-1); with the Event
+        the merger only builds N+1 speculatively (peak ≤ 2), so ≥ 3 assertion fails.
+        """
+        wt_n = await _make_branch_with_file(git_ops, 'k2d-n', 'k2d_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'k2d-n1', 'k2d_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'k2d-n2', 'k2d_n2.py', 'n2 = 3\n')
+        wt_n3 = await _make_branch_with_file(git_ops, 'k2d-n3', 'k2d_n3.py', 'n3 = 4\n')
+
+        active_worktrees: set[str] = set()
+        max_concurrent = 0
+        # Event fires when K=2 concurrent worktrees are active; the gate
+        # holds N's verify until this event fires so we verify the merger
+        # actually used both speculation slots before releasing.
+        k2_reached = asyncio.Event()
+        original_create = git_ops._create_merge_worktree
+        original_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _tracking_create(base_sha=None):
+            wt, sha = await original_create(base_sha)
+            active_worktrees.add(str(wt))
+            nonlocal max_concurrent
+            max_concurrent = max(max_concurrent, len(active_worktrees))
+            if len(active_worktrees) >= 3:
+                k2_reached.set()
+            return wt, sha
+
+        async def _tracking_cleanup(merge_wt):
+            active_worktrees.discard(str(merge_wt))
+            await original_cleanup(merge_wt)
+
+        first_verify_entered = asyncio.Event()
+
+        async def _gated_verify_k2(*args, **kwargs):
+            if not first_verify_entered.is_set():
+                first_verify_entered.set()
+                # Hold N's verify until 3 concurrent worktrees are active
+                # (N verifying + N+1 speculative + N+2 speculative).
+                # If K=2 is not yet implemented, this times out (test will
+                # fail on the max_concurrent >= 3 assertion below).
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(k2_reached.wait(), timeout=30)
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=2)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, '_create_merge_worktree', side_effect=_tracking_create),
+            patch.object(git_ops, 'cleanup_merge_worktree', side_effect=_tracking_cleanup),
+            patch('orchestrator.merge_queue.run_scoped_verification',
+                  AsyncMock(side_effect=_gated_verify_k2)),
+        ):
+            req_n = _make_request('k2d-n', 'k2d-n', wt_n, config)
+            req_n1 = _make_request('k2d-n1', 'k2d-n1', wt_n1, config)
+            req_n2 = _make_request('k2d-n2', 'k2d-n2', wt_n2, config)
+            req_n3 = _make_request('k2d-n3', 'k2d-n3', wt_n3, config)
+
+            # Submit all four.
+            await queue.put(req_n)
+            await queue.put(req_n1)
+            await queue.put(req_n2)
+            await queue.put(req_n3)
+
+            # The gate holds N's verify until 3 concurrent worktrees are seen
+            # OR 30s timeout.  After gate releases, wait for all to complete.
+            await asyncio.wait_for(req_n.result, timeout=60)
+            await asyncio.wait_for(req_n1.result, timeout=60)
+            await asyncio.wait_for(req_n2.result, timeout=60)
+            await asyncio.wait_for(req_n3.result, timeout=60)
+
+        # Peak must reach 3 (N verifying + N+1 + N+2 speculative).
+        # If _speculation_slot is still an Event (depth-1), peak stays ≤ 2.
+        assert max_concurrent >= 3, (
+            f'K=2 speculation depth did not produce 3 concurrent merge worktrees '
+            f'(N verifying + 2 speculative); got max_concurrent={max_concurrent}. '
+            f'_speculation_slot may still be an Event (depth-1).'
+        )
+        assert max_concurrent <= 3, (
+            f'K=2 peak concurrent worktrees must be ≤ 3; got {max_concurrent}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationPermitLeakOnMergerError — task-1698 step-9/10
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationPermitLeakOnMergerError:
+    """Speculation-permit leak when a PREFETCHED (speculative) item fails inside
+    the merger before being put on _verifier_queue (task-1698 step-9 RED).
+
+    The step-6 Event→Semaphore conversion introduced a leak: when a prefetched
+    speculative item fails inside the merger (WorktreeMissing, generic Exception,
+    or abandoned-at-top short-circuit), the speculation permit acquired during the
+    previous iteration's look-ahead is never released.  At K=1 this leaves the
+    semaphore at 0; the merger then blocks forever at the next look-ahead acquire,
+    deadlocking the whole merge worker.
+
+    All three sub-tests assert:
+    1. ``not worker._speculation_slot.locked()`` after the failure — the FAST RED
+       signal.  Against current code the permit is leaked and the slot stays locked.
+    2. No-deadlock: N+2 and N+3 both resolve within a timeout.  Against current
+       code the merger blocks at the look-ahead acquire after putting N+2 on the
+       verifier queue, so N+3 hangs.
+    """
+
+    async def test_worktree_missing_releases_speculation_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """(a) WorktreeMissing raised during N+1's merger step must release
+        the speculation permit (currently leaks → deadlock at next look-ahead).
+        """
+        wt_n = await _make_branch_with_file(git_ops, 'leak-wm-n', 'leak_wm_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'leak-wm-n1', 'leak_wm_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'leak-wm-n2', 'leak_wm_n2.py', 'n2 = 3\n')
+        wt_n3 = await _make_branch_with_file(git_ops, 'leak-wm-n3', 'leak_wm_n3.py', 'n3 = 4\n')
+
+        original_merge = git_ops.merge_to_main
+
+        async def _patched_merge(worktree, branch, **kwargs):
+            if branch == 'leak-wm-n1':
+                raise WorktreeMissing(worktree)
+            return await original_merge(worktree, branch, **kwargs)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_n = _make_request('leak-wm-n', 'leak-wm-n', wt_n, config)
+            req_n1 = _make_request('leak-wm-n1', 'leak-wm-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            # N resolves as 'done'; N+1 resolves as 'blocked' with WorktreeMissing reason.
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            assert outcome_n1.status == 'blocked', f'N+1 expected blocked, got {outcome_n1}'
+            assert outcome_n1.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
+                f'Expected reason starting with {WORKTREE_MISSING_REASON_PREFIX!r}, '
+                f'got: {outcome_n1.reason!r}'
+            )
+
+        # The speculation permit MUST be released after N+1 fails in the merger.
+        # Yield several event-loop ticks so the merger finishes processing N+1's
+        # failure and any subsequent look-ahead before we inspect the semaphore.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after WorktreeMissing on speculative item — '
+            'merger will deadlock on next request'
+        )
+
+        # No-deadlock: N+2 and N+3 must both resolve (merged + verified) after the permit
+        # is released.  Against current code the merger blocks at the look-ahead acquire
+        # after putting N+2 on the verifier queue, so N+3 hangs.
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n2 = _make_request('leak-wm-n2', 'leak-wm-n2', wt_n2, config)
+            req_n3 = _make_request('leak-wm-n3', 'leak-wm-n3', wt_n3, config)
+            await queue.put(req_n2)
+            await queue.put(req_n3)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_merger_exception_releases_speculation_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """(b) Generic Exception raised during N+1's merger step must release
+        the speculation permit (currently leaks → deadlock at next look-ahead).
+        """
+        wt_n = await _make_branch_with_file(git_ops, 'leak-ex-n', 'leak_ex_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'leak-ex-n1', 'leak_ex_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'leak-ex-n2', 'leak_ex_n2.py', 'n2 = 3\n')
+        wt_n3 = await _make_branch_with_file(git_ops, 'leak-ex-n3', 'leak_ex_n3.py', 'n3 = 4\n')
+
+        original_merge = git_ops.merge_to_main
+
+        async def _patched_merge(worktree, branch, **kwargs):
+            if branch == 'leak-ex-n1':
+                raise RuntimeError('Simulated unexpected merger error for N+1')
+            return await original_merge(worktree, branch, **kwargs)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'merge_to_main', side_effect=_patched_merge),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_n = _make_request('leak-ex-n', 'leak-ex-n', wt_n, config)
+            req_n1 = _make_request('leak-ex-n1', 'leak-ex-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            assert outcome_n1.status == 'blocked', f'N+1 expected blocked, got {outcome_n1}'
+            assert 'Merger error' in outcome_n1.reason, (
+                f'Expected "Merger error" in reason, got: {outcome_n1.reason!r}'
+            )
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after Exception on speculative item — '
+            'merger will deadlock on next request'
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n2 = _make_request('leak-ex-n2', 'leak-ex-n2', wt_n2, config)
+            req_n3 = _make_request('leak-ex-n3', 'leak-ex-n3', wt_n3, config)
+            await queue.put(req_n2)
+            await queue.put(req_n3)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_abandoned_speculative_releases_speculation_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """(c) Prefetched speculative item detected as abandoned at the top of the
+        merger loop must release the speculation permit (currently leaks → deadlock).
+
+        Patches _request_abandoned to return True only for N+1's task_id so the
+        merger short-circuits the prefetched item at :4685 without a verifier put.
+        N+1's future is never resolved (the abandon path has no set_result call) so
+        the test does not await it; the no-deadlock proof uses N+2 and N+3.
+        """
+        wt_n = await _make_branch_with_file(git_ops, 'leak-ab-n', 'leak_ab_n.py', 'n = 1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'leak-ab-n1', 'leak_ab_n1.py', 'n1 = 2\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'leak-ab-n2', 'leak_ab_n2.py', 'n2 = 3\n')
+        wt_n3 = await _make_branch_with_file(git_ops, 'leak-ab-n3', 'leak_ab_n3.py', 'n3 = 4\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Patch _request_abandoned to return True only for N+1 by task_id.
+        # N uses a different task_id so it passes through normally.
+        original_abandoned = worker._request_abandoned
+
+        def _patched_abandoned(req):
+            if req.task_id == 'leak-ab-n1':
+                return True
+            return original_abandoned(req)
+
+        worker._request_abandoned = _patched_abandoned  # type: ignore[method-assign]
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('leak-ab-n', 'leak-ab-n', wt_n, config)
+            req_n1 = _make_request('leak-ab-n1', 'leak-ab-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            # N completes normally; N+1 is abandoned (future never resolved — don't await).
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
+
+        # Yield several event-loop ticks so the merger processes N+1's abandonment.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # The speculation permit acquired for N's look-ahead (which prefetched N+1)
+        # MUST be released when N+1 is abandoned at the top of the loop.
+        # Against current code: the permit is leaked and the slot stays locked.
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after abandoned-at-top for speculative item — '
+            'merger will deadlock on next request'
+        )
+
+        # No-deadlock: N+2 and N+3 must both resolve.
+        # Against current code: the merger blocks at the look-ahead acquire after
+        # putting N+2 on the verifier queue, so N+3 hangs forever.
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n2 = _make_request('leak-ab-n2', 'leak-ab-n2', wt_n2, config)
+            req_n3 = _make_request('leak-ab-n3', 'leak-ab-n3', wt_n3, config)
+            await queue.put(req_n2)
+            await queue.put(req_n3)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+            assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
+            assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task

@@ -4057,9 +4057,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     N+1 is already a descendant and its CAS works immediately.  If N fails,
     the Verifier re-merges N+1 against actual main.
 
-    Speculation depth is capped at 1: the Merger waits on ``_speculation_slot``
-    before grabbing N+2 speculatively, which the Verifier sets after completing
-    the item preceding the speculation.
+    Speculation depth is configurable via ``speculation_depth`` (K = number of
+    verify runners, default ``_MERGE_AHEAD_BOUND`` = 1).  One K value sizes
+    both ``_speculation_slot`` and ``_merge_ahead_cap`` so the two caps remain
+    in sync as runner count grows.  The default (K=1) reproduces the original
+    depth-1 behaviour byte-identically.
     """
 
     MAX_CAS_RETRIES = 5
@@ -4083,6 +4085,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         queue: asyncio.Queue[MergeRequest],
         event_store: EventStore | None = None,
         on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
+        speculation_depth: int = _MERGE_AHEAD_BOUND,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4091,6 +4094,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
         self._on_merge_landed = on_merge_landed
+        # K = number of verify runners; sizes both caps so speculation depth
+        # and merger-ahead bound track runner count as a single knob (PRD D4).
+        # Default = _MERGE_AHEAD_BOUND (1) → byte-identical to prior behaviour.
+        self._speculation_depth: int = speculation_depth
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -4115,16 +4122,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Incremented on each consecutive tip-advance equivalence failure;
         # popped on a clean 'done' landing or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
-        # Depth-1 cap: cleared when a speculative merge is in flight,
-        # set by the Verifier when it finishes the item before the speculation.
-        self._speculation_slot = asyncio.Event()
-        self._speculation_slot.set()  # initially free
+        # Speculation-depth cap: one permit consumed by the Merger when it
+        # prefetches a speculative item; released by the Verifier when it drains
+        # that speculative item.  Symmetric accounting: acquire=prefetch,
+        # release=drain so in-flight speculations are bounded at
+        # _speculation_depth (K) at all times.  Plain Semaphore (not Bounded)
+        # so stop() may over-release without raising.
+        self._speculation_slot = asyncio.Semaphore(self._speculation_depth)
         # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
-        # build-ahead to _MERGE_AHEAD_BOUND items in the verifier queue.
+        # build-ahead to speculation_depth items in the verifier queue.
         # Plain Semaphore (not BoundedSemaphore) so stop() may over-release
         # without raising.  Released ON-DRAIN (right after verifier_queue.get()
         # for a counted item) so the slot is free while verify runs.
-        self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
+        self._merge_ahead_cap = asyncio.Semaphore(self._speculation_depth)
         # Per-lane halt: each event is set (running) by default
         self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
         for ln in MERGE_LANES:
@@ -4487,13 +4497,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
         shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
-        # Release speculation slot, all lane halts, and merge-ahead cap so the
-        # merger doesn't hang waiting at any synchronisation point.
+        # Release speculation-depth permits, all lane halts, and merge-ahead cap
+        # so the merger doesn't hang waiting at any synchronisation point.
         # Over-releasing a plain Semaphore is safe (it just increments the counter).
-        self._speculation_slot.set()
+        for _ in range(self._speculation_depth + 1):
+            self._speculation_slot.release()
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
-        for _ in range(_MERGE_AHEAD_BOUND + 1):
+        for _ in range(self._speculation_depth + 1):
             self._merge_ahead_cap.release()
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
@@ -4653,6 +4664,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         spec_base: str | None = None
         # Pre-fetched next request grabbed speculatively from main queue.
         prefetched: MergeRequest | None = None
+        # True exactly while the merger holds one _speculation_slot permit that
+        # has NOT yet been handed off to the verifier via _verifier_queue.put().
+        # Set True immediately after _speculation_slot.acquire() (:5003); set
+        # False after every _verifier_queue.put() hand-off (the verifier then
+        # owns the permit and releases it on drain), and on the no-pickable /
+        # shutdown release branches.  Every exit path that bypasses the verifier
+        # (abandoned-at-top, except WorktreeMissing, except Exception, outer
+        # finally) releases the permit and clears this flag.
+        held_spec_permit: bool = False
 
         try:
             while self._running:
@@ -4672,6 +4692,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # dequeued.  Skipping merge work avoids the orphan-halt
                 # window where no escalation owner is registered.
                 if self._request_abandoned(req):
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
                     continue
@@ -4719,6 +4742,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             skip_verify=False, immediate_outcome=outcome,
                             started_monotonic=t0,
                         ))
+                        # Train is put with speculative=False so the verifier
+                        # will NOT release the slot on drain.  Release explicitly
+                        # if the train was prefetched as a speculative item.
+                        if held_spec_permit:
+                            self._speculation_slot.release()
+                            held_spec_permit = False
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4753,6 +4782,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4779,6 +4809,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4810,6 +4841,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4826,6 +4858,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             immediate_outcome=MergeOutcome('already_merged'),
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4861,6 +4894,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4892,6 +4926,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             failure_diagnostic=_diag,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4937,6 +4972,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4977,18 +5013,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # simply increments past the original bound).
                         # Do NOT replace with asyncio.BoundedSemaphore, which
                         # raises ValueError on over-release and would crash here.
+                        #
+                        # The same double-release tolerance applies to
+                        # _speculation_slot: if this is a speculative item and
+                        # CancelledError fires after the put succeeded,
+                        # held_spec_permit remains True so the outer finally
+                        # releases the slot — and the verifier also releases it
+                        # on drain.  Both are plain Semaphores so over-release
+                        # is safe here too.
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise
+                    # The put succeeded — verifier now owns the speculation
+                    # permit for this item (released on drain if speculative).
+                    held_spec_permit = False
                     self._inflight_req = None  # item is now owned by verifier
 
-                    # ── Speculative look-ahead (depth-1 cap) ──────────────────
-                    # Non-blocking peek: if N+1 is already queued, grab it and
-                    # merge it against N's commit so the Verifier can CAS it
-                    # immediately after N succeeds.
-                    # Route through lane buffers so look-ahead prefers 'high'
-                    # and never speculatively picks from a halted lane.
-                    await self._speculation_slot.wait()  # depth-1 cap
+                    # ── Speculative look-ahead (depth-K cap) ──────────────────
+                    # Acquire one speculation permit before the look-ahead peek.
+                    # If an item is found and prefetched, the permit stays held;
+                    # the Verifier releases it when draining this speculative item.
+                    # If nothing is pickable (or shutdown), the permit is released
+                    # immediately — symmetric accounting keeps in-flight speculations
+                    # bounded at self._speculation_depth (K).
+                    await self._speculation_slot.acquire()  # depth-K cap
+                    held_spec_permit = True  # permit held until verifier drains or exception releases
                     # Harvest any item already delivered to the persistent
                     # getter so the look-ahead can see it via _pop_next_pickable.
                     if self._pending_get is not None and self._pending_get.done():
@@ -5001,7 +5050,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._drain_queue_into_lanes()
                     next_req = self._pop_next_pickable()
                     if next_req is not None:
-                        self._speculation_slot.clear()  # claim the slot
+                        # Permit stays held — verifier will release on drain.
                         prefetched = next_req
                         spec_base = merge_commit  # N+1 will merge against N's commit
                         logger.debug(
@@ -5009,8 +5058,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'{next_req.task_id} (base={merge_commit[:8]})'
                         )
                     elif self._shutdown_signaled:
+                        self._speculation_slot.release()  # return unused permit
+                        held_spec_permit = False
                         break  # shutdown sentinel and nothing left to speculate
                     else:
+                        self._speculation_slot.release()  # no pickable item — return permit
+                        held_spec_permit = False
                         spec_base = None  # no pickable item, no speculation
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
@@ -5044,6 +5097,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 ),
                             )
                         )
+                    # Release any speculation permit held for a prefetched item
+                    # that failed before being put on the verifier queue.
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
                 except Exception as exc:
@@ -5071,9 +5129,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._inflight_req.result.set_result(
                             MergeOutcome('blocked', reason=f'Merger error: {exc}')
                         )
+                    # Release any speculation permit held for a prefetched item
+                    # that failed before being put on the verifier queue.
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
         finally:
+            # Release any speculation permit still held — covers BaseException
+            # paths (e.g. CancelledError) that bypass the inner except clauses.
+            if held_spec_permit:
+                self._speculation_slot.release()
             # Resolve any in-flight request not yet handed to the verifier.
             # Covers BaseException paths (e.g. CancelledError) that bypass
             # the inner except clause above.
@@ -5137,7 +5204,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Treat as failed for chain-invalidation: any speculative
                 # item built on this one's commit is now stale.
                 n_failed = True
-                self._speculation_slot.set()
+                if item.speculative:
+                    self._speculation_slot.release()
                 continue
 
             # Operator halt: bounce real verify candidates back to the merger
@@ -5157,11 +5225,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     with contextlib.suppress(BaseException):
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                 n_failed = True
-                self._speculation_slot.set()
+                if item.speculative:
+                    self._speculation_slot.release()
                 self._queue.put_nowait(req)
                 continue
 
             try:
+                # Capture the original speculative flag BEFORE any _remerge
+                # reassignment so the finally can release the slot for exactly
+                # the items that consumed a permit (speculation_slot.acquire()
+                # was called by the Merger for every speculative prefetch).
+                # _remerge reassigns `item` to a non-speculative remapped item,
+                # so reading item.speculative in finally would miss the release.
+                item_was_speculative = item.speculative
+
                 # ── Unified re-merge site (Mechanism 2 + existing chain-invalidation) ─
                 #
                 # remerge_reason is set when the item must be re-merged:
@@ -5307,7 +5384,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._verify_item = None
                 self._verify_phase = None
                 self._verify_started_at = None
-                self._speculation_slot.set()
+                # Release one speculation permit only if the ORIGINAL item
+                # consumed one (i.e. it was a speculative prefetch).  Use
+                # item_was_speculative (captured before any _remerge reassignment)
+                # because _remerge replaces `item` with a non-speculative
+                # remapped item, so `item.speculative` would be False even for
+                # originally-speculative items that were re-merged.
+                if item_was_speculative:
+                    self._speculation_slot.release()
 
     async def _build_merge_failure_diagnostic(
         self,
@@ -6113,4 +6197,66 @@ def check_merge_liveness_margin(
             max_verify_timeouts,
         )
 
+    return assessment
+
+
+class MergeLivenessConfigError(Exception):
+    """Raised by :func:`enforce_merge_liveness_margin` when the configured
+    merge-ahead bound × cold-verify timeout exceeds the reaper liveness
+    threshold, indicating that startup should be refused.
+
+    The exception message contains the numeric details (worst_case, threshold,
+    timeout, bound) for operator triage.
+    """
+
+
+def enforce_merge_liveness_margin(
+    config: OrchestratorConfig,
+    *,
+    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+    liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    safety_factor: float = 0.75,
+    logger: logging.Logger = logger,
+) -> MergeLivenessAssessment:
+    """Fail-closed wrapper around :func:`check_merge_liveness_margin`.
+
+    Delegates entirely to :func:`check_merge_liveness_margin` (which remains
+    WARNING-only / fail-open) and raises :exc:`MergeLivenessConfigError` when
+    the assessment is ``not safe``, causing startup to be refused.
+
+    Args:
+        config: Live per-project orchestrator config.
+        merge_ahead_bound: Override for :data:`_MERGE_AHEAD_BOUND`.
+        max_verify_timeouts: Override for
+            :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`.
+        liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
+        safety_factor: Fraction of *liveness_secs* that constitutes the
+            threshold.  Default 0.75.
+        logger: Logger forwarded to :func:`check_merge_liveness_margin`.
+
+    Returns:
+        :class:`MergeLivenessAssessment` when the config is safe.
+
+    Raises:
+        :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``.
+    """
+    assessment = check_merge_liveness_margin(
+        config,
+        merge_ahead_bound=merge_ahead_bound,
+        max_verify_timeouts=max_verify_timeouts,
+        liveness_secs=liveness_secs,
+        safety_factor=safety_factor,
+        logger=logger,
+    )
+    if not assessment.safe:
+        raise MergeLivenessConfigError(
+            f'enforce_merge_liveness_margin: startup refused — queued _merge-* '
+            f'worktree worst-case age ({assessment.worst_case_secs:.0f}s) is not '
+            f'below the reaper liveness threshold ({assessment.threshold_secs:.0f}s, '
+            f'factor={safety_factor:.2f}, liveness={assessment.liveness_secs:.0f}s). '
+            f'Reduce merge_verify_cold_command_timeout_secs (currently '
+            f'{assessment.timeout_secs:.0f}s) or lower merge_ahead_bound '
+            f'(currently {assessment.merge_ahead_bound}).'
+        )
     return assessment
