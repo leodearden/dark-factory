@@ -521,6 +521,7 @@ async def _run_post_merge_verify(
             merge_wt, req.config, req.module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
+            task_id=req.task_id,
         )],
         event_store=event_store,
         task_id=req.task_id,
@@ -552,7 +553,7 @@ async def _run_post_merge_verify(
                 'stale merge worktree(s), retrying verify once',
                 req.task_id, len(pruned),
             )
-            verify = await pool.dispatch(merge_sha, spec)
+            verify = await pool.dispatch(merge_sha, spec, attempt=1)
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)

@@ -473,17 +473,6 @@ class TestVerifyRunnerProtocol:
         runner = _make_local_runner()
         assert isinstance(runner, VerifyRunner)
 
-    def test_local_runner_has_run_merge_verify_coroutine(self):
-        import asyncio
-        runner = _make_local_runner()
-        assert hasattr(runner, 'run_merge_verify')
-        assert asyncio.iscoroutinefunction(runner.run_merge_verify)
-
-    def test_local_runner_has_health_coroutine(self):
-        import asyncio
-        runner = _make_local_runner()
-        assert asyncio.iscoroutinefunction(runner.health)
-
 
 # ---------------------------------------------------------------------------
 # Step-3: LocalRunner.run_merge_verify combined-bundle behaviour

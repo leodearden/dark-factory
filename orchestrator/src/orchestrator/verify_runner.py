@@ -330,6 +330,7 @@ class LocalRunner:
         *,
         run_scoped: Callable[..., Awaitable[VerifyResult]],
         run_unscoped: Callable[..., Awaitable[Any]],
+        task_id: str | None = None,
     ) -> None:
         self._merge_wt = merge_wt
         self._config = config
@@ -337,6 +338,7 @@ class LocalRunner:
         self._task_files = task_files
         self._run_scoped = run_scoped
         self._run_unscoped = run_unscoped
+        self._task_id = task_id
 
     async def health(self) -> bool:
         return True
@@ -352,6 +354,12 @@ class LocalRunner:
         (preserving today's short-circuit). An unscoped-gate-broken outcome is
         encoded into a VerifyResult via a sentinel category so callers can branch
         byte-identically.
+
+        NOTE: ``spec`` is accepted for VerifyRunner protocol conformance and
+        forward-compat with γ/δ remote runners.  LocalRunner drives execution
+        from its injected callables + live config, not from the spec.
+        TODO(γ): when a RemoteRunner is added, spec replaces the per-call
+        config/module_configs projection for off-host dispatch.
         """
         scoped = await self._run_scoped(
             self._merge_wt,
@@ -371,6 +379,7 @@ class LocalRunner:
             self._config,
             self._module_configs,
             block_on_timeout=True,
+            task_id=self._task_id,
         )
         if gate.broken:
             failing = gate.failing_subprojects
@@ -439,8 +448,19 @@ class VerifyRunnerPool:
         self._event_store = event_store
         self._task_id = task_id
 
-    async def dispatch(self, merge_sha: str, spec: MergeVerifySpec) -> VerifyResult:
-        """Run the verify bundle and emit a merge_verify event."""
+    async def dispatch(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        *,
+        attempt: int = 0,
+    ) -> VerifyResult:
+        """Run the verify bundle and emit a merge_verify event.
+
+        ``attempt`` is 0 for the first dispatch and incremented for each
+        ENOSPC-retry re-dispatch.  Included in the event data so consumers
+        can deduplicate multiple events for the same logical merge-verify.
+        """
         from orchestrator.event_store import EventType
 
         t0 = time.monotonic()
@@ -456,6 +476,7 @@ class VerifyRunnerPool:
                     'merge_sha': merge_sha,
                     'passed': result.passed,
                     'duration_ms': duration_ms,
+                    'attempt': attempt,
                 },
             )
 
