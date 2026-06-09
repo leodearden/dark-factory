@@ -10,6 +10,7 @@ from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     LocalRunner,
     MergeVerifySpec,
+    RemoteRunner,
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
@@ -1211,3 +1212,102 @@ class TestRemoteRunnerConstruction:
         # health() must never raise
         result = await runner.health()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# δ step-5: RemoteRunner.run_merge_verify — happy path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerHappyPath:
+    """run_merge_verify happy path: git push + ssh + parse stdout."""
+
+    def _make_runner_and_calls(self, expected_result, *, config_path=None):
+        """Return (runner, calls_list) where calls_list is appended to on each run()."""
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append((argv, cwd))
+            # git push → rc=0
+            if argv[0] == 'git':
+                return (0, '', '')
+            # ssh → rc=0 with VerifyResult JSON stdout
+            return (0, result_to_json(expected_result), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            config_path=config_path,
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_returns_verify_result_equal_to_expected(self):
+        from orchestrator.verify_runner import RemoteRunner
+        expected = VerifyResult(
+            passed=True,
+            test_output='all green',
+            lint_output='',
+            type_output='',
+            summary='ok',
+        )
+        runner, _ = self._make_runner_and_calls(expected)
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result == expected
+
+    async def test_git_push_argv_and_cwd(self):
+        from orchestrator.verify_runner import RemoteRunner
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', _make_spec())
+        # first call is the git push
+        push_argv, push_cwd = calls[0]
+        assert push_argv == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+        assert push_cwd == '/repo'
+
+    async def test_ssh_argv_with_shlex_quoted_spec(self):
+        """ssh is called as ['ssh', host, remote_cmd] where shlex.split(remote_cmd) round-trips."""
+        import shlex as _shlex
+        from orchestrator.verify_runner import RemoteRunner, spec_to_json
+        spec = _make_spec()
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', spec)
+        # second call is the ssh
+        ssh_argv, _ = calls[1]
+        assert ssh_argv[0] == 'ssh'
+        assert ssh_argv[1] == 'laptop.local'
+        remote_cmd = ssh_argv[2]
+        parsed = _shlex.split(remote_cmd)
+        assert parsed[:4] == ['orchestrator', 'verify-merge', '--sha', 'abc123']
+        # spec JSON survives as a single token
+        spec_idx = parsed.index('--spec') + 1
+        assert parsed[spec_idx] == spec_to_json(spec)
+        # no --config when not set
+        assert '--config' not in parsed
+
+    async def test_ssh_argv_includes_config_path_when_set(self):
+        """When config_path is set, ['--config', config_path] appears in the remote cmd."""
+        import shlex as _shlex
+        from orchestrator.verify_runner import RemoteRunner
+        spec = _make_spec()
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected, config_path='/etc/orch.yaml')
+        await runner.run_merge_verify('abc123', spec)
+        ssh_argv, _ = calls[1]
+        parsed = _shlex.split(ssh_argv[2])
+        cfg_idx = parsed.index('--config') + 1
+        assert parsed[cfg_idx] == '/etc/orch.yaml'
+
+    async def test_request_id_from_id_factory(self):
+        """The pushed ref uses the id_factory's return value."""
+        from orchestrator.verify_runner import RemoteRunner
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', _make_spec())
+        push_argv, _ = calls[0]
+        assert push_argv[3] == 'abc123:refs/merge-verify/fixed-id'
