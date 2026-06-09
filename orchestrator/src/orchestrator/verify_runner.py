@@ -413,7 +413,7 @@ class VerifyRunner(Protocol):
     """
 
     name: str
-    is_local: bool
+    is_local: ClassVar[bool]
 
     async def health(self) -> bool:
         """Return True when this runner is reachable and healthy."""
@@ -597,6 +597,9 @@ class RemoteRunner:
         self._config_path = config_path
         self._run = run if run is not None else _default_subprocess_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+        # Optional test-instrumentation hook: tests may assign a list to this
+        # attribute so they can inspect all subprocess argv lists after the fact.
+        self._calls: list[list[str]] = []
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
