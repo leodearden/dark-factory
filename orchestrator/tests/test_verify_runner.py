@@ -8,16 +8,15 @@ import pytest
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     MergeVerifySpec,
+    UnscopedTypecheckSpec,
+    VerifyCommand,
     result_from_dict,
     result_from_json,
     result_to_dict,
     result_to_json,
     spec_from_json,
     spec_to_json,
-    UnscopedTypecheckSpec,
-    VerifyCommand,
 )
-
 
 # ---------------------------------------------------------------------------
 # VerifyCommand
