@@ -4614,6 +4614,32 @@ class TestMergeOutcomeDataclass:
         outcome_with_sha = MergeOutcome('done', merge_sha='abc123')  # type: ignore[call-arg]
         assert outcome_with_sha.merge_sha == 'abc123'  # type: ignore[attr-defined]
 
+    def test_failure_fingerprint_fields_default_empty_and_round_trip(self):
+        """task-1688 step-1: MergeOutcome carries failure_category / failure_cause_hint.
+
+        (a) Default construction has both fields as ''.
+        (b) Explicit construction round-trips both values.
+        (c) Existing positional construction MergeOutcome('done') still works.
+        """
+        # (a) defaults
+        outcome_defaults = MergeOutcome('blocked', reason='x')
+        assert outcome_defaults.failure_category == ''  # type: ignore[attr-defined]
+        assert outcome_defaults.failure_cause_hint == ''  # type: ignore[attr-defined]
+
+        # (b) round-trip
+        outcome_explicit = MergeOutcome(  # type: ignore[call-arg]
+            'blocked',
+            reason='x',
+            failure_category='gui_tsc',
+            failure_cause_hint='StatusBar.tsx error TS2322',
+        )
+        assert outcome_explicit.failure_category == 'gui_tsc'  # type: ignore[attr-defined]
+        assert outcome_explicit.failure_cause_hint == 'StatusBar.tsx error TS2322'  # type: ignore[attr-defined]
+
+        # (c) positional backward compat
+        outcome_positional = MergeOutcome('done')
+        assert outcome_positional.status == 'done'
+
 
 # ---------------------------------------------------------------------------
 # TestGenerationFieldsIdentity — γ2 step-01 RED: 'superseded' status +
