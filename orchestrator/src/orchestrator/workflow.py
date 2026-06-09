@@ -447,6 +447,11 @@ class TaskWorkflow:
         # check (Fix 3).  Cleared between merge attempts so a stale
         # reason from an earlier task slot can't poison the signature.
         self._last_merge_block_reason: str | None = None
+        # Structured fingerprint fields from the post-merge VerifyResult —
+        # task-1688.  Keyed by _merge_outcome_signature() for stable thrash
+        # detection across retries where prose varies but root cause is the same.
+        self._last_merge_failure_category: str = ''
+        self._last_merge_failure_cause_hint: str = ''
 
         # Background asyncio.Tasks spawned by _spawn_dry_run_unblock.
         # Holding a strong reference prevents the event loop's weak-ref GC
@@ -1342,6 +1347,8 @@ class TaskWorkflow:
 
                             # Phase 2: submit to merge queue (replaces _merge_lock)
                             self._last_merge_block_reason = None
+                            self._last_merge_failure_category = ''
+                            self._last_merge_failure_cause_hint = ''
                             merge_outcome = await self._submit_to_merge_queue(
                                 branch_name, pre_rebased=pre_rebased,
                                 merge_phase=True,
@@ -1373,9 +1380,7 @@ class TaskWorkflow:
                             # outcome signature.  At threshold escalates to L1
                             # rather than resubmitting the same merge.
                             if self._last_merge_block_reason is not None:
-                                current_signature = hashlib.sha256(
-                                    self._last_merge_block_reason.encode('utf-8'),
-                                ).hexdigest()[:16]
+                                current_signature = self._merge_outcome_signature()
                                 prev_signature = (
                                     self.task.get('metadata') or {}
                                 ).get('last_merge_outcome_signature')
@@ -2720,12 +2725,41 @@ class TaskWorkflow:
                 self.task_id, counter,
                 self.config.max_consecutive_merge_thrash,
             )
+            root_cause = (
+                f'merge-outcome-thrash:{self._last_merge_failure_category}:'
+                f'{_normalize_cause_hint(self._last_merge_failure_cause_hint)}'
+            )
             return await self._mark_blocked(
                 f'Repeated merge-phase thrash (counter={counter})',
                 detail=f'merge_outcome_signature={current_signature}',
                 escalate_to_human=True,
+                root_cause=root_cause,
             )
         return None
+
+    def _merge_outcome_signature(self) -> str:
+        """Return a 16-hex-char signature for the current merge-block fingerprint.
+
+        Keys on (category, normalised cause_hint) when either structured field
+        is populated — the same stable shape the in-branch contagion guard uses
+        (#1645, workflow.py:3544).  Falls back to sha256(normalised_reason) when
+        both structured fields are empty (e.g. git ff/merge errors with no
+        VerifyResult), which is a strict improvement over the old raw-reason hash.
+
+        Deploy note: this method replaced the old sha256(raw_reason) scheme. Any
+        task in-flight at deploy time will have a persisted
+        metadata.last_merge_outcome_signature in the old format; on the next merge
+        failure prev_signature (old) != current_signature (new), so
+        consecutive_merge_thrash resets to 1 — at most one extra thrash cycle
+        before the counter re-accumulates. Self-healing and benign.
+        """
+        category = self._last_merge_failure_category
+        cause_hint = self._last_merge_failure_cause_hint
+        if category or cause_hint:
+            basis = (category + '\x1f' + _normalize_cause_hint(cause_hint)).encode('utf-8')
+        else:
+            basis = _normalize_cause_hint(self._last_merge_block_reason or '').encode('utf-8')
+        return hashlib.sha256(basis).hexdigest()[:16]
 
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
@@ -4173,6 +4207,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
         self._last_merge_block_reason = result.reason
+        self._last_merge_failure_category = result.failure_category
+        self._last_merge_failure_cause_hint = result.failure_cause_hint
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
             category = 'post_merge_verify'
@@ -5607,6 +5643,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         category: str = 'task_failure',
         dedupe_fingerprint: str | None = None,
         spawn_dry_run: bool = False,
+        root_cause: str = '',
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5734,6 +5771,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if escalate_to_human:
                 await self._ensure_l1_escalation_for_blocked(
                     reason, detail or reason, category=category,
+                    root_cause=root_cause,
                 )
                 return WorkflowOutcome.BLOCKED
 
@@ -6023,6 +6061,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
+        root_cause: str = '',
     ) -> None:
         """Submit a level-1 escalation if none is open for this task.
 
@@ -6060,6 +6099,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             workflow_state=self.state.value,
             level=1,
             train_state=train_state,
+            root_cause=root_cause,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:

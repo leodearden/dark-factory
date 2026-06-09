@@ -461,7 +461,11 @@ async def _run_post_merge_verify(
                     'row — next submission will be abandoned',
                     req.task_id, new_count,
                 )
-        return MergeOutcome('blocked', reason=reason)
+        return MergeOutcome(
+            'blocked', reason=reason,
+            failure_category=verify.category,
+            failure_cause_hint=verify.cause_hint,
+        )
 
     # Pre-advance, fail-closed unscoped type-check gate.
     # Runs ONLY type_check_command unscoped against the already-created merge_wt
@@ -2778,6 +2782,12 @@ class MergeOutcome:
     merge_sha: str | None = None
     push_status: str | None = None
     failure_diagnostic: dict[str, str] | None = None
+    failure_category: str = ''
+    """Structured post-merge VerifyResult category (e.g. 'gui_tsc') for the
+    workflow merge-thrash signature.  Empty when no VerifyResult was produced."""
+    failure_cause_hint: str = ''
+    """Structured post-merge VerifyResult cause_hint for the workflow
+    merge-thrash signature.  Empty when no VerifyResult was produced."""
     verify_skipped: bool = False
     """True when the disk guard fired and ``run_scoped_verification`` was never
     called.  Lets callers distinguish a disk-guard short-circuit from an actual

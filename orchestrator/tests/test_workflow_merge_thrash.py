@@ -340,3 +340,255 @@ async def test_post_merge_pyright_broken_short_circuits_to_l1_excluded_from_thra
     )
     # (d) short-circuit fires before steward-path sets _last_merge_block_reason
     assert wf._last_merge_block_reason == 'sentinel'
+
+
+# ---------------------------------------------------------------------------
+# task-1688 step-5 RED: stable merge-thrash signature
+# ---------------------------------------------------------------------------
+
+
+def test_merge_outcome_signature_same_fingerprint_equal_despite_varied_reason():
+    """_merge_outcome_signature is stable when category+normalized_cause_hint are identical.
+
+    Two captures with the same category and cause_hint differing only by line
+    number produce EQUAL signatures, even if the prose reason differs.
+    A different category OR different normalised cause_hint yields a DIFFERENT
+    signature.
+    """
+    f = _make()
+    wf = f.wf
+
+    # Set the structured fingerprint fields for 'StatusBar.tsx line 42'
+    wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: tests failed, lint issues\n\nsome output'
+    sig_a = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    # Same category + cause_hint differing only by line number → same normalised key
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: unknown_test_failure\n\ndifferent output'
+    sig_b = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    assert sig_a == sig_b, (
+        f'Same fingerprint (category, normalised cause_hint) must yield equal signature; '
+        f'got {sig_a!r} vs {sig_b!r}'
+    )
+    assert len(sig_a) == 16 and all(c in '0123456789abcdef' for c in sig_a), (
+        f'Signature must be 16 hex chars, got {sig_a!r}'
+    )
+
+    # Different category → different signature
+    wf._last_merge_failure_category = 'test_failure'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    sig_different_category = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    assert sig_different_category != sig_a, (
+        'Different category must yield a different signature'
+    )
+
+    # Different normalised cause_hint → different signature
+    wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'OtherComponent.tsx:10 error TS9999: something else'  # type: ignore[attr-defined]
+    sig_different_hint = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    assert sig_different_hint != sig_a, (
+        'Different cause_hint must yield a different signature'
+    )
+
+
+def test_merge_outcome_signature_fallback_when_structured_fields_empty():
+    """_merge_outcome_signature falls back to sha256(normalised_reason) when both fields are ''.
+
+    The fallback applies _normalize_cause_hint (lowercase + whitespace-collapse),
+    so reasons that differ only by case or whitespace produce the same signature.
+    """
+    f = _make()
+    wf = f.wf
+
+    wf._last_merge_failure_category = ''  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = ''  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: TESTS FAILED\n\nextra output'
+    sig_fallback = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    assert len(sig_fallback) == 16 and all(c in '0123456789abcdef' for c in sig_fallback), (
+        f'Fallback signature must be 16 hex chars, got {sig_fallback!r}'
+    )
+
+    # Reason differing only by case/whitespace → same fallback sig (normalisation applied)
+    wf._last_merge_block_reason = 'post-merge verification failed:  tests  failed\n\nextra  output'
+    sig_normalised = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    assert sig_normalised == sig_fallback, (
+        'Fallback signatures must match for reasons that differ only by case/whitespace'
+    )
+
+    # Different reason → different fallback sig
+    wf._last_merge_block_reason = 'git merge failed: conflict in foo.py'
+    sig_other = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    assert sig_other != sig_fallback
+
+
+@pytest.mark.asyncio
+async def test_stable_signature_reaches_threshold_and_escalates():
+    """task-1688 step-5 end-to-end: same fingerprint + varied prose → reaches threshold.
+
+    Drive _check_merge_outcome_thrash twice using signatures from
+    _merge_outcome_signature (same category+cause_hint, different reason prose).
+    Counter reaches max_consecutive_merge_thrash (=2) → _mark_blocked with
+    escalate_to_human=True.
+    """
+    f = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    wf = f.wf
+
+    # Simulate capturing first failure
+    wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: tests failed\n\nfirst attempt'
+    first_sig = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    # Persist the first sig as prev_signature (simulates the prior iteration)
+    wf.task['metadata']['last_merge_outcome_signature'] = first_sig
+
+    # Simulate second failure — same fingerprint but prose differs (line num shifts)
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: unknown_test_failure\n\nsecond attempt'
+    second_sig = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    assert first_sig == second_sig, (
+        'Precondition: same fingerprint must produce equal signatures'
+    )
+
+    outcome = await wf._check_merge_outcome_thrash(
+        prev_signature=first_sig, current_signature=second_sig,
+    )
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
+
+
+@pytest.mark.asyncio
+async def test_genuinely_different_fingerprint_resets_counter_to_1():
+    """task-1688 step-5: different fingerprint resets counter to 1, no escalation."""
+    f = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    wf = f.wf
+
+    wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: tests failed'
+    sig_first = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    # Genuinely different failure: different category
+    wf._last_merge_failure_category = 'test_failure'  # type: ignore[attr-defined]
+    wf._last_merge_failure_cause_hint = 'some_test.py:10 AssertionError'  # type: ignore[attr-defined]
+    wf._last_merge_block_reason = 'Post-merge verification failed: test exploded'
+    sig_second = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+
+    assert sig_first != sig_second, 'Precondition: different fingerprints'
+
+    outcome = await wf._check_merge_outcome_thrash(
+        prev_signature=sig_first, current_signature=sig_second,
+    )
+
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['consecutive_merge_thrash'] == 1, (
+        f'Counter must reset to 1 on different fingerprint, got {md}'
+    )
+    f.mark_blocked.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task-1688 step-7 RED: stable root_cause threaded to L1 escalation for L2 dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thrash_threshold_passes_stable_root_cause_to_mark_blocked():
+    """task-1688 step-7(a): _check_merge_outcome_thrash at threshold calls _mark_blocked
+    with a non-empty root_cause kwarg derived from (category, normalised cause_hint).
+
+    Two TaskWorkflow instances that captured the SAME fingerprint must produce
+    the IDENTICAL root_cause string so find_pending_l2_by_root_cause folds them.
+    """
+    # Instance A
+    fa = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    fa.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    fa.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    sig_a = fa.wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    fa.wf.task['metadata']['last_merge_outcome_signature'] = sig_a
+    outcome_a = await fa.wf._check_merge_outcome_thrash(
+        prev_signature=sig_a, current_signature=sig_a,
+    )
+    assert outcome_a == WorkflowOutcome.BLOCKED
+    fa.mark_blocked.assert_awaited_once()
+    _, kwargs_a = fa.mark_blocked.await_args
+    root_cause_a = kwargs_a.get('root_cause', '')
+    assert root_cause_a, 'root_cause must be non-empty when fingerprint is set'
+    assert 'gui_tsc' in root_cause_a, f'root_cause must mention category: {root_cause_a!r}'
+
+    # Instance B — same fingerprint (line number differs only)
+    fb = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    fb.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    fb.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    sig_b = fb.wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    fb.wf.task['metadata']['last_merge_outcome_signature'] = sig_b
+    outcome_b = await fb.wf._check_merge_outcome_thrash(
+        prev_signature=sig_b, current_signature=sig_b,
+    )
+    assert outcome_b == WorkflowOutcome.BLOCKED
+    _, kwargs_b = fb.mark_blocked.await_args
+    root_cause_b = kwargs_b.get('root_cause', '')
+
+    assert root_cause_a == root_cause_b, (
+        f'Sibling tasks with the same fingerprint must produce identical root_cause; '
+        f'got {root_cause_a!r} vs {root_cause_b!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_l1_escalation_stamps_root_cause():
+    """task-1688 step-7(b): _ensure_l1_escalation_for_blocked stamps esc.root_cause.
+
+    Drives _ensure_l1_escalation_for_blocked with a fake escalation_queue
+    (has_open_l1 → False) and asserts the submitted Escalation has
+    esc.root_cause equal to the value passed.
+    """
+    from unittest.mock import patch
+
+    f = _make()
+    wf = f.wf
+
+    expected_root_cause = 'merge-outcome-thrash:gui_tsc:statusbar.tsx error ts2322: type x not assignable'
+
+    submitted_escs: list = []
+    mock_queue = MagicMock()
+    mock_queue.has_open_l1 = MagicMock(return_value=False)
+    mock_queue.make_id = MagicMock(return_value='esc-test-1')
+    mock_queue.submit = MagicMock(side_effect=submitted_escs.append)
+    wf.escalation_queue = mock_queue  # type: ignore[assignment]
+    wf.event_store = None
+
+    with patch.object(wf, '_build_train_state', new=AsyncMock(return_value=None)), patch.object(wf, '_durable_ref_suffix', return_value=''):
+        await wf._ensure_l1_escalation_for_blocked(
+            'Repeated merge-phase thrash',
+            'detail here',
+            category='task_failure',
+            root_cause=expected_root_cause,
+        )
+
+    assert len(submitted_escs) == 1, f'Expected 1 submitted escalation, got {submitted_escs}'
+    esc = submitted_escs[0]
+    assert esc.root_cause == expected_root_cause, (
+        f'Expected root_cause={expected_root_cause!r}, got {esc.root_cause!r}'
+    )

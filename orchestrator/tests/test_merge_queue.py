@@ -4614,6 +4614,32 @@ class TestMergeOutcomeDataclass:
         outcome_with_sha = MergeOutcome('done', merge_sha='abc123')  # type: ignore[call-arg]
         assert outcome_with_sha.merge_sha == 'abc123'  # type: ignore[attr-defined]
 
+    def test_failure_fingerprint_fields_default_empty_and_round_trip(self):
+        """task-1688 step-1: MergeOutcome carries failure_category / failure_cause_hint.
+
+        (a) Default construction has both fields as ''.
+        (b) Explicit construction round-trips both values.
+        (c) Existing positional construction MergeOutcome('done') still works.
+        """
+        # (a) defaults
+        outcome_defaults = MergeOutcome('blocked', reason='x')
+        assert outcome_defaults.failure_category == ''  # type: ignore[attr-defined]
+        assert outcome_defaults.failure_cause_hint == ''  # type: ignore[attr-defined]
+
+        # (b) round-trip
+        outcome_explicit = MergeOutcome(  # type: ignore[call-arg]
+            'blocked',
+            reason='x',
+            failure_category='gui_tsc',
+            failure_cause_hint='StatusBar.tsx error TS2322',
+        )
+        assert outcome_explicit.failure_category == 'gui_tsc'  # type: ignore[attr-defined]
+        assert outcome_explicit.failure_cause_hint == 'StatusBar.tsx error TS2322'  # type: ignore[attr-defined]
+
+        # (c) positional backward compat
+        outcome_positional = MergeOutcome('done')
+        assert outcome_positional.status == 'done'
+
 
 # ---------------------------------------------------------------------------
 # TestGenerationFieldsIdentity — γ2 step-01 RED: 'superseded' status +
@@ -10489,6 +10515,51 @@ class TestRunPostMergeVerify:
             )
 
         git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_blocked_merge_outcome_carries_verify_fingerprint_fields(self) -> None:
+        """task-1688 step-3: _run_post_merge_verify copies category/cause_hint to MergeOutcome.
+
+        Stubs run_scoped_verification to return a failing VerifyResult with
+        category='gui_tsc' and cause_hint='StatusBar.tsx:42 error TS2322: Type X not
+        assignable'.  Asserts the returned blocked MergeOutcome has those values
+        in failure_category and failure_cause_hint verbatim.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        failing_verify = MagicMock(
+            passed=False,
+            summary='tests failed',
+            timed_out=False,
+            category='gui_tsc',
+            cause_hint='StatusBar.tsx:42 error TS2322: Type X not assignable',
+        )
+        failing_verify.failure_report.return_value = ''
+        failing_verify.test_output = ''
+        failing_verify.lint_output = ''
+        failing_verify.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failing_verify)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.failure_category == 'gui_tsc', (  # type: ignore[attr-defined]
+            f'expected failure_category="gui_tsc", got {result.failure_category!r}'  # type: ignore[attr-defined]
+        )
+        assert result.failure_cause_hint == 'StatusBar.tsx:42 error TS2322: Type X not assignable', (  # type: ignore[attr-defined]
+            f'unexpected failure_cause_hint: {result.failure_cause_hint!r}'  # type: ignore[attr-defined]
+        )
 
 
 # ---------------------------------------------------------------------------
