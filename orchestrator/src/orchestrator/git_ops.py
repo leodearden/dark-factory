@@ -697,10 +697,12 @@ class GitOps:
                     )
 
                 _ensure_task_gitignore(worktree_path)
+                port = await self._provision_reify_debug_port(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,
                     base_commit=actual_base,
                     stale_commits=stale_commits,
+                    reify_debug_port=port,
                 )
             elif worktree_path.exists():
                 # The directory exists but git does not recognize it as a
