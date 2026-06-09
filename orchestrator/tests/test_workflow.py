@@ -529,7 +529,7 @@ class TestWorkflowMergeInflightRegistry:
         assignment.task_id = '999'
         assignment.task = {'id': '999', 'title': 'T', 'description': 'd'}
         assignment.modules = []
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -581,7 +581,7 @@ class TestSubmitToMergeQueueRegistersInRegistry:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -637,7 +637,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1006,7 +1006,7 @@ class TestAttachedWaiterOutcomeMapping:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1133,7 +1133,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1215,7 +1215,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1372,7 +1372,7 @@ class TestGroupMergePathUnchangedByGamma3:
         }
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1440,7 +1440,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1581,7 +1581,7 @@ class TestBoundaryTableWorkflow:
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
