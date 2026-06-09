@@ -11173,3 +11173,64 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
+
+
+class TestStage2PromptSuppressPrecheck:
+    """Stage 2 prompt must mandate a deterministic count_memories_by_metadata
+    pre-check before writing completion notes for already-done tasks.
+
+    Task 1685: the stage2_suppress guard must use an exact Qdrant payload-filter
+    count rather than semantic search ranking, which has a documented 0.71
+    false-negative precedent (task 1680 guard memories 492e02ab/e8cb6795 +
+    procedural norm 2fd528f8 ranking below threshold).
+
+    Mirrors the sanctioned TDD pattern for prompt-rule tasks:
+      TestStage2PromptCycleSummaryPoolTag (~line 10925)
+      TestStage2PromptNonceMechanism (~line 1611)
+    Minimal operational-token existence checks only — no prose-wording pins
+    (the task-1570 norm deleted brittle prose-pin tests).
+    """
+
+    def test_stage2_prompt_mandates_stage2_suppress_count_precheck(self):
+        """build_stage2_system_prompt('dark_factory') must include the
+        deterministic stage2_suppress pre-check contract tokens.
+
+        Asserts that the assembled prompt contains all four operational tokens
+        required for the suppression pre-check to function (task 1685):
+          (a) 'stage2_suppress' — the metadata filter key the agent must use
+          (b) "'stage2_suppress': True" — the exact key=value the agent must emit
+              (also verifies f-string brace-doubling evaluated correctly)
+          (c) 'count_memories_by_metadata' — the deterministic, semantic-
+              ranking-independent tool (already present for cycle-summary;
+              asserted here as a cohesive producer/consumer contract)
+          (d) 'count > 0' — the skip threshold the agent must check
+
+        Without these tokens the Stage 2 agent never performs the count pre-check
+        and the suppression silently falls back to unreliable semantic ranking.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        assert 'stage2_suppress' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include 'stage2_suppress' "
+            "so the Stage 2 agent knows which metadata filter key to use for the "
+            "deterministic pre-check (task 1685 — prevents false-negative semantic miss)."
+        )
+        assert "'stage2_suppress': True" in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include the literal fragment "
+            "\"'stage2_suppress': True\" so the agent emits the exact Qdrant payload "
+            "filter key=value; also verifies f-string {{ }} brace-doubling evaluated "
+            "correctly (task 1685)."
+        )
+        assert 'count_memories_by_metadata' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include "
+            "'count_memories_by_metadata' as the deterministic tool for the suppression "
+            "pre-check (task 1685 — exact payload-filter count is independent of "
+            "semantic ranking)."
+        )
+        assert 'count > 0' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include 'count > 0' "
+            "as the skip threshold for the completion-note suppression pre-check "
+            "(task 1685 — agent must skip the write when any stage2_suppress guard "
+            "memory exists for the task)."
+        )
