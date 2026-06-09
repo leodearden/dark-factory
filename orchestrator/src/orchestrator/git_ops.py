@@ -1556,6 +1556,12 @@ class GitOps:
         *wt_path* is the raw path from porcelain output (used for git commands).
         *wt_resolved* is the resolved path (used for identity comparisons such
         as the ``keep`` exclusion in :meth:`prune_stale_merge_worktrees`).
+
+        **Persistent-worktree exemption**: the fixed
+        :data:`PERSISTENT_MERGE_WORKTREE_NAME` (``_merge-verify``) is always
+        skipped so that both :meth:`prune_stale_merge_worktrees` (PRD §10
+        invariant 4) and :meth:`find_inflight_merge_worktree` never touch or
+        return the warm worktree.
         """
         rc, out, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'],
@@ -1575,6 +1581,10 @@ class GitOps:
             if wt_resolved.parent != self.worktree_base:
                 continue
             if not wt_resolved.name.startswith('_merge-'):
+                continue
+            # Exempt the persistent warm merge-verify worktree — prune and
+            # find_inflight must never touch it (invariant 4).
+            if wt_resolved.name == PERSISTENT_MERGE_WORKTREE_NAME:
                 continue
             yield wt_path, wt_resolved
 
@@ -1597,6 +1607,11 @@ class GitOps:
         prefixed that way).  Enumerates via :meth:`_iter_merge_worktrees`
         (``git worktree list --porcelain``), so a half-created directory git
         doesn't track is never removed.
+
+        The persistent warm merge-verify worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) is always exempted via
+        :meth:`_iter_merge_worktrees` — it is never removed by prune
+        (PRD §10 invariant 4).
         """
         removed: list[str] = []
         keep_resolved = keep.resolve() if keep else None
