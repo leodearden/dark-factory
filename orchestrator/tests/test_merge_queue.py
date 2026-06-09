@@ -16674,3 +16674,83 @@ class TestOperatorHalt:
         assert completed, 'verify must run to completion under an automatic WIP halt'
         assert result is True, 'verify completion must advance main (no abort)'
         assert await git_ops.get_main_sha() != pre_merge_sha, 'main must advance'
+
+
+# ---------------------------------------------------------------------------
+# TestDoTrainMergeTrainScope — task 1704 step-3 RED / step-4 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDoTrainMergeTrainScope:
+    """_do_train_merge emits train_started with train_scope='union'/'workspace'."""
+
+    @pytest.mark.parametrize('merge_verify_workspace,expected_scope', [
+        (False, 'union'),
+        (True, 'workspace'),
+    ])
+    async def test_train_started_event_has_train_scope(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        tmp_path: Path,
+        merge_verify_workspace: bool,
+        expected_scope: str,
+    ):
+        """train_started data contains train_scope reflecting the verify mode.
+
+        Uses a status_check that returns a non-deferred member so _do_train_merge
+        emits train_started and returns early (TRAIN_INCOMPLETE) without any git
+        work — the only thing we need to exercise is the event emission.
+        """
+        import json
+        import sqlite3
+
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _do_train_merge
+
+        # Build a real stacked train so GroupMergeRequest has valid worktrees.
+        req = await _make_stacked_train(git_ops, config)
+
+        # Override config to set merge_verify_workspace as requested.
+        req.config = config.model_copy(update={'merge_verify_workspace': merge_verify_workspace})
+
+        # Override status_check: one member not deferred → train_started fires then
+        # _do_train_merge returns TRAIN_INCOMPLETE without any further git work.
+        req.status_check = AsyncMock(return_value={
+            'trn-a': 'merge-deferred',
+            'trn-b': 'in-progress',   # not deferred → triggers incomplete
+            'trn-c': 'merge-deferred',
+        })
+
+        db_path = tmp_path / 'train_scope.db'
+        event_store = EventStore(db_path=db_path, run_id='test-train-scope')
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'blocked', f'expected blocked (train_incomplete), got {outcome!r}'
+        assert outcome.reason.startswith(TRAIN_INCOMPLETE_REASON_PREFIX)
+
+        # Query the train_started event from the EventStore
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'train_started'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'expected exactly 1 train_started event, got {len(rows)}'
+        payload = json.loads(rows[0][0])
+
+        assert 'train_scope' in payload, (
+            f'train_started data must contain train_scope key; got keys: {list(payload)}'
+        )
+        assert payload['train_scope'] == expected_scope, (
+            f'train_scope must be {expected_scope!r} '
+            f'(merge_verify_workspace={merge_verify_workspace}); got {payload["train_scope"]!r}'
+        )
+        # Existing keys must still be present (additive, not replacing)
+        assert 'member_count' in payload, 'existing member_count key must not be removed'
+        assert 'base_sha' in payload, 'existing base_sha key must not be removed'

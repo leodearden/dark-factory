@@ -3123,7 +3123,11 @@ async def _do_train_merge(
         event_store, EventType.train_started,
         task_id=req.task_id, train_id=req.train_id,
         member_task_ids=req.member_task_ids,
-        data={'member_count': len(req.member_task_ids), 'base_sha': base_sha_t0},
+        data={
+            'member_count': len(req.member_task_ids),
+            'base_sha': base_sha_t0,
+            'train_scope': 'workspace' if req.config.merge_verify_workspace else 'union',
+        },
     )
 
     # Loop-breaker: if this train's tip has timed out in post-merge verify
