@@ -296,7 +296,11 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
     Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
     """
     from orchestrator.git_ops import GitOps
-    from orchestrator.verify_runner import run_merge_verify_on_worktree, spec_from_json, result_to_json
+    from orchestrator.verify_runner import (
+        result_to_json,
+        run_merge_verify_on_worktree,
+        spec_from_json,
+    )
 
     try:
         config = load_config(config_path)

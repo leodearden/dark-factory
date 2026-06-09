@@ -893,6 +893,7 @@ class TestRunMergeVerifyOnWorktree:
 
         # Inspect positional args: run_scoped(merge_wt, config, module_configs, ...)
         call_args = run_scoped.await_args
+        assert call_args is not None
         pos_args = call_args[0]
         module_configs = pos_args[2]
         assert len(module_configs) == 2
@@ -924,6 +925,7 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
+        assert run_scoped.await_args is not None
         call_kwargs = run_scoped.await_args[1]
         assert call_kwargs['task_files'] == ('src/a/m.py',)
         assert call_kwargs['max_retries'] == 0
@@ -933,7 +935,10 @@ class TestRunMergeVerifyOnWorktree:
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
-        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY, run_merge_verify_on_worktree
+        from orchestrator.verify_runner import (
+            UNSCOPED_TYPECHECK_FAILED_CATEGORY,
+            run_merge_verify_on_worktree,
+        )
         run_scoped = AsyncMock(return_value=_make_pass_result())
         run_unscoped = AsyncMock(
             return_value=MagicMock(

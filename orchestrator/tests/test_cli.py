@@ -944,7 +944,7 @@ def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
     # stdout must not contain a parseable VerifyResult
     # (click 8.3.2: r.output mixes stdout+stderr; use result_from_json to prove
     # no valid verdict was emitted)
-    with pytest.raises(Exception):
+    with pytest.raises((ValueError, TypeError)):
         result_from_json(r.output)
     # No uncaught traceback — exception must be SystemExit (or None)
     assert r.exception is None or isinstance(r.exception, SystemExit), (
