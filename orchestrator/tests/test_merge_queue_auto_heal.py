@@ -30,7 +30,11 @@ from orchestrator.merge_queue import (
     MergeRequest,
 )
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import (  # type: ignore[attr-defined]
+    TaskWorkflow,
+    WorkflowOutcome,
+    _compute_merge_outcome_signature,
+)
 
 MAIN_SHA = 'deadbeef1234567890'
 
@@ -432,7 +436,6 @@ class TestAutoHealHappyPath:
         # (4) registry.attempts(sig) == 1 after the call
         # Use _compute_merge_outcome_signature with the outcome's fields (not
         # workflow._merge_outcome_signature() which reads stale instance fields).
-        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
         sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         assert merge_worker.auto_heal_registry.attempts(sig) == 1, (
             f'Expected attempts==1 after happy path; got {merge_worker.auto_heal_registry.attempts(sig)}'
@@ -631,7 +634,6 @@ class TestAutoHealAttemptCap:
 
         # Pre-seed the registry using the outcome-derived sig (not the stale
         # instance-field sig which would return the empty-basis constant).
-        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
         sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         for _ in range(MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS):
             merge_worker.auto_heal_registry.record_attempt(sig)
@@ -751,8 +753,6 @@ class TestAutoHealSignatureDerivedFromOutcome:
     # (A) Pure helper: distinct cause_hints → distinct sigs, and neither
     # collapses to the empty-basis constant.
     def test_distinct_cause_hints_produce_distinct_sigs(self) -> None:
-        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
-
         sig_a = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         sig_b = _compute_merge_outcome_signature('compile_error', 'error TS1005: Toolbar.tsx')
         assert sig_a != sig_b, (
@@ -760,8 +760,6 @@ class TestAutoHealSignatureDerivedFromOutcome:
         )
 
     def test_outcome_derived_sig_differs_from_empty_constant(self) -> None:
-        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
-
         sig_outcome = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
         sig_empty = _compute_merge_outcome_signature('', '')
         assert sig_outcome != sig_empty, (
