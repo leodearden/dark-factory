@@ -2494,3 +2494,95 @@ class TestRenderParityReport:
         lines = text.splitlines()
         assert sum(1 for line in lines if 'abc123' in line) == 1
         assert sum(1 for line in lines if 'def456' in line) == 1
+
+
+# ---------------------------------------------------------------------------
+# ι step-1: VerifyRunnerPool quarantine — pool-level runner quarantine
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolQuarantine:
+    """VerifyRunnerPool: quarantine(name) drops a runner from eligible dispatch."""
+
+    def _make_fake_runner(self, name, result=None):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+        fake.run_merge_verify = AsyncMock(return_value=result or _make_pass_result())
+        return fake
+
+    async def test_quarantine_sets_is_quarantined_true(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_is_quarantined_false_for_non_quarantined(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_dispatch_routes_to_local_when_remote_quarantined(self):
+        """After quarantine('laptop'), dispatch runs local, not laptop."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result(summary='local result')
+        local_fake = self._make_fake_runner('local', local_result)
+        laptop_fake = self._make_fake_runner('laptop', _make_pass_result(summary='laptop result'))
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        result = await pool.dispatch('sha1', _make_spec())
+        assert result is local_result
+        local_fake.run_merge_verify.assert_awaited_once()
+        laptop_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_eligible_remote_returns_none_when_quarantined(self):
+        """eligible_remote() returns None when the remote is quarantined."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        assert pool.eligible_remote() is None
+
+    async def test_eligible_remote_returns_runner_after_clear_quarantine(self):
+        """eligible_remote() returns the runner after clear_quarantine."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.clear_quarantine('laptop')
+        assert pool.eligible_remote() is laptop_fake
+
+    async def test_local_runner_property_returns_is_local_runner(self):
+        """pool.local_runner returns the runner with is_local=True."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        assert pool.local_runner is local_fake
+
+    async def test_quarantine_is_idempotent(self):
+        """Quarantining the same runner twice doesn't cause errors."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.quarantine('laptop')
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_clear_quarantine_removes_quarantine(self):
+        """clear_quarantine('laptop') makes is_quarantined('laptop') False."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_fake = self._make_fake_runner('local')
+        laptop_fake = self._make_fake_runner('laptop')
+        pool = VerifyRunnerPool([local_fake, laptop_fake])
+        pool.quarantine('laptop')
+        pool.clear_quarantine('laptop')
+        assert pool.is_quarantined('laptop') is False
