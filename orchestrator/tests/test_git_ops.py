@@ -4618,7 +4618,6 @@ class TestPersistentMergeWorktree:
 
         Step 7 (RED, control): the ephemeral path must still be removed.
         """
-        from orchestrator.git_ops import _create_merge_worktree  # noqa: F401
         # Use the internal helper to create a fresh ephemeral merge worktree
         merge_wt, _ = await git_ops._create_merge_worktree()
         assert merge_wt.exists()
