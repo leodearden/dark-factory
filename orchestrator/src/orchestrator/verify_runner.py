@@ -1258,7 +1258,7 @@ class DriftDetector:
 
     def __init__(
         self,
-        pool: 'VerifyRunnerPool',
+        pool: VerifyRunnerPool,
         *,
         event_store: Any = None,
         escalation_queue: Any = None,
