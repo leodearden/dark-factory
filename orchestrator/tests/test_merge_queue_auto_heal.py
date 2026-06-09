@@ -872,3 +872,96 @@ class TestAutoHealSignatureDerivedFromOutcome:
         assert registry.attempts(sig_in_b) == 1, (
             f'Registry for sig_in_b must have 1 attempt; got {registry.attempts(sig_in_b)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-25: halt-owner is the SURVIVING (parent) escalation, not folded child
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealHaltOwnerIsDedupeParent:
+    """Regression: when submit_or_dedupe folds into a pending parent, the
+    normal-lane halt owner must be the PARENT escalation id, not the locally-
+    built child esc.id that was never queued.
+
+    If the child id is registered as the halt owner, unhalt_lanes_owned_by(parent)
+    never matches and the normal lane stays halted forever.
+    """
+
+    def test_halt_owner_is_surviving_parent_on_fold(self, tmp_path: Path) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt-fold'
+        worktree.mkdir()
+        outcome = _make_compile_error_outcome()
+
+        workflow = _make_workflow(config, worktree)
+        workflow.merge_queue = asyncio.Queue()
+
+        # Use a REAL SpeculativeMergeWorker so _WipHaltMixin lane-owner state is
+        # exercised.
+        git_ops = MagicMock(spec=GitOps)
+        real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        workflow.merge_worker = real_worker
+
+        # make_id returns the CHILD (locally-built) escalation id
+        escalation_queue = MagicMock()
+        escalation_queue.make_id = MagicMock(return_value='esc-child-001')
+        workflow.escalation_queue = escalation_queue
+
+        spawned_args: list[list[dict]] = []
+
+        async def _fake_post_submit(arguments_list: list[dict]) -> None:
+            spawned_args.append(arguments_list)
+
+        workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
+        workflow._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        # submit_or_dedupe folds the child into an existing pending parent:
+        # returns {'id': parent_id, 'status': 'dedup_skipped',
+        #          'parent_id': parent_id, 'child_id': 'esc-child-001'}
+        fold_result = {
+            'id': 'parent-esc-999',
+            'status': 'dedup_skipped',
+            'parent_id': 'parent-esc-999',
+            'child_id': 'esc-child-001',
+        }
+        with patch('orchestrator.workflow.submit_or_dedupe', return_value=fold_result):
+            asyncio.run(
+                workflow._auto_heal_main_health(outcome, merge_phase=True)
+            )
+
+        # (1) normal lane must be halted
+        assert real_worker.is_lane_halted('normal') is True, (
+            'Normal lane must be halted after auto-heal happy path'
+        )
+
+        # (2) the PARENT escalation (the one that resolves) owns the halt
+        assert real_worker.lane_owned_by('parent-esc-999') == 'normal', (
+            f'parent-esc-999 must own the normal-lane halt (surviving parent); '
+            f'owner state: {real_worker._lane_halt_owner!r}'
+        )
+
+        # (3) the folded child must NOT own the halt
+        assert real_worker.lane_owned_by('esc-child-001') is None, (
+            f'esc-child-001 (folded child) must NOT own the halt; '
+            f'owner state: {real_worker._lane_halt_owner!r}'
+        )
+
+        # (4) owner-tied resume: unhalt_lanes_owned_by(parent) resumes normal lane
+        unhalted = real_worker.unhalt_lanes_owned_by('parent-esc-999')
+        assert unhalted == ['normal'], (
+            f'unhalt_lanes_owned_by(parent) must return [normal]; got {unhalted!r}'
+        )
+        assert real_worker.is_lane_halted('normal') is False, (
+            'Normal lane must be unhalted after unhalt_lanes_owned_by(parent)'
+        )
+
+        # (5) the spawned fix task must carry the parent escalation id as the
+        # correlation key (so the auto-watcher can match on resolution)
+        assert spawned_args, 'Expected fix task to be spawned'
+        fix_metadata = spawned_args[0][0].get('metadata', {})
+        assert fix_metadata.get('main_health_escalation_id') == 'parent-esc-999', (
+            f"Fix task must carry parent escalation id; got {fix_metadata.get('main_health_escalation_id')!r}"
+        )
