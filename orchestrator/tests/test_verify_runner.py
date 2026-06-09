@@ -1563,3 +1563,72 @@ class TestRemoteRunnerRefCleanup:
         )
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
+
+
+# ---------------------------------------------------------------------------
+# δ step-11: VerifyRunnerPool prefers remote runner over local
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolPreferRemote:
+    """VerifyRunnerPool.dispatch prefers the first non-local (remote) runner."""
+
+    def _make_fake_runner(self, name, result):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.run_merge_verify = AsyncMock(return_value=result)
+        return fake
+
+    async def test_dispatch_uses_remote_not_local_when_both_present(self):
+        """[local, remote] order forces a real RED against the current runners[0] selection."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result(summary='local result')
+        remote_result = _make_pass_result(summary='remote result')
+        local_fake = self._make_fake_runner('local', local_result)
+        remote_fake = self._make_fake_runner('laptop', remote_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result is remote_result
+        remote_fake.run_merge_verify.assert_awaited_once()
+        local_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_dispatch_event_runner_is_remote_name(self):
+        """merge_verify event has data['runner'] == 'laptop' when routed to remote."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        remote_result = _make_pass_result()
+        local_fake = self._make_fake_runner('local', _make_pass_result(summary='local'))
+        remote_fake = self._make_fake_runner('laptop', remote_result)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake, remote_fake], event_store=event_store, task_id='t-1')
+        await pool.dispatch('sha1', _make_spec())
+
+        assert len(emitted) == 1
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['runner'] == 'laptop'
+
+    async def test_dispatch_single_local_pool_uses_local(self):
+        """Regression: single-runner pool [local] still routes to local (β regression guard)."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result()
+        local_fake = self._make_fake_runner('local', local_result)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake], event_store=event_store)
+        result = await pool.dispatch('sha2', _make_spec())
+
+        assert result is local_result
+        (_, kwargs) = emitted[0]
+        assert kwargs['data']['runner'] == 'local'
