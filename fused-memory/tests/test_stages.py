@@ -1218,6 +1218,25 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
+    def test_stage2_prompt_includes_suppress_guard_write_side(self):
+        """Stage 2 prompt must instruct the WRITE side of the stage2_suppress gate.
+
+        Regression for esc-1685-37: the Completion-Note Suppression Pre-Check
+        reads ``count_memories_by_metadata(... {'stage2_suppress': True})``, but
+        the gate is inert unless some path actually WRITES that key. The prompt
+        must therefore direct agents to tag protective completion-note/guard
+        memories with ``metadata={'stage2_suppress': True, 'task_id':
+        str(task_id)}`` on the ``add_memory`` write — otherwise the count stays
+        0 forever and the SKIP branch never fires.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert "'stage2_suppress': True, 'task_id': str(task_id)" in STAGE2_SYSTEM_PROMPT, (
+            'Stage 2 prompt must instruct agents to tag protective guard '
+            "memories with metadata {'stage2_suppress': True, 'task_id': "
+            "str(task_id)} so the deterministic suppression count has a writer."
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
@@ -11173,3 +11192,4 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
+

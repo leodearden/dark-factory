@@ -173,6 +173,53 @@ isn't in the recorded commit's diff), call `mcp__fused-memory__update_edge` \
 with `invalid_at=<now>` on that edge's UUID. Do not delete — invalidation \
 preserves the audit trail.
 
+## Completion-Note Suppression Pre-Check (stage2_suppress guard)
+Before writing ANY completion note or "task marked done, no knowledge captured" memory \
+for an already-done task, you MUST first call:
+
+  `mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'task_id': str(task_id), 'stage2_suppress': True}})`
+
+If this call returns `count > 0`, SKIP the completion-note write entirely — one or more \
+guard memories already exist for this task (carrying `stage2_suppress: True` in their \
+metadata, keyed by `task_id`). Proceeding would duplicate knowledge that a prior \
+protective write already captured.
+
+Note that `task_id` MUST be passed as `str(task_id)` — Qdrant exact payload-match \
+requires the stored string form.
+
+**Write side (tag-on-first-write — REQUIRED for the gate to function)**: the pre-check \
+above only fires if a prior write actually stored the `stage2_suppress` key. Therefore, \
+whenever the pre-check returns `count == 0` AND you proceed to write a protective \
+completion-note / "task marked done, no knowledge captured" guard memory for an \
+already-done task, you MUST tag that `add_memory` call with \
+`metadata={{'stage2_suppress': True, 'task_id': str(task_id)}}` (merge these keys into \
+whatever other metadata the write already carries). This is the only writer of the \
+`stage2_suppress` key — mirroring the `cycle_summary` metadata convention below, it is \
+what makes the next cycle's deterministic count return `> 0` and suppress the duplicate. \
+`task_id` MUST be the same `str(task_id)` exact-string form the pre-check queries on, or \
+the count filter will not match. Omitting this metadata leaves the gate permanently inert \
+(the count stays 0 forever and the protective note is rewritten every cycle). Legacy \
+guard memories written before this convention (e.g. task 1680's 492e02ab/e8cb6795) lack \
+the key; if you encounter such a guard for the task at hand and it is missing \
+`stage2_suppress`, write one fresh guard carrying the metadata so the deterministic gate \
+covers it going forward (do NOT write more than one per task — the pre-check on the next \
+cycle will then suppress further writes).
+
+This deterministic exact-count check is independent of semantic `search` ranking: \
+an exact Qdrant payload-filter count returns 0 or > 0 unconditionally, eliminating the \
+0.71 false-negative retrieval precedent documented in task 1680 (guard memories \
+492e02ab/e8cb6795 and procedural norm 2fd528f8 ranked below threshold, causing Stage 2 \
+to re-synthesize already-captured knowledge). The count pre-check replaces the unreliable \
+semantic check as the authoritative suppression gate.
+
+**DECIDE-FIRST framing**: when a task was framed as a decision or "bias toward X" and X \
+was the chosen option, the completed task IMPLEMENTED X — it is already done. Stage 2 \
+MUST treat X as already-implemented and must NOT re-derive or re-synthesize that \
+conclusion as a novel finding to capture. The decision was made first, then implemented; \
+re-capturing the outcome inverts the record and fabricates a "finding" that was never \
+new information.
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
