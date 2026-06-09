@@ -3,33 +3,32 @@
 Mechanizes G3 + G6 per task. Evidence verified 2026-06-09 against `main` (cite-by-symbol).
 **No binding resolves to a FAIL value → batch is not blocked.**
 
-The two economic premises (union ≈ single; `s(N) > 1/N`) are **measured** (exp1/exp2) and consumed
-by the go/no-go gate — they are NOT frozen into any RED test (the G6 "guessed bound in a RED test"
-failure is structurally avoided: the build is gated *behind* the measurement, not asserted against it).
+**CORRECTED 2026-06-09 (PRD §4 D7).** Of the two economic premises, **union ≈ single is resolved a priori** —
+reify's merge gate is unconditionally full-`--scope all` (verify.sh:348 C2; `-p` narrowing structurally off at
+scope=all, :521-527), so a 1-task and an N-task merge verify are the byte-identical full plan ⇒ union ≡ single by
+construction. The only remaining premise, `s(N) > 1/N`, is **measured** (exp2) and consumed by a **human** go/no-go
+(not a task node — a no-code decision task churns the orchestrator). The design-doc M2 "~170 s, $0.90" was a
+misattribution — it is the verify-PHASE agent-invocation median, not the merge verify (which is ~90 min cold).
 
 Legend as in the C manifest. `reify:` = filed against the reify project (cross-project dep).
 
 ---
 
-## exp1 — Union-verify wall-time measurement *(leaf; reify; off-peak / out-of-band)*
-| Capability | Binding | Verdict |
-|---|---|---|
-| cargo verify scoped to a 2–3-task union closure | reify cargo/verify toolchain present | PASS |
-| ~170 s single-task baseline (M2) | design §4 M2 measured | PASS |
-| committed union/single ratio bench doc | producer:task-exp1 | PASS |
-| *constraint:* must run off-peak (contention — warm-builds D2) | recorded in description; filed **deferred** (out-of-band), not auto-dispatched | PASS |
+## exp1 — RETIRED / CANCELLED (reify task 4454)
+union ≡ single is an identity under the full-scope merge gate — there is no scoped union vs scoped single to time.
+The original "~170 s single-task baseline" was the verify-phase agent-invocation median, not the merge verify. No binding.
 
-## exp2 — s(N) thrash proxy from history *(leaf; reify)*
+## exp2 — s(N) thrash proxy from history *(leaf; reify task 4455; the ONLY economic gate)*
 | Capability | Binding | Verdict |
 |---|---|---|
 | `main` first-parent history + runs.db | present (design §4 measured from them) | PASS |
 | committed s(N) estimate (N=2,3) + `s(N) > 1/N` check | producer:task-exp2 | PASS |
 
-## gate — A′ go/no-go *(intermediate; depends_on exp1, exp2)*
+## go/no-go — human checkpoint, NOT a task node (D7.3)
 | Capability | Binding | Verdict |
 |---|---|---|
-| exp1 + exp2 results | producer:reify:exp1 + reify:exp2 upstream (cross-project) | PASS |
-| explicit go criteria (union≈single AND s(N)>1/N) | stated in PRD §5 / task — agent-evaluable, escalates on ambiguity | PASS |
+| s(N) result | producer:reify:4455 (exp2) | PASS |
+| explicit go criterion (`s(N) > 1/N`) | stated PRD §5/§4 D7 — human reads exp2, flips β…ε `deferred`→`pending` on go, cancels on no-go | PASS |
 
 ## α — Union-scope the train verify *(intermediate; NO gate — lands regardless, D6)*
 | Capability | Binding | Verdict |

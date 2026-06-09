@@ -11,6 +11,15 @@ interfaces, and the open decisions, mapped to the G1–G6 gates where useful.
 
 ---
 
+## 0. Correction (2026-06-09, post-/prd grounding)
+
+Two numbers/premises below were checked against `runs.db` + `verify.sh` during decompose and corrected. The **levers and rankings stand** (C and A′ both survive; B/disjoint still dead) — these touch only the absolute verify-time anchor and A′'s exp1.
+
+- **[M2] "~170 s median, ~$0.90 each" is misattributed.** It is the median **verify-PHASE agent-invocation** duration (`events.invocation_end · phase=verify` in `runs.db`; true median ~100 s; the `$0.90` is the LLM call cost), dominated by *scoped task-phase* verifies — **NOT** the cold merge-gate cargo verify. The merge-gate verify is the `merge_attempt`/journal population: **p90 ~81 min, cold median ~90 min** (corroborated by `reify/docs/prds/warmer-builds-merge-verify.md` §1, 57–148 min over 16 attempts). Anywhere this doc uses ~170 s as "the verify," read ~90 min (cold merge gate). The throughput identity (§3) and C's multiplier math (§6) are **ratio-based and unaffected**.
+- **A′'s "union ≈ single iff coupled closures overlap" (§7.1) is moot for reify — union ≡ single is *unconditional*.** reify's merge gate is forced full-`--scope all` (`scripts/verify.sh:348`, contract C2) and `-p` affected-crate narrowing is structurally unreachable at scope=all (`:521-527`). So *every* merge verify — 1 task or N — is the byte-identical full-workspace plan. A single-task and an N-task merge verify cost the **same** ~90 min ⇒ amortization is automatic and large (land N tasks for one ~90-min verify), and A′'s **only** real gate is the thrash rate `s(N)` (the §7.3 experiment 1, "union-verify wall-time," is retired — it measured scoped closures the merge gate never runs).
+
+---
+
 ## 1. Problem & premise (G6)
 
 reify's task-completion rate is limited by **merge-queue throughput**, not by task
