@@ -17131,3 +17131,77 @@ class TestMergeShaThreading:
         assert len(merge_sha) == 40 and all(c in '0123456789abcdef' for c in merge_sha), (
             f'merge_sha must be a 40-char hex SHA; got {merge_sha!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEnforceMergeLivenessMargin — task-1698 step-1/2
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceMergeLivenessMargin:
+    """enforce_merge_liveness_margin: fail-closed liveness wrapper (task-1698 step-1).
+
+    These tests use production defaults (liveness=10800, safety_factor=0.75,
+    threshold=8100) so the numeric premises are identical to the passing
+    TestCheckMergeLivenessMarginShippedDefaults cases.
+    """
+
+    def test_over_budget_raises_config_error(self, tmp_path: Path):
+        """bound=2 with bare cfg (cold=7200) → worst_case=14400 ≥ 8100 → raises MergeLivenessConfigError."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessConfigError,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with pytest.raises(MergeLivenessConfigError) as exc_info:
+            enforce_merge_liveness_margin(cfg, merge_ahead_bound=2)
+
+        # Error message must surface the key numbers for operator triage.
+        msg = str(exc_info.value)
+        assert '14400' in msg or '14400.0' in msg, (
+            f'MergeLivenessConfigError message must mention worst_case (14400); got: {msg!r}'
+        )
+
+    def test_in_budget_returns_assessment(self, tmp_path: Path):
+        """bound=1 with bare cfg (cold=7200) → worst_case=7200 < 8100 → no raise, returns MergeLivenessAssessment."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessAssessment,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        result = enforce_merge_liveness_margin(cfg, merge_ahead_bound=1)
+
+        assert isinstance(result, MergeLivenessAssessment), (
+            f'Expected MergeLivenessAssessment, got {type(result)!r}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for bound=1 (7200 < 8100); got safe={result.safe!r}'
+        )
+        assert result.worst_case_secs == 7200.0, (
+            f'Expected worst_case_secs=7200.0 (bound=1 * 7200); got {result.worst_case_secs}'
+        )
+
+    def test_error_message_contains_threshold(self, tmp_path: Path):
+        """MergeLivenessConfigError message includes threshold and timeout for operator triage."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessConfigError,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with pytest.raises(MergeLivenessConfigError) as exc_info:
+            enforce_merge_liveness_margin(cfg, merge_ahead_bound=2)
+
+        msg = str(exc_info.value)
+        # threshold (8100) and bound (2) and timeout (7200) all present.
+        assert '8100' in msg, (
+            f'MergeLivenessConfigError must mention threshold (8100); got: {msg!r}'
+        )
+        assert '2' in msg, (
+            f'MergeLivenessConfigError must mention merge_ahead_bound (2); got: {msg!r}'
+        )
+        assert '7200' in msg, (
+            f'MergeLivenessConfigError must mention timeout (7200); got: {msg!r}'
+        )
