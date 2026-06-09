@@ -386,6 +386,72 @@ async def _ensure_verify_disk_space(
     )
 
 
+def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
+    """Compose a dedupe fingerprint for a preexisting-main-break outcome.
+
+    Lazy-imports compute_preexisting_main_break_fingerprint from workflow so
+    merge_queue→workflow is a deferred import (no module-level cycle).
+    Fail-safe: returns '' when the import or composition raises.
+    """
+    try:
+        from orchestrator.workflow import compute_preexisting_main_break_fingerprint
+        return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
+    except Exception:
+        return ''
+
+
+async def _classify_main_health_red(
+    git_ops: GitOps,
+    req: 'MergeRequest',
+    verify: VerifyResult,
+) -> 'MergeOutcome | None':
+    """Probe whether *verify* is a pre-existing break already on bare main HEAD.
+
+    Returns a :class:`MergeOutcome` with reason starting with
+    :data:`MAIN_HEALTH_RED_REASON_PREFIX` when the break is confirmed
+    pre-existing.  Returns ``None`` to fall through to the normal task-fault
+    outcome.
+
+    Guards (short-circuit to None before calling the probe):
+    - ``req.config.escalate_preexisting_main_break`` is False
+    - ``verify.timed_out`` is True (non-deterministic; re-probing is wasteful)
+    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
+      (infra_timeout / flock_error — inherently flaky)
+    """
+    if not req.config.escalate_preexisting_main_break:
+        return None
+    if verify.timed_out:
+        return None
+    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
+        return None
+    try:
+        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
+            req.worktree, req.config, req.module_configs, req.task_files,
+            verify, git_ops,
+        )
+    except Exception:
+        return None
+    if not is_preexisting:
+        return None
+    detail = verify.failure_report()
+    suffix = (verify.cause_hint or verify.summary or '')[:160]
+    reason = (
+        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
+        f'(category={verify.category!r}): {suffix}'
+    )
+    if detail:
+        reason = f'{reason}\n\n{detail}'
+    return MergeOutcome(
+        'blocked',
+        reason=reason,
+        failure_category=verify.category,
+        failure_cause_hint=verify.cause_hint,
+        dedupe_fingerprint=_main_health_fingerprint(
+            verify.category or '', verify.cause_hint, probe_sha,
+        ),
+    )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -469,6 +535,15 @@ async def _run_post_merge_verify(
             if detail:
                 reason = f'{reason}\n\n{detail}'
             return MergeOutcome('blocked', reason=reason)
+        # Main-health probe: classify whether this failure is pre-existing on
+        # bare main HEAD rather than introduced by this merge.  Inserted after
+        # the ENOSPC early-return (ENOSPC is always task-side infra) and before
+        # the generic task-fault build so all 4 merge paths are covered uniformly.
+        # merge_wt is already cleaned up; the probe builds its own _mainprobe-
+        # worktree and always cleans it in a finally block.
+        main_health_outcome = await _classify_main_health_red(git_ops, req, verify)
+        if main_health_outcome is not None:
+            return main_health_outcome
         detail = verify.failure_report()
         reason = f'Post-merge verification failed: {verify.summary}'
         if detail:
