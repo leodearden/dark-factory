@@ -1632,3 +1632,113 @@ class TestVerifyRunnerPoolPreferRemote:
         assert result is local_result
         (_, kwargs) = emitted[0]
         assert kwargs['data']['runner'] == 'local'
+
+
+# ---------------------------------------------------------------------------
+# δ step-13: VerifyRunnerPool fail-safe fallback (PRD Invariant 2 / D5 / §B B3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolFailSafe:
+    """dispatch() falls back to local when the selected remote raises RunnerUnavailable."""
+
+    def _make_fake_runner(self, name, result=None, raises=None):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        if raises is not None:
+            fake.run_merge_verify = AsyncMock(side_effect=raises)
+        else:
+            fake.run_merge_verify = AsyncMock(return_value=result)
+        return fake
+
+    async def test_fallback_returns_local_result(self):
+        """Remote RunnerUnavailable → dispatch returns local result."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        local_result = _make_pass_result(summary='local fallback')
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('host down'))
+        local_fake = self._make_fake_runner('local', local_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha', _make_spec())
+
+        assert result is local_result
+
+    async def test_fallback_does_not_raise(self):
+        """dispatch() does NOT propagate RunnerUnavailable when local fallback exists."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('gone'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        # must not raise
+        await pool.dispatch('sha', _make_spec())
+
+    async def test_fallback_calls_local_run_merge_verify_once(self):
+        """local.run_merge_verify is called exactly once as the fallback."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        local_result = _make_pass_result()
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+        local_fake = self._make_fake_runner('local', local_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        await pool.dispatch('sha', _make_spec())
+
+        local_fake.run_merge_verify.assert_awaited_once()
+
+    async def test_fallback_event_runner_is_local(self):
+        """merge_verify event data['runner'] == 'local' when fallback is used."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake, remote_fake], event_store=event_store)
+        await pool.dispatch('sha', _make_spec())
+
+        assert len(emitted) == 1
+        (_, kwargs) = emitted[0]
+        assert kwargs['data']['runner'] == 'local'
+
+    async def test_fallback_logs_one_warning(self, caplog):
+        """Exactly one warning is logged identifying the unavailable runner; no escalation."""
+        import logging
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('host down'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        with caplog.at_level(logging.WARNING):
+            await pool.dispatch('sha', _make_spec())
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'laptop' in warnings[0].message.lower() or 'laptop' in warnings[0].getMessage().lower()
+
+    async def test_no_fallback_when_remote_returns_timed_out_result(self):
+        """A VerifyResult(timed_out=True) from remote is returned unchanged — NOT fallen back (Invariant 5)."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        timed_out = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='timeout', timed_out=True,
+        )
+        remote_fake = self._make_fake_runner('laptop', timed_out)
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha', _make_spec())
+
+        assert result is timed_out
+        local_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_no_local_fallback_reraises_runner_unavailable(self):
+        """A pool with only a remote runner and no local raises RunnerUnavailable (unsupported config)."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+
+        pool = VerifyRunnerPool([remote_fake])
+        with pytest.raises(RunnerUnavailable):
+            await pool.dispatch('sha', _make_spec())
