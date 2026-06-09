@@ -24,11 +24,11 @@ The original "~170 s single-task baseline" was the verify-phase agent-invocation
 | `main` first-parent history + runs.db | present (design §4 measured from them) | PASS |
 | committed s(N) estimate (N=2,3) + `s(N) > 1/N` check | producer:task-exp2 | PASS |
 
-## go/no-go — human checkpoint, NOT a task node (D7.3)
+## go/no-go — automated inside the s(N) task (4455), escalate-on-margin; NOT a separate node (D7.3)
 | Capability | Binding | Verdict |
 |---|---|---|
-| s(N) result | producer:reify:4455 (exp2) | PASS |
-| explicit go criterion (`s(N) > 1/N`) | stated PRD §5/§4 D7 — human reads exp2, flips β…ε `deferred`→`pending` on go, cancels on no-go | PASS |
+| s(N) estimate + sample size | producer:reify:4455 (exp2, PART 1) | PASS |
+| deterministic rule `s(N) > 1/N` + action | producer:reify:4455 (exp2, PART 2): clear go → flip β…ε `deferred`→`pending`; clear no-go → cancel + info-escalate; marginal → escalate to human. Marginal = `|s(N)−1/N| < 0.2·(1/N)` ∨ <~10 clusters ∨ ambiguous attribution | PASS |
 
 ## α — Union-scope the train verify *(intermediate; NO gate — lands regardless, D6)*
 | Capability | Binding | Verdict |
