@@ -137,7 +137,11 @@ class TestSubmitToMergeQueueMainHealthRouting:
     """_submit_to_merge_queue must route a MAIN_HEALTH_RED_REASON_PREFIX blocked
     outcome to _mark_blocked(escalate_to_human=True, category='preexisting_main_break',
     dedupe_fingerprint=..., suggested_action='await_preexisting_main_hotfix'),
-    and must NOT touch the steward or the generic task-fault path."""
+    and must NOT touch the steward or the generic task-fault path.
+
+    Pattern mirrors test_workflow_e2e.py: set workflow.merge_queue, patch
+    enqueue_merge_request to deliver the MergeOutcome, call with a branch name.
+    """
 
     def test_main_health_red_routes_to_l1_escalation(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -146,7 +150,7 @@ class TestSubmitToMergeQueueMainHealthRouting:
         workflow = _make_workflow(config, worktree)
 
         fp = 'fp-abc-123'
-        outcome = MergeOutcome(
+        main_health_outcome = MergeOutcome(
             'blocked',
             reason=f'{MAIN_HEALTH_RED_REASON_PREFIX} (category=compile_error): error TS2322',
             failure_category='compile_error',
@@ -158,10 +162,17 @@ class TestSubmitToMergeQueueMainHealthRouting:
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
         workflow._write_merge_failure_review = MagicMock()
 
-        async def _run() -> WorkflowOutcome:
-            return await workflow._submit_to_merge_queue(outcome, merge_phase=True)
+        # Deliver the MergeOutcome via the enqueue hook (same pattern as e2e tests).
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
+            request.result.set_result(main_health_outcome)
 
-        result = asyncio.run(_run())
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            result = asyncio.run(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
+            )
 
         assert result == WorkflowOutcome.BLOCKED
         mark_blocked_mock.assert_called_once()
@@ -192,7 +203,7 @@ class TestSubmitToMergeQueueMainHealthRouting:
         worktree.mkdir()
         workflow = _make_workflow(config, worktree)
 
-        outcome = MergeOutcome(
+        generic_outcome = MergeOutcome(
             'blocked',
             reason='Post-merge verification failed: tsc failed',
             failure_category='compile_error',
@@ -202,10 +213,16 @@ class TestSubmitToMergeQueueMainHealthRouting:
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
         workflow._write_merge_failure_review = MagicMock()
 
-        async def _run() -> WorkflowOutcome:
-            return await workflow._submit_to_merge_queue(outcome, merge_phase=False)
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
+            request.result.set_result(generic_outcome)
 
-        result = asyncio.run(_run())
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            result = asyncio.run(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
+            )
 
         assert result == WorkflowOutcome.BLOCKED
         mark_blocked_mock.assert_called_once()

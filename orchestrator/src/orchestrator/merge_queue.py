@@ -404,6 +404,7 @@ async def _classify_main_health_red(
     git_ops: GitOps,
     req: 'MergeRequest',
     verify: VerifyResult,
+    event_store: 'EventStore | None' = None,
 ) -> 'MergeOutcome | None':
     """Probe whether *verify* is a pre-existing break already on bare main HEAD.
 
@@ -441,7 +442,7 @@ async def _classify_main_health_red(
     )
     if detail:
         reason = f'{reason}\n\n{detail}'
-    return MergeOutcome(
+    outcome = MergeOutcome(
         'blocked',
         reason=reason,
         failure_category=verify.category,
@@ -450,6 +451,8 @@ async def _classify_main_health_red(
             verify.category or '', verify.cause_hint, probe_sha,
         ),
     )
+    _emit_merge_attempt(event_store, req.task_id, 'main_health_red')
+    return outcome
 
 
 async def _run_post_merge_verify(
@@ -461,6 +464,7 @@ async def _run_post_merge_verify(
     enospc_retries: dict[str, int],
     max_timeouts: int,
     max_enospc: int,
+    event_store: EventStore | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -541,7 +545,9 @@ async def _run_post_merge_verify(
         # the generic task-fault build so all 4 merge paths are covered uniformly.
         # merge_wt is already cleaned up; the probe builds its own _mainprobe-
         # worktree and always cleans it in a finally block.
-        main_health_outcome = await _classify_main_health_red(git_ops, req, verify)
+        main_health_outcome = await _classify_main_health_red(
+            git_ops, req, verify, event_store,
+        )
         if main_health_outcome is not None:
             return main_health_outcome
         detail = verify.failure_report()
@@ -3225,6 +3231,7 @@ async def _do_train_merge(
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        event_store=event_store,
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
@@ -3925,6 +3932,7 @@ class MergeWorker(_WipHaltMixin):
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                event_store=self._event_store,
             )
             if out is not None:
                 return out
@@ -5583,6 +5591,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                    event_store=self._event_store,
                 ))
                 while True:
                     done, _ = await asyncio.wait(

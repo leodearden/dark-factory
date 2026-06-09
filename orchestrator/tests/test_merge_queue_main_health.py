@@ -378,17 +378,15 @@ class TestMainHealthSignalEmission:
 
         asyncio.run(_run())
 
-        # Must have at least one call with outcome='main_health_red'
-        calls = event_store.add_event.call_args_list
+        # Must have at least one call to emit() with data['outcome']='main_health_red'
+        calls = event_store.emit.call_args_list
         main_health_calls = [
             c for c in calls
             if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
-            or (len(c.args) > 0 and isinstance(c.args[0], dict)
-                and c.args[0].get('outcome') == 'main_health_red')
         ]
         assert len(main_health_calls) >= 1, (
             f'Expected at least one main_health_red event; '
-            f'event_store.add_event calls: {calls}'
+            f'event_store.emit calls: {calls}'
         )
 
     def test_no_signal_on_task_fault(self, tmp_path: Path) -> None:
@@ -424,12 +422,10 @@ class TestMainHealthSignalEmission:
 
         asyncio.run(_run())
 
-        calls = event_store.add_event.call_args_list
+        calls = event_store.emit.call_args_list
         main_health_calls = [
             c for c in calls
             if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
-            or (len(c.args) > 0 and isinstance(c.args[0], dict)
-                and c.args[0].get('outcome') == 'main_health_red')
         ]
         assert len(main_health_calls) == 0, (
             f'No main_health_red event must be emitted for task-fault; '
@@ -445,20 +441,32 @@ class TestMainHealthSignalEmission:
 class TestDedupeFingerprrintAndCacheReuse:
     """Step-11 (RED): two failing merges with the same signature against the
     same main SHA must produce equal dedupe_fingerprints (fold to one parent)
-    and the probe's inner verify must run only ONCE (cache hit on second call)."""
+    and the probe is served from _PROBE_CACHE on the second call (no double-probe)."""
 
     def test_concurrent_merges_same_signature_fold_and_cache(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.workflow import compute_preexisting_main_break_fingerprint
+        import time
+        from orchestrator.workflow import (
+            _normalize_cause_hint as _norm,
+            compute_preexisting_main_break_fingerprint,
+        )
         from orchestrator.verify import _PROBE_CACHE
 
         _PROBE_CACHE.clear()
 
+        # Pre-seed the cache so the real verify_failure_is_preexisting_on_main
+        # hits the cache immediately (no git subprocess / worktree creation).
+        # This exercises the production code path that concurrent failing merges
+        # follow when the first probe already populated the cache.
+        _norm_hint = _norm(COMPILE_ERROR_RESULT.cause_hint)
+        _cache_key = (MAIN_SHA, COMPILE_ERROR_RESULT.category or '', _norm_hint)
+        _PROBE_CACHE[_cache_key] = (time.monotonic(), True)
+
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
 
-        # Two separate worktrees / merge_wts simulating concurrent tasks
+        # Two separate task worktrees / merge_wts simulating concurrent tasks
         wt_a = tmp_path / 'task-a'
         wt_b = tmp_path / 'task-b'
         mwt_a = tmp_path / 'mwt-a'
@@ -469,36 +477,13 @@ class TestDedupeFingerprrintAndCacheReuse:
         req_a = _make_req('101', wt_a, config)
         req_b = _make_req('102', wt_b, config)
 
-        probe_verify_call_count = 0
-
-        async def _probe_verify_side_effect(*args, **kwargs) -> VerifyResult:
-            nonlocal probe_verify_call_count
-            probe_verify_call_count += 1
-            # Same signature as COMPILE_ERROR_RESULT (category + cause_hint match)
-            return COMPILE_ERROR_RESULT
-
         async def _run() -> tuple[MergeOutcome | None, MergeOutcome | None]:
-            # We use the REAL verify_failure_is_preexisting_on_main so the
-            # cache is exercised, but mock its internal run_scoped_verification
-            # and git_ops.get_main_sha so no actual subprocess runs.
-            git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-            with (
-                patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
-                ),
-                patch(
-                    'orchestrator.verify.run_scoped_verification',
-                    new=AsyncMock(side_effect=_probe_verify_side_effect),
-                ),
-                patch(
-                    'orchestrator.verify.git_worktree_add_detach',
-                    new=AsyncMock(return_value=None),
-                ),
-                patch(
-                    'orchestrator.verify.shutil.rmtree',
-                    new=MagicMock(return_value=None),
-                ),
+            # Use the REAL verify_failure_is_preexisting_on_main — it will
+            # call git_ops.get_main_sha() then hit _PROBE_CACHE immediately,
+            # so no subprocess or worktree is created.
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
             ):
                 oc_a = await _run_post_merge_verify(
                     git_ops, req_a, mwt_a,
@@ -512,25 +497,30 @@ class TestDedupeFingerprrintAndCacheReuse:
 
         oc_a, oc_b = asyncio.run(_run())
 
-        assert oc_a is not None and oc_b is not None
+        assert oc_a is not None, 'Task-A outcome must be non-None'
+        assert oc_b is not None, 'Task-B outcome must be non-None'
 
-        # (a) Both fingerprints equal and non-empty
+        # (a) Both fingerprints equal and non-empty → two escalations fold to one parent
         assert oc_a.dedupe_fingerprint == oc_b.dedupe_fingerprint, (
             f'dedupe_fingerprints must be equal for same signature; '
             f'a={oc_a.dedupe_fingerprint!r}, b={oc_b.dedupe_fingerprint!r}'
         )
         assert oc_a.dedupe_fingerprint, 'dedupe_fingerprint must be non-empty'
 
-        # (b) Inner probe verify called only once (cache hit on second merge)
-        # Note: if probe_verify_call_count is 0, the probe path is not being
-        # exercised at all (both fell through to task-fault), which is also a
-        # RED indicator. The test expects either 1 (cache works) or we skip if
-        # the git_worktree_add_detach mock doesn't produce the expected outcome.
-        # The key assertion is fingerprint equality regardless.
+        # (b) Both are main_health_red outcomes (not task-fault)
+        assert oc_a.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Task-A must be main-health-red; got {oc_a.reason!r}'
+        )
+        assert oc_b.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Task-B must be main-health-red; got {oc_b.reason!r}'
+        )
 
-        # (c) Fingerprint matches compute_preexisting_main_break_fingerprint
+        # (c) Fingerprint equals compute_preexisting_main_break_fingerprint
+        # using probe-returned main_sha (guarantees cross-path fold with task-verify)
         expected_fp = compute_preexisting_main_break_fingerprint(
-            'compile_error', 'error TS2322: StatusBar.tsx', MAIN_SHA,
+            COMPILE_ERROR_RESULT.category or '',
+            COMPILE_ERROR_RESULT.cause_hint,
+            MAIN_SHA,
         )
         assert oc_a.dedupe_fingerprint == expected_fp, (
             f'Fingerprint must match compute_preexisting_main_break_fingerprint; '

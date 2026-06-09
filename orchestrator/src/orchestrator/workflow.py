@@ -4164,6 +4164,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # steward path entirely and submit an L1 immediately.
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
+            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             TRANSIENT_INFRA_REASON_PREFIX,
@@ -4217,6 +4218,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merge_phase=merge_phase,
                 escalate_to_human=True,
                 category='infra_issue',
+            )
+        # Main-health-red short-circuit: the failure reproduces on bare main HEAD
+        # (pre-existing break, not introduced by this task's merge).  Route
+        # directly to L1 — escalate_to_human=True skips the steward, which
+        # operates in the task's branch and cannot fix a broken main.  The
+        # dedupe_fingerprint folds N concurrent failing merges into one parent
+        # escalation.  suggested_action='await_preexisting_main_hotfix' signals
+        # the auto-watcher to hold off re-dispatching until main is green.
+        if result.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX):
+            self._write_merge_failure_review('main_health_red', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='preexisting_main_break',
+                dedupe_fingerprint=(result.dedupe_fingerprint or None),
+                suggested_action='await_preexisting_main_hotfix',
             )
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
