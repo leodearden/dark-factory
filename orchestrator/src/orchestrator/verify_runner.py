@@ -34,6 +34,7 @@ rounding or numeric tolerance is involved.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import shlex
@@ -673,13 +674,11 @@ class RemoteRunner:
 
         finally:
             # Best-effort ref cleanup — never alters the returned result nor masks exceptions
-            try:
+            with contextlib.suppress(Exception):
                 await self._run(
                     ['git', 'push', self._git_remote, '--delete', ref],
                     cwd=self._cwd,
                 )
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
