@@ -35,8 +35,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from dataclasses import dataclass, field
-from typing import Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from orchestrator.verify import VerifyResult
 
@@ -81,7 +81,7 @@ class VerifyCommand:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "VerifyCommand":
+    def from_dict(cls, d: dict) -> VerifyCommand:
         return cls(
             prefix=d["prefix"],
             test_command=d.get("test_command"),
@@ -118,7 +118,7 @@ class UnscopedTypecheckSpec:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "UnscopedTypecheckSpec":
+    def from_dict(cls, d: dict) -> UnscopedTypecheckSpec:
         return cls(
             commands=tuple(VerifyCommand.from_dict(vc) for vc in d["commands"]),
             block_on_timeout=d.get("block_on_timeout", True),
@@ -162,7 +162,7 @@ class MergeVerifySpec:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "MergeVerifySpec":
+    def from_dict(cls, d: dict) -> MergeVerifySpec:
         task_files_raw = d.get("task_files")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
