@@ -64,6 +64,7 @@ class EventType(StrEnum):
     lock_released = 'lock_released'
     merge_attempt = 'merge_attempt'
     merge_verify = 'merge_verify'
+    verdict_parity_ok = 'verdict_parity_ok'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'
