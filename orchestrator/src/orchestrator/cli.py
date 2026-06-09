@@ -313,7 +313,10 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
     async def _run():
         git_ops = GitOps(config.git, config.project_root)
         wt, _ = await git_ops._create_merge_worktree(base_sha=sha)
-        return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
+        try:
+            return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
+        finally:
+            await git_ops.cleanup_merge_worktree(wt)
 
     try:
         result = asyncio.run(_run())

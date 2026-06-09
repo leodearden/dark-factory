@@ -832,3 +832,125 @@ def test_verify_merge_parity(tmp_path, monkeypatch, test_command, expect_pass):
         f'CLI result != local result: cli={cli_result!r}, local={local!r}'
     )
     assert local.passed is expect_pass
+
+
+def test_verify_merge_cleanup(tmp_path, monkeypatch):
+    """verify-merge must not leak _merge-* worktrees after the run completes."""
+    from orchestrator.verify_runner import (
+        MergeVerifySpec,
+        UnscopedTypecheckSpec,
+        VerifyCommand,
+        spec_to_json,
+    )
+
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    config = OrchestratorConfig(project_root=repo)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+
+    cfg_file = tmp_path / 'dummy.yaml'
+    cfg_file.write_text('')
+
+    spec = MergeVerifySpec(
+        verify_commands=(VerifyCommand('mod', test_command='true'),),
+        unscoped_typecheck=UnscopedTypecheckSpec(
+            commands=(VerifyCommand('mod', type_check_command='true'),),
+            block_on_timeout=True,
+        ),
+        task_files=('mod/test_x.py',),
+        verify_env={},
+        cold_timeout_secs=300.0,
+    )
+
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', head_sha,
+        '--spec', spec_to_json(spec),
+        '--config', str(cfg_file),
+    ])
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+
+    # No _merge-* directories should remain under .worktrees
+    worktrees_dir = repo / '.worktrees'
+    leaked = (
+        any(p.name.startswith('_merge-') for p in worktrees_dir.iterdir())
+        if worktrees_dir.exists()
+        else False
+    )
+    assert not leaked, f'leaked worktree under {worktrees_dir}'
+
+    # git worktree list must not show any _merge-* entry
+    wt_list = subprocess.run(
+        ['git', '-C', str(repo), 'worktree', 'list', '--porcelain'],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert '_merge-' not in wt_list, f'git worktree list shows leaked entry:\n{wt_list}'
+
+
+@pytest.mark.parametrize('bad_case', ['malformed_spec', 'absent_sha'])
+def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
+    """Bad requests never emit a non-verdict to stdout and always exit non-zero.
+
+    Case A (malformed --spec): JSON parse error → graceful non-zero, empty stdout.
+    Case B (absent SHA): non-existent commit → graceful non-zero, empty stdout.
+    Both cases must have a concise message on stderr and no uncaught traceback.
+    """
+    from orchestrator.verify_runner import (
+        MergeVerifySpec,
+        UnscopedTypecheckSpec,
+        VerifyCommand,
+        result_from_json,
+        spec_to_json,
+    )
+
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    config = OrchestratorConfig(project_root=repo)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+
+    cfg_file = tmp_path / 'dummy.yaml'
+    cfg_file.write_text('')
+
+    good_spec = MergeVerifySpec(
+        verify_commands=(VerifyCommand('mod', test_command='true'),),
+        unscoped_typecheck=UnscopedTypecheckSpec(
+            commands=(VerifyCommand('mod', type_check_command='true'),),
+            block_on_timeout=True,
+        ),
+        task_files=('mod/test_x.py',),
+        verify_env={},
+        cold_timeout_secs=300.0,
+    )
+
+    if bad_case == 'malformed_spec':
+        invoke_args = [
+            'verify-merge',
+            '--sha', head_sha,
+            '--spec', 'not valid json',
+            '--config', str(cfg_file),
+        ]
+    else:  # absent_sha
+        invoke_args = [
+            'verify-merge',
+            '--sha', '0' * 40,
+            '--spec', spec_to_json(good_spec),
+            '--config', str(cfg_file),
+        ]
+
+    r = CliRunner().invoke(main, invoke_args)
+
+    # Must exit non-zero
+    assert r.exit_code != 0, (
+        f'expected non-zero exit_code for {bad_case}, got {r.exit_code}'
+    )
+    # stdout must not contain a parseable VerifyResult
+    # (click 8.3.2: r.output mixes stdout+stderr; use result_from_json to prove
+    # no valid verdict was emitted)
+    with pytest.raises(Exception):
+        result_from_json(r.output)
+    # No uncaught traceback — exception must be SystemExit (or None)
+    assert r.exception is None or isinstance(r.exception, SystemExit), (
+        f'expected SystemExit or None, got {type(r.exception).__name__}: {r.exception}'
+    )
+    # A concise error message on stderr
+    assert r.stderr.strip() != '', (
+        f'expected non-empty stderr for {bad_case!r}'
+    )
