@@ -4262,22 +4262,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 category='infra_issue',
             )
         # Main-health-red short-circuit: the failure reproduces on bare main HEAD
-        # (pre-existing break, not introduced by this task's merge).  Route
-        # directly to L1 — escalate_to_human=True skips the steward, which
-        # operates in the task's branch and cannot fix a broken main.  The
-        # dedupe_fingerprint folds N concurrent failing merges into one parent
-        # escalation.  suggested_action='await_preexisting_main_hotfix' signals
-        # the auto-watcher to hold off re-dispatching until main is green.
+        # (pre-existing break, not introduced by this task's merge).  Dispatch
+        # to _auto_heal_main_health which implements the full GATED auto-heal:
+        # halt the normal lane, submit a dedup'd escalation, spawn a HIGH-lane
+        # fix task, and block.  Non-mechanical breaks and attempt-cap exceedances
+        # fall back to escalate-to-human directly inside _auto_heal_main_health.
         if result.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX):
             self._write_merge_failure_review('main_health_red', result.reason)
-            return await self._mark_blocked(
-                result.reason,
-                merge_phase=merge_phase,
-                escalate_to_human=True,
-                category='preexisting_main_break',
-                dedupe_fingerprint=(result.dedupe_fingerprint or None),
-                suggested_action='await_preexisting_main_hotfix',
-            )
+            return await self._auto_heal_main_health(result, merge_phase=merge_phase)
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
         self._last_merge_block_reason = result.reason
@@ -4361,8 +4353,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         cause_hint = getattr(result, 'failure_cause_hint', None) or ''
         reason = getattr(result, 'reason', str(result))
 
-        # Branch (d): non-mechanical → escalate-only, no halt/spawn
-        if not is_auto_heal_eligible(category, cause_hint):
+        # Branch (d): non-mechanical, or no merge_worker (cannot halt lanes)
+        # → escalate-only, no halt/spawn.
+        if not is_auto_heal_eligible(category, cause_hint) or self.merge_worker is None:
             return await self._mark_blocked(
                 reason,
                 merge_phase=merge_phase,
