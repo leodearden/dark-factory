@@ -89,6 +89,11 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'|^Merge task/{tid} into '
 )
 
+# Fixed name for the persistent warm merge-verify worktree (task 1692).
+# Lives at <worktree_base>/_merge-verify.  Excluded from prune and
+# find_inflight enumeration (see _iter_merge_worktrees).
+PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -1453,6 +1458,78 @@ class GitOps:
             logger.warning(f'Failed to remove merge worktree {merge_wt}: {err}')
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
+
+    @property
+    def persistent_merge_worktree_path(self) -> Path:
+        """Fixed path for the persistent warm merge-verify worktree.
+
+        Always ``<worktree_base>/_merge-verify``.  The path is independent of
+        the ``git.persistent_merge_worktree`` knob — the property always
+        returns the canonical location so callers can compare against it even
+        when the feature is off.
+        """
+        return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
+        """Create or reset-in-place the persistent warm merge-verify worktree.
+
+        **Create-once path** (worktree not yet registered):
+            ``git worktree add --detach <fixed_path> <merge_commit>``
+
+        **Reset-in-place path** (worktree already registered):
+            ``git reset --hard <merge_commit>`` followed by
+            ``git clean -xfd -e <dir>`` for each dir in
+            ``config.reap_build_artifact_dirs`` — so the source tree is
+            bit-identical to a fresh checkout of *merge_commit* while
+            build-artifact dirs (e.g. ``target/``) are retained.
+
+        Returns the fixed path (:attr:`persistent_merge_worktree_path`).
+        Raises :exc:`RuntimeError` on git failure (mirrors
+        :meth:`_create_merge_worktree`).
+        """
+        warm_path = self.persistent_merge_worktree_path
+
+        if not await self._is_registered_worktree(warm_path):
+            # Create-once branch
+            warm_path.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to create persistent merge worktree at {warm_path}: {err}'
+                )
+            logger.info(
+                'Created persistent merge worktree at %s (HEAD=%s)',
+                warm_path, merge_commit[:8],
+            )
+        else:
+            # Reset-in-place branch (added in step-6)
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=warm_path,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to reset persistent merge worktree {warm_path} '
+                    f'to {merge_commit}: {err}'
+                )
+            for artifact_dir in self.config.reap_build_artifact_dirs:
+                rc, _, err = await _run(
+                    ['git', 'clean', '-xfd', '-e', artifact_dir],
+                    cwd=warm_path,
+                )
+                if rc != 0:
+                    raise RuntimeError(
+                        f'Failed to clean persistent merge worktree {warm_path}: {err}'
+                    )
+            logger.info(
+                'Reset persistent merge worktree %s to HEAD=%s',
+                warm_path, merge_commit[:8],
+            )
+
+        return warm_path
 
     async def _iter_merge_worktrees(self):
         """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
