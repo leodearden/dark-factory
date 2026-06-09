@@ -1611,6 +1611,7 @@ async def _reverify_rebased_tree(
     enospc_retries: dict[str, int],
     max_timeouts: int,
     max_enospc: int,
+    merge_sha: str = '',
 ) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
@@ -1674,6 +1675,7 @@ async def _reverify_rebased_tree(
         enospc_retries=enospc_retries,
         max_timeouts=max_timeouts,
         max_enospc=max_enospc,
+        merge_sha=merge_sha,
     )
 
 
@@ -3261,6 +3263,7 @@ async def _do_train_merge(
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
         event_store=event_store,
+        merge_sha=merge_commit,
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
@@ -3962,6 +3965,7 @@ class MergeWorker(_WipHaltMixin):
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                 event_store=self._event_store,
+                merge_sha=merge_result.merge_commit or '',
             )
             if out is not None:
                 return out
@@ -5621,6 +5625,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     event_store=self._event_store,
+                    merge_sha=merge_commit,
                 ))
                 while True:
                     done, _ = await asyncio.wait(
@@ -5800,6 +5805,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                    merge_sha=rebased_sha,
                 )
                 if gate is not None:
                     # Overlapping delta, verify failed (or disk guard fired).
