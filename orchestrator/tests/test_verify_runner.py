@@ -365,3 +365,64 @@ class TestGoldenRoundTrip:
     def test_result_deterministic(self):
         vr = self._make_result()
         assert result_to_json(vr) == result_to_json(vr)
+
+    def test_spec_byte_identical_with_int_cold_timeout(self):
+        """A spec constructed with an integer cold_timeout_secs round-trips byte-identically.
+
+        PRD Invariant 1: to_json(from_json(s)) == s must hold even when the
+        original spec was built with cold_timeout_secs as an int (e.g. from YAML).
+        Without symmetric float() coercion in to_dict(), the first serialization
+        would emit ``300`` while the re-serialization would emit ``300.0``.
+        """
+        vc = VerifyCommand(prefix="src/a")
+        utc = UnscopedTypecheckSpec(commands=())
+        spec = MergeVerifySpec(
+            verify_commands=(vc,),
+            unscoped_typecheck=utc,
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=300,  # int, not float literal
+        )
+        s = spec_to_json(spec)
+        assert spec_to_json(spec_from_json(s)) == s
+
+
+# ---------------------------------------------------------------------------
+# Error-path coverage — codec failure modes for bad wire input
+# ---------------------------------------------------------------------------
+
+
+class TestErrorPaths:
+    """Codec failure modes when consuming malformed or incomplete bytes from another host."""
+
+    def test_spec_from_json_missing_required_key_raises_key_error(self):
+        """spec_from_json with an empty object raises KeyError for 'verify_commands'."""
+        with pytest.raises(KeyError):
+            spec_from_json("{}")
+
+    def test_spec_from_json_malformed_json_raises_decode_error(self):
+        """spec_from_json with invalid JSON raises json.JSONDecodeError."""
+        with pytest.raises(json.JSONDecodeError):
+            spec_from_json("not { valid } json")
+
+    def test_result_from_dict_unknown_key_raises_type_error(self):
+        """result_from_dict with an unrecognised key raises TypeError.
+
+        VerifyResult(**d) fails when d contains keys that don't match any field,
+        so the codec has well-defined (not silent) behaviour on unexpected input.
+        """
+        d = {
+            "passed": True,
+            "test_output": "",
+            "lint_output": "",
+            "type_output": "",
+            "summary": "ok",
+            "unknown_extra_field": "should_fail",
+        }
+        with pytest.raises(TypeError):
+            result_from_dict(d)
+
+    def test_result_from_json_empty_object_raises_type_error(self):
+        """result_from_json with an empty JSON object raises TypeError (missing required args)."""
+        with pytest.raises(TypeError):
+            result_from_json("{}")
