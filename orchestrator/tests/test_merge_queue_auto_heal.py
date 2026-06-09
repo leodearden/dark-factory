@@ -11,6 +11,7 @@ Step-15 (RED/GREEN): _auto_heal_main_health idempotency (lane already halted →
 Step-17 (RED/GREEN): non-mechanical outcome → escalate, no halt/spawn.
 Step-19 (RED/GREEN): attempt cap → hard-escalate, no spawn.
 Step-21 (RED/GREEN): owner-tied auto-resume via unhalt_lanes_owned_by.
+Step-23 (RED/GREEN): auto-heal signature derives from failing outcome, not constant instance fields.
 """
 from __future__ import annotations
 
@@ -723,4 +724,148 @@ class TestAutoHealOwnerTiedResume:
         )
         assert real_worker.is_lane_halted('normal') is False, (
             'Normal lane must be unhalted after unhalt_lanes_owned_by'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-23: auto-heal signature derives from the failing outcome, not constant
+#           instance fields (_compute_merge_outcome_signature regression)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealSignatureDerivedFromOutcome:
+    """Regression: distinct (category,cause_hint) breaks must get distinct sigs.
+
+    Bug: _auto_heal_main_health used self._merge_outcome_signature() which reads
+    _last_merge_failure_* instance fields.  Those are never set on the
+    MAIN_HEALTH_RED_REASON_PREFIX fast-path, so every call returned the same
+    constant hash of the empty basis — a single shared registry key that caused
+    any later break to see attempts>=MAX and hard-escalate without spawning.
+    """
+
+    # (A) Pure helper: distinct cause_hints → distinct sigs, and neither
+    # collapses to the empty-basis constant.
+    def test_distinct_cause_hints_produce_distinct_sigs(self) -> None:
+        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
+
+        sig_a = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
+        sig_b = _compute_merge_outcome_signature('compile_error', 'error TS1005: Toolbar.tsx')
+        assert sig_a != sig_b, (
+            f'Distinct cause_hints must produce distinct sigs; got sig_a={sig_a!r} sig_b={sig_b!r}'
+        )
+
+    def test_outcome_derived_sig_differs_from_empty_constant(self) -> None:
+        from orchestrator.workflow import _compute_merge_outcome_signature  # type: ignore[attr-defined]
+
+        sig_outcome = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
+        sig_empty = _compute_merge_outcome_signature('', '')
+        assert sig_outcome != sig_empty, (
+            f'Outcome-derived sig must not collapse to empty-basis constant; '
+            f'sig_outcome={sig_outcome!r} sig_empty={sig_empty!r}'
+        )
+
+    # (B) Behavioral: two workflows sharing ONE registry must get independent
+    # attempt counters when called with DISTINCT outcomes.
+    def test_two_distinct_outcomes_get_independent_attempt_counters(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+
+        config = _make_config(tmp_path)
+
+        # Shared merge_worker with a REAL registry
+        shared_merge_worker = MagicMock()
+        shared_merge_worker.auto_heal_registry = MainHealthAutoHealRegistry()
+        shared_merge_worker.is_lane_halted = MagicMock(return_value=False)
+        shared_merge_worker.halt_lane = MagicMock()
+        shared_merge_worker.set_lane_halt_owner = MagicMock()
+
+        # Outcome A: compile_error / TS2322 / StatusBar
+        outcome_a = MergeOutcome(
+            'blocked',
+            reason=f'{MAIN_HEALTH_RED_REASON_PREFIX} (category=compile_error): error TS2322',
+            failure_category='compile_error',
+            failure_cause_hint='error TS2322: StatusBar.tsx',
+            dedupe_fingerprint='fp-A',
+        )
+
+        # Outcome B: compile_error / TS1005 / Toolbar (DIFFERENT cause_hint)
+        outcome_b = MergeOutcome(
+            'blocked',
+            reason=f'{MAIN_HEALTH_RED_REASON_PREFIX} (category=compile_error): error TS1005',
+            failure_category='compile_error',
+            failure_cause_hint='error TS1005: Toolbar.tsx',
+            dedupe_fingerprint='fp-B',
+        )
+
+        # Build two separate workflows pointing at the SAME merge_worker
+        worktree_a = tmp_path / 'wt-a'
+        worktree_a.mkdir()
+        workflow_a = _make_workflow(config, worktree_a)
+        workflow_a.merge_queue = asyncio.Queue()
+        workflow_a.merge_worker = shared_merge_worker
+
+        esc_queue_a = MagicMock()
+        esc_queue_a.make_id = MagicMock(return_value='esc-a-001')
+        workflow_a.escalation_queue = esc_queue_a
+
+        spawned_a: list[list[dict]] = []
+
+        async def _fake_post_submit_a(arguments_list: list[dict]) -> None:
+            spawned_a.append(arguments_list)
+
+        workflow_a._post_submit_tasks = _fake_post_submit_a  # type: ignore[method-assign]
+        workflow_a._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        worktree_b = tmp_path / 'wt-b'
+        worktree_b.mkdir()
+        workflow_b = _make_workflow(config, worktree_b)
+        workflow_b.merge_queue = asyncio.Queue()
+        workflow_b.merge_worker = shared_merge_worker
+
+        esc_queue_b = MagicMock()
+        esc_queue_b.make_id = MagicMock(return_value='esc-b-001')
+        workflow_b.escalation_queue = esc_queue_b
+
+        spawned_b: list[list[dict]] = []
+
+        async def _fake_post_submit_b(arguments_list: list[dict]) -> None:
+            spawned_b.append(arguments_list)
+
+        workflow_b._post_submit_tasks = _fake_post_submit_b  # type: ignore[method-assign]
+        workflow_b._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'}):
+            asyncio.run(workflow_a._auto_heal_main_health(outcome_a, merge_phase=True))
+
+        # After A's heal, reset is_lane_halted to return False for B's call
+        shared_merge_worker.is_lane_halted = MagicMock(return_value=False)
+
+        with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'}):
+            asyncio.run(workflow_b._auto_heal_main_health(outcome_b, merge_phase=True))
+
+        # Both workflows must have spawned a fix task
+        assert spawned_a, 'Workflow A must have spawned a fix task'
+        assert spawned_b, (
+            'Workflow B must have spawned a fix task — '
+            'NOT spuriously attempt-capped by A\'s heal'
+        )
+
+        # The spawned main_health_signature values must be DISTINCT
+        sig_in_a = spawned_a[0][0].get('metadata', {}).get('main_health_signature')
+        sig_in_b = spawned_b[0][0].get('metadata', {}).get('main_health_signature')
+        assert sig_in_a is not None, 'Workflow A fix task must carry main_health_signature'
+        assert sig_in_b is not None, 'Workflow B fix task must carry main_health_signature'
+        assert sig_in_a != sig_in_b, (
+            f'Distinct outcomes must produce distinct fix-task signatures; '
+            f'sig_in_a={sig_in_a!r} sig_in_b={sig_in_b!r}'
+        )
+
+        # Independent attempt counters on the shared registry
+        registry = shared_merge_worker.auto_heal_registry
+        assert registry.attempts(sig_in_a) == 1, (
+            f'Registry for sig_in_a must have 1 attempt; got {registry.attempts(sig_in_a)}'
+        )
+        assert registry.attempts(sig_in_b) == 1, (
+            f'Registry for sig_in_b must have 1 attempt; got {registry.attempts(sig_in_b)}'
         )
