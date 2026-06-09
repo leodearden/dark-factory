@@ -154,6 +154,16 @@ and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reac
 the workflow consumer."""
 
 
+MERGE_LANES: tuple[str, ...] = ('high', 'normal')
+"""Priority-ordered lane names (high first).  Used by SpeculativeMergeWorker to
+drain and pick requests: the first non-halted non-empty lane wins."""
+
+
+def _normalize_lane(lane: str) -> str:
+    """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
+    return lane if lane in MERGE_LANES else 'normal'
+
+
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
 fails with a no-space-left/ENOSPC signature that PERSISTS after one
@@ -2758,6 +2768,9 @@ class MergeRequest:
     generation: int = field(default=1, kw_only=True)
     """Generation counter for auto-chained merges (γ2).  Gen-1 is the original;
     each auto-chain increments by 1.  Bounded by MAX_AUTO_CHAINED_GENERATIONS."""
+    lane: Literal['normal', 'high'] = field(default='normal', kw_only=True)
+    """Priority lane for this request.  'high' requests are picked before all
+    'normal' requests; within a lane FIFO order is preserved."""
 
 
 @dataclass

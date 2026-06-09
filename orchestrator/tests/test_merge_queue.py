@@ -20,6 +20,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    MERGE_LANES,
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -100,6 +101,7 @@ def _make_request(
     worktree: Path,
     config: OrchestratorConfig,
     pre_rebased: bool = False,
+    lane: str = 'normal',
 ) -> MergeRequest:
     future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
     return MergeRequest(
@@ -111,7 +113,23 @@ def _make_request(
         module_configs=[],
         config=config,
         result=future,
+        lane=lane,
     )
+
+
+def _gated_verify(gate: asyncio.Event, gated_task_id: str):
+    """Return an AsyncMock side_effect that blocks on *gate* for *gated_task_id*.
+
+    For any other task the verify passes immediately.  Use this to hold a
+    merge pipeline mid-verify while enqueuing additional requests so pick-order
+    tests are deterministic.
+    """
+    async def _side_effect(worktree, *args, **kwargs):
+        task_id = Path(worktree).name if worktree else None
+        if task_id == gated_task_id:
+            await gate.wait()
+        return MagicMock(passed=True, summary='')
+    return _side_effect
 
 
 def _mock_verify_pass():
@@ -16014,3 +16032,47 @@ class TestSoftCancelMidVerify:
         )
         # main must not advance
         assert await git_ops.get_main_sha() == pre_merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestLanePriorityMechanics — Steps 1-14 (priority lanes feature)
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestLane:
+    """Step-1 / step-2: lane field on MergeRequest and MERGE_LANES constant."""
+
+    def test_merge_request_lane_attribute(self, config: OrchestratorConfig, git_repo: Path):
+        """lane defaults to 'normal'; can be set to 'high'."""
+        loop = asyncio.new_event_loop()
+        try:
+            future_n: asyncio.Future[MergeOutcome] = loop.create_future()
+            req_normal = MergeRequest(
+                task_id='t1',
+                branch='t1',
+                worktree=git_repo,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future_n,
+            )
+            assert req_normal.lane == 'normal'
+
+            future_h: asyncio.Future[MergeOutcome] = loop.create_future()
+            req_high = MergeRequest(
+                task_id='t2',
+                branch='t2',
+                worktree=git_repo,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=future_h,
+                lane='high',
+            )
+            assert req_high.lane == 'high'
+
+            assert MERGE_LANES == ('high', 'normal')
+        finally:
+            loop.close()
