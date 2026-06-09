@@ -397,8 +397,8 @@ def test_merge_outcome_signature_same_fingerprint_equal_despite_varied_reason():
 def test_merge_outcome_signature_fallback_when_structured_fields_empty():
     """_merge_outcome_signature falls back to sha256(normalised_reason) when both fields are ''.
 
-    The fallback must produce a 16-hex-char string and must match for reasons
-    that differ only by whitespace/case.
+    The fallback applies _normalize_cause_hint (lowercase + whitespace-collapse),
+    so reasons that differ only by case or whitespace produce the same signature.
     """
     f = _make()
     wf = f.wf
@@ -410,6 +410,13 @@ def test_merge_outcome_signature_fallback_when_structured_fields_empty():
 
     assert len(sig_fallback) == 16 and all(c in '0123456789abcdef' for c in sig_fallback), (
         f'Fallback signature must be 16 hex chars, got {sig_fallback!r}'
+    )
+
+    # Reason differing only by case/whitespace → same fallback sig (normalisation applied)
+    wf._last_merge_block_reason = 'post-merge verification failed:  tests  failed\n\nextra  output'
+    sig_normalised = wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    assert sig_normalised == sig_fallback, (
+        'Fallback signatures must match for reasons that differ only by case/whitespace'
     )
 
     # Different reason → different fallback sig

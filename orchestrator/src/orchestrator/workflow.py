@@ -2745,6 +2745,13 @@ class TaskWorkflow:
         (#1645, workflow.py:3544).  Falls back to sha256(normalised_reason) when
         both structured fields are empty (e.g. git ff/merge errors with no
         VerifyResult), which is a strict improvement over the old raw-reason hash.
+
+        Deploy note: this method replaced the old sha256(raw_reason) scheme. Any
+        task in-flight at deploy time will have a persisted
+        metadata.last_merge_outcome_signature in the old format; on the next merge
+        failure prev_signature (old) != current_signature (new), so
+        consecutive_merge_thrash resets to 1 — at most one extra thrash cycle
+        before the counter re-accumulates. Self-healing and benign.
         """
         category = self._last_merge_failure_category
         cause_hint = self._last_merge_failure_cause_hint
@@ -6092,9 +6099,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             workflow_state=self.state.value,
             level=1,
             train_state=train_state,
+            root_cause=root_cause,
         )
-        if root_cause:
-            esc.root_cause = root_cause
         self.escalation_queue.submit(esc)
         if self.event_store:
             self.event_store.emit(
