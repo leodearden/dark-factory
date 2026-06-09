@@ -4385,3 +4385,44 @@ class TestReclaimWorktreeBuildArtifacts:
         assert removed == [], (
             f'expected [] for non-existent path, got {removed}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1692 — persistent warm merge-verify worktree
+# ---------------------------------------------------------------------------
+
+
+def test_git_config_persistent_merge_worktree_knobs():
+    """GitConfig knobs for the persistent warm merge-verify worktree feature.
+
+    Step 1 (RED): these fields do not yet exist — test must fail before impl.
+    """
+    # Defaults: feature off
+    cfg_default = GitConfig()
+    assert cfg_default.persistent_merge_worktree is False, (
+        'persistent_merge_worktree must default to False (feature off)'
+    )
+    assert cfg_default.persistent_merge_worktree_safety_valve_every_n == 0, (
+        'safety_valve_every_n must default to 0 (disabled)'
+    )
+
+    # Round-trip True
+    cfg_on = GitConfig(persistent_merge_worktree=True)
+    assert cfg_on.persistent_merge_worktree is True, (
+        'persistent_merge_worktree=True must round-trip'
+    )
+    # safety_valve_every_n independent
+    assert cfg_on.persistent_merge_worktree_safety_valve_every_n == 0
+
+    # safety_valve_every_n set explicitly
+    cfg_valve = GitConfig(
+        persistent_merge_worktree=True,
+        persistent_merge_worktree_safety_valve_every_n=5,
+    )
+    assert cfg_valve.persistent_merge_worktree is True
+    assert cfg_valve.persistent_merge_worktree_safety_valve_every_n == 5
+
+    # safety_valve_every_n >= 0 enforced (0 means disabled)
+    import pydantic
+    with pytest.raises((pydantic.ValidationError, ValueError)):
+        GitConfig(persistent_merge_worktree_safety_valve_every_n=-1)
