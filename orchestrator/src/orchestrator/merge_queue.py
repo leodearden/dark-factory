@@ -243,6 +243,38 @@ concurrent failing merge to the steward would cause an ~85 min-per-task
 livelock for every task whose verify runs against a red main."""
 
 
+# ---------------------------------------------------------------------------
+# Auto-heal eligibility gate
+# ---------------------------------------------------------------------------
+
+# Conservative allowlist of verify.py category strings that are mechanical
+# (small diff, deterministic cause) and therefore safe to auto-spawn a fix
+# task for.  The category strings are those emitted by
+# ``verify._classify_failure``; compile_error covers the tsc/type/lint class.
+#
+# Deliberately EXCLUDED — not eligible for auto-heal:
+#   test_failure:         multi-file; needs human judgement on test expectations
+#   unknown_test_failure: ambiguous signal; may be flaky
+#   infra_timeout:        infra problem; auto-spawning cannot fix infra
+#   flock_error:          transient lock contention; auto-spawning cannot fix
+AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
+
+
+def is_auto_heal_eligible(
+    category: str | None, cause_hint: str | None,  # noqa: ARG001
+) -> bool:
+    """Return True when the failure class is safe for automated fix spawning.
+
+    The allowlist is intentionally conservative — start with compile_error
+    (the tsc/type/lint class, typically a small bounded diff) and expand
+    only after production evidence of clean auto-heals for each new class.
+
+    ``cause_hint`` is accepted for future per-hint filtering but is not
+    currently used; the gate is purely category-based.
+    """
+    return (category or '') in AUTO_HEAL_MECHANICAL_CATEGORIES
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
