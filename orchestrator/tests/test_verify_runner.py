@@ -2283,3 +2283,103 @@ class TestRunVerdictParityDivergence:
         row = report.rows[0]
         assert row.agree is True
         assert row.matches_expected is False
+
+
+# ---------------------------------------------------------------------------
+# ε step-11: render_parity_report — markdown structure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRenderParityReport:
+    """render_parity_report(report) -> str — markdown structure assertions."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def _all_agree_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc123', True), ('def456', False)]
+        local_fake = self._make_fake_runner('local', {
+            'abc123': _make_verify_result(passed=True),
+            'def456': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'abc123': _make_verify_result(passed=True),
+            'def456': _make_verify_result(passed=False),
+        })
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def _diverging_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc123', None), ('bad456', None)]
+        local_fake = self._make_fake_runner('local', {
+            'abc123': _make_verify_result(passed=True),
+            'bad456': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'abc123': _make_verify_result(passed=True),
+            'bad456': _make_verify_result(passed=False),  # disagrees
+        })
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def test_all_agree_headline_contains_pass_marker(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        assert 'PASS' in text or 'parity holds' in text.lower()
+
+    async def test_divergence_headline_contains_divergence_marker(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._diverging_report()
+        text = render_parity_report(report)
+        assert 'DIVERGENCE' in text or 'diverge' in text.lower()
+
+    async def test_results_table_contains_each_sha(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        assert 'abc123' in text
+        assert 'def456' in text
+
+    async def test_results_table_has_header_row(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # Table header must mention sha, local, remote, agree
+        assert 'sha' in text.lower()
+        assert 'local' in text.lower()
+        assert 'remote' in text.lower()
+        assert 'agree' in text.lower()
+
+    async def test_divergent_shas_listed_when_present(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._diverging_report()
+        text = render_parity_report(report)
+        assert 'bad456' in text
+
+    async def test_divergent_shas_section_absent_when_all_agree(self):
+        """No divergence callout section when all rows agree."""
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # The divergent SHA from the other corpus must NOT appear
+        assert 'bad456' not in text
+
+    async def test_one_table_row_per_corpus_sha(self):
+        """Table has exactly one data row per corpus SHA (not counting header)."""
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # Count lines containing 'abc123' and 'def456' — each should appear once
+        lines = text.splitlines()
+        assert sum(1 for l in lines if 'abc123' in l) == 1
+        assert sum(1 for l in lines if 'def456' in l) == 1
