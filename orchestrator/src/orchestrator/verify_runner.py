@@ -764,15 +764,47 @@ class VerifyRunnerPool:
         )
         self._event_store = event_store
         self._task_id = task_id
+        # ι: quarantine set — names of runners dropped from eligible dispatch.
+        # Local (is_local) is the trust anchor and is never quarantined.
+        self._quarantined: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # ι: quarantine API
+    # ------------------------------------------------------------------
+
+    def quarantine(self, name: str) -> None:
+        """Mark runner *name* as quarantined; idempotent."""
+        self._quarantined.add(name)
+
+    def clear_quarantine(self, name: str) -> None:
+        """Remove runner *name* from quarantine; idempotent."""
+        self._quarantined.discard(name)
+
+    def is_quarantined(self, name: str) -> bool:
+        """Return True if runner *name* is currently quarantined."""
+        return name in self._quarantined
+
+    @property
+    def local_runner(self) -> VerifyRunner | None:
+        """The is_local runner, or None if not present."""
+        return self._local
+
+    def eligible_remote(self) -> VerifyRunner | None:
+        """First non-local runner that is not quarantined, or None."""
+        for runner in self._runners:
+            if not runner.is_local and runner.name not in self._quarantined:
+                return runner
+        return None
 
     def _select_runner(self) -> VerifyRunner:
-        """Prefer-remote: return the first non-local runner; fall back to runners[0].
+        """Prefer-remote: return the first non-quarantined non-local runner; fall back to runners[0].
 
         The K-permit free/busy refinement (load-based selection) is ζ.
         RemoteRunner.is_local is False, so it is selected over LocalRunner.
+        Quarantined non-local runners are skipped; local is the trust anchor.
         """
         for runner in self._runners:
-            if not runner.is_local:
+            if not runner.is_local and runner.name not in self._quarantined:
                 return runner
         return self._runners[0]
 
