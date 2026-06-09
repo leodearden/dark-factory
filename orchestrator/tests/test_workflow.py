@@ -1809,6 +1809,7 @@ class TestGroupMergeUnionScope:
         config.lock_depth = 2
         config.steward_completion_timeout = 300.0
         config.project_root = tmp_path
+        config.merge_verify_workspace = False  # exercise the union path (not workspace short-circuit)
 
         def _for_module(m: str):
             if m.startswith('crate_a'):

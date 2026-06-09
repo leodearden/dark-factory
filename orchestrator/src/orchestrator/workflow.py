@@ -670,29 +670,12 @@ class TaskWorkflow:
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
 
-        # Compute union task_files and module_configs over all train members so
-        # that a lower member in a different crate is verified alongside the tip.
-        # Basis: the tip's plan-derived scope (self._task_files / self.modules) is
-        # always the base so tip coverage never regresses.  Each member's
-        # metadata.files-derived files and modules are added on top (deduplicated
-        # by value for files, by mc.prefix for module_configs).
-        _union_files: list[str] = list(self._task_files or [])
-        _seen_files: set[str] = set(_union_files)
-        _union_modules: list[str] = list(self.modules)
-        _seen_modules: set[str] = set(_union_modules)
-        for _member in members:
-            _member_files: list[str] = ((_member.get('metadata') or {}).get('files')) or []
-            for _f in _member_files:
-                if _f not in _seen_files:
-                    _seen_files.add(_f)
-                    _union_files.append(_f)
-            if _member_files:
-                for _m in files_to_modules(_member_files, self.config.lock_depth):
-                    if _m not in _seen_modules:
-                        _seen_modules.add(_m)
-                        _union_modules.append(_m)
-        union_task_files: list[str] | None = _union_files or None
-        union_module_configs = self._resolve_module_configs(_union_modules or None)
+        if self.config.merge_verify_workspace:
+            # workspace-wide verify ignores per-task scope; skip the member union loop
+            union_task_files = self._task_files
+            union_module_configs = self._module_configs
+        else:
+            union_task_files, union_module_configs = self._union_train_scope(members)
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
@@ -769,6 +752,33 @@ class TaskWorkflow:
             f'Group merge for train {train_id!r} failed: {result.status} — {result.reason}',
             escalate_to_human=True,
         )
+
+    def _union_train_scope(
+        self, members: list[dict],
+    ) -> tuple[list[str] | None, list[ModuleConfig]]:
+        """Compute the union verify scope over all train members.
+
+        Starts from the tip's plan-derived scope (self._task_files / self.modules)
+        so tip coverage never regresses, then folds in each member's metadata.files-
+        derived files and modules (deduped by value for files, by mc.prefix for
+        module_configs via _resolve_module_configs).
+        """
+        union_files: list[str] = list(self._task_files or [])
+        seen_files: set[str] = set(union_files)
+        union_modules: list[str] = list(self.modules)
+        seen_modules: set[str] = set(union_modules)
+        for member in members:
+            member_files: list[str] = ((member.get('metadata') or {}).get('files')) or []
+            for f in member_files:
+                if f not in seen_files:
+                    seen_files.add(f)
+                    union_files.append(f)
+            if member_files:
+                for m in files_to_modules(member_files, self.config.lock_depth):
+                    if m not in seen_modules:
+                        seen_modules.add(m)
+                        union_modules.append(m)
+        return union_files or None, self._resolve_module_configs(union_modules or None)
 
     async def _finalise_merged_done(self) -> WorkflowOutcome:
         """Common DONE-finalisation for the happy-path merge.
