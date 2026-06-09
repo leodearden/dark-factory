@@ -461,7 +461,11 @@ async def _run_post_merge_verify(
                     'row — next submission will be abandoned',
                     req.task_id, new_count,
                 )
-        return MergeOutcome('blocked', reason=reason)
+        return MergeOutcome(
+            'blocked', reason=reason,
+            failure_category=verify.category,
+            failure_cause_hint=verify.cause_hint,
+        )
 
     # Pre-advance, fail-closed unscoped type-check gate.
     # Runs ONLY type_check_command unscoped against the already-created merge_wt
