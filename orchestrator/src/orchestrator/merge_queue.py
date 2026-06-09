@@ -4664,6 +4664,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         spec_base: str | None = None
         # Pre-fetched next request grabbed speculatively from main queue.
         prefetched: MergeRequest | None = None
+        # True exactly while the merger holds one _speculation_slot permit that
+        # has NOT yet been handed off to the verifier via _verifier_queue.put().
+        # Set True immediately after _speculation_slot.acquire() (:5003); set
+        # False after every _verifier_queue.put() hand-off (the verifier then
+        # owns the permit and releases it on drain), and on the no-pickable /
+        # shutdown release branches.  Every exit path that bypasses the verifier
+        # (abandoned-at-top, except WorktreeMissing, except Exception, outer
+        # finally) releases the permit and clears this flag.
+        held_spec_permit: bool = False
 
         try:
             while self._running:
@@ -4683,6 +4692,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # dequeued.  Skipping merge work avoids the orphan-halt
                 # window where no escalation owner is registered.
                 if self._request_abandoned(req):
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
                     continue
@@ -4730,6 +4742,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             skip_verify=False, immediate_outcome=outcome,
                             started_monotonic=t0,
                         ))
+                        # Train is put with speculative=False so the verifier
+                        # will NOT release the slot on drain.  Release explicitly
+                        # if the train was prefetched as a speculative item.
+                        if held_spec_permit:
+                            self._speculation_slot.release()
+                            held_spec_permit = False
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4764,6 +4782,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4790,6 +4809,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4821,6 +4841,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4837,6 +4858,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             immediate_outcome=MergeOutcome('already_merged'),
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4872,6 +4894,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4903,6 +4926,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             failure_diagnostic=_diag,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4948,6 +4972,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
+                        held_spec_permit = False  # verifier releases if speculative
                         spec_base = None
                         self._inflight_req = None
                         continue
@@ -4991,6 +5016,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise
+                    # The put succeeded — verifier now owns the speculation
+                    # permit for this item (released on drain if speculative).
+                    held_spec_permit = False
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-K cap) ──────────────────
@@ -5001,6 +5029,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # immediately — symmetric accounting keeps in-flight speculations
                     # bounded at self._speculation_depth (K).
                     await self._speculation_slot.acquire()  # depth-K cap
+                    held_spec_permit = True  # permit held until verifier drains or exception releases
                     # Harvest any item already delivered to the persistent
                     # getter so the look-ahead can see it via _pop_next_pickable.
                     if self._pending_get is not None and self._pending_get.done():
@@ -5022,9 +5051,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                     elif self._shutdown_signaled:
                         self._speculation_slot.release()  # return unused permit
+                        held_spec_permit = False
                         break  # shutdown sentinel and nothing left to speculate
                     else:
                         self._speculation_slot.release()  # no pickable item — return permit
+                        held_spec_permit = False
                         spec_base = None  # no pickable item, no speculation
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
@@ -5058,6 +5089,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 ),
                             )
                         )
+                    # Release any speculation permit held for a prefetched item
+                    # that failed before being put on the verifier queue.
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
                 except Exception as exc:
@@ -5085,9 +5121,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._inflight_req.result.set_result(
                             MergeOutcome('blocked', reason=f'Merger error: {exc}')
                         )
+                    # Release any speculation permit held for a prefetched item
+                    # that failed before being put on the verifier queue.
+                    if held_spec_permit:
+                        self._speculation_slot.release()
+                        held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
         finally:
+            # Release any speculation permit still held — covers BaseException
+            # paths (e.g. CancelledError) that bypass the inner except clauses.
+            if held_spec_permit:
+                self._speculation_slot.release()
             # Resolve any in-flight request not yet handed to the verifier.
             # Covers BaseException paths (e.g. CancelledError) that bypass
             # the inner except clause above.
