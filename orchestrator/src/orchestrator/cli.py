@@ -276,6 +276,61 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('verify-merge')
+@click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
+@click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+def verify_merge(sha: str, spec_json: str, config_path: Path | None):
+    """Run the merge-verify bundle at a given SHA and emit a VerifyResult JSON to stdout.
+
+    Materialises a detached worktree at --sha, runs the same scoped + unscoped
+    verify bundle the merge queue uses (fidelity by construction), and emits a
+    single VerifyResult JSON document to stdout.  All logs go to stderr.  Exit
+    code is 0 on success (even when passed=False); non-zero only on bad input or
+    infrastructure errors.
+
+    Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
+    """
+    from orchestrator.git_ops import GitOps
+    from orchestrator.verify_runner import (
+        result_to_json,
+        run_merge_verify_on_worktree,
+        spec_from_json,
+    )
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+    try:
+        spec = spec_from_json(spec_json)
+    except Exception as e:
+        click.echo(f'Error: invalid --spec: {e}', err=True)
+        sys.exit(1)
+
+    async def _run():
+        git_ops = GitOps(config.git, config.project_root)
+        wt, _ = await git_ops._create_merge_worktree(base_sha=sha)
+        try:
+            return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
+        finally:
+            await git_ops.cleanup_merge_worktree(wt)
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+    click.echo(result_to_json(result))
+
+
 @main.command('eval')
 @click.option('--task', 'task_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to a single task JSON file')

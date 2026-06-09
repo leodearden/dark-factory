@@ -41,10 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult
 
 if TYPE_CHECKING:
-    from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.config import OrchestratorConfig
 
 __all__ = [
     "VerifyCommand",
@@ -60,6 +61,8 @@ __all__ = [
     "LocalRunner",
     "VerifyRunnerPool",
     "build_merge_verify_spec",
+    "_module_config_from_command",
+    "run_merge_verify_on_worktree",
     "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
@@ -272,6 +275,108 @@ def build_merge_verify_spec(
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# _module_config_from_command — inverse of build_merge_verify_spec's projection
+# ---------------------------------------------------------------------------
+
+
+def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> ModuleConfig:
+    """Reconstruct a ModuleConfig from a VerifyCommand + shared MergeVerifySpec fields.
+
+    This is the exact inverse of build_merge_verify_spec's projection:
+    - prefix + three command fields come from the VerifyCommand
+    - verify_env and cold_timeout_secs are shared spec-level fields threaded into
+      each ModuleConfig's verify_env and verify_cold_command_timeout_secs
+
+    ModuleConfig fields the wire spec never carried (lock_depth, warm timeout, etc.)
+    stay at their dataclass defaults.  Reconstruction is information-preserving for
+    all verify-relevant behaviour *when build_merge_verify_spec is the sole producer*:
+    it serialises a single spec-level cold_timeout_secs for all modules, so if modules
+    originally had distinct per-module cold timeouts the reconstruction is not lossless
+    (the spec collapses them).  In practice the merge path uses one config-level value.
+
+    cold_timeout_secs: the 0.0 wire sentinel (emitted by build_merge_verify_spec when
+    neither merge_verify_cold_command_timeout_secs nor verify_cold_command_timeout_secs
+    is set) maps back to None so that _resolve_verify_timeout falls through the cold
+    cascade (module→top-level→warm) exactly as a real local merge run does, instead of
+    returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
+    TimeoutError.  Positive cold timeouts map verbatim.
+    """
+    return ModuleConfig(
+        prefix=vc.prefix,
+        test_command=vc.test_command,
+        lint_command=vc.lint_command,
+        type_check_command=vc.type_check_command,
+        verify_env=dict(spec.verify_env),
+        verify_cold_command_timeout_secs=(
+            spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_merge_verify_on_worktree — host-entry for the CLI verify-merge subcommand
+# ---------------------------------------------------------------------------
+
+
+async def run_merge_verify_on_worktree(
+    merge_wt: Path,
+    config: OrchestratorConfig,
+    spec: MergeVerifySpec,
+    *,
+    merge_sha: str = '',
+    task_id: str | None = None,
+    run_scoped: Callable[..., Awaitable[VerifyResult]] | None = None,
+    run_unscoped: Callable[..., Awaitable[Any]] | None = None,
+) -> VerifyResult:
+    """Run the combined merge-verify bundle at a materialized worktree.
+
+    Reconstructs per-module ModuleConfig objects from the wire spec, then
+    delegates to LocalRunner.run_merge_verify (the same bundle the merge queue
+    runs), providing fidelity by construction (PRD §A Invariant 1 / D2).
+
+    Args:
+        merge_wt: Path to the detached worktree at the merge SHA.
+        config:   OrchestratorConfig for the host project.
+        spec:     Deserialized MergeVerifySpec from the --spec CLI flag.
+        merge_sha: The commit SHA being verified (threaded into telemetry).
+        task_id:  Optional task ID for logging/telemetry.
+        run_scoped:   Injected callable for scoped verification (default: real global).
+        run_unscoped: Injected callable for unscoped typecheck gate (default: real global).
+    """
+    # Deferred imports break the merge_queue↔verify_runner module-level cycle
+    # (merge_queue imports verify_runner at module level; a module-level import of
+    # merge_queue here would re-introduce the cycle). Defaults are wired in step-6.
+    if run_scoped is None:
+        from orchestrator.verify import run_scoped_verification  # type: ignore[attr-defined]
+        run_scoped = run_scoped_verification
+    if run_unscoped is None:
+        from orchestrator.merge_queue import _run_unscoped_typechecks  # type: ignore[attr-defined]
+        run_unscoped = _run_unscoped_typechecks
+
+    # module_configs is reconstructed from spec.verify_commands (which carries
+    # type_check_command per module).  build_merge_verify_spec — the sole spec producer
+    # — copies mc.type_check_command into *both* verify_commands and
+    # unscoped_typecheck.commands, so the typecheck gate's module_configs are correct.
+    # If any future producer emits a spec where those two lists diverge (verify_commands
+    # lacks type_check_command while unscoped_typecheck.commands carries it), the unscoped
+    # gate would silently become a no-op.  Adding a new spec producer must maintain that
+    # invariant or reconstruct module_configs from spec.unscoped_typecheck instead.
+    module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
+    task_files = tuple(spec.task_files) if spec.task_files is not None else None
+
+    runner = LocalRunner(
+        merge_wt,
+        config,
+        module_configs,
+        task_files,
+        run_scoped=run_scoped,
+        run_unscoped=run_unscoped,
+        task_id=task_id,
+    )
+    return await runner.run_merge_verify(merge_sha, spec)
 
 
 # ---------------------------------------------------------------------------
