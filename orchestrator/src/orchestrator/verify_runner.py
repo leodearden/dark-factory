@@ -293,6 +293,13 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     ModuleConfig fields the wire spec never carried (lock_depth, warm timeout, etc.)
     stay at their dataclass defaults so reconstruction is information-preserving for
     all verify-relevant behaviour.
+
+    cold_timeout_secs: the 0.0 wire sentinel (emitted by build_merge_verify_spec when
+    neither merge_verify_cold_command_timeout_secs nor verify_cold_command_timeout_secs
+    is set) maps back to None so that _resolve_verify_timeout falls through the cold
+    cascade (module→top-level→warm) exactly as a real local merge run does, instead of
+    returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
+    TimeoutError.  Positive cold timeouts map verbatim.
     """
     return ModuleConfig(
         prefix=vc.prefix,
@@ -300,7 +307,9 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
         lint_command=vc.lint_command,
         type_check_command=vc.type_check_command,
         verify_env=dict(spec.verify_env),
-        verify_cold_command_timeout_secs=spec.cold_timeout_secs,
+        verify_cold_command_timeout_secs=(
+            spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None
+        ),
     )
 
 

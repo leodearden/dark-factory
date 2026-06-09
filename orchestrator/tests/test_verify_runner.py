@@ -819,6 +819,36 @@ class TestModuleConfigFromCommand:
         assert mc.verify_env == {'K': 'V'}
         assert mc.verify_cold_command_timeout_secs == 300.0
 
+    def test_cold_timeout_zero_sentinel_maps_to_none(self):
+        """build_merge_verify_spec emits cold_timeout_secs=0.0 when neither
+        merge_verify_cold_command_timeout_secs nor verify_cold_command_timeout_secs
+        is set (the common 'unset' sentinel). The original local ModuleConfig in that
+        case has verify_cold_command_timeout_secs=None (config.py default).
+
+        Storing the literal 0.0 breaks fidelity: _resolve_verify_timeout treats 0.0
+        as 'not None', returns it, and asyncio.wait_for(..., timeout=0.0) raises
+        TimeoutError immediately, spuriously blocking merges.
+
+        The mapper must translate 0.0 → None so the host-side cascade falls through to
+        warm/global identically to a real local merge run.
+
+        Regression guard: a positive cold timeout (e.g. 300.0) must still map verbatim.
+        """
+        from orchestrator.verify_runner import _module_config_from_command
+        vc = VerifyCommand(prefix='mod', test_command='true')
+
+        # 0.0 sentinel → None (the fidelity-preserving round-trip value)
+        spec_zero = self._make_spec(cold_timeout_secs=0.0)
+        mc = _module_config_from_command(vc, spec_zero)
+        assert mc.verify_cold_command_timeout_secs is None, (
+            f"Expected None for 0.0 sentinel, got {mc.verify_cold_command_timeout_secs!r}"
+        )
+
+        # Positive cold timeout still maps verbatim
+        spec_pos = self._make_spec(cold_timeout_secs=300.0)
+        mc2 = _module_config_from_command(VerifyCommand(prefix='mod'), spec_pos)
+        assert mc2.verify_cold_command_timeout_secs == 300.0
+
 
 # ---------------------------------------------------------------------------
 # Step-3: run_merge_verify_on_worktree — host-entry wiring
