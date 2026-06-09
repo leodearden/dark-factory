@@ -85,6 +85,7 @@ class TestComputePreexistingMainBreakFingerprint:
 
     def test_matches_inline_composition(self) -> None:
         from escalation.dedupe import compute_content_fingerprint
+
         from orchestrator.workflow import (
             _normalize_cause_hint,
             compute_preexisting_main_break_fingerprint,

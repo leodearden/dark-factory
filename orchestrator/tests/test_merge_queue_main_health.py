@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
@@ -21,7 +21,7 @@ from orchestrator.merge_queue import (
     MergeRequest,
     _run_post_merge_verify,
 )
-from orchestrator.verify import VerifyResult, _PROBE_CACHE, PREEXISTING_BREAK_SKIP_CATEGORIES
+from orchestrator.verify import _PROBE_CACHE, VerifyResult
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
 
@@ -447,11 +447,14 @@ class TestDedupeFingerprrintAndCacheReuse:
         self, tmp_path: Path,
     ) -> None:
         import time
+
+        from orchestrator.verify import _PROBE_CACHE
         from orchestrator.workflow import (
             _normalize_cause_hint as _norm,
+        )
+        from orchestrator.workflow import (
             compute_preexisting_main_break_fingerprint,
         )
-        from orchestrator.verify import _PROBE_CACHE
 
         _PROBE_CACHE.clear()
 

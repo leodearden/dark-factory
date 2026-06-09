@@ -402,10 +402,10 @@ def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> 
 
 async def _classify_main_health_red(
     git_ops: GitOps,
-    req: 'MergeRequest',
+    req: MergeRequest,
     verify: VerifyResult,
-    event_store: 'EventStore | None' = None,
-) -> 'MergeOutcome | None':
+    event_store: EventStore | None = None,
+) -> MergeOutcome | None:
     """Probe whether *verify* is a pre-existing break already on bare main HEAD.
 
     Returns a :class:`MergeOutcome` with reason starting with
