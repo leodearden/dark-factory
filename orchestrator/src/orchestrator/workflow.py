@@ -4359,10 +4359,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             },
         }
         if self.mcp is not None:
-            asyncio.create_task(  # noqa: RUF006
-                self._post_submit_tasks([arguments]),
-                name=f'spawn_fix_main_{self.task_id}',
-            )
+            try:
+                _task = asyncio.create_task(
+                    self._post_submit_tasks([arguments]),
+                    name=f'spawn_fix_main_{self.task_id}',
+                )
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
+            except Exception as exc:
+                logger.warning(
+                    'Task %s: failed to spawn main-health fix task: %s',
+                    self.task_id, exc,
+                )
 
     async def _auto_heal_main_health(
         self, result: Any, *, merge_phase: bool,
