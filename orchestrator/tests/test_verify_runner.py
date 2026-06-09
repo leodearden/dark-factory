@@ -2697,3 +2697,116 @@ class TestDriftDetectorAgree:
         detector = DriftDetector(pool)
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
+
+
+# ---------------------------------------------------------------------------
+# ι step-5: DriftDetector diverge path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorDivergence:
+    """DriftDetector.check(): diverge path — local FAIL / remote PASS → DIVERGE + escalation + quarantine."""
+
+    async def test_diverge_returns_diverge_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue, task_id='t')
+        result = await detector.check('divergesha', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+
+    async def test_diverge_submits_escalation(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        escalation_queue.submit.assert_called_once()
+
+    async def test_diverge_escalation_task_id_is_sentinel(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.task_id == '__drift__'
+
+    async def test_diverge_escalation_level_1_severity_blocking(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+
+    async def test_diverge_escalation_category_and_role(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert esc.category == 'verify_drift_divergence'
+        assert esc.agent_role == 'orchestrator-drift-detector'
+
+    async def test_diverge_escalation_summary_mentions_sha(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('mydivergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert 'mydivergesha' in esc.summary
+
+    async def test_diverge_quarantines_remote(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_diverge_emits_no_verdict_parity_ok_event(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        event_store.emit.assert_not_called()
