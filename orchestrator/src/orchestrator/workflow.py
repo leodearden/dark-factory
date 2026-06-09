@@ -297,6 +297,32 @@ def _normalize_cause_hint(hint: str | None) -> str:
     return result.lower().strip()
 
 
+def compute_preexisting_main_break_fingerprint(
+    category: str,
+    cause_hint: str,
+    probe_sha: str,
+) -> str:
+    """Shared fingerprint for preexisting-main-break escalations.
+
+    Composes the same triple used by _verify_debugfix_loop inline so that
+    task-verify escalations and merge-queue escalations for the SAME broken
+    main fold into ONE parent via submit_or_dedupe.
+
+    Returns '' on any exception (fail-safe — an empty fingerprint triggers
+    the raw-submit path, not a crash).
+    """
+    try:
+        from escalation.dedupe import compute_content_fingerprint
+        return compute_content_fingerprint(
+            'preexisting_main_break',
+            category or '',
+            [],
+            description=_normalize_cause_hint(cause_hint) + '|' + probe_sha,
+        )
+    except Exception:
+        return ''
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
@@ -3507,25 +3533,13 @@ class TaskWorkflow:
             else:
                 _is_inherited, _probe_sha = False, ''
             if _is_inherited:
-                try:
-                    from escalation.dedupe import compute_content_fingerprint
-                    # Fingerprint encodes (category, normalized-cause_hint, main_sha).
-                    # Fold key: same triple -> identical fp -> submit_or_dedupe collapses
-                    # N sibling tasks to ONE parent escalation.  Once the hotfix lands,
-                    # main_sha changes AND the break disappears from main, so a post-fix
-                    # failure gets a distinct fp and is never mis-attributed to the old
-                    # parent (design_decision #3 / step-16 verified by
-                    # TestCrossTaskInheritedBreakDedup.test_same_signature_folds_to_one_parent).
-                    fp = compute_content_fingerprint(
-                        'preexisting_main_break',
-                        result.category or '',
-                        [],
-                        description=(
-                            _normalize_cause_hint(result.cause_hint) + '|' + _probe_sha
-                        ),
-                    )
-                except Exception:
-                    fp = ''
+                # Fold key: same (category, cause_hint, main_sha) -> identical fp
+                # -> submit_or_dedupe collapses N sibling tasks to ONE parent.
+                # Shared helper ensures merge-queue + task-verify paths compose
+                # the same fingerprint (verified by TestCrossTaskInheritedBreakDedup).
+                fp = compute_preexisting_main_break_fingerprint(
+                    result.category or '', result.cause_hint, _probe_sha,
+                )
                 self._inherited_break_info = {
                     'reason': (
                         f'Verify failure is preexisting on main '
