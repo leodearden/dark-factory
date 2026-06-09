@@ -33,9 +33,12 @@ rounding or numeric tolerance is involved.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import shlex
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -523,6 +526,95 @@ class LocalRunner:
             )
 
         return scoped
+
+
+# ---------------------------------------------------------------------------
+# RemoteRunner — off-host verify via git push + ssh
+# ---------------------------------------------------------------------------
+
+
+async def _default_subprocess_run(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[int, str, str]:
+    """Default subprocess helper — mirrors git_ops._run.
+
+    Returns (returncode, stdout_str, stderr_str).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    return (
+        proc.returncode or 0,
+        stdout_b.decode().strip(),
+        stderr_b.decode().strip(),
+    )
+
+
+class RemoteRunner:
+    """Runs a merge-verify bundle on a remote host via git push + ssh.
+
+    The remote host must have ``orchestrator verify-merge`` available (γ CLI
+    contract).  The spec is shipped over ssh as a shlex-quoted JSON argument;
+    stdout is parsed as a VerifyResult via result_from_json.
+
+    Transport failures (push fail, ssh connect failure, non-zero exit,
+    unparseable stdout) raise RunnerUnavailable.  A parseable VerifyResult on
+    stdout is always returned unchanged — even passed=False or timed_out=True
+    (PRD §A Invariant 5).
+
+    The pushed ref ``refs/merge-verify/<request_id>`` is pruned best-effort on
+    return (step-10).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        ssh_host: str,
+        git_remote: str,
+        cwd: str | Path,
+        *,
+        config_path: str | None = None,
+        run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.name = name
+        self._ssh_host = ssh_host
+        self._git_remote = git_remote
+        self._cwd = cwd
+        self._config_path = config_path
+        self._run = run if run is not None else _default_subprocess_run
+        self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+
+    async def health(self) -> bool:
+        """Best-effort health probe: ``ssh <host> true``.
+
+        Returns True when rc == 0, False otherwise.  Never raises.
+        """
+        try:
+            rc, _, _ = await self._run(['ssh', self._ssh_host, 'true'])
+            return rc == 0
+        except Exception:
+            return False
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the combined merge-verify bundle on the remote host.
+
+        Raises RunnerUnavailable on any transport failure.
+        Returns a VerifyResult (even if passed=False or timed_out=True).
+
+        Implemented in step-6 (happy path) and step-8 (error handling).
+        """
+        raise NotImplementedError('run_merge_verify implemented in step-6')
 
 
 # ---------------------------------------------------------------------------
