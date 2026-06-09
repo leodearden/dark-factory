@@ -195,6 +195,13 @@ an exact Qdrant payload-filter count returns 0 or > 0 unconditionally, eliminati
 to re-synthesize already-captured knowledge). The count pre-check replaces the unreliable \
 semantic check as the authoritative suppression gate.
 
+**DECIDE-FIRST framing**: when a task was framed as a decision or "bias toward X" and X \
+was the chosen option, the completed task IMPLEMENTED X — it is already done. Stage 2 \
+MUST treat X as already-implemented and must NOT re-derive or re-synthesize that \
+conclusion as a novel finding to capture. The decision was made first, then implemented; \
+re-capturing the outcome inverts the record and fabricates a "finding" that was never \
+new information.
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
