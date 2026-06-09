@@ -59,6 +59,7 @@ __all__ = [
     "VerifyRunner",
     "LocalRunner",
     "VerifyRunnerPool",
+    "build_merge_verify_spec",
     "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
@@ -222,6 +223,55 @@ def result_to_dict(vr: VerifyResult) -> dict:
 def result_from_dict(d: dict) -> VerifyResult:
     """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
     return VerifyResult(**d)
+
+
+# ---------------------------------------------------------------------------
+# build_merge_verify_spec factory
+# ---------------------------------------------------------------------------
+
+
+def build_merge_verify_spec(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    task_files: tuple[str, ...] | None,
+) -> MergeVerifySpec:
+    """Build a MergeVerifySpec from live config + module_configs.
+
+    The spec is a host-independent projection carried through dispatch for
+    forward-compat with γ/δ (the remote runner consumes it over the wire).
+    LocalRunner does not use it to drive execution — it uses the live objects.
+    """
+    verify_commands = tuple(
+        VerifyCommand(
+            prefix=mc.prefix,
+            test_command=mc.test_command,
+            lint_command=mc.lint_command,
+            type_check_command=mc.type_check_command,
+        )
+        for mc in module_configs
+    )
+    unscoped_commands = tuple(
+        VerifyCommand(prefix=mc.prefix, type_check_command=mc.type_check_command)
+        for mc in module_configs
+        if mc.type_check_command is not None
+    )
+    cold_timeout: float = (
+        config.merge_verify_cold_command_timeout_secs
+        if config.merge_verify_cold_command_timeout_secs is not None
+        else (
+            config.verify_cold_command_timeout_secs
+            if config.verify_cold_command_timeout_secs is not None
+            else 0.0
+        )
+    )
+    return MergeVerifySpec(
+        verify_commands=verify_commands,
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
+        task_files=task_files,
+        verify_env=dict(config.verify_env) if config.verify_env else {},
+        cold_timeout_secs=float(cold_timeout),
+        is_merge_verify=True,
+    )
 
 
 # ---------------------------------------------------------------------------

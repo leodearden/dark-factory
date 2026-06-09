@@ -671,3 +671,110 @@ class TestVerifyRunnerPool:
         result = await pool.dispatch('abc123', _make_spec())
 
         assert result.passed is True
+
+
+# ---------------------------------------------------------------------------
+# Step-7: build_merge_verify_spec
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMergeVerifySpec:
+    """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
+
+    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+        mc = MagicMock()
+        mc.prefix = prefix
+        mc.test_command = test_cmd
+        mc.lint_command = lint_cmd
+        mc.type_check_command = type_check_cmd
+        return mc
+
+    def _make_config(self, *, verify_env=None, cold_timeout=None):
+        config = MagicMock()
+        config.verify_env = verify_env or {}
+        config.merge_verify_cold_command_timeout_secs = cold_timeout
+        config.verify_cold_command_timeout_secs = None
+        return config
+
+    def test_verify_commands_project_module_fields(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc = self._make_module_config('src/a', test_cmd='pytest src/a', lint_cmd='ruff src/a')
+        spec = build_merge_verify_spec(self._make_config(), [mc], None)
+
+        assert len(spec.verify_commands) == 1
+        vc = spec.verify_commands[0]
+        assert vc.prefix == 'src/a'
+        assert vc.test_command == 'pytest src/a'
+        assert vc.lint_command == 'ruff src/a'
+
+    def test_unscoped_typecheck_includes_only_type_check_modules(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc_with = self._make_module_config('src/a', type_check_cmd='pyright src/a')
+        mc_without = self._make_module_config('src/b')
+        spec = build_merge_verify_spec(self._make_config(), [mc_with, mc_without], None)
+
+        prefixes = [vc.prefix for vc in spec.unscoped_typecheck.commands]
+        assert 'src/a' in prefixes
+        assert 'src/b' not in prefixes
+
+    def test_unscoped_typecheck_block_on_timeout_true(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc = self._make_module_config('src/a', type_check_cmd='pyright src/a')
+        spec = build_merge_verify_spec(self._make_config(), [mc], None)
+        assert spec.unscoped_typecheck.block_on_timeout is True
+
+    def test_task_files_carried_as_tuple(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        task_files = ('src/a/mod.py', 'src/b/utils.py')
+        spec = build_merge_verify_spec(self._make_config(), [], task_files)
+        assert spec.task_files == task_files
+
+    def test_task_files_none_stays_none(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(), [], None)
+        assert spec.task_files is None
+
+    def test_verify_env_from_config(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        env = {'RUSTC_WRAPPER': '/usr/bin/sccache', 'CARGO_INCREMENTAL': '0'}
+        spec = build_merge_verify_spec(self._make_config(verify_env=env), [], None)
+        assert spec.verify_env == env
+
+    def test_cold_timeout_from_merge_verify_specific(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(cold_timeout=7200.0), [], None)
+        assert spec.cold_timeout_secs == 7200.0
+
+    def test_cold_timeout_falls_back_to_verify_cold(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = MagicMock()
+        config.verify_env = {}
+        config.merge_verify_cold_command_timeout_secs = None
+        config.verify_cold_command_timeout_secs = 3600.0
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.cold_timeout_secs == 3600.0
+
+    def test_cold_timeout_falls_back_to_zero_when_both_none(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = MagicMock()
+        config.verify_env = {}
+        config.merge_verify_cold_command_timeout_secs = None
+        config.verify_cold_command_timeout_secs = None
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.cold_timeout_secs == 0.0
+
+    def test_is_merge_verify_is_true(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(), [], None)
+        assert spec.is_merge_verify is True
+
+    def test_result_roundtrips_json_codec(self):
+        from orchestrator.verify_runner import build_merge_verify_spec, spec_from_json, spec_to_json
+        mc = self._make_module_config('src/a', test_cmd='pytest', type_check_cmd='pyright src/a')
+        task_files = ('src/a/f.py',)
+        spec = build_merge_verify_spec(
+            self._make_config(verify_env={'K': 'V'}, cold_timeout=300.0),
+            [mc],
+            task_files,
+        )
+        assert spec_from_json(spec_to_json(spec)) == spec
