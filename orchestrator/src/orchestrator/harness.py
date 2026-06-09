@@ -4750,6 +4750,30 @@ Output JSON matching the schema. Every task must appear in the output.
         )
         return {'unhalted': True, 'prior_owner': owner, 'reason': reason}
 
+    def halt_merge_queue(self, reason: str) -> dict[str, Any]:
+        """Operator-initiated merge-queue halt (backs the halt_merge_queue tool).
+
+        Halts the merger (no new merge requests are taken) AND terminates the
+        post-merge verify currently running, re-queuing the affected merge so it
+        re-verifies after un-halt.  Sets the same ``_wip_halt`` as the automatic
+        WIP halt with no owning escalation, so ``get_merge_halt_status`` reports
+        ``halted=True`` with ``owner_esc_id=None`` and the existing
+        ``force_unhalt_merge_queue`` / ``unhalt_merge_queue`` cleanly reverses it
+        (the active-owner refusal does not trigger).
+
+        In-memory and transient: unlike the scheduler pause (runs.db), the merge
+        WIP halt is rehydrated only from preserved WIP L1 escalations.  An operator
+        halt has no owning escalation, so a process restart clears it — acceptable
+        and arguably desirable (a fresh process starts un-halted).
+        """
+        if self._merge_worker is None:
+            return {'halted': False, 'error': 'merge worker not initialised'}
+        if self._merge_worker.is_wip_halted:
+            return {'halted': False, 'reason': 'queue already halted'}
+        self._merge_worker.operator_halt(reason)
+        logger.warning('Operator-halted merge queue (reason=%r)', reason)
+        return {'halted': True, 'reason': reason}
+
     async def force_resume_scheduler(self, reason: str) -> dict[str, Any]:
         """Operator/watcher escape hatch: resume a paused scheduler in-process.
 
@@ -4782,17 +4806,53 @@ Output JSON matching the schema. Every task must appear in the output.
             'reason': reason,
         }
 
+    async def force_halt_scheduler(self, reason: str) -> dict[str, Any]:
+        """Operator-initiated scheduler halt (backs the halt_scheduler tool).
+
+        Pauses the scheduler so ``acquire_next()`` stops dispatching new tasks,
+        persists the pause to runs.db (survives restart), and emits
+        ``scheduler_paused`` — but does NOT file an auto-resumable scheduler-pause
+        L1 (``file_escalation=False``).  A deliberate operator halt should not
+        notify the operator of their own action, and an auto-watcher resolving
+        that L1 would silently undo the halt.  Reversed by
+        ``force_resume_scheduler`` / ``resume_scheduler``.
+
+        ``reason`` is required for audit.  Returns
+        ``{halted, was_paused, prior_reason, reason}``.
+        """
+        was_paused = self.scheduler.is_paused
+        prior_reason = self.scheduler.pause_reason
+        await self.pause_scheduler(reason, file_escalation=False)
+        logger.warning(
+            'force_halt_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
+            was_paused, prior_reason, reason,
+        )
+        return {
+            'halted': True,
+            'was_paused': was_paused,
+            'prior_reason': prior_reason,
+            'reason': reason,
+        }
+
     # ------------------------------------------------------------------ #
     # Scheduler park-and-stop pause (task 1322)                           #
     # ------------------------------------------------------------------ #
 
-    async def pause_scheduler(self, reason: str) -> None:
+    async def pause_scheduler(self, reason: str, *, file_escalation: bool = True) -> None:
         """Pause the scheduler so acquire_next() returns None until resumed.
 
         1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
         2. Persists via ``RunStore.save_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_paused`` (best-effort).
         4. Logs a WARNING so the operator sees it.
+        5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
+           is False.
+
+        ``file_escalation`` defaults True for every automatic trip (park-stop,
+        cost-ceiling, EWA, watcher) so an AFK operator is notified.  A *deliberate*
+        operator halt (``force_halt_scheduler``) passes False: notifying the
+        operator of their own action is noise, and worse — the auto-watcher /
+        unblock-low-risk skill could resolve that L1 and silently undo the halt.
 
         Called directly by sibling tasks (cost-ceiling 1323, EWA digest 1327)
         and also wired as the callback for Scheduler's park-stop trip detector.
@@ -4835,7 +4895,10 @@ Output JSON matching the schema. Every task must appear in the output.
         # Deduped via has_open_l1.  Note: the park-stop latch (scheduler.py)
         # sets is_paused=True *before* this callback runs, so a was-paused
         # transition check would never fire — dedup must be queue-state based.
-        self._file_scheduler_pause_escalation(reason)
+        # Skipped for a deliberate operator halt (force_halt_scheduler) — see
+        # the file_escalation docstring above.
+        if file_escalation:
+            self._file_scheduler_pause_escalation(reason)
 
     async def resume_scheduler(self) -> None:
         """Clear the scheduler pause so acquire_next() resumes dispatching.
