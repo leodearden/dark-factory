@@ -17205,3 +17205,65 @@ class TestEnforceMergeLivenessMargin:
         assert '7200' in msg, (
             f'MergeLivenessConfigError must mention timeout (7200); got: {msg!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculationDepthParameter — task-1698 step-3/4
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationDepthParameter:
+    """speculation_depth K-parameter on SpeculativeMergeWorker._merge_ahead_cap (task-1698 step-3)."""
+
+    async def test_k2_cap_allows_two_concurrent_items(self):
+        """speculation_depth=2 sizes _merge_ahead_cap to 2: one acquire leaves room, two locks it."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue, speculation_depth=2)
+        cap = worker._merge_ahead_cap
+
+        # First acquire: cap still has 1 slot free → not locked yet.
+        await cap.acquire()
+        assert not cap.locked(), (
+            'After 1 acquire of K=2 _merge_ahead_cap, cap should not be locked '
+            '(1 slot still free); cap is prematurely full.'
+        )
+
+        # Second acquire: cap is now full → locked.
+        await cap.acquire()
+        assert cap.locked(), (
+            'After 2 acquires of K=2 _merge_ahead_cap, cap must be locked '
+            '(all 2 slots exhausted).'
+        )
+
+    async def test_default_cap_preserves_bound_one(self):
+        """Default SpeculativeMergeWorker (no speculation_depth) preserves _MERGE_AHEAD_BOUND=1."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue)
+        cap = worker._merge_ahead_cap
+
+        # Single acquire must lock the cap immediately (bound=1 regression).
+        assert _cap_is_full(cap, 1), (
+            'Fresh K=1 (default) _merge_ahead_cap should report full (no slots taken); '
+            '_cap_is_full uses not-locked so this checks initial state is correct.'
+        )
+        await cap.acquire()
+        assert cap.locked(), (
+            'After 1 acquire of K=1 (default) _merge_ahead_cap, cap must be locked.'
+        )
+
+    async def test_k3_cap_allows_three_concurrent_items(self):
+        """speculation_depth=3 sizes _merge_ahead_cap to 3."""
+        git_ops_mock = MagicMock()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops_mock, queue, speculation_depth=3)
+        cap = worker._merge_ahead_cap
+
+        await cap.acquire()
+        assert not cap.locked(), 'After 1/3 acquires, K=3 cap should not be locked.'
+        await cap.acquire()
+        assert not cap.locked(), 'After 2/3 acquires, K=3 cap should not be locked.'
+        await cap.acquire()
+        assert cap.locked(), 'After 3/3 acquires, K=3 cap must be locked.'
