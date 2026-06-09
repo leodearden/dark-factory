@@ -2,14 +2,17 @@
 
 import dataclasses
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    LocalRunner,
     MergeVerifySpec,
     UnscopedTypecheckSpec,
     VerifyCommand,
+    VerifyRunner,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -426,3 +429,57 @@ class TestErrorPaths:
         """result_from_json with an empty JSON object raises TypeError (missing required args)."""
         with pytest.raises(TypeError):
             result_from_json("{}")
+
+
+# ---------------------------------------------------------------------------
+# Step-1: VerifyRunner protocol + LocalRunner identity
+# ---------------------------------------------------------------------------
+
+
+def _make_local_runner(*, run_scoped=None, run_unscoped=None):
+    """Build a LocalRunner with injected fake callables."""
+    merge_wt = MagicMock()
+    config = MagicMock()
+    config.merge_verify_workspace = False
+    module_configs = []
+    task_files = None
+    run_scoped = run_scoped or AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    ))
+    run_unscoped = run_unscoped or AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+    return LocalRunner(
+        merge_wt=merge_wt,
+        config=config,
+        module_configs=module_configs,
+        task_files=task_files,
+        run_scoped=run_scoped,
+        run_unscoped=run_unscoped,
+    )
+
+
+class TestVerifyRunnerProtocol:
+    """VerifyRunner is a @runtime_checkable Protocol; LocalRunner satisfies it."""
+
+    def test_local_runner_name_is_local(self):
+        runner = _make_local_runner()
+        assert runner.name == 'local'
+
+    @pytest.mark.asyncio
+    async def test_local_runner_health_returns_true(self):
+        runner = _make_local_runner()
+        assert await runner.health() is True
+
+    def test_local_runner_is_instance_of_verify_runner_protocol(self):
+        runner = _make_local_runner()
+        assert isinstance(runner, VerifyRunner)
+
+    def test_local_runner_has_run_merge_verify_coroutine(self):
+        import asyncio
+        runner = _make_local_runner()
+        assert hasattr(runner, 'run_merge_verify')
+        assert asyncio.iscoroutinefunction(runner.run_merge_verify)
+
+    def test_local_runner_has_health_coroutine(self):
+        import asyncio
+        runner = _make_local_runner()
+        assert asyncio.iscoroutinefunction(runner.health)

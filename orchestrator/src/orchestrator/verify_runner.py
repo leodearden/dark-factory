@@ -35,10 +35,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from orchestrator.verify import VerifyResult
+
+if TYPE_CHECKING:
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 __all__ = [
     "VerifyCommand",
@@ -50,6 +55,8 @@ __all__ = [
     "result_from_json",
     "result_to_dict",
     "result_from_dict",
+    "VerifyRunner",
+    "LocalRunner",
 ]
 
 
@@ -199,6 +206,90 @@ def result_to_dict(vr: VerifyResult) -> dict:
 def result_from_dict(d: dict) -> VerifyResult:
     """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
     return VerifyResult(**d)
+
+
+# ---------------------------------------------------------------------------
+# VerifyRunner protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class VerifyRunner(Protocol):
+    """Host-agnostic runner that executes a combined merge-verify bundle.
+
+    Implementations: LocalRunner (this module), RemoteRunner (γ/δ).
+    """
+
+    name: str
+
+    async def health(self) -> bool:
+        """Return True when this runner is reachable and healthy."""
+        ...
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the full combined merge-verify bundle and return a VerifyResult."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# LocalRunner
+# ---------------------------------------------------------------------------
+
+
+class LocalRunner:
+    """Wraps the current local verify path (run_scoped_verification + _run_unscoped_typechecks).
+
+    The verify callables are injected at construction time so that:
+    1. Existing test patches on 'orchestrator.merge_queue.run_scoped_verification'
+       keep intercepting (call-time resolution, not import-time binding).
+    2. There is no verify_runner → merge_queue module-level import cycle.
+
+    ``run_merge_verify`` is intentionally minimal in step-2 — full bundle logic
+    (scoped-first short-circuit, unscoped gate, sentinel encoding) lands in step-4.
+    """
+
+    name: str = 'local'
+
+    def __init__(
+        self,
+        merge_wt: Path,
+        config: OrchestratorConfig,
+        module_configs: list[ModuleConfig],
+        task_files: tuple[str, ...] | None,
+        *,
+        run_scoped: Callable[..., Awaitable[VerifyResult]],
+        run_unscoped: Callable[..., Awaitable[object]],
+    ) -> None:
+        self._merge_wt = merge_wt
+        self._config = config
+        self._module_configs = module_configs
+        self._task_files = task_files
+        self._run_scoped = run_scoped
+        self._run_unscoped = run_unscoped
+
+    async def health(self) -> bool:
+        return True
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the combined scoped + unscoped bundle (full logic in step-4)."""
+        return await self._run_scoped(
+            self._merge_wt,
+            self._config,
+            self._module_configs,
+            task_files=self._task_files,
+            max_retries=0,
+            is_merge_verify=True,
+            force_workspace=self._config.merge_verify_workspace,
+            role='merge',
+        )
 
 
 # ---------------------------------------------------------------------------
