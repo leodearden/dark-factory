@@ -16320,3 +16320,88 @@ class TestLanePickIntegration:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+@pytest.mark.asyncio
+class TestLaneSnapshotAndStop:
+    """Steps 9-10: snapshot and stop account for _lane_buffers items."""
+
+    async def test_snapshot_includes_lane_buffered_items(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """snapshot() reports items in _lane_buffers as 'queued' with their lane.
+
+        RED before step-10 impl: snapshot() only reads self._queue, so
+        lane-buffered items are invisible.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('snap-n', 'snap-n', git_repo, config, lane='normal')
+        req_h = _make_request('snap-h', 'snap-h', git_repo, config, lane='high')
+
+        # Put items into the queue and drain them into lane buffers
+        worker._queue.put_nowait(req_n)
+        worker._queue.put_nowait(req_h)
+        worker._drain_queue_into_lanes()
+
+        snap = worker.snapshot()
+        entries = snap['entries']
+
+        # Both items must appear in the snapshot
+        task_ids = [e['task_id'] for e in entries]
+        assert 'snap-n' in task_ids, f'snap-n missing from snapshot: {task_ids}'
+        assert 'snap-h' in task_ids, f'snap-h missing from snapshot: {task_ids}'
+
+        # Each entry must report state == 'queued' and expose lane
+        for entry in entries:
+            if entry['task_id'] in ('snap-n', 'snap-h'):
+                assert entry['state'] == 'queued', (
+                    f"Expected 'queued' for {entry['task_id']}, got {entry['state']!r}"
+                )
+                assert 'lane' in entry, (
+                    f"snapshot entry missing 'lane' key: {list(entry.keys())}"
+                )
+
+        # Lane values must match
+        n_entry = next(e for e in entries if e['task_id'] == 'snap-n')
+        h_entry = next(e for e in entries if e['task_id'] == 'snap-h')
+        assert n_entry['lane'] == 'normal', f"Expected 'normal', got {n_entry['lane']!r}"
+        assert h_entry['lane'] == 'high', f"Expected 'high', got {h_entry['lane']!r}"
+
+        # depth must include lane-buffered items
+        assert snap['depth'] >= 2, f'Expected depth >= 2, got {snap["depth"]}'
+
+    async def test_stop_resolves_lane_buffered_futures(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """stop() resolves futures for items buffered in _lane_buffers.
+
+        RED before step-10 impl: stop() only drains self._queue, so
+        lane-buffered futures hang unresolved.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('stop-n', 'stop-n', git_repo, config, lane='normal')
+        req_h = _make_request('stop-h', 'stop-h', git_repo, config, lane='high')
+
+        # Drain items into lane buffers (bypassing the merger loop)
+        worker._queue.put_nowait(req_n)
+        worker._queue.put_nowait(req_h)
+        worker._drain_queue_into_lanes()
+
+        # stop() must resolve all pending futures
+        await worker.stop()
+
+        assert req_n.result.done(), 'stop() left normal lane future unresolved'
+        assert req_h.result.done(), 'stop() left high lane future unresolved'
+
+        outcome_n = req_n.result.result()
+        outcome_h = req_h.result.result()
+        assert outcome_n.status == 'blocked', (
+            f'Expected blocked shutdown outcome, got {outcome_n.status!r}'
+        )
+        assert outcome_h.status == 'blocked', (
+            f'Expected blocked shutdown outcome, got {outcome_h.status!r}'
+        )
