@@ -859,7 +859,7 @@ class GitOps:
                     rc, worktree_path, err,
                 )
                 return None
-            lines = [l for l in out.splitlines() if l.strip()]
+            lines = [line for line in out.splitlines() if line.strip()]
             return int(lines[-1])
         except (ValueError, IndexError):
             logger.warning(
