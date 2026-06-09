@@ -1763,3 +1763,79 @@ class TestVerifyRunnerPoolFailSafe:
         pool = VerifyRunnerPool([remote_fake])
         with pytest.raises(RunnerUnavailable):
             await pool.dispatch('sha', _make_spec())
+
+
+# ---------------------------------------------------------------------------
+# ε step-1: EnvFingerprint frozen dataclass + JSON codec
+# ---------------------------------------------------------------------------
+
+
+class TestEnvFingerprint:
+    """EnvFingerprint is a frozen dataclass with canonical JSON codec."""
+
+    def _make_fp(self, **kwargs):
+        from orchestrator.verify_runner import EnvFingerprint
+        defaults = dict(
+            toolchain='rustc 1.80.0 (abc123 2024-07-01)\ncargo 1.80.0',
+            verify_env={'SCCACHE_BUCKET': 'builds', 'RUST_LOG': 'info'},
+            sccache_reachable=True,
+            extra_probes={'python_version': 'Python 3.11.9'},
+        )
+        defaults.update(kwargs)
+        return EnvFingerprint(**defaults)
+
+    def test_frozen_raises_on_reassignment(self):
+        fp = self._make_fp()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            fp.toolchain = 'other'  # type: ignore[misc]
+
+    def test_verify_env_frozen_raises_on_reassignment(self):
+        fp = self._make_fp()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            fp.verify_env = {}  # type: ignore[misc]
+
+    def test_sccache_reachable_bool_field(self):
+        fp_true = self._make_fp(sccache_reachable=True)
+        fp_false = self._make_fp(sccache_reachable=False)
+        assert fp_true.sccache_reachable is True
+        assert fp_false.sccache_reachable is False
+
+    def test_to_dict_from_dict_roundtrip(self):
+        fp = self._make_fp()
+        assert fp.from_dict(fp.to_dict()) == fp
+
+    def test_to_dict_from_dict_empty_maps(self):
+        fp = self._make_fp(verify_env={}, extra_probes={})
+        assert fp.from_dict(fp.to_dict()) == fp
+
+    def test_json_roundtrip_byte_identical(self):
+        """to_json(from_json(s)) == s (byte-identical re-serialisation)."""
+        from orchestrator.verify_runner import fingerprint_from_json, fingerprint_to_json
+        fp = self._make_fp()
+        s = fingerprint_to_json(fp)
+        assert fingerprint_to_json(fingerprint_from_json(s)) == s
+
+    def test_json_sort_keys_canonical(self):
+        """Env built in reversed insertion order serialises identically (sort_keys)."""
+        from orchestrator.verify_runner import fingerprint_to_json
+        fp_fwd = self._make_fp(verify_env={'A': '1', 'B': '2', 'C': '3'})
+        fp_rev = self._make_fp(verify_env={'C': '3', 'B': '2', 'A': '1'})
+        assert fingerprint_to_json(fp_fwd) == fingerprint_to_json(fp_rev)
+
+    def test_json_deterministic(self):
+        """Same object serialises to the same bytes on repeated calls."""
+        from orchestrator.verify_runner import fingerprint_to_json
+        fp = self._make_fp()
+        assert fingerprint_to_json(fp) == fingerprint_to_json(fp)
+
+    def test_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        assert 'EnvFingerprint' in vr_mod.__all__
+
+    def test_fingerprint_to_json_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        assert 'fingerprint_to_json' in vr_mod.__all__
+
+    def test_fingerprint_from_json_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        assert 'fingerprint_from_json' in vr_mod.__all__
