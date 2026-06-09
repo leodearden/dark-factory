@@ -41,10 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult
 
 if TYPE_CHECKING:
-    from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.config import OrchestratorConfig
 
 __all__ = [
     "VerifyCommand",
@@ -60,6 +61,7 @@ __all__ = [
     "LocalRunner",
     "VerifyRunnerPool",
     "build_merge_verify_spec",
+    "_module_config_from_command",
     "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
@@ -271,6 +273,33 @@ def build_merge_verify_spec(
         verify_env=dict(config.verify_env) if config.verify_env else {},
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _module_config_from_command — inverse of build_merge_verify_spec's projection
+# ---------------------------------------------------------------------------
+
+
+def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> ModuleConfig:
+    """Reconstruct a ModuleConfig from a VerifyCommand + shared MergeVerifySpec fields.
+
+    This is the exact inverse of build_merge_verify_spec's projection:
+    - prefix + three command fields come from the VerifyCommand
+    - verify_env and cold_timeout_secs are shared spec-level fields threaded into
+      each ModuleConfig's verify_env and verify_cold_command_timeout_secs
+
+    ModuleConfig fields the wire spec never carried (lock_depth, warm timeout, etc.)
+    stay at their dataclass defaults so reconstruction is information-preserving for
+    all verify-relevant behaviour.
+    """
+    return ModuleConfig(
+        prefix=vc.prefix,
+        test_command=vc.test_command,
+        lint_command=vc.lint_command,
+        type_check_command=vc.type_check_command,
+        verify_env=dict(spec.verify_env),
+        verify_cold_command_timeout_secs=spec.cold_timeout_secs,
     )
 
 

@@ -767,3 +767,54 @@ class TestBuildMergeVerifySpec:
             task_files,
         )
         assert spec_from_json(spec_to_json(spec)) == spec
+
+
+# ---------------------------------------------------------------------------
+# Step-1: _module_config_from_command — inverse of build_merge_verify_spec's projection
+# ---------------------------------------------------------------------------
+
+
+class TestModuleConfigFromCommand:
+    """_module_config_from_command(vc, spec) is the inverse of build_merge_verify_spec's projection."""
+
+    def _make_spec(self, *, verify_env=None, cold_timeout_secs=300.0):
+        return MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env=verify_env if verify_env is not None else {'K': 'V'},
+            cold_timeout_secs=cold_timeout_secs,
+        )
+
+    def test_case_a_fully_populated(self):
+        from orchestrator.config import ModuleConfig
+        from orchestrator.verify_runner import _module_config_from_command
+        vc = VerifyCommand(
+            prefix='mod',
+            test_command='true',
+            lint_command='ruff',
+            type_check_command='pyright',
+        )
+        spec = self._make_spec(verify_env={'K': 'V'}, cold_timeout_secs=300.0)
+        mc = _module_config_from_command(vc, spec)
+        assert isinstance(mc, ModuleConfig)
+        assert mc.prefix == 'mod'
+        assert mc.test_command == 'true'
+        assert mc.lint_command == 'ruff'
+        assert mc.type_check_command == 'pyright'
+        assert mc.verify_env == {'K': 'V'}
+        assert mc.verify_cold_command_timeout_secs == 300.0
+
+    def test_case_b_all_commands_none(self):
+        from orchestrator.config import ModuleConfig
+        from orchestrator.verify_runner import _module_config_from_command
+        vc = VerifyCommand(prefix='mod2')
+        spec = self._make_spec(verify_env={'K': 'V'}, cold_timeout_secs=300.0)
+        mc = _module_config_from_command(vc, spec)
+        assert isinstance(mc, ModuleConfig)
+        assert mc.prefix == 'mod2'
+        assert mc.test_command is None
+        assert mc.lint_command is None
+        assert mc.type_check_command is None
+        assert mc.verify_env == {'K': 'V'}
+        assert mc.verify_cold_command_timeout_secs == 300.0
