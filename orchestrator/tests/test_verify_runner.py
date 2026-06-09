@@ -1311,3 +1311,108 @@ class TestRemoteRunnerHappyPath:
         await runner.run_merge_verify('abc123', _make_spec())
         push_argv, _ = calls[0]
         assert push_argv[3] == 'abc123:refs/merge-verify/fixed-id'
+
+
+# ---------------------------------------------------------------------------
+# δ step-7: RemoteRunner transport vs timeout boundary (PRD Invariant 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerTransportVsTimeout:
+    """Invariant 5: RunnerUnavailable ↔ transport failure only; VerifyResult returned for any verdict."""
+
+    def _make_runner(self, responses, *, raise_on=None):
+        """Build a RemoteRunner with a fake `run` that returns successive responses.
+
+        ``responses`` is a list of (rc, stdout, stderr) tuples.
+        ``raise_on`` is an optional exception to raise on the Nth call (0-indexed dict).
+        """
+        calls = []
+        call_counter = [0]
+
+        async def fake_run(argv, *, cwd=None):
+            n = call_counter[0]
+            call_counter[0] += 1
+            calls.append(argv[:])
+            if raise_on is not None and n in raise_on:
+                raise raise_on[n]
+            return responses[n]
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'req-id',
+        )
+        runner._calls = calls
+        return runner
+
+    async def test_raises_runner_unavailable_on_push_failure(self):
+        """git push rc!=0 → RunnerUnavailable; ssh is never called."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(1, '', 'push error'), (0, '', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        # ssh must NOT have been attempted
+        assert not any(a[0] == 'ssh' for a in runner._calls)
+
+    async def test_raises_runner_unavailable_on_ssh_nonzero(self):
+        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_empty_stdout(self):
+        """ssh rc=0 but stdout is empty → RunnerUnavailable (unparseable)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (0, '', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_non_json_stdout(self):
+        """ssh rc=0 but stdout is non-JSON → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (0, 'not valid json!!!', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_when_run_raises_oserror(self):
+        """An OSError from the subprocess runner → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([], raise_on={0: FileNotFoundError('git not found')})
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_returns_result_when_verify_timed_out(self):
+        """ssh rc=0 + stdout=VerifyResult(timed_out=True) → returned unchanged (NOT RunnerUnavailable)."""
+        timed_out_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='timed out',
+            timed_out=True,
+        )
+        runner = self._make_runner([(0, '', ''), (0, result_to_json(timed_out_result), '')])
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result.timed_out is True
+        assert result == timed_out_result
+
+    async def test_returns_failing_result_unchanged(self):
+        """ssh rc=0 + stdout=VerifyResult(passed=False) → returned unchanged (NOT RunnerUnavailable)."""
+        fail_result = VerifyResult(
+            passed=False,
+            test_output='FAILED 2',
+            lint_output='',
+            type_output='',
+            summary='2 failures',
+            category='test_failure',
+        )
+        runner = self._make_runner([(0, '', ''), (0, result_to_json(fail_result), '')])
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result.passed is False
+        assert result == fail_result
