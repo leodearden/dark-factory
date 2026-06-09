@@ -29,10 +29,12 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.verify import (
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
     _resolve_verify_timeout,
     run_scoped_verification,
     run_verification,
+    verify_failure_is_preexisting_on_main,
 )
 
 if TYPE_CHECKING:
@@ -219,6 +221,19 @@ check), emit an L1 blocked outcome, and route to human / auto-watcher for a
 fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX``:
 a landed merge must never be blocked by a flaky hang or infra error, so the
 check fails open on timeouts and worktree-create exceptions."""
+
+MAIN_HEALTH_RED_REASON_PREFIX = 'Main-health red: merge verify failure reproduces on bare main'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
+verify failure is classified as a pre-existing break already present on bare
+main HEAD — i.e. not introduced by this task's merge.
+
+The workflow ``_submit_to_merge_queue`` pattern-matches this prefix and routes
+the outcome to a single dedup'd L1 escalation (``escalate_to_human=True``,
+``category='preexisting_main_break'``), skipping the steward entirely.  The
+steward operates in-branch and cannot fix a broken main; routing each
+concurrent failing merge to the steward would cause an ~85 min-per-task
+livelock for every task whose verify runs against a red main."""
+
 
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
@@ -2830,6 +2845,10 @@ class MergeOutcome:
     verification failure in log messages."""
     superseded_by: str | None = None
     """request_id of the gen-(n+1) request that supersedes this one (γ2)."""
+    dedupe_fingerprint: str = ''
+    """Carries the preexisting-main-break dedupe fingerprint so the workflow
+    can fold N concurrent failing merges into one parent escalation via
+    ``submit_or_dedupe``.  Empty for all non-main-health outcomes."""
 
 
 @dataclass
