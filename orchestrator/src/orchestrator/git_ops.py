@@ -846,12 +846,31 @@ class GitOps:
         Best-effort and fail-open: returns None on any miss or failure so
         worktree creation is never blocked by a debug-port hiccup.
         """
-        script = worktree_path / 'scripts' / 'setup-worktree-debug-port.sh'
-        if not script.exists():
+        try:
+            script = worktree_path / 'scripts' / 'setup-worktree-debug-port.sh'
+            if not script.exists():
+                return None
+            rc, out, err = await _run([str(script), str(worktree_path)], cwd=worktree_path)
+            if rc != 0:
+                logger.warning(
+                    '_provision_reify_debug_port: script exited %d for %s (stderr=%r)',
+                    rc, worktree_path, err,
+                )
+                return None
+            lines = [l for l in out.splitlines() if l.strip()]
+            return int(lines[-1])
+        except (ValueError, IndexError):
+            logger.warning(
+                '_provision_reify_debug_port: could not parse port from stdout for %s',
+                worktree_path,
+            )
             return None
-        rc, out, err = await _run([str(script), str(worktree_path)], cwd=worktree_path)
-        lines = [l for l in out.splitlines() if l.strip()]
-        return int(lines[-1])
+        except Exception:
+            logger.warning(
+                '_provision_reify_debug_port: unexpected error for %s',
+                worktree_path, exc_info=True,
+            )
+            return None
 
     async def _worktree_holding_branch(self, full_branch: str) -> Path | None:
         """Path of the registered worktree that has *full_branch* checked out.
