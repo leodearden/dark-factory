@@ -35,10 +35,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from orchestrator.verify import VerifyResult
+
+if TYPE_CHECKING:
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 __all__ = [
     "VerifyCommand",
@@ -50,7 +56,25 @@ __all__ = [
     "result_from_json",
     "result_to_dict",
     "result_from_dict",
+    "VerifyRunner",
+    "LocalRunner",
+    "VerifyRunnerPool",
+    "build_merge_verify_spec",
+    "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
+    "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
+    "is_unscoped_gate_failure",
+    "unscoped_gate_failing_subprojects",
 ]
+
+# Sentinel category constants — encode an unscoped-gate failure inside a
+# VerifyResult so _run_post_merge_verify can branch byte-identically.
+UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
+UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
+
+_UNSCOPED_SENTINEL_CATEGORIES = frozenset({
+    UNSCOPED_TYPECHECK_FAILED_CATEGORY,
+    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +223,264 @@ def result_to_dict(vr: VerifyResult) -> dict:
 def result_from_dict(d: dict) -> VerifyResult:
     """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
     return VerifyResult(**d)
+
+
+# ---------------------------------------------------------------------------
+# build_merge_verify_spec factory
+# ---------------------------------------------------------------------------
+
+
+def build_merge_verify_spec(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    task_files: tuple[str, ...] | None,
+) -> MergeVerifySpec:
+    """Build a MergeVerifySpec from live config + module_configs.
+
+    The spec is a host-independent projection carried through dispatch for
+    forward-compat with γ/δ (the remote runner consumes it over the wire).
+    LocalRunner does not use it to drive execution — it uses the live objects.
+    """
+    verify_commands = tuple(
+        VerifyCommand(
+            prefix=mc.prefix,
+            test_command=mc.test_command,
+            lint_command=mc.lint_command,
+            type_check_command=mc.type_check_command,
+        )
+        for mc in module_configs
+    )
+    unscoped_commands = tuple(
+        VerifyCommand(prefix=mc.prefix, type_check_command=mc.type_check_command)
+        for mc in module_configs
+        if mc.type_check_command is not None
+    )
+    cold_timeout: float = (
+        config.merge_verify_cold_command_timeout_secs
+        if config.merge_verify_cold_command_timeout_secs is not None
+        else (
+            config.verify_cold_command_timeout_secs
+            if config.verify_cold_command_timeout_secs is not None
+            else 0.0
+        )
+    )
+    return MergeVerifySpec(
+        verify_commands=verify_commands,
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
+        task_files=task_files,
+        verify_env=dict(config.verify_env) if config.verify_env else {},
+        cold_timeout_secs=float(cold_timeout),
+        is_merge_verify=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# VerifyRunner protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class VerifyRunner(Protocol):
+    """Host-agnostic runner that executes a combined merge-verify bundle.
+
+    Implementations: LocalRunner (this module), RemoteRunner (γ/δ).
+    """
+
+    name: str
+
+    async def health(self) -> bool:
+        """Return True when this runner is reachable and healthy."""
+        ...
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the full combined merge-verify bundle and return a VerifyResult."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# LocalRunner
+# ---------------------------------------------------------------------------
+
+
+class LocalRunner:
+    """Wraps the current local verify path (run_scoped_verification + _run_unscoped_typechecks).
+
+    The verify callables are injected at construction time so that:
+    1. Existing test patches on 'orchestrator.merge_queue.run_scoped_verification'
+       keep intercepting (call-time resolution, not import-time binding).
+    2. There is no verify_runner → merge_queue module-level import cycle.
+
+    ``run_merge_verify`` runs the combined scoped + unscoped bundle: scoped first,
+    unscoped only if scoped passed (short-circuit), unscoped-gate-broken outcomes
+    encoded as a sentinel-category VerifyResult so callers can branch byte-identically.
+    """
+
+    name: str = 'local'
+
+    def __init__(
+        self,
+        merge_wt: Path,
+        config: OrchestratorConfig,
+        module_configs: list[ModuleConfig],
+        task_files: tuple[str, ...] | None,
+        *,
+        run_scoped: Callable[..., Awaitable[VerifyResult]],
+        run_unscoped: Callable[..., Awaitable[Any]],
+        task_id: str | None = None,
+    ) -> None:
+        self._merge_wt = merge_wt
+        self._config = config
+        self._module_configs = module_configs
+        self._task_files = task_files
+        self._run_scoped = run_scoped
+        self._run_unscoped = run_unscoped
+        self._task_id = task_id
+
+    async def health(self) -> bool:
+        return True
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the combined scoped + unscoped bundle.
+
+        Scoped phase runs first; unscoped gate only runs if scoped passed
+        (preserving today's short-circuit). An unscoped-gate-broken outcome is
+        encoded into a VerifyResult via a sentinel category so callers can branch
+        byte-identically.
+
+        NOTE: ``spec`` is accepted for VerifyRunner protocol conformance and
+        forward-compat with γ/δ remote runners.  LocalRunner drives execution
+        from its injected callables + live config, not from the spec.
+        TODO(γ): when a RemoteRunner is added, spec replaces the per-call
+        config/module_configs projection for off-host dispatch.
+        """
+        scoped = await self._run_scoped(
+            self._merge_wt,
+            self._config,
+            self._module_configs,
+            task_files=self._task_files,
+            max_retries=0,
+            is_merge_verify=True,
+            force_workspace=self._config.merge_verify_workspace,
+            role='merge',
+        )
+        if not scoped.passed:
+            return scoped
+
+        gate = await self._run_unscoped(
+            self._merge_wt,
+            self._config,
+            self._module_configs,
+            block_on_timeout=True,
+            task_id=self._task_id,
+        )
+        if gate.broken:
+            failing = gate.failing_subprojects
+            timed_out = bool(gate.timed_out_subprojects)
+            category = (
+                UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+                if timed_out
+                else UNSCOPED_TYPECHECK_FAILED_CATEGORY
+            )
+            summary = ', '.join(failing)
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output=gate.detail if hasattr(gate, 'detail') else '',
+                summary=summary,
+                timed_out=timed_out,
+                category=category,
+            )
+
+        return scoped
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_queue to branch on unscoped-gate verdicts
+# ---------------------------------------------------------------------------
+
+
+def is_unscoped_gate_failure(vr: VerifyResult) -> bool:
+    """True when vr carries a sentinel category from LocalRunner's unscoped gate."""
+    return vr.category in _UNSCOPED_SENTINEL_CATEGORIES
+
+
+def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
+    """Extract the failing subproject prefixes from a sentinel VerifyResult.
+
+    Returns the list encoded in vr.summary (comma-joined prefixes).
+    """
+    if not vr.summary:
+        return []
+    return [p.strip() for p in vr.summary.split(',') if p.strip()]
+
+
+# ---------------------------------------------------------------------------
+# VerifyRunnerPool
+# ---------------------------------------------------------------------------
+
+
+class VerifyRunnerPool:
+    """Dispatches a merge-verify bundle to a single VerifyRunner and emits a telemetry event.
+
+    In β there is exactly one runner (LocalRunner). The long-lived K-permit
+    pool with multiple remote runners is deferred to ζ.
+    """
+
+    def __init__(
+        self,
+        runners: Sequence[VerifyRunner],
+        *,
+        event_store: Any = None,
+        task_id: str | None = None,
+    ) -> None:
+        if not runners:
+            raise ValueError('VerifyRunnerPool requires at least one runner')
+        self._runner = runners[0]
+        self._event_store = event_store
+        self._task_id = task_id
+
+    async def dispatch(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        *,
+        attempt: int = 0,
+    ) -> VerifyResult:
+        """Run the verify bundle and emit a merge_verify event.
+
+        ``attempt`` is 0 for the first dispatch and incremented for each
+        ENOSPC-retry re-dispatch.  Included in the event data so consumers
+        can deduplicate multiple events for the same logical merge-verify.
+        """
+        from orchestrator.event_store import EventType
+
+        t0 = time.monotonic()
+        result = await self._runner.run_merge_verify(merge_sha, spec)
+        duration_ms = round((time.monotonic() - t0) * 1000)
+
+        if self._event_store is not None:
+            self._event_store.emit(
+                EventType.merge_verify,
+                task_id=self._task_id,
+                data={
+                    'runner': self._runner.name,
+                    'merge_sha': merge_sha,
+                    'passed': result.passed,
+                    'duration_ms': duration_ms,
+                    'attempt': attempt,
+                },
+            )
+
+        return result
 
 
 # ---------------------------------------------------------------------------

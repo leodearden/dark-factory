@@ -2,14 +2,17 @@
 
 import dataclasses
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    LocalRunner,
     MergeVerifySpec,
     UnscopedTypecheckSpec,
     VerifyCommand,
+    VerifyRunner,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -426,3 +429,341 @@ class TestErrorPaths:
         """result_from_json with an empty JSON object raises TypeError (missing required args)."""
         with pytest.raises(TypeError):
             result_from_json("{}")
+
+
+# ---------------------------------------------------------------------------
+# Step-1: VerifyRunner protocol + LocalRunner identity
+# ---------------------------------------------------------------------------
+
+
+def _make_local_runner(*, run_scoped=None, run_unscoped=None):
+    """Build a LocalRunner with injected fake callables."""
+    merge_wt = MagicMock()
+    config = MagicMock()
+    config.merge_verify_workspace = False
+    module_configs = []
+    task_files = None
+    run_scoped = run_scoped or AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    ))
+    run_unscoped = run_unscoped or AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+    return LocalRunner(
+        merge_wt=merge_wt,
+        config=config,
+        module_configs=module_configs,
+        task_files=task_files,
+        run_scoped=run_scoped,
+        run_unscoped=run_unscoped,
+    )
+
+
+class TestVerifyRunnerProtocol:
+    """VerifyRunner is a @runtime_checkable Protocol; LocalRunner satisfies it."""
+
+    def test_local_runner_name_is_local(self):
+        runner = _make_local_runner()
+        assert runner.name == 'local'
+
+    @pytest.mark.asyncio
+    async def test_local_runner_health_returns_true(self):
+        runner = _make_local_runner()
+        assert await runner.health() is True
+
+    def test_local_runner_is_instance_of_verify_runner_protocol(self):
+        runner = _make_local_runner()
+        assert isinstance(runner, VerifyRunner)
+
+
+# ---------------------------------------------------------------------------
+# Step-3: LocalRunner.run_merge_verify combined-bundle behaviour
+# ---------------------------------------------------------------------------
+
+
+def _make_pass_result(**kwargs):
+    defaults = dict(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    defaults.update(kwargs)
+    return VerifyResult(**defaults)  # type: ignore[arg-type]
+
+
+def _make_fail_result(**kwargs):
+    defaults = dict(passed=False, test_output='FAILED', lint_output='', type_output='', summary='test fail')
+    defaults.update(kwargs)
+    return VerifyResult(**defaults)  # type: ignore[arg-type]
+
+
+def _make_spec():
+    return MergeVerifySpec(
+        verify_commands=(),
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+        task_files=None,
+        verify_env={},
+        cold_timeout_secs=60.0,
+    )
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerBundle:
+    """LocalRunner.run_merge_verify: combined scoped+unscoped bundle."""
+
+    async def test_pass_path_returns_passed_result_and_invokes_unscoped(self):
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        unscoped_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+        run_unscoped = AsyncMock(return_value=unscoped_gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is True
+        run_unscoped.assert_awaited_once()
+
+    async def test_scoped_fail_short_circuits_unscoped(self):
+        scoped_result = _make_fail_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        run_unscoped = AsyncMock()
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.summary == 'test fail'
+        run_unscoped.assert_not_awaited()
+
+    async def test_scoped_fail_returns_scoped_result_unchanged(self):
+        scoped_result = _make_fail_result(category='test_failure', cause_hint='assertion error')
+        run_scoped = AsyncMock(return_value=scoped_result)
+        runner = _make_local_runner(run_scoped=run_scoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result is scoped_result
+
+    async def test_unscoped_broken_returns_sentinel_category_result(self):
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        gate = MagicMock(
+            broken=True,
+            timed_out=False,
+            timed_out_subprojects=[],
+            failing_subprojects=['src/a', 'src/b'],
+            detail='type error line 10',
+        )
+        run_unscoped = AsyncMock(return_value=gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        assert 'src/a' in result.summary or 'src/a' in (result.type_output or '')
+
+    async def test_unscoped_timeout_returns_timeout_sentinel_category(self):
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        gate = MagicMock(
+            broken=True,
+            timed_out=True,
+            timed_out_subprojects=['src/a'],
+            failing_subprojects=['src/a'],
+            detail='',
+        )
+        run_unscoped = AsyncMock(return_value=gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+        assert result.timed_out is True
+
+    async def test_scoped_called_with_correct_kwargs(self):
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False))
+        config = MagicMock()
+        config.merge_verify_workspace = True
+        merge_wt = MagicMock()
+        module_configs = [MagicMock()]
+        task_files = ('src/a.py',)
+        runner = LocalRunner(
+            merge_wt=merge_wt,
+            config=config,
+            module_configs=module_configs,  # type: ignore[arg-type]
+            task_files=task_files,
+            run_scoped=run_scoped,
+            run_unscoped=run_unscoped,
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        run_scoped.assert_awaited_once_with(
+            merge_wt, config, module_configs,
+            task_files=task_files,
+            max_retries=0,
+            is_merge_verify=True,
+            force_workspace=True,
+            role='merge',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: VerifyRunnerPool.dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPool:
+    """VerifyRunnerPool.dispatch: routes to single runner + emits merge_verify event."""
+
+    async def test_dispatch_returns_runner_result(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        expected = _make_pass_result()
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=expected)
+        pool = VerifyRunnerPool([fake_runner])
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result is expected
+
+    async def test_dispatch_emits_merge_verify_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        expected = _make_pass_result()
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=expected)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+        await pool.dispatch('sha999', _make_spec())
+
+        assert len(emitted) == 1
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha999'
+        assert data['passed'] is True
+
+    async def test_dispatch_without_event_store_does_not_raise(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([fake_runner], event_store=None)
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.passed is True
+
+
+# ---------------------------------------------------------------------------
+# Step-7: build_merge_verify_spec
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMergeVerifySpec:
+    """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
+
+    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+        mc = MagicMock()
+        mc.prefix = prefix
+        mc.test_command = test_cmd
+        mc.lint_command = lint_cmd
+        mc.type_check_command = type_check_cmd
+        return mc
+
+    def _make_config(self, *, verify_env=None, cold_timeout=None):
+        config = MagicMock()
+        config.verify_env = verify_env or {}
+        config.merge_verify_cold_command_timeout_secs = cold_timeout
+        config.verify_cold_command_timeout_secs = None
+        return config
+
+    def test_verify_commands_project_module_fields(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc = self._make_module_config('src/a', test_cmd='pytest src/a', lint_cmd='ruff src/a')
+        spec = build_merge_verify_spec(self._make_config(), [mc], None)
+
+        assert len(spec.verify_commands) == 1
+        vc = spec.verify_commands[0]
+        assert vc.prefix == 'src/a'
+        assert vc.test_command == 'pytest src/a'
+        assert vc.lint_command == 'ruff src/a'
+
+    def test_unscoped_typecheck_includes_only_type_check_modules(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc_with = self._make_module_config('src/a', type_check_cmd='pyright src/a')
+        mc_without = self._make_module_config('src/b')
+        spec = build_merge_verify_spec(self._make_config(), [mc_with, mc_without], None)
+
+        prefixes = [vc.prefix for vc in spec.unscoped_typecheck.commands]
+        assert 'src/a' in prefixes
+        assert 'src/b' not in prefixes
+
+    def test_unscoped_typecheck_block_on_timeout_true(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        mc = self._make_module_config('src/a', type_check_cmd='pyright src/a')
+        spec = build_merge_verify_spec(self._make_config(), [mc], None)
+        assert spec.unscoped_typecheck.block_on_timeout is True
+
+    def test_task_files_carried_as_tuple(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        task_files = ('src/a/mod.py', 'src/b/utils.py')
+        spec = build_merge_verify_spec(self._make_config(), [], task_files)
+        assert spec.task_files == task_files
+
+    def test_task_files_none_stays_none(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(), [], None)
+        assert spec.task_files is None
+
+    def test_verify_env_from_config(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        env = {'RUSTC_WRAPPER': '/usr/bin/sccache', 'CARGO_INCREMENTAL': '0'}
+        spec = build_merge_verify_spec(self._make_config(verify_env=env), [], None)
+        assert spec.verify_env == env
+
+    def test_cold_timeout_from_merge_verify_specific(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(cold_timeout=7200.0), [], None)
+        assert spec.cold_timeout_secs == 7200.0
+
+    def test_cold_timeout_falls_back_to_verify_cold(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = MagicMock()
+        config.verify_env = {}
+        config.merge_verify_cold_command_timeout_secs = None
+        config.verify_cold_command_timeout_secs = 3600.0
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.cold_timeout_secs == 3600.0
+
+    def test_cold_timeout_falls_back_to_zero_when_both_none(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = MagicMock()
+        config.verify_env = {}
+        config.merge_verify_cold_command_timeout_secs = None
+        config.verify_cold_command_timeout_secs = None
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.cold_timeout_secs == 0.0
+
+    def test_is_merge_verify_is_true(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(), [], None)
+        assert spec.is_merge_verify is True
+
+    def test_result_roundtrips_json_codec(self):
+        from orchestrator.verify_runner import build_merge_verify_spec, spec_from_json, spec_to_json
+        mc = self._make_module_config('src/a', test_cmd='pytest', type_check_cmd='pyright src/a')
+        task_files = ('src/a/f.py',)
+        spec = build_merge_verify_spec(
+            self._make_config(verify_env={'K': 'V'}, cold_timeout=300.0),
+            [mc],
+            task_files,
+        )
+        assert spec_from_json(spec_to_json(spec)) == spec

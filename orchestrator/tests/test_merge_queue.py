@@ -16755,3 +16755,379 @@ class TestDoTrainMergeTrainScope:
         # Existing keys must still be present (additive, not replacing)
         assert 'member_count' in payload, 'existing member_count key must not be removed'
         assert 'base_sha' in payload, 'existing base_sha key must not be removed'
+
+# ---------------------------------------------------------------------------
+# TestRunPostMergeVerifyRouting — step-9/step-11: pool routing + byte-identical failures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyRouting:
+    """_run_post_merge_verify routes through VerifyRunnerPool and stays byte-identical."""
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        return git_ops
+
+    def _make_req(self) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-routing-test'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        return req
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'events.db'
+        return EventStore(db_path=db, run_id='test-routing')
+
+    async def test_pass_path_returns_none_and_emits_merge_verify_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """PASS path: returns None and emits one merge_verify event with runner='local'."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        event_store = self._make_event_store(tmp_path)
+
+        passed_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=event_store,
+                merge_sha='sha-abc123',
+            )
+
+        assert result is None, f'expected None on pass, got {result!r}'
+
+        import sqlite3
+        conn = sqlite3.connect(str(tmp_path / 'events.db'))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_verify'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'expected 1 merge_verify event, got {len(rows)}'
+        import json as _json
+        data = _json.loads(rows[0][0])
+        assert data.get('runner') == 'local', f'runner must be "local"; got {data!r}'
+        assert data.get('merge_sha') == 'sha-abc123', f'merge_sha must be forwarded; got {data!r}'
+        assert data.get('passed') is True, f'passed must be True; got {data!r}'
+
+    async def test_existing_patch_point_still_intercepts_after_routing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The existing patch('orchestrator.merge_queue.run_scoped_verification') intercepts.
+
+        Pins that the LocalRunner resolves run_scoped_verification through the
+        merge_queue module namespace at call time (not at import time), so test
+        patches applied BEFORE _run_post_merge_verify is called keep intercepting.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        intercepted: list[dict] = []
+
+        async def capturing_verify(*args, **kwargs):
+            intercepted.append(kwargs)
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        clean_gate = MagicMock(broken=False, failing_subprojects=[], timed_out_subprojects=[])
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=capturing_verify),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=clean_gate)),
+        ):
+            await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='abc',
+            )
+
+        assert intercepted, 'run_scoped_verification was not intercepted by patch'
+
+    async def test_scoped_failure_consults_main_health_probe(self) -> None:
+        """Scoped failure: MergeOutcome 'blocked' and _classify_main_health_red consulted."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        failed_result = VerifyResult(
+            passed=False, test_output='test failed', lint_output='', type_output='',
+            summary='test-fail',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=failed_result)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='sha-scoped-fail',
+            )
+
+        assert result is not None
+        assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
+        assert 'Post-merge verification failed: test-fail' in result.reason, (
+            f'unexpected reason: {result.reason!r}'
+        )
+        mock_mh.assert_called_once()
+
+    async def test_unscoped_gate_broken_returns_correct_reason_without_main_health(
+        self,
+    ) -> None:
+        """Unscoped gate broken: correct reason, NO main-health probe consulted."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        passed_scoped = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        broken_gate = MagicMock(
+            broken=True, failing_subprojects=['svc-a', 'svc-b'],
+            timed_out_subprojects=[], detail='type errors here',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_scoped)),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=broken_gate)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock()) as mock_mh,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='sha-unscoped-fail',
+            )
+
+        assert result is not None
+        assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
+        assert 'unscoped type-check failed for svc-a, svc-b.' in result.reason, (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert 'type errors here' in result.reason, (
+            f'gate detail must be appended: {result.reason!r}'
+        )
+        mock_mh.assert_not_called()
+
+    async def test_unscoped_gate_timeout_increments_counter(self) -> None:
+        """Unscoped gate timeout: correct reason and timeout counter incremented (fail-closed)."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        passed_scoped = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        timeout_gate = MagicMock(
+            broken=True, failing_subprojects=['svc-a'],
+            timed_out_subprojects=['svc-a'], detail='',
+        )
+
+        timeouts: dict = {}
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_scoped)),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(return_value=timeout_gate)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts=timeouts, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='sha-unscoped-timeout',
+            )
+
+        assert result is not None
+        assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
+        assert 'unscoped type-check timed out for svc-a.' in result.reason, (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert timeouts.get('task-routing-test') == 1, (
+            f'timeout counter must be incremented to 1; got {timeouts!r}'
+        )
+
+    async def test_enospc_retry_prunes_worktrees_and_returns_transient_infra(
+        self, tmp_path: Path,
+    ) -> None:
+        """Scoped ENOSPC: prune called, second dispatch still ENOSPC → transient-infra reason."""
+        from orchestrator.merge_queue import TRANSIENT_INFRA_REASON_PREFIX, _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[tmp_path / 'old-wt'])
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        enospc_result = VerifyResult(
+            passed=False, test_output='no space left on device',
+            lint_output='', type_output='', summary='disk full',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=enospc_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='sha-enospc',
+            )
+
+        assert result is not None
+        assert result.status == 'blocked', f'expected blocked, got {result.status!r}'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected transient-infra prefix; got: {result.reason!r}'
+        )
+        git_ops.prune_stale_merge_worktrees.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestMergeShaThreading — step-13/step-14: thread merge_sha from all callers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeShaThreading:
+    """merge_sha is threaded from all callers into _run_post_merge_verify/pool.dispatch."""
+
+    async def test_reverify_rebased_tree_accepts_and_forwards_merge_sha(self) -> None:
+        """_reverify_rebased_tree must accept a merge_sha kwarg and forward it.
+
+        RED: TypeError because the parameter doesn't exist yet.
+        GREEN after step-14 adds merge_sha param and forwards it to _run_post_merge_verify.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        req = MagicMock()
+        req.task_id = 'task-reverify-sha'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        merge_wt = MagicMock()
+
+        captured_sha: list[str] = []
+
+        async def capture_pmpv(
+            _git_ops, _req, _merge_wt, *,
+            merge_sha: str = '', **kwargs,
+        ):
+            captured_sha.append(merge_sha)
+            return None
+
+        with (
+            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+                  AsyncMock(return_value=['shared.py'])),
+            patch('orchestrator.merge_queue._run_post_merge_verify',
+                  side_effect=capture_pmpv),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from='a' * 40,
+                rebased_onto='b' * 40,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                merge_sha='c' * 40,  # RED: TypeError until step-14 adds this kwarg
+            )
+
+        assert result is None, f'expected None (green verify), got {result!r}'
+        assert captured_sha == ['c' * 40], (
+            f'merge_sha not forwarded to _run_post_merge_verify; captured: {captured_sha!r}'
+        )
+
+    async def test_do_train_merge_forwards_merge_sha_in_event(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """_do_train_merge threads merge_sha (merge_result.merge_commit) into pool.dispatch.
+
+        RED: merge_verify event carries merge_sha='' (the default) before step-14.
+        GREEN after step-14 threads merge_commit from _do_train_merge into the call.
+        """
+        import json
+        import sqlite3
+
+        req = await _make_stacked_train(git_ops, config)
+
+        db_path = tmp_path / 'train_sha.db'
+        event_store = EventStore(db_path=db_path, run_id='test-train-sha')
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        clean_gate = MagicMock(
+            broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[],
+        )
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification',
+                  AsyncMock(return_value=VerifyResult(
+                      passed=True, test_output='', lint_output='', type_output='', summary='ok',
+                  ))),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks',
+                  AsyncMock(return_value=clean_gate)),
+        ):
+            outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'done', f'expected done, got {outcome!r}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_verify'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) >= 1, f'expected at least 1 merge_verify event, got {len(rows)}'
+        data = json.loads(rows[0][0])
+        assert data.get('runner') == 'local', f'runner must be "local"; got {data!r}'
+
+        merge_sha = data.get('merge_sha', '')
+        assert merge_sha, (
+            'merge_sha in merge_verify event must be non-empty (threaded from merge_commit); '
+            f'got {data!r}'
+        )
+        assert len(merge_sha) == 40 and all(c in '0123456789abcdef' for c in merge_sha), (
+            f'merge_sha must be a 40-char hex SHA; got {merge_sha!r}'
+        )
