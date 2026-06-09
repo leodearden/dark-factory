@@ -17348,10 +17348,8 @@ class TestSpeculationSlotSemaphoreDepth:
                 # (N verifying + N+1 speculative + N+2 speculative).
                 # If K=2 is not yet implemented, this times out (test will
                 # fail on the max_concurrent >= 3 assertion below).
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(k2_reached.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass  # will fail on assertion below
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
