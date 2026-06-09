@@ -33,13 +33,17 @@ rounding or numeric tolerance is involved.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import json
+import shlex
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult
@@ -59,6 +63,8 @@ __all__ = [
     "result_from_dict",
     "VerifyRunner",
     "LocalRunner",
+    "RemoteRunner",
+    "RunnerUnavailable",
     "VerifyRunnerPool",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -380,6 +386,21 @@ async def run_merge_verify_on_worktree(
 
 
 # ---------------------------------------------------------------------------
+# RunnerUnavailable — transport failure exception
+# ---------------------------------------------------------------------------
+
+
+class RunnerUnavailable(Exception):
+    """Raised by RemoteRunner on any transport failure.
+
+    Transport failures include: host down/closed, ssh failure, git push failure,
+    or absent/unparseable verdict on stdout.  A parseable VerifyResult is always
+    returned as a result — even passed=False or timed_out=True — and never causes
+    this exception to be raised (PRD §A Invariant 5).
+    """
+
+
+# ---------------------------------------------------------------------------
 # VerifyRunner protocol
 # ---------------------------------------------------------------------------
 
@@ -392,6 +413,7 @@ class VerifyRunner(Protocol):
     """
 
     name: str
+    is_local: ClassVar[bool]
 
     async def health(self) -> bool:
         """Return True when this runner is reachable and healthy."""
@@ -425,6 +447,7 @@ class LocalRunner:
     """
 
     name: str = 'local'
+    is_local: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -509,6 +532,168 @@ class LocalRunner:
 
 
 # ---------------------------------------------------------------------------
+# RemoteRunner — off-host verify via git push + ssh
+# ---------------------------------------------------------------------------
+
+
+async def _default_subprocess_run(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[int, str, str]:
+    """Default subprocess helper — similar to git_ops._run but without the WorktreeMissing pre-flight.
+
+    Returns (returncode, stdout_str, stderr_str).  A missing ``cwd`` surfaces as
+    a raw ``FileNotFoundError`` (caught by callers as OSError → RunnerUnavailable)
+    rather than the ``WorktreeMissing`` sentinel that git_ops._run would raise.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    return (
+        proc.returncode or 0,
+        stdout_b.decode().strip(),
+        stderr_b.decode().strip(),
+    )
+
+
+class RemoteRunner:
+    """Runs a merge-verify bundle on a remote host via git push + ssh.
+
+    The remote host must have ``orchestrator verify-merge`` available (γ CLI
+    contract).  The spec is shipped over ssh as a shlex-quoted JSON argument;
+    stdout is parsed as a VerifyResult via result_from_json.
+
+    Transport failures (push fail, ssh connect failure, non-zero exit,
+    unparseable stdout) raise RunnerUnavailable.  A parseable VerifyResult on
+    stdout is always returned unchanged — even passed=False or timed_out=True
+    (PRD §A Invariant 5).
+
+    The pushed ref ``refs/merge-verify/<request_id>`` is pruned best-effort on
+    return (step-10).
+    """
+
+    is_local: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        name: str,
+        ssh_host: str,
+        git_remote: str,
+        cwd: str | Path,
+        *,
+        config_path: str | None = None,
+        run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.name = name
+        self._ssh_host = ssh_host
+        self._git_remote = git_remote
+        self._cwd = cwd
+        self._config_path = config_path
+        self._run = run if run is not None else _default_subprocess_run
+        self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+        # Optional test-instrumentation hook: tests may assign a list to this
+        # attribute so they can inspect all subprocess argv lists after the fact.
+        self._calls: list[list[str]] = []
+
+    async def health(self) -> bool:
+        """Best-effort health probe: ``ssh <host> true``.
+
+        Returns True when rc == 0, False otherwise.  Never raises.
+        BatchMode=yes prevents interactive password prompts; ConnectTimeout=10
+        bounds the TCP-connect wait so a down host is detected quickly.
+        """
+        try:
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self._ssh_host, 'true']
+            )
+            return rc == 0
+        except Exception:
+            return False
+
+    async def run_merge_verify(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+    ) -> VerifyResult:
+        """Run the combined merge-verify bundle on the remote host.
+
+        (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
+        (b) ssh <ssh_host> <shlex-quoted remote argv>
+        (c) parse stdout via result_from_json
+
+        Raises RunnerUnavailable on any transport failure (step-8).
+        Returns a VerifyResult unchanged — even passed=False or timed_out=True
+        (PRD §A Invariant 5).
+        """
+        request_id = self._id_factory()
+        ref = f'refs/merge-verify/{request_id}'
+
+        # Step 1: push the merge sha to the remote
+        try:
+            push_rc, _push_out, push_stderr = await self._run(
+                ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
+                cwd=self._cwd,
+            )
+        except OSError as exc:
+            raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+
+        if push_rc != 0:
+            raise RunnerUnavailable(
+                f'git push {self._git_remote} {merge_sha}:{ref} failed'
+                f' (rc={push_rc}): {push_stderr}'
+            )
+
+        # Push succeeded — clean up the ref on return (best-effort, in finally)
+        try:
+            # Step 2: build and issue the ssh command
+            argv = [
+                'orchestrator', 'verify-merge',
+                '--sha', merge_sha,
+                '--spec', spec_to_json(spec),
+            ]
+            if self._config_path:
+                argv += ['--config', self._config_path]
+            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+
+            try:
+                ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                    ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                     self._ssh_host, remote_cmd],
+                )
+            except OSError as exc:
+                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
+
+            if ssh_rc != 0:
+                raise RunnerUnavailable(
+                    f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
+                )
+
+            # Step 3: parse the host's stdout
+            # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
+            # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
+            try:
+                return result_from_json(ssh_stdout)
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                raise RunnerUnavailable(
+                    f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
+                ) from exc
+
+        finally:
+            # Best-effort ref cleanup — never alters the returned result nor masks exceptions
+            with contextlib.suppress(Exception):
+                await self._run(
+                    ['git', 'push', self._git_remote, '--delete', ref],
+                    cwd=self._cwd,
+                )
+
+
+# ---------------------------------------------------------------------------
 # Helpers for merge_queue to branch on unscoped-gate verdicts
 # ---------------------------------------------------------------------------
 
@@ -534,10 +719,17 @@ def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
 
 
 class VerifyRunnerPool:
-    """Dispatches a merge-verify bundle to a single VerifyRunner and emits a telemetry event.
+    """Dispatches a merge-verify bundle to a VerifyRunner and emits a telemetry event.
 
-    In β there is exactly one runner (LocalRunner). The long-lived K-permit
-    pool with multiple remote runners is deferred to ζ.
+    Selection policy (δ): prefers the first non-local (remote) runner.
+    The K-permit free/busy refinement (semaphore-based concurrency control) is
+    deferred to ζ.
+
+    Fail-safe (δ): if the selected runner raises RunnerUnavailable, dispatch
+    falls back to the local runner (if distinct), logging one warning.  The
+    merge_verify event reflects the runner that actually produced the result.
+    dispatch() never propagates RunnerUnavailable to its caller when a local
+    fallback exists (PRD §A Invariant 2).
     """
 
     def __init__(
@@ -549,9 +741,27 @@ class VerifyRunnerPool:
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
-        self._runner = runners[0]
+        self._runners = list(runners)
+        # Pre-compute the local runner for fast fail-safe lookup.
+        # Use the is_local flag (LocalRunner.is_local = True) rather than
+        # string equality so a RemoteRunner named 'local' isn't mistaken for
+        # the fallback target.
+        self._local: VerifyRunner | None = next(
+            (r for r in self._runners if r.is_local), None
+        )
         self._event_store = event_store
         self._task_id = task_id
+
+    def _select_runner(self) -> VerifyRunner:
+        """Prefer-remote: return the first non-local runner; fall back to runners[0].
+
+        The K-permit free/busy refinement (load-based selection) is ζ.
+        RemoteRunner.is_local is False, so it is selected over LocalRunner.
+        """
+        for runner in self._runners:
+            if not runner.is_local:
+                return runner
+        return self._runners[0]
 
     async def dispatch(
         self,
@@ -565,11 +775,38 @@ class VerifyRunnerPool:
         ``attempt`` is 0 for the first dispatch and incremented for each
         ENOSPC-retry re-dispatch.  Included in the event data so consumers
         can deduplicate multiple events for the same logical merge-verify.
+
+        Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
+        RunnerUnavailable, dispatch falls back to the local runner (if
+        distinct), logging exactly one WARNING.  dispatch() never propagates
+        RunnerUnavailable to its caller when a local fallback exists.  A
+        returned VerifyResult (any passed/timed_out value) is passed through
+        without fallback (PRD §A Invariant 5).
         """
+        import logging
+
         from orchestrator.event_store import EventType
 
+        _log = logging.getLogger(__name__)
+
+        selected = self._select_runner()
         t0 = time.monotonic()
-        result = await self._runner.run_merge_verify(merge_sha, spec)
+        try:
+            result = await selected.run_merge_verify(merge_sha, spec)
+            actual_runner = selected
+        except RunnerUnavailable:
+            # Fall back to the local runner if one exists and is not the
+            # runner that just failed.  Log exactly one WARNING; no escalation.
+            if self._local is not None and self._local is not selected:
+                _log.warning(
+                    'runner %r unavailable for %s — falling back to local',
+                    selected.name,
+                    merge_sha,
+                )
+                result = await self._local.run_merge_verify(merge_sha, spec)
+                actual_runner = self._local
+            else:
+                raise
         duration_ms = round((time.monotonic() - t0) * 1000)
 
         if self._event_store is not None:
@@ -577,7 +814,7 @@ class VerifyRunnerPool:
                 EventType.merge_verify,
                 task_id=self._task_id,
                 data={
-                    'runner': self._runner.name,
+                    'runner': actual_runner.name,
                     'merge_sha': merge_sha,
                     'passed': result.passed,
                     'duration_ms': duration_ms,

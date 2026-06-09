@@ -10,6 +10,7 @@ from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     LocalRunner,
     MergeVerifySpec,
+    RemoteRunner,
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
@@ -620,6 +621,7 @@ class TestVerifyRunnerPool:
         expected = _make_pass_result()
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=expected)
         pool = VerifyRunnerPool([fake_runner])
 
@@ -633,6 +635,7 @@ class TestVerifyRunnerPool:
         expected = _make_pass_result()
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=expected)
 
         emitted = []
@@ -654,6 +657,7 @@ class TestVerifyRunnerPool:
         from orchestrator.verify_runner import VerifyRunnerPool
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
         pool = VerifyRunnerPool([fake_runner], event_store=None)
 
@@ -1051,6 +1055,9 @@ class TestRunMergeVerifyOnWorktree:
 # Step-5: run_merge_verify_on_worktree defaults to real merge-path callables
 # ---------------------------------------------------------------------------
 
+# NOTE: The sections below are added by task δ (1696) and test RemoteRunner,
+# VerifyRunnerPool preference, and fail-safe fallback.
+
 
 @pytest.mark.asyncio
 class TestRunMergeVerifyOnWorktreeDefaults:
@@ -1090,3 +1097,669 @@ class TestRunMergeVerifyOnWorktreeDefaults:
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
         assert result is pass_result
+
+
+# ---------------------------------------------------------------------------
+# δ step-1: RunnerUnavailable — exception class + __all__ presence
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerUnavailable:
+    """RunnerUnavailable is an Exception subclass exported in verify_runner.__all__."""
+
+    def test_import_runner_unavailable(self):
+        from orchestrator.verify_runner import RunnerUnavailable  # noqa: F401
+
+    def test_is_exception_subclass(self):
+        from orchestrator.verify_runner import RunnerUnavailable
+        assert issubclass(RunnerUnavailable, Exception)
+
+    def test_constructible_with_message(self):
+        from orchestrator.verify_runner import RunnerUnavailable
+        exc = RunnerUnavailable("host down")
+        assert str(exc) == "host down"
+
+    def test_present_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        assert 'RunnerUnavailable' in vr_mod.__all__
+
+
+# ---------------------------------------------------------------------------
+# δ step-3: RemoteRunner construction + health()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerConstruction:
+    """RemoteRunner construction, VerifyRunner conformance, and health() probe."""
+
+    def _make_fake_run(self, responses):
+        """Return an async callable that returns successive (rc, stdout, stderr) tuples.
+
+        ``responses`` is a list of (rc, stdout, stderr) tuples consumed in order.
+        """
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv)
+            return responses.pop(0)
+
+        fake_run.calls = calls
+        return fake_run
+
+    async def test_name_attribute(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        assert runner.name == 'laptop'
+
+    async def test_isinstance_verify_runner_protocol(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        assert isinstance(runner, VerifyRunner)
+
+    async def test_health_true_when_ssh_rc_zero(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([(0, '', '')])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        result = await runner.health()
+        assert result is True
+        # health issues `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`
+        assert fake_run.calls == [
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'laptop.local', 'true']
+        ]
+
+    async def test_health_false_when_ssh_rc_nonzero(self):
+        from orchestrator.verify_runner import RemoteRunner
+        fake_run = self._make_fake_run([(1, '', 'Connection refused')])
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=fake_run,
+        )
+        result = await runner.health()
+        assert result is False
+
+    async def test_health_false_when_run_raises(self):
+        from orchestrator.verify_runner import RemoteRunner
+
+        async def raising_run(argv, *, cwd=None):
+            raise OSError("ssh not found")
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='laptop',
+            cwd='/repo',
+            run=raising_run,
+        )
+        # health() must never raise
+        result = await runner.health()
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# δ step-5: RemoteRunner.run_merge_verify — happy path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerHappyPath:
+    """run_merge_verify happy path: git push + ssh + parse stdout."""
+
+    def _make_runner_and_calls(self, expected_result, *, config_path=None):
+        """Return (runner, calls_list) where calls_list is appended to on each run()."""
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append((argv, cwd))
+            # git push → rc=0
+            if argv[0] == 'git':
+                return (0, '', '')
+            # ssh → rc=0 with VerifyResult JSON stdout
+            return (0, result_to_json(expected_result), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            config_path=config_path,
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_returns_verify_result_equal_to_expected(self):
+        expected = VerifyResult(
+            passed=True,
+            test_output='all green',
+            lint_output='',
+            type_output='',
+            summary='ok',
+        )
+        runner, _ = self._make_runner_and_calls(expected)
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result == expected
+
+    async def test_git_push_argv_and_cwd(self):
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', _make_spec())
+        # first call is the git push
+        push_argv, push_cwd = calls[0]
+        assert push_argv == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+        assert push_cwd == '/repo'
+
+    async def test_ssh_argv_with_shlex_quoted_spec(self):
+        """ssh is called as ['ssh', host, remote_cmd] where shlex.split(remote_cmd) round-trips."""
+        import shlex as _shlex
+
+        from orchestrator.verify_runner import spec_to_json
+        spec = _make_spec()
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', spec)
+        # second call is the ssh (with hardening flags: -o BatchMode=yes -o ConnectTimeout=10)
+        ssh_argv, _ = calls[1]
+        assert ssh_argv[0] == 'ssh'
+        assert ssh_argv[-2] == 'laptop.local'   # host is second-to-last
+        remote_cmd = ssh_argv[-1]               # quoted remote command is last
+        parsed = _shlex.split(remote_cmd)
+        assert parsed[:4] == ['orchestrator', 'verify-merge', '--sha', 'abc123']
+        # spec JSON survives as a single token
+        spec_idx = parsed.index('--spec') + 1
+        assert parsed[spec_idx] == spec_to_json(spec)
+        # no --config when not set
+        assert '--config' not in parsed
+
+    async def test_ssh_argv_includes_config_path_when_set(self):
+        """When config_path is set, ['--config', config_path] appears in the remote cmd."""
+        import shlex as _shlex
+
+        spec = _make_spec()
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected, config_path='/etc/orch.yaml')
+        await runner.run_merge_verify('abc123', spec)
+        ssh_argv, _ = calls[1]
+        parsed = _shlex.split(ssh_argv[-1])  # last arg is the quoted remote command
+        cfg_idx = parsed.index('--config') + 1
+        assert parsed[cfg_idx] == '/etc/orch.yaml'
+
+    async def test_request_id_from_id_factory(self):
+        """The pushed ref uses the id_factory's return value."""
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected)
+        await runner.run_merge_verify('abc123', _make_spec())
+        push_argv, _ = calls[0]
+        assert push_argv[3] == 'abc123:refs/merge-verify/fixed-id'
+
+
+# ---------------------------------------------------------------------------
+# δ step-7: RemoteRunner transport vs timeout boundary (PRD Invariant 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerTransportVsTimeout:
+    """Invariant 5: RunnerUnavailable ↔ transport failure only; VerifyResult returned for any verdict."""
+
+    def _make_runner(self, responses, *, raise_on=None):
+        """Build a RemoteRunner with a fake `run` that returns successive responses.
+
+        ``responses`` is a list of (rc, stdout, stderr) tuples.
+        ``raise_on`` is an optional exception to raise on the Nth call (0-indexed dict).
+        """
+        calls = []
+        call_counter = [0]
+
+        async def fake_run(argv, *, cwd=None):
+            n = call_counter[0]
+            call_counter[0] += 1
+            calls.append(argv[:])
+            if raise_on is not None and n in raise_on:
+                raise raise_on[n]
+            return responses[n]
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'req-id',
+        )
+        runner._calls = calls
+        return runner
+
+    async def test_raises_runner_unavailable_on_push_failure(self):
+        """git push rc!=0 → RunnerUnavailable; ssh is never called."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(1, '', 'push error'), (0, '', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        # ssh must NOT have been attempted
+        assert not any(a[0] == 'ssh' for a in runner._calls)
+
+    async def test_raises_runner_unavailable_on_ssh_nonzero(self):
+        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_empty_stdout(self):
+        """ssh rc=0 but stdout is empty → RunnerUnavailable (unparseable)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (0, '', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_non_json_stdout(self):
+        """ssh rc=0 but stdout is non-JSON → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([(0, '', ''), (0, 'not valid json!!!', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_wrong_shape_json(self):
+        """ssh rc=0 but stdout is valid JSON with wrong schema → RunnerUnavailable (TypeError path).
+
+        This is the most likely real-world malformed-verdict case from a buggy
+        remote CLI: the JSON parses but result_from_json raises TypeError because
+        the keys don't match VerifyResult's fields.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+        # Valid JSON dict but unrecognised keys — triggers TypeError in result_from_json
+        runner = self._make_runner([(0, '', ''), (0, '{"unexpected": 1}', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        # JSON list — also a TypeError because ** unpacking requires a mapping
+        runner2 = self._make_runner([(0, '', ''), (0, '[1, 2, 3]', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner2.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_when_run_raises_oserror(self):
+        """An OSError from the subprocess runner → RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        runner = self._make_runner([], raise_on={0: FileNotFoundError('git not found')})
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_returns_result_when_verify_timed_out(self):
+        """ssh rc=0 + stdout=VerifyResult(timed_out=True) → returned unchanged (NOT RunnerUnavailable)."""
+        timed_out_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='timed out',
+            timed_out=True,
+        )
+        runner = self._make_runner([(0, '', ''), (0, result_to_json(timed_out_result), '')])
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result.timed_out is True
+        assert result == timed_out_result
+
+    async def test_returns_failing_result_unchanged(self):
+        """ssh rc=0 + stdout=VerifyResult(passed=False) → returned unchanged (NOT RunnerUnavailable)."""
+        fail_result = VerifyResult(
+            passed=False,
+            test_output='FAILED 2',
+            lint_output='',
+            type_output='',
+            summary='2 failures',
+            category='test_failure',
+        )
+        runner = self._make_runner([(0, '', ''), (0, result_to_json(fail_result), '')])
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result.passed is False
+        assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# δ step-9: RemoteRunner ref cleanup (best-effort on return)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerRefCleanup:
+    """The pushed ref is deleted best-effort on return (PRD open-Q4)."""
+
+    def _make_tracking_runner(self, responses_by_argv_prefix):
+        """Build a RemoteRunner whose fake `run` logs all calls.
+
+        ``responses_by_argv_prefix`` maps an argv[0] to (rc, stdout, stderr).
+        The fake always records every call in `runner._calls`.
+        """
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            key = tuple(argv[:3])  # e.g. ('git','push','origin') or ('ssh', ...)
+            # git delete looks like ['git','push','origin','--delete',...]
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')  # default: delete succeeds
+            if key[0] == 'git':
+                return responses_by_argv_prefix.get('git', (0, '', ''))
+            if key[0] == 'ssh':
+                return responses_by_argv_prefix.get('ssh', (0, result_to_json(_make_pass_result()), ''))
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        runner._calls = calls
+        return runner
+
+    async def test_delete_called_after_success(self):
+        """After a successful run, the pushed ref is deleted via git push --delete."""
+        runner = self._make_tracking_runner({'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')})
+        await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 1
+        assert 'refs/merge-verify/cleanup-id' in delete_calls[0]
+
+    async def test_delete_called_after_ssh_failure(self):
+        """When ssh fails (→ RunnerUnavailable), the ref is still deleted (cleanup in finally)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def fake_run(argv, *, cwd=None):
+            runner._calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (255, '', 'ssh: connect refused')  # ssh fails
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        runner._calls = []
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 1
+
+    async def test_no_delete_when_push_failed(self):
+        """When the git push itself fails, no delete is attempted (nothing was pushed)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')
+            return (1, '', 'push error')  # ALL git push (incl. initial) fail
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 0
+
+    async def test_cleanup_failure_does_not_mask_result(self):
+        """A delete call that raises does NOT change the returned VerifyResult."""
+        pass_result = _make_pass_result()
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                raise OSError('git delete failed')  # cleanup fails
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (0, result_to_json(pass_result), '')  # ssh succeeds
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result == pass_result  # no exception, correct result
+
+    async def test_cleanup_failure_does_not_mask_runner_unavailable(self):
+        """A delete that raises does NOT suppress a RunnerUnavailable from the verify path."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                raise OSError('git delete failed')  # cleanup fails
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (1, '', 'ssh error')  # ssh fails → RunnerUnavailable
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+
+# ---------------------------------------------------------------------------
+# δ step-11: VerifyRunnerPool prefers remote runner over local
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolPreferRemote:
+    """VerifyRunnerPool.dispatch prefers the first non-local (remote) runner."""
+
+    def _make_fake_runner(self, name, result):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+        fake.run_merge_verify = AsyncMock(return_value=result)
+        return fake
+
+    async def test_dispatch_uses_remote_not_local_when_both_present(self):
+        """[local, remote] order forces a real RED against the current runners[0] selection."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result(summary='local result')
+        remote_result = _make_pass_result(summary='remote result')
+        local_fake = self._make_fake_runner('local', local_result)
+        remote_fake = self._make_fake_runner('laptop', remote_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result is remote_result
+        remote_fake.run_merge_verify.assert_awaited_once()
+        local_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_dispatch_event_runner_is_remote_name(self):
+        """merge_verify event has data['runner'] == 'laptop' when routed to remote."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        remote_result = _make_pass_result()
+        local_fake = self._make_fake_runner('local', _make_pass_result(summary='local'))
+        remote_fake = self._make_fake_runner('laptop', remote_result)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake, remote_fake], event_store=event_store, task_id='t-1')
+        await pool.dispatch('sha1', _make_spec())
+
+        assert len(emitted) == 1
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['runner'] == 'laptop'
+
+    async def test_dispatch_single_local_pool_uses_local(self):
+        """Regression: single-runner pool [local] still routes to local (β regression guard)."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        local_result = _make_pass_result()
+        local_fake = self._make_fake_runner('local', local_result)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake], event_store=event_store)
+        result = await pool.dispatch('sha2', _make_spec())
+
+        assert result is local_result
+        (_, kwargs) = emitted[0]
+        assert kwargs['data']['runner'] == 'local'
+
+
+# ---------------------------------------------------------------------------
+# δ step-13: VerifyRunnerPool fail-safe fallback (PRD Invariant 2 / D5 / §B B3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolFailSafe:
+    """dispatch() falls back to local when the selected remote raises RunnerUnavailable."""
+
+    def _make_fake_runner(self, name, result=None, raises=None):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+        if raises is not None:
+            fake.run_merge_verify = AsyncMock(side_effect=raises)
+        else:
+            fake.run_merge_verify = AsyncMock(return_value=result)
+        return fake
+
+    async def test_fallback_returns_local_result(self):
+        """Remote RunnerUnavailable → dispatch returns local result."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        local_result = _make_pass_result(summary='local fallback')
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('host down'))
+        local_fake = self._make_fake_runner('local', local_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha', _make_spec())
+
+        assert result is local_result
+
+    async def test_fallback_does_not_raise(self):
+        """dispatch() does NOT propagate RunnerUnavailable when local fallback exists."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('gone'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        # must not raise
+        await pool.dispatch('sha', _make_spec())
+
+    async def test_fallback_calls_local_run_merge_verify_once(self):
+        """local.run_merge_verify is called exactly once as the fallback."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        local_result = _make_pass_result()
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+        local_fake = self._make_fake_runner('local', local_result)
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        await pool.dispatch('sha', _make_spec())
+
+        local_fake.run_merge_verify.assert_awaited_once()
+
+    async def test_fallback_event_runner_is_local(self):
+        """merge_verify event data['runner'] == 'local' when fallback is used."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([local_fake, remote_fake], event_store=event_store)
+        await pool.dispatch('sha', _make_spec())
+
+        assert len(emitted) == 1
+        (_, kwargs) = emitted[0]
+        assert kwargs['data']['runner'] == 'local'
+
+    async def test_fallback_logs_one_warning(self, caplog):
+        """Exactly one warning is logged identifying the unavailable runner; no escalation."""
+        import logging
+
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('host down'))
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        with caplog.at_level(logging.WARNING):
+            await pool.dispatch('sha', _make_spec())
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'laptop' in warnings[0].message.lower() or 'laptop' in warnings[0].getMessage().lower()
+
+    async def test_no_fallback_when_remote_returns_timed_out_result(self):
+        """A VerifyResult(timed_out=True) from remote is returned unchanged — NOT fallen back (Invariant 5)."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+        timed_out = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='timeout', timed_out=True,
+        )
+        remote_fake = self._make_fake_runner('laptop', timed_out)
+        local_fake = self._make_fake_runner('local', _make_pass_result())
+
+        pool = VerifyRunnerPool([local_fake, remote_fake])
+        result = await pool.dispatch('sha', _make_spec())
+
+        assert result is timed_out
+        local_fake.run_merge_verify.assert_not_awaited()
+
+    async def test_no_local_fallback_reraises_runner_unavailable(self):
+        """A pool with only a remote runner and no local raises RunnerUnavailable (unsupported config)."""
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+        remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
+
+        pool = VerifyRunnerPool([remote_fake])
+        with pytest.raises(RunnerUnavailable):
+            await pool.dispatch('sha', _make_spec())
