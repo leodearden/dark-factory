@@ -4081,7 +4081,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         entries: list[dict] = []
         now = time.time()
 
-        def _entry(req: MergeRequest, state: str, worktree_path=None, position: int = 0) -> dict:
+        def _entry(
+            req: MergeRequest,
+            state: str,
+            worktree_path=None,
+            position: int = 0,
+            lane: str | None = None,
+        ) -> dict:
             return {
                 'task_id': req.task_id,
                 'branch': req.branch,
@@ -4093,6 +4099,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'worktree': str(worktree_path) if worktree_path is not None else None,
                 'pre_rebased': req.pre_rebased,
                 'request_id': req.request_id,
+                'lane': lane if lane is not None else req.lane,
             }
 
         # 1. Verifier-current item (head-of-line)
@@ -4129,7 +4136,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
 
         # 4. Queued (waiting for the merger; the incident blind spot)
-        # Same CPython internal-deque access as above — read-only, no lock needed.
+        # Items may be in the external _queue OR already drained into _lane_buffers.
+        # Enumerate _lane_buffers first (priority-ordered; items here are already
+        # waiting), then _queue for any not-yet-drained arrivals.
+        # Same CPython internal-deque access as _queue above — read-only, no lock.
+        for lane in MERGE_LANES:
+            for req in list(self._lane_buffers[lane]):
+                entries.append(_entry(
+                    req, 'queued', worktree_path=None,
+                    position=len(entries), lane=lane,
+                ))
         for req in list(self._queue._queue):  # type: ignore[attr-defined]
             if req is None:
                 continue
@@ -4269,7 +4285,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for _ in range(_MERGE_AHEAD_BOUND + 1):
             self._merge_ahead_cap.release()
 
-        # Drain main queue
+        # Drain per-lane buffers (items already removed from _queue by the merger)
+        for lane in MERGE_LANES:
+            while self._lane_buffers[lane]:
+                req = self._lane_buffers[lane].popleft()
+                if not req.result.done():
+                    req.result.set_result(shutdown)
+
+        # Drain main queue (items not yet drained into lane buffers)
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
@@ -4277,6 +4300,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req.result.set_result(shutdown)
             except asyncio.QueueEmpty:
                 break
+
+        # Cancel the persistent _pending_get future if live (it holds a
+        # queue.get() that will never fire because we're shutting down).
+        if self._pending_get is not None and not self._pending_get.done():
+            self._pending_get.cancel()
+            self._pending_get = None
 
         # Drain verifier queue — also clean up orphaned merge worktrees.
         # cleanup_merge_worktree is wrapped in suppress(BaseException) so that
