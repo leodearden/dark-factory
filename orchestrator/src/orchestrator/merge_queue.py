@@ -3935,6 +3935,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
         self._heartbeat_interval_s: float = 300.0
+        # Per-lane FIFO buffers — items are drained from _queue into these so
+        # pick-order can prefer high over normal.  Each deque preserves FIFO
+        # within a lane.  Accessed only from the merger coroutine.
+        self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
+            l: collections.deque() for l in MERGE_LANES
+        }
+
+    # ── lane-buffer helpers ───────────────────────────────────────────────
+
+    def _drain_queue_into_lanes(self) -> bool:
+        """Non-blocking drain of _queue into per-lane buffers.
+
+        Returns True and stops immediately if the shutdown sentinel (None) is
+        encountered (the sentinel is NOT placed into any buffer).
+        Returns False if the queue was drained to empty normally.
+        """
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return False
+            if item is None:
+                return True  # shutdown sentinel — signal to stop
+            lane = _normalize_lane(item.lane)
+            self._lane_buffers[lane].append(item)
+
+    def _pop_next_pickable(self) -> MergeRequest | None:
+        """Return the next pickable request (highest-priority non-halted lane, FIFO).
+
+        Returns None if every non-empty lane is halted, or all buffers are
+        empty.  Pure/synchronous so unit tests run without an event loop.
+        """
+        for lane in MERGE_LANES:  # high → normal
+            if self.is_lane_halted(lane):
+                continue
+            buf = self._lane_buffers[lane]
+            if buf:
+                return buf.popleft()
+        return None
 
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.

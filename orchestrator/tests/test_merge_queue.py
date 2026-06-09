@@ -16118,3 +16118,65 @@ class TestPerLaneHaltMechanics:
         assert worker.is_lane_halted('normal') is False
         assert worker.is_lane_halted('high') is False
         assert worker.is_wip_halted is False
+
+
+class TestLanePickOrderHelpers:
+    """Steps 5-6: _drain_queue_into_lanes and _pop_next_pickable."""
+
+    def _setup(self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path):
+        """Return (worker, loop) with the loop set as current event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        return worker, loop
+
+    def test_lane_pick_order_high_before_normal(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """high-C is picked before normal-A and normal-B (high lane fully ahead); FIFO within."""
+        worker, loop = self._setup(git_ops, config, git_repo)
+        try:
+            req_a = _make_request('t-a', 't-a', git_repo, config, lane='normal')
+            req_b = _make_request('t-b', 't-b', git_repo, config, lane='normal')
+            req_c = _make_request('t-c', 't-c', git_repo, config, lane='high')
+
+            # Put in normal-A, normal-B, high-C order
+            worker._queue.put_nowait(req_a)
+            worker._queue.put_nowait(req_b)
+            worker._queue.put_nowait(req_c)
+            worker._drain_queue_into_lanes()
+
+            # Pick order: high-C, normal-A, normal-B
+            assert worker._pop_next_pickable() is req_c
+            assert worker._pop_next_pickable() is req_a
+            assert worker._pop_next_pickable() is req_b
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def test_pop_skips_halted_lane(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """_pop_next_pickable skips halted lanes; un-halting resumes them."""
+        worker, loop = self._setup(git_ops, config, git_repo)
+        try:
+            req_normal = _make_request('t-n', 't-n', git_repo, config, lane='normal')
+            req_high = _make_request('t-h', 't-h', git_repo, config, lane='high')
+
+            worker._queue.put_nowait(req_normal)
+            worker._queue.put_nowait(req_high)
+            worker._drain_queue_into_lanes()
+
+            # Halt high lane — only normal should be available
+            worker.halt_lane('high', 'test')
+            assert worker._pop_next_pickable() is req_normal
+
+            # Un-halt high lane — should return the high item
+            worker.unhalt_lane('high')
+            assert worker._pop_next_pickable() is req_high
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
