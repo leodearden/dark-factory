@@ -154,6 +154,16 @@ and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reac
 the workflow consumer."""
 
 
+MERGE_LANES: tuple[str, ...] = ('high', 'normal')
+"""Priority-ordered lane names (high first).  Used by SpeculativeMergeWorker to
+drain and pick requests: the first non-halted non-empty lane wins."""
+
+
+def _normalize_lane(lane: str) -> str:
+    """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
+    return lane if lane in MERGE_LANES else 'normal'
+
+
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
 fails with a no-space-left/ENOSPC signature that PERSISTS after one
@@ -2758,6 +2768,9 @@ class MergeRequest:
     generation: int = field(default=1, kw_only=True)
     """Generation counter for auto-chained merges (γ2).  Gen-1 is the original;
     each auto-chain increments by 1.  Bounded by MAX_AUTO_CHAINED_GENERATIONS."""
+    lane: Literal['normal', 'high'] = field(default='normal', kw_only=True)
+    """Priority lane for this request.  'high' requests are picked before all
+    'normal' requests; within a lane FIFO order is preserved."""
 
 
 @dataclass
@@ -3273,21 +3286,199 @@ async def _do_train_merge(
 class _WipHaltMixin:
     """Shared WIP-halt machinery and request-abandoned helper.
 
-    Provides the byte-identical halt-owner methods that both
-    :class:`MergeWorker` and :class:`SpeculativeMergeWorker` expose as
-    public API to ``workflow.py`` and ``harness.py``.
+    Provides the halt-owner methods that both :class:`MergeWorker` and
+    :class:`SpeculativeMergeWorker` expose as public API to ``workflow.py``
+    and ``harness.py``.
+
+    Per-lane halt state: each lane in MERGE_LANES has an independent
+    asyncio.Event (set = not halted; cleared = halted) and an optional owner
+    esc_id.  Legacy all-lanes methods (halt_for_wip, unhalt_wip, …) are
+    preserved as backward-compatible shims.
 
     Methods-only: each concrete worker's ``__init__`` is responsible for
-    creating the instance attributes::
+    building the dicts::
 
-        self._wip_halt = asyncio.Event(); self._wip_halt.set()
-        self._halt_owner_esc_id: str | None = None
+        self._lane_halt = {l: asyncio.Event() for l in MERGE_LANES}
+        for l in MERGE_LANES: self._lane_halt[l].set()
+        self._lane_halt_owner: dict[str, str | None] = {l: None for l in MERGE_LANES}
     """
 
-    # Class-level annotations so pyright sees the attributes without an
-    # __init__ on the mixin itself.
-    _wip_halt: asyncio.Event
-    _halt_owner_esc_id: str | None
+    # Class-level annotations so pyright sees the attributes.
+    _lane_halt: dict[str, asyncio.Event]
+    _lane_halt_owner: dict[str, str | None]
+
+    # ── per-lane public API ────────────────────────────────────────────────
+
+    def halt_lane(self, lane: str, reason: str, *, owner_esc_id: str | None = None) -> None:
+        """Halt a specific lane."""
+        logger.warning('Merge queue lane %r halted: %s', lane, reason)
+        self._lane_halt[lane].clear()
+        if owner_esc_id is not None:
+            self._lane_halt_owner[lane] = owner_esc_id
+
+    def unhalt_lane(self, lane: str, reason: str | None = None) -> None:
+        """Resume a specific lane."""
+        logger.info(
+            'Merge queue lane %r un-halted%s',
+            lane,
+            f' ({reason})' if reason else '',
+        )
+        self._lane_halt[lane].set()
+        self._lane_halt_owner[lane] = None
+        self._signal_resume()
+
+    def is_lane_halted(self, lane: str) -> bool:
+        """True iff the given lane is currently halted."""
+        return not self._lane_halt[lane].is_set()
+
+    # ── per-lane owner API (step-12 extensions live here too) ─────────────
+
+    def set_lane_halt_owner(self, lane: str, esc_id: str) -> None:
+        """Register the escalation that owns the halt on *lane*.
+
+        Asserts no different owner is already set (mirrors ``set_halt_owner``
+        single-owner invariant).
+        """
+        current = self._lane_halt_owner[lane]
+        assert current is None or current == esc_id, (
+            f'lane {lane!r} halt owner already set to {current!r}, '
+            f'refusing to overwrite with {esc_id!r}'
+        )
+        self._lane_halt_owner[lane] = esc_id
+
+    def lane_owned_by(self, esc_id: str) -> str | None:
+        """Return the lane owned by *esc_id*, or None."""
+        for lane, owner in self._lane_halt_owner.items():
+            if owner == esc_id:
+                return lane
+        return None
+
+    def unhalt_lanes_owned_by(self, esc_id: str, reason: str | None = None) -> list[str]:
+        """Un-halt every lane owned by *esc_id*.  Returns list of lanes resumed."""
+        resumed = []
+        for lane in MERGE_LANES:
+            if self._lane_halt_owner.get(lane) == esc_id:
+                # Call lane halt setter directly to avoid double-signal; signal once after.
+                self._lane_halt[lane].set()
+                self._lane_halt_owner[lane] = None
+                logger.info('Merge queue lane %r un-halted (owner %r resolved)', lane, esc_id)
+                resumed.append(lane)
+        if resumed:
+            self._signal_resume()
+        return resumed
+
+    def _signal_resume(self) -> None:
+        """Set the resume signal if the concrete worker has one (SpeculativeMergeWorker).
+
+        The mixin is shared with MergeWorker which has no _resume_signal; the
+        hasattr guard makes the call a no-op on MergeWorker.
+        """
+        sig = getattr(self, '_resume_signal', None)
+        if sig is not None:
+            sig.set()
+
+    # ── legacy all-lanes shims (backward-compatible) ──────────────────────
+
+    def halt_for_wip(self, reason: str) -> None:
+        """Halt the merge queue due to a WIP conflict (all lanes)."""
+        logger.warning('Merge queue halted for WIP: %s', reason)
+        for lane in MERGE_LANES:
+            self._lane_halt[lane].clear()
+            self._lane_halt_owner[lane] = None
+
+    def set_halt_owner(self, esc_id: str) -> None:
+        """Register the escalation that owns the current halt.
+
+        The workflow calls this right after submitting its halt-triggering
+        escalation.  Sets the owner on all currently-halted lanes.
+        Asserts no owner is already set — a double-register indicates a
+        double-halt bug that should fail loudly.
+        """
+        current = self._halt_owner_esc_id
+        assert current is None, (
+            f'halt owner already set to {current!r}, '
+            f'refusing to overwrite with {esc_id!r}'
+        )
+        halted = [ln for ln in MERGE_LANES if not self._lane_halt[ln].is_set()]
+        assert halted, (
+            f'set_halt_owner({esc_id!r}) called when no lane is halted — '
+            'halt must be active before registering an owner'
+        )
+        for lane in halted:
+            self._lane_halt_owner[lane] = esc_id
+
+    def is_halt_owner(self, esc_id: str) -> bool:
+        """True iff esc_id owns any currently-halted lane."""
+        for lane in MERGE_LANES:
+            if (not self._lane_halt[lane].is_set()
+                    and self._lane_halt_owner.get(lane) == esc_id):
+                return True
+        return False
+
+    def unhalt_all_lanes(self, reason: str | None = None) -> None:
+        """Resume ALL lanes unconditionally, clearing every owner.
+
+        This is the global 'resume-all' backstop — e.g. operator
+        ``force_unhalt_merge_queue`` or a signal that all active halts should
+        be cleared regardless of which escalation owned them.
+        """
+        logger.info(
+            'Merge queue: all lanes un-halted%s',
+            f' ({reason})' if reason else '',
+        )
+        for lane in MERGE_LANES:
+            self._lane_halt[lane].set()
+            self._lane_halt_owner[lane] = None
+        self._signal_resume()
+
+    def unhalt_wip(self, reason: str | None = None) -> None:
+        """Resume the merge queue after WIP conflict resolution (all lanes).
+
+        Delegates to :meth:`unhalt_all_lanes` so that the operator
+        ``force_unhalt_merge_queue`` path (which calls this) also clears any
+        orphaned per-lane halt.
+        """
+        self.unhalt_all_lanes(reason=reason)
+
+    @property
+    def is_wip_halted(self) -> bool:
+        """True iff at least one lane is halted."""
+        return any(not self._lane_halt[ln].is_set() for ln in MERGE_LANES)
+
+    @property
+    def _halt_owner_esc_id(self) -> str | None:
+        """Owner of any currently-halted lane (for backward compat attr access)."""
+        for lane in MERGE_LANES:
+            if not self._lane_halt[lane].is_set():
+                owner = self._lane_halt_owner.get(lane)
+                if owner is not None:
+                    return owner
+        return None
+
+    @property
+    def halt_owner_esc_id(self) -> str | None:
+        """Read-only public view of the current halt-owner escalation id."""
+        return self._halt_owner_esc_id
+
+    # ── wait helper ───────────────────────────────────────────────────────
+
+    async def _wait_until_any_lane_runnable(self) -> None:
+        """Block until at least one lane is not halted.
+
+        Returns immediately if any lane is already running.  When all lanes
+        are halted, waits for the first lane event to be set (un-halted) and
+        cancels the remaining waiters before returning.
+        """
+        if any(self._lane_halt[ln].is_set() for ln in MERGE_LANES):
+            return
+        tasks = [asyncio.ensure_future(self._lane_halt[ln].wait()) for ln in MERGE_LANES]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+
+    # ── misc ──────────────────────────────────────────────────────────────
 
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
         """Build the terminal MergeOutcome for the loop-breaker.
@@ -3305,50 +3496,6 @@ class _WipHaltMixin:
                 'starving the queue behind a deterministic verify hang.'
             ),
         )
-
-    def halt_for_wip(self, reason: str) -> None:
-        """Halt the merge queue due to a WIP conflict."""
-        logger.warning('Merge queue halted for WIP: %s', reason)
-        self._wip_halt.clear()
-        self._halt_owner_esc_id = None
-
-    def set_halt_owner(self, esc_id: str) -> None:
-        """Register the escalation that owns the current halt.
-
-        The workflow calls this right after submitting its halt-triggering
-        escalation. Asserts owner is currently None — a double-register
-        indicates a double-halt bug that should fail loudly.
-        """
-        assert self._halt_owner_esc_id is None, (
-            f'halt owner already set to {self._halt_owner_esc_id!r}, '
-            f'refusing to overwrite with {esc_id!r}'
-        )
-        self._halt_owner_esc_id = esc_id
-
-    def is_halt_owner(self, esc_id: str) -> bool:
-        """True iff esc_id is the currently registered halt owner."""
-        return (
-            self._halt_owner_esc_id is not None
-            and self._halt_owner_esc_id == esc_id
-        )
-
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        """Resume the merge queue after WIP conflict resolution."""
-        logger.info(
-            'Merge queue un-halted (WIP conflict resolved%s)',
-            f', reason={reason!r}' if reason else '',
-        )
-        self._wip_halt.set()
-        self._halt_owner_esc_id = None
-
-    @property
-    def is_wip_halted(self) -> bool:
-        return not self._wip_halt.is_set()
-
-    @property
-    def halt_owner_esc_id(self) -> str | None:
-        """Read-only public view of the current halt-owner escalation id."""
-        return self._halt_owner_esc_id
 
     def _request_abandoned(self, req: MergeRequest) -> bool:
         """True iff the requester cancelled the result future — drop the request."""
@@ -3368,6 +3515,15 @@ class MergeWorker(_WipHaltMixin):
     Owns all main-branch advancement via CAS ``update-ref``.  The harness
     creates one instance and passes the same ``asyncio.Queue`` to every
     ``TaskWorkflow``.
+
+    .. note:: Legacy path.
+        This class inherits the per-lane halt *state machine* from
+        ``_WipHaltMixin`` and honours ``halt_for_wip`` / ``unhalt_wip``
+        (all-lanes) correctly.  However its ``_dequeue`` picks from the
+        FIFO queue without consulting ``req.lane``, so it does **not**
+        implement lane-priority ordering.  Use
+        :class:`SpeculativeMergeWorker` (the production worker) when lane
+        priority matters.
     """
 
     MAX_CAS_RETRIES = 5
@@ -3411,13 +3567,11 @@ class MergeWorker(_WipHaltMixin):
         # consecutive tip-advance equivalence failure; popped on a clean 'done'
         # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
         self._generation_chain_counts: dict[str, int] = {}
-        # WIP halt: cleared when halted, set when running
-        self._wip_halt = asyncio.Event()
-        self._wip_halt.set()  # not halted initially
-        # ID of the escalation that owns the current halt. Registered by the
-        # workflow handler after it submits the L1 escalation. Single source
-        # of truth for the resolve-callback un-halt path.
-        self._halt_owner_esc_id: str | None = None
+        # Per-lane halt: each event is set (running) by default
+        self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
+        self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
 
     # ------------------------------------------------------------------
     # Public API
@@ -3426,7 +3580,7 @@ class MergeWorker(_WipHaltMixin):
     async def run(self) -> None:
         """Main loop — runs until ``stop()`` is called."""
         while self._running:
-            await self._wip_halt.wait()  # blocks if halted for WIP conflict
+            await self._wait_until_any_lane_runnable()  # blocks if all lanes halted
             req = await self._dequeue()
             if req is None:
                 break  # shutdown sentinel
@@ -3793,13 +3947,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # without raising.  Released ON-DRAIN (right after verifier_queue.get()
         # for a counted item) so the slot is free while verify runs.
         self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
-        # WIP halt: cleared when halted, set when running
-        self._wip_halt = asyncio.Event()
-        self._wip_halt.set()  # not halted initially
-        # ID of the escalation that owns the current halt. Registered by the
-        # workflow handler after it submits the L1 escalation. Single source
-        # of truth for the resolve-callback un-halt path.
-        self._halt_owner_esc_id: str | None = None
+        # Per-lane halt: each event is set (running) by default
+        self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
+        self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -3827,6 +3979,111 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
         self._heartbeat_interval_s: float = 300.0
+        # Per-lane FIFO buffers — items are drained from _queue into these so
+        # pick-order can prefer high over normal.  Each deque preserves FIFO
+        # within a lane.  Accessed only from the merger coroutine.
+        self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
+            ln: collections.deque() for ln in MERGE_LANES
+        }
+        # Resume signal: set by every unhalt method so a blocked merger
+        # (waiting with no pickable item) wakes up to re-check lanes.
+        # Cleared by the merger before each wait; never cancelled.
+        self._resume_signal = asyncio.Event()
+        # Persistent queue.get() future — kept alive across iterations to
+        # avoid the lost-item hazard of cancelling an in-flight get().
+        # The merger always has at most one of these outstanding.
+        self._pending_get: asyncio.Task | None = None
+        # Set True when the shutdown sentinel (None) has been dequeued so
+        # _acquire_next_request can drain remaining lane-buffer items before
+        # returning None.  Cleared by stop() on full reset.
+        self._shutdown_signaled: bool = False
+
+    # ── lane-buffer helpers ───────────────────────────────────────────────
+
+    def _drain_queue_into_lanes(self) -> None:
+        """Non-blocking drain of _queue into per-lane buffers.
+
+        When the shutdown sentinel (None) is encountered it sets
+        ``_shutdown_signaled`` so the caller knows shutdown was requested
+        after draining any items that arrived before the sentinel.
+        """
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if item is None:
+                self._shutdown_signaled = True
+                return  # sentinel consumed — all prior items already buffered
+            lane = _normalize_lane(item.lane)
+            self._lane_buffers[lane].append(item)
+
+    def _pop_next_pickable(self) -> MergeRequest | None:
+        """Return the next pickable request (highest-priority non-halted lane, FIFO).
+
+        Returns None if every non-empty lane is halted, or all buffers are
+        empty.  Pure/synchronous so unit tests run without an event loop.
+        """
+        for lane in MERGE_LANES:  # high → normal
+            if self.is_lane_halted(lane):
+                continue
+            buf = self._lane_buffers[lane]
+            if buf:
+                return buf.popleft()
+        return None
+
+    async def _acquire_next_request(self) -> MergeRequest | None:
+        """Return the next pickable request, blocking if nothing is available.
+
+        Drains _queue into lane buffers, then picks the highest-priority
+        non-halted item.  When nothing is pickable it waits on FIRST_COMPLETED
+        of (a) the persistent _pending_get future that will fire when a new
+        item arrives, and (b) the _resume_signal that fires when a lane is
+        un-halted.  Only the _resume_signal.wait() task is ever cancelled;
+        the queue.get() task (_pending_get) persists to avoid the lost-item
+        hazard of cancelling a pending get().
+
+        Returns None when all lane-buffer items have been returned and the
+        shutdown sentinel has been seen.
+        """
+        while True:
+            # Drain any newly arrived items into lane buffers.
+            # Sets _shutdown_signaled if the sentinel is encountered.
+            self._drain_queue_into_lanes()
+
+            req = self._pop_next_pickable()
+            if req is not None:
+                return req
+
+            # Lane buffers empty — check shutdown before blocking.
+            if self._shutdown_signaled:
+                return None
+
+            # Nothing pickable — start (or reuse) the persistent queue getter
+            # and wait for EITHER a new arrival OR a lane resume.
+            if self._pending_get is None or self._pending_get.done():
+                self._pending_get = asyncio.ensure_future(self._queue.get())
+
+            self._resume_signal.clear()
+            resume_task = asyncio.ensure_future(self._resume_signal.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    [self._pending_get, resume_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not resume_task.done():
+                    resume_task.cancel()
+
+            # If _pending_get finished, harvest its result into lane buffers.
+            if self._pending_get in done:
+                item = self._pending_get.result()
+                self._pending_get = None
+                if item is None:
+                    self._shutdown_signaled = True
+                else:
+                    self._lane_buffers[_normalize_lane(item.lane)].append(item)
+            # Loop to try _pop_next_pickable again (maybe the resume unblocked a lane).
 
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
@@ -3851,7 +4108,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         entries: list[dict] = []
         now = time.time()
 
-        def _entry(req: MergeRequest, state: str, worktree_path=None, position: int = 0) -> dict:
+        def _entry(
+            req: MergeRequest,
+            state: str,
+            worktree_path=None,
+            position: int = 0,
+            lane: str | None = None,
+        ) -> dict:
             return {
                 'task_id': req.task_id,
                 'branch': req.branch,
@@ -3863,6 +4126,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'worktree': str(worktree_path) if worktree_path is not None else None,
                 'pre_rebased': req.pre_rebased,
                 'request_id': req.request_id,
+                'lane': lane if lane is not None else req.lane,
             }
 
         # 1. Verifier-current item (head-of-line)
@@ -3899,7 +4163,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
 
         # 4. Queued (waiting for the merger; the incident blind spot)
-        # Same CPython internal-deque access as above — read-only, no lock needed.
+        # Items may be in the external _queue OR already drained into _lane_buffers.
+        # Enumerate _lane_buffers first (priority-ordered; items here are already
+        # waiting), then _queue for any not-yet-drained arrivals.
+        # Same CPython internal-deque access as _queue above — read-only, no lock.
+        for lane in MERGE_LANES:
+            for req in list(self._lane_buffers[lane]):
+                entries.append(_entry(
+                    req, 'queued', worktree_path=None,
+                    position=len(entries), lane=lane,
+                ))
         for req in list(self._queue._queue):  # type: ignore[attr-defined]
             if req is None:
                 continue
@@ -4030,15 +4303,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
         shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
-        # Release speculation slot, WIP halt, and merge-ahead cap so the merger
-        # doesn't hang waiting at any of the three synchronisation points.
+        # Release speculation slot, all lane halts, and merge-ahead cap so the
+        # merger doesn't hang waiting at any synchronisation point.
         # Over-releasing a plain Semaphore is safe (it just increments the counter).
         self._speculation_slot.set()
-        self._wip_halt.set()
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
         for _ in range(_MERGE_AHEAD_BOUND + 1):
             self._merge_ahead_cap.release()
 
-        # Drain main queue
+        # Drain per-lane buffers (items already removed from _queue by the merger)
+        for lane in MERGE_LANES:
+            while self._lane_buffers[lane]:
+                req = self._lane_buffers[lane].popleft()
+                if not req.result.done():
+                    req.result.set_result(shutdown)
+
+        # Drain main queue (items not yet drained into lane buffers)
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
@@ -4046,6 +4327,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req.result.set_result(shutdown)
             except asyncio.QueueEmpty:
                 break
+
+        # Cancel the persistent _pending_get future if live (it holds a
+        # queue.get() that will never fire because we're shutting down).
+        if self._pending_get is not None and not self._pending_get.done():
+            self._pending_get.cancel()
+            self._pending_get = None
 
         # Drain verifier queue — also clean up orphaned merge worktrees.
         # cleanup_merge_worktree is wrapped in suppress(BaseException) so that
@@ -4185,19 +4472,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
-                await self._wip_halt.wait()  # blocks if halted for WIP conflict
-                # Get next request: use pre-fetched item if available, else block.
+                # Get next request: use pre-fetched (speculative) item if available,
+                # otherwise acquire from the lane-priority pick system.
                 if prefetched is not None:
                     req = prefetched
                     prefetched = None
                 else:
-                    req = await self._queue.get()
+                    req = await self._acquire_next_request()
                     if req is None:
                         break  # shutdown sentinel
                     spec_base = None  # fresh dequeue resets speculation chain
-                    # Re-check halt after blocking on queue.get() — the halt
-                    # may have been triggered while we were waiting.
-                    await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
                 # Drop-on-detection: workflow soft-cancelled before worker
@@ -4518,12 +4802,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Non-blocking peek: if N+1 is already queued, grab it and
                     # merge it against N's commit so the Verifier can CAS it
                     # immediately after N succeeds.
+                    # Route through lane buffers so look-ahead prefers 'high'
+                    # and never speculatively picks from a halted lane.
                     await self._speculation_slot.wait()  # depth-1 cap
-                    try:
-                        next_req = self._queue.get_nowait()
-                        if next_req is None:
-                            # Shutdown sentinel — stop.
-                            break
+                    # Harvest any item already delivered to the persistent
+                    # getter so the look-ahead can see it via _pop_next_pickable.
+                    if self._pending_get is not None and self._pending_get.done():
+                        _item = self._pending_get.result()
+                        self._pending_get = None
+                        if _item is None:
+                            self._shutdown_signaled = True
+                        else:
+                            self._lane_buffers[_normalize_lane(_item.lane)].append(_item)
+                    self._drain_queue_into_lanes()
+                    next_req = self._pop_next_pickable()
+                    if next_req is not None:
                         self._speculation_slot.clear()  # claim the slot
                         prefetched = next_req
                         spec_base = merge_commit  # N+1 will merge against N's commit
@@ -4531,8 +4824,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'Task {req.task_id}: speculative look-ahead for '
                             f'{next_req.task_id} (base={merge_commit[:8]})'
                         )
-                    except asyncio.QueueEmpty:
-                        spec_base = None  # no next item, no speculation
+                    elif self._shutdown_signaled:
+                        break  # shutdown sentinel and nothing left to speculate
+                    else:
+                        spec_base = None  # no pickable item, no speculation
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up

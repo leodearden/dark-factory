@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +20,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    MERGE_LANES,
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -100,6 +101,7 @@ def _make_request(
     worktree: Path,
     config: OrchestratorConfig,
     pre_rebased: bool = False,
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
     return MergeRequest(
@@ -111,7 +113,30 @@ def _make_request(
         module_configs=[],
         config=config,
         result=future,
+        lane=lane,
     )
+
+
+def _gated_verify(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event | None = None,
+):
+    """Return a verify patch that blocks the FIRST call until gate_release is set.
+
+    *gate_entered* (optional): set when the first verify call starts, so the
+    test can await it before enqueuing additional requests.  Subsequent calls
+    (for other tasks after the gate task) pass immediately.
+    """
+    _first_blocked = [False]
+
+    async def _side_effect(*args, **kwargs):
+        if not _first_blocked[0]:
+            _first_blocked[0] = True
+            if gate_entered is not None:
+                gate_entered.set()
+            await gate_release.wait()
+        return MagicMock(passed=True, summary='')
+    return AsyncMock(side_effect=_side_effect)
 
 
 def _mock_verify_pass():
@@ -16014,3 +16039,456 @@ class TestSoftCancelMidVerify:
         )
         # main must not advance
         assert await git_ops.get_main_sha() == pre_merge_sha
+
+
+# ---------------------------------------------------------------------------
+# TestLanePriorityMechanics — Steps 1-14 (priority lanes feature)
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestLane:
+    """Step-1 / step-2: lane field on MergeRequest and MERGE_LANES constant."""
+
+    def test_merge_request_lane_attribute(self, config: OrchestratorConfig, git_repo: Path):
+        """lane defaults to 'normal'; can be set to 'high'."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            req_normal = _make_request('t1', 't1', git_repo, config)
+            assert req_normal.lane == 'normal'
+
+            req_high = _make_request('t2', 't2', git_repo, config, lane='high')
+            assert req_high.lane == 'high'
+
+            assert MERGE_LANES == ('high', 'normal')
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestPerLaneHaltMechanics:
+    """Steps 3-4: per-lane halt state machine."""
+
+    def test_per_lane_halt_state_machine(self, worker_cls, git_ops: GitOps):
+        """Both lanes start un-halted; halt_lane/unhalt_lane work independently."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Initially: both lanes un-halted
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
+
+        # Halt normal lane only
+        worker.halt_lane('normal', 'red main')
+        assert worker.is_lane_halted('normal') is True
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is True   # any-lane-halted → True
+
+        # Un-halt normal lane
+        worker.unhalt_lane('normal')
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
+
+    def test_legacy_halt_affects_all_lanes(self, worker_cls, git_ops: GitOps):
+        """halt_for_wip halts all lanes; unhalt_wip un-halts all lanes."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('x')
+        assert worker.is_lane_halted('normal') is True
+        assert worker.is_lane_halted('high') is True
+        assert worker.is_wip_halted is True
+
+        worker.unhalt_wip()
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
+
+
+class TestLanePickOrderHelpers:
+    """Steps 5-6: _drain_queue_into_lanes and _pop_next_pickable."""
+
+    def _setup(self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path):
+        """Return (worker, loop) with the loop set as current event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        return worker, loop
+
+    def test_lane_pick_order_high_before_normal(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """high-C is picked before normal-A and normal-B (high lane fully ahead); FIFO within."""
+        worker, loop = self._setup(git_ops, config, git_repo)
+        try:
+            req_a = _make_request('t-a', 't-a', git_repo, config, lane='normal')
+            req_b = _make_request('t-b', 't-b', git_repo, config, lane='normal')
+            req_c = _make_request('t-c', 't-c', git_repo, config, lane='high')
+
+            # Put in normal-A, normal-B, high-C order
+            worker._queue.put_nowait(req_a)
+            worker._queue.put_nowait(req_b)
+            worker._queue.put_nowait(req_c)
+            worker._drain_queue_into_lanes()
+
+            # Pick order: high-C, normal-A, normal-B
+            assert worker._pop_next_pickable() is req_c
+            assert worker._pop_next_pickable() is req_a
+            assert worker._pop_next_pickable() is req_b
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def test_pop_skips_halted_lane(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """_pop_next_pickable skips halted lanes; un-halting resumes them."""
+        worker, loop = self._setup(git_ops, config, git_repo)
+        try:
+            req_normal = _make_request('t-n', 't-n', git_repo, config, lane='normal')
+            req_high = _make_request('t-h', 't-h', git_repo, config, lane='high')
+
+            worker._queue.put_nowait(req_normal)
+            worker._queue.put_nowait(req_high)
+            worker._drain_queue_into_lanes()
+
+            # Halt high lane — only normal should be available
+            worker.halt_lane('high', 'test')
+            assert worker._pop_next_pickable() is req_normal
+
+            # Un-halt high lane — should return the high item
+            worker.unhalt_lane('high')
+            assert worker._pop_next_pickable() is req_high
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+@pytest.mark.asyncio
+class TestLanePickIntegration:
+    """Steps 7-8: full merger loop pick-order and per-lane halt integration."""
+
+    async def test_high_lane_picked_after_current_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Behavior (a): HIGH task is processed before normal backlog after in-flight verify."""
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        wt_gate = await _make_branch_with_file(git_ops, 'ln-gate', 'gate.py', 'g=1\n')
+        wt_n1 = await _make_branch_with_file(git_ops, 'ln-n1', 'n1.py', 'n1=1\n')
+        wt_n2 = await _make_branch_with_file(git_ops, 'ln-n2', 'n2.py', 'n2=1\n')
+        wt_high = await _make_branch_with_file(git_ops, 'ln-high', 'high.py', 'h=1\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_gate = _make_request('ln-gate', 'ln-gate', wt_gate, config, lane='normal')
+        req_n1 = _make_request('ln-n1', 'ln-n1', wt_n1, config, lane='normal')
+        req_n2 = _make_request('ln-n2', 'ln-n2', wt_n2, config, lane='normal')
+        req_high = _make_request('ln-high', 'ln-high', wt_high, config, lane='high')
+
+        async def _tracking_side_effect(*args, **kwargs):
+            return MagicMock(passed=True, summary='')
+
+        done_order: list[str] = []
+
+        async def _on_landed(task_id, base_sha, advanced_sha):
+            done_order.append(task_id)
+
+        worker._on_merge_landed = _on_landed
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            await queue.put(req_gate)
+
+            # Wait until the gate task's verify has started
+            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+
+            # Now enqueue the normal backlog + one high task
+            await queue.put(req_n1)
+            await queue.put(req_n2)
+            await queue.put(req_high)
+
+            # Give the merger a moment to see the new items
+            await asyncio.sleep(0.1)
+
+            # Release the gate
+            gate_release.set()
+
+            # Wait for high task to complete
+            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+
+        assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
+
+        # HIGH must appear before n1/n2 in done_order
+        assert 'ln-high' in done_order
+        high_pos = done_order.index('ln-high')
+        for normal_id in ('ln-n1', 'ln-n2'):
+            if normal_id in done_order:
+                assert done_order.index(normal_id) > high_pos, (
+                    f'{normal_id} appeared before ln-high in done_order: {done_order}'
+                )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_high_lane_flows_while_normal_halted(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Behavior (b): HIGH task lands while NORMAL lane is halted; un-halt resumes normal."""
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        wt_gate = await _make_branch_with_file(git_ops, 'lh-gate', 'gate.py', 'g=1\n')
+        wt_normal = await _make_branch_with_file(git_ops, 'lh-normal', 'norm.py', 'n=1\n')
+        wt_high = await _make_branch_with_file(git_ops, 'lh-high', 'high.py', 'h=1\n')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_gate = _make_request('lh-gate', 'lh-gate', wt_gate, config, lane='normal')
+        req_normal = _make_request('lh-normal', 'lh-normal', wt_normal, config, lane='normal')
+        req_high = _make_request('lh-high', 'lh-high', wt_high, config, lane='high')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            await queue.put(req_gate)
+
+            # Wait until gate task is in verify
+            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+
+            # Halt normal lane, enqueue normal task (must stay pending) and high task
+            worker.halt_lane('normal', 'red main')
+            await queue.put(req_normal)
+            await queue.put(req_high)
+            await asyncio.sleep(0.1)
+
+            # Release gate so the gate task's verify finishes
+            gate_release.set()
+
+            # HIGH task must complete even while normal lane is halted
+            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+            assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
+
+            # Normal task must still be pending (normal lane halted)
+            assert not req_normal.result.done(), (
+                'normal task resolved while normal lane was halted'
+            )
+
+            # Un-halt normal lane — normal task should now complete
+            worker.unhalt_lane('normal', 'red main resolved')
+            outcome_normal = await asyncio.wait_for(req_normal.result, timeout=30)
+            assert outcome_normal.status == 'done', f'normal task failed: {outcome_normal}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+@pytest.mark.asyncio
+class TestLaneSnapshotAndStop:
+    """Steps 9-10: snapshot and stop account for _lane_buffers items."""
+
+    async def test_snapshot_includes_lane_buffered_items(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """snapshot() reports items in _lane_buffers as 'queued' with their lane.
+
+        RED before step-10 impl: snapshot() only reads self._queue, so
+        lane-buffered items are invisible.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('snap-n', 'snap-n', git_repo, config, lane='normal')
+        req_h = _make_request('snap-h', 'snap-h', git_repo, config, lane='high')
+
+        # Put items into the queue and drain them into lane buffers
+        worker._queue.put_nowait(req_n)
+        worker._queue.put_nowait(req_h)
+        worker._drain_queue_into_lanes()
+
+        snap = worker.snapshot()
+        entries = snap['entries']
+
+        # Both items must appear in the snapshot
+        task_ids = [e['task_id'] for e in entries]
+        assert 'snap-n' in task_ids, f'snap-n missing from snapshot: {task_ids}'
+        assert 'snap-h' in task_ids, f'snap-h missing from snapshot: {task_ids}'
+
+        # Each entry must report state == 'queued' and expose lane
+        for entry in entries:
+            if entry['task_id'] in ('snap-n', 'snap-h'):
+                assert entry['state'] == 'queued', (
+                    f"Expected 'queued' for {entry['task_id']}, got {entry['state']!r}"
+                )
+                assert 'lane' in entry, (
+                    f"snapshot entry missing 'lane' key: {list(entry.keys())}"
+                )
+
+        # Lane values must match
+        n_entry = next(e for e in entries if e['task_id'] == 'snap-n')
+        h_entry = next(e for e in entries if e['task_id'] == 'snap-h')
+        assert n_entry['lane'] == 'normal', f"Expected 'normal', got {n_entry['lane']!r}"
+        assert h_entry['lane'] == 'high', f"Expected 'high', got {h_entry['lane']!r}"
+
+        # depth must include lane-buffered items
+        assert snap['depth'] >= 2, f'Expected depth >= 2, got {snap["depth"]}'
+
+    async def test_stop_resolves_lane_buffered_futures(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """stop() resolves futures for items buffered in _lane_buffers.
+
+        RED before step-10 impl: stop() only drains self._queue, so
+        lane-buffered futures hang unresolved.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req_n = _make_request('stop-n', 'stop-n', git_repo, config, lane='normal')
+        req_h = _make_request('stop-h', 'stop-h', git_repo, config, lane='high')
+
+        # Drain items into lane buffers (bypassing the merger loop)
+        worker._queue.put_nowait(req_n)
+        worker._queue.put_nowait(req_h)
+        worker._drain_queue_into_lanes()
+
+        # stop() must resolve all pending futures
+        await worker.stop()
+
+        assert req_n.result.done(), 'stop() left normal lane future unresolved'
+        assert req_h.result.done(), 'stop() left high lane future unresolved'
+
+        outcome_n = req_n.result.result()
+        outcome_h = req_h.result.result()
+        assert outcome_n.status == 'blocked', (
+            f'Expected blocked shutdown outcome, got {outcome_n.status!r}'
+        )
+        assert outcome_h.status == 'blocked', (
+            f'Expected blocked shutdown outcome, got {outcome_h.status!r}'
+        )
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestPerLaneOwnerMechanics:
+    """Steps 11-12: per-lane owner methods for owner-tied auto-resume."""
+
+    def test_owner_tied_auto_resume_clears_normal_lane(self, worker_cls, git_ops: GitOps):
+        """Behavior (c): unhalt_lanes_owned_by resumes only the owned lane.
+
+        halt_lane + set_lane_halt_owner establishes ownership;
+        unhalt_lanes_owned_by with wrong esc_id is a no-op;
+        unhalt_lanes_owned_by with correct esc_id un-halts and clears owner.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Halt normal lane and set owner
+        worker.halt_lane('normal', 'red main')
+        worker.set_lane_halt_owner('normal', 'esc-1')
+
+        assert worker.lane_owned_by('esc-1') == 'normal'
+        assert worker.is_halt_owner('esc-1') is True
+        assert worker.halt_owner_esc_id == 'esc-1'
+
+        # Non-owner resume: no-op
+        resumed = worker.unhalt_lanes_owned_by('esc-2')
+        assert resumed == [], f'Expected [], got {resumed}'
+        assert worker.is_lane_halted('normal') is True, 'Normal lane should stay halted'
+
+        # Correct owner resume: clears the lane
+        resumed = worker.unhalt_lanes_owned_by('esc-1')
+        assert resumed == ['normal'], f'Expected [normal], got {resumed}'
+        assert worker.is_lane_halted('normal') is False
+        assert worker.lane_owned_by('esc-1') is None
+
+    def test_different_lane_owner_untouched_by_other_resume(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Resuming esc-1's lane must not affect a different lane owned by esc-2."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Halt high lane under esc-1, normal lane under esc-2
+        worker.halt_lane('high', 'h-reason', owner_esc_id='esc-1')
+        worker.halt_lane('normal', 'n-reason', owner_esc_id='esc-2')
+
+        # Resume esc-1's lane only
+        resumed = worker.unhalt_lanes_owned_by('esc-1')
+        assert 'high' in resumed
+        assert worker.is_lane_halted('high') is False
+
+        # Normal lane (esc-2) must remain halted and owned
+        assert worker.is_lane_halted('normal') is True
+        assert worker.lane_owned_by('esc-2') == 'normal'
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestGlobalResumeAll:
+    """Steps 13-14: unhalt_all_lanes() clears every per-lane halt and owner."""
+
+    def test_resume_all_clears_orphaned_per_lane_halt(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Behavior (d): unhalt_all_lanes clears every lane regardless of owner.
+
+        An orphaned high-lane halt (no owner) AND an owned normal-lane halt are
+        both cleared by a single unhalt_all_lanes() call.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Orphaned halt on high (no owner), owned halt on normal
+        worker.halt_lane('high', 'manual')
+        worker.halt_lane('normal', 'red main', owner_esc_id='esc-42')
+
+        assert worker.is_wip_halted is True
+
+        worker.unhalt_all_lanes()
+
+        assert worker.is_lane_halted('high') is False, 'High lane should be un-halted'
+        assert worker.is_lane_halted('normal') is False, 'Normal lane should be un-halted'
+        assert worker.is_wip_halted is False
+        # All owners cleared
+        assert worker.lane_owned_by('esc-42') is None, 'Owner should be cleared'
+        assert worker.halt_owner_esc_id is None
+
+    def test_unhalt_wip_delegates_to_resume_all(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Legacy unhalt_wip() must now delegate to unhalt_all_lanes().
+
+        Operator force-unhalt backstop: halting only the high lane and calling
+        the legacy unhalt_wip() must un-halt that lane.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Only halt the high lane (mimics an operator partial-halt)
+        worker.halt_lane('high', 'manual')
+        assert worker.is_lane_halted('high') is True
+        assert worker.is_lane_halted('normal') is False
+
+        # Legacy call path
+        worker.unhalt_wip()
+
+        assert worker.is_lane_halted('high') is False, 'High lane must be un-halted'
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_wip_halted is False
