@@ -2175,14 +2175,25 @@ class TestSpeculativeMergeWorker:
             )
             assert 'Unexpected verifier error' in outcome_n.reason
 
-            # _speculation_slot must have a free permit (not stuck acquired → deadlock)
-            assert not worker._speculation_slot.locked(), (
-                '_speculation_slot locked — merger will deadlock on next request'
-            )
-
-            # N+1 must also complete (not hang forever)
+            # N+1 must also complete (not hang forever due to deadlock)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
             assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
+
+        # _speculation_slot must have a free permit after all items drain.
+        # Yield several event-loop iterations so:
+        #   (1) _verify_and_advance completes any awaits it makes after setting
+        #       req.result (the test resumes on a yield inside that function);
+        #   (2) the verifier's finally block runs and releases the slot;
+        #   (3) the merger acquires the just-released permit for its next
+        #       look-ahead, finds the queue empty, and releases it again;
+        #   (4) the merger blocks at _acquire_next_request() — slot is free.
+        # Without these yields the assertion races with the still-running merger.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after all items drained — '
+            'merger will deadlock on next request'
+        )
 
         await worker.stop()
         await worker_task
@@ -2238,10 +2249,16 @@ class TestSpeculativeMergeWorker:
             )
             assert '_remerge failed' in outcome_n1.reason
 
-            # _speculation_slot must have a free permit
-            assert not worker._speculation_slot.locked(), (
-                '_speculation_slot locked after _remerge exception'
-            )
+        # _speculation_slot must have a free permit after all items drain.
+        # Yield several event-loop iterations: the verifier's finally releases
+        # the slot, the merger acquires it for its next look-ahead, finds the
+        # queue empty, and releases it — all before this assertion runs.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot locked after _remerge exception — '
+            'merger will deadlock on next request'
+        )
 
         await worker.stop()
         await worker_task
@@ -17302,6 +17319,10 @@ class TestSpeculationSlotSemaphoreDepth:
 
         active_worktrees: set[str] = set()
         max_concurrent = 0
+        # Event fires when K=2 concurrent worktrees are active; the gate
+        # holds N's verify until this event fires so we verify the merger
+        # actually used both speculation slots before releasing.
+        k2_reached = asyncio.Event()
         original_create = git_ops._create_merge_worktree
         original_cleanup = git_ops.cleanup_merge_worktree
 
@@ -17310,19 +17331,27 @@ class TestSpeculationSlotSemaphoreDepth:
             active_worktrees.add(str(wt))
             nonlocal max_concurrent
             max_concurrent = max(max_concurrent, len(active_worktrees))
+            if len(active_worktrees) >= 3:
+                k2_reached.set()
             return wt, sha
 
         async def _tracking_cleanup(merge_wt):
             active_worktrees.discard(str(merge_wt))
             await original_cleanup(merge_wt)
 
-        gate_open = asyncio.Event()
-        gate_entered = asyncio.Event()
+        first_verify_entered = asyncio.Event()
 
         async def _gated_verify_k2(*args, **kwargs):
-            if not gate_entered.is_set():
-                gate_entered.set()
-                await gate_open.wait()
+            if not first_verify_entered.is_set():
+                first_verify_entered.set()
+                # Hold N's verify until 3 concurrent worktrees are active
+                # (N verifying + N+1 speculative + N+2 speculative).
+                # If K=2 is not yet implemented, this times out (test will
+                # fail on the max_concurrent >= 3 assertion below).
+                try:
+                    await asyncio.wait_for(k2_reached.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass  # will fail on assertion below
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -17340,33 +17369,26 @@ class TestSpeculationSlotSemaphoreDepth:
             req_n2 = _make_request('k2d-n2', 'k2d-n2', wt_n2, config)
             req_n3 = _make_request('k2d-n3', 'k2d-n3', wt_n3, config)
 
-            # Submit all four; wait for N's verify to be entered.
+            # Submit all four.
             await queue.put(req_n)
             await queue.put(req_n1)
             await queue.put(req_n2)
             await queue.put(req_n3)
-            await asyncio.wait_for(gate_entered.wait(), timeout=30)
 
-            # While N's verify is gated, the merger should have speculatively
-            # built N+1 and N+2 (K=2 slots).  Give the event loop a few ticks.
-            for _ in range(10):
-                await asyncio.sleep(0)
+            # The gate holds N's verify until 3 concurrent worktrees are seen
+            # OR 30s timeout.  After gate releases, wait for all to complete.
+            await asyncio.wait_for(req_n.result, timeout=60)
+            await asyncio.wait_for(req_n1.result, timeout=60)
+            await asyncio.wait_for(req_n2.result, timeout=60)
+            await asyncio.wait_for(req_n3.result, timeout=60)
 
-            # At this point max_concurrent should have reached 3 (N verifying +
-            # N+1 and N+2 speculative).  If _speculation_slot is still an Event
-            # (depth-1), only N+1 is speculative → max_concurrent ≤ 2 → assertion fails.
-            assert max_concurrent >= 3, (
-                f'K=2 speculation depth did not produce 3 concurrent merge worktrees '
-                f'(N verifying + 2 speculative); got max_concurrent={max_concurrent}. '
-                f'_speculation_slot may still be an Event (depth-1).'
-            )
-
-            gate_open.set()
-            await asyncio.wait_for(req_n.result, timeout=30)
-            await asyncio.wait_for(req_n1.result, timeout=30)
-            await asyncio.wait_for(req_n2.result, timeout=30)
-            await asyncio.wait_for(req_n3.result, timeout=30)
-
+        # Peak must reach 3 (N verifying + N+1 + N+2 speculative).
+        # If _speculation_slot is still an Event (depth-1), peak stays ≤ 2.
+        assert max_concurrent >= 3, (
+            f'K=2 speculation depth did not produce 3 concurrent merge worktrees '
+            f'(N verifying + 2 speculative); got max_concurrent={max_concurrent}. '
+            f'_speculation_slot may still be an Event (depth-1).'
+        )
         assert max_concurrent <= 3, (
             f'K=2 peak concurrent worktrees must be ≤ 3; got {max_concurrent}'
         )
