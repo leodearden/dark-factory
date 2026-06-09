@@ -275,6 +275,17 @@ def is_auto_heal_eligible(
     return (category or '') in AUTO_HEAL_MECHANICAL_CATEGORIES
 
 
+def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
+    """Return the merge lane to use based on task metadata.
+
+    Reads ``metadata['merge_lane']`` and validates via :func:`_normalize_lane`
+    (unknown/missing → 'normal').  Passing ``None`` or an empty dict returns
+    the default 'normal' lane.
+    """
+    value = (metadata or {}).get('merge_lane', '')
+    return _normalize_lane(value or '')  # type: ignore[return-value]
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
