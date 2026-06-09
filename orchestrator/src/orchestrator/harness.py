@@ -3232,9 +3232,9 @@ Output JSON matching the schema. Every task must appear in the output.
         its note_merge method as the merge worker's on_merge_landed callback.
         """
         from orchestrator.merge_queue import (
+            _MERGE_AHEAD_BOUND,
             MergeLivenessConfigError,
             SpeculativeMergeWorker,
-            _MERGE_AHEAD_BOUND,
             enforce_merge_liveness_margin,
         )
 
