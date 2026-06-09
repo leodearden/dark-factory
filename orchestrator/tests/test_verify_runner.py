@@ -2810,3 +2810,71 @@ class TestDriftDetectorDivergence:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
         await detector.check('sha1', _make_spec())
         event_store.emit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ι step-7: DriftDetector dedup — has_open_l1 guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorDedup:
+    """DriftDetector dedup: has_open_l1('__drift__') guard prevents double submission."""
+
+    def _make_diverge_pool(self):
+        """Pool where local fails, remote passes (the load-bearing divergence case)."""
+        pool, local_fake, remote_fake = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        return pool, local_fake, remote_fake
+
+    async def test_dedup_skips_submit_when_open_l1_exists(self):
+        """has_open_l1 True → submit NOT called; quarantine still happens."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_dedup_still_quarantines_when_open_l1_exists(self):
+        """Even when deduped, the remote runner must be quarantined."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is True
+
+    async def test_dedup_still_returns_diverge_when_open_l1_exists(self):
+        """Return DIVERGE regardless of dedup state."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+
+    async def test_no_dedup_submits_when_no_open_l1(self):
+        """has_open_l1 False → submit called exactly once."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        escalation_queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_called_once()
+
+    async def test_has_open_l1_called_with_drift_sentinel(self):
+        """has_open_l1 must be called with '__drift__' sentinel."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = self._make_diverge_pool()
+        escalation_queue = MagicMock()
+        escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.has_open_l1.assert_called_with('__drift__')
