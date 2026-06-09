@@ -609,12 +609,39 @@ class RemoteRunner:
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
-        Raises RunnerUnavailable on any transport failure.
-        Returns a VerifyResult (even if passed=False or timed_out=True).
+        (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
+        (b) ssh <ssh_host> <shlex-quoted remote argv>
+        (c) parse stdout via result_from_json
 
-        Implemented in step-6 (happy path) and step-8 (error handling).
+        Raises RunnerUnavailable on any transport failure (step-8).
+        Returns a VerifyResult unchanged — even passed=False or timed_out=True
+        (PRD §A Invariant 5).
         """
-        raise NotImplementedError('run_merge_verify implemented in step-6')
+        request_id = self._id_factory()
+        ref = f'refs/merge-verify/{request_id}'
+
+        # Step 1: push the merge sha to the remote
+        _push_rc, _push_out, _push_err = await self._run(
+            ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
+            cwd=self._cwd,
+        )
+
+        # Step 2: build and issue the ssh command
+        argv = [
+            'orchestrator', 'verify-merge',
+            '--sha', merge_sha,
+            '--spec', spec_to_json(spec),
+        ]
+        if self._config_path:
+            argv += ['--config', self._config_path]
+        remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+
+        _ssh_rc, ssh_stdout, _ssh_err = await self._run(
+            ['ssh', self._ssh_host, remote_cmd],
+        )
+
+        # Step 3: parse the host's stdout
+        return result_from_json(ssh_stdout)
 
 
 # ---------------------------------------------------------------------------
