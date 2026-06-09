@@ -670,14 +670,38 @@ class TaskWorkflow:
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
 
+        # Compute union task_files and module_configs over all train members so
+        # that a lower member in a different crate is verified alongside the tip.
+        # Basis: the tip's plan-derived scope (self._task_files / self.modules) is
+        # always the base so tip coverage never regresses.  Each member's
+        # metadata.files-derived files and modules are added on top (deduplicated
+        # by value for files, by mc.prefix for module_configs).
+        _union_files: list[str] = list(self._task_files or [])
+        _seen_files: set[str] = set(_union_files)
+        _union_modules: list[str] = list(self.modules)
+        _seen_modules: set[str] = set(_union_modules)
+        for _member in members:
+            _member_files: list[str] = ((_member.get('metadata') or {}).get('files')) or []
+            for _f in _member_files:
+                if _f not in _seen_files:
+                    _seen_files.add(_f)
+                    _union_files.append(_f)
+            if _member_files:
+                for _m in files_to_modules(_member_files, self.config.lock_depth):
+                    if _m not in _seen_modules:
+                        _seen_modules.add(_m)
+                        _union_modules.append(_m)
+        union_task_files: list[str] | None = _union_files or None
+        union_module_configs = self._resolve_module_configs(_union_modules or None)
+
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id=self.task_id,
             branch=branch_name,
             worktree=self.worktree,
             pre_rebased=False,
-            task_files=self._task_files,
-            module_configs=self._module_configs,
+            task_files=union_task_files,
+            module_configs=union_module_configs,
             config=self.config,
             result=future,
             train_id=train_id,
@@ -1568,19 +1592,24 @@ class TaskWorkflow:
             if self._config_dir:
                 self._config_dir.cleanup()
 
-    def _resolve_module_configs(self) -> list[ModuleConfig]:
+    def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
         """Collect ModuleConfigs for this task's modules.
 
         Groups modules by subproject prefix and returns one ModuleConfig per
         subproject that has an ``orchestrator.yaml``.  Warns for subprojects
         without configs.  Returns an empty list when no modules are assigned
         (triggers global fallback in ``run_scoped_verification``).
+
+        *modules* overrides ``self.modules`` when provided; pass the union module
+        list from ``_maybe_enqueue_group_merge`` to build union ``module_configs``
+        without duplicating the ``for_module`` / dedupe-by-prefix logic.
         """
-        if not self.modules:
+        mods = modules if modules is not None else self.modules
+        if not mods:
             return []
         seen: dict[str, ModuleConfig] = {}
         missing: set[str] = set()
-        for m in self.modules:
+        for m in mods:
             mc = self.config.for_module(m)
             if mc:
                 seen[mc.prefix] = mc
