@@ -3411,16 +3411,30 @@ class _WipHaltMixin:
                 return True
         return False
 
-    def unhalt_wip(self, reason: str | None = None) -> None:
-        """Resume the merge queue after WIP conflict resolution (all lanes)."""
+    def unhalt_all_lanes(self, reason: str | None = None) -> None:
+        """Resume ALL lanes unconditionally, clearing every owner.
+
+        This is the global 'resume-all' backstop — e.g. operator
+        ``force_unhalt_merge_queue`` or a signal that all active halts should
+        be cleared regardless of which escalation owned them.
+        """
         logger.info(
-            'Merge queue un-halted (WIP conflict resolved%s)',
-            f', reason={reason!r}' if reason else '',
+            'Merge queue: all lanes un-halted%s',
+            f' ({reason})' if reason else '',
         )
         for lane in MERGE_LANES:
             self._lane_halt[lane].set()
             self._lane_halt_owner[lane] = None
         self._signal_resume()
+
+    def unhalt_wip(self, reason: str | None = None) -> None:
+        """Resume the merge queue after WIP conflict resolution (all lanes).
+
+        Delegates to :meth:`unhalt_all_lanes` so that the operator
+        ``force_unhalt_merge_queue`` path (which calls this) also clears any
+        orphaned per-lane halt.
+        """
+        self.unhalt_all_lanes(reason=reason)
 
     @property
     def is_wip_halted(self) -> bool:

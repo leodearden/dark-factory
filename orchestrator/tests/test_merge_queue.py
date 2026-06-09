@@ -16459,3 +16459,57 @@ class TestPerLaneOwnerMechanics:
         # Normal lane (esc-2) must remain halted and owned
         assert worker.is_lane_halted('normal') is True
         assert worker.lane_owned_by('esc-2') == 'normal'
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestGlobalResumeAll:
+    """Steps 13-14: unhalt_all_lanes() clears every per-lane halt and owner."""
+
+    def test_resume_all_clears_orphaned_per_lane_halt(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Behavior (d): unhalt_all_lanes clears every lane regardless of owner.
+
+        An orphaned high-lane halt (no owner) AND an owned normal-lane halt are
+        both cleared by a single unhalt_all_lanes() call.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Orphaned halt on high (no owner), owned halt on normal
+        worker.halt_lane('high', 'manual')
+        worker.halt_lane('normal', 'red main', owner_esc_id='esc-42')
+
+        assert worker.is_wip_halted is True
+
+        worker.unhalt_all_lanes()
+
+        assert worker.is_lane_halted('high') is False, 'High lane should be un-halted'
+        assert worker.is_lane_halted('normal') is False, 'Normal lane should be un-halted'
+        assert worker.is_wip_halted is False
+        # All owners cleared
+        assert worker.lane_owned_by('esc-42') is None, 'Owner should be cleared'
+        assert worker.halt_owner_esc_id is None
+
+    def test_unhalt_wip_delegates_to_resume_all(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Legacy unhalt_wip() must now delegate to unhalt_all_lanes().
+
+        Operator force-unhalt backstop: halting only the high lane and calling
+        the legacy unhalt_wip() must un-halt that lane.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Only halt the high lane (mimics an operator partial-halt)
+        worker.halt_lane('high', 'manual')
+        assert worker.is_lane_halted('high') is True
+        assert worker.is_lane_halted('normal') is False
+
+        # Legacy call path
+        worker.unhalt_wip()
+
+        assert worker.is_lane_halted('high') is False, 'High lane must be un-halted'
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_wip_halted is False
