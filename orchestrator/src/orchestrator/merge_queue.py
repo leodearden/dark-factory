@@ -37,12 +37,12 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_runner import (
+    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     LocalRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
     is_unscoped_gate_failure,
     unscoped_gate_failing_subprojects,
-    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
 )
 
 if TYPE_CHECKING:
@@ -509,7 +509,8 @@ async def _run_post_merge_verify(
 
     # Build the spec (carried for forward-compat with γ/δ remote runners;
     # the LocalRunner does not use it to drive execution).
-    spec = build_merge_verify_spec(req.config, req.module_configs, req.task_files)
+    task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
+    spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
     # Construct a per-call pool with a single LocalRunner.  The verify callables
     # are the merge_queue module globals resolved at call time so that existing
@@ -517,7 +518,7 @@ async def _run_post_merge_verify(
     # '_run_unscoped_typechecks' keep intercepting after the routing change.
     pool = VerifyRunnerPool(
         [LocalRunner(
-            merge_wt, req.config, req.module_configs, req.task_files,
+            merge_wt, req.config, req.module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
         )],

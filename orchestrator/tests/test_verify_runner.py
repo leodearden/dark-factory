@@ -493,13 +493,13 @@ class TestVerifyRunnerProtocol:
 def _make_pass_result(**kwargs):
     defaults = dict(passed=True, test_output='', lint_output='', type_output='', summary='ok')
     defaults.update(kwargs)
-    return VerifyResult(**defaults)
+    return VerifyResult(**defaults)  # type: ignore[arg-type]
 
 
 def _make_fail_result(**kwargs):
     defaults = dict(passed=False, test_output='FAILED', lint_output='', type_output='', summary='test fail')
     defaults.update(kwargs)
-    return VerifyResult(**defaults)
+    return VerifyResult(**defaults)  # type: ignore[arg-type]
 
 
 def _make_spec():
@@ -600,7 +600,7 @@ class TestLocalRunnerBundle:
         runner = LocalRunner(
             merge_wt=merge_wt,
             config=config,
-            module_configs=module_configs,
+            module_configs=module_configs,  # type: ignore[arg-type]
             task_files=task_files,
             run_scoped=run_scoped,
             run_unscoped=run_unscoped,

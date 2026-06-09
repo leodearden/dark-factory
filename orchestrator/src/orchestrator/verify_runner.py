@@ -36,10 +36,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from orchestrator.verify import VerifyResult
 
@@ -328,7 +328,7 @@ class LocalRunner:
         task_files: tuple[str, ...] | None,
         *,
         run_scoped: Callable[..., Awaitable[VerifyResult]],
-        run_unscoped: Callable[..., Awaitable[object]],
+        run_unscoped: Callable[..., Awaitable[Any]],
     ) -> None:
         self._merge_wt = merge_wt
         self._config = config
@@ -427,9 +427,9 @@ class VerifyRunnerPool:
 
     def __init__(
         self,
-        runners: list[VerifyRunner],
+        runners: Sequence[VerifyRunner],
         *,
-        event_store: object = None,
+        event_store: Any = None,
         task_id: str | None = None,
     ) -> None:
         if not runners:

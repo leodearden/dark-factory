@@ -16985,7 +16985,7 @@ class TestRunPostMergeVerifyRouting:
         self, tmp_path: Path,
     ) -> None:
         """Scoped ENOSPC: prune called, second dispatch still ENOSPC → transient-infra reason."""
-        from orchestrator.merge_queue import _run_post_merge_verify, TRANSIENT_INFRA_REASON_PREFIX
+        from orchestrator.merge_queue import TRANSIENT_INFRA_REASON_PREFIX, _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[tmp_path / 'old-wt'])
