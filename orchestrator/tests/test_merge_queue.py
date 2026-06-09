@@ -4533,7 +4533,7 @@ class TestSpeculativeMergeWorker:
 
         # N+2's red tree must NOT be on main.
         rc_n2, _, _ = await _run(
-            ['git', 'show', f'main:file_prb_n2.py'], cwd=git_ops.project_root,
+            ['git', 'show', 'main:file_prb_n2.py'], cwd=git_ops.project_root,
         )
         assert rc_n2 != 0, (
             'file_prb_n2.py must NOT be on main — blocked N+2 must not advance '
@@ -10358,6 +10358,7 @@ class TestRemergeTreePinnedSkip:
             ['git', 'rev-parse', f'{C1}^{{tree}}'], cwd=git_ops.project_root,
         )
         T1 = t1_out.strip()
+        assert probe.merge_worktree is not None
         await git_ops.cleanup_merge_worktree(probe.merge_worktree)
 
         # Re-merge (no-op): main unchanged → new merge commit has tree T1 again.
@@ -10402,6 +10403,7 @@ class TestRemergeTreePinnedSkip:
             ['git', 'rev-parse', f'{C1}^{{tree}}'], cwd=git_ops.project_root,
         )
         T1 = t1_out.strip()
+        assert probe.merge_worktree is not None
         await git_ops.cleanup_merge_worktree(probe.merge_worktree)
 
         # Advance main with a sibling commit → tree will differ from T1.
