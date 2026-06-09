@@ -3008,3 +3008,20 @@ class TestDriftDetectorCadence:
         assert detector.should_sample(1) is False
         assert detector.should_sample(4) is False
         assert detector.should_sample(6) is False
+
+
+# ---------------------------------------------------------------------------
+# ι step-13: public-surface __all__ — ι additions present and importable
+# ---------------------------------------------------------------------------
+
+
+class TestDriftDetectorPublicSurface:
+    """All ι-added public names are present in __all__ and importable."""
+
+    def test_all_new_iota_names_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        expected = {'DriftDetector', 'DriftVerdict', 'DriftCheckResult'}
+        missing = expected - set(vr_mod.__all__)
+        assert not missing, f"Missing from __all__: {sorted(missing)}"
+        for name in expected:
+            assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"
