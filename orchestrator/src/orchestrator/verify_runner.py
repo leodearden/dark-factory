@@ -59,6 +59,8 @@ __all__ = [
     "result_from_dict",
     "VerifyRunner",
     "LocalRunner",
+    "RemoteRunner",
+    "RunnerUnavailable",
     "VerifyRunnerPool",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -377,6 +379,21 @@ async def run_merge_verify_on_worktree(
         task_id=task_id,
     )
     return await runner.run_merge_verify(merge_sha, spec)
+
+
+# ---------------------------------------------------------------------------
+# RunnerUnavailable — transport failure exception
+# ---------------------------------------------------------------------------
+
+
+class RunnerUnavailable(Exception):
+    """Raised by RemoteRunner on any transport failure.
+
+    Transport failures include: host down/closed, ssh failure, git push failure,
+    or absent/unparseable verdict on stdout.  A parseable VerifyResult is always
+    returned as a result — even passed=False or timed_out=True — and never causes
+    this exception to be raised (PRD §A Invariant 5).
+    """
 
 
 # ---------------------------------------------------------------------------
