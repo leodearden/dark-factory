@@ -1416,3 +1416,150 @@ class TestRemoteRunnerTransportVsTimeout:
         result = await runner.run_merge_verify('abc123', _make_spec())
         assert result.passed is False
         assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# δ step-9: RemoteRunner ref cleanup (best-effort on return)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerRefCleanup:
+    """The pushed ref is deleted best-effort on return (PRD open-Q4)."""
+
+    def _make_tracking_runner(self, responses_by_argv_prefix):
+        """Build a RemoteRunner whose fake `run` logs all calls.
+
+        ``responses_by_argv_prefix`` maps an argv[0] to (rc, stdout, stderr).
+        The fake always records every call in `runner._calls`.
+        """
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            key = tuple(argv[:3])  # e.g. ('git','push','origin') or ('ssh', ...)
+            # git delete looks like ['git','push','origin','--delete',...]
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')  # default: delete succeeds
+            if key[0] == 'git':
+                return responses_by_argv_prefix.get('git', (0, '', ''))
+            if key[0] == 'ssh':
+                return responses_by_argv_prefix.get('ssh', (0, result_to_json(_make_pass_result()), ''))
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        runner._calls = calls
+        return runner
+
+    async def test_delete_called_after_success(self):
+        """After a successful run, the pushed ref is deleted via git push --delete."""
+        runner = self._make_tracking_runner({'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')})
+        await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 1
+        assert 'refs/merge-verify/cleanup-id' in delete_calls[0]
+
+    async def test_delete_called_after_ssh_failure(self):
+        """When ssh fails (→ RunnerUnavailable), the ref is still deleted (cleanup in finally)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def fake_run(argv, *, cwd=None):
+            runner._calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (255, '', 'ssh: connect refused')  # ssh fails
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        runner._calls = []
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 1
+
+    async def test_no_delete_when_push_failed(self):
+        """When the git push itself fails, no delete is attempted (nothing was pushed)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                return (0, '', '')
+            return (1, '', 'push error')  # ALL git push (incl. initial) fail
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        assert len(delete_calls) == 0
+
+    async def test_cleanup_failure_does_not_mask_result(self):
+        """A delete call that raises does NOT change the returned VerifyResult."""
+        pass_result = _make_pass_result()
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                raise OSError('git delete failed')  # cleanup fails
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (0, result_to_json(pass_result), '')  # ssh succeeds
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result == pass_result  # no exception, correct result
+
+    async def test_cleanup_failure_does_not_mask_runner_unavailable(self):
+        """A delete that raises does NOT suppress a RunnerUnavailable from the verify path."""
+        from orchestrator.verify_runner import RunnerUnavailable
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[:2] == ['git', 'push'] and '--delete' in argv:
+                raise OSError('git delete failed')  # cleanup fails
+            if argv[0] == 'git':
+                return (0, '', '')  # push succeeds
+            return (1, '', 'ssh error')  # ssh fails → RunnerUnavailable
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'cleanup-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
