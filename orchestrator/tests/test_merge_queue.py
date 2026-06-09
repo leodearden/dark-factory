@@ -16492,3 +16492,182 @@ class TestGlobalResumeAll:
         assert worker.is_lane_halted('high') is False, 'High lane must be un-halted'
         assert worker.is_lane_halted('normal') is False
         assert worker.is_wip_halted is False
+
+
+@pytest.mark.asyncio
+class TestOperatorHalt:
+    """Operator-initiated merge-queue halt (halt_merge_queue tool path).
+
+    operator_halt() raises a dedicated _operator_halt signal that the verifier's
+    abort-poll loop checks alongside the existing sole-waiter abandon trigger.
+    Unlike the automatic WIP halt (halt_for_wip), an operator halt TERMINATES the
+    in-flight verify and RE-QUEUES the merge (result left pending) so it
+    re-verifies after un-halt.  The regression test pins that halt_for_wip does
+    NOT abort an in-flight verify — the automatic path must stay untouched.
+    """
+
+    async def test_operator_halt_aborts_verify_and_requeues(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """operator_halt mid-verify: abort + cleanup + re-queue, result pending.
+
+        Mirrors test_mid_verify_cancel_aborts_verify but triggered by
+        operator_halt() instead of a sole-waiter detach, and the merge is
+        RE-QUEUED (not dropped): req lands back on the merger input queue with
+        its future still pending so the waiting workflow keeps waiting.
+        """
+        wt = await _make_branch_with_file(git_ops, 'op-halt', 'op_halt.py', 'y = 2\n')
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'op-halt')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        merge_wt_path = merge_result.merge_worktree
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+
+        req = _make_request('op-halt', 'op-halt', wt, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        verify_started = asyncio.Event()
+        release_event = asyncio.Event()
+        completed = False
+
+        async def _blocking_verify(_merge_wt, _cfg, _module_configs, **_kwargs):
+            nonlocal completed
+            verify_started.set()
+            await release_event.wait()
+            completed = True
+            return MagicMock(passed=True, summary='')
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=_blocking_verify,
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        ):
+            task = asyncio.create_task(worker._verify_and_advance(item))
+            await asyncio.wait_for(verify_started.wait(), timeout=5)
+
+            # Operator halt while the verify is in flight.
+            worker.operator_halt('operator halt test')
+
+            # Sleep > 2 poll cycles so the abort-poll loop fires.
+            await asyncio.sleep(0.05)
+
+            # Unblock the mock — on the implemented path the task is already done
+            # (aborted); this just guarantees the mock cannot hang the test.
+            release_event.set()
+            result = await asyncio.wait_for(task, timeout=5)
+
+        # (a) no advance.
+        assert result is False, f'Expected False after operator-halt abort; got {result!r}'
+        # (b) verify must NOT have completed — wasted compute aborted.
+        assert not completed, 'Verify must be aborted before completion'
+        # (c) operator-halt log emitted.
+        assert 'operator halt' in caplog.text.lower(), (
+            f'Expected operator-halt log; got: {caplog.text!r}'
+        )
+        # (d) main unchanged — advance_main never reached.
+        assert await git_ops.get_main_sha() == pre_merge_sha, 'main must NOT advance'
+        # (e) merge worktree cleaned up.
+        assert not merge_wt_path.exists(), f'merge_wt {merge_wt_path} must be removed'
+        # (f) req RE-QUEUED onto the merger input queue (not dropped).
+        assert req in list(queue._queue), (  # noqa: SLF001 — read-only test probe
+            'operator-halt must re-inject req onto the merger input queue'
+        )
+        # (g) future left PENDING so the waiting workflow keeps waiting.
+        assert not req.result.done(), 'req.result must stay pending for re-verify'
+        # (h) halt state reads as halted, with no owning escalation, so the
+        #     existing unhalt_merge_queue path cleanly reverses it.
+        assert worker.is_wip_halted is True
+        assert worker.halt_owner_esc_id is None
+
+    async def test_halt_for_wip_does_not_abort_inflight_verify(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ):
+        """REGRESSION: the automatic WIP halt must NOT abort an in-flight verify.
+
+        halt_for_wip (fired from _map_advance_failure during an item's advance
+        step) must leave the verifier draining as before.  If the verify-abort
+        were keyed on is_wip_halted it would start cancelling the in-flight
+        verify here — a behaviour change to the carefully-tuned automatic path.
+        The dedicated _operator_halt signal prevents that.
+        """
+        wt = await _make_branch_with_file(git_ops, 'wip-noabort', 'wip_na.py', 'z = 3\n')
+        pre_merge_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'wip-noabort')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        merge_wt_path = merge_result.merge_worktree
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+
+        req = _make_request('wip-noabort', 'wip-noabort', wt, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha=pre_merge_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        verify_started = asyncio.Event()
+        release_event = asyncio.Event()
+        completed = False
+
+        async def _blocking_verify(_merge_wt, _cfg, _module_configs, **_kwargs):
+            nonlocal completed
+            verify_started.set()
+            await release_event.wait()
+            completed = True
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_blocking_verify,
+        ):
+            task = asyncio.create_task(worker._verify_and_advance(item))
+            await asyncio.wait_for(verify_started.wait(), timeout=5)
+
+            # Automatic WIP halt while the verify is in flight.
+            worker.halt_for_wip('wip halt regression')
+
+            # Sleep > 2 poll cycles: if keyed on is_wip_halted the verify would
+            # be aborted here.  It must NOT be.
+            await asyncio.sleep(0.05)
+
+            # The in-flight verify must still be running (NOT aborted).
+            assert not task.done(), 'halt_for_wip must NOT abort the in-flight verify'
+            assert not completed, 'verify still blocked, not cancelled'
+            assert not req.result.done(), 'req.result must still be pending'
+            assert worker._operator_halt.is_set() is False, (  # noqa: SLF001
+                'halt_for_wip must NOT raise the operator-halt signal'
+            )
+
+            # Let the verify run to completion — proves it was never aborted.
+            release_event.set()
+            result = await asyncio.wait_for(task, timeout=30)
+
+        assert completed, 'verify must run to completion under an automatic WIP halt'
+        assert result is True, 'verify completion must advance main (no abort)'
+        assert await git_ops.get_main_sha() != pre_merge_sha, 'main must advance'

@@ -3306,6 +3306,12 @@ class _WipHaltMixin:
     # Class-level annotations so pyright sees the attributes.
     _lane_halt: dict[str, asyncio.Event]
     _lane_halt_owner: dict[str, str | None]
+    # Dedicated operator-halt signal — set ONLY by operator_halt() (the outward
+    # halt_merge_queue tool path), never by the automatic per-lane WIP halt. The
+    # verifier checks THIS (not is_wip_halted) to decide whether to abort an
+    # in-flight verify, so halt_for_wip's drain-the-verifier behaviour is left
+    # untouched. set() = operator halt active.
+    _operator_halt: asyncio.Event
 
     # ── per-lane public API ────────────────────────────────────────────────
 
@@ -3386,6 +3392,32 @@ class _WipHaltMixin:
             self._lane_halt[lane].clear()
             self._lane_halt_owner[lane] = None
 
+    def operator_halt(self, reason: str) -> None:
+        """Operator-initiated halt: stop the merger AND abort the in-flight verify.
+
+        Backs the ``halt_merge_queue`` escalation tool.  Unlike
+        :meth:`halt_for_wip` (the automatic WIP-conflict halt, which intentionally
+        lets the verifier keep draining the items behind it), this ALSO raises the
+        dedicated ``_operator_halt`` signal.  The verifier's abort-poll loop and
+        verifier-loop top check that signal: the in-flight verify is cancelled
+        (killing its subprocess via the existing CancelledError seam) and its merge
+        is re-queued so it re-verifies after un-halt — the waiter's future is left
+        pending and per-task retry counters are untouched (a halt is not a failure).
+
+        Halts every lane with no owner (like ``halt_for_wip``), so
+        ``is_wip_halted`` reports True and ``halt_owner_esc_id`` is None; the
+        existing ``unhalt_merge_queue`` / ``force_unhalt_merge_queue`` path
+        (→ ``unhalt_all_lanes``, which clears ``_operator_halt``) cleanly reverses
+        it without tripping the active-owner refusal.  Synchronous: the verify
+        abort happens asynchronously in the verifier within one
+        ``VERIFY_ABANDON_POLL_SECS`` interval.
+        """
+        logger.warning('Merge queue operator-halted: %s', reason)
+        self._operator_halt.set()
+        for lane in MERGE_LANES:
+            self._lane_halt[lane].clear()
+            self._lane_halt_owner[lane] = None
+
     def set_halt_owner(self, esc_id: str) -> None:
         """Register the escalation that owns the current halt.
 
@@ -3429,6 +3461,10 @@ class _WipHaltMixin:
         for lane in MERGE_LANES:
             self._lane_halt[lane].set()
             self._lane_halt_owner[lane] = None
+        # Also clear any operator halt — this global resume-all backstop (reached
+        # via unhalt_wip ← force_unhalt_merge_queue ← unhalt_merge_queue) is the
+        # reversal path for operator_halt().
+        self._operator_halt.clear()
         self._signal_resume()
 
     def unhalt_wip(self, reason: str | None = None) -> None:
@@ -3572,6 +3608,10 @@ class MergeWorker(_WipHaltMixin):
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
         self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
+        # Operator-halt signal (see _WipHaltMixin.operator_halt). Initially
+        # clear = no operator halt. MergeWorker has no verifier abort-poll loop,
+        # so this is for API parity (operator_halt/unhalt_all_lanes reference it).
+        self._operator_halt = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Public API
@@ -3952,6 +3992,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
         self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
+        # Operator-halt signal (see _WipHaltMixin.operator_halt). Initially
+        # clear = no operator halt. set() by operator_halt() to ALSO abort the
+        # in-flight verify and drain the verifier pipeline, re-queuing affected
+        # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
+        # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
+        self._operator_halt = asyncio.Event()
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -4956,6 +5002,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._speculation_slot.set()
                 continue
 
+            # Operator halt: bounce real verify candidates back to the merger
+            # input queue, draining the build-ahead pipeline to empty while
+            # halted.  Keyed on _operator_halt (NOT is_wip_halted) so the
+            # automatic WIP-halt path (halt_for_wip) is unaffected — it
+            # intentionally lets the verifier keep draining.  immediate_outcome
+            # items (trains / already-decided conflict/already_merged) run no
+            # verify subprocess, so they fall through and resolve normally below.
+            # Mirror the abandoned drain above: clean the merge worktree, mark
+            # n_failed for chain-invalidation, release the speculation slot — but
+            # re-queue req (result left pending) instead of dropping it.  The
+            # merger is halted, so nothing re-feeds _verifier_queue; the loop then
+            # blocks on an empty get() until un-halt.
+            if self._operator_halt.is_set() and item.immediate_outcome is None:
+                if item.merge_wt is not None:
+                    with contextlib.suppress(BaseException):
+                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                n_failed = True
+                self._speculation_slot.set()
+                self._queue.put_nowait(req)
+                continue
+
             try:
                 # ── Unified re-merge site (Mechanism 2 + existing chain-invalidation) ─
                 #
@@ -5431,11 +5498,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if verify_task in done:
                         out = verify_task.result()
                         break
+                    # Abort trigger 1 — sole-waiter gave up (future cancelled):
+                    # DROP the request (checked first so a gave-up waiter wins
+                    # over the operator-halt re-queue below when both hold).
                     if self._request_abandoned(req):
                         verify_task.cancel()
                         with contextlib.suppress(BaseException):
                             await verify_task
                         await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        return False
+                    # Abort trigger 2 — operator halt: terminate the in-flight
+                    # verify (CancelledError propagates into _run_cmd, which kills
+                    # the verify subprocess) and RE-QUEUE the merge for re-verify
+                    # after un-halt.  req.result is left pending so the waiting
+                    # workflow keeps waiting; per-task retry counters are untouched
+                    # (a transient operator halt is not a verify failure).
+                    if self._operator_halt.is_set():
+                        logger.warning(
+                            'Task %s: operator halt — aborting in-flight verify '
+                            'and re-queuing merge for re-verify after un-halt',
+                            req.task_id,
+                        )
+                        verify_task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await verify_task
+                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        self._queue.put_nowait(req)
                         return False
             except Exception as exc:
                 logger.info(
