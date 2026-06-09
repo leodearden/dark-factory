@@ -483,3 +483,136 @@ class TestVerifyRunnerProtocol:
         import asyncio
         runner = _make_local_runner()
         assert asyncio.iscoroutinefunction(runner.health)
+
+
+# ---------------------------------------------------------------------------
+# Step-3: LocalRunner.run_merge_verify combined-bundle behaviour
+# ---------------------------------------------------------------------------
+
+
+def _make_pass_result(**kwargs):
+    defaults = dict(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    defaults.update(kwargs)
+    return VerifyResult(**defaults)
+
+
+def _make_fail_result(**kwargs):
+    defaults = dict(passed=False, test_output='FAILED', lint_output='', type_output='', summary='test fail')
+    defaults.update(kwargs)
+    return VerifyResult(**defaults)
+
+
+def _make_spec():
+    return MergeVerifySpec(
+        verify_commands=(),
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+        task_files=None,
+        verify_env={},
+        cold_timeout_secs=60.0,
+    )
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerBundle:
+    """LocalRunner.run_merge_verify: combined scoped+unscoped bundle."""
+
+    async def test_pass_path_returns_passed_result_and_invokes_unscoped(self):
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        unscoped_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+        run_unscoped = AsyncMock(return_value=unscoped_gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is True
+        run_unscoped.assert_awaited_once()
+
+    async def test_scoped_fail_short_circuits_unscoped(self):
+        scoped_result = _make_fail_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        run_unscoped = AsyncMock()
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.summary == 'test fail'
+        run_unscoped.assert_not_awaited()
+
+    async def test_scoped_fail_returns_scoped_result_unchanged(self):
+        scoped_result = _make_fail_result(category='test_failure', cause_hint='assertion error')
+        run_scoped = AsyncMock(return_value=scoped_result)
+        runner = _make_local_runner(run_scoped=run_scoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result is scoped_result
+
+    async def test_unscoped_broken_returns_sentinel_category_result(self):
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        gate = MagicMock(
+            broken=True,
+            timed_out=False,
+            timed_out_subprojects=[],
+            failing_subprojects=['src/a', 'src/b'],
+            detail='type error line 10',
+        )
+        run_unscoped = AsyncMock(return_value=gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        assert 'src/a' in result.summary or 'src/a' in (result.type_output or '')
+
+    async def test_unscoped_timeout_returns_timeout_sentinel_category(self):
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+        scoped_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=scoped_result)
+        gate = MagicMock(
+            broken=True,
+            timed_out=True,
+            timed_out_subprojects=['src/a'],
+            failing_subprojects=['src/a'],
+            detail='',
+        )
+        run_unscoped = AsyncMock(return_value=gate)
+        runner = _make_local_runner(run_scoped=run_scoped, run_unscoped=run_unscoped)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+        assert result.timed_out is True
+
+    async def test_scoped_called_with_correct_kwargs(self):
+        from unittest.mock import call
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False))
+        config = MagicMock()
+        config.merge_verify_workspace = True
+        merge_wt = MagicMock()
+        module_configs = [MagicMock()]
+        task_files = ('src/a.py',)
+        runner = LocalRunner(
+            merge_wt=merge_wt,
+            config=config,
+            module_configs=module_configs,
+            task_files=task_files,
+            run_scoped=run_scoped,
+            run_unscoped=run_unscoped,
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        run_scoped.assert_awaited_once_with(
+            merge_wt, config, module_configs,
+            task_files=task_files,
+            max_retries=0,
+            is_merge_verify=True,
+            force_workspace=True,
+            role='merge',
+        )

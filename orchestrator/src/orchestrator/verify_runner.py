@@ -57,7 +57,21 @@ __all__ = [
     "result_from_dict",
     "VerifyRunner",
     "LocalRunner",
+    "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
+    "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
+    "is_unscoped_gate_failure",
+    "unscoped_gate_failing_subprojects",
 ]
+
+# Sentinel category constants — encode an unscoped-gate failure inside a
+# VerifyResult so _run_post_merge_verify can branch byte-identically.
+UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
+UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
+
+_UNSCOPED_SENTINEL_CATEGORIES = frozenset({
+    UNSCOPED_TYPECHECK_FAILED_CATEGORY,
+    UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +293,14 @@ class LocalRunner:
         merge_sha: str,
         spec: MergeVerifySpec,
     ) -> VerifyResult:
-        """Run the combined scoped + unscoped bundle (full logic in step-4)."""
-        return await self._run_scoped(
+        """Run the combined scoped + unscoped bundle.
+
+        Scoped phase runs first; unscoped gate only runs if scoped passed
+        (preserving today's short-circuit). An unscoped-gate-broken outcome is
+        encoded into a VerifyResult via a sentinel category so callers can branch
+        byte-identically.
+        """
+        scoped = await self._run_scoped(
             self._merge_wt,
             self._config,
             self._module_configs,
@@ -290,6 +310,55 @@ class LocalRunner:
             force_workspace=self._config.merge_verify_workspace,
             role='merge',
         )
+        if not scoped.passed:
+            return scoped
+
+        gate = await self._run_unscoped(
+            self._merge_wt,
+            self._config,
+            self._module_configs,
+            block_on_timeout=True,
+        )
+        if gate.broken:
+            failing = gate.failing_subprojects
+            timed_out = bool(gate.timed_out_subprojects)
+            category = (
+                UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY
+                if timed_out
+                else UNSCOPED_TYPECHECK_FAILED_CATEGORY
+            )
+            summary = ', '.join(failing)
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output=gate.detail if hasattr(gate, 'detail') else '',
+                summary=summary,
+                timed_out=timed_out,
+                category=category,
+            )
+
+        return scoped
+
+
+# ---------------------------------------------------------------------------
+# Helpers for merge_queue to branch on unscoped-gate verdicts
+# ---------------------------------------------------------------------------
+
+
+def is_unscoped_gate_failure(vr: VerifyResult) -> bool:
+    """True when vr carries a sentinel category from LocalRunner's unscoped gate."""
+    return vr.category in _UNSCOPED_SENTINEL_CATEGORIES
+
+
+def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
+    """Extract the failing subproject prefixes from a sentinel VerifyResult.
+
+    Returns the list encoded in vr.summary (comma-joined prefixes).
+    """
+    if not vr.summary:
+        return []
+    return [p.strip() for p in vr.summary.split(',') if p.strip()]
 
 
 # ---------------------------------------------------------------------------
