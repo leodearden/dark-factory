@@ -5580,6 +5580,8 @@ class TestMergeVerifyTimeoutLoopBreaker:
             result.summary = 'tests failed'
             result.timed_out = False
             result.failure_report = lambda: ''
+            # failure-classification path reads .category and .cause_hint;
+            # mock must define them explicitly to avoid AttributeError
             result.category = None
             result.cause_hint = None
             return result
