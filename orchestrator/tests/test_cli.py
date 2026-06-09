@@ -3,9 +3,11 @@
 import asyncio
 import io
 import logging
+import subprocess
 import threading
 import time
 import traceback as traceback_module
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -739,3 +741,94 @@ class TestRunArmsWatchdog:
             'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
         )
 
+
+# ---------------------------------------------------------------------------
+# Step-7: `orchestrator verify-merge` integration tests (parity + cleanup + errors)
+# ---------------------------------------------------------------------------
+
+
+def _setup_verify_repo(tmp_path: Path):
+    """Init a minimal git repo with a mod/test_x.py file, return (repo, head_sha)."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    p = str(repo)
+    subprocess.run(['git', 'init', '-b', 'main', p], check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'config', 'user.name', 'Test User'],
+                   check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'config', 'user.email', 'test@example.com'],
+                   check=True, capture_output=True)
+    mod_dir = repo / 'mod'
+    mod_dir.mkdir()
+    (mod_dir / 'test_x.py').write_text('# placeholder\n')
+    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'],
+                   check=True, capture_output=True)
+    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
+                            check=True, capture_output=True, text=True)
+    head_sha = result.stdout.strip()
+    return repo, head_sha
+
+
+@pytest.mark.parametrize('test_command,expect_pass', [('true', True), ('false', False)])
+def test_verify_merge_parity(tmp_path, monkeypatch, test_command, expect_pass):
+    """verify-merge emits a VerifyResult JSON identical to a local run on the same SHA.
+
+    SYNC test (asyncio_mode=auto): the local result is computed via asyncio.run()
+    before invoking CliRunner so we never nest event loops.
+    """
+    from orchestrator.git_ops import GitOps
+    from orchestrator.verify_runner import (
+        MergeVerifySpec,
+        UnscopedTypecheckSpec,
+        VerifyCommand,
+        result_from_json,
+        run_merge_verify_on_worktree,
+        spec_to_json,
+    )
+
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    config = OrchestratorConfig(project_root=repo)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
+
+    # A dummy config file just to satisfy click.Path(exists=True)
+    cfg_file = tmp_path / 'dummy.yaml'
+    cfg_file.write_text('')
+
+    spec = MergeVerifySpec(
+        verify_commands=(VerifyCommand('mod', test_command=test_command),),
+        unscoped_typecheck=UnscopedTypecheckSpec(
+            commands=(VerifyCommand('mod', type_check_command='true'),),
+            block_on_timeout=True,
+        ),
+        task_files=('mod/test_x.py',),
+        verify_env={},
+        cold_timeout_secs=300.0,
+    )
+
+    # Compute local result in-process (SYNC: use asyncio.run to avoid nested loop)
+    async def _local_run():
+        git_ops = GitOps(config.git, repo)
+        wt, _ = await git_ops._create_merge_worktree(base_sha=head_sha)
+        try:
+            return await run_merge_verify_on_worktree(wt, config, spec)
+        finally:
+            await git_ops.cleanup_merge_worktree(wt)
+
+    local = asyncio.run(_local_run())
+
+    # Invoke CLI
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', head_sha,
+        '--spec', spec_to_json(spec),
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, (
+        f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    )
+    cli_result = result_from_json(r.output)
+    assert cli_result == local, (
+        f'CLI result != local result: cli={cli_result!r}, local={local!r}'
+    )
+    assert local.passed is expect_pass
