@@ -832,11 +832,26 @@ class GitOps:
             cwd=worktree_path,
         )
         post_create_base = mb_out.strip() or base_sha.strip()
+        port = await self._provision_reify_debug_port(worktree_path)
         return WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
             stale_commits=stale_commits,
+            reify_debug_port=port,
         )
+
+    async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
+        """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
+
+        Best-effort and fail-open: returns None on any miss or failure so
+        worktree creation is never blocked by a debug-port hiccup.
+        """
+        script = worktree_path / 'scripts' / 'setup-worktree-debug-port.sh'
+        if not script.exists():
+            return None
+        rc, out, err = await _run([str(script), str(worktree_path)], cwd=worktree_path)
+        lines = [l for l in out.splitlines() if l.strip()]
+        return int(lines[-1])
 
     async def _worktree_holding_branch(self, full_branch: str) -> Path | None:
         """Path of the registered worktree that has *full_branch* checked out.
