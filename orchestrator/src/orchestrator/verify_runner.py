@@ -635,37 +635,49 @@ class RemoteRunner:
                 f' (rc={push_rc}): {push_stderr}'
             )
 
-        # Step 2: build and issue the ssh command
-        argv = [
-            'orchestrator', 'verify-merge',
-            '--sha', merge_sha,
-            '--spec', spec_to_json(spec),
-        ]
-        if self._config_path:
-            argv += ['--config', self._config_path]
-        remote_cmd = ' '.join(shlex.quote(a) for a in argv)
-
+        # Push succeeded — clean up the ref on return (best-effort, in finally)
         try:
-            ssh_rc, ssh_stdout, ssh_stderr = await self._run(
-                ['ssh', self._ssh_host, remote_cmd],
-            )
-        except OSError as exc:
-            raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
+            # Step 2: build and issue the ssh command
+            argv = [
+                'orchestrator', 'verify-merge',
+                '--sha', merge_sha,
+                '--spec', spec_to_json(spec),
+            ]
+            if self._config_path:
+                argv += ['--config', self._config_path]
+            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
-        if ssh_rc != 0:
-            raise RunnerUnavailable(
-                f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
-            )
+            try:
+                ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                    ['ssh', self._ssh_host, remote_cmd],
+                )
+            except OSError as exc:
+                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
 
-        # Step 3: parse the host's stdout
-        # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
-        # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
-        try:
-            return result_from_json(ssh_stdout)
-        except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
-            raise RunnerUnavailable(
-                f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
-            ) from exc
+            if ssh_rc != 0:
+                raise RunnerUnavailable(
+                    f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
+                )
+
+            # Step 3: parse the host's stdout
+            # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
+            # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
+            try:
+                return result_from_json(ssh_stdout)
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                raise RunnerUnavailable(
+                    f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
+                ) from exc
+
+        finally:
+            # Best-effort ref cleanup — never alters the returned result nor masks exceptions
+            try:
+                await self._run(
+                    ['git', 'push', self._git_remote, '--delete', ref],
+                    cwd=self._cwd,
+                )
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
