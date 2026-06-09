@@ -245,6 +245,26 @@ class TestWorktreeLifecycle:
         assert info_bad.reify_debug_port is None
         assert info_bad.path.exists()
 
+    async def test_create_worktree_reuse_provisions_reify_debug_port(
+        self, git_ops: GitOps,
+    ):
+        """Reuse/requeue path also runs the script and stamps the port."""
+        scripts_dir = git_ops.project_root / 'scripts'
+        scripts_dir.mkdir(exist_ok=True)
+        script = scripts_dir / 'setup-worktree-debug-port.sh'
+        script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add fake debug-port script'], cwd=git_ops.project_root)
+
+        # First call: fresh-create path
+        info1 = await git_ops.create_worktree('rdp-reuse')
+        assert info1.reify_debug_port == 39411
+
+        # Second call: reuse path
+        info2 = await git_ops.create_worktree('rdp-reuse')
+        assert info2.reify_debug_port == 39411
+
     async def test_create_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-1')
         assert worktree_info.path.exists()
