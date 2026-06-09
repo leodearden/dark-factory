@@ -3234,8 +3234,20 @@ Output JSON matching the schema. Every task must appear in the output.
         from orchestrator.merge_queue import (
             MergeLivenessConfigError,
             SpeculativeMergeWorker,
+            _MERGE_AHEAD_BOUND,
             enforce_merge_liveness_margin,
         )
+
+        # K = number of verify runners — sizes both the liveness guard
+        # (merge_ahead_bound) and the worker's speculation cap (speculation_depth).
+        # Both knobs are derived from this ONE variable so they cannot drift apart
+        # if K is ever raised.
+        #
+        # NOTE: K is intentionally pinned to _MERGE_AHEAD_BOUND (=1) here until
+        # task η (per-host warm worktree) provides the per-host parallel capacity
+        # that makes K>1 safe in production.  The deeper K>1 code-paths are
+        # exercised by tests; wiring K from config is a follow-up task.
+        _k: int = _MERGE_AHEAD_BOUND
 
         # Fail-CLOSED on an over-budget liveness verdict: if the configured
         # bound×timeout exceeds the safe threshold, refuse to start the merge
@@ -3244,7 +3256,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
         # preserving the original crash-loop protection for unrelated errors.
         try:
-            enforce_merge_liveness_margin(self.config)
+            enforce_merge_liveness_margin(self.config, merge_ahead_bound=_k)
         except MergeLivenessConfigError:
             raise  # fail-closed: over-budget verdict → refuse startup
         except Exception as e:
@@ -3255,6 +3267,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._merge_worker = SpeculativeMergeWorker(
             self.git_ops,
             self._merge_queue,
+            speculation_depth=_k,
             event_store=self.event_store,
             on_merge_landed=self._service_restart_coordinator.note_merge,
         )

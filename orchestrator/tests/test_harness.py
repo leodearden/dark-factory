@@ -195,5 +195,10 @@ class TestHarnessMergeLivenessGuard:
             # Must NOT raise MergeLivenessConfigError
             await harness._start_merge_worker()
 
-        # Worker task was created and will have completed (no-op)
-        assert harness._merge_worker_task is not None
+        try:
+            # Worker task was created and will have completed (no-op)
+            assert harness._merge_worker_task is not None
+        finally:
+            # Explicit teardown: stop the worker and await the task so the test
+            # cannot leave dangling asyncio tasks or open resources.
+            await harness._stop_merge_worker()
