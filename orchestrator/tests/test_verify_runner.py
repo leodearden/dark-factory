@@ -2586,3 +2586,114 @@ class TestVerifyRunnerPoolQuarantine:
         pool.quarantine('laptop')
         pool.clear_quarantine('laptop')
         assert pool.is_quarantined('laptop') is False
+
+
+# ---------------------------------------------------------------------------
+# ι step-3: DriftDetector agree path
+# ---------------------------------------------------------------------------
+
+
+def _make_drift_pool(local_result=None, remote_result=None):
+    """Return a VerifyRunnerPool with injected fake runners."""
+    from orchestrator.verify_runner import VerifyRunnerPool
+    local_fake = MagicMock(spec=VerifyRunner)
+    local_fake.name = 'local'
+    local_fake.is_local = True
+    local_fake.run_merge_verify = AsyncMock(return_value=local_result or _make_pass_result())
+    remote_fake = MagicMock(spec=VerifyRunner)
+    remote_fake.name = 'laptop'
+    remote_fake.is_local = False
+    remote_fake.run_merge_verify = AsyncMock(return_value=remote_result or _make_pass_result())
+    pool = VerifyRunnerPool([local_fake, remote_fake])
+    return pool, local_fake, remote_fake
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorAgree:
+    """DriftDetector.check(): agree path — both pass or both fail → AGREE + event."""
+
+    async def test_both_pass_returns_agree_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        event_store = MagicMock()
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue, task_id='t')
+        result = await detector.check('abc123', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+
+    async def test_both_fail_returns_agree_verdict(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_fail_result()
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock(), task_id='t')
+        result = await detector.check('abc123', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+
+    async def test_agree_result_carries_local_remote_passed(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock())
+        result = await detector.check('sha1', _make_spec())
+        assert result.local_passed is True
+        assert result.remote_passed is True
+
+    async def test_agree_emits_exactly_one_verdict_parity_ok_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, task_id='t')
+        await detector.check('mysha', _make_spec())
+        assert event_store.emit.call_count == 1
+        call_args = event_store.emit.call_args
+        assert call_args[0][0] == EventType.verdict_parity_ok
+
+    async def test_agree_event_data_contains_merge_sha(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('mysha', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['merge_sha'] == 'mysha'
+
+    async def test_agree_event_data_contains_runner_names(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['local_runner'] == 'local'
+        assert data['remote_runner'] == 'laptop'
+
+    async def test_agree_event_data_contains_agreed_passed(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['passed'] is True
+
+    async def test_agree_submits_no_escalation(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool()
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_agree_does_not_quarantine_remote(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, remote_fake = _make_drift_pool()
+        detector = DriftDetector(pool)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is False
