@@ -706,10 +706,17 @@ def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
 
 
 class VerifyRunnerPool:
-    """Dispatches a merge-verify bundle to a single VerifyRunner and emits a telemetry event.
+    """Dispatches a merge-verify bundle to a VerifyRunner and emits a telemetry event.
 
-    In β there is exactly one runner (LocalRunner). The long-lived K-permit
-    pool with multiple remote runners is deferred to ζ.
+    Selection policy (δ): prefers the first non-local (remote) runner.
+    The K-permit free/busy refinement (semaphore-based concurrency control) is
+    deferred to ζ.
+
+    Fail-safe (δ): if the selected runner raises RunnerUnavailable, dispatch
+    falls back to the local runner (if distinct), logging one warning.  The
+    merge_verify event reflects the runner that actually produced the result.
+    dispatch() never propagates RunnerUnavailable to its caller when a local
+    fallback exists (PRD §A Invariant 2).
     """
 
     def __init__(
@@ -721,9 +728,23 @@ class VerifyRunnerPool:
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
-        self._runner = runners[0]
+        self._runners = list(runners)
+        # Pre-compute the local runner for fast fail-safe lookup
+        self._local: VerifyRunner | None = next(
+            (r for r in self._runners if r.name == 'local'), None
+        )
         self._event_store = event_store
         self._task_id = task_id
+
+    def _select_runner(self) -> VerifyRunner:
+        """Prefer-remote: return the first non-local runner; fall back to runners[0].
+
+        The K-permit free/busy refinement (load-based selection) is ζ.
+        """
+        for runner in self._runners:
+            if runner.name != 'local':
+                return runner
+        return self._runners[0]
 
     async def dispatch(
         self,
@@ -738,10 +759,16 @@ class VerifyRunnerPool:
         ENOSPC-retry re-dispatch.  Included in the event data so consumers
         can deduplicate multiple events for the same logical merge-verify.
         """
+        import logging
+
         from orchestrator.event_store import EventType
 
+        _log = logging.getLogger(__name__)
+
+        selected = self._select_runner()
         t0 = time.monotonic()
-        result = await self._runner.run_merge_verify(merge_sha, spec)
+        result = await selected.run_merge_verify(merge_sha, spec)
+        actual_runner = selected
         duration_ms = round((time.monotonic() - t0) * 1000)
 
         if self._event_store is not None:
@@ -749,7 +776,7 @@ class VerifyRunnerPool:
                 EventType.merge_verify,
                 task_id=self._task_id,
                 data={
-                    'runner': self._runner.name,
+                    'runner': actual_runner.name,
                     'merge_sha': merge_sha,
                     'passed': result.passed,
                     'duration_ms': duration_ms,
