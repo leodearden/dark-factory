@@ -11234,3 +11234,25 @@ class TestStage2PromptSuppressPrecheck:
             "(task 1685 — agent must skip the write when any stage2_suppress guard "
             "memory exists for the task)."
         )
+
+    def test_stage2_prompt_includes_decide_first_bias_toward_framing(self):
+        """build_stage2_system_prompt('dark_factory') must include 'bias toward'.
+
+        When a task was framed as 'bias toward X' and X was the chosen option,
+        the completed task IMPLEMENTED X — Stage 2 must recognise this and must
+        NOT re-derive that conclusion via synthesis as a novel finding to capture
+        (task 1685 DECIDE-FIRST framing clarification).
+
+        Single distinctive operational token per the sanctioned precedent
+        (TestStage2PromptNonceMechanism asserts just 'summary_nonce'); no
+        prose-wording pin.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+        assert 'bias toward' in prompt, (
+            "build_stage2_system_prompt('dark_factory') must include 'bias toward' "
+            "so the Stage 2 agent recognises decision-framed tasks and does not "
+            "re-synthesize the chosen option as a novel finding (task 1685 "
+            "DECIDE-FIRST framing clarification)."
+        )
