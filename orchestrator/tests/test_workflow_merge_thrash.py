@@ -495,3 +495,96 @@ async def test_genuinely_different_fingerprint_resets_counter_to_1():
         f'Counter must reset to 1 on different fingerprint, got {md}'
     )
     f.mark_blocked.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task-1688 step-7 RED: stable root_cause threaded to L1 escalation for L2 dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thrash_threshold_passes_stable_root_cause_to_mark_blocked():
+    """task-1688 step-7(a): _check_merge_outcome_thrash at threshold calls _mark_blocked
+    with a non-empty root_cause kwarg derived from (category, normalised cause_hint).
+
+    Two TaskWorkflow instances that captured the SAME fingerprint must produce
+    the IDENTICAL root_cause string so find_pending_l2_by_root_cause folds them.
+    """
+    # Instance A
+    fa = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    fa.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    fa.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    sig_a = fa.wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    fa.wf.task['metadata']['last_merge_outcome_signature'] = sig_a
+    outcome_a = await fa.wf._check_merge_outcome_thrash(
+        prev_signature=sig_a, current_signature=sig_a,
+    )
+    assert outcome_a == WorkflowOutcome.BLOCKED
+    fa.mark_blocked.assert_awaited_once()
+    _, kwargs_a = fa.mark_blocked.await_args
+    root_cause_a = kwargs_a.get('root_cause', '')
+    assert root_cause_a, 'root_cause must be non-empty when fingerprint is set'
+    assert 'gui_tsc' in root_cause_a, f'root_cause must mention category: {root_cause_a!r}'
+
+    # Instance B — same fingerprint (line number differs only)
+    fb = _make(
+        metadata={'consecutive_merge_thrash': 1},
+        max_consecutive_merge_thrash=2,
+    )
+    fb.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
+    fb.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
+    sig_b = fb.wf._merge_outcome_signature()  # type: ignore[attr-defined]
+    fb.wf.task['metadata']['last_merge_outcome_signature'] = sig_b
+    outcome_b = await fb.wf._check_merge_outcome_thrash(
+        prev_signature=sig_b, current_signature=sig_b,
+    )
+    assert outcome_b == WorkflowOutcome.BLOCKED
+    _, kwargs_b = fb.mark_blocked.await_args
+    root_cause_b = kwargs_b.get('root_cause', '')
+
+    assert root_cause_a == root_cause_b, (
+        f'Sibling tasks with the same fingerprint must produce identical root_cause; '
+        f'got {root_cause_a!r} vs {root_cause_b!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_l1_escalation_stamps_root_cause():
+    """task-1688 step-7(b): _ensure_l1_escalation_for_blocked stamps esc.root_cause.
+
+    Drives _ensure_l1_escalation_for_blocked with a fake escalation_queue
+    (has_open_l1 → False) and asserts the submitted Escalation has
+    esc.root_cause equal to the value passed.
+    """
+    from unittest.mock import patch
+
+    f = _make()
+    wf = f.wf
+
+    expected_root_cause = 'merge-outcome-thrash:gui_tsc:statusbar.tsx error ts2322: type x not assignable'
+
+    submitted_escs: list = []
+    mock_queue = MagicMock()
+    mock_queue.has_open_l1 = MagicMock(return_value=False)
+    mock_queue.make_id = MagicMock(return_value='esc-test-1')
+    mock_queue.submit = MagicMock(side_effect=submitted_escs.append)
+    wf.escalation_queue = mock_queue  # type: ignore[assignment]
+    wf.event_store = None
+
+    with patch.object(wf, '_build_train_state', new=AsyncMock(return_value=None)):
+        with patch.object(wf, '_durable_ref_suffix', return_value=''):
+            await wf._ensure_l1_escalation_for_blocked(
+                'Repeated merge-phase thrash',
+                'detail here',
+                category='task_failure',
+                root_cause=expected_root_cause,
+            )
+
+    assert len(submitted_escs) == 1, f'Expected 1 submitted escalation, got {submitted_escs}'
+    esc = submitted_escs[0]
+    assert esc.root_cause == expected_root_cause, (
+        f'Expected root_cause={expected_root_cause!r}, got {esc.root_cause!r}'
+    )

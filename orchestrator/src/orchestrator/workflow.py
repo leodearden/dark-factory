@@ -2725,10 +2725,15 @@ class TaskWorkflow:
                 self.task_id, counter,
                 self.config.max_consecutive_merge_thrash,
             )
+            root_cause = (
+                f'merge-outcome-thrash:{self._last_merge_failure_category}:'
+                f'{_normalize_cause_hint(self._last_merge_failure_cause_hint)}'
+            )
             return await self._mark_blocked(
                 f'Repeated merge-phase thrash (counter={counter})',
                 detail=f'merge_outcome_signature={current_signature}',
                 escalate_to_human=True,
+                root_cause=root_cause,
             )
         return None
 
@@ -5631,6 +5636,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         category: str = 'task_failure',
         dedupe_fingerprint: str | None = None,
         spawn_dry_run: bool = False,
+        root_cause: str = '',
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -5758,6 +5764,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if escalate_to_human:
                 await self._ensure_l1_escalation_for_blocked(
                     reason, detail or reason, category=category,
+                    root_cause=root_cause,
                 )
                 return WorkflowOutcome.BLOCKED
 
@@ -6047,6 +6054,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
+        root_cause: str = '',
     ) -> None:
         """Submit a level-1 escalation if none is open for this task.
 
@@ -6085,6 +6093,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             level=1,
             train_state=train_state,
         )
+        if root_cause:
+            esc.root_cause = root_cause
         self.escalation_queue.submit(esc)
         if self.event_store:
             self.event_store.emit(
