@@ -16076,3 +16076,45 @@ class TestMergeRequestLane:
             assert MERGE_LANES == ('high', 'normal')
         finally:
             loop.close()
+
+
+@pytest.mark.parametrize('worker_cls', [MergeWorker, SpeculativeMergeWorker])
+class TestPerLaneHaltMechanics:
+    """Steps 3-4: per-lane halt state machine."""
+
+    def test_per_lane_halt_state_machine(self, worker_cls, git_ops: GitOps):
+        """Both lanes start un-halted; halt_lane/unhalt_lane work independently."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        # Initially: both lanes un-halted
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
+
+        # Halt normal lane only
+        worker.halt_lane('normal', 'red main')
+        assert worker.is_lane_halted('normal') is True
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is True   # any-lane-halted → True
+
+        # Un-halt normal lane
+        worker.unhalt_lane('normal')
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
+
+    def test_legacy_halt_affects_all_lanes(self, worker_cls, git_ops: GitOps):
+        """halt_for_wip halts all lanes; unhalt_wip un-halts all lanes."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('x')
+        assert worker.is_lane_halted('normal') is True
+        assert worker.is_lane_halted('high') is True
+        assert worker.is_wip_halted is True
+
+        worker.unhalt_wip()
+        assert worker.is_lane_halted('normal') is False
+        assert worker.is_lane_halted('high') is False
+        assert worker.is_wip_halted is False
