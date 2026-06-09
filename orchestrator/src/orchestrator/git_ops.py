@@ -1481,7 +1481,9 @@ class GitOps:
             ``git clean -xfd -e <dir>`` for each dir in
             ``config.reap_build_artifact_dirs`` — so the source tree is
             bit-identical to a fresh checkout of *merge_commit* while
-            build-artifact dirs (e.g. ``target/``) are retained.
+            build-artifact dirs (e.g. ``target/``) are retained (PRD §10
+            invariant 1: source bit-identical to fresh checkout; build-cache
+            dirs retained for warmth).
 
         Returns the fixed path (:attr:`persistent_merge_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
