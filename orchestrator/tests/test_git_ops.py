@@ -4392,6 +4392,16 @@ class TestReclaimWorktreeBuildArtifacts:
 # ---------------------------------------------------------------------------
 
 
+async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) -> str:
+    """Helper: create a feature branch, commit a file, merge to main, return merge_commit."""
+    wt_info = await git_ops.create_worktree(branch_name)
+    (wt_info.path / filename).write_text(f'{branch_name} = True\n')
+    await git_ops.commit(wt_info.path, f'Add {filename}')
+    result = await git_ops.merge_to_main(wt_info.path, branch_name)
+    assert result.success and result.merge_commit
+    return result.merge_commit
+
+
 def test_git_config_persistent_merge_worktree_knobs():
     """GitConfig knobs for the persistent warm merge-verify worktree feature.
 
@@ -4426,3 +4436,64 @@ def test_git_config_persistent_merge_worktree_knobs():
     import pydantic
     with pytest.raises((pydantic.ValidationError, ValueError)):
         GitConfig(persistent_merge_worktree_safety_valve_every_n=-1)
+
+
+@pytest.mark.asyncio
+class TestPersistentMergeWorktree:
+    """Integration tests for reset_persistent_merge_worktree and its exemptions.
+
+    Steps 3–10 of task 1692.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 3 — create-once path
+    # ------------------------------------------------------------------
+
+    async def test_persistent_merge_worktree_path_property(
+        self, git_ops: GitOps,
+    ):
+        """persistent_merge_worktree_path == worktree_base / '_merge-verify'."""
+        assert git_ops.persistent_merge_worktree_path == (
+            git_ops.worktree_base / '_merge-verify'
+        )
+
+    async def test_reset_persistent_merge_worktree_create_once(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_merge_worktree creates worktree on first call.
+
+        Step 3 (RED): method/property absent today — test must fail before impl.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-create-1', 'warm_create.py',
+        )
+
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+
+        # Returns the fixed path
+        assert warm_path == git_ops.persistent_merge_worktree_path
+        assert warm_path.exists()
+
+        # Path is a registered git worktree
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered_paths = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(warm_path) in registered_paths, (
+            f'_merge-verify not in registered worktrees: {registered_paths}'
+        )
+
+        # HEAD of warm worktree == merge_commit
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path,
+        )
+        assert head_sha.strip() == merge_commit.strip(), (
+            f'warm worktree HEAD {head_sha.strip()!r} != merge_commit {merge_commit.strip()!r}'
+        )
