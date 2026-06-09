@@ -3360,3 +3360,123 @@ class TestCreateServerStartupSweep:
             'Orphan was archived even with startup_sweep=False'
         )
         assert not (queue.queue_dir / 'archive').exists()
+
+
+@pytest.mark.asyncio
+class TestOperatorHaltTools:
+    """halt_merge_queue / halt_scheduler — operator-only halt-direction tools.
+
+    Siblings of unhalt_merge_queue / resume_scheduler.  Each guards the
+    standalone (no-harness) case, requires a non-empty reason, and forwards the
+    stripped reason to the harness.  Restriction from autonomous agents is by
+    allow-list omission (see test_roles_operator_tools.py), not a server gate.
+    """
+
+    async def test_tools_registered(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        assert await server.get_tool('halt_merge_queue') is not None
+        assert await server.get_tool('halt_scheduler') is not None
+
+    # ── halt_merge_queue ──────────────────────────────────────────────────
+
+    async def test_halt_merge_queue_standalone_returns_wired_error(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)  # no harness wired
+        tool = await server.get_tool('halt_merge_queue')
+        result = await tool.fn(reason='bad main')
+        assert result['halted'] is False
+        assert 'standalone' in result['error']
+
+    async def test_halt_merge_queue_forwards_stripped_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        calls: list[str] = []
+
+        def _halt(reason: str) -> dict[str, Any]:
+            calls.append(reason)
+            return {'halted': True, 'reason': reason}
+
+        stub_harness = types.SimpleNamespace(halt_merge_queue=_halt)
+        server = create_server(queue, harness=stub_harness)
+        tool = await server.get_tool('halt_merge_queue')
+
+        result = await tool.fn(reason='  infra incident  ')
+
+        assert calls == ['infra incident'], 'reason must be forwarded stripped'
+        assert result == {'halted': True, 'reason': 'infra incident'}
+
+    async def test_halt_merge_queue_rejects_empty_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        called: list[str] = []
+        stub_harness = types.SimpleNamespace(
+            halt_merge_queue=lambda r: called.append(r),
+        )
+        server = create_server(queue, harness=stub_harness)
+        tool = await server.get_tool('halt_merge_queue')
+
+        result = await tool.fn(reason='   ')
+
+        assert result['halted'] is False
+        assert 'reason' in result['error']
+        assert called == [], 'harness must NOT be invoked on an empty reason'
+
+    # ── halt_scheduler ────────────────────────────────────────────────────
+
+    async def test_halt_scheduler_standalone_returns_wired_error(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)  # no harness wired
+        tool = await server.get_tool('halt_scheduler')
+        result = await tool.fn(reason='runaway')
+        assert result['halted'] is False
+        assert 'standalone' in result['error']
+
+    async def test_halt_scheduler_forwards_stripped_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        calls: list[str] = []
+
+        async def _force_halt(reason: str) -> dict[str, Any]:
+            calls.append(reason)
+            return {
+                'halted': True, 'was_paused': False,
+                'prior_reason': None, 'reason': reason,
+            }
+
+        stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
+        server = create_server(queue, harness=stub_harness)
+        tool = await server.get_tool('halt_scheduler')
+
+        result = await tool.fn(reason='  bad deploy  ')
+
+        assert calls == ['bad deploy'], 'reason must be forwarded stripped'
+        assert result['halted'] is True
+        assert result['reason'] == 'bad deploy'
+
+    async def test_halt_scheduler_rejects_empty_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        called: list[str] = []
+
+        async def _force_halt(reason: str) -> dict[str, Any]:
+            called.append(reason)
+            return {}
+
+        stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
+        server = create_server(queue, harness=stub_harness)
+        tool = await server.get_tool('halt_scheduler')
+
+        result = await tool.fn(reason='')
+
+        assert result['halted'] is False
+        assert 'reason' in result['error']
+        assert called == [], 'harness must NOT be invoked on an empty reason'

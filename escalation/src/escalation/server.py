@@ -1020,6 +1020,28 @@ def create_server(
         return harness.force_unhalt_merge_queue(reason.strip())
 
     @mcp.tool()
+    async def halt_merge_queue(reason: str) -> dict[str, Any]:
+        """Operator-initiated halt of the orchestrator merge queue.
+
+        Pauses the merger (no new merge requests are taken) AND terminates the
+        post-merge verify currently running, re-queuing that merge so it
+        re-verifies once the queue is un-halted.  Reversed by unhalt_merge_queue.
+
+        Operator-only: this tool appears in no agent role's allow-list, so
+        autonomous orchestrator agents cannot call it.  The halt is in-memory and
+        transient — a process restart clears it (a fresh process starts
+        un-halted).  ``reason`` is required for audit.
+        """
+        if harness is None:
+            return {
+                'halted': False,
+                'error': 'escalation server running standalone — no harness wired',
+            }
+        if not reason or not reason.strip():
+            return {'halted': False, 'error': 'reason is required for audit'}
+        return harness.halt_merge_queue(reason.strip())
+
+    @mcp.tool()
     def get_merge_halt_status() -> dict[str, Any]:
         """Inspect the orchestrator merge queue's halt state."""
         if harness is None:
@@ -1072,6 +1094,32 @@ def create_server(
         if not reason or not reason.strip():
             return {'resumed': False, 'error': 'reason is required for audit'}
         return await harness.force_resume_scheduler(reason.strip())
+
+    @mcp.tool()
+    async def halt_scheduler(reason: str) -> dict[str, Any]:
+        """Operator-initiated halt of the orchestrator scheduler.
+
+        Stops the scheduler from dispatching new tasks (acquire_next() returns
+        None) and persists the pause to runs.db, so the halt survives a restart.
+
+        Unlike an automatic park-stop / cost-ceiling / EWA trip, this does NOT
+        file an auto-resumable scheduler-pause L1: notifying the operator of their
+        own deliberate halt is noise, and an auto-watcher resolving that L1 would
+        silently undo the halt.  Reversed by resume_scheduler.
+
+        Operator-only: this tool appears in no agent role's allow-list, so
+        autonomous orchestrator agents cannot call it.  ``reason`` is required for
+        audit.  Returns ``{halted, was_paused, prior_reason, reason}`` (or an
+        ``error`` when the server is running standalone with no harness wired).
+        """
+        if harness is None:
+            return {
+                'halted': False,
+                'error': 'escalation server running standalone — no harness wired',
+            }
+        if not reason or not reason.strip():
+            return {'halted': False, 'error': 'reason is required for audit'}
+        return await harness.force_halt_scheduler(reason.strip())
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
