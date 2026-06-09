@@ -295,10 +295,15 @@ class WorktreeInfo:
     N commits.  When local main has diverged (has unpushed commits), the worktree
     is based on local main despite the positive count — check this field together
     with base_commit to determine actual freshness.
+
+    reify_debug_port: per-worktree reify-debug port allocated during provisioning
+    by running scripts/setup-worktree-debug-port.sh in the worktree.  None when
+    no such script is present (non-reify projects) or provisioning failed (fail-open).
     """
     path: Path
     base_commit: str
     stale_commits: int | None = None
+    reify_debug_port: int | None = None
 
 
 class WorktreeMissing(FileNotFoundError):
