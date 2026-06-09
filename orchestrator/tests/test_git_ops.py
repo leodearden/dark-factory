@@ -4497,3 +4497,89 @@ class TestPersistentMergeWorktree:
         assert head_sha.strip() == merge_commit.strip(), (
             f'warm worktree HEAD {head_sha.strip()!r} != merge_commit {merge_commit.strip()!r}'
         )
+
+    # ------------------------------------------------------------------
+    # Step 5 — reset-in-place on an EXISTING warm worktree
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_merge_worktree_reset_in_place(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_merge_worktree resets in-place on a second call.
+
+        Verifies:
+        - Still the same single registered path after reset.
+        - HEAD updated to the new merge_commit B.
+        - Tracked source reflects B (not A).
+        - target/cache.bin STILL EXISTS (target/ retained → warm).
+        - stray.txt was removed (git clean -xfd cleaned except target/).
+
+        Step 5 (RED): reset-in-place branch not yet implemented.
+        """
+        # --- First reset: create at merge_commit A ---
+        merge_commit_a = await _get_merge_commit(
+            git_ops, 'warm-reset-a', 'warm_a.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit_a)
+        assert warm_path.exists()
+
+        # Simulate a warm build: write a build artifact and a stray file
+        target_dir = warm_path / 'target'
+        target_dir.mkdir()
+        cache_bin = target_dir / 'cache.bin'
+        cache_bin.write_bytes(b'\xde\xad\xbe\xef')
+        stray_txt = warm_path / 'stray.txt'
+        stray_txt.write_text('stray untracked\n')
+
+        # --- Second reset: create a different merge_commit B ---
+        merge_commit_b = await _get_merge_commit(
+            git_ops, 'warm-reset-b', 'warm_b.py',
+        )
+        warm_path_b = await git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        # Same single registered path
+        assert warm_path_b == git_ops.persistent_merge_worktree_path
+        assert warm_path_b == warm_path, 'path must not change on second call'
+
+        # Only one _merge-verify worktree registered
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        merge_verify_paths = [p for p in registered if p.endswith('_merge-verify')]
+        assert len(merge_verify_paths) == 1, (
+            f'expected exactly 1 _merge-verify registration, got {merge_verify_paths}'
+        )
+
+        # HEAD == merge_commit_b (not A)
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path_b,
+        )
+        assert head_sha.strip() == merge_commit_b.strip(), (
+            f'HEAD should be B={merge_commit_b[:8]}, got {head_sha.strip()[:8]}'
+        )
+
+        # Source reflects B: warm_b.py present, warm_a.py absent
+        assert (warm_path_b / 'warm_b.py').exists(), (
+            'warm_b.py (B commit) should be present in warm worktree'
+        )
+        assert not (warm_path_b / 'warm_a.py').exists(), (
+            'warm_a.py (A commit) should NOT be present after reset to B'
+        )
+
+        # target/cache.bin STILL EXISTS (target/ retained → warm)
+        assert cache_bin.exists(), (
+            'target/cache.bin must be retained (warm build artifact)'
+        )
+
+        # stray.txt removed (git clean -xfd removed it)
+        assert not stray_txt.exists(), (
+            'stray.txt must be cleaned by git clean -xfd'
+        )
