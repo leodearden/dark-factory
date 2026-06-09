@@ -142,6 +142,14 @@ class MergeVerifySpec:
     verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
+
+    Note
+    ----
+    ``verify_env`` is stored as a mutable ``dict`` at runtime.  Although
+    ``frozen=True`` prevents attribute reassignment, calling ``hash()`` on a
+    ``MergeVerifySpec`` instance raises ``TypeError`` because dicts are
+    unhashable.  Specs are serialization value-objects and are not intended to
+    be used as dict keys or set members.
     """
 
     verify_commands: tuple[VerifyCommand, ...]
@@ -157,7 +165,7 @@ class MergeVerifySpec:
             "unscoped_typecheck": self.unscoped_typecheck.to_dict(),
             "task_files": list(self.task_files) if self.task_files is not None else None,
             "verify_env": dict(self.verify_env),
-            "cold_timeout_secs": self.cold_timeout_secs,
+            "cold_timeout_secs": float(self.cold_timeout_secs),
             "is_merge_verify": self.is_merge_verify,
         }
 
