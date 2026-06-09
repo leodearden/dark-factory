@@ -3399,9 +3399,13 @@ class _WipHaltMixin:
             f'halt owner already set to {current!r}, '
             f'refusing to overwrite with {esc_id!r}'
         )
-        for lane in MERGE_LANES:
-            if not self._lane_halt[lane].is_set():  # halted
-                self._lane_halt_owner[lane] = esc_id
+        halted = [ln for ln in MERGE_LANES if not self._lane_halt[ln].is_set()]
+        assert halted, (
+            f'set_halt_owner({esc_id!r}) called when no lane is halted — '
+            'halt must be active before registering an owner'
+        )
+        for lane in halted:
+            self._lane_halt_owner[lane] = esc_id
 
     def is_halt_owner(self, esc_id: str) -> bool:
         """True iff esc_id owns any currently-halted lane."""
@@ -3511,6 +3515,15 @@ class MergeWorker(_WipHaltMixin):
     Owns all main-branch advancement via CAS ``update-ref``.  The harness
     creates one instance and passes the same ``asyncio.Queue`` to every
     ``TaskWorkflow``.
+
+    .. note:: Legacy path.
+        This class inherits the per-lane halt *state machine* from
+        ``_WipHaltMixin`` and honours ``halt_for_wip`` / ``unhalt_wip``
+        (all-lanes) correctly.  However its ``_dequeue`` picks from the
+        FIFO queue without consulting ``req.lane``, so it does **not**
+        implement lane-priority ordering.  Use
+        :class:`SpeculativeMergeWorker` (the production worker) when lane
+        priority matters.
     """
 
     MAX_CAS_RETRIES = 5
@@ -4792,6 +4805,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Route through lane buffers so look-ahead prefers 'high'
                     # and never speculatively picks from a halted lane.
                     await self._speculation_slot.wait()  # depth-1 cap
+                    # Harvest any item already delivered to the persistent
+                    # getter so the look-ahead can see it via _pop_next_pickable.
+                    if self._pending_get is not None and self._pending_get.done():
+                        _item = self._pending_get.result()
+                        self._pending_get = None
+                        if _item is None:
+                            self._shutdown_signaled = True
+                        else:
+                            self._lane_buffers[_normalize_lane(_item.lane)].append(_item)
                     self._drain_queue_into_lanes()
                     next_req = self._pop_next_pickable()
                     if next_req is not None:

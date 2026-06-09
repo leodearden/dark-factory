@@ -16052,36 +16052,17 @@ class TestMergeRequestLane:
     def test_merge_request_lane_attribute(self, config: OrchestratorConfig, git_repo: Path):
         """lane defaults to 'normal'; can be set to 'high'."""
         loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            future_n: asyncio.Future[MergeOutcome] = loop.create_future()
-            req_normal = MergeRequest(
-                task_id='t1',
-                branch='t1',
-                worktree=git_repo,
-                pre_rebased=False,
-                task_files=None,
-                module_configs=[],
-                config=config,
-                result=future_n,
-            )
+            req_normal = _make_request('t1', 't1', git_repo, config)
             assert req_normal.lane == 'normal'
 
-            future_h: asyncio.Future[MergeOutcome] = loop.create_future()
-            req_high = MergeRequest(
-                task_id='t2',
-                branch='t2',
-                worktree=git_repo,
-                pre_rebased=False,
-                task_files=None,
-                module_configs=[],
-                config=config,
-                result=future_h,
-                lane='high',
-            )
+            req_high = _make_request('t2', 't2', git_repo, config, lane='high')
             assert req_high.lane == 'high'
 
             assert MERGE_LANES == ('high', 'normal')
         finally:
+            asyncio.set_event_loop(None)
             loop.close()
 
 
