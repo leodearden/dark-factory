@@ -590,7 +590,6 @@ class TestLocalRunnerBundle:
         assert result.timed_out is True
 
     async def test_scoped_called_with_correct_kwargs(self):
-        from unittest.mock import call
         run_scoped = AsyncMock(return_value=_make_pass_result())
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False))
         config = MagicMock()
@@ -616,3 +615,59 @@ class TestLocalRunnerBundle:
             force_workspace=True,
             role='merge',
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: VerifyRunnerPool.dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPool:
+    """VerifyRunnerPool.dispatch: routes to single runner + emits merge_verify event."""
+
+    async def test_dispatch_returns_runner_result(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        expected = _make_pass_result()
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=expected)
+        pool = VerifyRunnerPool([fake_runner])
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result is expected
+
+    async def test_dispatch_emits_merge_verify_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        expected = _make_pass_result()
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=expected)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+        await pool.dispatch('sha999', _make_spec())
+
+        assert len(emitted) == 1
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha999'
+        assert data['passed'] is True
+
+    async def test_dispatch_without_event_store_does_not_raise(self):
+        from orchestrator.verify_runner import VerifyRunnerPool
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([fake_runner], event_store=None)
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.passed is True

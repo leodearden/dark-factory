@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,7 @@ __all__ = [
     "result_from_dict",
     "VerifyRunner",
     "LocalRunner",
+    "VerifyRunnerPool",
     "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
@@ -359,6 +361,54 @@ def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
     if not vr.summary:
         return []
     return [p.strip() for p in vr.summary.split(',') if p.strip()]
+
+
+# ---------------------------------------------------------------------------
+# VerifyRunnerPool
+# ---------------------------------------------------------------------------
+
+
+class VerifyRunnerPool:
+    """Dispatches a merge-verify bundle to a single VerifyRunner and emits a telemetry event.
+
+    In β there is exactly one runner (LocalRunner). The long-lived K-permit
+    pool with multiple remote runners is deferred to ζ.
+    """
+
+    def __init__(
+        self,
+        runners: list[VerifyRunner],
+        *,
+        event_store: object = None,
+        task_id: str | None = None,
+    ) -> None:
+        if not runners:
+            raise ValueError('VerifyRunnerPool requires at least one runner')
+        self._runner = runners[0]
+        self._event_store = event_store
+        self._task_id = task_id
+
+    async def dispatch(self, merge_sha: str, spec: MergeVerifySpec) -> VerifyResult:
+        """Run the verify bundle and emit a merge_verify event."""
+        from orchestrator.event_store import EventType
+
+        t0 = time.monotonic()
+        result = await self._runner.run_merge_verify(merge_sha, spec)
+        duration_ms = round((time.monotonic() - t0) * 1000)
+
+        if self._event_store is not None:
+            self._event_store.emit(
+                EventType.merge_verify,
+                task_id=self._task_id,
+                data={
+                    'runner': self._runner.name,
+                    'merge_sha': merge_sha,
+                    'passed': result.passed,
+                    'duration_ms': duration_ms,
+                },
+            )
+
+        return result
 
 
 # ---------------------------------------------------------------------------
