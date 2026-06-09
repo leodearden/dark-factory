@@ -29,10 +29,12 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.verify import (
+    PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
     _resolve_verify_timeout,
     run_scoped_verification,
     run_verification,
+    verify_failure_is_preexisting_on_main,
 )
 
 if TYPE_CHECKING:
@@ -220,6 +222,19 @@ fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX
 a landed merge must never be blocked by a flaky hang or infra error, so the
 check fails open on timeouts and worktree-create exceptions."""
 
+MAIN_HEALTH_RED_REASON_PREFIX = 'Main-health red: merge verify failure reproduces on bare main'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
+verify failure is classified as a pre-existing break already present on bare
+main HEAD — i.e. not introduced by this task's merge.
+
+The workflow ``_submit_to_merge_queue`` pattern-matches this prefix and routes
+the outcome to a single dedup'd L1 escalation (``escalate_to_human=True``,
+``category='preexisting_main_break'``), skipping the steward entirely.  The
+steward operates in-branch and cannot fix a broken main; routing each
+concurrent failing merge to the steward would cause an ~85 min-per-task
+livelock for every task whose verify runs against a red main."""
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
@@ -371,6 +386,84 @@ async def _ensure_verify_disk_space(
     )
 
 
+def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
+    """Compose a dedupe fingerprint for a preexisting-main-break outcome.
+
+    Lazy-imports compute_preexisting_main_break_fingerprint from workflow so
+    merge_queue→workflow is a deferred import (no module-level cycle).
+    Fail-safe: returns '' when the import or composition raises.
+    """
+    try:
+        from orchestrator.workflow import compute_preexisting_main_break_fingerprint
+        return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
+    except Exception:
+        return ''
+
+
+async def _classify_main_health_red(
+    git_ops: GitOps,
+    req: MergeRequest,
+    verify: VerifyResult,
+    event_store: EventStore | None = None,
+) -> MergeOutcome | None:
+    """Probe whether *verify* is a pre-existing break already on bare main HEAD.
+
+    Returns a :class:`MergeOutcome` with reason starting with
+    :data:`MAIN_HEALTH_RED_REASON_PREFIX` when the break is confirmed
+    pre-existing.  Returns ``None`` to fall through to the normal task-fault
+    outcome.
+
+    Guards (short-circuit to None before calling the probe):
+    - ``req.config.escalate_preexisting_main_break`` is False
+    - ``verify.timed_out`` is True (non-deterministic; re-probing is wasteful)
+    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
+      (infra_timeout / flock_error — inherently flaky)
+
+    Latency: the first failing merge per ``(main_sha, category, cause_hint)``
+    tuple pays a full probe build/test cost, bounded by the same
+    ``merge_verify_cold_command_timeout_secs`` / ``verify_cold_command_timeout_secs``
+    timeout that ``_run_post_merge_verify`` uses (inherited via
+    ``run_scoped_verification``'s config lookup — the probe runs with
+    ``max_retries=0`` so a hung probe cannot stall the worker beyond one
+    timeout window).  Subsequent merges with the same signature hit the
+    ``_PROBE_CACHE`` and pay only a ``get_main_sha()`` round-trip.
+    """
+    if not req.config.escalate_preexisting_main_break:
+        return None
+    if verify.timed_out:
+        return None
+    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
+        return None
+    try:
+        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
+            req.worktree, req.config, req.module_configs, req.task_files,
+            verify, git_ops,
+        )
+    except Exception:
+        return None
+    if not is_preexisting:
+        return None
+    detail = verify.failure_report()
+    suffix = (verify.cause_hint or verify.summary or '')[:160]
+    reason = (
+        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
+        f'(category={verify.category!r}): {suffix}'
+    )
+    if detail:
+        reason = f'{reason}\n\n{detail}'
+    outcome = MergeOutcome(
+        'blocked',
+        reason=reason,
+        failure_category=verify.category,
+        failure_cause_hint=verify.cause_hint,
+        dedupe_fingerprint=_main_health_fingerprint(
+            verify.category or '', verify.cause_hint, probe_sha,
+        ),
+    )
+    _emit_merge_attempt(event_store, req.task_id, 'main_health_red')
+    return outcome
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -380,6 +473,7 @@ async def _run_post_merge_verify(
     enospc_retries: dict[str, int],
     max_timeouts: int,
     max_enospc: int,
+    event_store: EventStore | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -454,6 +548,17 @@ async def _run_post_merge_verify(
             if detail:
                 reason = f'{reason}\n\n{detail}'
             return MergeOutcome('blocked', reason=reason)
+        # Main-health probe: classify whether this failure is pre-existing on
+        # bare main HEAD rather than introduced by this merge.  Inserted after
+        # the ENOSPC early-return (ENOSPC is always task-side infra) and before
+        # the generic task-fault build so all 4 merge paths are covered uniformly.
+        # merge_wt is already cleaned up; the probe builds its own _mainprobe-
+        # worktree and always cleans it in a finally block.
+        main_health_outcome = await _classify_main_health_red(
+            git_ops, req, verify, event_store,
+        )
+        if main_health_outcome is not None:
+            return main_health_outcome
         detail = verify.failure_report()
         reason = f'Post-merge verification failed: {verify.summary}'
         if detail:
@@ -2830,6 +2935,10 @@ class MergeOutcome:
     verification failure in log messages."""
     superseded_by: str | None = None
     """request_id of the gen-(n+1) request that supersedes this one (γ2)."""
+    dedupe_fingerprint: str = ''
+    """Carries the preexisting-main-break dedupe fingerprint so the workflow
+    can fold N concurrent failing merges into one parent escalation via
+    ``submit_or_dedupe``.  Empty for all non-main-health outcomes."""
 
 
 @dataclass
@@ -3131,6 +3240,7 @@ async def _do_train_merge(
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        event_store=event_store,
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
@@ -3831,6 +3941,7 @@ class MergeWorker(_WipHaltMixin):
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                event_store=self._event_store,
             )
             if out is not None:
                 return out
@@ -5489,6 +5600,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     enospc_retries=self._post_merge_verify_enospc_retries,
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                    event_store=self._event_store,
                 ))
                 while True:
                     done, _ = await asyncio.wait(
