@@ -427,8 +427,6 @@ async def test_stable_signature_reaches_threshold_and_escalates():
     Counter reaches max_consecutive_merge_thrash (=2) → _mark_blocked with
     escalate_to_human=True.
     """
-    import hashlib
-
     f = _make(
         metadata={'consecutive_merge_thrash': 1},
         max_consecutive_merge_thrash=2,
@@ -574,14 +572,13 @@ async def test_ensure_l1_escalation_stamps_root_cause():
     wf.escalation_queue = mock_queue  # type: ignore[assignment]
     wf.event_store = None
 
-    with patch.object(wf, '_build_train_state', new=AsyncMock(return_value=None)):
-        with patch.object(wf, '_durable_ref_suffix', return_value=''):
-            await wf._ensure_l1_escalation_for_blocked(
-                'Repeated merge-phase thrash',
-                'detail here',
-                category='task_failure',
-                root_cause=expected_root_cause,
-            )
+    with patch.object(wf, '_build_train_state', new=AsyncMock(return_value=None)), patch.object(wf, '_durable_ref_suffix', return_value=''):
+        await wf._ensure_l1_escalation_for_blocked(
+            'Repeated merge-phase thrash',
+            'detail here',
+            category='task_failure',
+            root_cause=expected_root_cause,
+        )
 
     assert len(submitted_escs) == 1, f'Expected 1 submitted escalation, got {submitted_escs}'
     esc = submitted_escs[0]
