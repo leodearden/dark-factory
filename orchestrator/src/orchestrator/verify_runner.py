@@ -73,6 +73,19 @@ __all__ = [
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
     "unscoped_gate_failing_subprojects",
+    # ε additions
+    "EnvFingerprint",
+    "fingerprint_to_json",
+    "fingerprint_from_json",
+    "EnvParityVerdict",
+    "compare_env_fingerprints",
+    "capture_env_fingerprint",
+    "ParityRow",
+    "VerdictParityReport",
+    "parity_report_to_json",
+    "parity_report_from_json",
+    "run_verdict_parity",
+    "render_parity_report",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -848,3 +861,356 @@ def result_to_json(vr: VerifyResult) -> str:
 def result_from_json(s: str) -> VerifyResult:
     """Deserialise a VerifyResult from a JSON string."""
     return result_from_dict(json.loads(s))
+
+
+# ---------------------------------------------------------------------------
+# ε: EnvFingerprint — env-fidelity fingerprint + codec
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnvFingerprint:
+    """Frozen snapshot of a host's verify environment.
+
+    Fields
+    ------
+    toolchain:        Trimmed stdout of rustc/cargo --version probes joined by newline.
+    verify_env:       A copy of the verify_env mapping (str→str).
+    sccache_reachable: True when the sccache probe exits 0.
+    extra_probes:     Operator-supplied key→trimmed-stdout probe results.
+
+    The canonical-JSON codec (fingerprint_to_json / fingerprint_from_json) is
+    byte-identical: sort_keys=True canonicalises dict key order so that the same
+    fingerprint always serialises to the same bytes regardless of insertion order.
+    """
+
+    toolchain: str
+    verify_env: Mapping[str, str]
+    sccache_reachable: bool
+    extra_probes: Mapping[str, str]
+
+    def to_dict(self) -> dict:
+        return {
+            "toolchain": self.toolchain,
+            "verify_env": dict(self.verify_env),
+            "sccache_reachable": self.sccache_reachable,
+            "extra_probes": dict(self.extra_probes),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> EnvFingerprint:
+        return cls(
+            toolchain=d["toolchain"],
+            verify_env=dict(d["verify_env"]),
+            sccache_reachable=bool(d["sccache_reachable"]),
+            extra_probes=dict(d["extra_probes"]),
+        )
+
+
+def fingerprint_to_json(fp: EnvFingerprint) -> str:
+    """Serialise an EnvFingerprint to canonical JSON (sort_keys=True, ensure_ascii=False)."""
+    return json.dumps(fp.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+def fingerprint_from_json(s: str) -> EnvFingerprint:
+    """Deserialise an EnvFingerprint from a JSON string."""
+    return EnvFingerprint.from_dict(json.loads(s))
+
+
+# ---------------------------------------------------------------------------
+# ε: EnvParityVerdict — compare two EnvFingerprints
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnvParityVerdict:
+    """Result of comparing two EnvFingerprints (local vs remote).
+
+    is_faithful:      True when every dimension matches; False if any drift.
+    drift_dimensions: Names of fields that differ (empty tuple when faithful).
+    """
+
+    is_faithful: bool
+    drift_dimensions: tuple[str, ...]
+
+
+def compare_env_fingerprints(
+    local: EnvFingerprint,
+    remote: EnvFingerprint,
+) -> EnvParityVerdict:
+    """Compare local and remote fingerprints field by field.
+
+    Returns an EnvParityVerdict with is_faithful=True when all fields match,
+    and drift_dimensions listing the names of any fields that differ.
+    """
+    drifts: list[str] = []
+    if local.toolchain != remote.toolchain:
+        drifts.append("toolchain")
+    if dict(local.verify_env) != dict(remote.verify_env):
+        drifts.append("verify_env")
+    if local.sccache_reachable != remote.sccache_reachable:
+        drifts.append("sccache_reachable")
+    if dict(local.extra_probes) != dict(remote.extra_probes):
+        drifts.append("extra_probes")
+    return EnvParityVerdict(
+        is_faithful=not bool(drifts),
+        drift_dimensions=tuple(drifts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ε: capture_env_fingerprint — probe a host's verify env
+# ---------------------------------------------------------------------------
+
+
+async def capture_env_fingerprint(
+    run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+    *,
+    verify_env: Mapping[str, str] | None = None,
+    extra_probe_specs: Sequence[tuple[str, list[str]]] = (),
+) -> EnvFingerprint:
+    """Probe a host's verify environment and return a frozen EnvFingerprint.
+
+    Parameters
+    ----------
+    run:
+        Injected async callable ``(argv, *, cwd=None) -> (rc, stdout, stderr)``.
+        Defaults to ``_default_subprocess_run`` for local capture; pass an
+        ssh-wrapping adapter for remote capture.
+    verify_env:
+        The verify_env mapping to embed verbatim (not probed — it is operator-
+        supplied configuration, not a discovered fact).
+    extra_probe_specs:
+        Sequence of ``(key, argv)`` pairs for operator-supplied OS-level probes.
+        Each argv is issued through ``run``; trimmed stdout is stored under
+        ``key``.  When a probe exits non-zero the value is
+        ``'<unavailable rc=N>'``.
+    """
+    _run = run if run is not None else _default_subprocess_run
+
+    # Toolchain: rustc --version + cargo --version
+    _, rustc_out, _ = await _run(['rustc', '--version'])
+    _, cargo_out, _ = await _run(['cargo', '--version'])
+    toolchain = (rustc_out.strip() + '\n' + cargo_out.strip()).strip()
+
+    # sccache reachability
+    sccache_rc, _, _ = await _run(['sccache', '--show-stats'])
+    sccache_reachable = (sccache_rc == 0)
+
+    # Extra probes
+    extra_probes: dict[str, str] = {}
+    for key, argv in extra_probe_specs:
+        probe_rc, probe_out, _ = await _run(argv)
+        if probe_rc == 0:
+            extra_probes[key] = probe_out.strip()
+        else:
+            extra_probes[key] = f'<unavailable rc={probe_rc}>'
+
+    return EnvFingerprint(
+        toolchain=toolchain,
+        verify_env=dict(verify_env) if verify_env is not None else {},
+        sccache_reachable=sccache_reachable,
+        extra_probes=extra_probes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ε: ParityRow + VerdictParityReport + run_verdict_parity + render_parity_report
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParityRow:
+    """One corpus entry in a verdict-parity run.
+
+    sha:             The merge SHA tested.
+    expected_pass:   Operator-supplied expected verdict (None if not specified).
+    local_passed:    LocalRunner verdict.
+    remote_passed:   RemoteRunner verdict.
+    local_category:  LocalRunner result category (for divergence detail).
+    remote_category: RemoteRunner result category.
+    agree:           True when local_passed == remote_passed.
+    matches_expected: True/False when expected_pass is not None; None otherwise.
+    """
+
+    sha: str
+    expected_pass: bool | None
+    local_passed: bool
+    remote_passed: bool
+    local_category: str
+    remote_category: str
+    agree: bool
+    matches_expected: bool | None
+
+    def to_dict(self) -> dict:
+        return {
+            "sha": self.sha,
+            "expected_pass": self.expected_pass,
+            "local_passed": self.local_passed,
+            "remote_passed": self.remote_passed,
+            "local_category": self.local_category,
+            "remote_category": self.remote_category,
+            "agree": self.agree,
+            "matches_expected": self.matches_expected,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ParityRow:
+        return cls(
+            sha=d["sha"],
+            expected_pass=d["expected_pass"],
+            local_passed=d["local_passed"],
+            remote_passed=d["remote_passed"],
+            local_category=d["local_category"],
+            remote_category=d["remote_category"],
+            agree=d["agree"],
+            matches_expected=d["matches_expected"],
+        )
+
+
+@dataclass(frozen=True)
+class VerdictParityReport:
+    """Result of a verdict-parity run over a corpus of merge SHAs.
+
+    rows:           One ParityRow per corpus SHA.
+    all_agree:      True when every row has agree==True.
+    divergent_shas: SHAs where local and remote disagreed.
+    """
+
+    rows: tuple[ParityRow, ...]
+    all_agree: bool
+    divergent_shas: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "rows": [r.to_dict() for r in self.rows],
+            "all_agree": self.all_agree,
+            "divergent_shas": list(self.divergent_shas),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> VerdictParityReport:
+        return cls(
+            rows=tuple(ParityRow.from_dict(r) for r in d["rows"]),
+            all_agree=d["all_agree"],
+            divergent_shas=tuple(d["divergent_shas"]),
+        )
+
+
+def parity_report_to_json(report: VerdictParityReport) -> str:
+    """Serialise a VerdictParityReport to canonical JSON."""
+    return json.dumps(report.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+def parity_report_from_json(s: str) -> VerdictParityReport:
+    """Deserialise a VerdictParityReport from a JSON string."""
+    return VerdictParityReport.from_dict(json.loads(s))
+
+
+async def run_verdict_parity(
+    corpus: Sequence[tuple[str, bool | None]],
+    local_runner: Any,
+    remote_runner: Any,
+    spec: MergeVerifySpec,
+) -> VerdictParityReport:
+    """Run the same merge SHA through BOTH runners and compare verdicts.
+
+    Parameters
+    ----------
+    corpus:        Sequence of (merge_sha, expected_pass_or_None).
+    local_runner:  A VerifyRunner (LocalRunner or equivalent) — called directly.
+    remote_runner: A VerifyRunner (RemoteRunner or equivalent) — called directly.
+    spec:          The MergeVerifySpec to pass to both runners.
+
+    Each SHA is run through local_runner.run_merge_verify AND
+    remote_runner.run_merge_verify independently (NOT via VerifyRunnerPool).
+    Agreement is decided on VerifyResult.passed (boolean verdict), per
+    PRD §A Invariant 1.
+    """
+    rows: list[ParityRow] = []
+    for sha, expected_pass in corpus:
+        try:
+            local_result = await local_runner.run_merge_verify(sha, spec)
+            remote_result = await remote_runner.run_merge_verify(sha, spec)
+        except Exception as exc:
+            # A runner failure for one SHA must not discard the whole corpus run.
+            # Record an errored row (agree=False, matches_expected=None) and continue.
+            error_msg = f"runner_error: {exc}"
+            rows.append(ParityRow(
+                sha=sha,
+                expected_pass=expected_pass,
+                local_passed=False,
+                remote_passed=False,
+                local_category=error_msg,
+                remote_category=error_msg,
+                agree=False,
+                matches_expected=None,
+            ))
+            continue
+        agree = local_result.passed == remote_result.passed
+        if expected_pass is None or not agree:
+            # matches_expected is undefined when there is no agreed verdict to compare.
+            matches_expected = None
+        else:
+            matches_expected = (local_result.passed == expected_pass)
+        rows.append(ParityRow(
+            sha=sha,
+            expected_pass=expected_pass,
+            local_passed=local_result.passed,
+            remote_passed=remote_result.passed,
+            local_category=getattr(local_result, 'category', ''),
+            remote_category=getattr(remote_result, 'category', ''),
+            agree=agree,
+            matches_expected=matches_expected,
+        ))
+
+    divergent_shas = tuple(r.sha for r in rows if not r.agree)
+    return VerdictParityReport(
+        rows=tuple(rows),
+        all_agree=not bool(divergent_shas),
+        divergent_shas=divergent_shas,
+    )
+
+
+def render_parity_report(report: VerdictParityReport) -> str:
+    """Render a VerdictParityReport as a Markdown string.
+
+    Structure
+    ---------
+    - Headline verdict (PASS / DIVERGENCE DETECTED)
+    - Results table: sha | expected | local | remote | agree
+    - Divergence callout listing divergent SHAs (when non-empty)
+    """
+    lines: list[str] = []
+
+    # Headline verdict
+    lines.append("# Verdict Parity Report\n")
+    if report.all_agree:
+        lines.append("**Overall verdict: ✅ PASS — parity holds across all corpus SHAs.**\n")
+    else:
+        lines.append(
+            f"**Overall verdict: ❌ DIVERGENCE DETECTED — "
+            f"{len(report.divergent_shas)} SHA(s) disagree.**\n"
+        )
+
+    # Results table
+    lines.append("## Results\n")
+    lines.append("| sha | expected | local | remote | agree |")
+    lines.append("|-----|----------|-------|--------|-------|")
+    for row in report.rows:
+        expected_str = "pass" if row.expected_pass else ("fail" if row.expected_pass is False else "—")
+        local_str = "✅" if row.local_passed else "❌"
+        remote_str = "✅" if row.remote_passed else "❌"
+        agree_str = "✅" if row.agree else "❌"
+        lines.append(
+            f"| `{row.sha}` | {expected_str} | {local_str} | {remote_str} | {agree_str} |"
+        )
+
+    # Divergence callout
+    if report.divergent_shas:
+        lines.append("\n## Divergent SHAs\n")
+        lines.append("The following SHAs produced different verdicts on local vs remote:\n")
+        for sha in report.divergent_shas:
+            lines.append(f"- `{sha}`")
+
+    return "\n".join(lines)

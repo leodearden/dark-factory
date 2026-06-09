@@ -1763,3 +1763,734 @@ class TestVerifyRunnerPoolFailSafe:
         pool = VerifyRunnerPool([remote_fake])
         with pytest.raises(RunnerUnavailable):
             await pool.dispatch('sha', _make_spec())
+
+
+# ---------------------------------------------------------------------------
+# ε step-1: EnvFingerprint frozen dataclass + JSON codec
+# ---------------------------------------------------------------------------
+
+
+class TestEnvFingerprint:
+    """EnvFingerprint is a frozen dataclass with canonical JSON codec."""
+
+    def _make_fp(self, **kwargs):
+        from orchestrator.verify_runner import EnvFingerprint
+        defaults = dict(
+            toolchain='rustc 1.80.0 (abc123 2024-07-01)\ncargo 1.80.0',
+            verify_env={'SCCACHE_BUCKET': 'builds', 'RUST_LOG': 'info'},
+            sccache_reachable=True,
+            extra_probes={'python_version': 'Python 3.11.9'},
+        )
+        defaults.update(kwargs)
+        return EnvFingerprint(**defaults)  # type: ignore[arg-type]
+
+    def test_frozen_raises_on_reassignment(self):
+        fp = self._make_fp()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            fp.toolchain = 'other'  # type: ignore[misc]
+
+    def test_verify_env_frozen_raises_on_reassignment(self):
+        fp = self._make_fp()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            fp.verify_env = {}  # type: ignore[misc]
+
+    def test_sccache_reachable_bool_field(self):
+        fp_true = self._make_fp(sccache_reachable=True)
+        fp_false = self._make_fp(sccache_reachable=False)
+        assert fp_true.sccache_reachable is True
+        assert fp_false.sccache_reachable is False
+
+    def test_to_dict_from_dict_roundtrip(self):
+        fp = self._make_fp()
+        assert fp.from_dict(fp.to_dict()) == fp
+
+    def test_to_dict_from_dict_empty_maps(self):
+        fp = self._make_fp(verify_env={}, extra_probes={})
+        assert fp.from_dict(fp.to_dict()) == fp
+
+    def test_json_roundtrip_byte_identical(self):
+        """to_json(from_json(s)) == s (byte-identical re-serialisation)."""
+        from orchestrator.verify_runner import fingerprint_from_json, fingerprint_to_json
+        fp = self._make_fp()
+        s = fingerprint_to_json(fp)
+        assert fingerprint_to_json(fingerprint_from_json(s)) == s
+
+    def test_json_sort_keys_canonical(self):
+        """Env built in reversed insertion order serialises identically (sort_keys)."""
+        from orchestrator.verify_runner import fingerprint_to_json
+        fp_fwd = self._make_fp(verify_env={'A': '1', 'B': '2', 'C': '3'})
+        fp_rev = self._make_fp(verify_env={'C': '3', 'B': '2', 'A': '1'})
+        assert fingerprint_to_json(fp_fwd) == fingerprint_to_json(fp_rev)
+
+    def test_json_deterministic(self):
+        """Same object serialises to the same bytes on repeated calls."""
+        from orchestrator.verify_runner import fingerprint_to_json
+        fp = self._make_fp()
+        assert fingerprint_to_json(fp) == fingerprint_to_json(fp)
+
+    def test_all_new_epsilon_names_in_dunder_all(self):
+        """All ε-added public names are present in __all__ and importable."""
+        import orchestrator.verify_runner as vr_mod
+        expected = {
+            'EnvFingerprint',
+            'fingerprint_to_json',
+            'fingerprint_from_json',
+            'EnvParityVerdict',
+            'compare_env_fingerprints',
+            'capture_env_fingerprint',
+            'ParityRow',
+            'VerdictParityReport',
+            'parity_report_to_json',
+            'parity_report_from_json',
+            'run_verdict_parity',
+            'render_parity_report',
+        }
+        missing = expected - set(vr_mod.__all__)
+        assert not missing, f"Missing from __all__: {sorted(missing)}"
+        # Also verify each name resolves to a real attribute
+        for name in expected:
+            assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"
+
+
+# ---------------------------------------------------------------------------
+# ε step-3: capture_env_fingerprint — probe commands via injected run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCaptureEnvFingerprint:
+    """capture_env_fingerprint is async and probes through an injected run callable."""
+
+    def _make_fake_run(self, responses):
+        """Return async callable that returns successive (rc, stdout, stderr) tuples."""
+        responses_queue = list(responses)
+        issued = []
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(argv)
+            return responses_queue.pop(0)
+
+        fake_run.issued = issued
+        return fake_run
+
+    async def test_toolchain_from_rustc_cargo_stdout(self):
+        """toolchain == trimmed rustc + cargo --version stdout joined by newline."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0 (abc 2024-01-01)\n', ''),  # rustc --version
+            (0, 'cargo 1.80.0 (def 2024-01-01)\n', ''),  # cargo --version
+            (0, 'sccache stats\n', ''),                   # sccache --show-stats
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.toolchain == 'rustc 1.80.0 (abc 2024-01-01)\ncargo 1.80.0 (def 2024-01-01)'
+
+    async def test_sccache_reachable_when_rc_zero(self):
+        """sccache_reachable is True when sccache --show-stats returns rc==0."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, 'stats here\n', ''),   # sccache rc=0
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.sccache_reachable is True
+
+    async def test_sccache_not_reachable_when_rc_nonzero(self):
+        """sccache_reachable is False when sccache --show-stats returns rc!=0."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (1, '', 'connection refused'),  # sccache rc=1
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.sccache_reachable is False
+
+    async def test_verify_env_carried_through_verbatim(self):
+        """verify_env is embedded verbatim from the kwarg."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        env = {'FOO': 'bar', 'SCCACHE_BUCKET': 'builds'}
+        fp = await capture_env_fingerprint(fake_run, verify_env=env)
+        assert dict(fp.verify_env) == env
+
+    async def test_extra_probe_specs_populate_extra_probes(self):
+        """extra_probe_specs (key, argv) pairs populate extra_probes with trimmed stdout."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),                        # sccache
+            (0, 'Python 3.11.9\n', ''),         # python_version probe
+            (0, 'Ubuntu 22.04\n', ''),           # os_release probe
+        ])
+        probes = [
+            ('python_version', ['python3', '--version']),
+            ('os_release', ['lsb_release', '-d']),
+        ]
+        fp = await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert dict(fp.extra_probes) == {
+            'python_version': 'Python 3.11.9',
+            'os_release': 'Ubuntu 22.04',
+        }
+
+    async def test_extra_probe_unavailable_on_nonzero_rc(self):
+        """When an extra probe exits non-zero, the value is '<unavailable rc=N>'."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),          # sccache
+            (2, '', 'not found'), # extra probe with rc=2
+        ])
+        probes = [('missing_tool', ['missing_tool', '--version'])]
+        fp = await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert fp.extra_probes['missing_tool'] == '<unavailable rc=2>'
+
+    async def test_exact_argv_lists_issued_to_run(self):
+        """Assert the exact argv lists issued to the run callable."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, 'stats\n', ''),
+            (0, 'Python 3.11.9\n', ''),
+        ])
+        probes = [('python_version', ['python3', '--version'])]
+        await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert fake_run.issued == [
+            ['rustc', '--version'],
+            ['cargo', '--version'],
+            ['sccache', '--show-stats'],
+            ['python3', '--version'],
+        ]
+
+    async def test_no_extra_probes_by_default(self):
+        """With no extra_probe_specs, extra_probes is an empty mapping."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert dict(fp.extra_probes) == {}
+
+    async def test_default_verify_env_empty(self):
+        """With no verify_env kwarg, verify_env is an empty mapping."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert dict(fp.verify_env) == {}
+
+
+# ---------------------------------------------------------------------------
+# ε step-5: compare_env_fingerprints → EnvParityVerdict
+# ---------------------------------------------------------------------------
+
+
+class TestCompareEnvFingerprints:
+    """compare_env_fingerprints(local, remote) -> EnvParityVerdict."""
+
+    def _fp(self, **kwargs):
+        from orchestrator.verify_runner import EnvFingerprint
+        base = dict(
+            toolchain='rustc 1.80.0\ncargo 1.80.0',
+            verify_env={'KEY': 'val'},
+            sccache_reachable=True,
+            extra_probes={'python_version': 'Python 3.11.9'},
+        )
+        base.update(kwargs)
+        return EnvFingerprint(**base)  # type: ignore[arg-type]
+
+    def test_identical_fingerprints_is_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        fp = self._fp()
+        verdict = compare_env_fingerprints(fp, fp)
+        assert verdict.is_faithful is True
+        assert verdict.drift_dimensions == ()
+
+    def test_toolchain_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0\ncargo 1.80.0')
+        remote = self._fp(toolchain='rustc 1.79.0\ncargo 1.79.0')
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'toolchain' in verdict.drift_dimensions
+
+    def test_verify_env_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(verify_env={'FOO': 'bar'})
+        remote = self._fp(verify_env={'FOO': 'baz'})
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'verify_env' in verdict.drift_dimensions
+
+    def test_sccache_reachable_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(sccache_reachable=True)
+        remote = self._fp(sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'sccache_reachable' in verdict.drift_dimensions
+
+    def test_extra_probes_mismatch_not_faithful(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(extra_probes={'python_version': 'Python 3.11.9'})
+        remote = self._fp(extra_probes={'python_version': 'Python 3.12.0'})
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'extra_probes' in verdict.drift_dimensions
+
+    def test_multi_dimension_drift_all_listed(self):
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0', sccache_reachable=True)
+        remote = self._fp(toolchain='rustc 1.79.0', sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'toolchain' in verdict.drift_dimensions
+        assert 'sccache_reachable' in verdict.drift_dimensions
+
+    def test_only_differing_dimensions_listed(self):
+        """Only the fields that differ appear in drift_dimensions."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.80.0')
+        remote = self._fp(toolchain='rustc 1.79.0')
+        verdict = compare_env_fingerprints(local, remote)
+        assert 'verify_env' not in verdict.drift_dimensions
+        assert 'sccache_reachable' not in verdict.drift_dimensions
+        assert 'extra_probes' not in verdict.drift_dimensions
+
+
+# ---------------------------------------------------------------------------
+# ε step-7: run_verdict_parity — all-agree path
+# ---------------------------------------------------------------------------
+
+
+def _make_verify_result(passed=True, category=''):
+    return VerifyResult(
+        passed=passed,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='ok' if passed else 'fail',
+        category=category,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunVerdictParityAllAgree:
+    """run_verdict_parity: all-agree path — both runners return identical verdicts."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        """Fake VerifyRunner whose run_merge_verify returns results keyed by sha."""
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def test_each_runner_called_once_per_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None)]
+        local_fake = self._make_fake_runner('local', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        _report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert local_fake.run_merge_verify.await_count == 2
+        assert remote_fake.run_merge_verify.await_count == 2
+
+    async def test_runners_called_with_sha_and_spec(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        spec = _make_spec()
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result()})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result()})
+        await run_verdict_parity(corpus, local_fake, remote_fake, spec)
+        local_fake.run_merge_verify.assert_awaited_once_with('sha1', spec)
+        remote_fake.run_merge_verify.assert_awaited_once_with('sha1', spec)
+
+    async def test_report_has_one_row_per_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None), ('ccc', None)]
+        results = {s: _make_verify_result() for s in ('aaa', 'bbb', 'ccc')}
+        local_fake = self._make_fake_runner('local', results)
+        remote_fake = self._make_fake_runner('laptop', results)
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert len(report.rows) == 3
+        assert [r.sha for r in report.rows] == ['aaa', 'bbb', 'ccc']
+
+    async def test_row_local_remote_passed_from_results(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.local_passed is True
+        assert row.remote_passed is True
+
+    async def test_agree_true_when_both_match(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=False)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].agree is True
+
+    async def test_all_agree_true_when_every_row_agrees(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None)]
+        local_fake = self._make_fake_runner('local', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.all_agree is True
+        assert report.divergent_shas == ()
+
+    async def test_empty_corpus_all_agree(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        local_fake = self._make_fake_runner('local', {})
+        remote_fake = self._make_fake_runner('laptop', {})
+        report = await run_verdict_parity([], local_fake, remote_fake, _make_spec())
+        assert report.all_agree is True
+        assert report.rows == ()
+
+
+# ---------------------------------------------------------------------------
+# ε step-9: run_verdict_parity — divergence + expected-class coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerdictParityDivergence:
+    """run_verdict_parity divergence detection and expected-class checks."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def test_disagreeing_row_has_agree_false(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].agree is False
+
+    async def test_all_agree_false_when_one_disagreement(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None), ('sha2', None)]
+        local_fake = self._make_fake_runner('local', {
+            'sha1': _make_verify_result(passed=True),
+            'sha2': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'sha1': _make_verify_result(passed=False),  # disagrees
+            'sha2': _make_verify_result(passed=True),   # agrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.all_agree is False
+
+    async def test_divergent_shas_contains_disagreeing_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None), ('sha2', None)]
+        local_fake = self._make_fake_runner('local', {
+            'sha1': _make_verify_result(passed=True),
+            'sha2': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'sha1': _make_verify_result(passed=False),  # disagrees
+            'sha2': _make_verify_result(passed=True),   # agrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert 'sha1' in report.divergent_shas
+        assert 'sha2' not in report.divergent_shas
+
+    async def test_divergent_shas_exactly_the_disagreeing_ones(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('a', None), ('b', None), ('c', None)]
+        local_fake = self._make_fake_runner('local', {
+            'a': _make_verify_result(passed=True),
+            'b': _make_verify_result(passed=False),
+            'c': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'a': _make_verify_result(passed=False),  # disagrees
+            'b': _make_verify_result(passed=False),  # agrees
+            'c': _make_verify_result(passed=False),  # disagrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert set(report.divergent_shas) == {'a', 'c'}
+
+    async def test_expected_pass_none_matches_expected_is_none(self):
+        """When expected_pass is None, row.matches_expected is None."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].matches_expected is None
+
+    async def test_matches_expected_true_when_agreed_verdict_matches(self):
+        """matches_expected is True when both agree and verdict == expected_pass."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True
+        assert row.matches_expected is True
+
+    async def test_matches_expected_false_when_verdict_does_not_match(self):
+        """matches_expected is False when agreed verdict != expected_pass."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True but both fail
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=False)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True          # both agree on False
+        assert row.matches_expected is False  # but expected True
+
+    async def test_agree_independent_of_expected_pass(self):
+        """agree is purely local-vs-remote; expected_pass does not affect it."""
+        from orchestrator.verify_runner import run_verdict_parity
+        # Both pass; expected was False — matches_expected=False but agree=True
+        corpus = [('sha1', False)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True
+        assert row.matches_expected is False
+
+    async def test_matches_expected_none_when_runners_disagree(self):
+        """matches_expected is None when agree=False, even if expected_pass is set.
+
+        When runners diverge there is no agreed verdict, so comparing to
+        expected_pass would be semantically meaningless.
+        """
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is False
+        assert row.matches_expected is None  # no agreed verdict to compare
+
+    async def test_runner_error_records_errored_row_not_abort(self):
+        """A runner exception for one SHA records an error row; the rest still run."""
+        from orchestrator.verify_runner import run_verdict_parity
+
+        class BoomRunner:
+            name = 'boom'
+            is_local = False
+
+            async def run_merge_verify(self, sha, spec):
+                if sha == 'bad':
+                    raise RuntimeError("ssh connection refused")
+                return _make_verify_result(passed=True)
+
+        local_fake = self._make_fake_runner('local', {
+            'bad': _make_verify_result(passed=True),
+            'good': _make_verify_result(passed=True),
+        })
+        remote_boom = BoomRunner()
+        corpus = [('bad', None), ('good', None)]
+        report = await run_verdict_parity(corpus, local_fake, remote_boom, _make_spec())
+        # Both SHAs produce rows — the error did NOT abort the run
+        assert len(report.rows) == 2
+        shas = {r.sha for r in report.rows}
+        assert shas == {'bad', 'good'}
+        # The errored row is marked as non-agreeing with error text in category
+        bad_row = next(r for r in report.rows if r.sha == 'bad')
+        assert bad_row.agree is False
+        assert 'runner_error' in bad_row.remote_category
+        # The good row is unaffected
+        good_row = next(r for r in report.rows if r.sha == 'good')
+        assert good_row.agree is True
+
+
+# ---------------------------------------------------------------------------
+# ε: VerdictParityReport JSON codec round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerdictParityReportCodec:
+    """parity_report_to_json / parity_report_from_json round-trip byte-identical."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def _build_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc', True), ('def', None), ('ghi', False)]
+        results = {
+            'abc': _make_verify_result(passed=True),
+            'def': _make_verify_result(passed=False),
+            'ghi': _make_verify_result(passed=False),
+        }
+        local_fake = self._make_fake_runner('local', results)
+        remote_fake = self._make_fake_runner('laptop', results)
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def test_parity_report_json_roundtrip_byte_identical(self):
+        """to_json(from_json(s)) == s — byte-identical re-serialisation."""
+        from orchestrator.verify_runner import parity_report_from_json, parity_report_to_json
+        report = await self._build_report()
+        s = parity_report_to_json(report)
+        assert parity_report_to_json(parity_report_from_json(s)) == s
+
+    async def test_parity_report_json_roundtrip_equals_original(self):
+        """from_json(to_json(report)) == report — structural equality."""
+        from orchestrator.verify_runner import parity_report_from_json, parity_report_to_json
+        report = await self._build_report()
+        assert parity_report_from_json(parity_report_to_json(report)) == report
+
+    async def test_parity_report_to_dict_from_dict_roundtrip(self):
+        """to_dict / from_dict round-trip preserves all rows and aggregates."""
+        report = await self._build_report()
+        restored = report.from_dict(report.to_dict())
+        assert restored == report
+        assert len(restored.rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# ε step-11: render_parity_report — markdown structure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRenderParityReport:
+    """render_parity_report(report) -> str — markdown structure assertions."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def _all_agree_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc123', True), ('def456', False)]
+        local_fake = self._make_fake_runner('local', {
+            'abc123': _make_verify_result(passed=True),
+            'def456': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'abc123': _make_verify_result(passed=True),
+            'def456': _make_verify_result(passed=False),
+        })
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def _diverging_report(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('abc123', None), ('bad456', None)]
+        local_fake = self._make_fake_runner('local', {
+            'abc123': _make_verify_result(passed=True),
+            'bad456': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'abc123': _make_verify_result(passed=True),
+            'bad456': _make_verify_result(passed=False),  # disagrees
+        })
+        return await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+
+    async def test_all_agree_headline_contains_pass_marker(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        assert 'PASS' in text or 'parity holds' in text.lower()
+
+    async def test_divergence_headline_contains_divergence_marker(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._diverging_report()
+        text = render_parity_report(report)
+        assert 'DIVERGENCE' in text or 'diverge' in text.lower()
+
+    async def test_results_table_contains_each_sha(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        assert 'abc123' in text
+        assert 'def456' in text
+
+    async def test_results_table_has_header_row(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # Table header must mention sha, local, remote, agree
+        assert 'sha' in text.lower()
+        assert 'local' in text.lower()
+        assert 'remote' in text.lower()
+        assert 'agree' in text.lower()
+
+    async def test_divergent_shas_listed_when_present(self):
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._diverging_report()
+        text = render_parity_report(report)
+        assert 'bad456' in text
+
+    async def test_divergent_shas_section_absent_when_all_agree(self):
+        """No divergence callout section when all rows agree."""
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # The divergent SHA from the other corpus must NOT appear
+        assert 'bad456' not in text
+
+    async def test_one_table_row_per_corpus_sha(self):
+        """Table has exactly one data row per corpus SHA (not counting header)."""
+        from orchestrator.verify_runner import render_parity_report
+        report = await self._all_agree_report()
+        text = render_parity_report(report)
+        # Count lines containing 'abc123' and 'def456' — each should appear once
+        lines = text.splitlines()
+        assert sum(1 for line in lines if 'abc123' in line) == 1
+        assert sum(1 for line in lines if 'def456' in line) == 1
