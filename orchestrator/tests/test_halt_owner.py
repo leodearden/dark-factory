@@ -434,3 +434,55 @@ class TestForceUnhaltMergeQueue:
         result = harness.force_unhalt_merge_queue('test')
         assert result['unhalted'] is False
         assert 'merge worker' in result.get('error', '').lower()
+
+
+class TestHaltMergeQueue:
+    """Operator-initiated merge-queue halt (backs the halt_merge_queue tool).
+
+    Exercised against a REAL SpeculativeMergeWorker so operator_halt() and the
+    halt-state contract (is_wip_halted / halt_owner_esc_id) can't drift.  An
+    operator halt sets the same _wip_halt with no owning escalation, so
+    get_merge_halt_status reports halted=True and force_unhalt_merge_queue
+    cleanly reverses it (its active-owner refusal does not trigger).
+    """
+
+    def test_halt_then_unhalt_round_trip(self, harness: Harness):
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+        harness._merge_worker = worker  # type: ignore[assignment]
+
+        # Initially un-halted.
+        assert harness.get_merge_halt_status() == {
+            'wired': True, 'halted': False, 'owner_esc_id': None,
+        }
+
+        result = harness.halt_merge_queue('operator halt: bad main')
+        assert result == {'halted': True, 'reason': 'operator halt: bad main'}
+
+        # Reads as halted with NO owner, and the operator-halt signal is set.
+        status = harness.get_merge_halt_status()
+        assert status['halted'] is True
+        assert status['owner_esc_id'] is None
+        assert worker._operator_halt.is_set() is True  # noqa: SLF001
+
+        # The existing force_unhalt_merge_queue cleanly reverses it (no owner →
+        # active-owner refusal does not fire) and clears the operator signal.
+        unhalt = harness.force_unhalt_merge_queue('all clear')
+        assert unhalt['unhalted'] is True
+        assert unhalt['prior_owner'] is None
+        assert harness.get_merge_halt_status()['halted'] is False
+        assert worker._operator_halt.is_set() is False  # noqa: SLF001
+
+    def test_halt_when_already_halted_is_noop(self, harness: Harness):
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+        harness._merge_worker = worker  # type: ignore[assignment]
+
+        assert harness.halt_merge_queue('first')['halted'] is True
+        # Second call short-circuits without re-halting.
+        again = harness.halt_merge_queue('second')
+        assert again == {'halted': False, 'reason': 'queue already halted'}
+
+    def test_halt_when_no_merge_worker(self, harness: Harness):
+        harness._merge_worker = None
+        result = harness.halt_merge_queue('test')
+        assert result['halted'] is False
+        assert 'merge worker' in result.get('error', '').lower()

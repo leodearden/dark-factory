@@ -2009,3 +2009,69 @@ class TestHarnessDigestEscalationCounterSnapshot:
             f'got {harness._last_digest_event_count} '
             f'(live value after concurrent +100 would be 105)'
         )
+
+
+class TestForceHaltScheduler:
+    """Harness.force_halt_scheduler — the operator-halt wrapper the MCP tool calls.
+
+    Mirrors force_resume_scheduler's structured-return shape but in the halt
+    direction: pauses + persists + emits scheduler_paused, yet deliberately does
+    NOT file the auto-resumable scheduler-pause L1 (file_escalation=False) so a
+    watcher cannot silently undo a deliberate operator halt.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_halt_pauses_persists_emits(self, tmp_path: Path) -> None:
+        """force_halt_scheduler pauses, persists to runs.db, and emits the event."""
+        harness, mock_run_store, event_store = _make_harness_with_mocks(tmp_path)
+        assert harness.scheduler.is_paused is False
+
+        result = await harness.force_halt_scheduler('operator halt: bad main')
+
+        assert result == {
+            'halted': True,
+            'was_paused': False,
+            'prior_reason': None,
+            'reason': 'operator halt: bad main',
+        }
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_reason == 'operator halt: bad main'
+        # Persisted so the halt survives a restart.
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        # Timeline event still fires.
+        rows = _query_events(event_store, 'scheduler_paused')
+        assert len(rows) == 1, f'Expected 1 scheduler_paused event; got {len(rows)}'
+
+    @pytest.mark.asyncio
+    async def test_force_halt_does_not_file_escalation(self, tmp_path: Path) -> None:
+        """A deliberate operator halt must NOT file an auto-resumable L1.
+
+        Contrast TestSchedulerPauseEscalation.test_pause_files_l1_escalation: the
+        default pause path DOES file one.  force_halt_scheduler passes
+        file_escalation=False so the auto-watcher / unblock-low-risk skill cannot
+        resolve an L1 and silently undo the halt.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+
+        await harness.force_halt_scheduler('operator halt: infra incident')
+
+        sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
+        assert sentinel == [], (
+            f'force_halt_scheduler must NOT file a scheduler-pause L1; got {sentinel!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_resume_reverses_force_halt(self, tmp_path: Path) -> None:
+        """force_resume_scheduler clears a halt set by force_halt_scheduler."""
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+
+        await harness.force_halt_scheduler('operator halt: runaway')
+        assert harness.scheduler.is_paused is True
+
+        resume = await harness.force_resume_scheduler('all clear')
+
+        assert resume['resumed'] is True
+        assert harness.scheduler.is_paused is False
+        mock_run_store.clear_scheduler_pause.assert_called_once()
