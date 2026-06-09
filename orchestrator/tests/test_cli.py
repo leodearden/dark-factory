@@ -770,8 +770,13 @@ def _setup_verify_repo(tmp_path: Path):
 
 
 @pytest.mark.parametrize('test_command,expect_pass', [('true', True), ('false', False)])
-def test_verify_merge_parity(tmp_path, monkeypatch, test_command, expect_pass):
-    """verify-merge emits a VerifyResult JSON identical to a local run on the same SHA.
+def test_verify_merge_cli_wrapper_transparency(tmp_path, monkeypatch, test_command, expect_pass):
+    """CLI verify-merge is a transparent wrapper: JSON round-trip is lossless and exit code is clean.
+
+    Both the local baseline and the CLI call run_merge_verify_on_worktree on the same
+    SHA with the same spec, so the test validates that the CLI scaffolding (config load,
+    spec parse, worktree create/cleanup, JSON serialise) adds no observable difference.
+    It does *not* validate parity against the merge-queue dispatch path directly.
 
     SYNC test (asyncio_mode=auto): the local result is computed via asyncio.run()
     before invoking CliRunner so we never nest event loops.

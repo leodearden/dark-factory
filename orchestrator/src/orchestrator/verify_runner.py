@@ -291,8 +291,11 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
       each ModuleConfig's verify_env and verify_cold_command_timeout_secs
 
     ModuleConfig fields the wire spec never carried (lock_depth, warm timeout, etc.)
-    stay at their dataclass defaults so reconstruction is information-preserving for
-    all verify-relevant behaviour.
+    stay at their dataclass defaults.  Reconstruction is information-preserving for
+    all verify-relevant behaviour *when build_merge_verify_spec is the sole producer*:
+    it serialises a single spec-level cold_timeout_secs for all modules, so if modules
+    originally had distinct per-module cold timeouts the reconstruction is not lossless
+    (the spec collapses them).  In practice the merge path uses one config-level value.
 
     cold_timeout_secs: the 0.0 wire sentinel (emitted by build_merge_verify_spec when
     neither merge_verify_cold_command_timeout_secs nor verify_cold_command_timeout_secs
@@ -353,6 +356,14 @@ async def run_merge_verify_on_worktree(
         from orchestrator.merge_queue import _run_unscoped_typechecks  # type: ignore[attr-defined]
         run_unscoped = _run_unscoped_typechecks
 
+    # module_configs is reconstructed from spec.verify_commands (which carries
+    # type_check_command per module).  build_merge_verify_spec — the sole spec producer
+    # — copies mc.type_check_command into *both* verify_commands and
+    # unscoped_typecheck.commands, so the typecheck gate's module_configs are correct.
+    # If any future producer emits a spec where those two lists diverge (verify_commands
+    # lacks type_check_command while unscoped_typecheck.commands carries it), the unscoped
+    # gate would silently become a no-op.  Adding a new spec producer must maintain that
+    # invariant or reconstruct module_configs from spec.unscoped_typecheck instead.
     module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 

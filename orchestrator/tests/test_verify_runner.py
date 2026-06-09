@@ -992,6 +992,60 @@ class TestRunMergeVerifyOnWorktree:
         assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
         assert 'src/a' in result.summary  # noqa: SIM910
 
+    async def test_type_check_command_survives_into_unscoped_module_configs(self):
+        """type_check_command on verify_commands survives into module_configs passed to run_unscoped.
+
+        build_merge_verify_spec copies type_check_command into both verify_commands and
+        unscoped_typecheck.commands, keeping them in sync.  This test mirrors a realistic
+        spec produced by that function and asserts that the reconstructed module_configs
+        passed to the unscoped gate carry the type_check_command — ensuring the gate is
+        not silently a no-op when typecheck commands are present.
+        """
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        config = MagicMock()
+        config.merge_verify_workspace = False
+
+        # Spec with type_check_command mirroring what build_merge_verify_spec produces
+        # when the module has a real typecheck command
+        spec = MergeVerifySpec(
+            verify_commands=(
+                VerifyCommand('src/a', test_command='true', type_check_command='mypy'),
+            ),
+            unscoped_typecheck=UnscopedTypecheckSpec(
+                commands=(VerifyCommand('src/a', type_check_command='mypy'),),
+                block_on_timeout=True,
+            ),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=123.0,
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_unscoped.await_args is not None, 'run_unscoped must have been called'
+        unscoped_pos = run_unscoped.await_args[0]
+        # run_unscoped(merge_wt, config, module_configs, ...)  — module_configs is positional arg 2
+        unscoped_module_configs = unscoped_pos[2]
+        assert len(unscoped_module_configs) == 1
+        assert unscoped_module_configs[0].prefix == 'src/a'
+        assert unscoped_module_configs[0].type_check_command == 'mypy', (
+            "type_check_command must survive spec→module_configs reconstruction so the "
+            "unscoped typecheck gate is not silently a no-op"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-5: run_merge_verify_on_worktree defaults to real merge-path callables
