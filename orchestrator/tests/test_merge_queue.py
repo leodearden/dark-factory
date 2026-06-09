@@ -16586,7 +16586,10 @@ class TestOperatorHalt:
         # (e) merge worktree cleaned up.
         assert not merge_wt_path.exists(), f'merge_wt {merge_wt_path} must be removed'
         # (f) req RE-QUEUED onto the merger input queue (not dropped).
-        assert req in list(queue._queue), (  # noqa: SLF001 — read-only test probe
+        # Read the asyncio.Queue's internal deque directly — the same read-only
+        # CPython-internal probe snapshot() uses; suppress private-access + attr.
+        queued = list(queue._queue)  # type: ignore[attr-defined]  # noqa: SLF001
+        assert req in queued, (
             'operator-halt must re-inject req onto the merger input queue'
         )
         # (g) future left PENDING so the waiting workflow keeps waiting.

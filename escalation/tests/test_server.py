@@ -3362,6 +3362,18 @@ class TestCreateServerStartupSweep:
         assert not (queue.queue_dir / 'archive').exists()
 
 
+async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
+    """Invoke an async MCP tool by name.
+
+    *server* is intentionally typed ``Any`` so pyright does not reach into
+    FastMCP's ``Tool`` internals (``.fn``) — mirroring the ``_blocker`` /
+    ``_info`` / ``_call_merge_status`` helpers above, which the type-check gate
+    accepts for exactly this reason.
+    """
+    tool = await server.get_tool(name)
+    return await tool.fn(**kwargs)
+
+
 @pytest.mark.asyncio
 class TestOperatorHaltTools:
     """halt_merge_queue / halt_scheduler — operator-only halt-direction tools.
@@ -3374,7 +3386,7 @@ class TestOperatorHaltTools:
 
     async def test_tools_registered(self, tmp_path: Path) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
+        server: Any = create_server(queue)
         assert await server.get_tool('halt_merge_queue') is not None
         assert await server.get_tool('halt_scheduler') is not None
 
@@ -3385,8 +3397,7 @@ class TestOperatorHaltTools:
     ) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)  # no harness wired
-        tool = await server.get_tool('halt_merge_queue')
-        result = await tool.fn(reason='bad main')
+        result = await _call_tool(server, 'halt_merge_queue', reason='bad main')
         assert result['halted'] is False
         assert 'standalone' in result['error']
 
@@ -3402,9 +3413,8 @@ class TestOperatorHaltTools:
 
         stub_harness = types.SimpleNamespace(halt_merge_queue=_halt)
         server = create_server(queue, harness=stub_harness)
-        tool = await server.get_tool('halt_merge_queue')
 
-        result = await tool.fn(reason='  infra incident  ')
+        result = await _call_tool(server, 'halt_merge_queue', reason='  infra incident  ')
 
         assert calls == ['infra incident'], 'reason must be forwarded stripped'
         assert result == {'halted': True, 'reason': 'infra incident'}
@@ -3418,9 +3428,8 @@ class TestOperatorHaltTools:
             halt_merge_queue=lambda r: called.append(r),
         )
         server = create_server(queue, harness=stub_harness)
-        tool = await server.get_tool('halt_merge_queue')
 
-        result = await tool.fn(reason='   ')
+        result = await _call_tool(server, 'halt_merge_queue', reason='   ')
 
         assert result['halted'] is False
         assert 'reason' in result['error']
@@ -3433,8 +3442,7 @@ class TestOperatorHaltTools:
     ) -> None:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)  # no harness wired
-        tool = await server.get_tool('halt_scheduler')
-        result = await tool.fn(reason='runaway')
+        result = await _call_tool(server, 'halt_scheduler', reason='runaway')
         assert result['halted'] is False
         assert 'standalone' in result['error']
 
@@ -3453,9 +3461,8 @@ class TestOperatorHaltTools:
 
         stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
         server = create_server(queue, harness=stub_harness)
-        tool = await server.get_tool('halt_scheduler')
 
-        result = await tool.fn(reason='  bad deploy  ')
+        result = await _call_tool(server, 'halt_scheduler', reason='  bad deploy  ')
 
         assert calls == ['bad deploy'], 'reason must be forwarded stripped'
         assert result['halted'] is True
@@ -3473,9 +3480,8 @@ class TestOperatorHaltTools:
 
         stub_harness = types.SimpleNamespace(force_halt_scheduler=_force_halt)
         server = create_server(queue, harness=stub_harness)
-        tool = await server.get_tool('halt_scheduler')
 
-        result = await tool.fn(reason='')
+        result = await _call_tool(server, 'halt_scheduler', reason='')
 
         assert result['halted'] is False
         assert 'reason' in result['error']

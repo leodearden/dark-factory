@@ -32,7 +32,7 @@ def test_operator_only_tools_absent_from_every_role_allow_list() -> None:
     """No agent role may list any operator-only escalation tool in allowed_tools."""
     offenders: dict[str, set[str]] = {}
     for name, role in ROLES.items():
-        leaked = OPERATOR_ONLY_ESCALATION_TOOLS.intersection(role.allowed_tools)
+        leaked = set(OPERATOR_ONLY_ESCALATION_TOOLS.intersection(role.allowed_tools))
         if leaked:
             offenders[name] = leaked
 
