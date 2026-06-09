@@ -1247,7 +1247,6 @@ class TestRemoteRunnerHappyPath:
         return runner, calls
 
     async def test_returns_verify_result_equal_to_expected(self):
-        from orchestrator.verify_runner import RemoteRunner
         expected = VerifyResult(
             passed=True,
             test_output='all green',
@@ -1260,7 +1259,6 @@ class TestRemoteRunnerHappyPath:
         assert result == expected
 
     async def test_git_push_argv_and_cwd(self):
-        from orchestrator.verify_runner import RemoteRunner
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected)
         await runner.run_merge_verify('abc123', _make_spec())
@@ -1272,7 +1270,8 @@ class TestRemoteRunnerHappyPath:
     async def test_ssh_argv_with_shlex_quoted_spec(self):
         """ssh is called as ['ssh', host, remote_cmd] where shlex.split(remote_cmd) round-trips."""
         import shlex as _shlex
-        from orchestrator.verify_runner import RemoteRunner, spec_to_json
+
+        from orchestrator.verify_runner import spec_to_json
         spec = _make_spec()
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected)
@@ -1293,7 +1292,7 @@ class TestRemoteRunnerHappyPath:
     async def test_ssh_argv_includes_config_path_when_set(self):
         """When config_path is set, ['--config', config_path] appears in the remote cmd."""
         import shlex as _shlex
-        from orchestrator.verify_runner import RemoteRunner
+
         spec = _make_spec()
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected, config_path='/etc/orch.yaml')
@@ -1305,7 +1304,6 @@ class TestRemoteRunnerHappyPath:
 
     async def test_request_id_from_id_factory(self):
         """The pushed ref uses the id_factory's return value."""
-        from orchestrator.verify_runner import RemoteRunner
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected)
         await runner.run_merge_verify('abc123', _make_spec())
@@ -1617,7 +1615,6 @@ class TestVerifyRunnerPoolPreferRemote:
 
     async def test_dispatch_single_local_pool_uses_local(self):
         """Regression: single-runner pool [local] still routes to local (β regression guard)."""
-        from orchestrator.event_store import EventType
         from orchestrator.verify_runner import VerifyRunnerPool
         local_result = _make_pass_result()
         local_fake = self._make_fake_runner('local', local_result)
@@ -1687,7 +1684,6 @@ class TestVerifyRunnerPoolFailSafe:
 
     async def test_fallback_event_runner_is_local(self):
         """merge_verify event data['runner'] == 'local' when fallback is used."""
-        from orchestrator.event_store import EventType
         from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
         remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('down'))
         local_fake = self._make_fake_runner('local', _make_pass_result())
@@ -1706,6 +1702,7 @@ class TestVerifyRunnerPoolFailSafe:
     async def test_fallback_logs_one_warning(self, caplog):
         """Exactly one warning is logged identifying the unavailable runner; no escalation."""
         import logging
+
         from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
         remote_fake = self._make_fake_runner('laptop', raises=RunnerUnavailable('host down'))
         local_fake = self._make_fake_runner('local', _make_pass_result())

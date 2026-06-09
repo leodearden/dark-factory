@@ -590,6 +590,8 @@ class RemoteRunner:
         self._config_path = config_path
         self._run = run if run is not None else _default_subprocess_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+        # Test-only injection point: tests may assign a list here to capture subprocess calls.
+        self._calls: list = []
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
