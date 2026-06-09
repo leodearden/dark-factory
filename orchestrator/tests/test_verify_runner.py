@@ -2057,3 +2057,112 @@ class TestCompareEnvFingerprints:
         assert 'verify_env' not in verdict.drift_dimensions
         assert 'sccache_reachable' not in verdict.drift_dimensions
         assert 'extra_probes' not in verdict.drift_dimensions
+
+
+# ---------------------------------------------------------------------------
+# ε step-7: run_verdict_parity — all-agree path
+# ---------------------------------------------------------------------------
+
+
+def _make_verify_result(passed=True, category=''):
+    return VerifyResult(
+        passed=passed,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='ok' if passed else 'fail',
+        category=category,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunVerdictParityAllAgree:
+    """run_verdict_parity: all-agree path — both runners return identical verdicts."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        """Fake VerifyRunner whose run_merge_verify returns results keyed by sha."""
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def test_each_runner_called_once_per_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None)]
+        local_fake = self._make_fake_runner('local', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert local_fake.run_merge_verify.await_count == 2
+        assert remote_fake.run_merge_verify.await_count == 2
+
+    async def test_runners_called_with_sha_and_spec(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        spec = _make_spec()
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result()})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result()})
+        await run_verdict_parity(corpus, local_fake, remote_fake, spec)
+        local_fake.run_merge_verify.assert_awaited_once_with('sha1', spec)
+        remote_fake.run_merge_verify.assert_awaited_once_with('sha1', spec)
+
+    async def test_report_has_one_row_per_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None), ('ccc', None)]
+        results = {s: _make_verify_result() for s in ('aaa', 'bbb', 'ccc')}
+        local_fake = self._make_fake_runner('local', results)
+        remote_fake = self._make_fake_runner('laptop', results)
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert len(report.rows) == 3
+        assert [r.sha for r in report.rows] == ['aaa', 'bbb', 'ccc']
+
+    async def test_row_local_remote_passed_from_results(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.local_passed is True
+        assert row.remote_passed is True
+
+    async def test_agree_true_when_both_match(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=False)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].agree is True
+
+    async def test_all_agree_true_when_every_row_agrees(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('aaa', None), ('bbb', None)]
+        local_fake = self._make_fake_runner('local', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'aaa': _make_verify_result(passed=True),
+            'bbb': _make_verify_result(passed=False),
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.all_agree is True
+        assert report.divergent_shas == ()
+
+    async def test_empty_corpus_all_agree(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        local_fake = self._make_fake_runner('local', {})
+        remote_fake = self._make_fake_runner('laptop', {})
+        report = await run_verdict_parity([], local_fake, remote_fake, _make_spec())
+        assert report.all_agree is True
+        assert report.rows == ()
