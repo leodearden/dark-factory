@@ -418,6 +418,15 @@ async def _classify_main_health_red(
     - ``verify.timed_out`` is True (non-deterministic; re-probing is wasteful)
     - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
       (infra_timeout / flock_error — inherently flaky)
+
+    Latency: the first failing merge per ``(main_sha, category, cause_hint)``
+    tuple pays a full probe build/test cost, bounded by the same
+    ``merge_verify_cold_command_timeout_secs`` / ``verify_cold_command_timeout_secs``
+    timeout that ``_run_post_merge_verify`` uses (inherited via
+    ``run_scoped_verification``'s config lookup — the probe runs with
+    ``max_retries=0`` so a hung probe cannot stall the worker beyond one
+    timeout window).  Subsequent merges with the same signature hit the
+    ``_PROBE_CACHE`` and pay only a ``get_main_sha()`` round-trip.
     """
     if not req.config.escalate_preexisting_main_break:
         return None

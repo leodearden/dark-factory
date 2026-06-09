@@ -108,6 +108,7 @@ async def _drive_verify(
         enospc_retries={},
         max_timeouts=3,
         max_enospc=1,
+        event_store=event_store,
     )
 
 
@@ -528,4 +529,116 @@ class TestDedupeFingerprrintAndCacheReuse:
         assert oc_a.dedupe_fingerprint == expected_fp, (
             f'Fingerprint must match compute_preexisting_main_break_fingerprint; '
             f'actual={oc_a.dedupe_fingerprint!r}, expected={expected_fp!r}'
+        )
+
+        # (d) Cache-hit contract: get_main_sha was called once per merge to
+        # build the cache key, but no new probe entry was written (cache had
+        # exactly one entry before and after, confirming no worktree was created).
+        assert git_ops.get_main_sha.call_count == 2, (
+            f'get_main_sha must be called once per merge (cache-key lookup); '
+            f'call_count={git_ops.get_main_sha.call_count}'
+        )
+        assert len(_PROBE_CACHE) == 1, (
+            f'_PROBE_CACHE must still have exactly one entry — no second probe was run; '
+            f'len={len(_PROBE_CACHE)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fail-safe branches in _classify_main_health_red (suggestion 3)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyFailSafeBranches:
+    """Cover the two silent fail-safe paths in _classify_main_health_red:
+    (1) probe raises → falls through to normal task-fault outcome
+    (2) probe confirms preexisting but fingerprint helper returns '' →
+        outcome is still main_health_red with empty dedupe_fingerprint.
+    """
+
+    def test_probe_exception_falls_through_to_task_fault(
+        self, tmp_path: Path,
+    ) -> None:
+        """When verify_failure_is_preexisting_on_main raises, the exception is
+        swallowed and the outcome is the normal 'Post-merge verification failed'
+        task-fault outcome (not a crash, not main_health_red)."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        probe_spy = AsyncMock(side_effect=RuntimeError('probe crashed'))
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=probe_spy,
+                ),
+            ):
+                return await _drive_verify(req, merge_wt, git_ops)
+
+        outcome = asyncio.run(_run())
+
+        assert probe_spy.call_count == 1, 'Probe must have been called once'
+        assert outcome is not None
+        assert outcome.reason.startswith('Post-merge verification failed'), (
+            f'Exception in probe must fall through to task-fault outcome; '
+            f'got: {outcome.reason!r}'
+        )
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            'Task-fault reason must not start with MAIN_HEALTH_RED_REASON_PREFIX'
+        )
+        assert outcome.dedupe_fingerprint == '', (
+            f'Task-fault outcome must have empty dedupe_fingerprint; '
+            f'got {outcome.dedupe_fingerprint!r}'
+        )
+
+    def test_empty_fingerprint_still_routes_main_health_red(
+        self, tmp_path: Path,
+    ) -> None:
+        """When the probe confirms preexisting (True, sha) but
+        _main_health_fingerprint returns '' due to a composition error,
+        the outcome is still main_health_red with dedupe_fingerprint=''
+        (rather than silently downgrading to task-fault)."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(True, MAIN_SHA)),
+                ),
+                patch(
+                    'orchestrator.merge_queue._main_health_fingerprint',
+                    return_value='',
+                ),
+            ):
+                return await _drive_verify(req, merge_wt, git_ops)
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Empty fingerprint must NOT downgrade to task-fault; '
+            f'got: {outcome.reason!r}'
+        )
+        assert outcome.dedupe_fingerprint == '', (
+            f'dedupe_fingerprint must be empty (fingerprint helper failed); '
+            f'got {outcome.dedupe_fingerprint!r}'
         )
