@@ -62,6 +62,7 @@ __all__ = [
     "VerifyRunnerPool",
     "build_merge_verify_spec",
     "_module_config_from_command",
+    "run_merge_verify_on_worktree",
     "UNSCOPED_TYPECHECK_FAILED_CATEGORY",
     "UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY",
     "is_unscoped_gate_failure",
@@ -301,6 +302,61 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
         verify_env=dict(spec.verify_env),
         verify_cold_command_timeout_secs=spec.cold_timeout_secs,
     )
+
+
+# ---------------------------------------------------------------------------
+# run_merge_verify_on_worktree — host-entry for the CLI verify-merge subcommand
+# ---------------------------------------------------------------------------
+
+
+async def run_merge_verify_on_worktree(
+    merge_wt: Path,
+    config: OrchestratorConfig,
+    spec: MergeVerifySpec,
+    *,
+    merge_sha: str = '',
+    task_id: str | None = None,
+    run_scoped: Callable[..., Awaitable[VerifyResult]] | None = None,
+    run_unscoped: Callable[..., Awaitable[Any]] | None = None,
+) -> VerifyResult:
+    """Run the combined merge-verify bundle at a materialized worktree.
+
+    Reconstructs per-module ModuleConfig objects from the wire spec, then
+    delegates to LocalRunner.run_merge_verify (the same bundle the merge queue
+    runs), providing fidelity by construction (PRD §A Invariant 1 / D2).
+
+    Args:
+        merge_wt: Path to the detached worktree at the merge SHA.
+        config:   OrchestratorConfig for the host project.
+        spec:     Deserialized MergeVerifySpec from the --spec CLI flag.
+        merge_sha: The commit SHA being verified (threaded into telemetry).
+        task_id:  Optional task ID for logging/telemetry.
+        run_scoped:   Injected callable for scoped verification (default: real global).
+        run_unscoped: Injected callable for unscoped typecheck gate (default: real global).
+    """
+    # Deferred imports break the merge_queue↔verify_runner module-level cycle
+    # (merge_queue imports verify_runner at module level; a module-level import of
+    # merge_queue here would re-introduce the cycle). Defaults are wired in step-6.
+    if run_scoped is None:
+        from orchestrator.verify import run_scoped_verification  # type: ignore[attr-defined]
+        run_scoped = run_scoped_verification
+    if run_unscoped is None:
+        from orchestrator.merge_queue import _run_unscoped_typechecks  # type: ignore[attr-defined]
+        run_unscoped = _run_unscoped_typechecks
+
+    module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
+    task_files = tuple(spec.task_files) if spec.task_files is not None else None
+
+    runner = LocalRunner(
+        merge_wt,
+        config,
+        module_configs,
+        task_files,
+        run_scoped=run_scoped,
+        run_unscoped=run_unscoped,
+        task_id=task_id,
+    )
+    return await runner.run_merge_verify(merge_sha, spec)
 
 
 # ---------------------------------------------------------------------------

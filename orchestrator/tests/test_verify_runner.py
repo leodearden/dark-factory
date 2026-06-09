@@ -818,3 +818,186 @@ class TestModuleConfigFromCommand:
         assert mc.type_check_command is None
         assert mc.verify_env == {'K': 'V'}
         assert mc.verify_cold_command_timeout_secs == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Step-3: run_merge_verify_on_worktree — host-entry wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunMergeVerifyOnWorktree:
+    """run_merge_verify_on_worktree reconstructs module_configs and delegates to LocalRunner."""
+
+    def _make_two_command_spec(self):
+        return MergeVerifySpec(
+            verify_commands=(
+                VerifyCommand('src/a', test_command='true'),
+                VerifyCommand('src/b', lint_command='ruff'),
+            ),
+            unscoped_typecheck=UnscopedTypecheckSpec(
+                commands=(VerifyCommand('src/a', type_check_command='true'),),
+                block_on_timeout=True,
+            ),
+            task_files=('src/a/m.py',),
+            verify_env={'K': 'V'},
+            cold_timeout_secs=123.0,
+        )
+
+    async def test_all_pass_returns_pass_result(self):
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+        pass_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=pass_result)
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        config = MagicMock()
+        config.merge_verify_workspace = False
+        merge_wt = MagicMock()
+        spec = self._make_two_command_spec()
+
+        result = await run_merge_verify_on_worktree(
+            merge_wt, config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert result is pass_result
+
+    async def test_module_configs_reconstructed_from_spec(self):
+        """run_scoped is called with module_configs reconstructed from spec."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+        pass_result = _make_pass_result()
+        run_scoped = AsyncMock(return_value=pass_result)
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        config = MagicMock()
+        config.merge_verify_workspace = False
+        merge_wt = MagicMock()
+        spec = self._make_two_command_spec()
+
+        await run_merge_verify_on_worktree(
+            merge_wt, config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        # Inspect positional args: run_scoped(merge_wt, config, module_configs, ...)
+        call_args = run_scoped.await_args
+        pos_args = call_args[0]
+        module_configs = pos_args[2]
+        assert len(module_configs) == 2
+        prefixes = [mc.prefix for mc in module_configs]
+        assert prefixes == ['src/a', 'src/b']
+        assert module_configs[0].test_command == 'true'
+        assert module_configs[0].lint_command is None
+        assert module_configs[1].test_command is None
+        assert module_configs[1].lint_command == 'ruff'
+
+    async def test_task_files_threaded_to_scoped(self):
+        """task_files from the spec are passed as the task_files kwarg to run_scoped."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        config = MagicMock()
+        config.merge_verify_workspace = False
+        spec = self._make_two_command_spec()
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        call_kwargs = run_scoped.await_args[1]
+        assert call_kwargs['task_files'] == ('src/a/m.py',)
+        assert call_kwargs['max_retries'] == 0
+        assert call_kwargs['is_merge_verify'] is True
+        assert call_kwargs['force_workspace'] is False
+        assert call_kwargs['role'] == 'merge'
+
+    async def test_gate_broken_returns_sentinel_result(self):
+        """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY, run_merge_verify_on_worktree
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=True,
+                timed_out=False,
+                timed_out_subprojects=[],
+                failing_subprojects=['src/a'],
+                detail='type err',
+            )
+        )
+        config = MagicMock()
+        config.merge_verify_workspace = False
+        spec = self._make_two_command_spec()
+
+        result = await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        assert 'src/a' in result.summary  # noqa: SIM910
+
+
+# ---------------------------------------------------------------------------
+# Step-5: run_merge_verify_on_worktree defaults to real merge-path callables
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunMergeVerifyOnWorktreeDefaults:
+    """When no callables are injected, the real merge-path globals are used (production path)."""
+
+    async def test_defaults_to_real_callables(self, monkeypatch):
+        import orchestrator.merge_queue as mq_mod
+        import orchestrator.verify as verify_mod
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        pass_result = _make_pass_result()
+        fake_scoped = AsyncMock(return_value=pass_result)
+        fake_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        monkeypatch.setattr(verify_mod, 'run_scoped_verification', fake_scoped)
+        monkeypatch.setattr(mq_mod, '_run_unscoped_typechecks', fake_unscoped)
+
+        config = MagicMock()
+        config.merge_verify_workspace = False
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand('mod', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+
+        # Call WITHOUT run_scoped/run_unscoped — should use patched globals
+        result = await run_merge_verify_on_worktree(MagicMock(), config, spec)
+
+        fake_scoped.assert_awaited_once()
+        fake_unscoped.assert_awaited_once()
+        assert result is pass_result
