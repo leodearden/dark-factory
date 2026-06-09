@@ -2965,3 +2965,46 @@ class TestDriftDetectorInconclusive:
         detector = DriftDetector(pool, escalation_queue=escalation_queue)
         result = await detector.check('sha1', _make_spec())
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+
+# ---------------------------------------------------------------------------
+# ι step-11: DriftDetector cadence predicate — should_sample
+# ---------------------------------------------------------------------------
+
+
+class TestDriftDetectorCadence:
+    """DriftDetector.should_sample: every-Nth-land pure predicate (PRD §10 Open Q2)."""
+
+    def _make_detector(self, every_n_lands=20):
+        from orchestrator.verify_runner import DriftDetector, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        pool = VerifyRunnerPool([local_fake])
+        return DriftDetector(pool, every_n_lands=every_n_lands)
+
+    def test_samples_on_multiples_of_20(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(20) is True
+        assert detector.should_sample(40) is True
+        assert detector.should_sample(60) is True
+
+    def test_does_not_sample_on_non_multiples(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(0) is False
+        assert detector.should_sample(1) is False
+        assert detector.should_sample(19) is False
+        assert detector.should_sample(21) is False
+
+    def test_does_not_sample_on_zero(self):
+        detector = self._make_detector(every_n_lands=20)
+        assert detector.should_sample(0) is False
+
+    def test_custom_every_n_lands_5(self):
+        detector = self._make_detector(every_n_lands=5)
+        assert detector.should_sample(5) is True
+        assert detector.should_sample(10) is True
+        assert detector.should_sample(15) is True
+        assert detector.should_sample(1) is False
+        assert detector.should_sample(4) is False
+        assert detector.should_sample(6) is False
