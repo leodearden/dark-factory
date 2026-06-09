@@ -2878,3 +2878,90 @@ class TestDriftDetectorDedup:
         detector = DriftDetector(pool, escalation_queue=escalation_queue)
         await detector.check('sha1', _make_spec())
         escalation_queue.has_open_l1.assert_called_with('__drift__')
+
+
+# ---------------------------------------------------------------------------
+# ι step-9: DriftDetector INCONCLUSIVE — Invariant 5 (transport ≠ divergence)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorInconclusive:
+    """DriftDetector: transport failure or no eligible remote → INCONCLUSIVE, no side-effects."""
+
+    async def test_runner_unavailable_returns_inconclusive(self):
+        """Remote RunnerUnavailable → INCONCLUSIVE (not DIVERGE)."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('host down'))
+        escalation_queue = MagicMock()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_runner_unavailable_submits_no_escalation(self):
+        """Transport failure must NOT raise a drift alarm."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('gone'))
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_runner_unavailable_emits_no_event(self):
+        """Transport failure must not emit verdict_parity_ok."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('gone'))
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        event_store.emit.assert_not_called()
+
+    async def test_runner_unavailable_does_not_quarantine_remote(self):
+        """A closed/flaky laptop must not quarantine itself via transport failure."""
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool()
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('flaky'))
+        detector = DriftDetector(pool)
+        await detector.check('sha1', _make_spec())
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_single_local_pool_returns_inconclusive(self):
+        """Pool with only local runner (no eligible remote) → INCONCLUSIVE."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([local_fake])
+        escalation_queue = MagicMock()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_single_local_pool_no_escalation(self):
+        """No eligible remote → no escalation."""
+        from orchestrator.verify_runner import DriftDetector, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+        pool = VerifyRunnerPool([local_fake])
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('sha1', _make_spec())
+        escalation_queue.submit.assert_not_called()
+
+    async def test_quarantined_remote_pool_returns_inconclusive(self):
+        """Pool with remote already quarantined → no eligible remote → INCONCLUSIVE."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool()
+        pool.quarantine('laptop')
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
