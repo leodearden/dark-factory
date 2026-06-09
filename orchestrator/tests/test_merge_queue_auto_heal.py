@@ -533,13 +533,20 @@ class TestAutoHealIdempotency:
         # is_lane_halted('normal') returns True → in-flight auto-heal
         workflow, merge_worker = _make_workflow_with_worker(config, worktree, is_halted=True)
 
+        # Realistic scenario: the first healing task already recorded an attempt before
+        # this concurrent duplicate arrives.  With attempts(sig)=1 and lane still halted,
+        # the idempotency branch must win — NOT the attempt-cap branch.
+        sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
+        merge_worker.auto_heal_registry.record_attempt(sig)
+
         spawned_args: list[list[dict]] = []
 
         async def _fake_post_submit(arguments_list: list[dict]) -> None:
             spawned_args.append(arguments_list)
 
         workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
-        workflow._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
 
         with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'folded'}):
             result = asyncio.run(
@@ -552,6 +559,18 @@ class TestAutoHealIdempotency:
         assert not spawned_args, 'Expected no spawn when lane already halted'
         # Still returns BLOCKED
         assert result == WorkflowOutcome.BLOCKED
+        # Must fold via idempotency (skip_escalation) — NOT attempt-cap (escalate_to_human)
+        mark_blocked_mock.assert_called_once()
+        call_kwargs = mark_blocked_mock.call_args[1]
+        assert call_kwargs.get('skip_escalation') is True, (
+            f'Idempotency fold must use skip_escalation=True; got {call_kwargs}. '
+            f'If escalate_to_human=True is set, the attempt-cap branch fired instead of '
+            f'idempotency — branch ordering bug.'
+        )
+        assert not call_kwargs.get('escalate_to_human'), (
+            f'Idempotency fold must NOT escalate_to_human; got {call_kwargs}. '
+            f'Wrong branch fired.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -964,4 +983,171 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         fix_metadata = spawned_args[0][0].get('metadata', {})
         assert fix_metadata.get('main_health_escalation_id') == 'parent-esc-999', (
             f"Fix task must carry parent escalation id; got {fix_metadata.get('main_health_escalation_id')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: no halt when escalation_queue is None (suggestion 2 regression)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealNoHaltWithoutOwner:
+    """Regression for resource_leak: when escalation_queue is None, a halt owner can
+    never be registered, so unhalt_lanes_owned_by can never match and the normal lane
+    would stay halted permanently.
+
+    Fix: treat escalation_queue=None like merge_worker=None in branch (d) — fall back
+    to escalate-only with no halt/spawn.
+    """
+
+    def test_no_escalation_queue_skips_halt_and_escalates_only(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt-no-esc'
+        worktree.mkdir()
+        outcome = _make_compile_error_outcome()
+
+        workflow, merge_worker = _make_workflow_with_worker(config, worktree)
+        # Remove escalation_queue — no owner can be registered for the halt.
+        workflow.escalation_queue = None
+
+        spawned_args: list[list[dict]] = []
+
+        async def _fake_post_submit(arguments_list: list[dict]) -> None:
+            spawned_args.append(arguments_list)
+
+        workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
+        mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            workflow._auto_heal_main_health(outcome, merge_phase=True)
+        )
+
+        # Must NOT halt the lane — no owner can ever be registered → livelock
+        merge_worker.halt_lane.assert_not_called()
+        # Must NOT spawn a fix task
+        assert not spawned_args, (
+            'Expected no spawn when escalation_queue is None (no owner can be registered)'
+        )
+        # Must fall back to escalate-only (branch d)
+        mark_blocked_mock.assert_called_once()
+        call_kwargs = mark_blocked_mock.call_args[1]
+        assert call_kwargs.get('escalate_to_human') is True, (
+            f'Expected escalate_to_human=True in fallback; got {call_kwargs}'
+        )
+        assert result == WorkflowOutcome.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Amendment: concurrent same-signature tasks fold via idempotency, not cap
+#             (suggestion 1 + 3 regression — branch ordering)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealConcurrentSameSignature:
+    """Regression for branch-ordering bug: with MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS=1,
+    the first task records attempt=1 and halts the lane. A concurrent second task
+    with the SAME signature then arrives while the lane is still halted.
+
+    Before fix: attempt-cap check fires before idempotency check →  second task
+    sees attempts(sig)=1 >= MAX=1 → takes attempt-cap branch → hard-escalates with
+    wrong root_cause='main-health-auto-heal-rebreak:<sig>'. This mis-classifies an
+    ordinary concurrent duplicate as a genuine re-break loop.
+
+    After fix: cap check gated on `not is_lane_halted('normal')` → when lane IS
+    halted, skip cap → take idempotency branch → fold cleanly (no second halt, no
+    spawn, skip_escalation=True).
+    """
+
+    def test_concurrent_duplicate_folds_via_idempotency_not_cap(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        config = _make_config(tmp_path)
+
+        # Use a REAL SpeculativeMergeWorker so is_lane_halted reflects actual state
+        git_ops = MagicMock(spec=GitOps)
+        real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+
+        # ── Task A setup ─────────────────────────────────────────────────────
+        worktree_a = tmp_path / 'wt-conc-a'
+        worktree_a.mkdir()
+        workflow_a = _make_workflow(config, worktree_a)
+        workflow_a.merge_queue = asyncio.Queue()
+        workflow_a.merge_worker = real_worker
+
+        esc_queue_a = MagicMock()
+        esc_queue_a.make_id = MagicMock(return_value='esc-conc-a-001')
+        workflow_a.escalation_queue = esc_queue_a
+
+        spawned_a: list[list[dict]] = []
+
+        async def _fake_post_submit_a(arguments_list: list[dict]) -> None:
+            spawned_a.append(arguments_list)
+
+        workflow_a._post_submit_tasks = _fake_post_submit_a  # type: ignore[method-assign]
+        workflow_a._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        # ── Task B setup (SAME outcome / SAME signature) ──────────────────────
+        worktree_b = tmp_path / 'wt-conc-b'
+        worktree_b.mkdir()
+        workflow_b = _make_workflow(config, worktree_b)
+        workflow_b.merge_queue = asyncio.Queue()
+        workflow_b.merge_worker = real_worker  # shared real worker
+
+        esc_queue_b = MagicMock()
+        esc_queue_b.make_id = MagicMock(return_value='esc-conc-b-001')
+        workflow_b.escalation_queue = esc_queue_b
+
+        spawned_b: list[list[dict]] = []
+
+        async def _fake_post_submit_b(arguments_list: list[dict]) -> None:
+            spawned_b.append(arguments_list)
+
+        workflow_b._post_submit_tasks = _fake_post_submit_b  # type: ignore[method-assign]
+        mark_blocked_b = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow_b._mark_blocked = mark_blocked_b  # type: ignore[method-assign]
+
+        outcome = _make_compile_error_outcome()
+
+        # Step 1: Task A runs the happy path → halts lane, records attempt=1
+        with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'}):
+            asyncio.run(workflow_a._auto_heal_main_health(outcome, merge_phase=True))
+
+        assert real_worker.is_lane_halted('normal') is True, (
+            'After A: normal lane must be halted'
+        )
+        sig = _compute_merge_outcome_signature('compile_error', 'error TS2322: StatusBar.tsx')
+        assert real_worker.auto_heal_registry.attempts(sig) == 1, (
+            f'After A: attempts must be 1; got {real_worker.auto_heal_registry.attempts(sig)}'
+        )
+        assert spawned_a, 'Task A must have spawned a fix task'
+
+        # Step 2: Task B arrives with the SAME signature while the lane is still halted.
+        # It must fold via idempotency, NOT mis-fire the attempt-cap branch.
+        with patch('orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'}):
+            asyncio.run(workflow_b._auto_heal_main_health(outcome, merge_phase=True))
+
+        # Task B must NOT spawn a second fix task
+        assert not spawned_b, (
+            'Task B must NOT spawn a fix task — concurrent same-signature duplicate '
+            'must fold via idempotency, not mis-fire the attempt-cap branch'
+        )
+
+        # Normal lane must still be halted (B did not halt or unhalt it)
+        assert real_worker.is_lane_halted('normal') is True, (
+            'After B: normal lane must still be halted (idempotency fold, no change)'
+        )
+
+        # B's _mark_blocked must use skip_escalation=True (idempotency fold), NOT
+        # escalate_to_human=True (which would indicate the attempt-cap branch fired).
+        mark_blocked_b.assert_called_once()
+        call_kwargs_b = mark_blocked_b.call_args[1]
+        assert call_kwargs_b.get('skip_escalation') is True, (
+            f'Task B idempotency fold must use skip_escalation=True; got {call_kwargs_b}. '
+            f'If escalate_to_human=True, the attempt-cap branch fired — branch-ordering bug.'
+        )
+        assert not call_kwargs_b.get('escalate_to_human'), (
+            f'Task B must NOT set escalate_to_human (indicates wrong branch); got {call_kwargs_b}'
         )

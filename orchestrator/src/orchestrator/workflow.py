@@ -4401,9 +4401,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         cause_hint = getattr(result, 'failure_cause_hint', None) or ''
         reason = getattr(result, 'reason', str(result))
 
-        # Branch (d): non-mechanical, or no merge_worker (cannot halt lanes)
+        # Branch (d): non-mechanical, no merge_worker (cannot halt lanes), or no
+        # escalation_queue (cannot register a halt-owner → unhalt_lanes_owned_by can
+        # never match → normal lane stays halted permanently → livelock).
         # → escalate-only, no halt/spawn.
-        if not is_auto_heal_eligible(category, cause_hint) or self.merge_worker is None:
+        if (
+            not is_auto_heal_eligible(category, cause_hint)
+            or self.merge_worker is None
+            or self.escalation_queue is None
+        ):
             return await self._mark_blocked(
                 reason,
                 merge_phase=merge_phase,
@@ -4427,8 +4433,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self.merge_worker is not None else None
         )
 
-        # Branch (e): attempt cap reached (same signature recurred after a prior heal)
-        if registry is not None and registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS:
+        # Branch (e): attempt cap reached — genuine re-break after a prior heal.
+        # Only fires when the lane is NOT currently halted.  If an auto-heal is
+        # in flight (lane already halted), concurrent same-signature tasks must
+        # fold via the idempotency branch below, NOT be mis-classified as
+        # re-break loops with a wrong root_cause.  The re-break cap is a
+        # guard against a completed-heal → new-break cycle, not an in-flight
+        # duplicate arriving while the same heal is still running.
+        if (
+            registry is not None
+            and registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+            and not self.merge_worker.is_lane_halted('normal')
+        ):
             return await self._mark_blocked(
                 (
                     f'Main-health auto-heal attempt cap reached (signature recurred '
