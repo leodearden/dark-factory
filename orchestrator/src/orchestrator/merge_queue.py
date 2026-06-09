@@ -4057,9 +4057,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     N+1 is already a descendant and its CAS works immediately.  If N fails,
     the Verifier re-merges N+1 against actual main.
 
-    Speculation depth is capped at 1: the Merger waits on ``_speculation_slot``
-    before grabbing N+2 speculatively, which the Verifier sets after completing
-    the item preceding the speculation.
+    Speculation depth is configurable via ``speculation_depth`` (K = number of
+    verify runners, default ``_MERGE_AHEAD_BOUND`` = 1).  One K value sizes
+    both ``_speculation_slot`` and ``_merge_ahead_cap`` so the two caps remain
+    in sync as runner count grows.  The default (K=1) reproduces the original
+    depth-1 behaviour byte-identically.
     """
 
     MAX_CAS_RETRIES = 5
@@ -4083,6 +4085,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         queue: asyncio.Queue[MergeRequest],
         event_store: EventStore | None = None,
         on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
+        speculation_depth: int = _MERGE_AHEAD_BOUND,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4091,6 +4094,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
         self._on_merge_landed = on_merge_landed
+        # K = number of verify runners; sizes both caps so speculation depth
+        # and merger-ahead bound track runner count as a single knob (PRD D4).
+        # Default = _MERGE_AHEAD_BOUND (1) → byte-identical to prior behaviour.
+        self._speculation_depth: int = speculation_depth
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -4120,11 +4127,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._speculation_slot = asyncio.Event()
         self._speculation_slot.set()  # initially free
         # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
-        # build-ahead to _MERGE_AHEAD_BOUND items in the verifier queue.
+        # build-ahead to speculation_depth items in the verifier queue.
         # Plain Semaphore (not BoundedSemaphore) so stop() may over-release
         # without raising.  Released ON-DRAIN (right after verifier_queue.get()
         # for a counted item) so the slot is free while verify runs.
-        self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
+        self._merge_ahead_cap = asyncio.Semaphore(self._speculation_depth)
         # Per-lane halt: each event is set (running) by default
         self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
         for ln in MERGE_LANES:
@@ -4493,7 +4500,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._speculation_slot.set()
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
-        for _ in range(_MERGE_AHEAD_BOUND + 1):
+        for _ in range(self._speculation_depth + 1):
             self._merge_ahead_cap.release()
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
