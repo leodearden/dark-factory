@@ -243,6 +243,119 @@ concurrent failing merge to the steward would cause an ~85 min-per-task
 livelock for every task whose verify runs against a red main."""
 
 
+# ---------------------------------------------------------------------------
+# Auto-heal eligibility gate
+# ---------------------------------------------------------------------------
+
+# Conservative allowlist of verify.py category strings that are mechanical
+# (small diff, deterministic cause) and therefore safe to auto-spawn a fix
+# task for.  The category strings are those emitted by
+# ``verify._classify_failure``; compile_error covers the tsc/type/lint class.
+#
+# Deliberately EXCLUDED — not eligible for auto-heal:
+#   test_failure:         multi-file; needs human judgement on test expectations
+#   unknown_test_failure: ambiguous signal; may be flaky
+#   infra_timeout:        infra problem; auto-spawning cannot fix infra
+#   flock_error:          transient lock contention; auto-spawning cannot fix
+AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
+
+
+def is_auto_heal_eligible(
+    category: str | None, cause_hint: str | None,  # noqa: ARG001
+) -> bool:
+    """Return True when the failure class is safe for automated fix spawning.
+
+    The allowlist is intentionally conservative — start with compile_error
+    (the tsc/type/lint class, typically a small bounded diff) and expand
+    only after production evidence of clean auto-heals for each new class.
+
+    ``cause_hint`` is accepted for future per-hint filtering but is not
+    currently used; the gate is purely category-based.
+    """
+    return (category or '') in AUTO_HEAL_MECHANICAL_CATEGORIES
+
+
+def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
+    """Return the merge lane to use based on task metadata.
+
+    Reads ``metadata['merge_lane']`` and validates via :func:`_normalize_lane`
+    (unknown/missing → 'normal').  Passing ``None`` or an empty dict returns
+    the default 'normal' lane.
+    """
+    value = (metadata or {}).get('merge_lane', '')
+    return _normalize_lane(value or '')  # type: ignore[return-value]
+
+
+_FIX_BRIEF_TITLE_MAX = 100
+"""Maximum length for a compose_fix_main_brief title."""
+_FIX_BRIEF_DETAIL_MAX = 800
+"""Maximum bytes of detail to embed in a compose_fix_main_brief description."""
+
+
+def compose_fix_main_brief(
+    category: str, cause_hint: str, detail: str = '',
+) -> tuple[str, str]:
+    """Build a task title and description for a main-health fix task.
+
+    The title follows the pattern ``'fix main: <cause_hint-or-category>'``,
+    truncated to :data:`_FIX_BRIEF_TITLE_MAX` characters.  The description
+    states that this is an automated main-health fix and includes ``category``,
+    ``cause_hint``, and a bounded slice of ``detail``.
+
+    Pure function — no I/O, no side effects.
+    """
+    # Title: use cause_hint when non-empty; fall back to category
+    label = cause_hint.strip() if cause_hint and cause_hint.strip() else category
+    raw_title = f'fix main: {label}'
+    title = raw_title[:_FIX_BRIEF_TITLE_MAX]
+
+    # Description: automated context header + structured fields + truncated detail
+    detail_snippet = (detail or '').strip()[:_FIX_BRIEF_DETAIL_MAX]
+    description = (
+        f'Automated main-health fix task.\n'
+        f'Category: {category}\n'
+        f'Cause: {cause_hint}\n'
+    )
+    if detail_snippet:
+        description += f'\nDetail:\n{detail_snippet}'
+
+    return title, description
+
+
+MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS: int = 1
+"""Maximum number of auto-heal attempts allowed per sha-independent failure signature.
+
+A value of 1 means: attempt the first auto-heal, but if the same signature
+recurs afterwards (heal → re-break loop), hard-escalate instead of spawning
+another fix task.  Promotes to config if tuning is needed.
+"""
+
+
+class MainHealthAutoHealRegistry:
+    """Monotonic per-signature attempt counter for main-health auto-heal.
+
+    Keyed by sha-INDEPENDENT failure signatures (workflow._merge_outcome_signature),
+    so a recurrence at a new main SHA (after a fix advanced main) is detected and
+    the attempt cap trips correctly.
+
+    Thread safety: no synchronisation needed — the registry is owned by the merge
+    worker and accessed only from asyncio tasks in the same event loop.
+    """
+
+    def __init__(self) -> None:
+        self._attempts: dict[str, int] = {}
+
+    def attempts(self, sig: str) -> int:
+        """Return the number of auto-heal attempts recorded for *sig* (0 if none)."""
+        return self._attempts.get(sig, 0)
+
+    def record_attempt(self, sig: str) -> int:
+        """Increment the attempt counter for *sig* and return the new count."""
+        count = self._attempts.get(sig, 0) + 1
+        self._attempts[sig] = count
+        return count
+
+
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
 )
@@ -3748,6 +3861,10 @@ class MergeWorker(_WipHaltMixin):
         # clear = no operator halt. MergeWorker has no verifier abort-poll loop,
         # so this is for API parity (operator_halt/unhalt_all_lanes reference it).
         self._operator_halt = asyncio.Event()
+        # Cross-workflow auto-heal attempt counter (shared via self.merge_worker
+        # on TaskWorkflow instances).  Lives on the worker so the counter persists
+        # across the heal→re-break cycle without any harness.py change.
+        self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
 
     # ------------------------------------------------------------------
     # Public API
@@ -4146,6 +4263,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
         # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
         self._operator_halt = asyncio.Event()
+        # Cross-workflow auto-heal attempt counter (mirrors MergeWorker; shared
+        # via self.merge_worker on TaskWorkflow instances).
+        self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None

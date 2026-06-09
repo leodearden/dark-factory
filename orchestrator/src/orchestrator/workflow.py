@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 # _is_gating_escalation evaluates the set at call time, not just for type hints.
 # This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
 # nothing in it imports orchestrator.
+from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
 from shared.cli_invoke import (
     AllAccountsCappedException,
@@ -295,6 +296,37 @@ def _normalize_cause_hint(hint: str | None) -> str:
     result = _WHITESPACE_RE.sub(' ', result)
     # 4. Lowercase and strip.
     return result.lower().strip()
+
+
+def _compute_merge_outcome_signature(
+    category: str | None,
+    cause_hint: str | None,
+    fallback_reason: str = '',
+) -> str:
+    """Compute a 16-hex-char sha-independent outcome signature from explicit fields.
+
+    Keys on (category, normalised cause_hint) when either field is set; falls
+    back to sha256(normalised_reason) when both are empty — same logic as
+    _merge_outcome_signature() but takes the values directly rather than reading
+    the TaskWorkflow._last_merge_failure_* instance fields.
+
+    Those instance fields are never set on the MAIN_HEALTH_RED_REASON_PREFIX
+    fast-path in _submit_to_merge_queue (the method returns into
+    _auto_heal_main_health before the generic block path that sets them), so
+    calling self._merge_outcome_signature() there would always hash the empty
+    basis — a single constant key for every main-health break.  This helper
+    lets _auto_heal_main_health pass the outcome fields it already holds.
+
+    _merge_outcome_signature() delegates here so the hash algorithm stays in
+    one place; that method's behaviour and the #1688 thrash tests are unchanged.
+    """
+    cat = category or ''
+    hint = cause_hint or ''
+    if cat or hint:
+        basis = (cat + '\x1f' + _normalize_cause_hint(hint)).encode('utf-8')
+    else:
+        basis = _normalize_cause_hint(fallback_reason or '').encode('utf-8')
+    return hashlib.sha256(basis).hexdigest()[:16]
 
 
 def compute_preexisting_main_break_fingerprint(
@@ -2805,6 +2837,9 @@ class TaskWorkflow:
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
+        Delegates to the module-level _compute_merge_outcome_signature() helper
+        using the instance's _last_merge_failure_* fields.
+
         Keys on (category, normalised cause_hint) when either structured field
         is populated — the same stable shape the in-branch contagion guard uses
         (#1645, workflow.py:3544).  Falls back to sha256(normalised_reason) when
@@ -2817,14 +2852,19 @@ class TaskWorkflow:
         failure prev_signature (old) != current_signature (new), so
         consecutive_merge_thrash resets to 1 — at most one extra thrash cycle
         before the counter re-accumulates. Self-healing and benign.
+
+        NOTE: do NOT call this from _auto_heal_main_health — the
+        MAIN_HEALTH_RED_REASON_PREFIX fast-path returns before the generic blocked
+        path that sets _last_merge_failure_*; those fields are at their __init__
+        defaults, so this method would return a constant hash.  Use
+        _compute_merge_outcome_signature(category, cause_hint, reason) with the
+        outcome's fields instead.
         """
-        category = self._last_merge_failure_category
-        cause_hint = self._last_merge_failure_cause_hint
-        if category or cause_hint:
-            basis = (category + '\x1f' + _normalize_cause_hint(cause_hint)).encode('utf-8')
-        else:
-            basis = _normalize_cause_hint(self._last_merge_block_reason or '').encode('utf-8')
-        return hashlib.sha256(basis).hexdigest()[:16]
+        return _compute_merge_outcome_signature(
+            self._last_merge_failure_category,
+            self._last_merge_failure_cause_hint,
+            self._last_merge_block_reason or '',
+        )
 
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
@@ -4052,6 +4092,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        from orchestrator.merge_queue import lane_for_task_metadata
         merge_request = MergeRequest(
             task_id=self.task_id,
             branch=branch_name,
@@ -4061,6 +4102,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             module_configs=self._module_configs,
             config=self.config,
             result=future,
+            lane=lane_for_task_metadata(self.task.get('metadata')),
         )
 
         attached = False
@@ -4259,22 +4301,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 category='infra_issue',
             )
         # Main-health-red short-circuit: the failure reproduces on bare main HEAD
-        # (pre-existing break, not introduced by this task's merge).  Route
-        # directly to L1 — escalate_to_human=True skips the steward, which
-        # operates in the task's branch and cannot fix a broken main.  The
-        # dedupe_fingerprint folds N concurrent failing merges into one parent
-        # escalation.  suggested_action='await_preexisting_main_hotfix' signals
-        # the auto-watcher to hold off re-dispatching until main is green.
+        # (pre-existing break, not introduced by this task's merge).  Dispatch
+        # to _auto_heal_main_health which implements the full GATED auto-heal:
+        # halt the normal lane, submit a dedup'd escalation, spawn a HIGH-lane
+        # fix task, and block.  Non-mechanical breaks and attempt-cap exceedances
+        # fall back to escalate-to-human directly inside _auto_heal_main_health.
         if result.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX):
             self._write_merge_failure_review('main_health_red', result.reason)
-            return await self._mark_blocked(
-                result.reason,
-                merge_phase=merge_phase,
-                escalate_to_human=True,
-                category='preexisting_main_break',
-                dedupe_fingerprint=(result.dedupe_fingerprint or None),
-                suggested_action='await_preexisting_main_hotfix',
-            )
+            return await self._auto_heal_main_health(result, merge_phase=merge_phase)
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
         self._last_merge_block_reason = result.reason
@@ -4289,6 +4323,216 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             category = 'merge_error'
         self._write_merge_failure_review(category, result.reason)
         return await self._mark_blocked(result.reason, merge_phase=merge_phase)
+
+    async def _spawn_main_health_fix_task(
+        self,
+        signature: str,
+        escalation_id: str,
+        category: str,
+        cause_hint: str,
+        detail: str,
+    ) -> None:
+        """Schedule a high-lane fix task for a confirmed main-health break.
+
+        Builds a submit_task argument block with:
+        - title/description from :func:`~orchestrator.merge_queue.compose_fix_main_brief`
+        - ``merge_lane='high'`` so the fix merges via the HIGH lane
+        - Correlation keys so the auto-watcher can link it to its escalation:
+          ``spawn_context``, ``main_health_signature``, ``main_health_escalation_id``
+
+        Delegates the actual POST to :meth:`_post_submit_tasks` via
+        ``asyncio.create_task`` so the caller is not blocked.
+        """
+        from orchestrator.merge_queue import compose_fix_main_brief
+
+        title, description = compose_fix_main_brief(category, cause_hint, detail)
+        arguments = {
+            'title': title,
+            'description': description,
+            'priority': 'high',
+            'project_root': str(self.config.project_root),
+            'metadata': {
+                'merge_lane': 'high',
+                'spawn_context': 'main_health_auto_heal',
+                'main_health_signature': signature,
+                'main_health_escalation_id': escalation_id,
+            },
+        }
+        if self.mcp is not None:
+            try:
+                _task = asyncio.create_task(
+                    self._post_submit_tasks([arguments]),
+                    name=f'spawn_fix_main_{self.task_id}',
+                )
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
+            except Exception as exc:
+                logger.warning(
+                    'Task %s: failed to spawn main-health fix task: %s',
+                    self.task_id, exc,
+                )
+
+    async def _auto_heal_main_health(
+        self, result: Any, *, merge_phase: bool,
+    ) -> WorkflowOutcome:
+        """Orchestrate the main-health auto-heal response for a confirmed red-main verdict.
+
+        Branches:
+        (d) NOT mechanical (category not in AUTO_HEAL_MECHANICAL_CATEGORIES)
+            → escalate to human, no halt, no spawn.
+        (e) Attempt cap reached (sha-independent signature recurred after prior heal)
+            → hard-escalate, no halt, no spawn.
+        (idempotency) Normal lane already halted (auto-heal in flight)
+            → fold escalation, no second halt/spawn.
+        (a) Happy path: record attempt; halt 'normal' lane; submit one dedup'd
+            L1 escalation; register it as halt-owner; spawn a HIGH-lane fix task;
+            block via _mark_blocked(skip_escalation=True).
+        """
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+        from escalation.models import Escalation
+
+        from orchestrator.merge_queue import (
+            MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
+            is_auto_heal_eligible,
+        )
+
+        fp = getattr(result, 'dedupe_fingerprint', None) or None
+        category = getattr(result, 'failure_category', None) or ''
+        cause_hint = getattr(result, 'failure_cause_hint', None) or ''
+        reason = getattr(result, 'reason', str(result))
+
+        # Branch (d): non-mechanical, no merge_worker (cannot halt lanes), or no
+        # escalation_queue (cannot register a halt-owner → unhalt_lanes_owned_by can
+        # never match → normal lane stays halted permanently → livelock).
+        # → escalate-only, no halt/spawn.
+        if (
+            not is_auto_heal_eligible(category, cause_hint)
+            or self.merge_worker is None
+            or self.escalation_queue is None
+        ):
+            return await self._mark_blocked(
+                reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='preexisting_main_break',
+                dedupe_fingerprint=fp,
+                suggested_action='await_preexisting_main_hotfix',
+            )
+
+        # Sha-independent signature for attempt-cap / re-break-loop detection.
+        # Derived from THIS outcome's (category, cause_hint) — distinct per break,
+        # stable across the heal→re-break loop (same category+cause_hint at a new
+        # main SHA).  Must NOT use self._merge_outcome_signature() here because the
+        # MAIN_HEALTH_RED_REASON_PREFIX fast-path returns before the generic blocked
+        # path that sets _last_merge_failure_*; those fields stay at __init__
+        # defaults, collapsing every break to the same empty-basis constant key.
+        sig = _compute_merge_outcome_signature(category, cause_hint, reason)
+
+        registry = (
+            self.merge_worker.auto_heal_registry
+            if self.merge_worker is not None else None
+        )
+
+        # Branch (e): attempt cap reached — genuine re-break after a prior heal.
+        # Only fires when the lane is NOT currently halted.  If an auto-heal is
+        # in flight (lane already halted), concurrent same-signature tasks must
+        # fold via the idempotency branch below, NOT be mis-classified as
+        # re-break loops with a wrong root_cause.  The re-break cap is a
+        # guard against a completed-heal → new-break cycle, not an in-flight
+        # duplicate arriving while the same heal is still running.
+        if (
+            registry is not None
+            and registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+            and not self.merge_worker.is_lane_halted('normal')
+        ):
+            return await self._mark_blocked(
+                (
+                    f'Main-health auto-heal attempt cap reached (signature recurred '
+                    f'after auto-heal): {reason[:160]}'
+                ),
+                detail=reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='preexisting_main_break',
+                dedupe_fingerprint=fp,
+                root_cause=f'main-health-auto-heal-rebreak:{sig}',
+                suggested_action='await_preexisting_main_hotfix',
+            )
+
+        # Build and submit the dedup'd L1 escalation (shared across all three
+        # remaining branches: idempotency + happy path both file/fold it).
+        esc_id: str | None = None
+        if self.escalation_queue is not None:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='preexisting_main_break',
+                summary=reason[:200],
+                detail=reason,
+                suggested_action='main_health_auto_heal_in_flight',
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            if fp:
+                esc.dedupe_fingerprint = fp
+                submit_result = submit_or_dedupe(
+                    self.escalation_queue,
+                    esc,
+                    DedupeConfig(
+                        infra_dedupe_enabled=True,
+                        infra_dedupe_window_secs=float('inf'),
+                        infra_dedupe_categories=('preexisting_main_break',),
+                        key_fn=content_fingerprint_key,
+                    ),
+                )
+                # Derive esc_id from the SURVIVING (parent) escalation.
+                # submit_or_dedupe returns {'id': parent_id, 'status': 'dedup_skipped',
+                # 'parent_id': parent_id, 'child_id': esc.id} when the child folds
+                # into a pending parent — only the parent resolves, so the halt owner
+                # and the fix-task correlation key must reference the parent.
+                # For a fresh (non-dedup) submit the dict has no 'parent_id', so we
+                # fall back to 'id', then to esc.id as the final safety net.
+                submit_result_dict: dict = submit_result if isinstance(submit_result, dict) else {}
+                esc_id = (
+                    submit_result_dict.get('parent_id')
+                    or submit_result_dict.get('id')
+                    or esc.id
+                )
+            else:
+                self.escalation_queue.submit(esc)
+                esc_id = esc.id
+
+        # Branch (idempotency): lane already halted → adopt the in-flight auto-heal
+        if self.merge_worker is not None and self.merge_worker.is_lane_halted('normal'):
+            return await self._mark_blocked(
+                reason,
+                merge_phase=merge_phase,
+                skip_escalation=True,
+            )
+
+        # Branch (a): happy path — record attempt, halt lane, register owner, spawn fix
+        if registry is not None:
+            registry.record_attempt(sig)
+
+        if self.merge_worker is not None:
+            self.merge_worker.halt_lane(
+                'normal',
+                f'main-health auto-heal in flight (task {self.task_id})',
+            )
+            if esc_id:
+                self.merge_worker.set_lane_halt_owner('normal', esc_id)
+
+        await self._spawn_main_health_fix_task(
+            sig, esc_id or '', category, cause_hint, reason,
+        )
+
+        return await self._mark_blocked(
+            reason,
+            merge_phase=merge_phase,
+            skip_escalation=True,
+        )
 
     async def _resolve_and_resubmit(
         self, branch_name: str, conflict_details: str,
