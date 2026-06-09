@@ -10,7 +10,7 @@ Asserts that:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.merge_queue import MergeLivenessConfigError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -147,3 +148,52 @@ class TestHarnessExternalDepBlockWiring:
             detail='detail',
             category='dependency_discovered',
         )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessMergeLivenessGuard (step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestHarnessMergeLivenessGuard:
+    """Harness._start_merge_worker must be FAIL-CLOSED on an over-budget config.
+
+    At default bound (K=1) and cold timeout 9000 s:
+      worst_case = 1 × 9000 = 9000 ≥ threshold (0.75 × 10800 = 8100) → NOT safe.
+    At default bound and default cold timeout (7200 s):
+      worst_case = 1 × 7200 = 7200 < 8100 → safe → worker starts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_over_budget_config_raises_at_startup(self, tmp_path: Path) -> None:
+        """Over-budget config (cold_timeout=9000, bound=1) must raise MergeLivenessConfigError."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=9000,
+        )
+        harness = Harness(config)
+
+        with pytest.raises(MergeLivenessConfigError):
+            await harness._start_merge_worker()
+
+    @pytest.mark.asyncio
+    async def test_in_budget_config_starts_worker(self, tmp_path: Path) -> None:
+        """Default/in-budget config (cold_timeout=7200 default, bound=1) must NOT raise.
+
+        Patch SpeculativeMergeWorker.run to a no-op coroutine so the asyncio
+        task doesn't run indefinitely and the test tears down cleanly.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            pass
+
+        with patch(
+            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            _noop_run,
+        ):
+            # Must NOT raise MergeLivenessConfigError
+            await harness._start_merge_worker()
+
+        # Worker task was created and will have completed (no-op)
+        assert harness._merge_worker_task is not None
