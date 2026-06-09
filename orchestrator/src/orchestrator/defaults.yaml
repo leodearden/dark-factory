@@ -218,6 +218,15 @@ git:
   branch_prefix: "task/"
   remote: "origin"
   worktree_dir: ".worktrees"
+  # Persistent warm merge-verify worktree (task 1692, PRD κ Phase 1).
+  # When true, the post-merge verify step reuses a FIXED worktree at
+  # <worktree_dir>/_merge-verify retaining build artifacts (target/) across
+  # attempts.  Requires _MERGE_AHEAD_BOUND=1; default false → byte-identical
+  # to prior behaviour (trivially revertible).
+  persistent_merge_worktree: false
+  # Safety valve: when >0, every Nth verifying serial attempt runs a
+  # from-scratch cold verify in a throwaway ephemeral worktree.  0 = disabled.
+  persistent_merge_worktree_safety_valve_every_n: 0
 
 # Autonomous dry-run unblock hook
 unblock_auto:
