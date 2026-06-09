@@ -1763,3 +1763,124 @@ class TestHandleSoftCancelOutcome:
         assert not wf._cancel_event.is_set()
         outcome = await wf._handle_soft_cancel('merge')
         assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+class TestGroupMergeUnionScope:
+    """Task 1704: _maybe_enqueue_group_merge union-scopes GroupMergeRequest across all members."""
+
+    async def test_enqueued_request_includes_lower_member_crate(self, tmp_path, monkeypatch):
+        """Union verify: lower-member files+config are included in the enqueued GroupMergeRequest.
+
+        3-member train (A=crate_a, M=no-files, B=tip=crate_b).  On main (before fix),
+        req.task_files == tip-only and crate_a is absent → lower member breakage undetected.
+        After fix: both files and both ModuleConfigs are present in req.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from orchestrator.config import ModuleConfig
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            InFlightMergeRegistry,
+            MergeOutcome,
+        )
+
+        mc_a = ModuleConfig(prefix='crate_a')
+        mc_b = ModuleConfig(prefix='crate_b')
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {
+            'id': 'B', 'title': 'T', 'description': 'd',
+            'metadata': {'train': {'id': 'T1', 'order': 1, 'members': ['A', 'M', 'B']}},
+        }
+        # Tip's module is in crate_b; _resolve_module_configs will map it to mc_b.
+        assignment.modules = ['crate_b/src']
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+        config.merge_verify_workspace = False  # exercise the union path (not workspace short-circuit)
+
+        def _for_module(m: str):
+            if m.startswith('crate_a'):
+                return mc_a
+            if m.startswith('crate_b'):
+                return mc_b
+            return None
+        config.for_module.side_effect = _for_module
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        # 3 members: A (crate_a files), M (no files), B (tip — no metadata.files; base from plan)
+        scheduler.tasks_by_train = AsyncMock(return_value=[
+            {'id': 'A', 'status': 'merge-deferred', 'metadata': {'files': ['crate_a/src/lib.rs']}},
+            {'id': 'M', 'status': 'merge-deferred', 'metadata': {}},
+            {'id': 'B', 'status': 'merge-deferred'},
+        ])
+        scheduler.get_statuses = AsyncMock(return_value=(
+            {'A': 'merge-deferred', 'M': 'merge-deferred', 'B': 'merge-deferred'}, None,
+        ))
+
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {'files': ['crate_b/src/main.rs']}
+        wf._base_commit = None
+        # tip's own ModuleConfig (crate_b), set directly to avoid depending on
+        # config.for_module being called at __init__ time for this test's purposes
+        wf._module_configs = [mc_b]
+
+        captured: list[GroupMergeRequest] = []
+
+        async def _fake_register(queue, req, event_store, reg, **kw):
+            captured.append(req)
+            req.result.set_result(MergeOutcome(status='done', merge_sha='abc123'))
+            return True
+
+        with patch('orchestrator.merge_queue.register_and_enqueue_merge_request', _fake_register):
+            outcome = await wf._maybe_enqueue_group_merge()
+
+        assert outcome == WorkflowOutcome.DONE, f'expected DONE, got {outcome!r}'
+        assert captured, '_fake_register must have been called (GroupMergeRequest enqueued)'
+        req = captured[0]
+
+        # Union task_files: lower-member's file must be present alongside the tip's
+        assert req.task_files is not None, 'union task_files must not be None'
+        assert 'crate_a/src/lib.rs' in req.task_files, (
+            f'lower-member crate_a file must be in union task_files; got {req.task_files}'
+        )
+        assert 'crate_b/src/main.rs' in req.task_files, (
+            f'tip crate_b file must remain in union task_files; got {req.task_files}'
+        )
+
+        # Union module_configs: both crate_a and crate_b configs must be present
+        mc_prefixes = {mc.prefix for mc in req.module_configs}
+        assert 'crate_a' in mc_prefixes, (
+            f'lower-member crate_a config must be in union module_configs; got {mc_prefixes}'
+        )
+        assert 'crate_b' in mc_prefixes, (
+            f'tip crate_b config must remain in union module_configs; got {mc_prefixes}'
+        )
+
+        # Member with no metadata.files (M) must not cause an error (skipped silently)
+        assert len(captured) == 1, 'exactly one GroupMergeRequest must be enqueued'
