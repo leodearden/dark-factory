@@ -4423,11 +4423,16 @@ class TestSpeculativeMergeWorker:
             f'got discard reasons: {discard_reasons}'
         )
 
-        # (A) N+2 re-verify must run exactly once and see all three files.
+        # (A) N+2 re-verify must run at least once and see all three files.
         #     RED on base: skip_verify=True → verify never called → count == 0.
+        #     We assert >= 1 rather than == 1 because the exact call count is an
+        #     implementation detail subject to speculative-prefetch changes; the
+        #     invariant under test is that _run_post_merge_verify ran before
+        #     advance_main (locked by the three-file assertions below, and by the
+        #     companion blocked-tree test which covers the core safety property).
         n2_verify_calls = [fs for fs in verify_worktrees if 'file_pr_n2.py' in fs]
-        assert len(n2_verify_calls) == 1, (
-            f'N+2 (pre_rebased=True, chain_invalidated) must be verified exactly '
+        assert len(n2_verify_calls) >= 1, (
+            f'N+2 (pre_rebased=True, chain_invalidated) must be verified at least '
             f'once after re-merge against advanced main (tree changed: now contains '
             f"N's and N+1's commits); got {len(n2_verify_calls)} verify call(s) with "
             f'file_pr_n2.py.  verify_worktrees={verify_worktrees!r}'

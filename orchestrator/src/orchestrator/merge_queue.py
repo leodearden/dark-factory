@@ -1315,6 +1315,8 @@ async def _resolve_commit_tree(git_ops: GitOps, commit: str) -> str | None:
     Callers that use this to gate a skip-verify decision must treat None as
     fail-closed (i.e., verify rather than skip).
     """
+    if not commit:
+        return None
     rc, out, err = await _run(
         ['git', 'rev-parse', f'{commit}^{{tree}}'],
         cwd=git_ops.project_root,
