@@ -802,16 +802,19 @@ class VerifyRunnerPool:
         return None
 
     def _select_runner(self) -> VerifyRunner:
-        """Prefer-remote: return the first non-quarantined non-local runner; fall back to runners[0].
+        """Prefer-remote: return the first non-quarantined non-local runner; fall back to local or runners[0].
 
         The K-permit free/busy refinement (load-based selection) is ζ.
         RemoteRunner.is_local is False, so it is selected over LocalRunner.
         Quarantined non-local runners are skipped; local is the trust anchor.
+        Delegates to eligible_remote() to avoid duplicating the quarantine predicate,
+        then falls back to self._local rather than self._runners[0] so the quarantine
+        invariant holds regardless of pool construction order.
         """
-        for runner in self._runners:
-            if not runner.is_local and runner.name not in self._quarantined:
-                return runner
-        return self._runners[0]
+        eligible = self.eligible_remote()
+        if eligible is not None:
+            return eligible
+        return self._local or self._runners[0]
 
     async def dispatch(
         self,
@@ -1213,6 +1216,9 @@ async def run_verdict_parity(
 # ι: DriftDetector — dual-host same-SHA verdict parity + divergence escalation
 # ---------------------------------------------------------------------------
 
+# Sentinel task_id used for dedup'd drift escalation (mirrors harness '__scheduler__').
+_DRIFT_SENTINEL = '__drift__'
+
 
 class DriftVerdict(StrEnum):
     """Outcome of a single DriftDetector.check() call."""
@@ -1269,6 +1275,10 @@ class DriftDetector:
         self._event_store = event_store
         self._escalation_queue = escalation_queue
         self._task_id = task_id
+        if every_n_lands <= 0:
+            raise ValueError(
+                f'every_n_lands must be a positive integer, got {every_n_lands!r}'
+            )
         self._every_n_lands = every_n_lands
 
     def should_sample(self, land_count: int) -> bool:
@@ -1291,7 +1301,11 @@ class DriftDetector:
         if local is None or remote is None:
             return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
 
-        local_result = await local.run_merge_verify(merge_sha, spec)
+        try:
+            local_result = await local.run_merge_verify(merge_sha, spec)
+        except RunnerUnavailable:
+            # Local transport failure also yields INCONCLUSIVE — symmetric with remote.
+            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
         try:
             remote_result = await remote.run_merge_verify(merge_sha, spec)
         except RunnerUnavailable:
@@ -1325,11 +1339,11 @@ class DriftDetector:
 
         # Diverge — dedup'd escalation + quarantine.
         escalated = False
-        if self._escalation_queue is not None and not self._escalation_queue.has_open_l1('__drift__'):
+        if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
             from escalation.models import Escalation
             esc = Escalation(
-                id=self._escalation_queue.make_id('__drift__'),
-                task_id='__drift__',
+                id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
+                task_id=_DRIFT_SENTINEL,
                 agent_role='orchestrator-drift-detector',
                 severity='blocking',
                 level=1,
