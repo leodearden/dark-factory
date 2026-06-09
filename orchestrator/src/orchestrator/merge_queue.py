@@ -6114,3 +6114,65 @@ def check_merge_liveness_margin(
         )
 
     return assessment
+
+
+class MergeLivenessConfigError(Exception):
+    """Raised by :func:`enforce_merge_liveness_margin` when the configured
+    merge-ahead bound × cold-verify timeout exceeds the reaper liveness
+    threshold, indicating that startup should be refused.
+
+    The exception message contains the numeric details (worst_case, threshold,
+    timeout, bound) for operator triage.
+    """
+
+
+def enforce_merge_liveness_margin(
+    config: OrchestratorConfig,
+    *,
+    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+    liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    safety_factor: float = 0.75,
+    logger: logging.Logger = logger,
+) -> MergeLivenessAssessment:
+    """Fail-closed wrapper around :func:`check_merge_liveness_margin`.
+
+    Delegates entirely to :func:`check_merge_liveness_margin` (which remains
+    WARNING-only / fail-open) and raises :exc:`MergeLivenessConfigError` when
+    the assessment is ``not safe``, causing startup to be refused.
+
+    Args:
+        config: Live per-project orchestrator config.
+        merge_ahead_bound: Override for :data:`_MERGE_AHEAD_BOUND`.
+        max_verify_timeouts: Override for
+            :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`.
+        liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
+        safety_factor: Fraction of *liveness_secs* that constitutes the
+            threshold.  Default 0.75.
+        logger: Logger forwarded to :func:`check_merge_liveness_margin`.
+
+    Returns:
+        :class:`MergeLivenessAssessment` when the config is safe.
+
+    Raises:
+        :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``.
+    """
+    assessment = check_merge_liveness_margin(
+        config,
+        merge_ahead_bound=merge_ahead_bound,
+        max_verify_timeouts=max_verify_timeouts,
+        liveness_secs=liveness_secs,
+        safety_factor=safety_factor,
+        logger=logger,
+    )
+    if not assessment.safe:
+        raise MergeLivenessConfigError(
+            f'enforce_merge_liveness_margin: startup refused — queued _merge-* '
+            f'worktree worst-case age ({assessment.worst_case_secs:.0f}s) is not '
+            f'below the reaper liveness threshold ({assessment.threshold_secs:.0f}s, '
+            f'factor={safety_factor:.2f}, liveness={assessment.liveness_secs:.0f}s). '
+            f'Reduce merge_verify_cold_command_timeout_secs (currently '
+            f'{assessment.timeout_secs:.0f}s) or lower merge_ahead_bound '
+            f'(currently {assessment.merge_ahead_bound}).'
+        )
+    return assessment
