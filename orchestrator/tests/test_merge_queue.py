@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -101,7 +101,7 @@ def _make_request(
     worktree: Path,
     config: OrchestratorConfig,
     pre_rebased: bool = False,
-    lane: str = 'normal',
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
     return MergeRequest(
@@ -16212,8 +16212,6 @@ class TestLanePickIntegration:
         req_n1 = _make_request('ln-n1', 'ln-n1', wt_n1, config, lane='normal')
         req_n2 = _make_request('ln-n2', 'ln-n2', wt_n2, config, lane='normal')
         req_high = _make_request('ln-high', 'ln-high', wt_high, config, lane='high')
-
-        verify_order: list[str] = []
 
         async def _tracking_side_effect(*args, **kwargs):
             return MagicMock(passed=True, summary='')

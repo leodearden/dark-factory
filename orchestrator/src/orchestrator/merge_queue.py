@@ -3439,7 +3439,7 @@ class _WipHaltMixin:
     @property
     def is_wip_halted(self) -> bool:
         """True iff at least one lane is halted."""
-        return any(not self._lane_halt[l].is_set() for l in MERGE_LANES)
+        return any(not self._lane_halt[ln].is_set() for ln in MERGE_LANES)
 
     @property
     def _halt_owner_esc_id(self) -> str | None:
@@ -3465,9 +3465,9 @@ class _WipHaltMixin:
         are halted, waits for the first lane event to be set (un-halted) and
         cancels the remaining waiters before returning.
         """
-        if any(self._lane_halt[l].is_set() for l in MERGE_LANES):
+        if any(self._lane_halt[ln].is_set() for ln in MERGE_LANES):
             return
-        tasks = [asyncio.ensure_future(self._lane_halt[l].wait()) for l in MERGE_LANES]
+        tasks = [asyncio.ensure_future(self._lane_halt[ln].wait()) for ln in MERGE_LANES]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -3555,10 +3555,10 @@ class MergeWorker(_WipHaltMixin):
         # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
         self._generation_chain_counts: dict[str, int] = {}
         # Per-lane halt: each event is set (running) by default
-        self._lane_halt = {l: asyncio.Event() for l in MERGE_LANES}
-        for l in MERGE_LANES:
-            self._lane_halt[l].set()
-        self._lane_halt_owner: dict[str, str | None] = {l: None for l in MERGE_LANES}
+        self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
+        self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
 
     # ------------------------------------------------------------------
     # Public API
@@ -3935,10 +3935,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # for a counted item) so the slot is free while verify runs.
         self._merge_ahead_cap = asyncio.Semaphore(_MERGE_AHEAD_BOUND)
         # Per-lane halt: each event is set (running) by default
-        self._lane_halt = {l: asyncio.Event() for l in MERGE_LANES}
-        for l in MERGE_LANES:
-            self._lane_halt[l].set()
-        self._lane_halt_owner: dict[str, str | None] = {l: None for l in MERGE_LANES}
+        self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
+        self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -3970,7 +3970,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # pick-order can prefer high over normal.  Each deque preserves FIFO
         # within a lane.  Accessed only from the merger coroutine.
         self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
-            l: collections.deque() for l in MERGE_LANES
+            ln: collections.deque() for ln in MERGE_LANES
         }
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.
@@ -4294,8 +4294,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merger doesn't hang waiting at any synchronisation point.
         # Over-releasing a plain Semaphore is safe (it just increments the counter).
         self._speculation_slot.set()
-        for l in MERGE_LANES:
-            self._lane_halt[l].set()
+        for ln in MERGE_LANES:
+            self._lane_halt[ln].set()
         for _ in range(_MERGE_AHEAD_BOUND + 1):
             self._merge_ahead_cap.release()
 
