@@ -2166,3 +2166,120 @@ class TestRunVerdictParityAllAgree:
         report = await run_verdict_parity([], local_fake, remote_fake, _make_spec())
         assert report.all_agree is True
         assert report.rows == ()
+
+
+# ---------------------------------------------------------------------------
+# ε step-9: run_verdict_parity — divergence + expected-class coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerdictParityDivergence:
+    """run_verdict_parity divergence detection and expected-class checks."""
+
+    def _make_fake_runner(self, name, results_by_sha):
+        fake = MagicMock(spec=VerifyRunner)
+        fake.name = name
+        fake.is_local = (name == 'local')
+
+        async def run_merge_verify(sha, spec):
+            return results_by_sha[sha]
+
+        fake.run_merge_verify = AsyncMock(side_effect=run_merge_verify)
+        return fake
+
+    async def test_disagreeing_row_has_agree_false(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].agree is False
+
+    async def test_all_agree_false_when_one_disagreement(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None), ('sha2', None)]
+        local_fake = self._make_fake_runner('local', {
+            'sha1': _make_verify_result(passed=True),
+            'sha2': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'sha1': _make_verify_result(passed=False),  # disagrees
+            'sha2': _make_verify_result(passed=True),   # agrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.all_agree is False
+
+    async def test_divergent_shas_contains_disagreeing_sha(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None), ('sha2', None)]
+        local_fake = self._make_fake_runner('local', {
+            'sha1': _make_verify_result(passed=True),
+            'sha2': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'sha1': _make_verify_result(passed=False),  # disagrees
+            'sha2': _make_verify_result(passed=True),   # agrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert 'sha1' in report.divergent_shas
+        assert 'sha2' not in report.divergent_shas
+
+    async def test_divergent_shas_exactly_the_disagrreeing_ones(self):
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('a', None), ('b', None), ('c', None)]
+        local_fake = self._make_fake_runner('local', {
+            'a': _make_verify_result(passed=True),
+            'b': _make_verify_result(passed=False),
+            'c': _make_verify_result(passed=True),
+        })
+        remote_fake = self._make_fake_runner('laptop', {
+            'a': _make_verify_result(passed=False),  # disagrees
+            'b': _make_verify_result(passed=False),  # agrees
+            'c': _make_verify_result(passed=False),  # disagrees
+        })
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert set(report.divergent_shas) == {'a', 'c'}
+
+    async def test_expected_pass_none_matches_expected_is_none(self):
+        """When expected_pass is None, row.matches_expected is None."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', None)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        assert report.rows[0].matches_expected is None
+
+    async def test_matches_expected_true_when_agreed_verdict_matches(self):
+        """matches_expected is True when both agree and verdict == expected_pass."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True
+        assert row.matches_expected is True
+
+    async def test_matches_expected_false_when_verdict_does_not_match(self):
+        """matches_expected is False when agreed verdict != expected_pass."""
+        from orchestrator.verify_runner import run_verdict_parity
+        corpus = [('sha1', True)]  # expected pass=True but both fail
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=False)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=False)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True          # both agree on False
+        assert row.matches_expected is False  # but expected True
+
+    async def test_agree_independent_of_expected_pass(self):
+        """agree is purely local-vs-remote; expected_pass does not affect it."""
+        from orchestrator.verify_runner import run_verdict_parity
+        # Both pass; expected was False — matches_expected=False but agree=True
+        corpus = [('sha1', False)]
+        local_fake = self._make_fake_runner('local', {'sha1': _make_verify_result(passed=True)})
+        remote_fake = self._make_fake_runner('laptop', {'sha1': _make_verify_result(passed=True)})
+        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        row = report.rows[0]
+        assert row.agree is True
+        assert row.matches_expected is False
