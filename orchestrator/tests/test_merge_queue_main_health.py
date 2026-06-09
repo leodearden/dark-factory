@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -534,9 +535,10 @@ class TestDedupeFingerprrintAndCacheReuse:
         # (d) Cache-hit contract: get_main_sha was called once per merge to
         # build the cache key, but no new probe entry was written (cache had
         # exactly one entry before and after, confirming no worktree was created).
-        assert git_ops.get_main_sha.call_count == 2, (
+        _get_main_sha_mock = cast(AsyncMock, git_ops.get_main_sha)
+        assert _get_main_sha_mock.call_count == 2, (
             f'get_main_sha must be called once per merge (cache-key lookup); '
-            f'call_count={git_ops.get_main_sha.call_count}'
+            f'call_count={_get_main_sha_mock.call_count}'
         )
         assert len(_PROBE_CACHE) == 1, (
             f'_PROBE_CACHE must still have exactly one entry — no second probe was run; '
