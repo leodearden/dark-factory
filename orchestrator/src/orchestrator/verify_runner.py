@@ -43,7 +43,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult
@@ -413,6 +413,7 @@ class VerifyRunner(Protocol):
     """
 
     name: str
+    is_local: bool
 
     async def health(self) -> bool:
         """Return True when this runner is reachable and healthy."""
@@ -446,6 +447,7 @@ class LocalRunner:
     """
 
     name: str = 'local'
+    is_local: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -539,9 +541,11 @@ async def _default_subprocess_run(
     *,
     cwd: str | Path | None = None,
 ) -> tuple[int, str, str]:
-    """Default subprocess helper — mirrors git_ops._run.
+    """Default subprocess helper — similar to git_ops._run but without the WorktreeMissing pre-flight.
 
-    Returns (returncode, stdout_str, stderr_str).
+    Returns (returncode, stdout_str, stderr_str).  A missing ``cwd`` surfaces as
+    a raw ``FileNotFoundError`` (caught by callers as OSError → RunnerUnavailable)
+    rather than the ``WorktreeMissing`` sentinel that git_ops._run would raise.
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -573,6 +577,8 @@ class RemoteRunner:
     return (step-10).
     """
 
+    is_local: ClassVar[bool] = False
+
     def __init__(
         self,
         name: str,
@@ -591,16 +597,18 @@ class RemoteRunner:
         self._config_path = config_path
         self._run = run if run is not None else _default_subprocess_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
-        # Test-only injection point: tests may assign a list here to capture subprocess calls.
-        self._calls: list = []
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
 
         Returns True when rc == 0, False otherwise.  Never raises.
+        BatchMode=yes prevents interactive password prompts; ConnectTimeout=10
+        bounds the TCP-connect wait so a down host is detected quickly.
         """
         try:
-            rc, _, _ = await self._run(['ssh', self._ssh_host, 'true'])
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self._ssh_host, 'true']
+            )
             return rc == 0
         except Exception:
             return False
@@ -652,7 +660,8 @@ class RemoteRunner:
 
             try:
                 ssh_rc, ssh_stdout, ssh_stderr = await self._run(
-                    ['ssh', self._ssh_host, remote_cmd],
+                    ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                     self._ssh_host, remote_cmd],
                 )
             except OSError as exc:
                 raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
@@ -730,9 +739,12 @@ class VerifyRunnerPool:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
         self._runners = list(runners)
-        # Pre-compute the local runner for fast fail-safe lookup
+        # Pre-compute the local runner for fast fail-safe lookup.
+        # Use the is_local flag (LocalRunner.is_local = True) rather than
+        # string equality so a RemoteRunner named 'local' isn't mistaken for
+        # the fallback target.
         self._local: VerifyRunner | None = next(
-            (r for r in self._runners if r.name == 'local'), None
+            (r for r in self._runners if r.is_local), None
         )
         self._event_store = event_store
         self._task_id = task_id
@@ -741,9 +753,10 @@ class VerifyRunnerPool:
         """Prefer-remote: return the first non-local runner; fall back to runners[0].
 
         The K-permit free/busy refinement (load-based selection) is ζ.
+        RemoteRunner.is_local is False, so it is selected over LocalRunner.
         """
         for runner in self._runners:
-            if runner.name != 'local':
+            if not runner.is_local:
                 return runner
         return self._runners[0]
 

@@ -621,6 +621,7 @@ class TestVerifyRunnerPool:
         expected = _make_pass_result()
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=expected)
         pool = VerifyRunnerPool([fake_runner])
 
@@ -634,6 +635,7 @@ class TestVerifyRunnerPool:
         expected = _make_pass_result()
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=expected)
 
         emitted = []
@@ -655,6 +657,7 @@ class TestVerifyRunnerPool:
         from orchestrator.verify_runner import VerifyRunnerPool
         fake_runner = MagicMock(spec=VerifyRunner)
         fake_runner.name = 'local'
+        fake_runner.is_local = True
         fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
         pool = VerifyRunnerPool([fake_runner], event_store=None)
 
@@ -1180,8 +1183,10 @@ class TestRemoteRunnerConstruction:
         )
         result = await runner.health()
         assert result is True
-        # health issues `ssh <host> true`
-        assert fake_run.calls == [['ssh', 'laptop.local', 'true']]
+        # health issues `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`
+        assert fake_run.calls == [
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'laptop.local', 'true']
+        ]
 
     async def test_health_false_when_ssh_rc_nonzero(self):
         from orchestrator.verify_runner import RemoteRunner
@@ -1276,11 +1281,11 @@ class TestRemoteRunnerHappyPath:
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected)
         await runner.run_merge_verify('abc123', spec)
-        # second call is the ssh
+        # second call is the ssh (with hardening flags: -o BatchMode=yes -o ConnectTimeout=10)
         ssh_argv, _ = calls[1]
         assert ssh_argv[0] == 'ssh'
-        assert ssh_argv[1] == 'laptop.local'
-        remote_cmd = ssh_argv[2]
+        assert ssh_argv[-2] == 'laptop.local'   # host is second-to-last
+        remote_cmd = ssh_argv[-1]               # quoted remote command is last
         parsed = _shlex.split(remote_cmd)
         assert parsed[:4] == ['orchestrator', 'verify-merge', '--sha', 'abc123']
         # spec JSON survives as a single token
@@ -1298,7 +1303,7 @@ class TestRemoteRunnerHappyPath:
         runner, calls = self._make_runner_and_calls(expected, config_path='/etc/orch.yaml')
         await runner.run_merge_verify('abc123', spec)
         ssh_argv, _ = calls[1]
-        parsed = _shlex.split(ssh_argv[2])
+        parsed = _shlex.split(ssh_argv[-1])  # last arg is the quoted remote command
         cfg_idx = parsed.index('--config') + 1
         assert parsed[cfg_idx] == '/etc/orch.yaml'
 
@@ -1377,6 +1382,23 @@ class TestRemoteRunnerTransportVsTimeout:
         runner = self._make_runner([(0, '', ''), (0, 'not valid json!!!', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
+
+    async def test_raises_runner_unavailable_on_wrong_shape_json(self):
+        """ssh rc=0 but stdout is valid JSON with wrong schema → RunnerUnavailable (TypeError path).
+
+        This is the most likely real-world malformed-verdict case from a buggy
+        remote CLI: the JSON parses but result_from_json raises TypeError because
+        the keys don't match VerifyResult's fields.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+        # Valid JSON dict but unrecognised keys — triggers TypeError in result_from_json
+        runner = self._make_runner([(0, '', ''), (0, '{"unexpected": 1}', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+        # JSON list — also a TypeError because ** unpacking requires a mapping
+        runner2 = self._make_runner([(0, '', ''), (0, '[1, 2, 3]', '')])
+        with pytest.raises(RunnerUnavailable):
+            await runner2.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_when_run_raises_oserror(self):
         """An OSError from the subprocess runner → RunnerUnavailable."""
@@ -1575,6 +1597,7 @@ class TestVerifyRunnerPoolPreferRemote:
     def _make_fake_runner(self, name, result):
         fake = MagicMock(spec=VerifyRunner)
         fake.name = name
+        fake.is_local = (name == 'local')
         fake.run_merge_verify = AsyncMock(return_value=result)
         return fake
 
@@ -1643,6 +1666,7 @@ class TestVerifyRunnerPoolFailSafe:
     def _make_fake_runner(self, name, result=None, raises=None):
         fake = MagicMock(spec=VerifyRunner)
         fake.name = name
+        fake.is_local = (name == 'local')
         if raises is not None:
             fake.run_merge_verify = AsyncMock(side_effect=raises)
         else:
