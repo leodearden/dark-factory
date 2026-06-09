@@ -1839,3 +1839,143 @@ class TestEnvFingerprint:
     def test_fingerprint_from_json_in_dunder_all(self):
         import orchestrator.verify_runner as vr_mod
         assert 'fingerprint_from_json' in vr_mod.__all__
+
+
+# ---------------------------------------------------------------------------
+# ε step-3: capture_env_fingerprint — probe commands via injected run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCaptureEnvFingerprint:
+    """capture_env_fingerprint is async and probes through an injected run callable."""
+
+    def _make_fake_run(self, responses):
+        """Return async callable that returns successive (rc, stdout, stderr) tuples."""
+        responses_queue = list(responses)
+        issued = []
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(argv)
+            return responses_queue.pop(0)
+
+        fake_run.issued = issued
+        return fake_run
+
+    async def test_toolchain_from_rustc_cargo_stdout(self):
+        """toolchain == trimmed rustc + cargo --version stdout joined by newline."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0 (abc 2024-01-01)\n', ''),  # rustc --version
+            (0, 'cargo 1.80.0 (def 2024-01-01)\n', ''),  # cargo --version
+            (0, 'sccache stats\n', ''),                   # sccache --show-stats
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.toolchain == 'rustc 1.80.0 (abc 2024-01-01)\ncargo 1.80.0 (def 2024-01-01)'
+
+    async def test_sccache_reachable_when_rc_zero(self):
+        """sccache_reachable is True when sccache --show-stats returns rc==0."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, 'stats here\n', ''),   # sccache rc=0
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.sccache_reachable is True
+
+    async def test_sccache_not_reachable_when_rc_nonzero(self):
+        """sccache_reachable is False when sccache --show-stats returns rc!=0."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (1, '', 'connection refused'),  # sccache rc=1
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert fp.sccache_reachable is False
+
+    async def test_verify_env_carried_through_verbatim(self):
+        """verify_env is embedded verbatim from the kwarg."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        env = {'FOO': 'bar', 'SCCACHE_BUCKET': 'builds'}
+        fp = await capture_env_fingerprint(fake_run, verify_env=env)
+        assert dict(fp.verify_env) == env
+
+    async def test_extra_probe_specs_populate_extra_probes(self):
+        """extra_probe_specs (key, argv) pairs populate extra_probes with trimmed stdout."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),                        # sccache
+            (0, 'Python 3.11.9\n', ''),         # python_version probe
+            (0, 'Ubuntu 22.04\n', ''),           # os_release probe
+        ])
+        probes = [
+            ('python_version', ['python3', '--version']),
+            ('os_release', ['lsb_release', '-d']),
+        ]
+        fp = await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert dict(fp.extra_probes) == {
+            'python_version': 'Python 3.11.9',
+            'os_release': 'Ubuntu 22.04',
+        }
+
+    async def test_extra_probe_unavailable_on_nonzero_rc(self):
+        """When an extra probe exits non-zero, the value is '<unavailable rc=N>'."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),          # sccache
+            (2, '', 'not found'), # extra probe with rc=2
+        ])
+        probes = [('missing_tool', ['missing_tool', '--version'])]
+        fp = await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert fp.extra_probes['missing_tool'] == '<unavailable rc=2>'
+
+    async def test_exact_argv_lists_issued_to_run(self):
+        """Assert the exact argv lists issued to the run callable."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, 'stats\n', ''),
+            (0, 'Python 3.11.9\n', ''),
+        ])
+        probes = [('python_version', ['python3', '--version'])]
+        await capture_env_fingerprint(fake_run, extra_probe_specs=probes)
+        assert fake_run.issued == [
+            ['rustc', '--version'],
+            ['cargo', '--version'],
+            ['sccache', '--show-stats'],
+            ['python3', '--version'],
+        ]
+
+    async def test_no_extra_probes_by_default(self):
+        """With no extra_probe_specs, extra_probes is an empty mapping."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert dict(fp.extra_probes) == {}
+
+    async def test_default_verify_env_empty(self):
+        """With no verify_env kwarg, verify_env is an empty mapping."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fake_run = self._make_fake_run([
+            (0, 'rustc 1.80.0\n', ''),
+            (0, 'cargo 1.80.0\n', ''),
+            (0, '', ''),
+        ])
+        fp = await capture_env_fingerprint(fake_run)
+        assert dict(fp.verify_env) == {}
