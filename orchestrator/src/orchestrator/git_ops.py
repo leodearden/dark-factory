@@ -323,11 +323,13 @@ class WorktreeMissing(FileNotFoundError):
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    """Run a git command and return (returncode, stdout, stderr).
+    """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
-    Raises :class:`WorktreeMissing` if ``cwd`` is provided but does not exist,
-    so the caller can distinguish a deleted worktree (recoverable race) from
-    other ``FileNotFoundError``\\ s (e.g. missing binary on ``PATH``).
+    Used throughout for git invocations and for any other subprocess call
+    (e.g. project setup scripts).  Raises :class:`WorktreeMissing` if ``cwd``
+    is provided but does not exist, so the caller can distinguish a deleted
+    worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
+    missing binary on ``PATH``).
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
@@ -697,6 +699,11 @@ class GitOps:
                     )
 
                 _ensure_task_gitignore(worktree_path)
+                # Re-run on reuse so the requeued agent re-acquires a free
+                # port and re-patches its .mcp.json.  The script must be
+                # idempotent (return the same port for the same worktree dir)
+                # to avoid leaking ports across requeues — see the docstring
+                # of _provision_reify_debug_port for the full contract.
                 port = await self._provision_reify_debug_port(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,
@@ -847,6 +854,18 @@ class GitOps:
 
         Best-effort and fail-open: returns None on any miss or failure so
         worktree creation is never blocked by a debug-port hiccup.
+
+        **Idempotency contract**: This helper is invoked on *both* the
+        fresh-create and reuse/requeue return paths of ``create_worktree``.
+        On reuse the script is re-run to re-acquire a free port and re-patch
+        ``<worktree>/.mcp.json``.  The script (``scripts/setup-worktree-
+        debug-port.sh`` in the provisioned worktree) is therefore expected to
+        be idempotent with respect to the worktree directory — successive calls
+        for the same worktree must return the same port rather than allocating
+        a new one each time.  If the script is not idempotent it may churn
+        (leak) ports across requeues; the existence guard and ``try/except``
+        wrapper below ensure this function itself is always safe to call, but
+        port stability is the script's responsibility.
         """
         try:
             script = worktree_path / 'scripts' / 'setup-worktree-debug-port.sh'
