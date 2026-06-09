@@ -5013,6 +5013,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # simply increments past the original bound).
                         # Do NOT replace with asyncio.BoundedSemaphore, which
                         # raises ValueError on over-release and would crash here.
+                        #
+                        # The same double-release tolerance applies to
+                        # _speculation_slot: if this is a speculative item and
+                        # CancelledError fires after the put succeeded,
+                        # held_spec_permit remains True so the outer finally
+                        # releases the slot — and the verifier also releases it
+                        # on drain.  Both are plain Semaphores so over-release
+                        # is safe here too.
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise
