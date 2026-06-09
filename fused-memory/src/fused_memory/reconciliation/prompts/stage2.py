@@ -188,6 +188,24 @@ protective write already captured.
 Note that `task_id` MUST be passed as `str(task_id)` — Qdrant exact payload-match \
 requires the stored string form.
 
+**Write side (tag-on-first-write — REQUIRED for the gate to function)**: the pre-check \
+above only fires if a prior write actually stored the `stage2_suppress` key. Therefore, \
+whenever the pre-check returns `count == 0` AND you proceed to write a protective \
+completion-note / "task marked done, no knowledge captured" guard memory for an \
+already-done task, you MUST tag that `add_memory` call with \
+`metadata={{'stage2_suppress': True, 'task_id': str(task_id)}}` (merge these keys into \
+whatever other metadata the write already carries). This is the only writer of the \
+`stage2_suppress` key — mirroring the `cycle_summary` metadata convention below, it is \
+what makes the next cycle's deterministic count return `> 0` and suppress the duplicate. \
+`task_id` MUST be the same `str(task_id)` exact-string form the pre-check queries on, or \
+the count filter will not match. Omitting this metadata leaves the gate permanently inert \
+(the count stays 0 forever and the protective note is rewritten every cycle). Legacy \
+guard memories written before this convention (e.g. task 1680's 492e02ab/e8cb6795) lack \
+the key; if you encounter such a guard for the task at hand and it is missing \
+`stage2_suppress`, write one fresh guard carrying the metadata so the deterministic gate \
+covers it going forward (do NOT write more than one per task — the pre-check on the next \
+cycle will then suppress further writes).
+
 This deterministic exact-count check is independent of semantic `search` ranking: \
 an exact Qdrant payload-filter count returns 0 or > 0 unconditionally, eliminating the \
 0.71 false-negative retrieval precedent documented in task 1680 (guard memories \
