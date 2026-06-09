@@ -896,7 +896,7 @@ class EnvFingerprint:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "EnvFingerprint":
+    def from_dict(cls, d: dict) -> EnvFingerprint:
         return cls(
             toolchain=d["toolchain"],
             verify_env=dict(d["verify_env"]),
@@ -1053,7 +1053,7 @@ class ParityRow:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ParityRow":
+    def from_dict(cls, d: dict) -> ParityRow:
         return cls(
             sha=d["sha"],
             expected_pass=d["expected_pass"],
@@ -1087,7 +1087,7 @@ class VerdictParityReport:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "VerdictParityReport":
+    def from_dict(cls, d: dict) -> VerdictParityReport:
         return cls(
             rows=tuple(ParityRow.from_dict(r) for r in d["rows"]),
             all_agree=d["all_agree"],

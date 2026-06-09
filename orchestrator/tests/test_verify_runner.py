@@ -1782,7 +1782,7 @@ class TestEnvFingerprint:
             extra_probes={'python_version': 'Python 3.11.9'},
         )
         defaults.update(kwargs)
-        return EnvFingerprint(**defaults)
+        return EnvFingerprint(**defaults)  # type: ignore[arg-type]
 
     def test_frozen_raises_on_reassignment(self):
         fp = self._make_fp()
@@ -1998,7 +1998,7 @@ class TestCompareEnvFingerprints:
             extra_probes={'python_version': 'Python 3.11.9'},
         )
         base.update(kwargs)
-        return EnvFingerprint(**base)
+        return EnvFingerprint(**base)  # type: ignore[arg-type]
 
     def test_identical_fingerprints_is_faithful(self):
         from orchestrator.verify_runner import compare_env_fingerprints
@@ -2102,7 +2102,7 @@ class TestRunVerdictParityAllAgree:
             'aaa': _make_verify_result(passed=True),
             'bbb': _make_verify_result(passed=False),
         })
-        report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
+        _report = await run_verdict_parity(corpus, local_fake, remote_fake, _make_spec())
         assert local_fake.run_merge_verify.await_count == 2
         assert remote_fake.run_merge_verify.await_count == 2
 
@@ -2381,5 +2381,5 @@ class TestRenderParityReport:
         text = render_parity_report(report)
         # Count lines containing 'abc123' and 'def456' — each should appear once
         lines = text.splitlines()
-        assert sum(1 for l in lines if 'abc123' in l) == 1
-        assert sum(1 for l in lines if 'def456' in l) == 1
+        assert sum(1 for line in lines if 'abc123' in line) == 1
+        assert sum(1 for line in lines if 'def456' in line) == 1
