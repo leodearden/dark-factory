@@ -3289,8 +3289,12 @@ async def reverify_member_solo(
         passed=False,
         merge_sha=None,
         reason=outcome.reason,
-        solo_wt=solo_wt,
-        solo_branch=solo_branch,
+        # solo_wt and solo_branch are set to None to reflect that they
+        # have already been torn down above.  A caller that iterated
+        # failer results and trusted these fields would double-clean or
+        # operate on a stale path.
+        solo_wt=None,
+        solo_branch=None,
     )
 
 

@@ -343,8 +343,10 @@ class TestReverifyMemberSoloContract:
         assert result.solo_branch == solo_branch
 
     async def test_solo_worktree_cleaned_up_on_fail(self) -> None:
-        """Fail-path: cleanup_merge_worktree AND delete_solo_branch are both called."""
-        from orchestrator.merge_queue import reverify_member_solo
+        """Fail-path: cleanup_merge_worktree AND delete_solo_branch are both called;
+        returned SoloVerifyResult has solo_wt=None and solo_branch=None to reflect
+        that the paths are already torn down (not stale references)."""
+        from orchestrator.merge_queue import SoloVerifyResult, reverify_member_solo
 
         git_ops = _make_git_ops_mock()
         git_ops.delete_solo_branch = AsyncMock()
@@ -358,7 +360,7 @@ class TestReverifyMemberSoloContract:
             'orchestrator.merge_queue._run_post_merge_verify',
             new=AsyncMock(return_value=fail_outcome),
         ):
-            await reverify_member_solo(
+            result = await reverify_member_solo(
                 git_ops=git_ops,
                 member_id='b1',
                 solo_wt=solo_wt,
@@ -372,3 +374,14 @@ class TestReverifyMemberSoloContract:
         # Fail path: both worktree and branch are torn down
         git_ops.cleanup_merge_worktree.assert_called_once_with(solo_wt)
         git_ops.delete_solo_branch.assert_called_once_with(solo_branch)
+
+        # Returned result must have solo_wt=None and solo_branch=None to avoid
+        # callers operating on stale (already-deleted) paths.
+        assert isinstance(result, SoloVerifyResult)
+        assert result.passed is False
+        assert result.solo_wt is None, (
+            f'Expected solo_wt=None on fail path, got {result.solo_wt!r}'
+        )
+        assert result.solo_branch is None, (
+            f'Expected solo_branch=None on fail path, got {result.solo_branch!r}'
+        )

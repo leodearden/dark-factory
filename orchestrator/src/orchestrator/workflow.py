@@ -5144,6 +5144,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
           (verdict='interaction'), escalate the train, land nothing.
         - Some fail → land each passer, block each failer (steps 12/14).
         """
+        # Sort members by their metadata train 'order' (root→tip) so that the
+        # predecessor_ref computation is correct regardless of caller-side ordering.
+        # tasks_by_train normally returns them sorted, but attributing the right
+        # delta to each member depends on strict stacking order — a silently
+        # mis-ordered list would rebase against the wrong predecessor, either
+        # producing a spurious conflict (mis-classified 'unstackable') or
+        # extracting the wrong delta.
+        members = sorted(
+            members,
+            key=lambda m: (m.get('metadata') or {}).get('train', {}).get('order', 0),
+        )
+
         member_ids = [str(m.get('id', '')) for m in members]
         branch_prefix = self.git_ops.config.branch_prefix
         main_branch = self.git_ops.config.main_branch
@@ -5312,15 +5324,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, train_id, r.member_id, adv,
                 )
 
+        # Build shared train_state once before the loop — it is identical for
+        # every failer; only failing_member is overridden per iteration.
+        # Hoisting avoids N redundant scheduler round-trips (get_statuses).
+        esc_train_state_base: object = None
+        if self.escalation_queue:
+            esc_train_state_base = await self._build_train_state()
+
         # Block each failer: set status blocked and submit an L1.
         for r in failers:
             await self.scheduler.set_task_status(r.member_id, 'blocked')
             if self.escalation_queue:
                 from escalation.models import Escalation
-                train_state = await self._build_train_state()
-                # Override failing_member to point at the actual offender.
-                if train_state is not None:
-                    train_state = dict(train_state)  # type: ignore[assignment]
+                # Copy the base train_state and override failing_member to the
+                # actual offender (each failer gets its own attribution pointer).
+                train_state = None
+                if esc_train_state_base is not None:
+                    train_state = dict(esc_train_state_base)  # type: ignore[arg-type]
                     train_state['failing_member'] = r.member_id  # type: ignore[index]
                 esc = Escalation(
                     id=self.escalation_queue.make_id(r.member_id),
@@ -5373,11 +5393,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Tip return value: DONE if the tip landed, BLOCKED otherwise.
         if self.task_id in landed_ids:
             return WorkflowOutcome.DONE
-        # Tip is blocked or advance failed — need to surface tip as blocked too.
+        # Tip is blocked or advance failed — surface tip as blocked.
+        # When the tip is itself an attribution offender, the failer loop above
+        # already submitted a dedicated L1 for it (via escalation_queue.submit).
+        # Calling _mark_blocked(escalate_to_human=True) here would create a
+        # second L1 and a second blocked status transition for the same task.
+        # Pass skip_escalation=True to suppress the redundant escalation while
+        # still recording the BLOCKED state and updating internal fields.
+        tip_is_offender = self.task_id in offender_ids
         return await self._mark_blocked(
             f'Train {train_id!r} union verify failed — tip {self.task_id!r} '
-            f'{"is an offender" if self.task_id in offender_ids else "advance failed"}',
-            escalate_to_human=True,
+            f'{"is an offender" if tip_is_offender else "advance failed"}',
+            escalate_to_human=not tip_is_offender,
+            skip_escalation=tip_is_offender,
         )
 
     async def _escalate_train_halt(

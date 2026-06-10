@@ -814,6 +814,48 @@ class TestEdgeMappings:
         )
 
 
+    # ── (d) tip-offender: no duplicate escalation ────────────────────────
+
+    async def test_tip_offender_skip_escalation(self) -> None:
+        """When tip is sole offender, _mark_blocked is called with skip_escalation=True.
+
+        The failer loop submits one L1 for the tip-offender directly via
+        escalation_queue.submit.  Calling _mark_blocked(escalate_to_human=True)
+        afterward would create a second L1 + a second blocked transition for the
+        same task.  The fix: pass skip_escalation=True when tip_is_offender so
+        _mark_blocked records the BLOCKED state without adding another escalation.
+        """
+        f = self._fixture()
+        members = _train_members(train_id='T-dedup-esc', tip_id='103')
+        # Only the tip '103' fails; '101' and '102' pass.
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass_wt('101'),
+            _solo_pass_wt('102'),
+            _solo_fail('103'),
+        ])
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-dedup-esc', members)
+
+        # _mark_blocked must have been called with skip_escalation=True
+        # (not escalate_to_human=True) so the L1 submitted by the failer loop
+        # is the only one for the tip-offender.
+        assert f.mark_blocked.called, 'Expected _mark_blocked to be called'
+        call_kwargs = f.mark_blocked.call_args.kwargs
+        assert call_kwargs.get('skip_escalation') is True, (
+            f'Expected skip_escalation=True when tip is an offender; '
+            f'got _mark_blocked kwargs: {call_kwargs!r}'
+        )
+        # esc_queue.submit called exactly once: only from the failer loop for '103'.
+        # (If _mark_blocked were NOT mocked and called escalate_to_human=True,
+        # it would submit a second escalation — this count pins that doesn't happen.)
+        assert f.esc_queue.submit.call_count == 1, (
+            f'Expected exactly 1 escalation submit (failer loop for tip-offender), '
+            f'got {f.esc_queue.submit.call_count}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step-19: Passer land path — branch=None, fresh-main per passer, teardown,
 #          and all-pass teardown.
