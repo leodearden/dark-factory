@@ -715,7 +715,6 @@ class TestMaybeFormTrainStackBranches:
             f'Expected train metadata for {{200, 201}}, got {set(ids_with_train)}'
         )
         # 202 must NEVER receive train metadata.
-        ids_called = [c.args[0] for c in calls]
         for c in calls:
             if c.args[0] == '202':
                 assert 'train' not in (c.args[1] if c.args else {}), (

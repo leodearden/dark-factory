@@ -20,6 +20,7 @@ from orchestrator.git_ops import (
     _run,
     scrub_task_dir_from_tree,
 )
+
 try:
     from orchestrator.git_ops import TrainStackResult  # added in step-4
 except ImportError:
@@ -5272,7 +5273,7 @@ class TestRebaseOntoArbitraryRef:
         returns True and the feature worktree now contains fileA.
         """
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
-        base_wt = await self._make_branch(
+        await self._make_branch(
             git_ops, 'base-rb', 'main', 'fileA.txt', 'content A\n',
         )
         feature_wt = await self._make_branch(
@@ -5297,7 +5298,7 @@ class TestRebaseOntoArbitraryRef:
         """
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         # base edits shared.txt with one value
-        base_wt = await self._make_branch(
+        await self._make_branch(
             git_ops, 'base-conf', 'main', 'shared.txt', 'version: alpha\n',
         )
         # feature also edits shared.txt with a different value → conflict
@@ -5309,17 +5310,8 @@ class TestRebaseOntoArbitraryRef:
         result = await git_ops.rebase_onto_main(feature_wt, onto=base_branch)
 
         assert result is False
-        # Worktree must be clean — no rebase in progress
-        rebase_dir = feature_wt / '.git'
-        # For worktrees, the .git is a file pointing to the main .git/worktrees/<name>
-        # The rebase state is kept under .git/worktrees/<name>/rebase-merge or
-        # directly in the worktree's gitdir.  Check via git status instead.
-        rc, out, _ = await _run(
-            ['git', 'rebase', '--show-current-patch'],
-            cwd=feature_wt,
-        )
-        # If rebase is NOT in progress, git exits non-zero with a message.
-        # More reliably: check that git status exits 0 (clean state).
+        # Worktree must be clean — rebase was aborted.
+        # Check via git status: exits 0 when the worktree is in a clean state.
         rc2, _, _ = await _run(['git', 'status'], cwd=feature_wt)
         assert rc2 == 0, 'worktree should be in a clean state after failed rebase'
 
