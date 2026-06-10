@@ -6969,6 +6969,46 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
     return result
 
 
+# Matches cargo-nextest Summary footer lines, e.g.:
+#   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
+# Capture group: (1) total test count N from 'N tests run:'
+_NEXTEST_SUMMARY_LINE_RE = re.compile(
+    r'^Summary\s+\[[^\]]*\]\s+(\d+)\s+tests\s+run:',
+    re.MULTILINE,
+)
+
+
+def _nextest_reported_test_count(output: str) -> int | None:
+    """Return the total number of tests reported in nextest Summary footer line(s).
+
+    Scans all lines in *output* for the cargo-nextest human-format footer::
+
+        Summary [<timing>] N tests run: P passed, F failed, S skipped
+
+    Returns the **sum** of N across all matched Summary lines (to cover
+    multi-pass debug+release aggregate runs), or ``None`` when no Summary
+    line is found in the output.
+
+    A return value of ``0`` is distinct from ``None``:  ``0`` means a Summary
+    was found but reported zero tests run (e.g. legitimately test-free crate);
+    ``None`` means no nextest pass occurred at all (pure build noise or empty
+    output).
+
+    Used by :func:`_alarm_warm_shadow_unparseable` to discriminate between
+    a genuinely test-free merge (no alarm) and a parser failure (alarm).
+
+    Args:
+        output: Raw string from a verify run.
+
+    Returns:
+        Sum of reported test counts, or ``None`` if no Summary line present.
+    """
+    matches = _NEXTEST_SUMMARY_LINE_RE.findall(output)
+    if not matches:
+        return None
+    return sum(int(n) for n in matches)
+
+
 @dataclass
 class ShadowCompareDiff:
     """Per-test divergence between a warm and a cold verify run.
