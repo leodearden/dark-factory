@@ -1379,3 +1379,90 @@ class TestBlockedHistoryGate:
         assert events[0]['data'].get('exclusions') == [], (
             f'exclusions must be empty when no risk signals; got {events[0]["data"].get("exclusions")}'
         )
+
+
+# ─── δ Step 5 ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestOneStrikeExclusion:
+    """δ step-5 (RED): one-strike registry excludes a candidate.
+
+    Pre-populate worker._coalesce_derailed_task_ids = {'os2'} (simulating
+    os2 having derailed a prior coalesce train). Run the pass with 3 disjoint
+    stackable singles and DEFAULT predicate.
+
+    Asserts:
+      (a) returns True — train forms with the 2 clean members
+      (b) os2 NOT in train.member_task_ids; train == {os1, os3}
+      (c) req2.result NOT done() — excluded request stays unresolved
+      (d) os2 remains as solo in the buffer
+      (e) exclusions contains {'request_id': req2.request_id,
+          'reason': 'coalesce_derailed_one_strike'}
+    """
+
+    async def test_one_strike_excludes_candidate(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'os1', 'file_os1.py', 'os1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'os2', 'file_os2.py', 'os2 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'os3', 'file_os3.py', 'os3 = 3\n')
+
+        db_path = tmp_path / 'es_os.db'
+        es = EventStore(db_path=db_path, run_id='run-os-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        # Pre-populate the one-strike set (simulating a prior coalesce derail).
+        worker._coalesce_derailed_task_ids = {'os2'}
+
+        req1 = _make_req('os1', 'task/os1', wt1, coalesce_config)
+        req2 = _make_req('os2', 'task/os2', wt2, coalesce_config)
+        req3 = _make_req('os3', 'task/os3', wt3, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must form a train from the 2 clean candidates'
+
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+
+        # (b) os2 excluded — NOT in train
+        assert len(trains) == 1
+        train = trains[0]
+        assert 'os2' not in train.member_task_ids, (
+            f'os2 must be excluded (one-strike); members={train.member_task_ids}'
+        )
+        assert set(train.member_task_ids) == {'os1', 'os3'}, (
+            f'train must contain os1+os3; got {train.member_task_ids}'
+        )
+
+        # (c) req2 future unresolved
+        assert not req2.result.done(), 'excluded os2 future must remain unresolved'
+
+        # (d) os2 stays as a solo
+        solo_ids = [r.task_id for r in solos]
+        assert 'os2' in solo_ids, f'os2 must remain as solo; got {solo_ids}'
+
+        # (e) exclusions with one-strike reason
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1
+        exc = events[0]['data'].get('exclusions', [])
+        assert len(exc) == 1, f'Expected 1 exclusion; got {exc}'
+        assert exc[0] == {
+            'request_id': req2.request_id,
+            'reason': 'coalesce_derailed_one_strike',
+        }, f'exclusion entry mismatch: {exc[0]}'
