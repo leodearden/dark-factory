@@ -1481,6 +1481,44 @@ class GitOps:
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
+    #: Name of the counter file used to persist the per-host verify attempt count
+    #: across stateless CLI invocations.  Lives under worktree_base so it is
+    #: never inside a registered worktree and therefore never pruned or cleaned.
+    _HOST_VERIFY_COUNTER_FILENAME: str = '.merge_verify_host_attempts'
+
+    def _bump_host_verify_attempt_count(self) -> int:
+        """Read, increment, and persist the per-host verify attempt counter.
+
+        The counter is stored as a plain integer in
+        ``<worktree_base>/.merge_verify_host_attempts`` so that it survives
+        across the stateless ``orchestrator verify-merge`` CLI invocations
+        (each invocation is a fresh process; an in-memory counter cannot
+        persist on the laptop host).
+
+        A missing or corrupt counter file is treated as count 0 so the next
+        call returns 1 — fail-safe, no exception raised.
+
+        The non-atomic read / modify / write is safe because the per-host
+        serial invariant enforced by
+        :func:`~orchestrator.merge_queue.enforce_persistent_worktree_serial_lane`
+        guarantees that at most one ``verify-merge`` process runs at a time on
+        this host.
+
+        Returns:
+            The new 1-based attempt count after the increment.
+        """
+        counter_file = self.worktree_base / self._HOST_VERIFY_COUNTER_FILENAME
+        # Read existing count; treat missing/corrupt file as 0 (fail-safe)
+        try:
+            current = int(counter_file.read_text().strip())
+        except (FileNotFoundError, ValueError, OSError):
+            current = 0
+        new_count = current + 1
+        # Ensure worktree_base exists before writing
+        self.worktree_base.mkdir(parents=True, exist_ok=True)
+        counter_file.write_text(str(new_count))
+        return new_count
+
     async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
         """Create or reset-in-place the persistent warm merge-verify worktree.
 
