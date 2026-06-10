@@ -34,6 +34,7 @@ from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
+    _derive_task_files_from_git,
     _resolve_verify_timeout,
     run_scoped_verification,
     run_verification,
@@ -654,6 +655,7 @@ async def _run_post_merge_verify(
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
+    quarantine: 'set[str] | None' = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -688,19 +690,31 @@ async def _run_post_merge_verify(
     # Build the spec (carried for forward-compat with γ/δ remote runners;
     # the LocalRunner does not use it to drive execution).
     task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
+
+    # Mechanism 5b (dispatching-host scope derivation): when Lever C is on and
+    # task_files was not supplied, derive the scope on the DISPATCHING host
+    # (which has a fresh main) before building the spec.  This ships a faithful
+    # non-None task_files in the spec so the remote's run_scoped_verification
+    # never calls _derive_task_files_from_git against its own possibly-stale main.
+    # Gated on enabled_verify_runners so the local-only path is byte-identical
+    # when Lever C is off (zero behaviour change, trivially revertible).
+    if task_files_tuple is None and req.config.enabled_verify_runners:
+        derived = await _derive_task_files_from_git(merge_wt, req.config)
+        if derived:
+            task_files_tuple = tuple(derived)
+
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # Construct a per-call pool with a single LocalRunner.  The verify callables
-    # are the merge_queue module globals resolved at call time so that existing
-    # test patches on 'orchestrator.merge_queue.run_scoped_verification' and
-    # '_run_unscoped_typechecks' keep intercepting after the routing change.
+    # Construct a per-call pool.  When Lever C is on (enabled_verify_runners
+    # non-empty), include remote runners after the LocalRunner trust anchor.
+    # _run_cold_shadow_verify stays LOCAL-ONLY (see design decision: cold trust-anchor).
     pool = VerifyRunnerPool(
         [LocalRunner(
             merge_wt, req.config, req.module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
             task_id=req.task_id,
-        )],
+        ), *_build_remote_runners(req.config, merge_wt, quarantine=quarantine)],
         event_store=event_store,
         task_id=req.task_id,
     )
@@ -7163,6 +7177,11 @@ async def _run_cold_shadow_verify(
             tuple(req.task_files) if req.task_files is not None else None
         )
         spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
+        # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
+        # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
+        # (b) reintroduce remote scope-derivation concerns into the very control whose
+        # purpose is to BE the local ground truth.  See design decision in plan.json.
         pool = VerifyRunnerPool(
             [LocalRunner(
                 wt, req.config, req.module_configs, task_files_tuple,
