@@ -269,6 +269,74 @@ class TestThroughputHarness:
 
 
 # ---------------------------------------------------------------------------
+# Step-4 (GREEN): ThroughputReport + summarize_throughput aggregator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ThroughputReport:
+    """Aggregated throughput metrics for a backlog window."""
+
+    completed: int
+    completion_rate: float          # completions / window_duration_secs
+    peak_oldest_age_secs: float
+    mean_oldest_age_secs: float
+    peak_depth: int
+    per_runner: dict[str, int]      # runner_name → verify count
+    runners_seen: set[str]
+    window_duration_secs: float
+
+
+def summarize_throughput(
+    events: list[tuple[Any, Any, dict[str, Any]]],
+    *,
+    window_duration_secs: float | None = None,
+) -> ThroughputReport:
+    """Aggregate a recorded event list into a ThroughputReport.
+
+    Iterates the list once:
+    - EventType.merge_verify   → count per runner (per_runner, runners_seen, completed)
+    - EventType.merge_heartbeat → collect oldest_age_secs + depth sequences
+    """
+    per_runner: dict[str, int] = {}
+    runners_seen: set[str] = set()
+    completed = 0
+
+    oldest_ages: list[float] = []
+    depths: list[int] = []
+
+    for event_type, _task_id, data in events:
+        if event_type == EventType.merge_verify:
+            runner = data.get('runner', 'local')
+            per_runner[runner] = per_runner.get(runner, 0) + 1
+            runners_seen.add(runner)
+            completed += 1
+        elif event_type == EventType.merge_heartbeat:
+            age = data.get('oldest_age_secs', 0.0)
+            depth = data.get('depth', 0)
+            oldest_ages.append(float(age))
+            depths.append(int(depth))
+
+    duration = window_duration_secs if window_duration_secs is not None else 0.0
+    completion_rate = completed / duration if duration > 0.0 else 0.0
+
+    peak_oldest = max(oldest_ages, default=0.0)
+    mean_oldest = sum(oldest_ages) / len(oldest_ages) if oldest_ages else 0.0
+    peak_depth = max(depths, default=0)
+
+    return ThroughputReport(
+        completed=completed,
+        completion_rate=completion_rate,
+        peak_oldest_age_secs=peak_oldest,
+        mean_oldest_age_secs=mean_oldest,
+        peak_depth=peak_depth,
+        per_runner=per_runner,
+        runners_seen=runners_seen,
+        window_duration_secs=duration,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step-3 (RED): test_summarize_throughput_reads_heartbeat_and_verify_events
 # ---------------------------------------------------------------------------
 
