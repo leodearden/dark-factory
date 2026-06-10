@@ -76,7 +76,6 @@ def _make_single_req(
     lane: Literal['normal', 'high'] = 'normal',
 ) -> 'MergeRequest':
     from orchestrator.merge_queue import MergeRequest
-    loop = asyncio.get_event_loop()
     try:
         future = asyncio.get_running_loop().create_future()
     except RuntimeError:
@@ -1070,9 +1069,11 @@ class TestEndToEndWiring:
         # Build requests and pre-enqueue all 3 BEFORE starting the worker.
         # The coalescing pass fires on the first merger iteration (spec_base=None,
         # prefetched=None) and drains all 3 from the asyncio.Queue in one shot.
-        req1 = _make_req('e2e1', 'task/e2e1', wt1, coalesce_config)
-        req2 = _make_req('e2e2', 'task/e2e2', wt2, coalesce_config)
-        req3 = _make_req('e2e3', 'task/e2e3', wt3, coalesce_config)
+        # IMPORTANT: branch must be the BARE name (no 'task/' prefix) — merge_to_main
+        # prepends branch_prefix itself; passing 'task/e2e1' would produce 'task/task/e2e1'.
+        req1 = _make_req('e2e1', 'e2e1', wt1, coalesce_config)
+        req2 = _make_req('e2e2', 'e2e2', wt2, coalesce_config)
+        req3 = _make_req('e2e3', 'e2e3', wt3, coalesce_config)
         await queue.put(req1)
         await queue.put(req2)
         await queue.put(req3)

@@ -5362,12 +5362,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
-                # γ/1719 retroactive coalescing pass: attempt to merge waiting
-                # single MergeRequests into one GroupMergeRequest before dequeue.
-                # Only runs when the pipeline is clean (no speculative merge in
-                # flight and no prefetched item) — honours the train-dispatch
-                # contract that a train must not be enqueued behind an unverified
-                # speculative merge commit (:5239 warning).
+                # γ/1719 retroactive coalescing pass — design decisions summary:
+                # • DD1: runs at the pre-dequeue point, gated on a clean pipeline
+                #   (spec_base=None and prefetched=None) so a train is never enqueued
+                #   behind an unverified speculative merge commit (:5239 warning).
+                # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
+                #   done/cancelled futures); no new MergeRequest field required.
+                # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
+                #   unchanged waiting set on every tick.
+                # • DD6 (timing): absorbed members park merge-deferred asynchronously;
+                #   _do_train_merge's status pre-check may return TRAIN_INCOMPLETE on a
+                #   prematurely-dequeued train — same retryable 'blocked' the β/δ path
+                #   uses; full retry is left to δ/ζ.  Feature is OFF by default.
                 # When merge_train_coalesce_enabled=False (default) this returns
                 # immediately, keeping the loop byte-identical to pre-γ behaviour.
                 if spec_base is None and prefetched is None:
