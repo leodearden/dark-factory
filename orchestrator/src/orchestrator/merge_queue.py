@@ -3186,7 +3186,7 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded', 'error']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
