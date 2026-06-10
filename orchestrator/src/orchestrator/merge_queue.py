@@ -6885,9 +6885,26 @@ class ShadowCompareState:
 # ---------------------------------------------------------------------------
 
 # Matches cargo-nextest human-output test result lines.
-# Capture groups: (1) status, (2) crate name, (3) test path (rest of line)
+# Capture groups: (1) status, (2) crate/package::binary, (3) test path (rest of line)
+#
+# Real cargo-nextest 0.9.136 output (reify's merge-verify runner) inserts an
+# OPTIONAL parenthesized progress counter such as '(  1/250)' between the timing
+# bracket and the package::binary id, e.g.:
+#
+#     PASS [   0.130s] (  1/250) reify-cli::cli_affine_eval eval_x
+#
+# The non-capturing optional group ``(?:\(\s*\d+/\s*\d+\)\s+)?`` consumes and
+# DISCARDS the counter so it does not appear in the stable key
+# ``"pkg::bin test_path"``.  Without this group the regex captures the open-paren
+# '(' as the crate and folds the counter remainder into the test path, producing
+# run-specific garbage keys that break warm/cold shadow comparison.
+#
+# Backward-compatible: the group is optional, so old no-counter format and the
+# libtest branch are unaffected.
 _NEXTEST_TEST_LINE_RE = re.compile(
-    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+'
+    r'(?:\(\s*\d+/\s*\d+\)\s+)?'  # optional N/M progress counter — consumed, not captured
+    r'(\S+)\s+(\S.*?)\s*$'
 )
 
 # Matches plain `cargo test` (libtest) result lines.
@@ -6904,9 +6921,15 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
 
     * **cargo-nextest** (reify's default merge-verify runner)::
 
-          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] <crate> <path>
+          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] [(<N>/<M>)] <pkg::bin> <path>
 
-      Key: ``"<crate> <test::path>"``, value: ``True`` iff status is ``PASS``.
+      Real cargo-nextest 0.9.136 output inserts an optional parenthesized progress
+      counter ``(  N/M)`` (with internal whitespace padding) between the timing
+      bracket and the ``package::binary`` id.  The counter is consumed and
+      **excluded** from the key so that warm and cold runs (which have different
+      N/M indices) produce identical stable keys.
+
+      Key: ``"<pkg::bin> <test::path>"``, value: ``True`` iff status is ``PASS``.
       TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
 
     * **libtest** (plain ``cargo test``)::
