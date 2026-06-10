@@ -3122,3 +3122,75 @@ class TestTrainThroughputStats:
         assert result['cas_retry_rate_delta'] == 0.5, (
             f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['cas_retry_rate_delta']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAggregatorTrainThroughput — step-12 RED / step-13 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAggregatorTrainThroughput:
+    """step-12: build_per_project_merge_queue includes 'train_throughput' key.
+
+    Verifies:
+    - each project result dict contains a 'train_throughput' key
+    - its value is the train_throughput_stats dict (all-zeros for empty/None db)
+    - populated with a train_merged row: trains_landed=1, tasks_landed=2
+    """
+
+    async def test_none_db_includes_train_throughput_zeros(self):
+        """db=None project includes train_throughput with all-zeros default."""
+        from datetime import UTC, datetime
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        result = await build_per_project_merge_queue(
+            [('/tmp/proj-none', None)],
+            hours=24,
+            now=now,
+            recent_window_minutes=15,
+        )
+
+        assert 'train_throughput' in result['/tmp/proj-none'], (
+            "expected 'train_throughput' key in per-project result (got None-db path)"
+        )
+        tt = result['/tmp/proj-none']['train_throughput']
+        assert tt['trains_landed'] == 0
+        assert tt['tasks_landed_via_trains'] == 0
+        assert tt['improved'] is False
+
+    async def test_populated_db_includes_train_throughput(self, tmp_path):
+        """DB with a train_merged row → train_throughput has trains_landed=1."""
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        events = [
+            dict(
+                event_type='train_merged',
+                timestamp=now - timedelta(hours=1),
+                run_id='run-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'abc', 'base_sha': 'def'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'agg_train.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/proj-train', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=15,
+            )
+
+        assert 'train_throughput' in result['/tmp/proj-train'], (
+            "expected 'train_throughput' key in per-project result"
+        )
+        tt = result['/tmp/proj-train']['train_throughput']
+        assert tt['trains_landed'] == 1
+        assert tt['tasks_landed_via_trains'] == 2
