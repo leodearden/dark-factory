@@ -5171,6 +5171,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if not failers:
             # ALL pass → genuine cross-member interaction; escalate train, land nothing.
+            # Tear down every member's solo worktree+branch before returning
+            # (reverify_member_solo left them alive for the land path; here we
+            # land nothing, so we own the cleanup).
+            for sr in solo_results:
+                if sr.solo_wt is not None:
+                    try:
+                        await self.git_ops.cleanup_merge_worktree(sr.solo_wt)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: all-pass teardown: cleanup_merge_worktree '
+                            'failed for member %s', self.task_id, sr.member_id,
+                            exc_info=True,
+                        )
+                if sr.solo_branch is not None:
+                    try:
+                        await self.git_ops.delete_solo_branch(sr.solo_branch)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: all-pass teardown: delete_solo_branch '
+                            'failed for member %s', self.task_id, sr.member_id,
+                            exc_info=True,
+                        )
             if self.event_store is not None:
                 self.event_store.emit(
                     EventType.train_derailed,
@@ -5198,12 +5220,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         offender_ids = [r.member_id for r in failers]
         passer_ids = [r.member_id for r in passers]
 
-        # Read current main sha before landing passers (used as expected_main for CAS).
-        probe_main = await self.git_ops.get_main_sha()
-
         # Land each passer: advance main with the solo-verified sha.
-        # Each passer's solo worktree is cleaned up in a finally block so no
-        # worktree leaks even when advance_main fails or raises unexpectedly.
+        # Re-read get_main_sha() immediately before each advance_main so that
+        # sequential intra-loop landings CAS against the current tip (not a
+        # stale pre-loop snapshot).  Pass branch=None so advance_main does NOT
+        # try to resolve a non-existent task/_solo-<id> ref or fall back to
+        # the merge_sha^2 re-merge path (a linear solo tip has no ^2).
+        # Each passer's solo worktree and branch are cleaned up in a finally
+        # block after the advance attempt.
         landed_ids: list[str] = []
         for r in passers:
             # Guard: passers always have a merge_sha (set by reverify_member_solo).
@@ -5214,12 +5238,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 continue
             try:
+                expected_main = await self.git_ops.get_main_sha()
                 adv = await self.git_ops.advance_main(
                     r.merge_sha,
                     r.solo_wt,
-                    branch=r.solo_branch,
-                    expected_main=probe_main,
-                    reverify_on_rebase=True,
+                    branch=None,
+                    expected_main=expected_main,
+                    reverify_on_rebase=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 # advance_main raised (unexpected); leave member parked for
@@ -5231,11 +5256,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 adv = 'exception'
             finally:
-                # Always clean up the solo worktree after processing this
-                # passer — the worktree is no longer needed once advance_main
-                # has run (or failed), and cleanup must not depend on outcome.
+                # Always clean up the solo worktree and branch after the
+                # advance attempt — regardless of outcome, neither is needed
+                # once advance_main has run.
                 if r.solo_wt is not None:
-                    await self.git_ops.cleanup_merge_worktree(r.solo_wt)
+                    try:
+                        await self.git_ops.cleanup_merge_worktree(r.solo_wt)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: passer teardown: cleanup_merge_worktree '
+                            'failed for member %s', self.task_id, r.member_id,
+                            exc_info=True,
+                        )
+                if r.solo_branch is not None:
+                    try:
+                        await self.git_ops.delete_solo_branch(r.solo_branch)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: passer teardown: delete_solo_branch '
+                            'failed for member %s', self.task_id, r.member_id,
+                            exc_info=True,
+                        )
             if adv == 'advanced':
                 landed_sha: str = (
                     getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha
