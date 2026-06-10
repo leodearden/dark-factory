@@ -969,3 +969,177 @@ class TestDebounce:
         assert 'sc1' in {r for r in sig_after_coalesce} or len(sig_after_coalesce) == 2, (
             'signature must capture the pre-coalesce request_ids of both singles'
         )
+
+
+# ─── Step 13 ────────────────────────────────────────────────────────────────
+
+def _gated_verify(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event | None = None,
+):
+    """Block the FIRST run_scoped_verification call until gate_release is set.
+
+    gate_entered (optional): set when the first call starts, giving the test a
+    synchronisation point.  Subsequent calls pass immediately (MagicMock passed=True).
+    Local copy — test_merge_queue_coalesce must not import from test_merge_queue.
+    """
+    _first_blocked = [False]
+
+    from unittest.mock import MagicMock as _MagicMock  # local alias for clarity
+
+    async def _side_effect(*args, **kwargs):
+        if not _first_blocked[0]:
+            _first_blocked[0] = True
+            if gate_entered is not None:
+                gate_entered.set()
+            await gate_release.wait()
+        return _MagicMock(passed=True, summary='')
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+@pytest.mark.asyncio
+class TestEndToEndWiring:
+    """step-13 (RED): merger-loop wiring — coalesced train dispatched end-to-end.
+
+    Three disjoint singles are pre-enqueued before the worker starts so the
+    coalescing pass fires on the FIRST merger iteration (spec_base=None,
+    prefetched=None).  A gated-verify blocks the TRAIN's first
+    run_scoped_verification call, providing a deterministic sync point:
+
+      • When gate_entered fires, coalescing has already happened (coalescing
+        pass ran before _acquire_next_request; the 3 singles' futures are
+        already resolved 'superseded') and the train's merge commit is on disk.
+      • Releasing the gate completes verify → advance_main → mark_member_done.
+
+    Asserts:
+      (a) all 3 singles' futures are resolved 'superseded' before verify starts
+      (b) 1 GroupMergeRequest was dispatched through _do_train_merge (train path)
+      (c) all 3 member files appear on main after the train lands
+      (d) mark_member_done called once per member, all with the same merge SHA
+      (e) EventType.train_coalesced event emitted with correct member_task_ids
+    """
+
+    async def test_coalesced_train_dispatched_and_lands(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        import contextlib
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
+        from orchestrator.git_ops import _run
+
+        # Build 3 disjoint-file branches off main.
+        # Each touches a unique file → mutually line-stackable.
+        wt1 = await _make_branch_with_file(git_ops, 'e2e1', 'file_e2e1.py', 'e1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'e2e2', 'file_e2e2.py', 'e2 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'e2e3', 'file_e2e3.py', 'e3 = 3\n')
+
+        db_path = tmp_path / 'e2e_coalesce.db'
+        es = EventStore(db_path=db_path, run_id='e2e-coalesce')
+
+        # Stub factory: status_check always returns all merge-deferred; mark_member_done
+        # records (task_id, sha) and sets all_done when all 3 members are notified.
+        mark_done_calls: list[tuple[str, str]] = []
+        all_done = asyncio.Event()
+
+        async def _mark_done(task_id: str, sha: str) -> None:
+            mark_done_calls.append((task_id, sha))
+            if len(mark_done_calls) >= 3:
+                all_done.set()
+
+        status_check = AsyncMock(return_value={
+            'e2e1': 'merge-deferred',
+            'e2e2': 'merge-deferred',
+            'e2e3': 'merge-deferred',
+        })
+
+        def factory(train_id: str) -> TrainCallbacks:
+            return TrainCallbacks(
+                status_check=status_check,
+                mark_member_done=AsyncMock(side_effect=_mark_done),
+            )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es, train_callback_factory=factory,
+        )
+
+        # Build requests and pre-enqueue all 3 BEFORE starting the worker.
+        # The coalescing pass fires on the first merger iteration (spec_base=None,
+        # prefetched=None) and drains all 3 from the asyncio.Queue in one shot.
+        req1 = _make_req('e2e1', 'task/e2e1', wt1, coalesce_config)
+        req2 = _make_req('e2e2', 'task/e2e2', wt2, coalesce_config)
+        req3 = _make_req('e2e3', 'task/e2e3', wt3, coalesce_config)
+        await queue.put(req1)
+        await queue.put(req2)
+        await queue.put(req3)
+
+        # Gate the train's first run_scoped_verification call.
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            # (a) Wait for the train's verify to start.
+            # When gate_entered fires: _maybe_coalesce_waiting_singles has already
+            # run (resolving the 3 singles as 'superseded') AND _do_train_merge has
+            # run the rebase + merge steps before calling run_scoped_verification.
+            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+
+            for req, label in ((req1, 'e2e1'), (req2, 'e2e2'), (req3, 'e2e3')):
+                assert req.result.done(), (
+                    f'{label}: future must be resolved as superseded before verify starts'
+                )
+                outcome = req.result.result()
+                assert outcome.status == 'superseded', (
+                    f'{label}: expected superseded, got {outcome.status!r}'
+                )
+
+            # Release the gate — train verify completes, advance_main runs.
+            gate_release.set()
+
+            # (d) Wait for all 3 mark_member_done calls (train has fully landed).
+            await asyncio.wait_for(all_done.wait(), timeout=60)
+
+        # (c) All 3 member files appear on main.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'file_e2e1.py' in main_files, 'file_e2e1.py must be on main after train lands'
+        assert 'file_e2e2.py' in main_files, 'file_e2e2.py must be on main after train lands'
+        assert 'file_e2e3.py' in main_files, 'file_e2e3.py must be on main after train lands'
+
+        # (d) mark_member_done called once per member with the same merge SHA.
+        assert len(mark_done_calls) == 3, (
+            f'expected 3 mark_member_done calls, got {len(mark_done_calls)}'
+        )
+        task_ids_notified = {tid for tid, _ in mark_done_calls}
+        assert task_ids_notified == {'e2e1', 'e2e2', 'e2e3'}, (
+            f'unexpected member task IDs: {task_ids_notified}'
+        )
+        merge_shas = {sha for _, sha in mark_done_calls}
+        assert len(merge_shas) == 1, (
+            f'all mark_member_done calls must share one SHA; got: {merge_shas}'
+        )
+
+        # (e) train_coalesced event emitted with correct member_task_ids.
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1, (
+            f'expected 1 train_coalesced event, got {len(events)}'
+        )
+        event_data = events[0]['data']
+        assert set(event_data.get('member_task_ids', [])) == {'e2e1', 'e2e2', 'e2e3'}, (
+            f'train_coalesced event member_task_ids mismatch: {event_data}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
