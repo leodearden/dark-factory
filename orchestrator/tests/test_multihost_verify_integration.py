@@ -42,11 +42,12 @@ from orchestrator.verify_runner import (
     run_verdict_parity,
 )
 from orchestrator.merge_queue import (
+    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Module-level builder helpers (mirror test_verify_runner.py pattern)
@@ -748,4 +749,93 @@ class TestK2ConcurrencyAndAdvanceOrder:
         assert run.advance_order == expected_shas, (
             f'advance_order does not match arrival order: '
             f'got {run.advance_order}, expected {expected_shas}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-18 (GREEN): config builder helpers for B7/B8 guard tests.
+# Placed before step-17 RED test so helpers are in scope.
+# ---------------------------------------------------------------------------
+
+def _make_persistent_config(tmp_path: Any) -> OrchestratorConfig:
+    """OrchestratorConfig with git.persistent_merge_worktree=True."""
+    git = GitConfig(persistent_merge_worktree=True)
+    return OrchestratorConfig(project_root=tmp_path, git=git)
+
+
+def _make_liveness_config(
+    tmp_path: Any,
+    *,
+    cold_timeout_secs: float,
+) -> OrchestratorConfig:
+    """OrchestratorConfig with merge_verify_cold_command_timeout_secs set.
+
+    Setting both cold-tier fields to the given value ensures
+    _resolve_verify_timeout returns exactly cold_timeout_secs regardless of
+    any bundled defaults.yaml override.
+    """
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        merge_verify_cold_command_timeout_secs=cold_timeout_secs,
+        verify_cold_command_timeout_secs=cold_timeout_secs,
+    )
+
+
+# Timeouts chosen so bound=2 straddles the safety threshold deterministically.
+# threshold = 0.75 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+# worst_case = merge_ahead_bound * timeout_secs
+# safe = worst_case < threshold
+_B8_THRESHOLD = 0.75 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS   # e.g. 8100
+_B8_BIG_TIMEOUT = _B8_THRESHOLD / 2 + 100.0     # worst_case > threshold for bound=2
+_B8_SMALL_TIMEOUT = _B8_THRESHOLD / 4 - 10.0    # worst_case < threshold for bound=2
+
+
+# ---------------------------------------------------------------------------
+# Step-17 (RED): B7 per-host warmth guard + B8 liveness-margin guard
+# ---------------------------------------------------------------------------
+
+
+class TestStartupGuards:
+    def test_per_host_warmth_guard_and_liveness_margin(self, tmp_path: Any):
+        """B7+B8: startup guards enforce serial-lane + liveness safety.
+
+        B7 — enforce_persistent_worktree_serial_lane:
+          - num_hosts=2, bound=2 → ceil(2/2)=1 ≤ 1 → no raise
+          - num_hosts=1, bound=2 → ceil(2/1)=2 > 1 → raises PersistentWorktreeConfigError
+
+        B8 — check_merge_liveness_margin with bound=2:
+          - BIG cold_timeout → worst_case ≥ threshold → safe=False
+          - SMALL cold_timeout → worst_case < threshold → safe=True
+        """
+        # --- B7 ---
+        cfg_persistent = _make_persistent_config(tmp_path)
+
+        # num_hosts=2, bound=2 → per_host = ceil(2/2) = 1 → no raise
+        result = enforce_persistent_worktree_serial_lane(
+            cfg_persistent, merge_ahead_bound=2, num_hosts=2
+        )
+        assert result is None, (
+            f'expected None (no raise) for num_hosts=2, bound=2; got {result!r}'
+        )
+
+        # num_hosts=1, bound=2 → per_host = ceil(2/1) = 2 > 1 → raises
+        import pytest as _pytest  # noqa: PLC0415
+        with _pytest.raises(PersistentWorktreeConfigError):
+            enforce_persistent_worktree_serial_lane(
+                cfg_persistent, merge_ahead_bound=2, num_hosts=1
+            )
+
+        # --- B8 ---
+        cfg_big = _make_liveness_config(tmp_path, cold_timeout_secs=_B8_BIG_TIMEOUT)
+        assessment_big = check_merge_liveness_margin(cfg_big, merge_ahead_bound=2)
+        assert assessment_big.safe is False, (
+            f'expected safe=False for timeout={_B8_BIG_TIMEOUT}, '
+            f'worst_case={assessment_big.worst_case_secs}, threshold={assessment_big.threshold_secs}'
+        )
+
+        cfg_small = _make_liveness_config(tmp_path, cold_timeout_secs=_B8_SMALL_TIMEOUT)
+        assessment_small = check_merge_liveness_margin(cfg_small, merge_ahead_bound=2)
+        assert assessment_small.safe is True, (
+            f'expected safe=True for timeout={_B8_SMALL_TIMEOUT}, '
+            f'worst_case={assessment_small.worst_case_secs}, threshold={assessment_small.threshold_secs}'
         )
