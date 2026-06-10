@@ -1236,3 +1236,146 @@ class TestMergeReadyPredicateSeam:
         assert exc[0] == {'request_id': req2.request_id, 'reason': 'custom_reason'}, (
             f'exclusion entry mismatch: {exc[0]}'
         )
+
+
+# ─── δ Step 3 ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestBlockedHistoryGate:
+    """δ step-3 (RED): event-store blocked-history excludes a candidate.
+
+    Uses the DEFAULT predicate (no merge_ready_predicate injected).
+    A synthetic prior terminal merge_finalized event with state='blocked'
+    for t1's branch causes the default predicate to exclude t1.
+
+    Sub-tests:
+      (a) With prior blocked finalized event for t1's branch → t1 excluded,
+          train forms with t2+t3, exclusions entry carried in event.
+      (b) No merge_finalized emitted → all 3 coalesce, exclusions == [].
+    """
+
+    async def test_prior_blocked_excludes_candidate(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'bh1', 'file_bh1.py', 'bh1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'bh2', 'file_bh2.py', 'bh2 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'bh3', 'file_bh3.py', 'bh3 = 3\n')
+
+        db_path = tmp_path / 'es_bh.db'
+        es = EventStore(db_path=db_path, run_id='run-bh-test')
+
+        # Emit a prior blocked outcome for bh1's branch.
+        es.emit(
+            EventType.merge_finalized,
+            task_id='bh1',
+            phase='merge',
+            role='merger',
+            data={
+                'request_id': 'mr-old-bh1',
+                'branch': 'task/bh1',
+                'state': 'blocked',
+                'merge_sha': None,
+            },
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('bh1', 'task/bh1', wt1, coalesce_config)
+        req2 = _make_req('bh2', 'task/bh2', wt2, coalesce_config)
+        req3 = _make_req('bh3', 'task/bh3', wt3, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must form a train from the 2 clean candidates'
+
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+
+        # bh1 excluded — NOT in train
+        assert len(trains) == 1
+        train = trains[0]
+        assert 'bh1' not in train.member_task_ids, (
+            f'bh1 must be excluded (prior blocked); members={train.member_task_ids}'
+        )
+        assert set(train.member_task_ids) == {'bh2', 'bh3'}, (
+            f'train must contain bh2+bh3; got {train.member_task_ids}'
+        )
+
+        # req1 future unresolved (bh1 excluded, not absorbed)
+        assert not req1.result.done(), 'excluded bh1 future must remain unresolved'
+
+        # bh1 stays as a solo in the buffer
+        solo_ids = [r.task_id for r in solos]
+        assert 'bh1' in solo_ids, f'bh1 must remain as solo; got {solo_ids}'
+
+        # train_coalesced event carries the exclusion with state-based reason
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1
+        exc = events[0]['data'].get('exclusions', [])
+        assert len(exc) == 1, f'Expected 1 exclusion; got {exc}'
+        assert exc[0]['request_id'] == req1.request_id
+        # Reason must reference the blocked state
+        assert 'blocked' in exc[0]['reason'], (
+            f"reason must contain 'blocked'; got {exc[0]['reason']!r}"
+        )
+
+    async def test_no_history_all_coalesce(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """No merge_finalized emitted → default predicate returns None for all →
+        all 3 coalesce normally; exclusions == [].
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'nh1', 'file_nh1.py', 'nh1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'nh2', 'file_nh2.py', 'nh2 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'nh3', 'file_nh3.py', 'nh3 = 3\n')
+
+        db_path = tmp_path / 'es_nh.db'
+        es = EventStore(db_path=db_path, run_id='run-nh-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('nh1', 'task/nh1', wt1, coalesce_config)
+        req2 = _make_req('nh2', 'task/nh2', wt2, coalesce_config)
+        req3 = _make_req('nh3', 'task/nh3', wt3, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must form a train when no risk signals'
+
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 1
+        assert set(trains[0].member_task_ids) == {'nh1', 'nh2', 'nh3'}
+
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1
+        assert events[0]['data'].get('exclusions') == [], (
+            f'exclusions must be empty when no risk signals; got {events[0]["data"].get("exclusions")}'
+        )
