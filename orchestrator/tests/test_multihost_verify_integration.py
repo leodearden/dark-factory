@@ -168,6 +168,11 @@ async def run_backlog_window(
 
     The semaphore(k) mirrors merge_queue._speculation_slot so at most k verifies
     run concurrently.  Advance order is preserved (SHAs submitted in sequence 0..N-1).
+
+    Robustness (step-8): tolerates single-runner pools, k > len(runners), and
+    k < len(runners) — the semaphore bounds concurrency independently of pool
+    size.  The pool's own _select_runner picks among available (non-quarantined)
+    runners; runners_seen is populated from emitted merge_verify provenance.
     """
     shas = [f'sha{i:04d}' for i in range(n_merges)]
     spans: list[tuple[str, str, float, float]] = []
@@ -512,3 +517,102 @@ class TestRunnerProvenance:
         assert run.completed == 4
         # Pool always prefers remote runner → laptop used for all 4 dispatches
         assert 'laptop' in report.runners_seen
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (RED) / Step-10 (GREEN): B3 fail-safe fallback
+# _FakeRunner.unavailable already implemented in step-2 GREEN.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFailsafeFallback:
+    async def test_failsafe_falls_back_to_local_no_stall(self, caplog):
+        """B3: laptop unavailable → fall back to local, no stall (PRD §A Inv 2/D5).
+
+        VerifyRunnerPool.dispatch logs exactly one WARNING per dispatch when the
+        remote runner raises RunnerUnavailable; the queue never stalls and all
+        completions are attributed to the local runner.
+        """
+        rec = _RecordingEventStore()
+        local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
+        laptop_unavail = _FakeRunner('laptop', is_local=False, service_secs=1.0, unavailable=True)
+        pool = VerifyRunnerPool([local_fake, laptop_unavail], event_store=rec, task_id='b3')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify_runner'):
+            run = await run_backlog_window(
+                pool, rec, n_merges=4, k=2,
+                service_secs={'local': 1.0, 'laptop': 1.0},
+            )
+
+        # Queue does NOT stall — all 4 merges complete
+        assert run.completed == 4, f'expected 4 completed, got {run.completed}'
+
+        # All verifies fell back to local (no laptop provenance)
+        verify_events = rec.events_of(EventType.merge_verify)
+        assert len(verify_events) == 4
+        assert all(ev[2].get('runner') == 'local' for ev in verify_events), (
+            f'expected all runner=local; runners seen: {[ev[2].get("runner") for ev in verify_events]}'
+        )
+
+        # Exactly one WARNING per dispatch ("falling back to local")
+        fallback_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'falling back to local' in r.getMessage()
+        ]
+        assert len(fallback_warnings) == 4, (
+            f'expected 4 fallback warnings (one per dispatch), got {len(fallback_warnings)}'
+        )
+
+        # No drift-divergence escalations (no DriftDetector attached)
+        # Verified implicitly: _RecordingEventStore has no submit() call path
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (RED) / Step-12 (GREEN): B4 verdict parity over known corpus
+# _FakeRunner.verdict_map already implemented in step-2 GREEN.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerdictParity:
+    async def test_verdict_parity_all_agree_over_known_corpus(self):
+        """B4: two runners sharing a verdict_map agree on all SHAs in the corpus.
+
+        run_verdict_parity is called with N pass SHAs + N fail SHAs.  Both
+        _FakeRunners use the same verdict_map so they always agree.
+        """
+        N = 4
+        pass_shas = [f'pass{i:04d}' for i in range(N)]
+        fail_shas = [f'fail{i:04d}' for i in range(N)]
+
+        # Shared verdict map: pass SHAs → True, fail SHAs → False
+        shared_map: dict[str, bool] = {}
+        for sha in pass_shas:
+            shared_map[sha] = True
+        for sha in fail_shas:
+            shared_map[sha] = False
+
+        local_fake = _FakeRunner('local', is_local=True, verdict_map=shared_map)
+        laptop_fake = _FakeRunner('laptop', is_local=False, verdict_map=shared_map)
+
+        # corpus: (sha, expected_pass)
+        corpus = [(sha, True) for sha in pass_shas] + [(sha, False) for sha in fail_shas]
+
+        report = await run_verdict_parity(corpus, local_fake, laptop_fake, _make_spec())
+
+        assert report.all_agree is True, (
+            f'expected all_agree=True; divergent_shas: {report.divergent_shas}'
+        )
+        assert report.divergent_shas == (), (
+            f'expected no divergent SHAs, got {report.divergent_shas}'
+        )
+
+        # Every row where expected_pass is not None should have matches_expected=True
+        for row in report.rows:
+            if row.expected_pass is not None:
+                assert row.matches_expected is True, (
+                    f'sha={row.sha}: expected matches_expected=True, '
+                    f'got {row.matches_expected} (local={row.local_passed}, '
+                    f'remote={row.remote_passed}, expected={row.expected_pass})'
+                )
