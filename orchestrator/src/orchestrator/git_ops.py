@@ -1313,8 +1313,16 @@ class GitOps:
             return None
         return out
 
-    async def rebase_onto_main(self, worktree: Path) -> bool:
-        """Rebase the task branch in *worktree* onto current main.
+    async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
+        """Rebase the task branch in *worktree* onto *onto* (default: main).
+
+        When *onto* is None (the default), rebases onto the configured
+        ``main_branch`` — identical to the original behaviour, keeping all
+        existing callers byte-compatible.
+
+        When *onto* is provided (e.g. a sibling branch like ``task/123``),
+        rebases the branch in *worktree* onto that ref instead.  This is used
+        by ``stack_train_branches`` to chain members into a linear stack.
 
         Returns True on success.  On failure, aborts the rebase so the
         worktree is left in a clean state, and returns False.
@@ -1323,8 +1331,9 @@ class GitOps:
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
+        target = onto if onto is not None else self.config.main_branch
         rc, _, err = await _run(
-            ['git', 'rebase', self.config.main_branch],
+            ['git', 'rebase', target],
             cwd=worktree,
         )
         if rc != 0:
