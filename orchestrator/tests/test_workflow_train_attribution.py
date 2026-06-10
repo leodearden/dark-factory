@@ -405,3 +405,203 @@ class TestAllPassInteraction:
         assert result == WorkflowOutcome.BLOCKED, (
             f'Expected WorkflowOutcome.BLOCKED, got {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: Some-fail → land passers, block offender, bounded.
+# ---------------------------------------------------------------------------
+
+
+def _solo_fail(member_id: str, reason: str = 'test failed') -> SoloVerifyResult:
+    return SoloVerifyResult(
+        member_id=member_id,
+        passed=False,
+        merge_sha=None,
+        reason=reason,
+    )
+
+
+def _solo_pass_wt(member_id: str) -> SoloVerifyResult:
+    """SoloVerifyResult for a passer with solo_wt/solo_branch populated."""
+    from pathlib import Path as _Path  # noqa: PLC0415
+    r = SoloVerifyResult(
+        member_id=member_id,
+        passed=True,
+        merge_sha=f'sha-{member_id}-solo',
+        reason='',
+    )
+    # Step-12 will add these fields to SoloVerifyResult; pre-populate via
+    # monkey-patch so the RED tests are consistent with the expected impl shape.
+    object.__setattr__(r, 'solo_wt', _Path(f'/tmp/solo-{member_id}'))
+    object.__setattr__(r, 'solo_branch', f'_solo-{member_id}')
+    return r
+
+
+@pytest.mark.asyncio
+class TestSomeFailAttribution:
+    """Non-tip member fails solo → land passers, block offender; tip passer returns DONE."""
+
+    def _three_member_fixture(self, offender_id: str = '101') -> '_Fixture':
+        """3-member train; offender_id is the failer, others pass."""
+        members = _train_members(train_id='T-some-fail', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-some-fail', 'order': 2,
+                                'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+        f.wf.git_ops = f.git_ops  # alias so tests can use f.git_ops
+        # get_main_sha needed by advance_main expected_main path
+        f.git_ops.get_main_sha = AsyncMock(return_value='main-sha-probe')
+        return f
+
+    async def test_passers_are_landed_advance_main(self) -> None:
+        """advance_main called once per passer with the passer's solo merge_sha."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-some-fail', tip_id='103')
+        # Order 1 ('101') fails; '102' and '103' (tip) pass.
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-some-fail', members)
+
+        # advance_main should have been called for each passer (2 calls)
+        assert f.git_ops.advance_main.await_count == 2, (
+            f'Expected advance_main called 2 times, got {f.git_ops.advance_main.await_count}'
+        )
+        # Verify the solo merge_shas were used
+        advanced_shas = {c.args[0] for c in f.git_ops.advance_main.await_args_list}
+        assert 'sha-102-solo' in advanced_shas
+        assert 'sha-103-solo' in advanced_shas
+
+    async def test_passers_are_marked_done(self) -> None:
+        """scheduler.mark_done called for each passer that advanced successfully."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-some-fail2', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        # Patch event_store separately (not the mark_blocked one)
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-some-fail2', members)
+
+        # scheduler.mark_done called for '102' and '103'
+        called_ids = {c.args[0] for c in f.scheduler.mark_done.await_args_list}
+        assert '102' in called_ids, f'Expected mark_done for 102, calls: {f.scheduler.mark_done.await_args_list}'
+        assert '103' in called_ids, f'Expected mark_done for 103, calls: {f.scheduler.mark_done.await_args_list}'
+        # NOT called for the offender
+        assert '101' not in called_ids
+
+    async def test_offender_is_blocked(self) -> None:
+        """Offender's status set to 'blocked' via scheduler.set_task_status."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-offender', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-offender', members)
+
+        # scheduler.set_task_status('101', 'blocked') must be called
+        set_status_calls = [
+            (c.args[0], c.args[1]) if c.args else (c.kwargs.get('task_id'), c.kwargs.get('status'))
+            for c in f.scheduler.set_task_status.await_args_list
+        ]
+        assert ('101', 'blocked') in set_status_calls, (
+            f'Expected set_task_status("101", "blocked"), calls: {set_status_calls}'
+        )
+
+    async def test_offender_l1_submitted(self) -> None:
+        """An L1 is submitted for the offender's task_id."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-l1-submit', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-l1-submit', members)
+
+        # esc_queue.submit should be called at least once for the offender
+        assert f.esc_queue.submit.called, 'Expected esc_queue.submit to be called for offender'
+
+    async def test_train_derailed_attributed_event(self) -> None:
+        """train_derailed emitted with verdict='attributed', offenders=['101']."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-attributed', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        event_store = MagicMock()
+        f.wf.event_store = event_store
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-attributed', members)
+
+        derailed_calls = [
+            c for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.train_derailed
+        ]
+        assert len(derailed_calls) >= 1, (
+            f'Expected train_derailed event, got: {event_store.emit.call_args_list}'
+        )
+        data_kwarg = derailed_calls[0].kwargs.get('data') or {}
+        assert data_kwarg.get('verdict') == 'attributed', (
+            f'Expected verdict="attributed", got: {data_kwarg!r}'
+        )
+        offenders = data_kwarg.get('offenders') or []
+        assert '101' in offenders, f'Expected offenders to include "101", got: {offenders!r}'
+
+    async def test_tip_passer_returns_done(self) -> None:
+        """When tip ('103') passes solo and lands, returns WorkflowOutcome.DONE."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-tip-done', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        result = await f.wf._attribute_train_failure(tagged, 'T-tip-done', members)
+
+        assert result == WorkflowOutcome.DONE, (
+            f'Expected WorkflowOutcome.DONE (tip passed), got {result!r}'
+        )
+
+    async def test_exactly_n_solo_verifies(self) -> None:
+        """_reverify_one_member called exactly N=3 times (≤N+1 bound)."""
+        f = self._three_member_fixture()
+        members = _train_members(train_id='T-bound', tip_id='103')
+        reverify_mock = AsyncMock(side_effect=[
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        f.wf._reverify_one_member = reverify_mock  # type: ignore[method-assign]
+        f.wf.event_store = MagicMock()
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-bound', members)
+
+        assert reverify_mock.await_count == 3, (
+            f'Expected exactly 3 _reverify_one_member calls, got {reverify_mock.await_count}'
+        )
