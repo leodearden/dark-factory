@@ -2933,3 +2933,49 @@ class TestBoundaryTableMcpSurface:
         assert status.get('superseded_by') == TRAIN_RID, (
             f"Expected superseded_by={TRAIN_RID!r}, got: {status}"
         )
+
+    async def test_scenario_superseded_merge_request_bounded_wait(
+        self, tmp_path: Path,
+    ) -> None:
+        """merge_request bounded-wait returns status='superseded' + superseded_by.
+
+        Submit merge_request(wait_secs=5) while a background worker dequeues the
+        entry and resolves req.result with MergeOutcome('superseded',
+        superseded_by='mr-train3').
+
+        Assert the returned dict has:
+          - status == 'superseded'
+          - superseded_by == 'mr-train3'
+
+        RED: the bounded-wait terminal response (server.py ~905-915) builds
+        status/request_id/reason/conflict_details/push_status/commit and the
+        failure_diagnostic conditional, but never includes superseded_by.
+        """
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        server, mq, _, _, _ = _build_merge_server(tmp_path)
+
+        async def _worker():
+            req = await mq.get()
+            req.result.set_result(MergeOutcome('superseded', superseded_by='mr-train3'))
+
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='sc-sup5',
+                branch='sc-sup5',
+                worktree=str(tmp_path / 'wt-sup5'),
+                wait_secs=5,
+            ),
+            timeout=5.0,
+        )
+        await worker_task
+
+        assert result.get('status') == 'superseded', (
+            f"Expected status='superseded', got: {result}"
+        )
+        assert result.get('superseded_by') == 'mr-train3', (
+            f"Expected superseded_by='mr-train3', got: {result}"
+        )
