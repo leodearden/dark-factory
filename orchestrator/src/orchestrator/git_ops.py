@@ -52,6 +52,11 @@ AdvanceResult = Literal[
 PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 
 
+# Return type for recover_red_main — distinguishes a successful CAS move
+# from an atomic abort (another writer beat us to the ref).
+RecoverResult = Literal['rewound', 'cas_failed']
+
+
 class TrainMembership(TypedDict, total=False):
     """Train metadata passed from task.metadata.train.
 
@@ -2641,6 +2646,103 @@ class GitOps:
         # pre-rebase SHA from MergeResult.merge_commit.
         self._last_advanced_sha = merge_sha
         return 'advanced'
+
+    async def recover_red_main(
+        self,
+        target_sha: str,
+        expected_main: str,
+    ) -> RecoverResult:
+        """Move refs/heads/main to *target_sha* atomically, sanctioning it for reify's gate.
+
+        This is the enforce-safe break-glass recovery operation: a SINGLE CAS
+        update-ref that drops a bad merge in one move (no rewind-then-readvance).
+        Mirrors advance_main's main_gate mark → update-ref → unmark-on-failure
+        sequence so that reify's reference-transaction hook records the move as
+        SANCTIONED under ENFORCE.
+
+        Args:
+            target_sha:    The good SHA to restore main to (the pre-bad-merge state).
+            expected_main: The current (bad) value of refs/heads/main; used as the
+                           CAS old-value so a concurrent ref-move aborts cleanly.
+
+        Returns:
+            ``'rewound'``    — update-ref succeeded; main now points at target_sha.
+            ``'cas_failed'`` — another writer moved the ref first; no change made.
+
+        Note:
+            The caller (skill) must ensure project_root is clean before invoking
+            this method.  recover_red_main does NOT stash/pop uncommitted WIP —
+            that dance is out of scope for a break-glass operation.
+        """
+        # ── Check working tree ────────────────────────────────────────────
+        is_on_main = False
+        rc, branch_out, _ = await _run(
+            ['git', 'symbolic-ref', '--short', 'HEAD'],
+            cwd=self.project_root,
+        )
+        if rc == 0 and branch_out.strip() == self.config.main_branch:
+            is_on_main = True
+
+        # ── Main-gate mark (best-effort) ──────────────────────────────────
+        # Run the project-configurable sentinel command immediately before
+        # update-ref so reify's reference-transaction hook sees the marker
+        # and records this recovery as SANCTIONED.  Mirrors advance_main's
+        # 1678 sanction block exactly.  Non-zero return is logged as WARNING
+        # but never aborts the recovery.
+        if self.config.main_gate_mark_command:
+            mark_rc, _, mark_err = await _run(
+                ['sh', '-c', self.config.main_gate_mark_command],
+                cwd=self.project_root,
+            )
+            if mark_rc != 0:
+                logger.warning(
+                    'main_gate_mark_command returned non-zero rc=%d: %s',
+                    mark_rc, mark_err,
+                )
+
+        # ── CAS move of refs/heads/main ───────────────────────────────────
+        rc, _, err = await _run(
+            ['git', 'update-ref',
+             f'refs/heads/{self.config.main_branch}',
+             target_sha, expected_main],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            # ── Main-gate unmark (best-effort cleanup) ────────────────────
+            if self.config.main_gate_unmark_command:
+                unmark_rc, _, unmark_err = await _run(
+                    ['sh', '-c', self.config.main_gate_unmark_command],
+                    cwd=self.project_root,
+                )
+                if unmark_rc != 0:
+                    logger.warning(
+                        'main_gate_unmark_command returned non-zero rc=%d: %s',
+                        unmark_rc, unmark_err,
+                    )
+            logger.warning(
+                'recover_red_main: CAS update-ref failed (expected %s): %s',
+                expected_main[:8], err,
+            )
+            return 'cas_failed'
+
+        logger.info(
+            'recover_red_main: rewound %s to %s',
+            self.config.main_branch, target_sha[:8],
+        )
+
+        # ── Sync working tree to new HEAD ─────────────────────────────────
+        if is_on_main:
+            sync_rc, _, sync_err = await _run(
+                ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+                cwd=self.project_root,
+            )
+            if sync_rc != 0:
+                logger.error(
+                    'read-tree failed after recover_red_main — working tree '
+                    'is stale. error=%s', sync_err,
+                )
+
+        return 'rewound'
 
     async def push_main(self) -> PushResult:
         """Push local main to ``<remote>/<main_branch>`` as a fast-forward.
