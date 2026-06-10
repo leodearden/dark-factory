@@ -6558,6 +6558,11 @@ def enforce_persistent_worktree_serial_lane(
     """
     if not config.git.persistent_merge_worktree:
         return None
+    # max(1, ...) clamps degenerate inputs: merge_ahead_bound is always >= 1
+    # in practice (harness pins _k = _MERGE_AHEAD_BOUND = 1; callers never pass
+    # 0 or negative).  The clamp ensures we fail-safe (per_host_inflight stays
+    # >= 1 → guard still raises for any positive bound with a single host) rather
+    # than silently allowing division-by-zero or a spuriously permissive result.
     per_host_inflight = math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
     if per_host_inflight > 1:
         raise PersistentWorktreeConfigError(

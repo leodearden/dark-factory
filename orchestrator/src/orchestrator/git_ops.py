@@ -1481,19 +1481,25 @@ class GitOps:
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
-    #: Name of the counter file used to persist the per-host verify attempt count
-    #: across stateless CLI invocations.  Lives under worktree_base so it is
-    #: never inside a registered worktree and therefore never pruned or cleaned.
-    _HOST_VERIFY_COUNTER_FILENAME: str = '.merge_verify_host_attempts'
+    #: Name of the counter file used to persist the verify attempt count across
+    #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
+    #: lives under ``worktree_base`` (``project_root / config.worktree_dir``), so
+    #: a single laptop host running ``verify-merge`` for multiple projects keeps
+    #: independent counters per project.  The file is never inside a registered
+    #: worktree, so it is never pruned or git-cleaned.
+    _VERIFY_ATTEMPT_COUNTER_FILENAME: str = '.merge_verify_host_attempts'
 
     def _bump_host_verify_attempt_count(self) -> int:
-        """Read, increment, and persist the per-host verify attempt counter.
+        """Read, increment, and persist the per-project-worktree verify attempt counter.
 
         The counter is stored as a plain integer in
         ``<worktree_base>/.merge_verify_host_attempts`` so that it survives
         across the stateless ``orchestrator verify-merge`` CLI invocations
         (each invocation is a fresh process; an in-memory counter cannot
-        persist on the laptop host).
+        persist on the laptop host).  The counter is **per-project-worktree**:
+        a single host running verify-merge for multiple projects has one
+        independent counter file per project under that project's
+        ``worktree_base``.
 
         A missing or corrupt counter file is treated as count 0 so the next
         call returns 1 — fail-safe, no exception raised.
@@ -1502,12 +1508,12 @@ class GitOps:
         serial invariant enforced by
         :func:`~orchestrator.merge_queue.enforce_persistent_worktree_serial_lane`
         guarantees that at most one ``verify-merge`` process runs at a time on
-        this host.
+        this host for this project.
 
         Returns:
             The new 1-based attempt count after the increment.
         """
-        counter_file = self.worktree_base / self._HOST_VERIFY_COUNTER_FILENAME
+        counter_file = self.worktree_base / self._VERIFY_ATTEMPT_COUNTER_FILENAME
         # Read existing count; treat missing/corrupt file as 0 (fail-safe)
         try:
             current = int(counter_file.read_text().strip())
