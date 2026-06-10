@@ -4576,6 +4576,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # submissions; the dedup'd L1 escalation in DriftDetector is the
         # durable cross-restart protection.  None-safe: initialised here so
         # bare-worker tests that don't set up remotes stay green.
+        #
+        # RESTART RE-TRUST WINDOW: _runner_quarantine resets to empty on worker
+        # restart.  A remote that diverged (remote PASS / local FAIL) becomes
+        # re-eligible immediately after restart.  The dedup'd L1 blocking
+        # escalation (submitted by DriftDetector before quarantine) is the
+        # cross-restart guard: an open verify_drift_divergence L1 escalation
+        # halts the merge queue across restart via the normal EscalationQueue
+        # gate, so the re-trusted remote's verdict is never authoritative for
+        # real merges until the escalation is resolved.  Rely on that coupling
+        # rather than persisting the quarantine set (operational simplicity
+        # tradeoff accepted; see plan.json §Mechanism-4 design notes).
         self._drift_land_count: int = 0
         self._runner_quarantine: set[str] = set()
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
@@ -7448,8 +7459,13 @@ async def _run_drift_check(
             added here so subsequent ``_run_post_merge_verify`` dispatches
             skip the diverged remote (in-memory protection until restart).
     """
-    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    # wt is initialised before the try so the finally guard (`if wt is not None`)
+    # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
+    # creation inside the try ensures the docstring contract ("Exceptions are caught
+    # and logged") holds for all failure modes — disk-full / git errors included.
+    wt = None
     try:
+        wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
         task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
         # Derive task_files on the dispatching host (fresh main) when not supplied
         # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
@@ -7468,12 +7484,15 @@ async def _run_drift_check(
             event_store=event_store,
             task_id=req.task_id,
         )
+        # Cadence is already enforced upstream in _maybe_run_drift_check
+        # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
+        # never called on this path, so omitting every_n_lands here keeps a
+        # single source of truth and avoids a dead duplicate cadence value.
         detector = DriftDetector(
             pool,
             event_store=event_store,
             escalation_queue=escalation_queue,
             task_id=req.task_id,
-            every_n_lands=req.config.verify_drift_check_every_n_lands,
         )
         # Capture the eligible remote BEFORE check() so we can propagate its
         # name even after the pool quarantines it (eligible_remote() returns
@@ -7489,7 +7508,8 @@ async def _run_drift_check(
             exc_info=True,
         )
     finally:
-        await git_ops.cleanup_merge_worktree(wt)
+        if wt is not None:
+            await git_ops.cleanup_merge_worktree(wt)
 
 
 async def _maybe_run_drift_check(

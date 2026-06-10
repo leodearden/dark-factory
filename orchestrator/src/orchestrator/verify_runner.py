@@ -630,6 +630,19 @@ class RemoteRunner:
         # Optional test-instrumentation hook: tests may assign a list to this
         # attribute so they can inspect all subprocess argv lists after the fact.
         self._calls: list[list[str]] = []
+        # Reserved for future deduplication of the best-effort main-branch push.
+        # When runner instances are long-lived (cached across calls), this
+        # attribute can be used to skip the push when main has not advanced
+        # since the last successful push to this remote.
+        #
+        # NOTE on current production behaviour: _build_remote_runners creates
+        # fresh RemoteRunner instances on each _run_post_merge_verify /
+        # _run_drift_check call, so this attribute is always None at dispatch
+        # time and deduplication never fires.  The main push is already cheap
+        # (git sends only a thin packfile when remote objects are present), so
+        # the per-call round-trip is acceptable at current merge cadences.
+        # Filed as a follow-up: cache runners and wire deduplication.
+        self._last_pushed_main_sha: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
