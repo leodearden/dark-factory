@@ -6919,6 +6919,95 @@ async def _run_shadow_compare(
             )
 
 
+async def _maybe_schedule_shadow_compare(
+    worker: 'SpeculativeMergeWorker',
+    git_ops: GitOps,
+    req: 'MergeRequest',
+    merge_commit: str,
+    warm_results: dict[str, bool],
+    escalation_queue: Any,
+    event_store: 'EventStore | None',
+) -> None:
+    """Non-blocking scheduler for the warm-vs-cold SHADOW compare (PRD §10 invariant 6(b)).
+
+    Called from :meth:`SpeculativeMergeWorker._verify_and_advance` on every
+    successful warm-verified land.  Returns **immediately** without awaiting
+    the cold leg — the shadow/detective control must never block or occupy the
+    serial merge lane.
+
+    Cadence (whichever sooner = OR):
+
+    * Every *N* merges (``warm_verify_shadow_compare_every_n_merges``).
+    * Once per nightly window (``warm_verify_shadow_compare_nightly_interval_secs``).
+
+    State is persisted to ``worker._shadow_state_path`` so the cadence
+    survives orchestrator restarts.
+
+    Single-in-flight guard: if a shadow compare task is already running (tracked in
+    ``worker._shadow_compare_tasks``), the new trigger is silently skipped so the
+    cold leg never piles up behind the serial lane.
+
+    Args:
+        worker: The live :class:`SpeculativeMergeWorker` instance (provides
+            ``_shadow_compare_tasks`` set and ``_shadow_state_path``).
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just landed (provides config).
+        merge_commit: The just-landed merge commit SHA (same-candidate guarantee).
+        warm_results: Per-test pass/fail map from the warm verify run.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    # Early exits: knob off or no warm results to compare against
+    if not req.config.git.warm_verify_shadow_compare:
+        return
+    if not warm_results:
+        return
+
+    # Load persisted cadence state (fail-safe: returns default on missing/corrupt)
+    state = _load_shadow_compare_state(worker._shadow_state_path)
+
+    # Increment the merge counter (counts this landing)
+    state = ShadowCompareState(
+        merges_since_last_shadow=state.merges_since_last_shadow + 1,
+        last_shadow_run_at=state.last_shadow_run_at,
+    )
+
+    now = time.time()
+    due = _shadow_compare_due(
+        state, now,
+        every_n_merges=req.config.git.warm_verify_shadow_compare_every_n_merges,
+        nightly_interval_secs=req.config.git.warm_verify_shadow_compare_nightly_interval_secs,
+    )
+
+    if not due:
+        # Save incremented counter and return without scheduling a task
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+        return
+
+    # In-flight guard: skip if a shadow compare task is already running
+    in_flight = [t for t in worker._shadow_compare_tasks if not t.done()]
+    if in_flight:
+        return
+
+    # Due and no in-flight task: reset state + persist
+    state = ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=now)
+    _save_shadow_compare_state(worker._shadow_state_path, state)
+
+    # Spawn the shadow compare OFF the serial lane — this call returns IMMEDIATELY
+    # without awaiting the cold verify (detective/async control, PRD §10 invariant 6(b)).
+    t = asyncio.create_task(
+        _run_shadow_compare(
+            git_ops, req, merge_commit, warm_results, escalation_queue, event_store
+        )
+    )
+
+    def _discard_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
+        worker._shadow_compare_tasks.discard(task)
+
+    t.add_done_callback(_discard_task)
+    worker._shadow_compare_tasks.add(t)
+
+
 async def _acquire_warm_verify_worktree(
     git_ops: GitOps,
     req: MergeRequest,

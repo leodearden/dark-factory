@@ -31,6 +31,7 @@ from orchestrator.merge_queue import (  # noqa: E402
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     _run_shadow_compare,
+    _maybe_schedule_shadow_compare,
     diff_per_test_results,
     parse_per_test_results,
 )
@@ -808,3 +809,211 @@ class TestRunShadowCompare:
         assert 'sha_target_123' in call_args[0], (
             f'cold leg must be called with merge_commit; call_args={call_args}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13: _maybe_schedule_shadow_compare (non-blocking scheduler)
+# ---------------------------------------------------------------------------
+
+
+def _make_worker_stub(
+    tmp_path: Path,
+    *,
+    shadow_compare_on: bool = True,
+    every_n: int = 40,
+    nightly_interval: float = 86400.0,
+) -> MagicMock:
+    """Build a minimal SpeculativeMergeWorker stub for scheduler tests."""
+    worker = MagicMock()
+    worker._shadow_compare_tasks = set()
+    worker._shadow_state_path = tmp_path / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+    return worker
+
+
+def _make_shadow_config(
+    tmp_path: Path,
+    *,
+    shadow_compare_on: bool = True,
+    every_n: int = 40,
+    nightly_interval: float = 86400.0,
+) -> OrchestratorConfig:
+    """Build OrchestratorConfig with shadow-compare knobs set."""
+    git = GitConfig(
+        warm_verify_shadow_compare=shadow_compare_on,
+        warm_verify_shadow_compare_every_n_merges=every_n,
+        warm_verify_shadow_compare_nightly_interval_secs=nightly_interval,
+    )
+    return OrchestratorConfig(project_root=tmp_path, git=git)
+
+
+class TestMaybeScheduleShadowCompare:
+    """Tests for _maybe_schedule_shadow_compare — the (e) non-blocking scheduler.
+
+    Guarantees: shadow leg does not block/occupy the serial merge lane.
+    """
+
+    # Knob OFF → no task, state file untouched
+    def test_knob_off_no_task_scheduled(self, tmp_path: Path) -> None:
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, shadow_compare_on=False)
+        warm = {'t1': True}
+
+        # Should be a sync or async function; call synchronously via asyncio.run
+        asyncio.run(
+            _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', warm, None, None
+            )
+        )
+
+        assert len(worker._shadow_compare_tasks) == 0
+        assert not worker._shadow_state_path.exists()
+
+    # Empty warm_results → no-op
+    def test_empty_warm_results_no_op(self, tmp_path: Path) -> None:
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, shadow_compare_on=True)
+
+        asyncio.run(
+            _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', {}, None, None
+            )
+        )
+
+        assert len(worker._shadow_compare_tasks) == 0
+        assert not worker._shadow_state_path.exists()
+
+    # Knob ON + not due (count < every_n, nightly not elapsed) →
+    # increments counter, persists, NO task
+    def test_not_due_increments_counter_no_task(self, tmp_path: Path) -> None:
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
+        warm = {'t1': True}
+
+        # Pre-set state: count=5, last_run recent enough that nightly won't fire
+        state = ShadowCompareState(merges_since_last_shadow=5, last_shadow_run_at=1e10)
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+
+        asyncio.run(
+            _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', warm, None, None
+            )
+        )
+
+        # Counter must have been incremented (5 → 6, still below 10)
+        saved = _load_shadow_compare_state(worker._shadow_state_path)
+        assert saved.merges_since_last_shadow == 6
+        # No task scheduled
+        assert len(worker._shadow_compare_tasks) == 0
+
+    # Knob ON + due (count == every_n) → task spawned, state reset, returns immediately
+    @pytest.mark.asyncio
+    async def test_due_spawns_task_and_returns_immediately(
+        self, tmp_path: Path
+    ) -> None:
+        """(e) core: _maybe_schedule_shadow_compare returns BEFORE the cold leg completes."""
+        gate = asyncio.Event()
+
+        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
+            """Gate that blocks until the test releases it."""
+            await gate.wait()
+
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
+        warm = {'t1': True}
+
+        # Seed state at threshold
+        state = ShadowCompareState(merges_since_last_shadow=9, last_shadow_run_at=0.0)
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+
+        with patch(
+            'orchestrator.merge_queue._run_shadow_compare',
+            new=gated_shadow_compare,
+        ):
+            # This call must RETURN before the gate is released
+            await _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha123', warm, None, None
+            )
+            # At this point the cold leg is still blocked on gate.wait() →
+            # _maybe_schedule_shadow_compare returned immediately
+            assert not gate.is_set(), (
+                '_maybe_schedule_shadow_compare must return before the cold leg completes'
+            )
+            # A task must have been spawned
+            assert len(worker._shadow_compare_tasks) == 1
+
+            # Release gate, await the task
+            gate.set()
+            pending = list(worker._shadow_compare_tasks)
+            for t in pending:
+                await t
+
+    # Due → state reset to 0 + last_shadow_run_at updated
+    def test_due_resets_persisted_state(self, tmp_path: Path) -> None:
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
+        warm = {'t1': True}
+
+        state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+
+        with patch(
+            'orchestrator.merge_queue._run_shadow_compare',
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(
+                _maybe_schedule_shadow_compare(
+                    worker, MagicMock(), req, 'sha', warm, None, None
+                )
+            )
+
+        saved = _load_shadow_compare_state(worker._shadow_state_path)
+        assert saved.merges_since_last_shadow == 0
+        assert saved.last_shadow_run_at > 0.0  # updated to now
+
+    # In-flight guard: when a task is already pending, second call schedules nothing
+    @pytest.mark.asyncio
+    async def test_in_flight_guard_skips_second_call(self, tmp_path: Path) -> None:
+        gate = asyncio.Event()
+
+        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
+            await gate.wait()
+
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
+        warm = {'t1': True}
+
+        # Both calls see state with count=10 (due)
+        state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+
+        with patch(
+            'orchestrator.merge_queue._run_shadow_compare',
+            new=gated_shadow_compare,
+        ):
+            # First call: spawns task (cold leg gated)
+            await _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', warm, None, None
+            )
+            assert len(worker._shadow_compare_tasks) == 1
+
+            # Second call while first is still in-flight: must NOT spawn another
+            # Reset state so it looks "due" again
+            state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
+            _save_shadow_compare_state(worker._shadow_state_path, state2)
+
+            await _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha2', warm, None, None
+            )
+            # Still only 1 task
+            assert len(worker._shadow_compare_tasks) == 1
+
+            # Release gate, await the task
+            gate.set()
+            for t in list(worker._shadow_compare_tasks):
+                await t
