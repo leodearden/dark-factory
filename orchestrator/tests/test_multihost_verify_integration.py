@@ -368,3 +368,54 @@ class TestSummarizeThroughput:
         assert report.per_runner == {'local': 2, 'laptop': 1}
         assert report.runners_seen == {'local', 'laptop'}
         assert report.window_duration_secs == window_duration
+
+
+# ---------------------------------------------------------------------------
+# Step-5 (RED): test_compare_throughput_reports_direction_and_records_delta
+# ---------------------------------------------------------------------------
+
+
+class TestCompareThroughput:
+    def test_compare_throughput_reports_direction_and_records_delta(self):
+        """compare_throughput returns direction booleans and signed deltas (PRD G6).
+
+        The test does NOT assert any fixed multiplier or threshold — only that
+        direction is correct and that non-zero numeric deltas are recorded.
+        """
+        baseline = ThroughputReport(
+            completed=4,
+            completion_rate=0.4,
+            peak_oldest_age_secs=10.0,
+            mean_oldest_age_secs=7.0,
+            peak_depth=4,
+            per_runner={'local': 4},
+            runners_seen={'local'},
+            window_duration_secs=10.0,
+        )
+        multihost = ThroughputReport(
+            completed=4,
+            completion_rate=0.8,
+            peak_oldest_age_secs=5.0,
+            mean_oldest_age_secs=3.5,
+            peak_depth=2,
+            per_runner={'local': 2, 'laptop': 2},
+            runners_seen={'local', 'laptop'},
+            window_duration_secs=5.0,
+        )
+
+        delta = compare_throughput(baseline, multihost)
+
+        # Direction assertions
+        assert delta.rate_improved is True
+        assert delta.oldest_age_reduced is True
+        assert delta.depth_reduced is True
+
+        # Signed delta assertions — direction only, no frozen threshold
+        assert delta.rate_delta > 0.0, 'rate_delta should be positive (improvement)'
+        assert delta.oldest_age_delta < 0.0, 'oldest_age_delta should be negative (reduction)'
+        assert delta.depth_delta < 0, 'depth_delta should be negative (reduction)'
+
+        # Deltas are the numeric magnitude (multihost - baseline)
+        assert abs(delta.rate_delta - (0.8 - 0.4)) < 1e-9
+        assert abs(delta.oldest_age_delta - (5.0 - 10.0)) < 1e-9
+        assert delta.depth_delta == (2 - 4)
