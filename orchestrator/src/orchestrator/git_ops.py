@@ -371,6 +371,50 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     return f'Merge {branch} into {main_branch}'
 
 
+def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """Parse a unified diff and return old-side (BASE) line ranges per file.
+
+    Given the output of ``git diff <main>...<ref> --unified=0 --no-color``,
+    returns a mapping of file path → list of (start, end) tuples representing
+    old-side (BASE/main-relative) changed line ranges.  Using old-side ranges
+    from both branches diffed against the same main makes ranges directly
+    comparable for stackability checks.
+
+    Pure insertion hunks (old_count == 0, e.g. ``@@ -7,0 +8,3 @@``) are
+    mapped to a point range ``(old_start, old_start)`` so they are still
+    comparable; ``@@ -N,0 ... @@`` anchors at line N (the line *before* the
+    insertion in the old file).
+
+    Returns an empty dict for an empty or header-only diff.
+    """
+    import re
+
+    result: dict[str, list[tuple[int, int]]] = {}
+    current_file: str | None = None
+
+    hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@')
+
+    for line in diff_text.splitlines():
+        if line.startswith('+++ b/'):
+            # Strip the "b/" prefix to get the canonical file path.
+            current_file = line[6:]
+            if current_file not in result:
+                result[current_file] = []
+        elif line.startswith('diff --git '):
+            # Reset current file; it will be set when +++ b/ is seen.
+            current_file = None
+        elif current_file is not None:
+            m = hunk_re.match(line)
+            if m:
+                old_start = int(m.group(1))
+                old_count = int(m.group(2)) if m.group(2) is not None else 1
+                # Pure insertion: old_count == 0 → point range at old_start.
+                end = old_start + max(old_count, 1) - 1
+                result[current_file].append((old_start, end))
+
+    return result
+
+
 class GitOps:
     """Git worktree and merge operations."""
 
