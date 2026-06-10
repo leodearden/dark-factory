@@ -136,6 +136,9 @@ async def test_superseded_outcome_parks_as_merge_deferred(
     assert wf._last_merge_block_reason == 'sentinel', (
         f'Thrash sentinel must be unchanged; got {wf._last_merge_block_reason!r}'
     )
+    # (e) clear_requeue_count was called — prevents stranded retry counter
+    #     (mirrors _enter_merge_deferred; a regression dropping this call must fail).
+    cast(MagicMock, wf.scheduler.clear_requeue_count).assert_called_once_with('99')
 
 
 # ---------------------------------------------------------------------------
@@ -198,15 +201,16 @@ async def test_superseded_emits_event_and_log_naming_superseded_by(
         f'outcome="superseded"}}; emit calls were: {emit_calls}'
     )
 
-    # (b) An INFO log record names superseded_by and conveys parking semantics.
-    parking_keywords = ('absorbed', 'superseded', 'merge-deferred')
+    # (b) An INFO log record names superseded_by ('mr-x').
+    #     We only require the id is present — semantic content is already pinned
+    #     structurally by assertion (a); coupling this check to prose wording
+    #     (e.g. 'absorbed', 'superseded') would fail on benign rewording.
     matching_records = [
         r for r in caplog.records
         if r.levelno == logging.INFO
         and 'mr-x' in r.getMessage()
-        and any(kw in r.getMessage() for kw in parking_keywords)
     ]
     assert matching_records, (
-        f'Expected an INFO log containing "mr-x" and one of {parking_keywords}; '
+        f'Expected an INFO log containing "mr-x"; '
         f'INFO records were: {[r.getMessage() for r in caplog.records if r.levelno == logging.INFO]}'
     )
