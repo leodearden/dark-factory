@@ -22,7 +22,6 @@ import pytest
 from orchestrator.config import VerifyRunnerConfig
 from orchestrator.harness import Harness
 
-
 # ---------------------------------------------------------------------------
 # Harness builder
 # ---------------------------------------------------------------------------

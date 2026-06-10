@@ -1210,7 +1210,7 @@ class TestVerifyRunnerConfig:
         """Constructing with a list of dicts coerces to list[VerifyRunnerConfig]."""
         from orchestrator.config import VerifyRunnerConfig
 
-        config = OrchestratorConfig(verify_runners=[
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
             {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
         ])
         assert len(config.verify_runners) == 1
@@ -1234,7 +1234,7 @@ class TestVerifyRunnerConfig:
 
     def test_enabled_verify_runners_filters_disabled(self):
         """enabled_verify_runners returns only runners with enabled=True."""
-        config = OrchestratorConfig(verify_runners=[
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
             {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True},
             {'name': 'disabled', 'ssh_host': 'h2', 'git_remote': 'r2', 'enabled': False},
         ])
@@ -1244,14 +1244,14 @@ class TestVerifyRunnerConfig:
 
     def test_enabled_verify_runners_empty_when_all_disabled(self):
         """enabled_verify_runners returns [] when all runners are disabled."""
-        config = OrchestratorConfig(verify_runners=[
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
             {'name': 'r', 'ssh_host': 'h', 'git_remote': 'g', 'enabled': False},
         ])
         assert config.enabled_verify_runners == []
 
     def test_enabled_verify_runners_all_when_all_enabled(self):
         """enabled_verify_runners returns all runners when all have enabled=True."""
-        config = OrchestratorConfig(verify_runners=[
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
             {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1'},
             {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2'},
         ])

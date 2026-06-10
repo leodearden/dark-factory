@@ -3431,15 +3431,12 @@ class TestRemoteRunnerMainBranchPush:
 
     async def test_main_push_failure_is_non_fatal(self):
         """main-push rc!=0 is swallowed; merge-sha push + ssh still succeed and return VerifyResult."""
-        from orchestrator.verify_runner import RunnerUnavailable
-
         expected = VerifyResult(passed=True, test_output='ok', lint_output='', type_output='', summary='ok')
         calls = []
         call_count = [0]
 
         async def fake_run(argv, *, cwd=None):
             calls.append((argv, cwd))
-            n = call_count[0]
             call_count[0] += 1
             # First git call = main push → rc=1 (non-fast-forward)
             if argv[0] == 'git' and 'refs/heads/' in (argv[3] if len(argv) > 3 else ''):

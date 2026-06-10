@@ -8,7 +8,6 @@ Covers:
     (step-9 RED / step-10 GREEN)
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +15,6 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import RemoteRunner
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -168,13 +166,10 @@ def _make_merge_request(config, *, task_files=None, worktree=None):
     """Build a MergeRequest for use in _run_post_merge_verify tests."""
     import asyncio
     from pathlib import Path
-    from orchestrator.merge_queue import MergeRequest
 
-    try:
-        future = asyncio.get_running_loop().create_future()
-    except RuntimeError:
-        import concurrent.futures
-        future = concurrent.futures.Future()
+    from orchestrator.merge_queue import MergeOutcome, MergeRequest
+
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
     return MergeRequest(
         task_id='task-42',
@@ -221,8 +216,12 @@ class TestRunPostMergeVerifyPoolWiring:
         fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
 
         emitted = []
+        from orchestrator.event_store import EventStore
 
-        class FakeEventStore:
+        class FakeEventStore(EventStore):
+            def __init__(self):
+                object.__init__(self)
+
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
@@ -254,7 +253,6 @@ class TestRunPostMergeVerifyPoolWiring:
         fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
 
         spec_calls = []
-        orig_build_spec = None
 
         import orchestrator.verify_runner as _vr
         orig_build = _vr.build_merge_verify_spec
@@ -381,20 +379,21 @@ class TestRunDriftCheck:
         return eq
 
     def _make_fake_event_store(self):
-        emitted = []
+        from orchestrator.event_store import EventStore
 
-        class FakeES:
+        class FakeES(EventStore):
+            def __init__(self):
+                object.__init__(self)
+                self._emitted: list = []
+
             def emit(self, event_type, *, task_id=None, data=None, **kw):
-                emitted.append({'type': event_type, 'data': data or {}})
+                self._emitted.append({'type': event_type, 'data': data or {}})
 
-        es = FakeES()
-        es._emitted = emitted
-        return es
+        return FakeES()
 
     async def test_agree_emits_verdict_parity_ok(self, tmp_path):
         """When local and remote agree, a verdict_parity_ok event is emitted."""
         from orchestrator.merge_queue import _run_drift_check
-        from orchestrator.event_store import EventType
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -558,8 +557,7 @@ class TestDriftLandHookIntegration:
 
     async def test_maybe_run_drift_check_called_on_done_land(self, tmp_path):
         """After a 'done' land, _maybe_run_drift_check is awaited with the merge_commit."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker, MergeRequest
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         git_ops = _make_git_ops_mock()
@@ -588,7 +586,6 @@ class TestDriftLandHookIntegration:
             req.config = config
 
             # Manually call the drift hook as the land path would
-            from orchestrator.merge_queue import _maybe_run_drift_check
             with patch('orchestrator.merge_queue._maybe_run_drift_check',
                        side_effect=fake_maybe_drift):
                 # Invoke the SpeculativeMergeWorker's advance+land path indirectly

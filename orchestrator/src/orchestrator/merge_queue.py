@@ -58,10 +58,10 @@ logger = logging.getLogger(__name__)
 
 
 def _build_remote_runners(
-    config: 'OrchestratorConfig',
-    cwd: 'str | Path',
+    config: OrchestratorConfig,
+    cwd: str | Path,
     *,
-    quarantine: 'set[str] | None' = None,
+    quarantine: set[str] | None = None,
 ) -> list[RemoteRunner]:
     """Build the list of RemoteRunner instances from operator config (Lever C).
 
@@ -656,7 +656,7 @@ async def _run_post_merge_verify(
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
-    quarantine: 'set[str] | None' = None,
+    quarantine: set[str] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -7407,8 +7407,8 @@ async def _run_drift_check(
     req: MergeRequest,
     merge_commit: str,
     escalation_queue: Any,
-    event_store: 'EventStore | None',
-    quarantine_set: 'set[str]',
+    event_store: EventStore | None,
+    quarantine_set: set[str],
 ) -> None:
     """Drift detective control: run DriftDetector.check in a throwaway worktree.
 
@@ -7477,7 +7477,7 @@ async def _run_drift_check(
 
 
 async def _maybe_run_drift_check(
-    worker: 'SpeculativeMergeWorker',
+    worker: SpeculativeMergeWorker,
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
