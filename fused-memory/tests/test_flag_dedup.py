@@ -5544,3 +5544,165 @@ class TestFilterTerminalMetadataFlags:
         # get_task must NOT be called for non-metadata flags (out of scope)
         taskmaster.get_task.assert_not_called()
 
+    # ---- edge cases added in step-3 ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_done_task_stale_metadata_flag_is_dropped(self):
+        """stale_metadata flag for a DONE task is DROPPED (done is terminal too)."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+        project_root = '/proj'
+
+        flag = {'task_id': '42', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'stale_metadata flag for a done task must be dropped '
+            '(done is terminal — no future execution to consume the metadata)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_raising_keeps_flag(self):
+        """get_task raising an exception → KEEP the flag (fail-safe)."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('backend down'))
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'get_task raising must KEEP the flag (fail-safe: only drop on positively '
+            'confirmed terminal status)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_returning_non_dict_keeps_flag(self):
+        """get_task returning a non-dict (e.g. None) → KEEP the flag (fail-safe)."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=None)
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'Non-dict get_task result must KEEP the flag (fail-safe: unknown status)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_returning_dict_without_status_keeps_flag(self):
+        """get_task returning a dict with no 'status' key → 'unknown' status → KEEP."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '1703', 'title': 'Old task'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'Missing status key should result in unknown status → KEEP the flag'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_returning_non_terminal_status_keeps_flag(self):
+        """get_task returning a non-terminal status ('in-progress') → KEEP."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'in-progress'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'in-progress status is not terminal → flag must be kept'
+        )
+
+    @pytest.mark.asyncio
+    async def test_nested_data_status_cancelled_drops_flag(self):
+        """Status under {'data': {'status': 'cancelled'}} is extracted and causes DROP."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'data': {'status': 'cancelled'}})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'Status nested under data.status must be extracted; cancelled → DROP'
+        )
+
+    @pytest.mark.asyncio
+    async def test_passthrough_when_taskmaster_is_none(self):
+        """No-op pass-through when taskmaster is None — get_task must not be called."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+
+        result = await filter_terminal_metadata_flags(None, '/proj', [flag])
+
+        assert result == [flag], 'None taskmaster must pass all flags through unchanged'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_passthrough_when_project_root_is_empty(self):
+        """No-op pass-through when project_root is '' — get_task must not be called."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+
+        result = await filter_terminal_metadata_flags(taskmaster, '', [flag])
+
+        assert result == [flag], 'Empty project_root must pass all flags through unchanged'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_metadata_flag_with_no_task_id_passes_through(self):
+        """stale_metadata flag with task_id=None passes through without get_task call."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock()
+        project_root = '/proj'
+
+        flag = {'task_id': None, 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'stale_metadata flag with task_id=None must pass through unchanged '
+            '(no task to look up)'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_task_metadata_stale_alias_also_dropped(self):
+        """task_metadata_stale (the task-title spelling) is treated the same as stale_metadata."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'task_metadata_stale'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'task_metadata_stale alias must also be dropped for cancelled tasks'
+        )
+
