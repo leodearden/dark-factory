@@ -4753,3 +4753,58 @@ class TestPersistentMergeWorktree:
         assert not stray_txt.exists(), (
             'stray.txt must be cleaned by git clean -xfd'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1699 — per-host disk-persistent attempt counter (step-3 RED)
+# ---------------------------------------------------------------------------
+
+
+class TestHostVerifyAttemptCounter:
+    """Disk-persistent per-host attempt counter for the verify-merge CLI.
+
+    Step-3 (RED): _bump_host_verify_attempt_count absent today — AttributeError.
+    """
+
+    def test_counter_monotonically_increasing(self, git_ops: GitOps):
+        """Successive calls return 1-based monotonically increasing counts."""
+        assert git_ops._bump_host_verify_attempt_count() == 1
+        assert git_ops._bump_host_verify_attempt_count() == 2
+        assert git_ops._bump_host_verify_attempt_count() == 3
+
+    def test_counter_persists_across_instances(self, git_config: GitConfig, git_repo: Path):
+        """Counter survives across separate stateless GitOps instances (separate CLI invocations)."""
+        ops1 = GitOps(git_config, git_repo)
+        ops2 = GitOps(git_config, git_repo)
+        ops3 = GitOps(git_config, git_repo)
+
+        c1 = ops1._bump_host_verify_attempt_count()
+        c2 = ops2._bump_host_verify_attempt_count()
+        c3 = ops3._bump_host_verify_attempt_count()
+
+        assert c1 == 1
+        assert c2 == 2
+        assert c3 == 3
+
+    def test_counter_failsafe_on_corrupt_file(self, git_config: GitConfig, git_repo: Path):
+        """A corrupt counter file is treated as 0; next call returns 1 (no exception)."""
+        ops = GitOps(git_config, git_repo)
+        # Manually write garbage into the counter file location
+        ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        counter_file = ops.worktree_base / '.merge_verify_host_attempts'
+        counter_file.write_text('not-an-integer\n')
+
+        # Must not raise; must treat corrupt file as 0 and return 1
+        result = ops._bump_host_verify_attempt_count()
+        assert result == 1, f'Corrupt file must be treated as 0; got count={result}'
+
+    def test_counter_failsafe_missing_file(self, git_config: GitConfig, git_repo: Path):
+        """A missing counter file is treated as 0; first call returns 1 (no exception)."""
+        ops = GitOps(git_config, git_repo)
+        # Ensure no counter file exists
+        counter_file = ops.worktree_base / '.merge_verify_host_attempts'
+        if counter_file.exists():
+            counter_file.unlink()
+
+        result = ops._bump_host_verify_attempt_count()
+        assert result == 1, f'Missing file must be treated as 0; got count={result}'
