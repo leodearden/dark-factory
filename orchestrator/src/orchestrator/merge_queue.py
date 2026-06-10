@@ -5018,20 +5018,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return True
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically emit merge-queue depth heartbeats while the worker runs.
+        """Periodically emit merge-queue depth heartbeats and touch owned worktrees.
 
         Runs independently of the merger and verifier loops so it continues to
         fire even when those are blocked on ``queue.get()`` or semaphores (the
         exact silence window that caused the 2026-06-04 dead-slot misdiagnosis).
 
-        Wakes every ``_HEARTBEAT_POLL_S`` seconds and delegates the
-        fire/rate-limit/format/emit decision to the synchronous, clock-injectable
-        :meth:`_maybe_log_queue_heartbeat`.  Any unexpected exception is logged
-        and swallowed so a heartbeat bug can never crash the worker.
+        Wakes every ``_HEARTBEAT_POLL_S`` seconds and:
+          1. Touches every owned ephemeral _merge-* worktree in the liveness
+             ledger (α mechanism) so the stale-worktree reaper never reaps a
+             live-owner worktree.  Touch runs FIRST, unconditionally, and
+             swallows per-path errors internally (ENOENT/OSError) so it can
+             never starve the heartbeat log.
+          2. Delegates the fire/rate-limit/format/emit decision to the
+             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+
+        Any unexpected exception from either call is logged and swallowed so a
+        heartbeat bug can never crash the worker.
         """
         while self._running:
             await asyncio.sleep(_HEARTBEAT_POLL_S)
             try:
+                self._touch_owned_merge_worktrees()
                 self._maybe_log_queue_heartbeat(time.time())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
