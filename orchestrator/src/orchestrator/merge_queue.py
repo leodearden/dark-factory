@@ -7275,6 +7275,12 @@ async def _maybe_schedule_shadow_compare(
         return
     if not warm_results:
         return
+    # None-safe: _shadow_state_path is None on bare-harness workers (mirrors the
+    # escalation_queue None-safety / bare-harness contract in __init__).
+    # _load_shadow_compare_state(None) raises AttributeError — not in its except
+    # tuple — so guard here to keep the Path|None type sound at call sites.
+    if worker._shadow_state_path is None:
+        return
 
     # Load persisted cadence state (fail-safe: returns default on missing/corrupt)
     state = _load_shadow_compare_state(worker._shadow_state_path)
