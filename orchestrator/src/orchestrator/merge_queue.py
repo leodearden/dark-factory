@@ -3130,6 +3130,12 @@ class TrainCallbacks:
 TrainCallbackFactory = Callable[[str], TrainCallbacks]
 
 # δ/1720 merge-ready confidence gate constants.
+# Prefix used when constructing coalesce-formed train IDs in
+# _maybe_coalesce_waiting_singles.  Used as the single source of truth
+# so the merger-loop recording hook can identify coalesce-formed trains
+# without a separate flag field on GroupMergeRequest.
+_COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
+
 # Terminal merge outcomes in this set are treated as "risky" by the default
 # predicate — a waiting single whose branch's most-recent merge_finalized
 # event has one of these states is excluded from train formation.
@@ -5264,6 +5270,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Retroactive coalescing pass (γ/1719)
     # ------------------------------------------------------------------
 
+    def _mark_coalesce_derailed(self, member_task_ids: list[str]) -> None:
+        """Record the members of a derailed coalesce-formed train as one-strike.
+
+        Called by _merger_loop after _do_train_merge returns a blocked outcome
+        for a train whose train_id startswith _COALESCE_TRAIN_ID_PREFIX.  Adds
+        each task_id to self._coalesce_derailed_task_ids so the next coalescing
+        pass (default predicate) excludes them from train formation.
+        """
+        if not member_task_ids:
+            return
+        self._coalesce_derailed_task_ids.update(member_task_ids)
+        logger.info(
+            'Coalesce one-strike: marked %d task(s) after coalesce-train derail: %s',
+            len(member_task_ids), member_task_ids,
+        )
+
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
         """Built-in merge-ready predicate (δ/1720 confidence gate).
 
@@ -5460,7 +5482,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         _seen_mc.add(mc.prefix)
                         union_module_configs.append(mc)
 
-        train_id = f'coalesce-{tip_id}-{uuid.uuid4().hex[:8]}'
+        train_id = f'{_COALESCE_TRAIN_ID_PREFIX}{tip_id}-{uuid.uuid4().hex[:8]}'
         callbacks = self._train_callback_factory(train_id)  # type: ignore[misc]
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
@@ -5633,6 +5655,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 req.train_id, spec_base[:12],
                             )
                         outcome = await _do_train_merge(self, req)
+                        # δ/1720: if a coalesce-formed train derailed, mark all
+                        # its members one-strike so they are excluded from the
+                        # next coalescing pass (leaving them to merge solo).
+                        if (
+                            outcome.status == 'blocked'
+                            and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
+                        ):
+                            self._mark_coalesce_derailed(req.member_task_ids)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
