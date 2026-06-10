@@ -1528,15 +1528,19 @@ class GitOps:
                     f'Failed to reset persistent merge worktree {warm_path} '
                     f'to {merge_commit}: {err}'
                 )
+            # Single invocation excluding ALL artifact dirs at once — every
+            # configured build-output dir (e.g. build AND dist) survives in
+            # one pass.  A per-dir loop would call ``git clean -xfd -e build``
+            # (deleting dist/) then ``git clean -xfd -e dist`` (deleting
+            # build/), so with >1 dir NONE survive (step-19 regression).
+            clean_cmd = ['git', 'clean', '-xfd']
             for artifact_dir in self.config.reap_build_artifact_dirs:
-                rc, _, err = await _run(
-                    ['git', 'clean', '-xfd', '-e', artifact_dir],
-                    cwd=warm_path,
+                clean_cmd += ['-e', artifact_dir]
+            rc, _, err = await _run(clean_cmd, cwd=warm_path)
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to clean persistent merge worktree {warm_path}: {err}'
                 )
-                if rc != 0:
-                    raise RuntimeError(
-                        f'Failed to clean persistent merge worktree {warm_path}: {err}'
-                    )
             logger.info(
                 'Reset persistent merge worktree %s to HEAD=%s',
                 warm_path, merge_commit[:8],
