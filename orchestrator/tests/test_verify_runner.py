@@ -3306,11 +3306,10 @@ class TestColdWarmVerifyDelta:
 
     def test_json_sort_keys(self):
         """JSON output must have sort_keys=True (canonical form)."""
-        import json as _json
         from orchestrator.verify_runner import ColdWarmVerifyDelta, delta_to_json
         d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
         serialised = delta_to_json(d)
-        parsed = _json.loads(serialised)
+        parsed = json.loads(serialised)
         assert list(parsed.keys()) == sorted(parsed.keys())
 
     def test_warm_equal_cold_speedup_one(self):

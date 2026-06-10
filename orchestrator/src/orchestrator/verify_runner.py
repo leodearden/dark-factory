@@ -1491,6 +1491,29 @@ def parse_sccache_stats(output: str) -> SccacheStats:
     cache_misses = 0
     cache_location = ''
 
+    # Numeric labels: extract the LAST whitespace-delimited token as an integer.
+    # We require EXACT label == expected text (before the numeric column) so
+    # "Cache hits (Rust)" is never mistaken for "Cache hits".
+    def _extract_int(label_expected: str, s: str) -> int | None:
+        if not s.startswith(label_expected):
+            return None
+        # The remainder after the label must be purely numeric (possibly with
+        # leading spaces).  If the label is followed by a '(' it is a variant
+        # (e.g. "Cache hits (Rust)") and must be rejected.
+        remainder = s[len(label_expected):]
+        if not remainder:
+            return None
+        # reject parenthesised variants
+        if remainder.lstrip().startswith('('):
+            return None
+        tokens = remainder.split()
+        if not tokens:
+            return None
+        try:
+            return int(tokens[-1])
+        except ValueError:
+            return None
+
     for line in output.splitlines():
         # Strip leading whitespace; skip blank lines.
         stripped = line.strip()
@@ -1506,40 +1529,17 @@ def parse_sccache_stats(output: str) -> SccacheStats:
             cache_location = rest
             continue
 
-        # Numeric labels: extract the LAST whitespace-delimited token as an integer.
-        # We require EXACT label == expected text (before the numeric column) so
-        # "Cache hits (Rust)" is never mistaken for "Cache hits".
-        def _extract_int(label_expected: str) -> int | None:
-            if not stripped.startswith(label_expected):
-                return None
-            # The remainder after the label must be purely numeric (possibly with
-            # leading spaces).  If the label is followed by a '(' it is a variant
-            # (e.g. "Cache hits (Rust)") and must be rejected.
-            remainder = stripped[len(label_expected):]
-            if not remainder:
-                return None
-            # reject parenthesised variants
-            if remainder.lstrip().startswith('('):
-                return None
-            tokens = remainder.split()
-            if not tokens:
-                return None
-            try:
-                return int(tokens[-1])
-            except ValueError:
-                return None
-
-        v = _extract_int('Compile requests')
+        v = _extract_int('Compile requests', stripped)
         if v is not None:
             compile_requests = v
             continue
 
-        v = _extract_int('Cache hits')
+        v = _extract_int('Cache hits', stripped)
         if v is not None:
             cache_hits = v
             continue
 
-        v = _extract_int('Cache misses')
+        v = _extract_int('Cache misses', stripped)
         if v is not None:
             cache_misses = v
 
@@ -1609,7 +1609,7 @@ class ColdWarmVerifyDelta:
         return {'cold_secs': self.cold_secs, 'warm_secs': self.warm_secs}
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'ColdWarmVerifyDelta':
+    def from_dict(cls, d: dict) -> ColdWarmVerifyDelta:
         return cls(cold_secs=float(d['cold_secs']), warm_secs=float(d['warm_secs']))
 
 
