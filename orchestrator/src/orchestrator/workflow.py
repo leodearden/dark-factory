@@ -672,13 +672,27 @@ class TaskWorkflow:
         terminal handler) is responsible for flipping status merge-deferred→done
         with merged provenance once the absorbing request lands.
         """
-        from orchestrator.merge_queue import MergeOutcome as _MergeOutcome  # noqa: F401
         self._enter_phase(WorkflowState.MERGE_DEFERRED)
         await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
         # Clear any requeue counter accumulated from prior failed attempts: the
         # task's work is structurally complete — its branch was absorbed — so
         # old retry counts are no longer relevant.  Mirrors _enter_merge_deferred.
         self.scheduler.clear_requeue_count(self.task_id)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.merge_attempt,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'outcome': 'superseded',
+                    'superseded_by': result.superseded_by,
+                },
+            )
+        logger.info(
+            'Task %s: merge absorbed into %s — parking in merge-deferred '
+            '(absorbing request owns done transition)',
+            self.task_id, result.superseded_by,
+        )
         return WorkflowOutcome.MERGE_DEFERRED
 
     async def _maybe_enqueue_group_merge(self) -> WorkflowOutcome | None:
