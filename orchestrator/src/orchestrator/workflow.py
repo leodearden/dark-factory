@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry
+    from orchestrator.merge_queue import InFlightMergeRegistry, SoloVerifyResult
     from orchestrator.usage_gate import UsageGate
 
 
@@ -693,6 +693,7 @@ class TaskWorkflow:
         """
         from orchestrator.merge_queue import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
+            TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
             register_and_enqueue_merge_request,
@@ -821,6 +822,14 @@ class TaskWorkflow:
                 self.task_id, train_id, result.reason,
             )
             return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Attribution trigger: train union-verify red with a non-interaction-exempt
+        # failure category → re-verify each member as a single (δ).  The prefix is
+        # tagged in _do_train_merge ONLY on interaction-candidate verify-red outcomes
+        # (failure_category set AND not main-health-red), so rebase-conflict,
+        # main-health-red, transient-infra, unscoped-pyright, and wip-halt keep
+        # their existing routing unchanged.
+        if result.reason and result.reason.startswith(TRAIN_VERIFY_FAILED_REASON_PREFIX):
+            return await self._attribute_train_failure(result, train_id, members)
         # Orphan-halt probe: _map_advance_failure halted the merge queue (one of the
         # four halt-inducing statuses: wip_halted, done_wip_recovery,
         # wip_recovery_no_advance, unmerged_state) and halt_owner_esc_id is None,
@@ -5068,6 +5077,336 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         return category, summary, detail
+
+    async def _reverify_one_member(
+        self,
+        member: dict,
+        predecessor_ref: str,
+    ) -> SoloVerifyResult:
+        """Un-stack a member's own delta onto main and verify it in isolation.
+
+        1. Call ``git_ops.materialize_member_solo(member_id, predecessor_ref)``
+           to create an isolated worktree carrying only this member's commits.
+        2. If the un-stack fails (returns None — rebase conflict), return a
+           failed result with reason='unstackable'.
+        3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
+           never advances main) and return its result.
+        """
+        from orchestrator.merge_queue import (
+            SoloVerifyResult,
+            reverify_member_solo,
+        )
+
+        member_id = str(member.get('id', ''))
+        solo_wt_info = await self.git_ops.materialize_member_solo(
+            member_id, predecessor_ref,
+        )
+        if solo_wt_info is None:
+            return SoloVerifyResult(
+                member_id=member_id,
+                passed=False,
+                merge_sha=None,
+                reason='unstackable',
+            )
+        # WorktreeInfo carries path + base_commit (=rebased tip SHA).
+        # The solo branch name mirrors materialize_member_solo's default prefix.
+        solo_branch = f'_solo-{member_id}'
+        return await reverify_member_solo(
+            self.git_ops,
+            member_id=member_id,
+            solo_wt=solo_wt_info.path,
+            solo_branch=solo_branch,
+            tip_sha=solo_wt_info.base_commit,
+            config=self.config,
+            task_files=self._task_files,
+            module_configs=self._module_configs,
+            event_store=self.event_store,
+        )
+
+    async def _attribute_train_failure(
+        self,
+        result: object,
+        train_id: str,
+        members: list[dict],
+    ) -> WorkflowOutcome:
+        """Re-verify each train member as a solo to attribute a union-verify failure.
+
+        Called from ``_maybe_enqueue_group_merge`` when the result carries a
+        ``TRAIN_VERIFY_FAILED_REASON_PREFIX`` tag — meaning the train's post-merge
+        verification failed with an interaction-candidate failure category.
+
+        Design (δ):
+        - For each member root→tip, un-stack its own delta onto current main via
+          ``_reverify_one_member`` (wraps materialize_member_solo +
+          reverify_member_solo; never advances).  Exactly N solo verifies.
+        - Partition into passers / failers (un-stack conflict → failer).
+        - All pass → genuine cross-member INTERACTION: emit train_derailed
+          (verdict='interaction'), escalate the train, land nothing.
+        - Some fail → land each passer, block each failer (steps 12/14).
+        """
+        # Sort members by their metadata train 'order' (root→tip) so that the
+        # predecessor_ref computation is correct regardless of caller-side ordering.
+        # tasks_by_train normally returns them sorted, but attributing the right
+        # delta to each member depends on strict stacking order — a silently
+        # mis-ordered list would rebase against the wrong predecessor, either
+        # producing a spurious conflict (mis-classified 'unstackable') or
+        # extracting the wrong delta.
+        members = sorted(
+            members,
+            key=lambda m: (m.get('metadata') or {}).get('train', {}).get('order', 0),
+        )
+
+        member_ids = [str(m.get('id', '')) for m in members]
+        branch_prefix = self.git_ops.config.branch_prefix
+        main_branch = self.git_ops.config.main_branch
+
+        logger.info(
+            'Task %s: train %r union verify failed — re-verifying %d members as singles',
+            self.task_id, train_id, len(members),
+        )
+
+        # Collect per-member solo verify results (root→tip; N verifies total).
+        solo_results: list[SoloVerifyResult] = []
+        for i, member in enumerate(members):
+            predecessor_ref = (
+                main_branch if i == 0
+                else f'{branch_prefix}{members[i - 1].get("id", "")}'
+            )
+            solo = await self._reverify_one_member(member, predecessor_ref)
+            solo_results.append(solo)
+            logger.debug(
+                'Task %s: member %s solo verify: passed=%s reason=%r',
+                self.task_id, solo.member_id, solo.passed, solo.reason,
+            )
+
+        failers = [r for r in solo_results if not r.passed]
+
+        if not failers:
+            # ALL pass → genuine cross-member interaction; escalate train, land nothing.
+            # Tear down every member's solo worktree+branch before returning
+            # (reverify_member_solo left them alive for the land path; here we
+            # land nothing, so we own the cleanup).
+            for sr in solo_results:
+                if sr.solo_wt is not None:
+                    try:
+                        await self.git_ops.cleanup_merge_worktree(sr.solo_wt)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: all-pass teardown: cleanup_merge_worktree '
+                            'failed for member %s', self.task_id, sr.member_id,
+                            exc_info=True,
+                        )
+                if sr.solo_branch is not None:
+                    try:
+                        await self.git_ops.delete_solo_branch(sr.solo_branch)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: all-pass teardown: delete_solo_branch '
+                            'failed for member %s', self.task_id, sr.member_id,
+                            exc_info=True,
+                        )
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.train_derailed,
+                    task_id=self.task_id,
+                    phase='merge',
+                    data={
+                        'train_id': train_id,
+                        'member_task_ids': member_ids,
+                        'verdict': 'interaction',
+                        'members': member_ids,
+                        'derail_reason': (
+                            f'All {len(members)} members pass solo — '
+                            'failure is a cross-member interaction'
+                        ),
+                    },
+                )
+            return await self._mark_blocked(
+                f'Train {train_id!r} union verify failed but all '
+                f'{len(members)} members pass solo — cross-member interaction',
+                escalate_to_human=True,
+            )
+
+        # Some fail → land each passer, block each failer.
+        passers = [r for r in solo_results if r.passed]
+        offender_ids = [r.member_id for r in failers]
+        passer_ids = [r.member_id for r in passers]
+
+        # Land each passer: advance main with the solo-verified sha.
+        # Re-read get_main_sha() immediately before each advance_main so that
+        # sequential intra-loop landings CAS against the current tip (not a
+        # stale pre-loop snapshot).  Pass branch=None so advance_main does NOT
+        # try to resolve a non-existent task/_solo-<id> ref or fall back to
+        # the merge_sha^2 re-merge path (a linear solo tip has no ^2).
+        # Each passer's solo worktree and branch are cleaned up in a finally
+        # block after the advance attempt.
+        landed_ids: list[str] = []
+        for r in passers:
+            # Guard: passers always have a merge_sha (set by reverify_member_solo).
+            if r.merge_sha is None:  # defensive — should not happen for a passer
+                logger.warning(
+                    'Task %s: train %r member %s passer has no merge_sha — skipping',
+                    self.task_id, train_id, r.member_id,
+                )
+                continue
+            try:
+                expected_main = await self.git_ops.get_main_sha()
+                adv = await self.git_ops.advance_main(
+                    r.merge_sha,
+                    r.solo_wt,
+                    branch=None,
+                    expected_main=expected_main,
+                    reverify_on_rebase=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # advance_main raised (unexpected); leave member parked for
+                # re-dispatch and continue processing the remaining passers.
+                logger.warning(
+                    'Task %s: train %r member %s advance_main raised %r '
+                    '— leaving parked for re-dispatch',
+                    self.task_id, train_id, r.member_id, exc,
+                )
+                adv = 'exception'
+            finally:
+                # Always clean up the solo worktree and branch after the
+                # advance attempt — regardless of outcome, neither is needed
+                # once advance_main has run.
+                if r.solo_wt is not None:
+                    try:
+                        await self.git_ops.cleanup_merge_worktree(r.solo_wt)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: passer teardown: cleanup_merge_worktree '
+                            'failed for member %s', self.task_id, r.member_id,
+                            exc_info=True,
+                        )
+                if r.solo_branch is not None:
+                    try:
+                        await self.git_ops.delete_solo_branch(r.solo_branch)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'Task %s: passer teardown: delete_solo_branch '
+                            'failed for member %s', self.task_id, r.member_id,
+                            exc_info=True,
+                        )
+            if adv == 'advanced':
+                landed_sha: str = (
+                    getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha
+                )
+                await self.scheduler.mark_done(
+                    r.member_id,
+                    kind='merged',
+                    sha=landed_sha,
+                    note=f'train {train_id} attribution: member passed solo',
+                )
+                landed_ids.append(r.member_id)
+                if self.event_store is not None:
+                    self.event_store.emit(
+                        EventType.train_merged,
+                        task_id=r.member_id,
+                        phase='merge',
+                        data={
+                            'train_id': train_id,
+                            'verdict': 'attributed',
+                            'merge_sha': landed_sha,
+                        },
+                    )
+                logger.info(
+                    'Task %s: train %r member %s passed solo — advanced main to %s',
+                    self.task_id, train_id, r.member_id, landed_sha,
+                )
+            else:
+                # advance_main failure or exception: leave member parked for
+                # re-dispatch — do NOT flip to done; log a warning.
+                logger.warning(
+                    'Task %s: train %r member %s advance_main returned %r '
+                    '— leaving parked for re-dispatch',
+                    self.task_id, train_id, r.member_id, adv,
+                )
+
+        # Build shared train_state once before the loop — it is identical for
+        # every failer; only failing_member is overridden per iteration.
+        # Hoisting avoids N redundant scheduler round-trips (get_statuses).
+        esc_train_state_base: object = None
+        if self.escalation_queue:
+            esc_train_state_base = await self._build_train_state()
+
+        # Block each failer: set status blocked and submit an L1.
+        for r in failers:
+            await self.scheduler.set_task_status(r.member_id, 'blocked')
+            if self.escalation_queue:
+                from escalation.models import Escalation
+                # Copy the base train_state and override failing_member to the
+                # actual offender (each failer gets its own attribution pointer).
+                train_state = None
+                if esc_train_state_base is not None:
+                    train_state = dict(esc_train_state_base)  # type: ignore[arg-type]
+                    train_state['failing_member'] = r.member_id  # type: ignore[index]
+                esc = Escalation(
+                    id=self.escalation_queue.make_id(r.member_id),
+                    task_id=r.member_id,
+                    agent_role='orchestrator',
+                    severity='blocking',
+                    category='task_failure',
+                    summary=(
+                        f'Train {train_id!r} attribution: member {r.member_id!r} '
+                        f'failed solo verify — reason: {r.reason[:120]}'
+                    ),
+                    detail=(
+                        f'Train {train_id!r} union verify failed; member '
+                        f'{r.member_id!r} was re-verified in isolation and '
+                        f'failed (reason: {r.reason}). '
+                        f'Passers landed: {passer_ids}. '
+                        f'Offenders blocked: {offender_ids}.'
+                    ),
+                    suggested_action='manual_intervention',
+                    worktree=None,
+                    workflow_state=self.state.value,
+                    level=1,
+                    train_state=train_state,  # type: ignore[arg-type]
+                )
+                self.escalation_queue.submit(esc)
+                logger.warning(
+                    'Task %s: train %r member %s blocked as attribution offender — L1 %s',
+                    self.task_id, train_id, r.member_id, esc.id,
+                )
+
+        # Emit attributed train_derailed telemetry.
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.train_derailed,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'train_id': train_id,
+                    'member_task_ids': member_ids,
+                    'verdict': 'attributed',
+                    'offenders': offender_ids,
+                    'passers': passer_ids,
+                    'derail_reason': (
+                        f'Solo attribution: offenders={offender_ids} '
+                        f'passers={passer_ids}'
+                    ),
+                },
+            )
+
+        # Tip return value: DONE if the tip landed, BLOCKED otherwise.
+        if self.task_id in landed_ids:
+            return WorkflowOutcome.DONE
+        # Tip is blocked or advance failed — surface tip as blocked.
+        # When the tip is itself an attribution offender, the failer loop above
+        # already submitted a dedicated L1 for it (via escalation_queue.submit).
+        # Calling _mark_blocked(escalate_to_human=True) here would create a
+        # second L1 and a second blocked status transition for the same task.
+        # Pass skip_escalation=True to suppress the redundant escalation while
+        # still recording the BLOCKED state and updating internal fields.
+        tip_is_offender = self.task_id in offender_ids
+        return await self._mark_blocked(
+            f'Train {train_id!r} union verify failed — tip {self.task_id!r} '
+            f'{"is an offender" if tip_is_offender else "advance failed"}',
+            escalate_to_human=not tip_is_offender,
+            skip_escalation=tip_is_offender,
+        )
 
     async def _escalate_train_halt(
         self, result, train_id: str,

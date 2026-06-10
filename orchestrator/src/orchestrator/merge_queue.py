@@ -204,6 +204,27 @@ left clean.  The downstream classifier surfaces this to the enqueuer so the
 tip task can be re-rebased in its own worktree before the train is
 re-submitted."""
 
+TRAIN_VERIFY_FAILED_REASON_PREFIX = (
+    'Train union verify failed (re-verifying members as singles)'
+)
+"""Prefix tagged onto ``MergeOutcome.reason`` when the post-merge verify of a
+train (union of all member commits) fails with a structured failure_category
+AND the failure is NOT a pre-existing main-health-red break.
+
+This precise set of conditions identifies an "interaction candidate" — a
+verify-red that *could* be caused by a cross-member interaction rather than a
+single broken member.  Workflow δ intercepts this prefix and falls back to
+re-verifying each member as a solo branch before blocking or escalating.
+
+Outcomes that must NOT be tagged (and are NOT):
+  - main-health-red (``reason`` starts with ``MAIN_HEALTH_RED_REASON_PREFIX``):
+    the break pre-exists on bare main; per-member re-verify would be spurious.
+  - transient-infra / disk-guard (``failure_category == ''``): no structured
+    failure; re-verify would be unreliable.
+  - rebase-conflict (``reason`` starts with ``TRAIN_REBASE_CONFLICT_REASON_PREFIX``):
+    git-level conflict, not a test failure.
+"""
+
 TRAIN_PARTIAL_FLIP_REASON_PREFIX = 'Train partially flipped'
 """Prefix of the ``MergeOutcome.reason`` string emitted when a train lands
 (main advances successfully) but one or more ``mark_member_done`` callbacks
@@ -3094,6 +3115,30 @@ class MergeOutcome:
 
 
 @dataclass
+class SoloVerifyResult:
+    """Result of verifying a single train member's un-stacked delta in isolation.
+
+    Returned by :func:`reverify_member_solo`.  ``passed=True`` means the
+    member's own delta passes the post-merge verify in a fresh solo worktree;
+    ``passed=False`` means it failed (or the solo worktree could not be created
+    / the rebase conflicted — treated as a failer by the attribution logic).
+
+    ``merge_sha`` is the rebased tip SHA of the solo branch (used by
+    ``advance_main`` when the member passes and needs to land); None on failure.
+
+    ``solo_wt`` and ``solo_branch`` carry the isolated worktree path and branch
+    name so ``_attribute_train_failure`` can call ``advance_main`` for passers
+    without re-materialising the worktree (keeps the verify cost at ≤N+1).
+    """
+    member_id: str
+    passed: bool
+    merge_sha: str | None
+    reason: str = ''
+    solo_wt: Path | None = None
+    solo_branch: str | None = None
+
+
+@dataclass
 class SpeculativeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine.
 
@@ -3146,6 +3191,111 @@ class _TrainMergeHost(Protocol):
     def halt_for_wip(self, reason: str) -> None: ...
     def unhalt_wip(self, reason: str | None = None) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
+
+
+async def reverify_member_solo(
+    git_ops: GitOps,
+    member_id: str,
+    solo_wt: Path,
+    solo_branch: str,
+    tip_sha: str,
+    config: OrchestratorConfig,
+    task_files: list[str] | None,
+    module_configs: list[ModuleConfig],
+    event_store: EventStore | None = None,
+) -> SoloVerifyResult:
+    """Run post-merge verification on a single train member's un-stacked solo branch.
+
+    Wraps :func:`_run_post_merge_verify` (which provides disk-guard, ENOSPC
+    prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
+    Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
+    attempts do not count against the tip's existing timeout budgets.
+
+    Returns a :class:`SoloVerifyResult`:
+      - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
+        The solo worktree and branch are **left intact** so that
+        ``_attribute_train_failure`` can call ``advance_main`` against the live
+        worktree without re-materialising it (keeps verify cost ≤N+1).
+        ``solo_wt`` and ``solo_branch`` are populated in the result for handoff.
+      - ``passed=False`` when it returns a :class:`MergeOutcome`.
+        Both the worktree (``cleanup_merge_worktree``) and the bare branch
+        (``git_ops.delete_solo_branch``) are torn down before returning.
+        A failer is never landed, so its solo is no longer needed.
+
+    Args:
+        git_ops:        GitOps instance for the current repo.
+        member_id:      The member's task id (used for logging and the result).
+        solo_wt:        Path to the isolated solo worktree (from
+                        :meth:`~GitOps.materialize_member_solo`).
+        solo_branch:    Name of the temporary solo branch (e.g. ``_solo-b2``).
+        tip_sha:        Rebased tip SHA of the solo branch (the "merge SHA"
+                        for the verify run and for the returned result).
+        config:         OrchestratorConfig carrying verify command / disk limits.
+        task_files:     Task-scoped files list for scoped verify (may be None).
+        module_configs: Module-level configs for multi-module projects.
+        event_store:    Optional EventStore for telemetry (may be None).
+
+    Returns:
+        :class:`SoloVerifyResult` with passed/failed verdict and reason.
+    """
+    req = MergeRequest(
+        task_id=member_id,
+        branch=solo_branch,
+        worktree=solo_wt,
+        pre_rebased=True,
+        task_files=task_files,
+        module_configs=module_configs,
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+    outcome = await _run_post_merge_verify(
+        git_ops, req, solo_wt,
+        timeouts={},
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=3,
+        event_store=event_store,
+        merge_sha=tip_sha,
+    )
+    if outcome is None:
+        # Pass: hand off the live worktree+branch to _attribute_train_failure.
+        return SoloVerifyResult(
+            member_id=member_id,
+            passed=True,
+            merge_sha=tip_sha,
+            reason='',
+            solo_wt=solo_wt,
+            solo_branch=solo_branch,
+        )
+
+    # Fail: tear down the solo worktree and branch — failer is never landed.
+    try:
+        await git_ops.cleanup_merge_worktree(solo_wt)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'reverify_member_solo: cleanup_merge_worktree failed for member %s',
+            member_id, exc_info=True,
+        )
+    try:
+        await git_ops.delete_solo_branch(solo_branch)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'reverify_member_solo: delete_solo_branch failed for member %s',
+            member_id, exc_info=True,
+        )
+    return SoloVerifyResult(
+        member_id=member_id,
+        passed=False,
+        merge_sha=None,
+        reason=outcome.reason,
+        # solo_wt and solo_branch are set to None to reflect that they
+        # have already been torn down above.  A caller that iterated
+        # failer results and trusted these fields would double-clean or
+        # operate on a stale path.
+        solo_wt=None,
+        solo_branch=None,
+    )
 
 
 async def _do_train_merge(
@@ -3401,6 +3551,31 @@ async def _do_train_merge(
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
+        # Tag the reason with TRAIN_VERIFY_FAILED_REASON_PREFIX when this is an
+        # "interaction candidate" — a structured verify-red that could be caused
+        # by a cross-member interaction rather than a single broken member.
+        # Conditions: failure_category is non-empty (structured failure) AND the
+        # reason does NOT already start with MAIN_HEALTH_RED_REASON_PREFIX (which
+        # indicates a pre-existing break on bare main, not an interaction).
+        # Rebase-conflict, disk-guard, transient-infra, and unscoped-pyright
+        # failures all leave failure_category='' and therefore are NOT tagged.
+        _is_interaction_candidate = (
+            verify_outcome.failure_category != ''
+            and not reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX)
+        )
+        if _is_interaction_candidate:
+            tagged_reason = f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: {reason}'
+            logger.info(
+                'Train %s: verify gate interaction-candidate — tagging reason for δ attribution',
+                req.train_id,
+            )
+            verify_outcome = MergeOutcome(
+                verify_outcome.status,
+                reason=tagged_reason,
+                failure_category=verify_outcome.failure_category,
+                failure_cause_hint=verify_outcome.failure_cause_hint,
+            )
+            reason = tagged_reason
         logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
         _emit_train_event(
             event_store, EventType.train_derailed,
