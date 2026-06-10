@@ -295,7 +295,10 @@ def build_merge_verify_spec(
         verify_commands=verify_commands,
         unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
         task_files=task_files,
-        verify_env=dict(config.verify_env) if config.verify_env else {},
+        # κ: read effective_verify_env (the single merge rule) so the spec shipped
+        # to the laptop carries the shared sccache backend even for direct-constructed
+        # (eval/test) configs that never call load_config.
+        verify_env=dict(config.effective_verify_env),
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
     )

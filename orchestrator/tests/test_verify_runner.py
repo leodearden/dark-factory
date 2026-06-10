@@ -685,6 +685,7 @@ class TestBuildMergeVerifySpec:
     def _make_config(self, *, verify_env=None, cold_timeout=None):
         config = MagicMock()
         config.verify_env = verify_env or {}
+        config.effective_verify_env = verify_env or {}
         config.merge_verify_cold_command_timeout_secs = cold_timeout
         config.verify_cold_command_timeout_secs = None
         return config
@@ -742,6 +743,7 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         config = MagicMock()
         config.verify_env = {}
+        config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = 3600.0
         spec = build_merge_verify_spec(config, [], None)
@@ -751,6 +753,7 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         config = MagicMock()
         config.verify_env = {}
+        config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = None
         spec = build_merge_verify_spec(config, [], None)
@@ -771,6 +774,29 @@ class TestBuildMergeVerifySpec:
             task_files,
         )
         assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_effective_verify_env_propagated_to_spec(self, monkeypatch, tmp_path):
+        """spec.verify_env carries the merged sccache backend from effective_verify_env.
+
+        Uses a real OrchestratorConfig (not MagicMock) so that effective_verify_env
+        is computed by the actual property; this exercises the κ wire end-to-end for
+        the remote/laptop path (build_merge_verify_spec reads effective_verify_env).
+        """
+        from orchestrator.config import OrchestratorConfig, SccacheConfig
+        from orchestrator.verify_runner import build_merge_verify_spec
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
+        config = OrchestratorConfig(
+            verify_env={'RUSTC_WRAPPER': 'sccache'},
+            sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://orch:6379'}),
+        )
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.verify_env == {
+            'RUSTC_WRAPPER': 'sccache',
+            'SCCACHE_REDIS': 'redis://orch:6379',
+        }
 
 
 # ---------------------------------------------------------------------------
