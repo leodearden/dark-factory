@@ -3125,11 +3125,17 @@ class SoloVerifyResult:
 
     ``merge_sha`` is the rebased tip SHA of the solo branch (used by
     ``advance_main`` when the member passes and needs to land); None on failure.
+
+    ``solo_wt`` and ``solo_branch`` carry the isolated worktree path and branch
+    name so ``_attribute_train_failure`` can call ``advance_main`` for passers
+    without re-materialising the worktree (keeps the verify cost at ≤N+1).
     """
     member_id: str
     passed: bool
     merge_sha: str | None
     reason: str = ''
+    solo_wt: Path | None = None
+    solo_branch: str | None = None
 
 
 @dataclass
@@ -3193,10 +3199,10 @@ async def reverify_member_solo(
     solo_wt: Path,
     solo_branch: str,
     tip_sha: str,
-    config: 'OrchestratorConfig',
+    config: OrchestratorConfig,
     task_files: list[str] | None,
-    module_configs: list['ModuleConfig'],
-    event_store: 'EventStore | None' = None,
+    module_configs: list[ModuleConfig],
+    event_store: EventStore | None = None,
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
@@ -3257,12 +3263,16 @@ async def reverify_member_solo(
                 passed=True,
                 merge_sha=tip_sha,
                 reason='',
+                solo_wt=solo_wt,
+                solo_branch=solo_branch,
             )
         return SoloVerifyResult(
             member_id=member_id,
             passed=False,
             merge_sha=None,
             reason=outcome.reason,
+            solo_wt=solo_wt,
+            solo_branch=solo_branch,
         )
     finally:
         # Defensive cleanup: _run_post_merge_verify already cleans up on

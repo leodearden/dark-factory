@@ -21,7 +21,6 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 
-
 # ---------------------------------------------------------------------------
 # Helpers: repo setup
 # ---------------------------------------------------------------------------
