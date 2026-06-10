@@ -3333,6 +3333,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 
+        # Build the callback factory here (where self.scheduler is live) and
+        # inject it opaquely into the worker so task γ can construct
+        # GroupMergeRequests without the worker importing the scheduler
+        # (pure-git-engine layering preserved; the worker never calls the factory).
+        train_callback_factory = build_train_callback_factory(self.scheduler)
+
         self._merge_worker = SpeculativeMergeWorker(
             self.git_ops,
             self._merge_queue,
@@ -3340,6 +3346,7 @@ Output JSON matching the schema. Every task must appear in the output.
             event_store=self.event_store,
             on_merge_landed=self._service_restart_coordinator.note_merge,
             escalation_queue=self._escalation_queue,
+            train_callback_factory=train_callback_factory,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',

@@ -278,17 +278,18 @@ class TestHarnessWiring:
             async def stop(self) -> None:
                 pass
 
-        # Patch the service-restart coordinator builder to avoid Harness deps.
+        # _start_merge_worker imports everything locally from orchestrator.merge_queue,
+        # so we must patch on the merge_queue module (not harness).
         with (
             patch(
                 'orchestrator.merge_queue.SpeculativeMergeWorker',
                 CapturingWorker,
             ),
             patch(
-                'orchestrator.harness.enforce_merge_liveness_margin',
+                'orchestrator.merge_queue.enforce_merge_liveness_margin',
             ),
             patch(
-                'orchestrator.harness.enforce_persistent_worktree_serial_lane',
+                'orchestrator.merge_queue.enforce_persistent_worktree_serial_lane',
             ),
             patch.object(
                 harness,
