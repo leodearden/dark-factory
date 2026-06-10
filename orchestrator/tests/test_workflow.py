@@ -512,6 +512,49 @@ class TestRunMergeDeferredGuard:
 
 
 # ---------------------------------------------------------------------------
+# TestMakeWorkflowTrainFormerImmunity — _make_workflow sets real train-former fields
+# ---------------------------------------------------------------------------
+
+
+class TestMakeWorkflowTrainFormerImmunity:
+    """Regression: _make_workflow must set real train-former config values.
+
+    The shared helper builds a MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.  If merge_train_former_enabled and merge_train_max_members are left as
+    auto-child MagicMocks, any test that calls run() will eventually hit
+    _maybe_form_train() (workflow.py:922/928) where:
+      - Guard 1: `not <truthy MagicMock>` is False → no short-circuit
+      - Guard 3: `MagicMock < 2` → TypeError (workflow.py:928 landmine)
+
+    Both fields must carry real Python values matching the OrchestratorConfig
+    defaults (merge_train_former_enabled=False, merge_train_max_members=3) so
+    Guard 1 short-circuits cleanly for every run()-path test in this file.
+    """
+
+    def test_make_workflow_sets_real_train_former_config(self, tmp_path: Path) -> None:
+        """_make_workflow config must carry real train-former values, not MagicMocks.
+
+        Guard-3 landmine: workflow.py:928 evaluates `self.config.merge_train_max_members < 2`
+        — if the field is an auto-child MagicMock the comparison raises TypeError.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+
+        assert wf.config.merge_train_former_enabled is False, (
+            'merge_train_former_enabled must be exactly False (not a MagicMock) so '
+            '_maybe_form_train Guard 1 short-circuits before the MagicMock < int landmine'
+        )
+        assert isinstance(wf.config.merge_train_max_members, int), (
+            f'merge_train_max_members must be an int, got '
+            f'{type(wf.config.merge_train_max_members)!r} — '
+            'workflow.py:928 `MagicMock < 2` raises TypeError'
+        )
+        assert wf.config.merge_train_max_members >= 2, (
+            f'merge_train_max_members must be >= 2 (got {wf.config.merge_train_max_members}); '
+            'mirrors the real OrchestratorConfig default (3)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestWorkflowMergeInflightRegistry — merge_inflight_registry wiring in __init__
 # ---------------------------------------------------------------------------
 
