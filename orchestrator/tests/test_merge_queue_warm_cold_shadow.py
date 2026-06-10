@@ -19,6 +19,7 @@ from orchestrator.merge_queue import (  # noqa: E402
     _load_shadow_compare_state,
     _save_shadow_compare_state,
     _shadow_compare_due,
+    parse_per_test_results,
 )
 
 
@@ -225,3 +226,84 @@ class TestShadowCompareStatePersistence:
         state = _load_shadow_compare_state(path)
         assert state.merges_since_last_shadow == 0
         assert state.last_shadow_run_at == pytest.approx(9999.0)
+
+
+# ---------------------------------------------------------------------------
+# Step-5: parse_per_test_results
+# ---------------------------------------------------------------------------
+
+# Realistic cargo-nextest human output sample
+_NEXTEST_SAMPLE = """\
+    Compiling reify-core v0.1.0
+       Finished test [unoptimized + debuginfo] target(s) in 3.52s
+        Starting 3 tests across 2 binaries
+
+        PASS [   0.045s] reify-core some::mod::test_a
+        FAIL [   1.200s] reify-eval other::test_b
+        PASS [   0.003s] reify-eval some::other::test_c
+
+------------
+Summary [   1.25s] 3 tests run: 2 passed, 1 failed, 0 skipped
+"""
+
+_NEXTEST_MULTI_CRATE = """\
+        PASS [   0.001s] crate-alpha alpha::test_one
+        FAIL [   0.500s] crate-beta  beta::test_two
+        FAIL [   2.000s] crate-alpha alpha::test_three
+        PASS [   0.050s] crate-beta  beta::test_four
+"""
+
+
+class TestParsePerTestResults:
+    """Unit tests for parse_per_test_results(test_output) -> dict[str, bool]."""
+
+    def test_parses_pass_and_fail(self) -> None:
+        result = parse_per_test_results(_NEXTEST_SAMPLE)
+        assert result["reify-core some::mod::test_a"] is True
+        assert result["reify-eval other::test_b"] is False
+        assert result["reify-eval some::other::test_c"] is True
+
+    def test_test_id_is_crate_space_path(self) -> None:
+        result = parse_per_test_results(_NEXTEST_SAMPLE)
+        for key in result:
+            parts = key.split(" ", 1)
+            assert len(parts) == 2, f"Expected 'crate test_path', got {key!r}"
+
+    def test_non_test_lines_ignored(self) -> None:
+        result = parse_per_test_results(_NEXTEST_SAMPLE)
+        # Only test lines should appear
+        assert len(result) == 3
+
+    def test_empty_input_yields_empty_dict(self) -> None:
+        assert parse_per_test_results("") == {}
+
+    def test_blank_whitespace_input_yields_empty_dict(self) -> None:
+        assert parse_per_test_results("   \n\n   ") == {}
+
+    def test_only_non_test_lines_yields_empty_dict(self) -> None:
+        output = "Building...\nFinished\nSummary [3s] 0 tests\n"
+        assert parse_per_test_results(output) == {}
+
+    def test_multi_crate_output(self) -> None:
+        result = parse_per_test_results(_NEXTEST_MULTI_CRATE)
+        assert result["crate-alpha alpha::test_one"] is True
+        assert result["crate-beta  beta::test_two"] is False
+        assert result["crate-alpha alpha::test_three"] is False
+        assert result["crate-beta  beta::test_four"] is True
+
+    def test_tolerates_varying_leading_whitespace(self) -> None:
+        # Same test line with more leading spaces
+        output = "         PASS [   0.010s] my-crate my::test\n"
+        result = parse_per_test_results(output)
+        assert "my-crate my::test" in result
+        assert result["my-crate my::test"] is True
+
+    def test_fail_is_false(self) -> None:
+        output = "        FAIL [  99.999s] my-crate long::test::path\n"
+        result = parse_per_test_results(output)
+        assert result.get("my-crate long::test::path") is False
+
+    def test_only_fail_lines(self) -> None:
+        output = "        FAIL [0.1s] c1 t1\n        FAIL [0.2s] c2 t2\n"
+        result = parse_per_test_results(output)
+        assert result == {"c1 t1": False, "c2 t2": False}
