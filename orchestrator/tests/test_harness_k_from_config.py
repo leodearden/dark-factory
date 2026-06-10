@@ -114,11 +114,15 @@ class TestHarnessKFromConfig:
             'step-12 adds num_hosts=_k to enforce_persistent_worktree_serial_lane'
         )
 
-        # (c) enforce_merge_liveness_margin called with merge_ahead_bound=3
+        # (c) enforce_merge_liveness_margin called with merge_ahead_bound=3, num_hosts=3
         mock_liveness.assert_called_once()
         liveness_kwargs = mock_liveness.call_args[1]
         assert liveness_kwargs.get('merge_ahead_bound') == 3, (
             f'Expected merge_ahead_bound=3, got {liveness_kwargs!r}'
+        )
+        assert liveness_kwargs.get('num_hosts') == 3, (
+            f'Expected num_hosts=3, got {liveness_kwargs!r}; '
+            'step-1726 adds num_hosts=_k to enforce_merge_liveness_margin'
         )
 
     async def test_k1_with_zero_runners_byte_identical(self, mock_orch_config) -> None:
@@ -148,6 +152,10 @@ class TestHarnessKFromConfig:
             'step-12 adds explicit num_hosts=_k (=1 when no runners)'
         )
 
-        # enforce_merge_liveness_margin: merge_ahead_bound=1
+        # enforce_merge_liveness_margin: merge_ahead_bound=1, num_hosts=1
         liveness_kwargs = mock_liveness.call_args[1]
         assert liveness_kwargs.get('merge_ahead_bound') == 1
+        assert liveness_kwargs.get('num_hosts') == 1, (
+            f'Expected num_hosts=1, got {liveness_kwargs!r}; '
+            'step-1726 adds num_hosts=_k (=1 when no runners) to enforce_merge_liveness_margin'
+        )

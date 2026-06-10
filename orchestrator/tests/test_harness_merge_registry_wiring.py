@@ -192,7 +192,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
 
             await h._start_merge_worker()
 
-        mock_guard.assert_called_once_with(h.config, merge_ahead_bound=1)
+        mock_guard.assert_called_once_with(h.config, merge_ahead_bound=1, num_hosts=1)
 
 
 @pytest.mark.asyncio
