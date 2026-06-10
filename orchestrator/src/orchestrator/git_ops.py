@@ -1464,6 +1464,17 @@ class GitOps:
         solo_wt = self.worktree_base / solo_name
         solo_wt.parent.mkdir(parents=True, exist_ok=True)
 
+        # Defensively pre-clean any stale solo artifacts for this member from a
+        # prior crashed or un-torn-down attribution run.  A leaked _solo-<id>
+        # branch/worktree from the previous attempt would make `git worktree add
+        # -b _solo-<id>` fail (rc!=0) → materialize returns None → member is
+        # mis-classified as 'unstackable'.  All three commands are best-effort
+        # (we ignore their rc) — if there is nothing stale they are no-ops.
+        await _run(['git', 'worktree', 'remove', str(solo_wt), '--force'],
+                   cwd=self.project_root)
+        await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+        await _run(['git', 'branch', '-D', solo_name], cwd=self.project_root)
+
         # Create a temporary branch _solo-<member_id> starting at the member's
         # current tip and check it out in an isolated worktree.  Using -b with
         # the member branch as start-point avoids modifying the original branch.
@@ -1522,6 +1533,45 @@ class GitOps:
             member_id, solo_name, tip_sha, solo_wt,
         )
         return WorktreeInfo(path=solo_wt, base_commit=tip_sha)
+
+    async def delete_solo_branch(self, solo_branch: str) -> None:
+        """Delete a bare ``_solo-<id>`` branch and prune any stale worktree entry.
+
+        Companion to :meth:`materialize_member_solo`.  Called by
+        ``_attribute_train_failure`` (and its tests) to tear down the temporary
+        solo branch after a passer has been landed (or when the all-pass
+        interaction case land-nothing branch is taken).
+
+        Unlike :meth:`cleanup_worktree`, this method operates on the BARE
+        branch name (e.g. ``_solo-b2``) — **NOT** prefixed with
+        ``config.branch_prefix`` — because the solo branch is created without
+        the prefix by :meth:`materialize_member_solo`.
+
+        Best-effort / never-raises: non-zero rc from either git command is
+        logged as a warning and ignored, mirroring the
+        :meth:`cleanup_merge_worktree` never-raise contract.
+
+        Args:
+            solo_branch: Bare solo branch name (e.g. ``'_solo-b2'``).
+        """
+        # Prune first so that a removed (but not yet pruned) worktree entry
+        # does not keep git from deleting the branch.
+        prune_rc, _, prune_err = await _run(
+            ['git', 'worktree', 'prune'], cwd=self.project_root,
+        )
+        if prune_rc != 0:
+            logger.warning('delete_solo_branch: worktree prune failed: %s', prune_err)
+
+        del_rc, _, del_err = await _run(
+            ['git', 'branch', '-D', solo_branch], cwd=self.project_root,
+        )
+        if del_rc != 0:
+            logger.warning(
+                'delete_solo_branch: failed to delete branch %s: %s',
+                solo_branch, del_err,
+            )
+        else:
+            logger.debug('delete_solo_branch: deleted %s', solo_branch)
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """Return True if *ancestor* is an ancestor of *descendant*."""
