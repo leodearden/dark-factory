@@ -1497,7 +1497,6 @@ class TestOneStrikeRecording:
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
-            TrainCallbacks,
         )
 
         db_path = tmp_path / 'es_osr.db'
