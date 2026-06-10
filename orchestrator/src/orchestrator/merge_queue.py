@@ -3129,6 +3129,25 @@ class TrainCallbacks:
 # Called with a train_id str; returns a TrainCallbacks for that train.
 TrainCallbackFactory = Callable[[str], TrainCallbacks]
 
+# δ/1720 merge-ready confidence gate constants.
+# Prefix used when constructing coalesce-formed train IDs in
+# _maybe_coalesce_waiting_singles.  Used as the single source of truth
+# so the merger-loop recording hook can identify coalesce-formed trains
+# without a separate flag field on GroupMergeRequest.
+_COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
+
+# Terminal merge outcomes in this set are treated as "risky" by the default
+# predicate — a waiting single whose branch's most-recent merge_finalized
+# event has one of these states is excluded from train formation.
+_COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
+
+# Type alias for the injectable merge-ready predicate (δ/1720 confidence gate).
+# Called with a MergeRequest; returns an exclusion REASON string (truthy →
+# exclude from train) or None (eligible).  Returning the reason (not a bool)
+# lets the same value flow uniformly into the log line and the event
+# data['exclusions'] entry, for both built-in and injected predicates.
+MergeReadyPredicate = Callable[['MergeRequest'], 'str | None']
+
 
 @dataclass
 class GroupMergeRequest(MergeRequest):
@@ -3167,7 +3186,7 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded', 'error']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
@@ -4500,6 +4519,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         speculation_depth: int = _MERGE_AHEAD_BOUND,
         escalation_queue: Any = None,
         train_callback_factory: TrainCallbackFactory | None = None,
+        merge_ready_predicate: MergeReadyPredicate | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4521,6 +4541,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # worker importing the scheduler (pure-git-engine layering preserved).
         # The worker itself does NOT call this factory in this task; γ uses it.
         self._train_callback_factory: TrainCallbackFactory | None = train_callback_factory
+        # δ/1720 merge-ready confidence gate: injectable predicate for excluding
+        # known-risky candidates from coalescing.  None → use the built-in
+        # _default_coalesce_exclusion_reason (event-store history + one-strike).
+        # The injectable seam keeps the worker a pure git engine while letting
+        # the harness thread richer closures (flakiness counters, dry-run
+        # proposals) later without re-opening the worker layering.
+        self._merge_ready_predicate: MergeReadyPredicate | None = merge_ready_predicate
         # Tracks in-flight shadow compare asyncio.Tasks (single-in-flight guard).
         self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Persisted cadence state path — under project_root/data/orchestrator/
@@ -4664,6 +4691,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
+        # train derailed (MergeOutcome('blocked') on a train with train_id
+        # startswith _COALESCE_TRAIN_ID_PREFIX).  Keyed by task_id so the marker
+        # survives re-dispatch as a new MergeRequest with the same task_id.
+        # Process-lifetime (cleared only on worker restart); injectable predicate
+        # is the seam for richer decay/flakiness policies later.
+        self._coalesce_derailed_task_ids: set[str] = set()
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
         # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
@@ -5236,6 +5270,48 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Retroactive coalescing pass (γ/1719)
     # ------------------------------------------------------------------
 
+    def _mark_coalesce_derailed(self, member_task_ids: list[str]) -> None:
+        """Record the members of a derailed coalesce-formed train as one-strike.
+
+        Called by _merger_loop after _do_train_merge returns a blocked outcome
+        for a train whose train_id startswith _COALESCE_TRAIN_ID_PREFIX.  Adds
+        each task_id to self._coalesce_derailed_task_ids so the next coalescing
+        pass (default predicate) excludes them from train formation.
+        """
+        if not member_task_ids:
+            return
+        self._coalesce_derailed_task_ids.update(member_task_ids)
+        logger.info(
+            'Coalesce one-strike: marked %d task(s) after coalesce-train derail: %s',
+            len(member_task_ids), member_task_ids,
+        )
+
+    def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
+        """Built-in merge-ready predicate (δ/1720 confidence gate).
+
+        Returns an exclusion REASON string (truthy → exclude from coalescing) or
+        None (eligible).  Signals implemented here use only worker-reachable
+        substrate (no scheduler import):
+
+          1. One-strike registry (cheapest, in-memory first):
+             If req.task_id is in self._coalesce_derailed_task_ids (a prior
+             coalesce-formed train that included this task derailed), exclude.
+             Filled in step-6; always empty until then.
+
+          2. Event-store blocked history:
+             If the branch's most-recent terminal merge outcome was 'blocked' or
+             'error', exclude.  Filled in step-4.
+        """
+        # Signal 1: one-strike registry (cheapest, in-memory — check first).
+        if req.task_id in self._coalesce_derailed_task_ids:
+            return 'coalesce_derailed_one_strike'
+        # Signal 2: event-store blocked history.
+        if self._event_store is not None:
+            rec = self._event_store.latest_merge_finalized(branch=req.branch)
+            if rec is not None and rec.get('state') in _COALESCE_RISKY_TERMINAL_STATES:
+                return f'recent_terminal_{rec["state"]}'
+        return None
+
     async def _maybe_coalesce_waiting_singles(self) -> bool:
         """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
 
@@ -5307,6 +5383,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if sig == self._last_coalesce_signature:
             return False
         self._last_coalesce_signature = sig
+
+        # ── δ/1720: merge-ready exclusion filter ──────────────────────────────
+        # Split structural candidates into eligible + exclusions.  The predicate
+        # returns a REASON string (truthy → exclude) or None (eligible).
+        # Run AFTER recording the debounce signature (keyed on the structural
+        # waiting set) so risk signals — which are monotonic within a process —
+        # only re-evaluate when the structural set changes, avoiding per-tick
+        # event-store reads.
+        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        eligible: list[MergeRequest] = []
+        exclusions: list[dict[str, str]] = []
+        for _c in candidates:
+            try:
+                _reason = predicate(_c)
+            except Exception:  # noqa: BLE001
+                # An injected predicate raised — degrade gracefully: log the
+                # error and treat the candidate as eligible so a buggy closure
+                # does not kill the merger loop.  The default predicate is
+                # fire-safe (latest_merge_finalized swallows its own errors).
+                logger.exception(
+                    'Coalesce predicate raised for request_id=%s task_id=%s '
+                    'branch=%s; treating as eligible (safe-degrade)',
+                    _c.request_id, _c.task_id, _c.branch,
+                )
+                _reason = None
+            if _reason:
+                exclusions.append({'request_id': _c.request_id, 'reason': _reason})
+                logger.info(
+                    'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
+                    _c.request_id, _c.task_id, _c.branch, _reason,
+                )
+            else:
+                eligible.append(_c)
+        candidates = eligible
+        if len(candidates) < 2:
+            # The exclusion gate reduced eligible candidates below the 2-member
+            # minimum needed to form a train.  Log so the decision is auditable
+            # even though no event is emitted (a train_coalesced event only fires
+            # when a train actually forms).  The excluded tasks will merge solo.
+            if exclusions:
+                logger.info(
+                    'Coalesce near-train suppressed: exclusion gate left only %d '
+                    'eligible candidate(s) (need ≥2); tasks will merge solo. '
+                    'exclusions=%r',
+                    len(candidates),
+                    exclusions,
+                )
+            return False
 
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
@@ -5382,7 +5506,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         _seen_mc.add(mc.prefix)
                         union_module_configs.append(mc)
 
-        train_id = f'coalesce-{tip_id}-{uuid.uuid4().hex[:8]}'
+        train_id = f'{_COALESCE_TRAIN_ID_PREFIX}{tip_id}-{uuid.uuid4().hex[:8]}'
         callbacks = self._train_callback_factory(train_id)  # type: ignore[misc]
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
@@ -5437,6 +5561,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'tip_task_id': tip_id,
                 'ejected': ejected,
                 'size': len(survivors),
+                'exclusions': exclusions,
             },
         )
 
@@ -5554,6 +5679,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 req.train_id, spec_base[:12],
                             )
                         outcome = await _do_train_merge(self, req)
+                        # δ/1720: if a coalesce-formed train derailed with a
+                        # risky terminal outcome, mark all its members one-strike
+                        # so they are excluded from the next coalescing pass and
+                        # left to merge solo.  We use _COALESCE_RISKY_TERMINAL_STATES
+                        # (frozenset{'blocked','error'}) to align the recording
+                        # trigger with the exclusion predicate — both 'blocked'
+                        # (verify failure) and 'error' (unexpected git/infra error)
+                        # are deterministic enough to warrant solo-merge.
+                        # 'conflict' and 'wip_halted' are intentionally excluded:
+                        # a conflict may resolve after the partner task lands, and
+                        # wip_halted is policy-driven rather than a task failure.
+                        if (
+                            outcome.status in _COALESCE_RISKY_TERMINAL_STATES
+                            and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
+                        ):
+                            self._mark_coalesce_derailed(req.member_task_ids)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
