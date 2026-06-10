@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -86,7 +87,10 @@ def _make_merge_request(
     worktree: Path,
     config: OrchestratorConfig,
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    try:
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,

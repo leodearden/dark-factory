@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_queue import (
@@ -76,7 +77,10 @@ def _make_group_req(
     members = member_task_ids or ['b1', 'b2', 'tip99']
     status_check = AsyncMock(return_value={m: 'merge-deferred' for m in members})
     mark_member_done = AsyncMock()
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    try:
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        future = make_placeholder_future()
 
     config = MagicMock()
     config.merge_verify_workspace = False

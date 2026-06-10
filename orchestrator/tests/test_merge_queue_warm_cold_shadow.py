@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1393,7 +1394,10 @@ async def _make_task_branch(
 
 def _make_smw_req(task_id: str, branch: str, worktree: Path, config: OrchestratorConfig) -> MergeRequest:
     """Build a MergeRequest for an integration test."""
-    fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    try:
+        fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        fut = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
