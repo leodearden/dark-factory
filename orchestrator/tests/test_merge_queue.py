@@ -18127,3 +18127,109 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             await worker.stop()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+
+    async def test_cleanup_wrapper_deregisters_before_disk_removal(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_cleanup_owned_merge_worktree: deregisters then removes from disk.
+
+        Part (a): Unit — register a real worktree, call the wrapper, assert
+        path gone from _owned_merge_worktrees AND removed from disk.
+
+        Part (b): Robustness — monkeypatch git_ops.cleanup_merge_worktree to
+        raise; call wrapper via contextlib.suppress; path must still be
+        deregistered (a failed remove cannot immortalise a ledger entry).
+
+        GREEN for (a) + (b): wrapper implemented in step-2.
+        RED lives in test_done_landing_clears_ledger (part c) below.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # --- Part (a): unit --- #
+        wt_a = await _make_branch_with_file(git_ops, 'cleanup-a', 'a.py', 'a = 1\n')
+        merge_result_a = await git_ops.merge_to_main(wt_a, 'cleanup-a')
+        assert merge_result_a.success
+        merge_wt_a = merge_result_a.merge_worktree
+        assert merge_wt_a is not None and merge_wt_a.exists()
+
+        worker._owned_merge_worktrees.add(merge_wt_a)
+        await worker._cleanup_owned_merge_worktree(merge_wt_a)
+
+        assert merge_wt_a not in worker._owned_merge_worktrees, (
+            'Wrapper must deregister the worktree from the liveness ledger'
+        )
+        assert not merge_wt_a.exists(), (
+            'Wrapper must remove the worktree directory from disk'
+        )
+
+        # --- Part (b): robustness — cleanup raises → still deregistered --- #
+        wt_b = await _make_branch_with_file(git_ops, 'cleanup-b', 'b.py', 'b = 2\n')
+        merge_result_b = await git_ops.merge_to_main(wt_b, 'cleanup-b')
+        assert merge_result_b.success
+        merge_wt_b = merge_result_b.merge_worktree
+        assert merge_wt_b is not None
+
+        worker._owned_merge_worktrees.add(merge_wt_b)
+
+        original_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _raising_cleanup(wt: Path) -> None:
+            raise OSError('test-induced cleanup failure')
+
+        git_ops.cleanup_merge_worktree = _raising_cleanup  # type: ignore[method-assign]
+        try:
+            with contextlib.suppress(OSError):
+                await worker._cleanup_owned_merge_worktree(merge_wt_b)
+        finally:
+            git_ops.cleanup_merge_worktree = original_cleanup  # type: ignore[method-assign]
+
+        assert merge_wt_b not in worker._owned_merge_worktrees, (
+            'Failed disk removal must NOT prevent deregistration from the ledger'
+        )
+        # Actual cleanup of the real dir (cleanup was mocked)
+        await git_ops.cleanup_merge_worktree(merge_wt_b)
+
+    async def test_done_landing_clears_ledger(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Done landing removes the ephemeral worktree from the liveness ledger.
+
+        Part (c) end-to-end: drive a merge to 'done' status and assert the
+        registered ephemeral worktree path is NOT in _owned_merge_worktrees
+        after completion.
+
+        RED because _verify_and_advance's cleanup_merge_worktree call after
+        successful advance_main uses a direct git_ops call, not the wrapper,
+        so the ledger entry survives the 'done' landing.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'done-clear', 'done.py', 'd = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_verify_pass(),
+            ):
+                req = _make_request('done-clear', 'done-clear', wt, config)
+                await queue.put(req)
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+            assert outcome.status == 'done', (
+                f'Expected done landing; got {outcome}'
+            )
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        # After a successful 'done' landing the ephemeral worktree was cleaned
+        # from disk.  The liveness ledger must also be cleared — a ghost entry
+        # would accumulate until the next ENOENT self-heal tick.
+        assert len(worker._owned_merge_worktrees) == 0, (
+            f'_owned_merge_worktrees must be empty after done landing; '
+            f'residual: {worker._owned_merge_worktrees}'
+        )
