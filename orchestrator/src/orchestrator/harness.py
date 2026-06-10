@@ -42,7 +42,7 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker
+    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker, TrainCallbackFactory
 
 try:
     from escalation.queue import EscalationQueue
@@ -298,7 +298,7 @@ class HarnessReport:
         return '\n'.join(lines)
 
 
-def build_train_callback_factory(scheduler: Any) -> 'TrainCallbackFactory':
+def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
     """Build a per-train callback factory that captures the live scheduler.
 
     Returns a factory function ``factory(train_id) -> TrainCallbacks`` whose
@@ -310,7 +310,7 @@ def build_train_callback_factory(scheduler: Any) -> 'TrainCallbackFactory':
     The factory is module-level (not a Harness method) so unit tests can drive
     it with a FakeScheduler without constructing a full Harness.
     """
-    from orchestrator.merge_queue import TrainCallbacks, TrainCallbackFactory  # noqa: F401
+    from orchestrator.merge_queue import TrainCallbacks
 
     def factory(train_id: str) -> TrainCallbacks:
         async def status_check(ids: list[str]) -> dict[str, str]:

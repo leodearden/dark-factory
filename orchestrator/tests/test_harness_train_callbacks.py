@@ -22,9 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _workflow_helpers import FakeScheduler
-
 
 # ---------------------------------------------------------------------------
 # Step 1 / Step 2 — worker-side surface
@@ -36,7 +34,7 @@ class TestWorkerSideSurface:
 
     def test_import_train_callbacks_and_factory(self) -> None:
         """Importing TrainCallbacks and TrainCallbackFactory from merge_queue must not raise."""
-        from orchestrator.merge_queue import TrainCallbacks, TrainCallbackFactory  # noqa: F401
+        from orchestrator.merge_queue import TrainCallbackFactory, TrainCallbacks  # noqa: F401
 
     def test_train_callbacks_holds_two_fields(self) -> None:
         """TrainCallbacks is a dataclass with status_check and mark_member_done attributes."""
@@ -63,7 +61,7 @@ class TestWorkerSideSurface:
         worker = SpeculativeMergeWorker(
             MagicMock(),  # git_ops
             asyncio.Queue(),
-            train_callback_factory=sentinel,
+            train_callback_factory=sentinel,  # type: ignore[arg-type]
         )
         assert worker._train_callback_factory is sentinel
 
@@ -249,7 +247,7 @@ class TestHarnessWiring:
         """
         from orchestrator.config import OrchestratorConfig
         from orchestrator.event_store import EventStore
-        from orchestrator.harness import Harness, build_train_callback_factory
+        from orchestrator.harness import Harness
         from orchestrator.merge_queue import TrainCallbacks
 
         config = OrchestratorConfig(project_root=tmp_path)
