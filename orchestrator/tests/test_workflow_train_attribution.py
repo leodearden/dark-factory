@@ -812,3 +812,213 @@ class TestEdgeMappings:
             f'Expected cleanup for passer 103 solo_wt={passer_103.solo_wt}, '
             f'got: {cleanup_paths!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-19: Passer land path — branch=None, fresh-main per passer, teardown,
+#          and all-pass teardown.
+# ---------------------------------------------------------------------------
+
+
+def _solo_pass_full(member_id: str) -> SoloVerifyResult:
+    """SoloVerifyResult passer with solo_wt + solo_branch populated via dataclass fields."""
+    return SoloVerifyResult(
+        member_id=member_id,
+        passed=True,
+        merge_sha=f'sha-{member_id}-solo',
+        reason='',
+        solo_wt=Path(f'/tmp/solo-full-{member_id}'),
+        solo_branch=f'_solo-{member_id}',
+    )
+
+
+@pytest.mark.asyncio
+class TestPasserLandPath:
+    """Correct passer-land contract: branch=None, per-passer fresh main, teardown.
+
+    Step-19 (RED).  These tests pin the four issues identified in the plan:
+      Issue 1 — per-passer cleanup: cleanup_merge_worktree + delete_solo_branch.
+      Issue 3 — per-passer fresh main: get_main_sha re-read inside the loop.
+      Issue 4 — branch=None passed to advance_main (not _solo-<id>).
+    And the all-pass interaction teardown.
+    """
+
+    def _fixture_with_delete_solo(self) -> _Fixture:
+        """3-member train fixture with delete_solo_branch wired as AsyncMock."""
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-land', 'order': 2,
+                                'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+        f.wf.git_ops = f.git_ops
+        f.git_ops.get_main_sha = AsyncMock(return_value='sha-main-init')
+        f.git_ops.delete_solo_branch = AsyncMock()
+        return f
+
+    # ── ISSUE 4: advance_main must be called with branch=None ────────────
+
+    async def test_advance_main_called_with_branch_none(self) -> None:
+        """advance_main must receive branch=None (not '_solo-<id>') for the linear solo tip.
+
+        Passing branch='_solo-<id>' makes advance_main try to build
+        task/_solo-<id> (non-existent) and fall back to the merge_sha^2
+        re-merge path, which fails for a linear solo commit (no ^2).
+        """
+        f = self._fixture_with_delete_solo()
+        members = _train_members(train_id='T-branch-none', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_full('102'),
+            _solo_pass_full('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-branch-none', members)
+
+        # Every advance_main call must have branch=None
+        for call in f.git_ops.advance_main.await_args_list:
+            branch_kwarg = call.kwargs.get('branch')
+            assert branch_kwarg is None, (
+                f'advance_main must be called with branch=None, '
+                f'got branch={branch_kwarg!r} in call {call!r}'
+            )
+
+    # ── ISSUE 3: per-passer fresh get_main_sha ───────────────────────────
+
+    async def test_per_passer_fresh_main_both_passers_land(self) -> None:
+        """Both passers land when get_main_sha is re-read inside the loop.
+
+        Smart CAS fake: returns 'advanced' when expected_main matches current
+        main, then updates main to a new sha.  Old code (single upfront
+        probe_main) causes the 2nd passer to see a stale expected_main →
+        'cas_failed' → only one passer lands.  New per-passer re-read fixes it.
+        """
+        f = self._fixture_with_delete_solo()
+        members = _train_members(train_id='T-fresh-main', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_full('102'),
+            _solo_pass_full('103'),
+        ])
+
+        # Mutable container — advanced by each successful CAS.
+        _main = ['sha-main-init']
+
+        async def smart_advance(merge_sha, solo_wt, *, branch=None,
+                                expected_main, reverify_on_rebase=False, **kw):
+            if expected_main == _main[0]:
+                _main[0] = f'{merge_sha}-advanced'
+                return 'advanced'
+            return 'cas_failed'
+
+        async def fresh_main():
+            return _main[0]
+
+        f.git_ops.advance_main = AsyncMock(side_effect=smart_advance)
+        f.git_ops.get_main_sha = AsyncMock(side_effect=fresh_main)
+
+        f.wf.event_store = MagicMock()
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-fresh-main', members)
+
+        # BOTH passers must be marked done
+        called_ids = {c.args[0] for c in f.scheduler.mark_done.await_args_list}
+        assert '102' in called_ids, (
+            f'Expected mark_done for 102 (per-passer fresh main), '
+            f'got: {f.scheduler.mark_done.await_args_list}'
+        )
+        assert '103' in called_ids, (
+            f'Expected mark_done for 103 (per-passer fresh main), '
+            f'got: {f.scheduler.mark_done.await_args_list}'
+        )
+
+    async def test_get_main_sha_called_per_passer(self) -> None:
+        """get_main_sha must be awaited at least once per passer (not just once up-front)."""
+        f = self._fixture_with_delete_solo()
+        members = _train_members(train_id='T-main-calls', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_full('102'),
+            _solo_pass_full('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-main-calls', members)
+
+        # 2 passers → get_main_sha must be awaited at least 2 times
+        assert f.git_ops.get_main_sha.await_count >= 2, (
+            f'Expected get_main_sha awaited ≥2 times (one per passer), '
+            f'got: {f.git_ops.get_main_sha.await_count}'
+        )
+
+    # ── ISSUE 1: per-passer teardown — cleanup_merge_worktree + delete_solo_branch
+
+    async def test_passer_teardown_includes_delete_solo_branch(self) -> None:
+        """After advance_main, each passer's solo_branch is deleted via delete_solo_branch.
+
+        cleanup_merge_worktree was already called (step-13 test).  This test
+        pins the missing delete_solo_branch call (Issue 1 of the plan).
+        """
+        f = self._fixture_with_delete_solo()
+        members = _train_members(train_id='T-teardown', tip_id='103')
+        passer_102 = _solo_pass_full('102')
+        passer_103 = _solo_pass_full('103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            passer_102,
+            passer_103,
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-teardown', members)
+
+        delete_calls = {c.args[0] for c in f.git_ops.delete_solo_branch.await_args_list}
+        assert passer_102.solo_branch in delete_calls, (
+            f'Expected delete_solo_branch for passer 102 branch={passer_102.solo_branch}, '
+            f'got: {delete_calls!r}'
+        )
+        assert passer_103.solo_branch in delete_calls, (
+            f'Expected delete_solo_branch for passer 103 branch={passer_103.solo_branch}, '
+            f'got: {delete_calls!r}'
+        )
+
+    # ── ALL-PASS teardown ─────────────────────────────────────────────────
+
+    async def test_all_pass_solo_teardown(self) -> None:
+        """All-pass (interaction): cleanup_merge_worktree + delete_solo_branch for each member.
+
+        When all members pass solo but landing nothing (cross-member interaction),
+        the solo worktrees+branches must still be torn down before returning.
+        Currently the all-pass branch returns without any solo cleanup → RED.
+        """
+        f = self._fixture_with_delete_solo()
+        members = _train_members(train_id='T-allpass-td', tip_id='103')
+        m101 = _solo_pass_full('101')
+        m102 = _solo_pass_full('102')
+        m103 = _solo_pass_full('103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            m101, m102, m103,
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-allpass-td', members)
+
+        # No landing — advance_main must NOT be called
+        f.git_ops.advance_main.assert_not_awaited()
+
+        # But every member's solo_wt must be cleaned up
+        cleanup_paths = {c.args[0] for c in f.git_ops.cleanup_merge_worktree.await_args_list}
+        for m in [m101, m102, m103]:
+            assert m.solo_wt in cleanup_paths, (
+                f'Expected cleanup_merge_worktree for all-pass member {m.member_id} '
+                f'solo_wt={m.solo_wt}, got: {cleanup_paths!r}'
+            )
+
+        # And every member's solo_branch must be deleted
+        delete_calls = {c.args[0] for c in f.git_ops.delete_solo_branch.await_args_list}
+        for m in [m101, m102, m103]:
+            assert m.solo_branch in delete_calls, (
+                f'Expected delete_solo_branch for all-pass member {m.member_id} '
+                f'solo_branch={m.solo_branch}, got: {delete_calls!r}'
+            )
