@@ -5012,6 +5012,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
 
+        # Cancel in-flight drift-check detective tasks so their finally blocks run
+        # (i.e. _run_drift_check's cleanup_merge_worktree call executes during
+        # CancelledError unwinding rather than leaking the throwaway verify worktree).
+        # Take a snapshot before iterating: the done-callback mutates the set.
+        for _dt in list(self._drift_check_tasks):
+            if not _dt.done():
+                _dt.cancel()
+                with contextlib.suppress(BaseException):
+                    await _dt
+
     # ------------------------------------------------------------------
     # Event helpers
     # ------------------------------------------------------------------
