@@ -17834,3 +17834,40 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         # Cleanup
         await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_touch_enoent_self_heal(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """_touch_owned_merge_worktrees: ENOENT self-heals by dropping path from ledger.
+
+        Scenario:
+          - Register a non-existent path (never created on disk).
+          - Call _touch_owned_merge_worktrees().
+          - Assert: path removed from _owned_merge_worktrees, INFO log mentions
+            the drop, returned count excludes it (0 when it was the only entry).
+
+        RED (step-3 design): step-2 os.utime raises FileNotFoundError uncaught.
+        GREEN because the ENOENT branch was included in step-2 implementation.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Non-existent path
+        gone_path = git_ops.worktree_base / '_merge-gone-enoent'
+        worker._owned_merge_worktrees.add(gone_path)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            n = worker._touch_owned_merge_worktrees()
+
+        assert n == 0, f'Expected 0 (ENOENT path excluded), got {n}'
+        assert gone_path not in worker._owned_merge_worktrees, (
+            'ENOENT path must be removed from ledger'
+        )
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'dropped' in r.message.lower()
+        ]
+        assert len(info_records) >= 1, (
+            f'Expected INFO "dropped from liveness ledger" record; got: '
+            f'{[r.message for r in caplog.records]}'
+        )
