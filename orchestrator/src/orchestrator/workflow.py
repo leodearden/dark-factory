@@ -844,6 +844,41 @@ class TaskWorkflow:
             escalate_to_human=True,
         )
 
+    async def _train_candidates(self) -> list[dict]:
+        """Discover other tasks that are merge-ready candidates for this train.
+
+        Conservative proxy for "merge-ready": the task is in-progress, has no
+        existing train metadata, and its branch resolves (i.e. the branch exists
+        in the repo).  Self is always excluded.  Tighter merge-ready gating and
+        trigger cadence/debounce are deferred to γ/ε; this proxy is safe because
+        the former is off-by-default.
+
+        The branch name for a task follows the established convention:
+        task_id (bare, same as ``branch_name = self.task_id`` in run()).
+        """
+        all_tasks: list[dict] = await self.scheduler.get_tasks()
+        candidates: list[dict] = []
+        for task in all_tasks:
+            task_id: str = str(task.get('id', ''))
+            # Exclude self.
+            if task_id == self.task_id:
+                continue
+            # Exclude non-in-progress statuses (done, blocked, cancelled,
+            # merge-deferred, deferred, …).
+            if task.get('status') != 'in-progress':
+                continue
+            # Exclude tasks already assigned to a train.
+            metadata: dict = task.get('metadata') or {}
+            if metadata.get('train'):
+                continue
+            # Branch-existence gate: the branch must be resolvable so the
+            # diff-range computation downstream has a real ref to diff against.
+            sha = await self.git_ops.resolve_branch_sha(task_id)
+            if sha is None:
+                continue
+            candidates.append(task)
+        return candidates
+
     def _union_train_scope(
         self, members: list[dict],
     ) -> tuple[list[str] | None, list[ModuleConfig]]:
