@@ -6278,13 +6278,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if _warm_capture:
                     _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
                     if not _warm_results and req.config.git.warm_verify_shadow_compare:
-                        logger.warning(
-                            'Task %s: warm verify produced no parseable test results '
-                            'for shadow compare (merge=%s) — the parser may not match '
-                            'the project verify command output format; shadow compare '
-                            'will be skipped for this landing',
-                            req.task_id,
-                            merge_commit[:8],
+                        # Fail-closed: if tests ran but we parsed nothing, the
+                        # shadow-compare detective is silently inert — raise a
+                        # born-at-L2 alarm instead of silently skipping.
+                        _alarm_warm_shadow_unparseable(
+                            self._escalation_queue,
+                            merge_commit,
+                            _warm_capture[0].test_output or '',
                         )
             elif out.verify_skipped:
                 # Disk guard fired — run_scoped_verification was never called;
