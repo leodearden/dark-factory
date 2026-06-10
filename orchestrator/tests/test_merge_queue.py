@@ -17871,3 +17871,88 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             f'Expected INFO "dropped from liveness ledger" record; got: '
             f'{[r.message for r in caplog.records]}'
         )
+
+    async def test_touch_oserror_warns_once_per_episode(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path, caplog,
+    ):
+        """_touch_owned_merge_worktrees: persistent OSError → exactly 1 WARNING/episode.
+
+        Scenario:
+          1. Register a real worktree dir (so the path exists — rules out ENOENT).
+          2. Monkeypatch os.utime to raise PermissionError.
+          3. Call _touch_owned_merge_worktrees() twice with caplog at WARNING.
+          4. Assert: exactly ONE WARNING across both calls (loud-once).
+          5. Assert: path still in _owned_merge_worktrees (kept for retry).
+          6. Assert: count == 0 both times.
+          7. Restore os.utime, call again → count == 1 and no new WARNING.
+          8. Inject failure again → a fresh WARNING is emitted (warned-state
+             cleared on success).
+        """
+        import os as _os
+        import orchestrator.merge_queue as mq_mod
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Use a real dir so utime mock is necessary to trigger OSError
+        wt_dir = tmp_path / '_merge-perm-test'
+        wt_dir.mkdir()
+        worker._owned_merge_worktrees.add(wt_dir)
+
+        original_utime = _os.utime
+
+        def _raise_permission(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise PermissionError('permission denied (test)')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            # Inject failure
+            mq_mod.os.utime = _raise_permission  # type: ignore[attr-defined]
+            try:
+                n1 = worker._touch_owned_merge_worktrees()
+                n2 = worker._touch_owned_merge_worktrees()
+            finally:
+                mq_mod.os.utime = original_utime  # type: ignore[attr-defined]
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly 1 WARNING across 2 calls with injected failure; '
+            f'got {len(warn_records)}: {[r.message for r in warn_records]}'
+        )
+        assert n1 == 0, f'Expected count 0 on first failed call, got {n1}'
+        assert n2 == 0, f'Expected count 0 on second failed call, got {n2}'
+        assert wt_dir in worker._owned_merge_worktrees, (
+            'Path must remain in ledger after non-ENOENT OSError'
+        )
+
+        # --- Recovery: restore utime, call once → success → warned-state cleared ---
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            n3 = worker._touch_owned_merge_worktrees()
+        assert n3 == 1, f'Expected count 1 after recovery, got {n3}'
+        warn_after_recovery = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(warn_after_recovery) == 0, (
+            f'No WARNING expected after recovery; got: {warn_after_recovery}'
+        )
+
+        # --- Re-inject failure → a fresh WARNING emitted (cleared on recovery) ---
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            mq_mod.os.utime = _raise_permission  # type: ignore[attr-defined]
+            try:
+                n4 = worker._touch_owned_merge_worktrees()
+            finally:
+                mq_mod.os.utime = original_utime  # type: ignore[attr-defined]
+        assert n4 == 0
+        fresh_warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(fresh_warns) == 1, (
+            f'Expected fresh WARNING after re-inject; got {len(fresh_warns)}'
+        )
