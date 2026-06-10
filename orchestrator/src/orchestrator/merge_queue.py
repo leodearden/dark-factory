@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
@@ -6854,9 +6854,9 @@ def _submit_shadow_divergence_escalation(
 
 async def _run_cold_shadow_verify(
     git_ops: GitOps,
-    req: 'MergeRequest',
+    req: MergeRequest,
     merge_commit: str,
-    event_store: 'EventStore | None',
+    event_store: EventStore | None,
 ) -> dict[str, bool]:
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
@@ -6906,11 +6906,11 @@ async def _run_cold_shadow_verify(
 
 async def _run_shadow_compare(
     git_ops: GitOps,
-    req: 'MergeRequest',
+    req: MergeRequest,
     merge_commit: str,
     warm_results: dict[str, bool],
     escalation_queue: Any,
-    event_store: 'EventStore | None',
+    event_store: EventStore | None,
 ) -> None:
     """Compare warm vs cold verify results for *merge_commit* and alarm on divergence.
 
@@ -6973,13 +6973,13 @@ async def _run_shadow_compare(
 
 
 async def _maybe_schedule_shadow_compare(
-    worker: 'SpeculativeMergeWorker',
+    worker: SpeculativeMergeWorker,
     git_ops: GitOps,
-    req: 'MergeRequest',
+    req: MergeRequest,
     merge_commit: str,
     warm_results: dict[str, bool],
     escalation_queue: Any,
-    event_store: 'EventStore | None',
+    event_store: EventStore | None,
 ) -> None:
     """Non-blocking scheduler for the warm-vs-cold SHADOW compare (PRD §10 invariant 6(b)).
 

@@ -11,30 +11,28 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Step-1: cadence predicate _shadow_compare_due
-# ---------------------------------------------------------------------------
-
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-
 from orchestrator.merge_queue import (  # noqa: E402
-    ShadowCompareState,
-    ShadowCompareDiff,
     _WARM_COLD_SHADOW_SENTINEL,
+    ShadowCompareDiff,
+    ShadowCompareState,
     _load_shadow_compare_state,
+    _maybe_schedule_shadow_compare,
+    _run_shadow_compare,
     _save_shadow_compare_state,
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
-    _run_shadow_compare,
-    _maybe_schedule_shadow_compare,
     diff_per_test_results,
     parse_per_test_results,
 )
+
+# ---------------------------------------------------------------------------
+# Step-1: cadence predicate _shadow_compare_due
+# ---------------------------------------------------------------------------
 
 
 class TestShadowCompareDue:
@@ -662,7 +660,7 @@ class TestCreateThrowawayVerifyWorktree:
         assert wt.exists()
 
         await git_ops_wcs.cleanup_merge_worktree(wt)
-        assert not wt.exists(), f'cleanup_merge_worktree must remove the throwaway worktree'
+        assert not wt.exists(), 'cleanup_merge_worktree must remove the throwaway worktree'
 
 
 # --- _run_shadow_compare async tests (cold leg stubbed) ---
@@ -1170,7 +1168,7 @@ def wcs_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def wcs_git_ops(wcs_repo: Path) -> 'GitOps':
+def wcs_git_ops(wcs_repo: Path) -> GitOps:
     """GitOps with persistent_merge_worktree OFF (wired in config, not git_ops)."""
     git = GitConfig(
         main_branch='main',
@@ -1184,7 +1182,7 @@ def wcs_git_ops(wcs_repo: Path) -> 'GitOps':
 
 
 async def _make_task_branch(
-    git_ops: 'GitOps', branch: str, filename: str, content: str
+    git_ops: GitOps, branch: str, filename: str, content: str
 ) -> Path:
     """Create a branch with a committed file, return its worktree path."""
     wt = (await git_ops.create_worktree(branch)).path
@@ -1220,21 +1218,12 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
 
     @pytest.mark.asyncio
     async def test_maybe_schedule_called_on_done_land(
-        self, wcs_git_ops: 'GitOps', wcs_repo: Path,
+        self, wcs_git_ops: GitOps, wcs_repo: Path,
     ) -> None:
         """_maybe_schedule_shadow_compare must be called after a warm-verify 'done' land."""
         cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
         wt = await _make_task_branch(wcs_git_ops, 'task-sched', 'f.py', 'x = 1\n')
         req = _make_smw_req('task-sched', 'task-sched', wt, cfg)
-
-        # PASS verify result with parseable test output
-        from orchestrator.verify import VerifyResult  # noqa: PLC0415
-
-        fake_vr = VerifyResult(
-            passed=True,
-            test_output='        PASS [0.1s] crate some::test',
-            lint_output='', type_output='', summary='',
-        )
 
         sched_calls: list[tuple] = []
 
@@ -1266,7 +1255,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
 
     @pytest.mark.asyncio
     async def test_done_land_does_not_await_cold_leg(
-        self, wcs_git_ops: 'GitOps', wcs_repo: Path,
+        self, wcs_git_ops: GitOps, wcs_repo: Path,
     ) -> None:
         """The 'done' outcome must arrive BEFORE the cold compare completes (non-blocking)."""
         cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
