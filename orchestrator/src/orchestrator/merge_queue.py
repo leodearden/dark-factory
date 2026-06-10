@@ -3129,6 +3129,12 @@ class TrainCallbacks:
 # Called with a train_id str; returns a TrainCallbacks for that train.
 TrainCallbackFactory = Callable[[str], TrainCallbacks]
 
+# δ/1720 merge-ready confidence gate constants.
+# Terminal merge outcomes in this set are treated as "risky" by the default
+# predicate — a waiting single whose branch's most-recent merge_finalized
+# event has one of these states is excluded from train formation.
+_COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
+
 # Type alias for the injectable merge-ready predicate (δ/1720 confidence gate).
 # Called with a MergeRequest; returns an exclusion REASON string (truthy →
 # exclude from train) or None (eligible).  Returning the reason (not a bool)
@@ -5265,10 +5271,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
           2. Event-store blocked history:
              If the branch's most-recent terminal merge outcome was 'blocked' or
-             'error', exclude.  Filled in step-4; always returns None until then.
+             'error', exclude.  Filled in step-4.
         """
         # Signal 1 will be added in step-6.
-        # Signal 2 will be added in step-4.
+        # Signal 2: event-store blocked history.
+        if self._event_store is not None:
+            rec = self._event_store.latest_merge_finalized(branch=req.branch)
+            if rec is not None and rec.get('state') in _COALESCE_RISKY_TERMINAL_STATES:
+                return f'recent_terminal_{rec["state"]}'
         return None
 
     async def _maybe_coalesce_waiting_singles(self) -> bool:
