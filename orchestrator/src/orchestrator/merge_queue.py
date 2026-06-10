@@ -5132,21 +5132,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Called from _merger_loop at the pre-dequeue point when the pipeline is
         idle (spec_base is None and prefetched is None) so a train is never
         enqueued behind an unverified speculative merge commit (pipeline-ordering
-        contract, merge_queue.py:5195).
+        contract, :5239 warning comment).
 
         Returns True when a GroupMergeRequest was formed and appended to
         _lane_buffers['normal']; False in all no-op / guard-exit cases.
 
-        This step (step-4) adds guards only; the core pass body is added in step-6.
+        Config is read from the first candidate MergeRequest's .config field
+        (OrchestratorConfig), mirroring the pattern in _do_train_merge (req.config).
         """
-        # Guard 1: feature knob.
-        if not self._git_ops.config.merge_train_coalesce_enabled:
-            return False
-        # Guard 2: factory required to build callbacks.
+        # Guard: factory required to build callbacks.
         if self._train_callback_factory is None:
-            return False
-        # Guard 3: max_members must be ≥ 2 (a single-member train is meaningless).
-        if self._git_ops.config.merge_train_max_members < 2:
             return False
 
         # Drain any newly arrived items so the candidate list is current.
@@ -5161,8 +5156,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             and not req.result.cancelled()
         ]
 
-        # Guard 4: need at least 2 candidates to form a train.
+        # Guard: need at least 2 candidates to form a train.
         if len(candidates) < 2:
+            return False
+
+        # Read OrchestratorConfig from the first candidate (all requests in the
+        # queue share the same config since the worker is per-project).
+        orch_config = candidates[0].config
+
+        # Guard: feature knob (OFF by default — fold-the-decision norm).
+        if not orch_config.merge_train_coalesce_enabled:
+            return False
+        # Guard: max_members ≥ 2 (the ge=2 Pydantic constraint should catch this,
+        # but guard defensively so the invariant is local to this method).
+        if orch_config.merge_train_max_members < 2:
             return False
 
         # Core pass body will be added in step-6.
