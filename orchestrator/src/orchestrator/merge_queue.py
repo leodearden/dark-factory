@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import posixpath
+import re
 import shutil
 import time
 import uuid
@@ -6491,6 +6492,46 @@ class ShadowCompareState:
 
     merges_since_last_shadow: int = 0
     last_shadow_run_at: float = 0.0
+
+
+# Matches cargo-nextest human-output test result lines, e.g.:
+#   "        PASS [   0.045s] reify-core some::mod::test_a"
+#   "        FAIL [   1.200s] reify-eval other::test_b"
+# Capture groups: (1) PASS|FAIL, (2) crate name, (3) test path (rest of line)
+_NEXTEST_TEST_LINE_RE = re.compile(
+    r'^\s*(PASS|FAIL)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+)
+
+
+def parse_per_test_results(test_output: str) -> dict[str, bool]:
+    """Parse cargo-nextest human output into a per-test pass/fail map.
+
+    Scans *test_output* line by line and extracts lines that match the
+    nextest result format::
+
+        <whitespace> PASS|FAIL [<timing>] <crate> <test::path>
+
+    The returned map key is ``"<crate> <test::path>"`` and the value is
+    ``True`` (PASS) or ``False`` (FAIL).  All other lines (build output,
+    summary footer, blank lines) are ignored.
+
+    Used by the warm-vs-cold shadow compare (PRD §10 invariant 6(b)) to
+    capture per-test granularity so divergences can be named in the L2 alarm.
+
+    Args:
+        test_output: Raw string output from a cargo-nextest verify run.
+
+    Returns:
+        ``dict[str, bool]`` mapping test id to pass status.  Empty dict for
+        empty/blank input or when no test lines are present.
+    """
+    result: dict[str, bool] = {}
+    for line in test_output.splitlines():
+        m = _NEXTEST_TEST_LINE_RE.match(line)
+        if m:
+            status, crate, test_path = m.group(1), m.group(2), m.group(3)
+            result[f"{crate} {test_path}"] = (status == 'PASS')
+    return result
 
 
 def _load_shadow_compare_state(path: Path) -> ShadowCompareState:

@@ -248,9 +248,9 @@ Summary [   1.25s] 3 tests run: 2 passed, 1 failed, 0 skipped
 
 _NEXTEST_MULTI_CRATE = """\
         PASS [   0.001s] crate-alpha alpha::test_one
-        FAIL [   0.500s] crate-beta  beta::test_two
+        FAIL [   0.500s] crate-beta beta::test_two
         FAIL [   2.000s] crate-alpha alpha::test_three
-        PASS [   0.050s] crate-beta  beta::test_four
+        PASS [   0.050s] crate-beta beta::test_four
 """
 
 
@@ -287,9 +287,9 @@ class TestParsePerTestResults:
     def test_multi_crate_output(self) -> None:
         result = parse_per_test_results(_NEXTEST_MULTI_CRATE)
         assert result["crate-alpha alpha::test_one"] is True
-        assert result["crate-beta  beta::test_two"] is False
+        assert result["crate-beta beta::test_two"] is False
         assert result["crate-alpha alpha::test_three"] is False
-        assert result["crate-beta  beta::test_four"] is True
+        assert result["crate-beta beta::test_four"] is True
 
     def test_tolerates_varying_leading_whitespace(self) -> None:
         # Same test line with more leading spaces
