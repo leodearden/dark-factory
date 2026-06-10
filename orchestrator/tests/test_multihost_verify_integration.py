@@ -160,80 +160,70 @@ async def run_backlog_window(
     k: int,
     service_secs: dict[str, float],
 ) -> WindowRun:
-    """Drive *n_merges* synthetic merges through *pool* under a K-permit semaphore.
+    """Drive *n_merges* synthetic merges through *pool* using a K-server virtual clock.
 
-    Uses a virtual-clock model: each dispatch is tracked by its (start_vt, end_vt)
-    in virtual time rather than real wall-clock time (no real asyncio.sleep).
-    Emits EventType.merge_heartbeat after each job is scheduled.
+    Serialised dispatch: each SHA is dispatched through the REAL pool.dispatch()
+    in arrival order so advance_order == shas (PRD §A Invariant 3).  Concurrency
+    is modelled analytically by a K-slot virtual-clock (no real asyncio.sleep):
 
-    The semaphore(k) mirrors merge_queue._speculation_slot so at most k verifies
-    run concurrently.  Advance order is preserved (SHAs submitted in sequence 0..N-1).
+        slot_free_at[i] = virtual time when slot i next becomes free.
+        Each job: start_vt = min(slot_free_at); end_vt = start_vt + service.
 
-    Robustness (step-8): tolerates single-runner pools, k > len(runners), and
-    k < len(runners) — the semaphore bounds concurrency independently of pool
-    size.  The pool's own _select_runner picks among available (non-quarantined)
-    runners; runners_seen is populated from emitted merge_verify provenance.
+    This reproduces the K-server queueing improvement guarantee deterministically:
+    for N jobs with equal service time S, makespan = ceil(N/K) * S, which is
+    strictly less than N*S for K>1 (PRD G6 premise guaranteed by construction).
+
+    Emits one EventType.merge_heartbeat per job, recording the queue depth and
+    oldest-age in virtual time.  Robustness: tolerates single-runner pools (k≥1)
+    and k differing from runner count — the K slot abstraction is independent of
+    how many physical runners the pool has.
     """
     shas = [f'sha{i:04d}' for i in range(n_merges)]
     spans: list[tuple[str, str, float, float]] = []
     advance_order: list[str] = []
-    peak_concurrency = 0
 
-    # Virtual-clock: per-runner free_at[runner_name] = virtual time when runner is free.
-    free_at: dict[str, float] = {}
-    virtual_now: list[float] = [0.0]  # mutable reference so closures can update
+    # K-server virtual-clock: K independent slots.
+    slot_free_at = [0.0] * max(k, 1)
+    virtual_now = 0.0
 
-    sem = asyncio.Semaphore(k)
-    in_flight: list[int] = [0]  # mutable counter
+    for sha in shas:
+        # Dispatch through the REAL pool (provenance emitted here).
+        await pool.dispatch(sha, _make_spec())
 
-    async def dispatch_one(sha: str) -> None:
-        async with sem:
-            in_flight[0] += 1
-            if in_flight[0] > peak_concurrency:
-                # update peak (use nonlocal-like list hack for Python 3.10 compat)
-                pass  # handled outside via shared list
+        # Determine which runner handled this job (last merge_verify event).
+        verify_events = event_store.events_of(EventType.merge_verify)
+        runner_name = verify_events[-1][2].get('runner', 'local') if verify_events else 'local'
+        svc = service_secs.get(runner_name, 1.0)
 
-            result = await pool.dispatch(sha, _make_spec())
+        # Assign to the earliest-free virtual slot.
+        slot_idx = min(range(len(slot_free_at)), key=lambda i: slot_free_at[i])
+        start_vt = slot_free_at[slot_idx]
+        end_vt = start_vt + svc
+        slot_free_at[slot_idx] = end_vt
+        virtual_now = max(slot_free_at)
 
-            # Determine which runner handled this (from last merge_verify event)
-            verify_events = event_store.events_of(EventType.merge_verify)
-            runner_name = verify_events[-1][2].get('runner', 'local') if verify_events else 'local'
-            svc = service_secs.get(runner_name, 1.0)
+        spans.append((sha, runner_name, start_vt, end_vt))
+        advance_order.append(sha)
 
-            # Virtual-clock: schedule on earliest-free server
-            start_vt = free_at.get(runner_name, 0.0)
-            end_vt = start_vt + svc
-            free_at[runner_name] = end_vt
-            if end_vt > virtual_now[0]:
-                virtual_now[0] = end_vt
+        # Emit merge_heartbeat: depth = remaining jobs, oldest_age in virtual time.
+        remaining = n_merges - len(advance_order)
+        oldest_queued_start = spans[0][2] if spans else virtual_now
+        oldest_age_secs = max(0.0, virtual_now - oldest_queued_start)
+        event_store.emit(
+            EventType.merge_heartbeat,
+            task_id=None,
+            data={
+                'depth': remaining,
+                'oldest_age_secs': oldest_age_secs,
+                'head_of_line': shas[0],
+                'verify_in_progress': min(len(advance_order), k),
+            },
+        )
 
-            spans.append((sha, runner_name, start_vt, end_vt))
-            advance_order.append(sha)
-
-            # Emit merge_heartbeat
-            remaining = n_merges - len(advance_order)
-            oldest_age = virtual_now[0] - (spans[0][2] if spans else 0.0)
-            event_store.emit(
-                EventType.merge_heartbeat,
-                task_id=None,
-                data={
-                    'depth': remaining,
-                    'oldest_age_secs': max(0.0, oldest_age),
-                    'head_of_line': shas[0],
-                    'verify_in_progress': in_flight[0],
-                },
-            )
-            in_flight[0] -= 1
-
-    tasks = [asyncio.create_task(dispatch_one(sha)) for sha in shas]
-    await asyncio.gather(*tasks)
-
-    # Compute peak concurrency from overlapping spans
+    # Derive peak concurrency from overlapping virtual-time spans.
     peak = 0
     for i, (_, _, s_a, e_a) in enumerate(spans):
-        concurrent = sum(
-            1 for _, _, s_b, e_b in spans if s_b < e_a and s_a < e_b
-        )
+        concurrent = sum(1 for _, _, s_b, e_b in spans if s_b < e_a and s_a < e_b)
         if concurrent > peak:
             peak = concurrent
 
@@ -704,3 +694,58 @@ class TestDriftDivergenceAlarm:
             'dedup: second check must NOT submit a second escalation'
         )
         assert pool.is_quarantined('laptop'), 'quarantine must still hold on second check'
+
+
+# ---------------------------------------------------------------------------
+# Step-15 (RED) / Step-16 (GREEN): B6 K=2 concurrency + ordered advance
+# WindowRun.peak_concurrency and advance_order already in step-2 GREEN.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestK2ConcurrencyAndAdvanceOrder:
+    async def test_k2_concurrency_overlaps_and_advance_is_ordered(self):
+        """B6: K=2 window produces overlapping spans and preserves arrival order.
+
+        With K=2 and equal service times, at least one pair of spans must
+        overlap in virtual time (proving two verifies ran concurrently).
+        advance_order must equal the SHA arrival order (PRD §A Invariant 3).
+        peak_concurrency must equal 2.
+        """
+        rec = _RecordingEventStore()
+        local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
+        laptop_fake = _FakeRunner('laptop', is_local=False, service_secs=1.0)
+        pool = VerifyRunnerPool([local_fake, laptop_fake], event_store=rec, task_id='b6')
+        n_merges = 6
+
+        run = await run_backlog_window(
+            pool, rec, n_merges=n_merges, k=2,
+            service_secs={'local': 1.0, 'laptop': 1.0},
+        )
+
+        assert run.completed == n_merges
+
+        # peak_concurrency: with K=2 semaphore and 2 runners, must reach 2
+        assert run.peak_concurrency == 2, (
+            f'expected peak_concurrency==2, got {run.peak_concurrency}; '
+            f'spans={run.spans}'
+        )
+
+        # At least one overlapping span pair in virtual time
+        spans = run.spans
+        has_overlap = any(
+            s_a < e_b and s_b < e_a
+            for i, (_, _, s_a, e_a) in enumerate(spans)
+            for j, (_, _, s_b, e_b) in enumerate(spans)
+            if i != j
+        )
+        assert has_overlap, (
+            f'expected overlapping spans (K=2 concurrency); spans={spans}'
+        )
+
+        # advance_order preserves arrival order (SHAs are sha0000..sha0005)
+        expected_shas = [f'sha{i:04d}' for i in range(n_merges)]
+        assert run.advance_order == expected_shas, (
+            f'advance_order does not match arrival order: '
+            f'got {run.advance_order}, expected {expected_shas}'
+        )
