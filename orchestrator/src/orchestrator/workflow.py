@@ -894,8 +894,16 @@ class TaskWorkflow:
           - merge_train_max_members < 2 — defensive; the ge=2 pydantic constraint
             should prevent this, but guard anyway to keep the invariant local.
 
-        Skeleton (step-14): guards + candidate discovery only.
-        Selection, metadata assignment, and train_formed event are added in step-16.
+        Formation (when guards pass and candidates exist):
+          1. Fetch line ranges for self + each candidate.
+          2. Select a mutually-stackable subset via _select_train_members (greedy, capped).
+          3. Assign metadata.train={id, order, members} to every selected member via
+             scheduler.update_task(append=True) — backend recursive-merge touches only
+             the train key, preserving all other metadata keys without a race.
+          4. Set self.task['metadata']['train'] in-memory so self._train flips truthy
+             for the immediate merge-decision routing.
+          5. Emit EventType.train_formed.
+          6. Return True.
         """
         # Guard 1: former must be explicitly enabled.
         if not self.config.merge_train_former_enabled:
@@ -912,8 +920,61 @@ class TaskWorkflow:
         if not candidates:
             return False
 
-        # Selection, metadata assignment, and event emission deferred to step-16.
-        return False  # placeholder — step-16 completes this
+        # --- Selection ---
+        # Fetch BASE-coordinate line ranges for self and every candidate.
+        candidate_ids: list[str] = [c['id'] for c in candidates]
+        ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        ranges_by_id[self.task_id] = await self.git_ops.get_changed_line_ranges(self.task_id)
+        for cid in candidate_ids:
+            ranges_by_id[cid] = await self.git_ops.get_changed_line_ranges(cid)
+
+        selected = _select_train_members(
+            self.task_id, candidate_ids, ranges_by_id,
+            self.config.merge_train_max_members,
+        )
+        if len(selected) < 2:
+            # No viable train (no stackable candidates or lone anchor).
+            return False
+
+        # --- Metadata assignment ---
+        train_id = f'train-{self.task_id}-{uuid.uuid4().hex[:8]}'
+        all_members = selected  # anchor first (order-0), then selected candidates
+
+        for order, member_id in enumerate(all_members):
+            train_meta: dict = {
+                'id': train_id,
+                'order': order,
+                'members': list(all_members),
+            }
+            await self.scheduler.update_task(
+                member_id, {'train': train_meta}, append=True,
+            )
+
+        # Set self's metadata in-memory so self._train flips truthy immediately
+        # for the subsequent merge-decision routing (avoids a round-trip read).
+        (self.task.setdefault('metadata', {}))['train'] = {
+            'id': train_id,
+            'order': 0,
+            'members': list(all_members),
+        }
+
+        # --- Event emission ---
+        if self.event_store:
+            self.event_store.emit(
+                EventType.train_formed,
+                task_id=self.task_id,
+                data={
+                    'train_id': train_id,
+                    'members': list(all_members),
+                    'size': len(all_members),
+                },
+            )
+
+        logger.info(
+            'Task %s: train formed — id=%s members=%s',
+            self.task_id, train_id, all_members,
+        )
+        return True
 
     def _union_train_scope(
         self, members: list[dict],
