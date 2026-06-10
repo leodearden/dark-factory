@@ -55,7 +55,14 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_status(task_data: dict) -> str:
-    """Extract status from a Taskmaster get_task response dict."""
+    """Extract status from a Taskmaster get_task response dict.
+
+    **Sibling copies** — keep in sync if the get_task response shape ever changes:
+
+    * ``middleware/task_interceptor._extract_status`` (~line 3292) — canonical source
+    * ``reconciliation/flag_dedup._extract_terminal_status`` — same logic with an
+      additional non-dict guard (returns ``'unknown'`` for non-dict input)
+    """
     if 'status' in task_data:
         return task_data['status']
     data = task_data.get('data', {})

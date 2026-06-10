@@ -17,7 +17,11 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
     build_summary_nonce_section,
 )
-from fused_memory.reconciliation.flag_dedup import dedup_flags, filter_false_absence_flags
+from fused_memory.reconciliation.flag_dedup import (
+    dedup_flags,
+    filter_false_absence_flags,
+    filter_terminal_metadata_flags,
+)
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stage1_stall_detector import (
@@ -85,6 +89,14 @@ class MemoryConsolidator(BaseStage):
             return report
 
         if report.items_flagged:
+            # ── Terminal-metadata guard (task-1725): drop stale_metadata flags for ──
+            # cancelled/done tasks BEFORE dedup_flags so no marker write/delete churn
+            # occurs.  Fail-safe: only drops on positively-confirmed terminal status.
+            report.items_flagged = await filter_terminal_metadata_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
             report.items_flagged = await dedup_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,

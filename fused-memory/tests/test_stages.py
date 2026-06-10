@@ -4255,6 +4255,113 @@ class TestMemoryConsolidatorFlagDedup:
 
 
 # ---------------------------------------------------------------------------
+# Task 1725 — filter_terminal_metadata_flags wired before dedup_flags
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorTerminalMetadataFilter:
+    """filter_terminal_metadata_flags runs BEFORE dedup_flags in MemoryConsolidator.run().
+
+    Acceptance criterion: a cancelled task's stale_metadata flag is dropped before
+    reaching items_flagged AND before dedup_flags (no marker churn).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_stale_metadata_absent_from_flagged_items(self, mock_deps):
+        """Cancelled task 1703 stale_metadata flag is absent from final report.items_flagged.
+
+        This is the acceptance criterion: task 1703 must never appear in Stage 1
+        flagged_items across cycles.  The flag must be dropped before dedup_flags
+        so the marker write/delete churn stops.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        cancelled_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[cancelled_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # taskmaster.get_task returns 'cancelled' for 1703, 'pending' for everything else
+        async def _mock_get_task(task_id, project_root_arg, **_kw):
+            if str(task_id) == '1703':
+                return {'status': 'cancelled'}
+            return {'status': 'pending'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        # dedup_flags passthrough spy — returns its flags argument unchanged
+        dedup_call_args: list = []
+
+        async def _dedup_spy(**kwargs):
+            dedup_call_args.append(kwargs.get('flags', []))
+            return kwargs.get('flags', [])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=_dedup_spy,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        # (a) 1703's stale_metadata flag must NOT appear in final items_flagged
+        assert cancelled_flag not in (report.items_flagged or []), (
+            'Cancelled task 1703 stale_metadata flag must be absent from '
+            'report.items_flagged (acceptance criterion)'
+        )
+
+        # (b) Active task flag must still appear in final items_flagged
+        assert active_flag in (report.items_flagged or []), (
+            'Active (pending) task flag must survive to items_flagged'
+        )
+
+        # (c) dedup_flags must have been called WITHOUT the 1703 stale_metadata flag
+        # — proving it was dropped BEFORE dedup_flags, so no marker write/delete churn
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        flags_seen_by_dedup = dedup_call_args[0]
+        assert cancelled_flag not in flags_seen_by_dedup, (
+            'Cancelled 1703 stale_metadata flag must NOT reach dedup_flags '
+            '— dropping it before dedup stops the per-cycle marker churn'
+        )
+        assert active_flag in flags_seen_by_dedup, (
+            'Active flag must reach dedup_flags (only terminal metadata flags are dropped)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 1201 — MemoryConsolidator stale human-operator detector integration
 # ---------------------------------------------------------------------------
 
