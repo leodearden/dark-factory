@@ -545,6 +545,38 @@ class GitConfig(BaseModel):
     )
 
 
+class VerifyRunnerConfig(BaseModel):
+    """Configuration for a single remote verify runner (Lever C).
+
+    Each entry in OrchestratorConfig.verify_runners describes one remote host
+    that participates in the multi-host merge-verify pool.  Follows the
+    SccacheConfig/GitConfig BaseModel+Field pattern.
+
+    Note: OrchestratorConfig uses extra='ignore' (config.py:1414); prior to
+    adding this model, a verify_runners: block in orchestrator.yaml was
+    silently inert.  Adding this field makes the block live.
+    """
+
+    name: str = Field(description='Short identifier for this runner (e.g. "laptop").')
+    ssh_host: str = Field(description='SSH host string used for git push and ssh invocations.')
+    git_remote: str = Field(description='Git remote name pointing to the remote host.')
+    config_path: str | None = Field(
+        default=None,
+        description=(
+            'Path to the orchestrator YAML config on the remote host.  '
+            'Passed as --config to the remote orchestrator verify-merge CLI.  '
+            'None omits --config (remote uses its own ORCH_CONFIG_PATH).'
+        ),
+    )
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'When False, this runner is excluded from the active pool.  '
+            'Allows temporary disabling without removing the entry.'
+        ),
+    )
+
+
 # --- Per-module overrides ---
 
 _OVERRIDABLE_FIELDS = frozenset({
@@ -1288,6 +1320,32 @@ class OrchestratorConfig(BaseSettings):
     # no defaults.yaml edit is required.
     sccache: SccacheConfig = Field(default_factory=SccacheConfig)
 
+    # Lever C: remote verify runner pool configuration.
+    # Adding this field makes a verify_runners: block in orchestrator.yaml live;
+    # previously, extra='ignore' (config.py model_config) silently dropped the block.
+    # DO NOT flip reify's orchestrator.yaml verify_runners on until the
+    # verdict-parity report is green (PRD D6 operator checklist).
+    verify_runners: list[VerifyRunnerConfig] = Field(
+        default_factory=list,
+        description=(
+            'List of remote verify runner configs (Lever C).  Each entry describes '
+            'one remote host that participates in the multi-host merge-verify pool.  '
+            'Default [] means Lever C is off (local-only path, byte-identical to '
+            'prior behaviour).  A verify_runners: block in orchestrator.yaml was '
+            'silently inert prior to this field being added (extra=\'ignore\').'
+        ),
+    )
+    verify_drift_check_every_n_lands: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'When Lever C is on (verify_runners non-empty), run an async drift check '
+            '(local vs remote verdict comparison via DriftDetector) after every Nth '
+            'successful land.  Must be >= 1.  Mirrors the '
+            'warm_verify_shadow_compare_every_n_merges cadence knob pattern.'
+        ),
+    )
+
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
@@ -1348,6 +1406,15 @@ class OrchestratorConfig(BaseSettings):
         shared-backend default without having to disable the whole knob.
         """
         return {**self.sccache.env_overrides(), **self.verify_env}
+
+    @property
+    def enabled_verify_runners(self) -> list[VerifyRunnerConfig]:
+        """Return runners with enabled=True (the active Lever C pool).
+
+        Callers use this instead of iterating verify_runners directly so the
+        enabled filter cannot be accidentally omitted.
+        """
+        return [r for r in self.verify_runners if r.enabled]
 
     @property
     def module_configs_or_empty(self) -> dict[str, ModuleConfig]:
