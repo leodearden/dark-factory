@@ -1445,6 +1445,10 @@ class SccacheStats:
     cache_misses:      Total cache misses.
     cache_location:    Raw ``Cache location`` value from the stats output, e.g.
                        ``"Redis: redis://orch:6379"`` or ``"Local disk: /path"``.
+    probe_ok:          True when the ``sccache --show-stats`` subprocess exited 0;
+                       False when the daemon was unreachable or returned non-zero.
+                       Defaults to True (parse_sccache_stats never sets it to False;
+                       capture_sccache_stats sets it based on the subprocess rc).
 
     Properties
     ----------
@@ -1460,6 +1464,7 @@ class SccacheStats:
     cache_hits: int
     cache_misses: int
     cache_location: str
+    probe_ok: bool = True
 
     @property
     def hit_rate(self) -> float:
@@ -1497,20 +1502,19 @@ def parse_sccache_stats(output: str) -> SccacheStats:
     def _extract_int(label_expected: str, s: str) -> int | None:
         if not s.startswith(label_expected):
             return None
-        # The remainder after the label must be purely numeric (possibly with
-        # leading spaces).  If the label is followed by a '(' it is a variant
-        # (e.g. "Cache hits (Rust)") and must be rejected.
+        # The remainder after the label must consist of EXACTLY ONE token and
+        # that token must be an integer.  This rejects both parenthesised
+        # variants ("Cache hits (Rust)") and suffix-word variants like
+        # "Compile requests executed   N" that also start with the expected
+        # prefix but carry extra words before the numeric column.
         remainder = s[len(label_expected):]
         if not remainder:
             return None
-        # reject parenthesised variants
-        if remainder.lstrip().startswith('('):
-            return None
-        tokens = remainder.split()
-        if not tokens:
+        toks = remainder.split()
+        if len(toks) != 1:
             return None
         try:
-            return int(tokens[-1])
+            return int(toks[0])
         except ValueError:
             return None
 
@@ -1568,8 +1572,14 @@ async def capture_sccache_stats(
         ssh-wrapping adapter for remote capture.
     """
     _run = run if run is not None else _default_subprocess_run
-    _, stdout, _ = await _run(['sccache', '--show-stats'])
-    return parse_sccache_stats(stdout)
+    rc, stdout, _ = await _run(['sccache', '--show-stats'])
+    stats = parse_sccache_stats(stdout)
+    if rc != 0:
+        # Daemon absent or returned non-zero — surface the failure so callers
+        # can distinguish a probe error from a legitimately cold shared cache
+        # (which would also yield all-zero stats but with probe_ok=True).
+        return dataclasses.replace(stats, probe_ok=False)
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -1615,11 +1625,9 @@ class ColdWarmVerifyDelta:
 
 def delta_to_json(d: ColdWarmVerifyDelta) -> str:
     """Serialize a ColdWarmVerifyDelta to a byte-canonical JSON string (sort_keys=True)."""
-    import json as _json
-    return _json.dumps(d.to_dict(), sort_keys=True, ensure_ascii=False)
+    return json.dumps(d.to_dict(), sort_keys=True, ensure_ascii=False)
 
 
 def delta_from_json(s: str) -> ColdWarmVerifyDelta:
     """Deserialize a ColdWarmVerifyDelta from a JSON string produced by delta_to_json."""
-    import json as _json
-    return ColdWarmVerifyDelta.from_dict(_json.loads(s))
+    return ColdWarmVerifyDelta.from_dict(json.loads(s))

@@ -3274,6 +3274,25 @@ class TestCaptureSccacheStats:
         await capture_sccache_stats(fake_run)
         assert fake_run.issued == [['sccache', '--show-stats']]
 
+    async def test_probe_ok_true_on_zero_rc(self):
+        """probe_ok is True when sccache --show-stats exits 0."""
+        from orchestrator.verify_runner import capture_sccache_stats
+        fake_run = self._make_fake_run([(0, _SCCACHE_STATS_REDIS, '')])
+        stats = await capture_sccache_stats(fake_run)
+        assert stats.probe_ok is True
+
+    async def test_probe_ok_false_on_nonzero_rc(self):
+        """probe_ok is False when sccache --show-stats exits non-zero (daemon absent).
+
+        This distinguishes a probe failure from a legitimately cold shared
+        cache (which would also yield all-zero stats but with probe_ok=True).
+        """
+        from orchestrator.verify_runner import SccacheStats, capture_sccache_stats
+        fake_run = self._make_fake_run([(127, '', 'sccache: not found')])
+        stats = await capture_sccache_stats(fake_run)
+        assert isinstance(stats, SccacheStats)
+        assert stats.probe_ok is False
+
 
 # ---------------------------------------------------------------------------
 # κ step-13: ColdWarmVerifyDelta
