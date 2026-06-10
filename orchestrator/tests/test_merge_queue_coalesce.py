@@ -13,14 +13,17 @@ Each TestClass maps to one plan step:
 from __future__ import annotations
 
 import asyncio
-import collections
-import sys
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
+
+if TYPE_CHECKING:
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.git_ops import GitOps
+    from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker, TrainCallbackFactory
 
 # ─── Step 1 ─────────────────────────────────────────────────────────────────
 
@@ -31,8 +34,9 @@ class TestConfigAndEventType:
         """OrchestratorConfig.merge_train_coalesce_enabled defaults to False (OFF by default,
         human-flips after soak — fold-the-decision norm).
         """
-        from orchestrator.config import GitConfig, OrchestratorConfig
         import tempfile
+
+        from orchestrator.config import GitConfig, OrchestratorConfig
         with tempfile.TemporaryDirectory() as tmp:
             cfg = OrchestratorConfig(
                 project_root=Path(tmp),
@@ -53,7 +57,7 @@ class TestConfigAndEventType:
 
 # ─── helpers shared across steps ────────────────────────────────────────────
 
-def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> 'OrchestratorConfig':
+def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> OrchestratorConfig:
     from orchestrator.config import GitConfig, OrchestratorConfig
     return OrchestratorConfig(
         project_root=tmp_path,
@@ -71,10 +75,10 @@ def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> 'Orchestr
 def _make_single_req(
     task_id: str,
     *,
-    config: 'OrchestratorConfig',
+    config: OrchestratorConfig,
     worktree: Path | None = None,
     lane: Literal['normal', 'high'] = 'normal',
-) -> 'MergeRequest':
+) -> MergeRequest:
     from orchestrator.merge_queue import MergeRequest
     try:
         future = asyncio.get_running_loop().create_future()
@@ -93,10 +97,10 @@ def _make_single_req(
     )
 
 
-def _stub_factory() -> 'TrainCallbackFactory':
+def _stub_factory() -> TrainCallbackFactory:
     """Return a simple TrainCallbackFactory stub."""
     from orchestrator.merge_queue import TrainCallbacks
-    def _factory(train_id: str) -> 'TrainCallbacks':
+    def _factory(train_id: str) -> TrainCallbacks:
         return TrainCallbacks(
             status_check=AsyncMock(return_value={}),
             mark_member_done=AsyncMock(),
@@ -105,13 +109,12 @@ def _stub_factory() -> 'TrainCallbackFactory':
 
 
 def _make_worker(
-    queue: 'asyncio.Queue',
-    config: 'OrchestratorConfig',
-    git_ops: 'GitOps | None' = None,
+    queue: asyncio.Queue,
+    config: OrchestratorConfig,
+    git_ops: GitOps | None = None,
     factory=None,
-) -> 'SpeculativeMergeWorker':
+) -> SpeculativeMergeWorker:
     from orchestrator.merge_queue import SpeculativeMergeWorker
-    from orchestrator.git_ops import GitOps, GitConfig
     if git_ops is None:
         # stub git_ops — not used in no-op guard tests
         git_ops = MagicMock()
@@ -121,8 +124,6 @@ def _make_worker(
         queue,
         train_callback_factory=factory,
     )
-    # Wire config onto the worker for the pass to read it.
-    worker._config = config
     return worker
 
 
@@ -134,7 +135,6 @@ class TestNoOpGuards:
 
     async def test_knob_disabled_returns_false_no_mutation(self, tmp_path: Path):
         """(a) merge_train_coalesce_enabled=False → returns False, buffer unchanged."""
-        from orchestrator.merge_queue import GroupMergeRequest
         cfg = _make_config(tmp_path, coalesce_enabled=False)
         queue: asyncio.Queue = asyncio.Queue()
         worker = _make_worker(queue, cfg, factory=_stub_factory())
@@ -225,13 +225,13 @@ def git_ops(git_config, git_repo: Path):
 
 
 @pytest.fixture
-def config(git_repo: Path, git_config) -> 'OrchestratorConfig':
+def config(git_repo: Path, git_config) -> OrchestratorConfig:
     from orchestrator.config import OrchestratorConfig
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
 @pytest.fixture
-def coalesce_config(git_repo: Path, git_config) -> 'OrchestratorConfig':
+def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
     """Config with merge_train_coalesce_enabled=True."""
     from orchestrator.config import OrchestratorConfig
     return OrchestratorConfig(
@@ -242,7 +242,7 @@ def coalesce_config(git_repo: Path, git_config) -> 'OrchestratorConfig':
 
 
 async def _make_branch_with_file(
-    git_ops: 'GitOps',
+    git_ops: GitOps,
     branch_name: str,
     filename: str,
     content: str,
@@ -252,7 +252,6 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     from orchestrator.git_ops import _run
     await _run(['git', 'add', '-A'], cwd=worktree)
-    from orchestrator.git_ops import GitOps
     # Use the git_ops.commit method if available, else manual
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
@@ -262,8 +261,8 @@ def _make_req(
     task_id: str,
     branch: str,
     worktree: Path,
-    config: 'OrchestratorConfig',
-) -> 'MergeRequest':
+    config: OrchestratorConfig,
+) -> MergeRequest:
     from orchestrator.merge_queue import MergeRequest
     future = asyncio.get_running_loop().create_future()
     return MergeRequest(
@@ -281,7 +280,8 @@ def _make_req(
 
 def _events_of_type(db_path: Path, event_type: str) -> list[dict]:
     """Return all events of the given type from the event store."""
-    import json, sqlite3
+    import json
+    import sqlite3
     conn = sqlite3.connect(str(db_path))
     rows = conn.execute(
         "SELECT event_type, task_id, data FROM events WHERE event_type = ?",
@@ -302,8 +302,8 @@ class TestCoreFormation:
 
     async def test_three_disjoint_singles_coalesce(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """3 waiting singles with disjoint files coalesce into one GroupMergeRequest.
@@ -317,8 +317,7 @@ class TestCoreFormation:
           (e) EventType.train_coalesced event emitted with train_id, absorbed_request_ids,
               member_task_ids
         """
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.event_store import EventStore, EventType
+        from orchestrator.event_store import EventStore
         from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
 
         # Set up 3 branches each touching a unique file (disjoint → line-stackable).
@@ -417,8 +416,8 @@ class TestExclusionIdempotency:
 
     async def test_inflight_request_never_absorbed(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(a) IN-FLIGHT NEVER ABSORBED.
@@ -427,7 +426,7 @@ class TestExclusionIdempotency:
         be touched by the pass — its future remains unresolved and its task_id
         does not appear in the train's member_task_ids.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
 
         # Three disjoint-file branches so all are line-stackable.
         wt0 = await _make_branch_with_file(git_ops, 'in0', 'inflight.py', 'x = 0\n')
@@ -472,8 +471,8 @@ class TestExclusionIdempotency:
 
     async def test_cancelled_waiter_skipped_no_set_result(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(b) DETACHED WAITER SKIPPED WITHOUT set_result.
@@ -530,8 +529,8 @@ class TestExclusionIdempotency:
 
     async def test_group_merge_request_in_buffer_not_reabsorbed(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(c) IDEMPOTENCY.
@@ -541,7 +540,8 @@ class TestExclusionIdempotency:
         unresolved after the pass.
         """
         from orchestrator.merge_queue import (
-            GroupMergeRequest, SpeculativeMergeWorker, TrainCallbacks,
+            GroupMergeRequest,
+            SpeculativeMergeWorker,
         )
 
         wt1 = await _make_branch_with_file(git_ops, 'g1', 'one.py', 'n = 1\n')
@@ -580,7 +580,7 @@ class TestExclusionIdempotency:
         # Put the existing group first, then the 2 singles.
         worker._lane_buffers['normal'].extend([existing_group, req1, req2])
 
-        result = await worker._maybe_coalesce_waiting_singles()
+        await worker._maybe_coalesce_waiting_singles()
 
         # (c1) The existing GroupMergeRequest's future must be unresolved.
         assert not existing_group_future.done(), (
@@ -613,8 +613,8 @@ class TestPartialStackability:
 
     async def test_overlap_pair_stays_solo(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(a) OVERLAP: 2 tasks editing overlapping lines + 1 disjoint task.
@@ -623,9 +623,9 @@ class TestPartialStackability:
         disjoint task form a viable train.  The non-stackable task stays solo
         in the buffer with its future unresolved.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
-        from orchestrator.git_ops import TrainStackResult
         from orchestrator.event_store import EventStore
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_overlap.db'
         es = EventStore(db_path=db_path, run_id='run-overlap')
@@ -679,8 +679,8 @@ class TestPartialStackability:
 
     async def test_stack_conflict_eject(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(b) STACK CONFLICT EJECT.
@@ -689,9 +689,9 @@ class TestPartialStackability:
         absorbs only the 2 survivors; m3 stays solo (future unresolved, in buffer);
         the train_coalesced event data includes the ejected list.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
-        from orchestrator.git_ops import TrainStackResult
         from orchestrator.event_store import EventStore
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_eject.db'
         es = EventStore(db_path=db_path, run_id='run-eject')
@@ -752,8 +752,8 @@ class TestPartialStackability:
 
     async def test_survivors_lt2_no_train(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """(c) SURVIVORS<2: stack ejects all but the anchor → no train formed.
@@ -761,9 +761,9 @@ class TestPartialStackability:
         The pass returns False, no future is resolved, no event is emitted, and
         all candidates remain in the buffer.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
-        from orchestrator.git_ops import TrainStackResult
         from orchestrator.event_store import EventStore
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_nosurv.db'
         es = EventStore(db_path=db_path, run_id='run-nosurv')
@@ -817,8 +817,8 @@ class TestDebounce:
 
     async def test_unchanged_set_skipped_on_second_call(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """Unchanged waiting set: 2nd call skips get_changed_line_ranges entirely.
@@ -873,8 +873,8 @@ class TestDebounce:
 
     async def test_new_request_rearms_debounce(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """Adding a new request re-arms the debounce (different signature → re-runs)."""
@@ -923,8 +923,8 @@ class TestDebounce:
 
     async def test_successful_coalesce_updates_signature(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         """After a successful coalesce the signature reflects the NEW composition.
@@ -935,7 +935,7 @@ class TestDebounce:
         _last_coalesce_signature was set to the pre-coalesce candidate set, so a
         caller that somehow re-invokes without any new singles sees no extra stacking.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'sc1', 'aa.py', 'x = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'sc2', 'bb.py', 'y = 2\n')
@@ -1021,14 +1021,15 @@ class TestEndToEndWiring:
 
     async def test_coalesced_train_dispatched_and_lands(
         self,
-        git_ops: 'GitOps',
-        coalesce_config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         import contextlib
+
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
         from orchestrator.git_ops import _run
+        from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
 
         # Build 3 disjoint-file branches off main.
         # Each touches a unique file → mutually line-stackable.

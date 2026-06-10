@@ -5298,9 +5298,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         new_buffer: collections.deque[MergeRequest] = collections.deque()
         for buf_req in self._lane_buffers['normal']:
             # Keep GroupMergeRequests and non-survivor singles intact.
-            if isinstance(buf_req, GroupMergeRequest):
-                new_buffer.append(buf_req)
-            elif buf_req.task_id not in survivor_set:
+            if isinstance(buf_req, GroupMergeRequest) or buf_req.task_id not in survivor_set:
                 new_buffer.append(buf_req)
         new_buffer.append(group_req)
         self._lane_buffers['normal'] = new_buffer
