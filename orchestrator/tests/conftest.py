@@ -28,7 +28,7 @@ _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-from _orch_helpers import pydantic_spec  # noqa: E402
+from _orch_helpers import drain_async_mock_coroutines, pydantic_spec  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 
 from orchestrator.config import (  # noqa: E402
@@ -163,6 +163,28 @@ def _clear_probe_cache():
     verify._PROBE_CACHE.clear()
     yield
     verify._PROBE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _drain_async_mock_coroutines():
+    """Drain orphaned AsyncMock._execute_mock_call coroutines after every test.
+
+    Task 1714 / esc-1702-13: prevents order-dependent orchestrator test failures
+    caused by un-awaited AsyncMock coroutines surviving GC cycles into sibling
+    tests.  CPython emits RuntimeWarning("coroutine '...' was never awaited")
+    when GC finalizes such an orphan; orchestrator/pyproject.toml promotes this
+    (and pytest's PytestUnraisableExceptionWarning wrapper) to hard errors via
+    filterwarnings — failing whichever test the GC ran during.
+
+    By closing every CORO_CREATED ``_execute_mock_call`` coroutine at each test's
+    own teardown boundary, orphans are reclaimed before they can be promoted into
+    a sibling.  Product coroutines (co_name != _execute_mock_call) are untouched,
+    preserving the real-leak safety net.
+
+    See drain_async_mock_coroutines() in _orch_helpers.py for full rationale.
+    """
+    yield
+    drain_async_mock_coroutines()
 
 
 @pytest.fixture
