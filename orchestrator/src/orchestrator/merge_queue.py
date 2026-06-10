@@ -204,6 +204,27 @@ left clean.  The downstream classifier surfaces this to the enqueuer so the
 tip task can be re-rebased in its own worktree before the train is
 re-submitted."""
 
+TRAIN_VERIFY_FAILED_REASON_PREFIX = (
+    'Train union verify failed (re-verifying members as singles)'
+)
+"""Prefix tagged onto ``MergeOutcome.reason`` when the post-merge verify of a
+train (union of all member commits) fails with a structured failure_category
+AND the failure is NOT a pre-existing main-health-red break.
+
+This precise set of conditions identifies an "interaction candidate" — a
+verify-red that *could* be caused by a cross-member interaction rather than a
+single broken member.  Workflow δ intercepts this prefix and falls back to
+re-verifying each member as a solo branch before blocking or escalating.
+
+Outcomes that must NOT be tagged (and are NOT):
+  - main-health-red (``reason`` starts with ``MAIN_HEALTH_RED_REASON_PREFIX``):
+    the break pre-exists on bare main; per-member re-verify would be spurious.
+  - transient-infra / disk-guard (``failure_category == ''``): no structured
+    failure; re-verify would be unreliable.
+  - rebase-conflict (``reason`` starts with ``TRAIN_REBASE_CONFLICT_REASON_PREFIX``):
+    git-level conflict, not a test failure.
+"""
+
 TRAIN_PARTIAL_FLIP_REASON_PREFIX = 'Train partially flipped'
 """Prefix of the ``MergeOutcome.reason`` string emitted when a train lands
 (main advances successfully) but one or more ``mark_member_done`` callbacks
@@ -3401,6 +3422,31 @@ async def _do_train_merge(
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
+        # Tag the reason with TRAIN_VERIFY_FAILED_REASON_PREFIX when this is an
+        # "interaction candidate" — a structured verify-red that could be caused
+        # by a cross-member interaction rather than a single broken member.
+        # Conditions: failure_category is non-empty (structured failure) AND the
+        # reason does NOT already start with MAIN_HEALTH_RED_REASON_PREFIX (which
+        # indicates a pre-existing break on bare main, not an interaction).
+        # Rebase-conflict, disk-guard, transient-infra, and unscoped-pyright
+        # failures all leave failure_category='' and therefore are NOT tagged.
+        _is_interaction_candidate = (
+            verify_outcome.failure_category != ''
+            and not reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX)
+        )
+        if _is_interaction_candidate:
+            tagged_reason = f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: {reason}'
+            logger.info(
+                'Train %s: verify gate interaction-candidate — tagging reason for δ attribution',
+                req.train_id,
+            )
+            verify_outcome = MergeOutcome(
+                verify_outcome.status,
+                reason=tagged_reason,
+                failure_category=verify_outcome.failure_category,
+                failure_cause_hint=verify_outcome.failure_cause_hint,
+            )
+            reason = tagged_reason
         logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
         _emit_train_event(
             event_store, EventType.train_derailed,
