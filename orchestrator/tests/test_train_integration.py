@@ -489,3 +489,154 @@ class TestTrainIntegrationB2:
             f"expected NO train_merged event when train is blocked by compile break, "
             f"got: {merged_events}"
         )
+
+
+# ---------------------------------------------------------------------------
+# B3+B4: selection contract — non-overlapping co-selected, overlapping rejected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainIntegrationB3B4:
+    """B3+B4 selection contract: real _select_train_members over real git line ranges.
+
+    B3: two candidates edit the SAME file in NON-overlapping line ranges →
+        co-selected (returns 2-member list).
+    B4: two candidates edit OVERLAPPING line ranges → NOT co-selected (returns []).
+
+    No cargo needed — this only tests the selection predicate with real git diffs.
+    GREEN on arrival.
+    """
+
+    async def test_non_overlapping_ranges_co_selected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """B3: non-overlapping edits to the same file are co-selected.
+
+        Anchor edits line 3 of crate_a/src/lib.rs (modifies the ``value`` field
+        comment); candidate appends after the last line (anchored at line 21).
+        parse_diff_line_ranges maps pure insertions to point ranges at their
+        old-side anchor: (3,3) vs (21,21) → non-overlapping → co-selected.
+        """
+        from orchestrator.workflow import _select_train_members
+
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, tmp_path / "target_b3")
+        git_ops = GitOps(config.git, repo)
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        # Anchor: modifies line 3 ("pub value: u32,") — a CHANGE, not an insertion,
+        # so the diff covers the exact line number in the old (main) side.
+        def edit_b3_anchor(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(
+                lib.read_text().replace(
+                    "    pub value: u32,",
+                    "    pub value: u32, // b3_anchor_edit",
+                )
+            )
+
+        # Candidate: appends a new public function after the closing brace (line 21).
+        # The insertion is anchored at line 21 → range (21,21) vs anchor's (3,3).
+        def edit_b3_candidate(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn b3_candidate_fn() -> u32 { 31 }\n")
+
+        _wt_anchor, _sha_anchor = await make_stacked_member(
+            git_ops, "b3_anchor", main_sha, edit_b3_anchor
+        )
+        _wt_candidate, _sha_candidate = await make_stacked_member(
+            git_ops, "b3_candidate", main_sha, edit_b3_candidate
+        )
+
+        # Get real git line ranges for each branch vs main.
+        ranges_anchor = await git_ops.get_changed_line_ranges("task/b3_anchor")
+        ranges_candidate = await git_ops.get_changed_line_ranges("task/b3_candidate")
+
+        ranges_by_id = {
+            "b3_anchor": ranges_anchor,
+            "b3_candidate": ranges_candidate,
+        }
+
+        result = _select_train_members(
+            "b3_anchor",
+            ["b3_candidate"],
+            ranges_by_id,
+            max_members=2,
+        )
+
+        assert len(result) == 2, (
+            f"B3: expected non-overlapping pair to be co-selected (2-member list), "
+            f"got: {result!r}; "
+            f"anchor ranges: {ranges_anchor!r}, candidate ranges: {ranges_candidate!r}"
+        )
+
+    async def test_overlapping_ranges_not_co_selected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """B4: overlapping edits to the same file line are NOT co-selected.
+
+        Both anchor and candidate modify line 3 of crate_a/src/lib.rs
+        (the ``value`` field) → both get range (3,3) on the old side →
+        overlapping → _select_train_members returns [].
+        """
+        from orchestrator.workflow import _select_train_members
+
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, tmp_path / "target_b4")
+        git_ops = GitOps(config.git, repo)
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha = main_sha.strip()
+
+        # Anchor: changes the same line 3 with one variant.
+        def edit_b4_anchor(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(
+                lib.read_text().replace(
+                    "    pub value: u32,",
+                    "    pub value: u32, // b4_anchor",
+                )
+            )
+
+        # Candidate: changes the SAME line 3 with a different variant.
+        def edit_b4_candidate(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(
+                lib.read_text().replace(
+                    "    pub value: u32,",
+                    "    pub value: u32, // b4_candidate",
+                )
+            )
+
+        _wt_anchor, _sha_anchor = await make_stacked_member(
+            git_ops, "b4_anchor", main_sha, edit_b4_anchor
+        )
+        _wt_candidate, _sha_candidate = await make_stacked_member(
+            git_ops, "b4_candidate", main_sha, edit_b4_candidate
+        )
+
+        ranges_anchor = await git_ops.get_changed_line_ranges("task/b4_anchor")
+        ranges_candidate = await git_ops.get_changed_line_ranges("task/b4_candidate")
+
+        ranges_by_id = {
+            "b4_anchor": ranges_anchor,
+            "b4_candidate": ranges_candidate,
+        }
+
+        result = _select_train_members(
+            "b4_anchor",
+            ["b4_candidate"],
+            ranges_by_id,
+            max_members=2,
+        )
+
+        assert result == [], (
+            f"B4: expected overlapping pair NOT to be co-selected (returns []), "
+            f"got: {result!r}; "
+            f"anchor ranges: {ranges_anchor!r}, candidate ranges: {ranges_candidate!r}"
+        )
