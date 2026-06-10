@@ -425,3 +425,148 @@ class TestMaybeFormTrainGuards:
         assert result is False
         fix.scheduler.update_task.assert_not_called()
         fix.wf.event_store.emit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-15: _maybe_form_train formation, overlap-rejection, cap-from-config
+# ---------------------------------------------------------------------------
+
+
+def _ip_task(id: str, metadata: dict | None = None) -> dict:
+    """Shorthand: build a minimal in-progress task dict."""
+    return {'id': id, 'status': 'in-progress', 'metadata': metadata or {}}
+
+
+class TestMaybeFormTrainFormation:
+    """Formation / overlap / cap tests for _maybe_form_train (PRD §B3, B4)."""
+
+    def _ranges_side_effect(self, table: dict):
+        """Return an AsyncMock side-effect that dispatches by ref (= task_id)."""
+        async def _fn(ref):
+            return table.get(ref, {})
+        return _fn
+
+    @pytest.mark.asyncio
+    async def test_forms_train_with_non_overlapping_candidate(self):
+        """Self + one candidate touching SAME file at NON-overlapping lines → train formed.
+
+        Asserts:
+        - returns True
+        - scheduler.update_task called once per member with metadata={'train': {...}}
+          carrying a shared id, ascending order, members list, and append=True
+        - self.task['metadata']['train'] set in-memory (self._train is truthy)
+        - event_store.emit called with EventType.train_formed containing train_id + members
+        """
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201')],
+        )
+        event_store = MagicMock()
+        fix.wf.event_store = event_store
+
+        # Self touches lines 1-10; candidate touches lines 20-30 — non-overlapping.
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'src/foo.rs': [(1, 10)]},
+                '201': {'src/foo.rs': [(20, 30)]},
+            })
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is True
+
+        # update_task called once per member (anchor + candidate = 2 calls).
+        assert fix.scheduler.update_task.call_count == 2
+
+        # Inspect calls — each must carry append=True and a valid train shape.
+        calls = fix.scheduler.update_task.call_args_list
+        by_id = {}
+        for c in calls:
+            assert c.kwargs.get('append') is True, 'update_task must use append=True'
+            m_id = c.args[0]
+            payload = c.args[1]
+            assert isinstance(payload, dict), 'metadata payload must be a dict'
+            assert 'train' in payload
+            by_id[m_id] = payload['train']
+
+        assert set(by_id) == {'200', '201'}
+        # Both members share the same train id.
+        assert by_id['200']['id'] == by_id['201']['id']
+        # Anchor is order 0; other member is order 1.
+        assert by_id['200']['order'] == 0
+        assert by_id['201']['order'] == 1
+        # Both see the full members list.
+        assert sorted(by_id['200']['members']) == ['200', '201']
+        assert sorted(by_id['201']['members']) == ['200', '201']
+
+        # self._train must be truthy (in-memory metadata was updated).
+        assert fix.wf._train is not None
+
+        # train_formed event must have been emitted.
+        event_store.emit.assert_called_once()
+        emit_call = event_store.emit.call_args
+        assert emit_call.args[0] is EventType.train_formed
+        data = emit_call.kwargs.get('data', {})
+        assert 'train_id' in data
+        assert sorted(data['members']) == ['200', '201']
+
+    @pytest.mark.asyncio
+    async def test_no_train_when_candidate_overlaps_self(self):
+        """Candidate overlapping self on a shared file → returns False, no train formed."""
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201')],
+        )
+        event_store = MagicMock()
+        fix.wf.event_store = event_store
+
+        # Candidate overlaps self on foo.rs → not stackable.
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'src/foo.rs': [(1, 20)]},
+                '201': {'src/foo.rs': [(15, 30)]},  # overlaps [1,20]
+            })
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False
+        # update_task must NOT have been called with train metadata.
+        for c in fix.scheduler.update_task.call_args_list:
+            payload = c.args[1] if c.args else {}
+            assert 'train' not in payload, 'No train metadata on overlap-rejection'
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cap_limits_train_size(self):
+        """3 mutually-stackable candidates with max_members=2 → exactly 2-member train."""
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=2,  # cap at 2
+            get_tasks_return=[_ip_task('201'), _ip_task('202'), _ip_task('203')],
+        )
+        fix.wf.event_store = MagicMock()
+
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'src/foo.rs': [(1, 10)]},
+                '201': {'src/foo.rs': [(20, 30)]},
+                '202': {'src/foo.rs': [(40, 50)]},
+                '203': {'src/foo.rs': [(60, 70)]},
+            })
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is True
+        # Cap=2 → exactly 2 update_task calls (anchor + 1 candidate).
+        assert fix.scheduler.update_task.call_count == 2
+        ids_updated = {c.args[0] for c in fix.scheduler.update_task.call_args_list}
+        assert '200' in ids_updated  # anchor always included
+        assert len(ids_updated) == 2
