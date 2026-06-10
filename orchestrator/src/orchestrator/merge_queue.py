@@ -4685,6 +4685,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
+        # train derailed (MergeOutcome('blocked') on a train with train_id
+        # startswith _COALESCE_TRAIN_ID_PREFIX).  Keyed by task_id so the marker
+        # survives re-dispatch as a new MergeRequest with the same task_id.
+        # Process-lifetime (cleared only on worker restart); injectable predicate
+        # is the seam for richer decay/flakiness policies later.
+        self._coalesce_derailed_task_ids: set[str] = set()
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
         # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
@@ -5273,7 +5280,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              If the branch's most-recent terminal merge outcome was 'blocked' or
              'error', exclude.  Filled in step-4.
         """
-        # Signal 1 will be added in step-6.
+        # Signal 1: one-strike registry (cheapest, in-memory — check first).
+        if req.task_id in self._coalesce_derailed_task_ids:
+            return 'coalesce_derailed_one_strike'
         # Signal 2: event-store blocked history.
         if self._event_store is not None:
             rec = self._event_store.latest_merge_finalized(branch=req.branch)
