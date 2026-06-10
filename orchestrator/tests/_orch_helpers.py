@@ -15,14 +15,14 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
-_log = logging.getLogger(__name__)
-
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
 
 if TYPE_CHECKING:
     from orchestrator.harness import Harness
+
+_log = logging.getLogger(__name__)
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
