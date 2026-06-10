@@ -13,7 +13,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import make_placeholder_future, pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -103,7 +103,10 @@ def _make_request(
     pre_rebased: bool = False,
     lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    try:
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
