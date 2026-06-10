@@ -605,3 +605,213 @@ class TestSomeFailAttribution:
         assert reverify_mock.await_count == 3, (
             f'Expected exactly 3 _reverify_one_member calls, got {reverify_mock.await_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13: Edge mappings — tip-as-offender, un-stack conflict, advance failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEdgeMappings:
+    """Edge cases: tip-as-offender, un-stack conflict, passer advance failure."""
+
+    def _fixture(self, task_id: str = '103') -> '_Fixture':
+        f = _make(
+            task_id=task_id,
+            metadata={'train': {'id': 'T-edge', 'order': 2,
+                                'members': ['101', '102', task_id]}},
+        )
+        f.wf.event_store = MagicMock()
+        f.wf.git_ops = f.git_ops
+        f.git_ops.get_main_sha = AsyncMock(return_value='main-sha-edge')
+        return f
+
+    # ── (a) tip-as-offender ───────────────────────────────────────────────
+
+    async def test_tip_as_offender_lower_member_lands(self) -> None:
+        """When tip ('103') fails and '101' passes, '101' is landed via advance_main."""
+        f = self._fixture()
+        members = _train_members(train_id='T-tip-off', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass_wt('101'),
+            _solo_fail('102'),
+            _solo_fail('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-tip-off', members)
+
+        # '101' passed → advance_main called with its sha
+        assert f.git_ops.advance_main.await_count >= 1
+        advanced_shas = {c.args[0] for c in f.git_ops.advance_main.await_args_list}
+        assert 'sha-101-solo' in advanced_shas
+
+    async def test_tip_as_offender_tip_is_blocked(self) -> None:
+        """When tip ('103') fails solo, it is blocked (set_task_status) and L1 submitted."""
+        f = self._fixture()
+        members = _train_members(train_id='T-tip-blk', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass_wt('101'),
+            _solo_fail('102'),
+            _solo_fail('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-tip-blk', members)
+
+        # Tip '103' must be blocked
+        set_status_calls = [
+            (c.args[0], c.args[1]) if c.args else (c.kwargs.get('task_id'), c.kwargs.get('status'))
+            for c in f.scheduler.set_task_status.await_args_list
+        ]
+        assert ('103', 'blocked') in set_status_calls, (
+            f'Expected set_task_status("103", "blocked"), calls: {set_status_calls}'
+        )
+
+    async def test_tip_as_offender_returns_blocked(self) -> None:
+        """When tip fails solo (offender), _attribute_train_failure returns BLOCKED."""
+        f = self._fixture()
+        members = _train_members(train_id='T-tip-ret', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass_wt('101'),
+            _solo_fail('102'),
+            _solo_fail('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        result = await f.wf._attribute_train_failure(tagged, 'T-tip-ret', members)
+
+        # Since tip is not in landed_ids, result must be BLOCKED (via _mark_blocked)
+        assert result == WorkflowOutcome.BLOCKED, (
+            f'Expected WorkflowOutcome.BLOCKED (tip is offender), got {result!r}'
+        )
+
+    # ── (b) un-stack conflict → member treated as offender ──────────────
+
+    async def test_unstackable_conflict_treated_as_offender(self) -> None:
+        """Member returning reason='unstackable' is blocked; others proceed; no crash."""
+        f = self._fixture()
+        members = _train_members(train_id='T-unstackable', tip_id='103')
+        # '101' cannot be un-stacked (conflict); '102' and '103' pass.
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            SoloVerifyResult(member_id='101', passed=False, merge_sha=None,
+                             reason='unstackable'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        result = await f.wf._attribute_train_failure(tagged, 'T-unstackable', members)
+
+        # '101' must be blocked as offender
+        set_status_calls = [
+            (c.args[0], c.args[1]) if c.args else (c.kwargs.get('task_id'), c.kwargs.get('status'))
+            for c in f.scheduler.set_task_status.await_args_list
+        ]
+        assert ('101', 'blocked') in set_status_calls, (
+            f'Expected set_task_status("101", "blocked"), calls: {set_status_calls}'
+        )
+        # '102' and '103' (tip) passed → advance_main called for them
+        assert f.git_ops.advance_main.await_count == 2
+        # Tip landed → DONE
+        assert result == WorkflowOutcome.DONE
+
+    async def test_unstackable_no_crash(self) -> None:
+        """Un-stack conflict does not crash attribution; whole method completes."""
+        f = self._fixture()
+        members = _train_members(train_id='T-no-crash', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            SoloVerifyResult(member_id='101', passed=False, merge_sha=None,
+                             reason='unstackable'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        # Should not raise
+        tagged = _make_tagged_result()
+        try:
+            await f.wf._attribute_train_failure(tagged, 'T-no-crash', members)
+        except Exception as exc:
+            pytest.fail(f'_attribute_train_failure raised unexpectedly: {exc!r}')
+
+    # ── (c) passer advance failure ────────────────────────────────────────
+
+    async def test_advance_failure_no_mark_done(self) -> None:
+        """When advance_main returns 'cas_failed', mark_done is NOT called for that member."""
+        f = self._fixture()
+        members = _train_members(train_id='T-adv-fail', tip_id='103')
+        # '101' fails; '102' passes but advance fails; '103' (tip) passes and advances.
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        # advance_main: 'cas_failed' for '102', 'advanced' for '103'
+        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-adv-fail', members)
+
+        # mark_done must NOT be called for '102' (advance failed)
+        called_ids = {c.args[0] for c in f.scheduler.mark_done.await_args_list}
+        assert '102' not in called_ids, (
+            f'Expected mark_done NOT called for 102, calls: {f.scheduler.mark_done.await_args_list}'
+        )
+        # '103' (advance succeeded) IS marked done
+        assert '103' in called_ids
+
+    async def test_advance_failure_attribution_completes_for_rest(self) -> None:
+        """When advance_main fails for one passer, the rest still complete (no early abort)."""
+        f = self._fixture()
+        members = _train_members(train_id='T-adv-rest', tip_id='103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+
+        tagged = _make_tagged_result()
+        # Should not raise; tip '103' lands successfully
+        result = await f.wf._attribute_train_failure(tagged, 'T-adv-rest', members)
+        assert result == WorkflowOutcome.DONE, (
+            f'Expected DONE (tip landed), got {result!r}'
+        )
+
+    async def test_advance_failure_cleanup_invoked(self) -> None:
+        """When advance_main returns 'cas_failed', cleanup_merge_worktree is still called.
+
+        This tests that _attribute_train_failure explicitly cleans up each
+        passer's solo worktree after processing it — even when advance_main
+        fails.  The cleanup must happen regardless of advance success/failure
+        (the solo worktree is no longer needed after the advance attempt).
+
+        RED: currently _attribute_train_failure does NOT call cleanup after
+        advance_main; step-14 will add per-passer finally-cleanup.
+        """
+        f = self._fixture()
+        members = _train_members(train_id='T-adv-cleanup', tip_id='103')
+        passer_102 = _solo_pass_wt('102')  # solo_wt = Path('/tmp/solo-102')
+        passer_103 = _solo_pass_wt('103')  # solo_wt = Path('/tmp/solo-103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            passer_102,
+            passer_103,
+        ])
+        # '102' advance fails; '103' advance succeeds
+        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-adv-cleanup', members)
+
+        # cleanup_merge_worktree must have been called for BOTH passers'
+        # solo worktrees — regardless of advance outcome.
+        cleanup_paths = {c.args[0] for c in f.git_ops.cleanup_merge_worktree.await_args_list}
+        assert passer_102.solo_wt in cleanup_paths, (
+            f'Expected cleanup for passer 102 solo_wt={passer_102.solo_wt}, '
+            f'got: {cleanup_paths!r}'
+        )
+        assert passer_103.solo_wt in cleanup_paths, (
+            f'Expected cleanup for passer 103 solo_wt={passer_103.solo_wt}, '
+            f'got: {cleanup_paths!r}'
+        )
