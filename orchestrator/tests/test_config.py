@@ -1160,3 +1160,99 @@ class TestLoadConfigSccacheFold:
         }))
         config = load_config(cfg_path)
         assert list(config.verify_env.keys()) == ['RUSTC_WRAPPER']
+
+
+# ---------------------------------------------------------------------------
+# step-1: VerifyRunnerConfig + OrchestratorConfig.verify_runners surface
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyRunnerConfig:
+    """Tests for VerifyRunnerConfig and OrchestratorConfig.verify_runners fields."""
+
+    def test_verify_runner_config_required_fields(self):
+        """VerifyRunnerConfig parses from required str fields."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='laptop', ssh_host='laptop.local', git_remote='origin')
+        assert cfg.name == 'laptop'
+        assert cfg.ssh_host == 'laptop.local'
+        assert cfg.git_remote == 'origin'
+
+    def test_verify_runner_config_defaults(self):
+        """config_path defaults None, enabled defaults True."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        assert cfg.config_path is None
+        assert cfg.enabled is True
+
+    def test_verify_runner_config_explicit_values(self):
+        """All fields can be set explicitly."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='ci',
+            ssh_host='ci.example.com',
+            git_remote='ci',
+            config_path='/etc/orch.yaml',
+            enabled=False,
+        )
+        assert cfg.config_path == '/etc/orch.yaml'
+        assert cfg.enabled is False
+
+    def test_orchestrator_config_verify_runners_defaults_empty(self):
+        """OrchestratorConfig.verify_runners defaults to [] not None."""
+        config = OrchestratorConfig()
+        assert config.verify_runners == []
+
+    def test_orchestrator_config_verify_runners_parses_dict_list(self):
+        """Constructing with a list of dicts coerces to list[VerifyRunnerConfig]."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        config = OrchestratorConfig(verify_runners=[
+            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+        ])
+        assert len(config.verify_runners) == 1
+        assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
+        assert config.verify_runners[0].name == 'laptop'
+
+    def test_orchestrator_config_verify_drift_check_every_n_lands_default(self):
+        """verify_drift_check_every_n_lands defaults to 20."""
+        config = OrchestratorConfig()
+        assert config.verify_drift_check_every_n_lands == 20
+
+    def test_orchestrator_config_verify_drift_check_every_n_lands_rejects_zero(self):
+        """verify_drift_check_every_n_lands must be >= 1 (ge=1)."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_drift_check_every_n_lands=0)
+
+    def test_orchestrator_config_verify_drift_check_every_n_lands_rejects_negative(self):
+        """Negative value also rejected."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_drift_check_every_n_lands=-5)
+
+    def test_enabled_verify_runners_filters_disabled(self):
+        """enabled_verify_runners returns only runners with enabled=True."""
+        config = OrchestratorConfig(verify_runners=[
+            {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True},
+            {'name': 'disabled', 'ssh_host': 'h2', 'git_remote': 'r2', 'enabled': False},
+        ])
+        enabled = config.enabled_verify_runners
+        assert len(enabled) == 1
+        assert enabled[0].name == 'active'
+
+    def test_enabled_verify_runners_empty_when_all_disabled(self):
+        """enabled_verify_runners returns [] when all runners are disabled."""
+        config = OrchestratorConfig(verify_runners=[
+            {'name': 'r', 'ssh_host': 'h', 'git_remote': 'g', 'enabled': False},
+        ])
+        assert config.enabled_verify_runners == []
+
+    def test_enabled_verify_runners_all_when_all_enabled(self):
+        """enabled_verify_runners returns all runners when all have enabled=True."""
+        config = OrchestratorConfig(verify_runners=[
+            {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1'},
+            {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2'},
+        ])
+        assert len(config.enabled_verify_runners) == 2
