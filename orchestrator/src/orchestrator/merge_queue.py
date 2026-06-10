@@ -4578,6 +4578,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # bare-worker tests that don't set up remotes stay green.
         self._drift_land_count: int = 0
         self._runner_quarantine: set[str] = set()
+        # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
+        # reference to running tasks, so without a strong ref here the drift
+        # detective can be GC'd mid-run and a remote-PASS / local-FAIL
+        # divergence would go undetected — defeating the safety control.
+        # Mirrors the _shadow_compare_tasks pattern (see :func:`_maybe_schedule_shadow_compare`).
+        self._drift_check_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
@@ -7518,6 +7524,14 @@ async def _maybe_run_drift_check(
             # "coroutine was never awaited" RuntimeWarning from leaking into
             # unrelated tests (pyproject.toml converts those warnings to errors).
             _coro.close()
+        else:
+            # Hold a strong reference so the event loop cannot GC the drift
+            # detective mid-run (asyncio keeps only a weak ref to Tasks).
+            # Mirrors the _shadow_compare_tasks pattern at :func:`_maybe_schedule_shadow_compare`.
+            worker._drift_check_tasks.add(_task)
+            _task.add_done_callback(
+                lambda t: worker._drift_check_tasks.discard(t)
+            )
 
 
 async def _acquire_warm_verify_worktree(
