@@ -602,11 +602,11 @@ async def train_throughput_stats(
     async def _query(conn: aiosqlite.Connection) -> dict:
         since = _cutoff_iso(hours, now=now)
         # --- train_merged rows ---
-        train_merged_rows = await conn.execute_fetchall(
+        train_merged_rows = list(await conn.execute_fetchall(
             "SELECT data FROM events "
             "WHERE event_type = 'train_merged' AND timestamp >= ?",
             (since,),
-        )
+        ))
         trains_landed = len(train_merged_rows)
         tasks_landed_via_trains = 0
         for row in train_merged_rows:
@@ -625,14 +625,14 @@ async def train_throughput_stats(
         )
 
         # --- baseline solo merge_attempt(outcome='done', train_id IS NULL) ---
-        solo_rows = await conn.execute_fetchall(
+        solo_rows = list(await conn.execute_fetchall(
             "SELECT COUNT(*) AS cnt FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND json_extract(data, '$.outcome') = 'done' "
             "  AND json_extract(data, '$.train_id') IS NULL "
             "  AND timestamp >= ?",
             (since,),
-        )
+        ))
         baseline_solo_landed = solo_rows[0]['cnt'] if solo_rows else 0
         baseline_verifies_per_landed_task = 1.0 if baseline_solo_landed > 0 else 0.0
 
@@ -641,14 +641,14 @@ async def train_throughput_stats(
         )
 
         # --- CAS-retry rates ---
-        train_retry_rows = await conn.execute_fetchall(
+        train_retry_rows = list(await conn.execute_fetchall(
             "SELECT COUNT(*) AS cnt FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND json_extract(data, '$.outcome') = 'cas_retry' "
             "  AND json_extract(data, '$.train_id') IS NOT NULL "
             "  AND timestamp >= ?",
             (since,),
-        )
+        ))
         train_retries = train_retry_rows[0]['cnt'] if train_retry_rows else 0
         train_cas_retry_rate = (
             train_retries / tasks_landed_via_trains
@@ -656,14 +656,14 @@ async def train_throughput_stats(
             else 0.0
         )
 
-        solo_retry_rows = await conn.execute_fetchall(
+        solo_retry_rows = list(await conn.execute_fetchall(
             "SELECT COUNT(*) AS cnt FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND json_extract(data, '$.outcome') = 'cas_retry' "
             "  AND json_extract(data, '$.train_id') IS NULL "
             "  AND timestamp >= ?",
             (since,),
-        )
+        ))
         solo_retries = solo_retry_rows[0]['cnt'] if solo_retry_rows else 0
         baseline_cas_retry_rate = (
             solo_retries / baseline_solo_landed

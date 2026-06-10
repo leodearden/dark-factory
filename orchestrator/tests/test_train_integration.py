@@ -38,6 +38,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     GroupMergeRequest,
@@ -215,14 +216,16 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
 # ---------------------------------------------------------------------------
 
 
-class _SpyEventStore:
+class _SpyEventStore(EventStore):
     """Minimal event store that collects emitted events for inspection.
 
-    Provides the same ``emit`` interface as EventStore but stores events
-    in-memory.  Adapted from test_atomic_train_merge.py:2260.
+    Subclasses EventStore so it is assignable to EventStore | None.
+    Skips the parent DB init — no on-disk store needed.
+    Adapted from test_atomic_train_merge.py:2260.
     """
 
     def __init__(self) -> None:
+        # Do not call super().__init__() — no DB path required for a spy.
         self.events: list[dict] = []
 
     def emit(
