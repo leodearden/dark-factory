@@ -266,3 +266,37 @@ class TestThroughputHarness:
         assert len(verify_events) == 4
         for _et, _tid, data in verify_events:
             assert data['runner'] in {'local', 'laptop'}
+
+
+# ---------------------------------------------------------------------------
+# Step-3 (RED): test_summarize_throughput_reads_heartbeat_and_verify_events
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeThroughput:
+    def test_summarize_throughput_reads_heartbeat_and_verify_events(self):
+        """summarize_throughput correctly aggregates merge_verify + heartbeat events."""
+        window_duration = 10.0
+        # Build a synthetic event list
+        events: list[tuple[Any, Any, dict[str, Any]]] = [
+            # 3 merge_verify events: 2 local, 1 laptop
+            (EventType.merge_verify, None, {'runner': 'local', 'merge_sha': 'sha0', 'passed': True}),
+            (EventType.merge_verify, None, {'runner': 'local', 'merge_sha': 'sha1', 'passed': True}),
+            (EventType.merge_verify, None, {'runner': 'laptop', 'merge_sha': 'sha2', 'passed': True}),
+            # heartbeat events with known depth and oldest_age_secs
+            (EventType.merge_heartbeat, None, {'depth': 3, 'oldest_age_secs': 2.0}),
+            (EventType.merge_heartbeat, None, {'depth': 2, 'oldest_age_secs': 5.0}),
+            (EventType.merge_heartbeat, None, {'depth': 1, 'oldest_age_secs': 4.0}),
+        ]
+
+        report = summarize_throughput(events, window_duration_secs=window_duration)
+
+        assert report.completed == 3
+        assert abs(report.completion_rate - 3.0 / window_duration) < 1e-9
+        assert report.peak_oldest_age_secs == 5.0
+        # mean of [2.0, 5.0, 4.0] = 11/3
+        assert abs(report.mean_oldest_age_secs - (2.0 + 5.0 + 4.0) / 3) < 1e-9
+        assert report.peak_depth == 3
+        assert report.per_runner == {'local': 2, 'laptop': 1}
+        assert report.runners_seen == {'local', 'laptop'}
+        assert report.window_duration_secs == window_duration
