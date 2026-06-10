@@ -4653,6 +4653,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # _acquire_next_request can drain remaining lane-buffer items before
         # returning None.  Cleared by stop() on full reset.
         self._shutdown_signaled: bool = False
+        # γ/1719 debounce signature — frozenset of candidate request_ids from
+        # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
+        # attempts).  Short-circuits when the waiting set is unchanged.
+        self._last_coalesce_signature: frozenset[str] | None = None
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
@@ -5119,6 +5123,52 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return True
 
     # ------------------------------------------------------------------
+    # Retroactive coalescing pass (γ/1719)
+    # ------------------------------------------------------------------
+
+    async def _maybe_coalesce_waiting_singles(self) -> bool:
+        """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
+
+        Called from _merger_loop at the pre-dequeue point when the pipeline is
+        idle (spec_base is None and prefetched is None) so a train is never
+        enqueued behind an unverified speculative merge commit (pipeline-ordering
+        contract, merge_queue.py:5195).
+
+        Returns True when a GroupMergeRequest was formed and appended to
+        _lane_buffers['normal']; False in all no-op / guard-exit cases.
+
+        This step (step-4) adds guards only; the core pass body is added in step-6.
+        """
+        # Guard 1: feature knob.
+        if not self._git_ops.config.merge_train_coalesce_enabled:
+            return False
+        # Guard 2: factory required to build callbacks.
+        if self._train_callback_factory is None:
+            return False
+        # Guard 3: max_members must be ≥ 2 (a single-member train is meaningless).
+        if self._git_ops.config.merge_train_max_members < 2:
+            return False
+
+        # Drain any newly arrived items so the candidate list is current.
+        self._drain_queue_into_lanes()
+
+        # Build candidate list: single MergeRequests in the normal lane whose
+        # futures are still live (not done and not cancelled).
+        candidates = [
+            req for req in self._lane_buffers['normal']
+            if not isinstance(req, GroupMergeRequest)
+            and not req.result.done()
+            and not req.result.cancelled()
+        ]
+
+        # Guard 4: need at least 2 candidates to form a train.
+        if len(candidates) < 2:
+            return False
+
+        # Core pass body will be added in step-6.
+        return False
+
+    # ------------------------------------------------------------------
     # Merger coroutine
     # ------------------------------------------------------------------
 
@@ -5148,6 +5198,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
+                # γ/1719 retroactive coalescing pass: attempt to merge waiting
+                # single MergeRequests into one GroupMergeRequest before dequeue.
+                # Only runs when the pipeline is clean (no speculative merge in
+                # flight and no prefetched item) — honours the train-dispatch
+                # contract that a train must not be enqueued behind an unverified
+                # speculative merge commit (:5239 warning).
+                # When merge_train_coalesce_enabled=False (default) this returns
+                # immediately, keeping the loop byte-identical to pre-γ behaviour.
+                if spec_base is None and prefetched is None:
+                    await self._maybe_coalesce_waiting_singles()
+
                 # Get next request: use pre-fetched (speculative) item if available,
                 # otherwise acquire from the lane-priority pick system.
                 if prefetched is not None:
