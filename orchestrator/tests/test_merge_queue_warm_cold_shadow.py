@@ -19,6 +19,8 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (  # noqa: E402
     _WARM_COLD_SHADOW_SENTINEL,
+    _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
+    _alarm_warm_shadow_unparseable,
     _nextest_reported_test_count,
     ShadowCompareDiff,
     ShadowCompareState,
@@ -1613,6 +1615,123 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # None is passed — SMW accepts it (None-safe)
         call_kwargs = mock_smw_cls.call_args[1]
         assert call_kwargs.get('escalation_queue') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-5: _alarm_warm_shadow_unparseable
+# ---------------------------------------------------------------------------
+
+# Output that has a Summary reporting tests ran but parse_per_test_results would
+# return {} (simulated by passing this output to _alarm_warm_shadow_unparseable
+# directly — the function inspects only the Summary count, not the per-test map).
+_OUTPUT_WITH_TESTS_RAN = (
+    "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+)
+
+# Output with no Summary line (legitimately test-free merge)
+_OUTPUT_NO_TESTS = "Building crate foo...\nFinished\n"
+
+
+class TestAlarmWarmShadowUnparseable:
+    """Unit tests for _alarm_warm_shadow_unparseable(queue, merge_commit, test_output).
+
+    The function is the fail-closed alarm: when the warm verify shows tests RAN
+    (Summary line with N > 0) but the per-test parser produced an empty map,
+    it submits a born-at-L2 critical escalation.
+    """
+
+    def test_alarm_fires_when_tests_ran_but_no_parseable_results(self) -> None:
+        """Summary N > 0 → escalation submitted exactly once."""
+        q = _make_escalation_queue(has_open=False)
+        _alarm_warm_shadow_unparseable(q, "abcdef123456", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_called_once()
+
+    def test_escalation_severity_critical_born_at_l2(self) -> None:
+        """Severity must be 'critical' (in BORN_AT_L2_SEVERITIES)."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.severity == 'critical'
+        assert esc.severity in BORN_AT_L2_SEVERITIES
+
+    def test_escalation_level_2(self) -> None:
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.level == 2
+
+    def test_escalation_agent_role_starts_with_orchestrator(self) -> None:
+        """agent_role must carry 'orchestrator-' prefix to prevent downgrade."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.agent_role.startswith('orchestrator-')
+
+    def test_escalation_category_risk_identified(self) -> None:
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.category == 'risk_identified'
+
+    def test_summary_names_commit_sha(self) -> None:
+        """Escalation summary must reference the commit short-sha."""
+        q = _make_escalation_queue()
+        commit = "cafebabe1234"
+        _alarm_warm_shadow_unparseable(q, commit, _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert commit[:8] in esc.summary
+
+    def test_detail_mentions_shadow_compare_inert(self) -> None:
+        """Detail must describe the shadow-compare being inert / parser failure."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha123", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        detail_lower = esc.detail.lower()
+        # Must state the parser couldn't read the format or the detective is inert
+        assert any(kw in detail_lower for kw in (
+            'shadow', 'inert', 'parser', 'parse', 'format', 'unparseable',
+        ))
+
+    def test_task_id_is_unparseable_sentinel(self) -> None:
+        """task_id must be _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL, distinct from divergence."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.task_id == _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL
+        assert esc.task_id != _WARM_COLD_SHADOW_SENTINEL  # independent dedup key
+
+    def test_no_alarm_when_no_summary_line(self) -> None:
+        """Output with no Summary line (no evidence tests ran) → no alarm (no false positive)."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_NO_TESTS)
+        q.submit.assert_not_called()
+
+    def test_no_alarm_when_summary_reports_zero_tests(self) -> None:
+        """Summary reporting 0 tests (test-free merge) → no alarm."""
+        q = _make_escalation_queue()
+        output = "Summary [   0.01s] 0 tests run: 0 passed, 0 failed, 0 skipped\n"
+        _alarm_warm_shadow_unparseable(q, "sha", output)
+        q.submit.assert_not_called()
+
+    def test_none_escalation_queue_is_noop(self) -> None:
+        """None queue must not raise."""
+        _alarm_warm_shadow_unparseable(None, "sha", _OUTPUT_WITH_TESTS_RAN)
+
+    def test_dedup_no_second_submit_when_open_exists(self) -> None:
+        """When has_open_l1 returns True for the unparseable sentinel, no re-submit."""
+        q = _make_escalation_queue(has_open=True)
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_not_called()
+
+    def test_dedup_submits_when_no_open(self) -> None:
+        """When has_open_l1 returns False, alarm is submitted."""
+        q = _make_escalation_queue(has_open=False)
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_called_once()
+
+    def test_unparseable_sentinel_distinct_from_divergence_sentinel(self) -> None:
+        """The two sentinels are different strings (independent dedup)."""
+        assert _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL != _WARM_COLD_SHADOW_SENTINEL
 
 
 # ---------------------------------------------------------------------------
