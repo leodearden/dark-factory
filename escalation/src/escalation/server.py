@@ -912,6 +912,8 @@ def create_server(
         }
         if outcome.failure_diagnostic is not None:
             result['failure_diagnostic'] = outcome.failure_diagnostic
+        if outcome.superseded_by is not None:
+            result['superseded_by'] = outcome.superseded_by
         return result
 
     @mcp.tool()
@@ -1117,6 +1119,11 @@ def create_server(
 
     _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
 
+    # Optional fields that _durable_terminal_state threads into the meta dict
+    # when present and non-None.  Add future terminal-metadata fields here so
+    # every tier stays in sync automatically.
+    _OPTIONAL_TERMINAL_META_FIELDS: tuple[str, ...] = ('superseded_by',)
+
     def _epoch_to_iso8601(ts: float) -> str:
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
         return datetime.fromtimestamp(ts, tz=UTC).isoformat()
@@ -1129,6 +1136,8 @@ def create_server(
             return 'conflict'
         if raw == 'abandoned':
             return 'abandoned'
+        if raw == 'superseded':
+            return 'superseded'
         # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
         # unknown_branch / error → blocked
         return 'blocked'
@@ -1177,11 +1186,16 @@ def create_server(
         if ring is not None and request_id is not None:
             rec = ring.get(request_id)
             if rec is not None:
-                return _map_terminal_state(rec.state), {
+                meta: dict = {
                     'request_id': rec.request_id,
                     'outcome': rec.state,
                     'finished_at': _epoch_to_iso8601(rec.finished_at),
                 }
+                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
+                    _v = getattr(rec, _f, None)
+                    if _v is not None:
+                        meta[_f] = _v
+                return _map_terminal_state(rec.state), meta
 
         # Tier 3: event store (supports all three lookup keys).
         if event_store is not None:
@@ -1191,11 +1205,16 @@ def create_server(
                 task_id=task_id,
             )
             if row is not None:
-                return _map_terminal_state(row['state']), {
+                es_meta: dict = {
                     'request_id': row['request_id'],
                     'outcome': row['state'],
                     'finished_at': row['finished_at'],
                 }
+                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
+                    _v = row.get(_f)
+                    if _v is not None:
+                        es_meta[_f] = _v
+                return _map_terminal_state(row['state']), es_meta
 
         return None
 
@@ -1265,13 +1284,16 @@ def create_server(
         durable = _durable_terminal_state(request_id, branch, task_id)
         if durable is not None:
             coarse_state, meta = durable
-            return {
+            resp: dict = {
                 'state': coarse_state,
                 'request_id': meta['request_id'],
                 'generation': 1,
                 'outcome': meta['outcome'],
                 'finished_at': meta['finished_at'],
             }
+            if meta.get('superseded_by') is not None:
+                resp['superseded_by'] = meta['superseded_by']
+            return resp
 
         # Tier 4: honest unknown
         return {
