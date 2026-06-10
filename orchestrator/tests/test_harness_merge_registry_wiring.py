@@ -152,20 +152,20 @@ def harness_for_registry_run_slot() -> Harness:
 
 @pytest.mark.asyncio
 class TestStartMergeWorkerCallsLivenessGuard:
-    """_start_merge_worker calls check_merge_liveness_margin(self.config) at startup."""
+    """_start_merge_worker calls enforce_merge_liveness_margin(self.config, ...) at startup."""
 
     async def test_guard_called_with_live_config(self, mock_orch_config) -> None:
-        """check_merge_liveness_margin is invoked exactly once with h.config.
+        """enforce_merge_liveness_margin is invoked exactly once with h.config.
 
         RED until step-4 adds the guard call to _start_merge_worker.
 
         Patching strategy
         -----------------
         _start_merge_worker does a LOCAL import ``from orchestrator.merge_queue
-        import check_merge_liveness_margin`` (added in step-4, mirroring the
+        import enforce_merge_liveness_margin`` (added in step-4, mirroring the
         existing ``from orchestrator.merge_queue import SpeculativeMergeWorker``).
         Patching the SOURCE module attribute (``orchestrator.merge_queue.
-        check_merge_liveness_margin``) is what the local import picks up at call
+        enforce_merge_liveness_margin``) is what the local import picks up at call
         time; patching ``orchestrator.harness.*`` would have no effect because
         no module-level binding exists in harness.py for this symbol.
         """
@@ -177,7 +177,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator') as mock_build_coord, \
              patch('asyncio.create_task') as mock_create_task, \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin') as mock_guard:
+             patch('orchestrator.merge_queue.enforce_merge_liveness_margin') as mock_guard:
 
             # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()
@@ -192,7 +192,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
 
             await h._start_merge_worker()
 
-        mock_guard.assert_called_once_with(h.config)
+        mock_guard.assert_called_once_with(h.config, merge_ahead_bound=1)
 
 
 @pytest.mark.asyncio
