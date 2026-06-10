@@ -3366,3 +3366,130 @@ class TestSccacheKappaPublicSurface:
         assert not missing, f"Missing from __all__: {sorted(missing)}"
         for name in expected:
             assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"
+
+
+# ---------------------------------------------------------------------------
+# step-3: RemoteRunner.run_merge_verify — main_branch best-effort push
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerMainBranchPush:
+    """Tests for RemoteRunner main_branch parameter (opt-in best-effort main push)."""
+
+    def _make_runner_and_calls(self, expected_result, *, main_branch=None, config_path=None):
+        """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append((argv, cwd))
+            if argv[0] == 'git':
+                return (0, '', '')
+            # ssh
+            return (0, result_to_json(expected_result), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            config_path=config_path,
+            main_branch=main_branch,
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_with_main_branch_main_push_is_first(self):
+        """With main_branch='main', calls[0] argv is the main-branch push."""
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected, main_branch='main')
+        await runner.run_merge_verify('abc123', _make_spec())
+        # calls[0] must be the main-branch push
+        push_argv, push_cwd = calls[0]
+        assert push_argv == ['git', 'push', 'origin', 'main:refs/heads/main']
+        assert push_cwd == '/repo'
+        # calls[1] must be the merge-sha push
+        merge_push_argv, _ = calls[1]
+        assert merge_push_argv == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+
+    async def test_with_main_branch_ssh_is_third(self):
+        """With main_branch set, ssh invocation is calls[2] (after two git pushes)."""
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected, main_branch='main')
+        await runner.run_merge_verify('abc123', _make_spec())
+        ssh_argv, _ = calls[2]
+        assert ssh_argv[0] == 'ssh'
+
+    async def test_without_main_branch_calls0_is_merge_sha_push(self):
+        """main_branch=None (default): calls[0] is the merge-sha push (byte-identical to prior behaviour)."""
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner_and_calls(expected, main_branch=None)
+        await runner.run_merge_verify('abc123', _make_spec())
+        push_argv, _ = calls[0]
+        assert push_argv == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+
+    async def test_main_push_failure_is_non_fatal(self):
+        """main-push rc!=0 is swallowed; merge-sha push + ssh still succeed and return VerifyResult."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        expected = VerifyResult(passed=True, test_output='ok', lint_output='', type_output='', summary='ok')
+        calls = []
+        call_count = [0]
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append((argv, cwd))
+            n = call_count[0]
+            call_count[0] += 1
+            # First git call = main push → rc=1 (non-fast-forward)
+            if argv[0] == 'git' and 'refs/heads/' in (argv[3] if len(argv) > 3 else ''):
+                return (1, '', 'rejected: non-fast-forward')
+            # git push merge-sha or cleanup → rc=0
+            if argv[0] == 'git':
+                return (0, '', '')
+            # ssh → valid result
+            return (0, result_to_json(expected), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            main_branch='main',
+            run=fake_run,
+            id_factory=lambda: 'req-id',
+        )
+        # Must NOT raise RunnerUnavailable — main-push failure is non-fatal
+        result = await runner.run_merge_verify('abc123', _make_spec())
+        assert result == expected
+        # merge-sha push was still issued
+        push_argvs = [c[0] for c in calls if c[0][0] == 'git' and 'refs/merge-verify/' in (c[0][3] if len(c[0]) > 3 else '')]
+        assert len(push_argvs) >= 1
+
+    async def test_merge_sha_push_failure_still_raises_runner_unavailable(self):
+        """Even with main_branch set, a merge-sha push failure raises RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv)
+            # main push → ok
+            if argv[0] == 'git' and len(argv) > 3 and 'refs/heads/' in argv[3]:
+                return (0, '', '')
+            # merge-sha push → fail
+            if argv[0] == 'git' and len(argv) > 3 and 'refs/merge-verify/' in argv[3]:
+                return (1, '', 'rejected')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            main_branch='main',
+            run=fake_run,
+            id_factory=lambda: 'req-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
