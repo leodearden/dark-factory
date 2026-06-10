@@ -17956,3 +17956,42 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         assert len(fresh_warns) == 1, (
             f'Expected fresh WARNING after re-inject; got {len(fresh_warns)}'
         )
+
+    async def test_register_guard_rejects_none_and_persistent(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_register_owned_merge_worktree: guards None and _merge-verify; admits ephemeral.
+
+        Scenario:
+          - Register None → no error, nothing added.
+          - Register persistent worktree path (_merge-verify) → NOT added.
+          - Register an ephemeral _merge-xyz path → IS added.
+
+        RED (step-7 design): step-2's register has no None/name guard.
+        GREEN because the guard was included in step-2 implementation.
+        """
+        from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME as _PMN
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        persistent_path = git_ops.worktree_base / _PMN
+
+        # None → no-op, no error
+        worker._register_owned_merge_worktree(None)
+        assert len(worker._owned_merge_worktrees) == 0, (
+            'Registering None must not add any entry'
+        )
+
+        # Persistent warm worktree → rejected
+        worker._register_owned_merge_worktree(persistent_path)
+        assert persistent_path not in worker._owned_merge_worktrees, (
+            f'Persistent {_PMN!r} path must never enter the liveness ledger'
+        )
+
+        # Ephemeral _merge-xyz → admitted
+        ephemeral = git_ops.worktree_base / '_merge-abc123'
+        worker._register_owned_merge_worktree(ephemeral)
+        assert ephemeral in worker._owned_merge_worktrees, (
+            'Ephemeral _merge-<id> path must be added to ledger'
+        )
