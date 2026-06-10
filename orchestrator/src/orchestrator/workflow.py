@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry
+    from orchestrator.merge_queue import InFlightMergeRegistry, SoloVerifyResult
     from orchestrator.usage_gate import UsageGate
 
 
@@ -5078,6 +5078,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         return category, summary, detail
 
+    async def _reverify_one_member(
+        self,
+        member: dict,
+        predecessor_ref: str,
+    ) -> SoloVerifyResult:
+        """Un-stack a member's own delta onto main and verify it in isolation.
+
+        1. Call ``git_ops.materialize_member_solo(member_id, predecessor_ref)``
+           to create an isolated worktree carrying only this member's commits.
+        2. If the un-stack fails (returns None — rebase conflict), return a
+           failed result with reason='unstackable'.
+        3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
+           never advances main) and return its result.
+        """
+        from orchestrator.merge_queue import (
+            SoloVerifyResult,
+            reverify_member_solo,
+        )
+
+        member_id = str(member.get('id', ''))
+        solo_wt_info = await self.git_ops.materialize_member_solo(
+            member_id, predecessor_ref,
+        )
+        if solo_wt_info is None:
+            return SoloVerifyResult(
+                member_id=member_id,
+                passed=False,
+                merge_sha=None,
+                reason='unstackable',
+            )
+        return await reverify_member_solo(
+            self.git_ops,
+            member_id=member_id,
+            solo_wt=solo_wt_info.path,
+            solo_branch=solo_wt_info.branch,
+            tip_sha=solo_wt_info.tip_sha,
+            config=self.config,
+            task_files=self._task_files,
+            module_configs=self._module_configs,
+            event_store=self.event_store,
+        )
+
     async def _attribute_train_failure(
         self,
         result: object,
@@ -5092,18 +5134,68 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Design (δ):
         - For each member root→tip, un-stack its own delta onto current main via
-          ``git_ops.materialize_member_solo``, then verify-only via
-          ``merge_queue.reverify_member_solo`` (never advance).
-        - Partition into passers / failers.
-        - All pass → genuine cross-member INTERACTION: escalate the train, land nothing.
-        - Some fail → land each passer via ``advance_main``; block each failer.
-
-        This stub delegates to ``_mark_blocked`` so the suite stays green while
-        steps 10/12/14 add the real per-member logic.
+          ``_reverify_one_member`` (wraps materialize_member_solo +
+          reverify_member_solo; never advances).  Exactly N solo verifies.
+        - Partition into passers / failers (un-stack conflict → failer).
+        - All pass → genuine cross-member INTERACTION: emit train_derailed
+          (verdict='interaction'), escalate the train, land nothing.
+        - Some fail → land each passer, block each failer (steps 12/14).
         """
-        # Real implementation added in steps 10, 12, 14.
+        member_ids = [str(m.get('id', '')) for m in members]
+        branch_prefix = self.git_ops.config.branch_prefix
+        main_branch = self.git_ops.config.main_branch
+
+        logger.info(
+            'Task %s: train %r union verify failed — re-verifying %d members as singles',
+            self.task_id, train_id, len(members),
+        )
+
+        # Collect per-member solo verify results (root→tip; N verifies total).
+        solo_results: list[SoloVerifyResult] = []
+        for i, member in enumerate(members):
+            predecessor_ref = (
+                main_branch if i == 0
+                else f'{branch_prefix}{members[i - 1].get("id", "")}'
+            )
+            solo = await self._reverify_one_member(member, predecessor_ref)
+            solo_results.append(solo)
+            logger.debug(
+                'Task %s: member %s solo verify: passed=%s reason=%r',
+                self.task_id, solo.member_id, solo.passed, solo.reason,
+            )
+
+        failers = [r for r in solo_results if not r.passed]
+
+        if not failers:
+            # ALL pass → genuine cross-member interaction; escalate train, land nothing.
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.train_derailed,
+                    task_id=self.task_id,
+                    phase='merge',
+                    data={
+                        'train_id': train_id,
+                        'member_task_ids': member_ids,
+                        'verdict': 'interaction',
+                        'members': member_ids,
+                        'derail_reason': (
+                            f'All {len(members)} members pass solo — '
+                            'failure is a cross-member interaction'
+                        ),
+                    },
+                )
+            return await self._mark_blocked(
+                f'Train {train_id!r} union verify failed but all '
+                f'{len(members)} members pass solo — cross-member interaction',
+                escalate_to_human=True,
+            )
+
+        # Some fail → land passers, block failers (steps 12/14).
+        # Stub: delegate to _mark_blocked until step-12 implements landing.
+        offender_ids = [r.member_id for r in failers]
         return await self._mark_blocked(
-            f'Train {train_id!r} union verify failed — per-member attribution pending',
+            f'Train {train_id!r} union verify failed — '
+            f'offenders: {offender_ids}',
             escalate_to_human=True,
         )
 
