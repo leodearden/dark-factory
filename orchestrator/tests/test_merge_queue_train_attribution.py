@@ -302,36 +302,54 @@ class TestReverifyMemberSoloContract:
         git_ops.advance_main.assert_not_called()
 
     async def test_solo_worktree_cleaned_up_on_pass(self) -> None:
-        """Solo worktree is cleaned up after verification passes."""
-        from orchestrator.merge_queue import reverify_member_solo
+        """Pass-path: worktree+branch are RETAINED (handed off to _attribute_train_failure).
+
+        Step-17 revision: the old contract (unconditional cleanup) is wrong for the pass
+        path — advance_main needs the worktree alive.  cleanup_merge_worktree must NOT
+        be called and delete_solo_branch must NOT be called on the pass path.
+        solo_wt and solo_branch must be populated in the returned result.
+        """
+        from orchestrator.merge_queue import SoloVerifyResult, reverify_member_solo
 
         git_ops = _make_git_ops_mock()
+        git_ops.delete_solo_branch = AsyncMock()
         solo_wt = Path('/tmp/fake-solo-wt-pass')
+        solo_branch = '_solo-b2'
         config = MagicMock()
 
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
             new=AsyncMock(return_value=None),
         ):
-            await reverify_member_solo(
+            result = await reverify_member_solo(
                 git_ops=git_ops,
                 member_id='b2',
                 solo_wt=solo_wt,
-                solo_branch='_solo-b2',
+                solo_branch=solo_branch,
                 tip_sha='abc123',
                 config=config,
                 task_files=None,
                 module_configs=[],
             )
 
-        git_ops.cleanup_merge_worktree.assert_called_once_with(solo_wt)
+        # Pass path: worktree and branch are left intact for advance_main
+        git_ops.cleanup_merge_worktree.assert_not_called()
+        git_ops.delete_solo_branch.assert_not_called()
+
+        # solo_wt and solo_branch populated for handoff
+        assert isinstance(result, SoloVerifyResult)
+        assert result.passed is True
+        assert result.solo_wt == solo_wt
+        assert result.solo_branch == solo_branch
 
     async def test_solo_worktree_cleaned_up_on_fail(self) -> None:
-        """Solo worktree is cleaned up after verification fails."""
+        """Fail-path: cleanup_merge_worktree AND delete_solo_branch are both called."""
         from orchestrator.merge_queue import reverify_member_solo
 
         git_ops = _make_git_ops_mock()
+        git_ops.delete_solo_branch = AsyncMock()
         solo_wt = Path('/tmp/fake-solo-wt-fail')
+        solo_branch = '_solo-b1'
         config = MagicMock()
 
         fail_outcome = MergeOutcome('blocked', reason='tests failed', failure_category='x')
@@ -344,11 +362,13 @@ class TestReverifyMemberSoloContract:
                 git_ops=git_ops,
                 member_id='b1',
                 solo_wt=solo_wt,
-                solo_branch='_solo-b1',
+                solo_branch=solo_branch,
                 tip_sha='xyz789',
                 config=config,
                 task_files=None,
                 module_configs=[],
             )
 
+        # Fail path: both worktree and branch are torn down
         git_ops.cleanup_merge_worktree.assert_called_once_with(solo_wt)
+        git_ops.delete_solo_branch.assert_called_once_with(solo_branch)
