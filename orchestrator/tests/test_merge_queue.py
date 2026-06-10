@@ -17995,3 +17995,70 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         assert ephemeral in worker._owned_merge_worktrees, (
             'Ephemeral _merge-<id> path must be added to ledger'
         )
+
+    async def test_heartbeat_loop_touches_ledger_and_freezes_on_stop(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """_heartbeat_loop wires touch into per-tick; mtime freezes after stop().
+
+        Scenario:
+          1. Monkeypatch _HEARTBEAT_POLL_S to a small value (0.02 s).
+          2. Set _heartbeat_interval_s high (9999 s) so rate-limited log stays quiet.
+          3. Create a real _merge-* worktree; register it; force mtime to 0.
+          4. Start _heartbeat_loop as a standalone task (set _running=True).
+          5. Poll ≤ 1 s asserting mtime advanced to near-now (touched).
+          6. Set _running=False, cancel/await task; record mtime.
+          7. Sleep > 2× poll; assert mtime unchanged (frozen).
+
+        RED because _heartbeat_loop does not call _touch_owned_merge_worktrees yet.
+        """
+        import os as _os
+        import orchestrator.merge_queue as mq_mod
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker._heartbeat_interval_s = 9999.0  # suppress rate-limited log
+
+        # Build a real _merge-* worktree
+        wt = await _make_branch_with_file(git_ops, 'hb-loop-test', 'f.py', 'x = 1\n')
+        merge_result = await git_ops.merge_to_main(wt, 'hb-loop-test')
+        assert merge_result.success
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        worker._owned_merge_worktrees.add(merge_wt)
+        _os.utime(str(merge_wt), (0, 0))
+        assert merge_wt.stat().st_mtime == 0
+
+        # Start heartbeat with fast poll
+        original_poll = mq_mod._HEARTBEAT_POLL_S
+        mq_mod._HEARTBEAT_POLL_S = 0.02
+        worker._running = True
+        task = asyncio.create_task(worker._heartbeat_loop())
+        try:
+            # Poll up to 1 s for mtime to advance
+            deadline = asyncio.get_event_loop().time() + 1.0
+            while asyncio.get_event_loop().time() < deadline:
+                if merge_wt.stat().st_mtime > time.time() - 5:
+                    break
+                await asyncio.sleep(0.05)
+            assert merge_wt.stat().st_mtime > time.time() - 5, (
+                f'mtime not advanced after heartbeat loop ran; '
+                f'st_mtime={merge_wt.stat().st_mtime}'
+            )
+        finally:
+            worker._running = False
+            task.cancel()
+            import contextlib as _cl
+            with _cl.suppress(asyncio.CancelledError):
+                await task
+            mq_mod._HEARTBEAT_POLL_S = original_poll
+
+        # After stop: mtime must freeze
+        frozen_mtime = merge_wt.stat().st_mtime
+        await asyncio.sleep(0.12)  # > 2× poll
+        assert merge_wt.stat().st_mtime == frozen_mtime, (
+            'mtime advanced after worker stopped — heartbeat leaked'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
