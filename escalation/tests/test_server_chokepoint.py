@@ -2796,3 +2796,63 @@ class TestBoundaryTableMcpSurface:
         # Cleanup
         req = mq.get_nowait()
         req.result.cancel()
+
+    async def test_scenario_superseded_ring_tier(
+        self, tmp_path: Path,
+    ) -> None:
+        """Superseded surface via retention ring (Tier 2).
+
+        Record two TerminalOutcomeRecords directly into the ring:
+          1. absorbed request (state='superseded', superseded_by='mr-train')
+          2. train request    (state='done', merge_sha='sha-train')
+
+        Assert:
+          - merge_status(request_id='mr-absorbed') → state='superseded', outcome='superseded',
+            superseded_by='mr-train'
+          - merge_status(request_id='mr-train')    → state='done'
+
+        RED: _map_terminal_state collapses 'superseded' → 'blocked', and the ring meta
+        never threads superseded_by, so neither assertion passes until step-2 impl.
+        """
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+
+        retention = TerminalOutcomeRetention()
+        server, _, _, _, _ = _build_merge_server(tmp_path, retention=retention)
+
+        # Record absorbed request into ring
+        retention.record(TerminalOutcomeRecord(
+            request_id='mr-absorbed',
+            task_id='task-absorbed',
+            branch='branch-absorbed',
+            state='superseded',
+            superseded_by='mr-train',
+        ))
+        # Record train request into ring
+        retention.record(TerminalOutcomeRecord(
+            request_id='mr-train',
+            task_id='task-train',
+            branch='branch-train',
+            state='done',
+            merge_sha='sha-train',
+        ))
+
+        # Assert absorbed → state='superseded', outcome='superseded', superseded_by='mr-train'
+        status_absorbed = await _call_merge_status(server, request_id='mr-absorbed')
+        assert status_absorbed.get('state') == 'superseded', (
+            f"Expected state='superseded' for absorbed request, got: {status_absorbed}"
+        )
+        assert status_absorbed.get('outcome') == 'superseded', (
+            f"Expected outcome='superseded' for absorbed request, got: {status_absorbed}"
+        )
+        assert status_absorbed.get('superseded_by') == 'mr-train', (
+            f"Expected superseded_by='mr-train', got: {status_absorbed}"
+        )
+
+        # Assert train → state='done'
+        status_train = await _call_merge_status(server, request_id='mr-train')
+        assert status_train.get('state') == 'done', (
+            f"Expected state='done' for train request, got: {status_train}"
+        )
