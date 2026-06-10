@@ -5,13 +5,21 @@ born-at-L2 alarm on divergence.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 # ---------------------------------------------------------------------------
 # Step-1: cadence predicate _shadow_compare_due
 # ---------------------------------------------------------------------------
 
-from orchestrator.merge_queue import ShadowCompareState, _shadow_compare_due  # noqa: E402
+from orchestrator.merge_queue import (  # noqa: E402
+    ShadowCompareState,
+    _load_shadow_compare_state,
+    _save_shadow_compare_state,
+    _shadow_compare_due,
+)
 
 
 class TestShadowCompareDue:
@@ -132,3 +140,88 @@ class TestShadowCompareDue:
         assert _shadow_compare_due(
             state, now, every_n_merges=40, nightly_interval_secs=86400.0
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# Step-3: persisted cadence state load/save round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestShadowCompareStatePersistence:
+    """Unit tests for _load_shadow_compare_state + _save_shadow_compare_state."""
+
+    def test_load_returns_default_when_file_missing(self, tmp_path: Path) -> None:
+        state = _load_shadow_compare_state(tmp_path / "nonexistent.json")
+        assert state == ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=0.0)
+
+    def test_load_returns_default_on_corrupt_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "shadow.json"
+        path.write_text("{ not valid json !!!")
+        state = _load_shadow_compare_state(path)
+        assert state == ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=0.0)
+
+    def test_load_returns_default_on_empty_json_object(self, tmp_path: Path) -> None:
+        # Missing keys → fail-safe default
+        path = tmp_path / "shadow.json"
+        path.write_text("{}")
+        state = _load_shadow_compare_state(path)
+        assert state == ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=0.0)
+
+    def test_round_trip_preserves_all_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / "shadow.json"
+        original = ShadowCompareState(merges_since_last_shadow=17, last_shadow_run_at=1234567.89)
+        _save_shadow_compare_state(path, original)
+        loaded = _load_shadow_compare_state(path)
+        assert loaded.merges_since_last_shadow == 17
+        assert loaded.last_shadow_run_at == pytest.approx(1234567.89, rel=1e-9)
+
+    def test_round_trip_counter_zero_timestamp_zero(self, tmp_path: Path) -> None:
+        path = tmp_path / "shadow.json"
+        original = ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=0.0)
+        _save_shadow_compare_state(path, original)
+        loaded = _load_shadow_compare_state(path)
+        assert loaded == original
+
+    def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
+        path = tmp_path / "a" / "b" / "c" / "shadow.json"
+        state = ShadowCompareState(merges_since_last_shadow=5, last_shadow_run_at=99.0)
+        _save_shadow_compare_state(path, state)
+        assert path.exists()
+
+    def test_save_writes_valid_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "shadow.json"
+        state = ShadowCompareState(merges_since_last_shadow=3, last_shadow_run_at=42.0)
+        _save_shadow_compare_state(path, state)
+        data = json.loads(path.read_text())
+        assert "merges_since_last_shadow" in data
+        assert "last_shadow_run_at" in data
+        assert data["merges_since_last_shadow"] == 3
+
+    def test_simulated_restart_cadence_count_survives(self, tmp_path: Path) -> None:
+        """Simulate 3 separate process restarts; counter must accumulate then reset."""
+        path = tmp_path / "shadow.json"
+        # Restart 1: load default (0), increment, not due yet, save
+        state = _load_shadow_compare_state(path)
+        state = ShadowCompareState(
+            merges_since_last_shadow=state.merges_since_last_shadow + 10,
+            last_shadow_run_at=state.last_shadow_run_at,
+        )
+        _save_shadow_compare_state(path, state)
+        # Restart 2: load (10), increment, still not due
+        state = _load_shadow_compare_state(path)
+        assert state.merges_since_last_shadow == 10
+        state = ShadowCompareState(
+            merges_since_last_shadow=state.merges_since_last_shadow + 10,
+            last_shadow_run_at=state.last_shadow_run_at,
+        )
+        _save_shadow_compare_state(path, state)
+        # Restart 3: load (20), trigger fires at 20, reset
+        state = _load_shadow_compare_state(path)
+        assert state.merges_since_last_shadow == 20
+        assert _shadow_compare_due(state, 1.0, every_n_merges=20, nightly_interval_secs=86400.0)
+        # Reset after trigger
+        state = ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=9999.0)
+        _save_shadow_compare_state(path, state)
+        state = _load_shadow_compare_state(path)
+        assert state.merges_since_last_shadow == 0
+        assert state.last_shadow_run_at == pytest.approx(9999.0)
