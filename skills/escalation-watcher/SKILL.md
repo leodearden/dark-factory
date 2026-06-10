@@ -638,6 +638,57 @@ relationship in your resolution text.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
+## Red-on-main recovery (enforce-safe, break-glass)
+
+When a bad merge has turned `main` RED and the ref must be moved to a known-good SHA, use the `recover_main` CLI for a **single atomic sanctioned move**. This avoids the rewind-then-readvance back-and-forth that produces a net no-op (the jun9 fumble: f4101683→4001d48d→f4101683), and logs the move as `SANCTIONED` under the watched project's main-gate ENFORCE policy.
+
+### Prerequisite check
+
+- The watched project's `project_root` working tree must be **clean** (no uncommitted WIP). The CLI does not stash/pop — that is out of scope for a break-glass operation.
+- Confirm the watched project's `orchestrator.yaml` has `git.main_gate_mark_command` set. If not, the move is still atomic but will not be sanctioned by the reference-transaction hook (use the bypass fallback below instead).
+
+### Step 1 — Identify the bad merge and good target
+
+```bash
+# In the WATCHED project's repo:
+git log --oneline -10 main
+# Find the last known-good SHA (pre-bad-merge) and the current bad SHA.
+```
+
+- `<good-sha>` = the commit you want to restore `main` to (pre-bad-merge)
+- `<current-main>` = current value of `refs/heads/main` (the bad merge; CAS old-value)
+
+### Step 2 — Perform the single atomic sanctioned move
+
+Run from `$DARK_FACTORY_ROOT`:
+
+```bash
+.venv/bin/python -m orchestrator.recover_main \
+  --project-root <watched-project-root> \
+  --config <watched-orchestrator.yaml, e.g. orchestrator/config.yaml> \
+  --target-sha <good-sha> \
+  --expected-main <current-main>
+```
+
+Parse JSON output: `{"result": "rewound"|"cas_failed", "target_sha": "..."}`.
+
+- `rewound` (exit 0): `main` is now at `<good-sha>`; proceed to step 3.
+- `cas_failed` (exit 1): another writer moved the ref first. Re-read current `main` and retry — or escalate to the human if the situation is unclear.
+
+### Step 3 — Re-advance the fix through the normal merge queue
+
+Once `main` is at the good SHA, the fix commit must land through the normal merge queue (already sanctioned by `advance_main`). Do **not** repeat a raw `git update-ref` — use the queue.
+
+### Break-glass bypass fallback (no `main_gate_mark_command` configured)
+
+If the watched project's gate is under ENFORCE but no `main_gate_mark_command` is configured, the gate itself may honor a project-specific break-glass bypass. Check the watched project's config for:
+
+- **Environment variable**: `<PROJ>_MAIN_GATE_BYPASS=1` (e.g. `REIFY_MAIN_GATE_BYPASS=1`)
+- **Git config key**: `git config <proj>.mainGate.bypass true` in the watched repo
+- **Flag file**: a sentinel file under the repo's git common-dir (path from the watched project's gate config)
+
+These are gate-side controls read by the watched project's reference-transaction hook — they are not dark-factory settings. Consult the watched project's gate documentation for the exact knob. Once the bypass is set, a raw `git update-ref` in the watched repo will be allowed through; clear the bypass immediately after.
+
 ## Failure Modes
 
 **"Too many open files" (historical — no longer expected)**: Early sessions could exhaust the background-task fd pool after ~35 watcher restart cycles. This is no longer observed in practice — 100+ cycle sessions are routine. The watcher exits promptly via `sys.exit(0)`, so its inotify fd is reclaimed by the kernel and the background task is reaped shortly after. If you ever do hit it, start a fresh Claude Code session.
