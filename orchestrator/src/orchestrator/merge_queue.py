@@ -6470,6 +6470,70 @@ def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
     return every_n > 0 and attempt_count > 0 and attempt_count % every_n == 0
 
 
+# ---------------------------------------------------------------------------
+# PRD §10 invariant 6(b): warm-vs-cold SHADOW compare cadence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShadowCompareState:
+    """Persisted cadence state for the warm-vs-cold shadow compare.
+
+    Stored as JSON at ``config.project_root/data/orchestrator/warm_verify_shadow.json``
+    so both cadence conditions survive orchestrator restarts.
+
+    Fields:
+        merges_since_last_shadow: Count of warm-verified lands since the last
+            shadow compare run.  Reset to 0 when a shadow compare is triggered.
+        last_shadow_run_at: Unix timestamp (float) of the last shadow compare
+            trigger.  0.0 when no shadow compare has ever run.
+    """
+
+    merges_since_last_shadow: int = 0
+    last_shadow_run_at: float = 0.0
+
+
+def _shadow_compare_due(
+    state: ShadowCompareState,
+    now: float,
+    *,
+    every_n_merges: int,
+    nightly_interval_secs: float,
+) -> bool:
+    """Return True when a shadow compare should be triggered.
+
+    Implements PRD §10 invariant 6(b) "whichever sooner" = OR cadence:
+    a shadow compare fires when EITHER the merge-count leg OR the nightly-timer
+    leg is satisfied.
+
+    Count leg: fires when ``state.merges_since_last_shadow >= every_n_merges``
+        (provided ``every_n_merges > 0``; 0 disables the count leg entirely).
+
+    Nightly leg: fires when ``now - state.last_shadow_run_at >= nightly_interval_secs``
+        (provided ``nightly_interval_secs > 0``; 0 disables the timer leg).
+
+    Args:
+        state: Current persisted cadence state.
+        now: Current Unix timestamp (time.time()).
+        every_n_merges: From ``config.git.warm_verify_shadow_compare_every_n_merges``.
+            0 → count leg disabled.
+        nightly_interval_secs: From
+            ``config.git.warm_verify_shadow_compare_nightly_interval_secs``.
+            0 → timer leg disabled.
+
+    Returns:
+        True when at least one trigger condition is met.
+    """
+    count_due = (
+        every_n_merges > 0
+        and state.merges_since_last_shadow >= every_n_merges
+    )
+    timer_due = (
+        nightly_interval_secs > 0
+        and (now - state.last_shadow_run_at) >= nightly_interval_secs
+    )
+    return count_due or timer_due
+
+
 async def _acquire_warm_verify_worktree(
     git_ops: GitOps,
     req: MergeRequest,
