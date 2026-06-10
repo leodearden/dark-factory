@@ -2062,17 +2062,22 @@ def create_mcp_server(
                 # When page_size is None the response is the full untouched list (no
                 # ``pagination`` key), preserving backward compatibility for the scheduler.
                 if page_size is not None:
-                    all_tasks = result.get('tasks', [])
-                    total = len(all_tasks)
-                    page = all_tasks[offset:offset + page_size]
-                    result['tasks'] = page
-                    result['pagination'] = {
-                        'total': total,
-                        'offset': offset,
-                        'page_size': page_size,
-                        'returned': len(page),
-                        'has_more': offset + len(page) < total,
-                    }
+                    all_tasks = result.get('tasks')
+                    # Only paginate when tasks is a proper list — a non-standard backend
+                    # could return None or a dict; in that case skip pagination and leave
+                    # the result untouched rather than masking the real failure with a
+                    # generic slicing error.
+                    if isinstance(all_tasks, list):
+                        total = len(all_tasks)
+                        page = all_tasks[offset:offset + page_size]
+                        result['tasks'] = page
+                        result['pagination'] = {
+                            'total': total,
+                            'offset': offset,
+                            'page_size': page_size,
+                            'returned': len(page),
+                            'has_more': offset + len(page) < total,
+                        }
 
                 await _log_read(
                     'get_tasks',

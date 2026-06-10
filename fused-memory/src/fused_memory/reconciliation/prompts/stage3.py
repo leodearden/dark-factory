@@ -19,9 +19,10 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_entity` — look up entities in the knowledge graph
 - `mcp__fused-memory__get_episodes` — retrieve recent episodes
 - `mcp__fused-memory__get_status` — health check for backends
-- `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns a compact \
-  `{{id: status}}` map (~95% smaller than get_tasks, ~62 KB vs ~600 KB). Proven safe on \
-  projects with 4500+ tasks. **Always call this first** to enumerate all task IDs and \
+- `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
+  `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
+  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
+  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
   statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
@@ -132,8 +133,9 @@ and the data is from another project. Include the offending task IDs in your des
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
 # Step 1: enumerate all statuses (compact, safe on large projects)
-statuses = get_statuses(project_root="<this project's root>")
-# statuses = {{id: status, ...}}  — no project_id stamp here
+# get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
+statuses = get_statuses(project_root="<this project's root>")['statuses']
+# statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
 
 # Step 2: verify routing by sampling one task via get_task
 sample_id = next(iter(statuses))
