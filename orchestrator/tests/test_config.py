@@ -1007,6 +1007,29 @@ class TestMergeVerifyStormGuardFields:
         assert config.max_concurrent_module_verifies == 8
         assert config.verify_use_cgroup_scope is True
 
+
+class TestTrainFormerConfigFields:
+    """Defaults and constraint for the β train-former config knobs."""
+
+    def test_defaults(self):
+        config = OrchestratorConfig()
+        # Former is OFF by default so β can land before γ/δ complete the chain.
+        assert config.merge_train_former_enabled is False
+        # s(N) go/no-go resolved GO at N=3 (reify esc-4455-16).
+        assert config.merge_train_max_members == 3
+
+    def test_overrides_accepted(self):
+        config = OrchestratorConfig(
+            merge_train_former_enabled=True,
+            merge_train_max_members=5,
+        )
+        assert config.merge_train_former_enabled is True
+        assert config.merge_train_max_members == 5
+
+    def test_max_members_rejects_below_2(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(merge_train_max_members=1)
+
     def test_max_concurrent_module_verifies_floor(self):
         with pytest.raises(ValidationError):
             OrchestratorConfig(max_concurrent_module_verifies=0)
