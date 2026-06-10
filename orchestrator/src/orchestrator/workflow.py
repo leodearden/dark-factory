@@ -976,7 +976,7 @@ class TaskWorkflow:
         )
         return True
 
-    async def _maybe_defer_as_train_member(self) -> 'WorkflowOutcome | None':
+    async def _maybe_defer_as_train_member(self) -> WorkflowOutcome | None:
         """Merge-decision routing helper (PRD §7 β, design decision 4).
 
         Encapsulates the "form-or-defer-or-fall-through" logic so it can be
