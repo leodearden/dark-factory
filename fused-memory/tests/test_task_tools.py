@@ -1233,3 +1233,57 @@ async def test_get_tasks_pagination_slices_and_reports_metadata(
     assert result3.get('tasks') == [], f'Expected empty list, got: {result3.get("tasks")}'
     assert result3['pagination']['returned'] == 0
     assert result3['pagination']['has_more'] is False
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_pagination_validation_and_backward_compat(
+    mcp_server_with_tasks, task_interceptor
+):
+    """get_tasks pagination: backward-compat + input validation.
+
+    (a) Backward-compat: no page_size → full list returned, no 'pagination' key.
+    (b) page_size=0  → ValidationError, interceptor NOT called.
+    (c) page_size=-1 → ValidationError, interceptor NOT called.
+    (d) offset=-1 with page_size=2 → ValidationError, interceptor NOT called.
+    """
+    # (a) Backward-compat: default call (no page_size)
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory'},
+    )
+    assert result.get('tasks') == _FIVE_TASKS, (
+        f'Backward-compat: full list expected, got: {result.get("tasks")}'
+    )
+    assert 'pagination' not in result, (
+        f'Backward-compat: pagination key must be absent, got: {result}'
+    )
+
+    # (b) page_size=0 → ValidationError
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    bad0 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': 0},
+    )
+    assert bad0.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=0, got: {bad0}'
+    assert 'page_size' in bad0.get('error', '').lower(), f'Error message should mention page_size: {bad0}'
+    task_interceptor.get_tasks.assert_not_awaited()
+
+    # (c) page_size=-1 → ValidationError
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    bad_neg = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': -1},
+    )
+    assert bad_neg.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=-1, got: {bad_neg}'
+    task_interceptor.get_tasks.assert_not_awaited()
+
+    # (d) offset=-1 with page_size=2 → ValidationError
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    bad_off = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': 2, 'offset': -1},
+    )
+    assert bad_off.get('error_type') == 'ValidationError', f'Expected ValidationError for offset=-1, got: {bad_off}'
+    assert 'offset' in bad_off.get('error', '').lower(), f'Error message should mention offset: {bad_off}'
+    task_interceptor.get_tasks.assert_not_awaited()
