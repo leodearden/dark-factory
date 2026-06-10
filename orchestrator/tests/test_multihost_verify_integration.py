@@ -20,15 +20,21 @@ Headline λ gate: test_end_to_end_throughput_gate_direction_and_provenance_and_z
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.merge_queue import (
+    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    PersistentWorktreeConfigError,
+    check_merge_liveness_margin,
+    enforce_persistent_worktree_serial_lane,
+)
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     DriftDetector,
@@ -36,18 +42,9 @@ from orchestrator.verify_runner import (
     MergeVerifySpec,
     RunnerUnavailable,
     UnscopedTypecheckSpec,
-    VerifyCommand,
-    VerifyRunner,
     VerifyRunnerPool,
     run_verdict_parity,
 )
-from orchestrator.merge_queue import (
-    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
-    PersistentWorktreeConfigError,
-    check_merge_liveness_margin,
-    enforce_persistent_worktree_serial_lane,
-)
-from orchestrator.config import GitConfig, OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Module-level builder helpers (mirror test_verify_runner.py pattern)
@@ -112,18 +109,26 @@ class _RecordingEventStore:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _FakeRunner:
-    """Fake VerifyRunner that returns deterministic results without real I/O.
+class _FakeRunnerBase:
+    """Fake VerifyRunner base — subclasses fix is_local as a ClassVar for protocol conformance.
 
     Implements the VerifyRunner protocol: name, is_local, health(), run_merge_verify().
     """
 
-    name: str
-    is_local: bool
-    service_secs: float = 1.0
-    unavailable: bool = False
-    verdict_map: dict[str, bool] | None = None
+    is_local: ClassVar[bool]
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        service_secs: float = 1.0,
+        unavailable: bool = False,
+        verdict_map: dict[str, bool] | None = None,
+    ) -> None:
+        self.name = name
+        self.service_secs = service_secs
+        self.unavailable = unavailable
+        self.verdict_map = verdict_map
 
     async def health(self) -> bool:
         return not self.unavailable
@@ -133,11 +138,33 @@ class _FakeRunner:
     ) -> VerifyResult:
         if self.unavailable:
             raise RunnerUnavailable(f'runner {self.name!r} is unavailable')
-        if self.verdict_map is not None:
-            passed = self.verdict_map.get(merge_sha, True)
-        else:
-            passed = True
+        passed = self.verdict_map.get(merge_sha, True) if self.verdict_map is not None else True
         return _make_result(passed)
+
+
+class _LocalFakeRunner(_FakeRunnerBase):
+    """Fake local runner (is_local=True)."""
+
+    is_local: ClassVar[bool] = True
+
+
+class _RemoteFakeRunner(_FakeRunnerBase):
+    """Fake remote runner (is_local=False)."""
+
+    is_local: ClassVar[bool] = False
+
+
+def _FakeRunner(
+    name: str,
+    *,
+    is_local: bool,
+    service_secs: float = 1.0,
+    unavailable: bool = False,
+    verdict_map: dict[str, bool] | None = None,
+) -> _LocalFakeRunner | _RemoteFakeRunner:
+    """Factory — return a protocol-conformant fake runner for the given locality."""
+    cls: type[_LocalFakeRunner | _RemoteFakeRunner] = _LocalFakeRunner if is_local else _RemoteFakeRunner
+    return cls(name, service_secs=service_secs, unavailable=unavailable, verdict_map=verdict_map)
 
 
 @dataclass
@@ -228,7 +255,7 @@ async def run_backlog_window(
 
     # Derive peak concurrency from overlapping virtual-time spans.
     peak = 0
-    for i, (_, _, s_a, e_a) in enumerate(spans):
+    for _i, (_, _, s_a, e_a) in enumerate(spans):
         concurrent = sum(1 for _, _, s_b, e_b in spans if s_b < e_a and s_a < e_b)
         if concurrent > peak:
             peak = concurrent
