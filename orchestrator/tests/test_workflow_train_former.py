@@ -182,3 +182,101 @@ class TestLineRangesStackable:
         a = {'src/foo.rs': [(10, 20)], 'src/bar.rs': [(1, 5)]}
         b = {'src/foo.rs': [(15, 25)], 'src/baz.rs': [(100, 110)]}
         assert fn(a, b) is False
+
+
+# ---------------------------------------------------------------------------
+# step-9: _select_train_members — pure selection tests
+# ---------------------------------------------------------------------------
+
+
+class TestSelectTrainMembers:
+    """Unit tests for _select_train_members pure selection function."""
+
+    def _fn(self):
+        from orchestrator.workflow import _select_train_members
+        return _select_train_members
+
+    def _ranges(self, file: str, start: int, end: int) -> dict[str, list[tuple[int, int]]]:
+        return {file: [(start, end)]}
+
+    def test_anchor_plus_two_stackable_candidates(self):
+        """Anchor + 2 mutually-stackable candidates → [anchor, c1, c2]."""
+        fn = self._fn()
+        # Anchor '200' modifies lines 1-10 of foo.rs
+        # c1 '201' modifies lines 20-30 of foo.rs (no overlap with anchor)
+        # c2 '202' modifies lines 40-50 of foo.rs (no overlap with either)
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(20, 30)]},
+            '202': {'src/foo.rs': [(40, 50)]},
+        }
+        result = fn('200', ['201', '202'], ranges_by_id, max_members=3)
+        assert result == ['200', '201', '202']
+
+    def test_candidate_overlapping_anchor_excluded(self):
+        """A candidate overlapping the anchor is excluded from the train."""
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 20)]},
+            '201': {'src/foo.rs': [(15, 30)]},  # overlaps anchor
+        }
+        result = fn('200', ['201'], ranges_by_id, max_members=3)
+        # Only anchor, so <2 members → returns []
+        assert result == []
+
+    def test_candidate_overlapping_already_selected_member_excluded(self):
+        """Mutual stackability: a candidate overlapping an already-selected member is excluded."""
+        fn = self._fn()
+        # c1 is stackable with anchor (200); c2 overlaps c1 but not anchor
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(20, 30)]},   # stackable with anchor
+            '202': {'src/foo.rs': [(25, 35)]},   # overlaps c1 → excluded
+        }
+        result = fn('200', ['201', '202'], ranges_by_id, max_members=3)
+        assert result == ['200', '201']
+
+    def test_cap_honored(self):
+        """3 mutually-stackable candidates but max=2 → exactly 2 members."""
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(20, 30)]},
+            '202': {'src/foo.rs': [(40, 50)]},
+            '203': {'src/foo.rs': [(60, 70)]},
+        }
+        result = fn('200', ['201', '202', '203'], ranges_by_id, max_members=2)
+        assert len(result) == 2
+        assert result[0] == '200'  # anchor always first
+
+    def test_fewer_than_2_total_returns_empty(self):
+        """Lone anchor (no stackable candidates) → returns [] sentinel for no-train."""
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+        }
+        result = fn('200', [], ranges_by_id, max_members=3)
+        assert result == []
+
+    def test_deterministic_order(self):
+        """Candidates are processed in sorted id order for determinism."""
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(20, 30)]},
+            '202': {'src/foo.rs': [(40, 50)]},
+        }
+        # Shuffle candidate order — result should still be ['200','201','202']
+        r1 = fn('200', ['202', '201'], ranges_by_id, max_members=3)
+        r2 = fn('200', ['201', '202'], ranges_by_id, max_members=3)
+        assert r1 == r2 == ['200', '201', '202']
+
+    def test_anchor_always_order_0(self):
+        """Anchor is always the first element (order-0) in the returned list."""
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(20, 30)]},
+        }
+        result = fn('200', ['201'], ranges_by_id, max_members=3)
+        assert result[0] == '200'
