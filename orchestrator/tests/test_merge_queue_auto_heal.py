@@ -38,6 +38,11 @@ from orchestrator.workflow import (  # type: ignore[attr-defined]
 
 MAIN_SHA = 'deadbeef1234567890'
 
+# Fixed synthetic root for tests that hold no pytest tmp_path (pure-unit
+# registry checks that never reach shadow-persistence code paths).
+# ANY test that could reach _save_shadow_compare_state MUST pass its own
+# pytest tmp_path instead — _DEFAULT_FAKE_ROOT is a process-shared /tmp path
+# and writes would escape pytest's tmp_path isolation sandbox.
 _DEFAULT_FAKE_ROOT = Path('/tmp/df-test-root')
 
 
@@ -52,8 +57,12 @@ def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
     Using a wired project_root prevents bare-spec mocks from breaking when
     SpeculativeMergeWorker.__init__ reads ``git_ops.project_root`` — which is an
     instance attribute (git_ops.py:474) and therefore absent on a spec-only mock.
-    Call sites that hold a tmp_path should pass it; otherwise the default fake
-    root is used.
+
+    Pass the pytest ``tmp_path`` fixture wherever one is available.  The
+    ``_DEFAULT_FAKE_ROOT`` default is ONLY safe for pure-unit tests (e.g. registry
+    existence checks) that can never reach ``_save_shadow_compare_state`` — it is a
+    process-shared /tmp path and would escape pytest's isolation sandbox if
+    shadow-persistence were triggered.
 
     Do NOT use this helper in tests that intentionally exercise the
     project_root-absent / None path (e.g. TestSpeculativeWorkerBareHarnessContract).
@@ -87,7 +96,7 @@ def _make_workflow(config: OrchestratorConfig, worktree: Path, *, task_metadata:
         },
         modules=['lib'],
     )
-    git_ops = _make_mock_git_ops()
+    git_ops = _make_mock_git_ops(config.project_root)
     git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
