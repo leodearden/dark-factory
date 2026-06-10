@@ -6702,6 +6702,103 @@ def _shadow_compare_due(
     return count_due or timer_due
 
 
+# Sentinel task_id used for dedup on the warm/cold shadow divergence escalation.
+# Mirrors ``_DRIFT_SENTINEL`` in verify_runner.py.
+_WARM_COLD_SHADOW_SENTINEL = '__warm_cold_shadow__'
+
+
+def _submit_shadow_divergence_escalation(
+    escalation_queue: Any,
+    merge_commit: str,
+    diff: ShadowCompareDiff,
+    warm_results: dict[str, bool],
+    cold_results: dict[str, bool],
+) -> None:
+    """Submit a born-at-L2 escalation for a warm/cold shadow divergence.
+
+    Implements PRD §10 invariant 6(b) L2 alarm.  The escalation is:
+
+    * ``severity='critical'`` (in ``BORN_AT_L2_SEVERITIES``) → born at L2
+    * ``level=2``
+    * ``agent_role='orchestrator-warm-cold-shadow'`` (``orchestrator-`` prefix →
+      harness sentinel → not downgraded by the escalation server)
+    * ``category='risk_identified'``
+    * ``task_id=_WARM_COLD_SHADOW_SENTINEL`` (dedup key)
+
+    The detail explicitly states that the warm merge has ALREADY LANDED via the
+    shadow/async lane and that the commit may be bad on main.
+
+    None-safe: if *escalation_queue* is None the function is a no-op.
+    Dedup: if an open escalation for the sentinel already exists (checked via
+    ``escalation_queue.has_open_l1``), no second submission is made.
+
+    Args:
+        escalation_queue: Live escalation queue (``EscalationQueue`` instance),
+            or ``None`` when escalation is unavailable.
+        merge_commit: Full or abbreviated SHA of the just-landed merge commit.
+        diff: Per-test divergence bucket summary from :func:`diff_per_test_results`.
+        warm_results: Per-test pass/fail map from the warm verify run.
+        cold_results: Per-test pass/fail map from the cold verify run.
+    """
+    if escalation_queue is None:
+        return
+
+    # Dedup: don't fire again while an open/pending alarm already exists.
+    if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    n_diverging = len(diff.diverging) + len(diff.only_warm) + len(diff.only_cold)
+    short_sha = merge_commit[:8]
+
+    # Build summary (must name commit[:8] and diverging test count).
+    summary = (
+        f'Warm/cold shadow divergence on {short_sha}: '
+        f'{n_diverging} diverging test(s)'
+    )
+
+    # Build detail: list diverging tests + both result sets + "already landed" statement.
+    lines: list[str] = [
+        f'Commit: {merge_commit}',
+        f'Diverging tests ({n_diverging}):',
+    ]
+    for test_id, (w, c) in sorted(diff.diverging.items()):
+        lines.append(f'  warm={w} cold={c}  {test_id}')
+    if diff.only_warm:
+        lines.append('Tests present only in warm run (absent cold):')
+        lines.extend(f'  {t}' for t in diff.only_warm)
+    if diff.only_cold:
+        lines.append('Tests present only in cold run (absent warm):')
+        lines.extend(f'  {t}' for t in diff.only_cold)
+    lines.append('')
+    lines.append('Warm results: ' + repr(warm_results))
+    lines.append('Cold results: ' + repr(cold_results))
+    lines.append('')
+    lines.append(
+        'The warm merge has ALREADY LANDED via the shadow/async lane — '
+        'this commit may be bad on main.  '
+        'Investigate the diverging tests and consider a potential rollback.'
+    )
+    detail = '\n'.join(lines)
+
+    esc = Escalation(
+        id=escalation_queue.make_id(_WARM_COLD_SHADOW_SENTINEL),
+        task_id=_WARM_COLD_SHADOW_SENTINEL,
+        agent_role='orchestrator-warm-cold-shadow',
+        severity='critical',
+        level=2,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Investigate the diverging tests on the landed merge commit; '
+            'roll back main if the cold leg reveals a real failure.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
 async def _acquire_warm_verify_worktree(
     git_ops: GitOps,
     req: MergeRequest,
