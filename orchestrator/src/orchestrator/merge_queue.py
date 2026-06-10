@@ -3852,6 +3852,11 @@ class MergeWorker(_WipHaltMixin):
         # consecutive tip-advance equivalence failure; popped on a clean 'done'
         # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
         self._generation_chain_counts: dict[str, int] = {}
+        # Persistent warm merge-verify worktree: counts verifying attempts so
+        # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
+        # Only incremented when not skip_verify; never reset so the counter
+        # covers the full worker lifetime (cross-submission).
+        self._verify_attempt_count: int = 0
         # Per-lane halt: each event is set (running) by default
         self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
         for ln in MERGE_LANES:
@@ -4078,15 +4083,21 @@ class MergeWorker(_WipHaltMixin):
                 f'(pre-rebased, main unchanged)'
             )
         # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
-        # Parity with SpeculativeMergeWorker._verify_and_advance: when the
-        # knob is ON and not due, swap the ephemeral merge_wt for the warm
-        # _merge-verify path before verify, advance_main, and cleanup.
-        # safety_valve_due=False here; step-18 wires the real predicate.
+        # Parity with SpeculativeMergeWorker._verify_and_advance: increment the
+        # per-worker verify counter and compute the safety-valve predicate so
+        # every Nth verifying attempt runs a from-scratch cold verify in a
+        # throwaway worktree (PRD §10 invariant 6).
+        # merge_result.merge_commit is non-None (asserted at line 4044 above).
         if not skip_verify:
+            self._verify_attempt_count += 1
+            _due = _safety_valve_due(
+                self._verify_attempt_count,
+                req.config.git.persistent_merge_worktree_safety_valve_every_n,
+            )
             merge_wt = await _acquire_warm_verify_worktree(
                 self._git_ops, req, merge_wt,
-                merge_result.merge_commit or '',
-                safety_valve_due=False,
+                merge_result.merge_commit,  # non-None; assert at 4044 above
+                safety_valve_due=_due,
             )
             assert merge_wt is not None  # input was non-None; warm or unchanged
         if not skip_verify:

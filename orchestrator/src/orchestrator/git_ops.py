@@ -1503,7 +1503,21 @@ class GitOps:
         warm_path = self.persistent_merge_worktree_path
 
         if not await self._is_registered_worktree(warm_path):
-            # Create-once branch
+            # Create-once branch — self-heal a stale unregistered directory first.
+            # A previous run may have left the directory on disk without a git
+            # worktree registration (e.g. worktree metadata pruned after a crash).
+            # `git worktree add` refuses a non-empty directory, permanently
+            # wedging the warm path until manual cleanup.  Removing the orphaned
+            # directory here mirrors the stale-directory removal in create_worktree
+            # and makes the create-once path self-healing.
+            if warm_path.exists():
+                logger.warning(
+                    'Persistent merge worktree path %s exists on disk but is not '
+                    'a registered git worktree; removing stale directory to allow '
+                    'fresh creation (self-heal)',
+                    warm_path,
+                )
+                shutil.rmtree(warm_path)
             warm_path.parent.mkdir(parents=True, exist_ok=True)
             rc, _, err = await _run(
                 ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
