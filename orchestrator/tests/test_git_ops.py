@@ -5614,3 +5614,103 @@ class TestRecoverRedMain:
         assert not any(c[:2] == ['sh', '-c'] for c in recorded), (
             f'Unexpected sh -c call with feature off; recorded: {recorded}'
         )
+
+    async def test_recover_unmarks_on_cas_failure(self, git_repo: Path):
+        """main_gate_unmark_command fires after a failed update-ref, clearing the sentinel.
+
+        Setup: GitOps with both mark and unmark set; patch _run to fail on
+        update-ref only; assert result=='cas_failed', mark before update-ref,
+        unmark after update-ref.  Mirrors advance_main's unmark-on-CAS-failure
+        test (TestWorkingTreeSync.test_advance_main_unmarks_on_cas_failure).
+        """
+        mark_cmd = 'echo recover-mark-unmark'
+        unmark_cmd = 'echo recover-unmark-cleanup'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            if cmd[:2] == ['git', 'update-ref']:
+                recorded.append((list(cmd), cwd))
+                return (1, '', 'CAS mismatch: refs/heads/main has been updated')
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+
+        commands = [cmd for cmd, _ in recorded]
+        mark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', mark_cmd]]
+        unmark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', unmark_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(commands)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+
+        assert len(mark_indices) >= 1, f'No mark call; commands: {commands}'
+        assert len(unmark_indices) >= 1, f'No unmark call; commands: {commands}'
+        assert len(update_ref_indices) >= 1, f'No update-ref call; commands: {commands}'
+
+        mark_idx = mark_indices[-1]
+        unmark_idx = unmark_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+
+        assert mark_idx < update_ref_idx, (
+            f'mark (idx={mark_idx}) must precede failed update-ref (idx={update_ref_idx})'
+        )
+        assert unmark_idx > update_ref_idx, (
+            f'unmark (idx={unmark_idx}) must come AFTER failed update-ref (idx={update_ref_idx}); '
+            f'commands: {commands}'
+        )
+
+    async def test_recover_no_unmark_when_unmark_command_unset(self, git_repo: Path):
+        """With main_gate_unmark_command=None, CAS failure returns 'cas_failed' without raising."""
+        mark_cmd = 'echo recover-mark-only'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                # main_gate_unmark_command intentionally unset
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            if cmd[:2] == ['git', 'update-ref']:
+                recorded.append(list(cmd))
+                return (1, '', 'CAS mismatch')
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+        # No sh -c after the update-ref failure (no unmark command set)
+        update_ref_idx = next(
+            i for i, c in enumerate(recorded)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        )
+        post_cmds = recorded[update_ref_idx + 1:]
+        assert not any(c[:2] == ['sh', '-c'] for c in post_cmds), (
+            f'Unexpected sh -c after failed update-ref with unmark unset; post: {post_cmds}'
+        )
