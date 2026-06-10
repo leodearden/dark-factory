@@ -2861,7 +2861,7 @@ class TestPersistAttemptLogs:
         import asyncio  # noqa: PLC0415
 
         from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
         ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
             worktree, attempt_id, runs, category, cause_hint
