@@ -6278,13 +6278,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if _warm_capture:
                     _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
                     if not _warm_results and req.config.git.warm_verify_shadow_compare:
-                        logger.warning(
-                            'Task %s: warm verify produced no parseable test results '
-                            'for shadow compare (merge=%s) — the parser may not match '
-                            'the project verify command output format; shadow compare '
-                            'will be skipped for this landing',
-                            req.task_id,
-                            merge_commit[:8],
+                        # Fail-closed: if tests ran but we parsed nothing, the
+                        # shadow-compare detective is silently inert — raise a
+                        # born-at-L2 alarm instead of silently skipping.
+                        _alarm_warm_shadow_unparseable(
+                            self._escalation_queue,
+                            merge_commit,
+                            _warm_capture[0].test_output or '',
                         )
             elif out.verify_skipped:
                 # Disk guard fired — run_scoped_verification was never called;
@@ -6885,9 +6885,26 @@ class ShadowCompareState:
 # ---------------------------------------------------------------------------
 
 # Matches cargo-nextest human-output test result lines.
-# Capture groups: (1) status, (2) crate name, (3) test path (rest of line)
+# Capture groups: (1) status, (2) crate/package::binary, (3) test path (rest of line)
+#
+# Real cargo-nextest 0.9.136 output (reify's merge-verify runner) inserts an
+# OPTIONAL parenthesized progress counter such as '(  1/250)' between the timing
+# bracket and the package::binary id, e.g.:
+#
+#     PASS [   0.130s] (  1/250) reify-cli::cli_affine_eval eval_x
+#
+# The non-capturing optional group ``(?:\(\s*\d+/\s*\d+\)\s+)?`` consumes and
+# DISCARDS the counter so it does not appear in the stable key
+# ``"pkg::bin test_path"``.  Without this group the regex captures the open-paren
+# '(' as the crate and folds the counter remainder into the test path, producing
+# run-specific garbage keys that break warm/cold shadow comparison.
+#
+# Backward-compatible: the group is optional, so old no-counter format and the
+# libtest branch are unaffected.
 _NEXTEST_TEST_LINE_RE = re.compile(
-    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+'
+    r'(?:\(\s*\d+/\s*\d+\)\s+)?'  # optional N/M progress counter — consumed, not captured
+    r'(\S+)\s+(\S.*?)\s*$'
 )
 
 # Matches plain `cargo test` (libtest) result lines.
@@ -6904,9 +6921,15 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
 
     * **cargo-nextest** (reify's default merge-verify runner)::
 
-          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] <crate> <path>
+          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] [(<N>/<M>)] <pkg::bin> <path>
 
-      Key: ``"<crate> <test::path>"``, value: ``True`` iff status is ``PASS``.
+      Real cargo-nextest 0.9.136 output inserts an optional parenthesized progress
+      counter ``(  N/M)`` (with internal whitespace padding) between the timing
+      bracket and the ``package::binary`` id.  The counter is consumed and
+      **excluded** from the key so that warm and cold runs (which have different
+      N/M indices) produce identical stable keys.
+
+      Key: ``"<pkg::bin> <test::path>"``, value: ``True`` iff status is ``PASS``.
       TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
 
     * **libtest** (plain ``cargo test``)::
@@ -6944,6 +6967,48 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
             test_path, status = m.group(1), m.group(2)
             result[test_path] = (status == 'ok')
     return result
+
+
+# Matches cargo-nextest Summary footer lines, e.g.:
+#   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
+#   Summary [   0.13s]   1 test run: 1 passed, 0 failed, 0 skipped   (N==1 → singular)
+#   (leading whitespace tolerated: nextest may indent the Summary footer)
+# Capture group: (1) total test count N from 'N tests run:' / 'N test run:'
+_NEXTEST_SUMMARY_LINE_RE = re.compile(
+    r'^\s*Summary\s+\[[^\]]*\]\s+(\d+)\s+tests?\s+run:',
+    re.MULTILINE,
+)
+
+
+def _nextest_reported_test_count(output: str) -> int | None:
+    """Return the total number of tests reported in nextest Summary footer line(s).
+
+    Scans all lines in *output* for the cargo-nextest human-format footer::
+
+        Summary [<timing>] N tests run: P passed, F failed, S skipped
+
+    Returns the **sum** of N across all matched Summary lines (to cover
+    multi-pass debug+release aggregate runs), or ``None`` when no Summary
+    line is found in the output.
+
+    A return value of ``0`` is distinct from ``None``:  ``0`` means a Summary
+    was found but reported zero tests run (e.g. legitimately test-free crate);
+    ``None`` means no nextest pass occurred at all (pure build noise or empty
+    output).
+
+    Used by :func:`_alarm_warm_shadow_unparseable` to discriminate between
+    a genuinely test-free merge (no alarm) and a parser failure (alarm).
+
+    Args:
+        output: Raw string from a verify run.
+
+    Returns:
+        Sum of reported test counts, or ``None`` if no Summary line present.
+    """
+    matches = _NEXTEST_SUMMARY_LINE_RE.findall(output)
+    if not matches:
+        return None
+    return sum(int(n) for n in matches)
 
 
 @dataclass
@@ -7118,6 +7183,11 @@ def _shadow_compare_due(
 # Mirrors ``_DRIFT_SENTINEL`` in verify_runner.py.
 _WARM_COLD_SHADOW_SENTINEL = '__warm_cold_shadow__'
 
+# Sentinel task_id for the fail-closed unparseable-format escalation.
+# Kept DISTINCT from _WARM_COLD_SHADOW_SENTINEL so a divergence alarm and an
+# unparseable-format alarm dedup independently.
+_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL = '__warm_cold_shadow_unparseable__'
+
 
 def _submit_shadow_divergence_escalation(
     escalation_queue: Any,
@@ -7213,6 +7283,109 @@ def _submit_shadow_divergence_escalation(
         suggested_action=(
             'Investigate the diverging tests on the landed merge commit; '
             'roll back main if the cold leg reveals a real failure.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
+def _alarm_warm_shadow_unparseable(
+    escalation_queue: Any,
+    merge_commit: str,
+    test_output: str,
+) -> None:
+    """Submit a born-at-L2 critical escalation when the warm verify is unparseable.
+
+    Fail-closed guard for the warm/cold shadow-compare detective: when the warm
+    verify output shows that tests actually RAN (a nextest Summary footer with
+    N > 0) yet :func:`parse_per_test_results` returned an empty dict, the
+    detective is silently inert for that landing — a dangerous invisible failure
+    mode.  This function converts that silent failure to an L2 alarm.
+
+    The escalation is modelled on :func:`_submit_shadow_divergence_escalation`:
+
+    * ``severity='critical'`` (in ``BORN_AT_L2_SEVERITIES``) → born at L2
+    * ``level=2``
+    * ``agent_role='orchestrator-warm-cold-shadow-unparseable'``
+      (``orchestrator-`` prefix → harness sentinel → not downgraded)
+    * ``category='risk_identified'``
+    * ``task_id=_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL`` (separate dedup key,
+      does not collide with ``_WARM_COLD_SHADOW_SENTINEL``)
+
+    The alarm is suppressed (no false positive) when *test_output* contains no
+    nextest Summary line or the Summary reports 0 tests — that case represents a
+    legitimately test-free merge.
+
+    None-safe: if *escalation_queue* is None the function is a no-op.
+    Dedup: if an open escalation for the unparseable sentinel already exists
+    (checked via ``escalation_queue.has_open_l1``), no second submission is made.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        merge_commit: Full or abbreviated SHA of the just-landed merge commit.
+        test_output: Raw ``test_output`` string from the warm :class:`VerifyResult`.
+    """
+    if escalation_queue is None:
+        return
+
+    # Discriminate: did tests actually run in this output?
+    # NOTE: _nextest_reported_test_count is nextest-only (reads cargo-nextest
+    # "Summary [..] N tests run:" footers).  A libtest-format verify run whose
+    # per-test parse fails will not match here, so the alarm is suppressed.
+    # Warm verify is expected to use cargo-nextest; libtest is not a supported
+    # warm-verify format and would fall through as reported=None (no false alarm).
+    reported = _nextest_reported_test_count(test_output)
+    if reported is None or reported == 0:
+        # Legitimately test-free merge (no nextest pass, or zero tests reported).
+        # No alarm — would be a false positive.
+        if reported is None:
+            # Leave a low-severity breadcrumb so suppressed alarms are diagnosable
+            # in the field even when no escalation is raised.
+            logger.debug(
+                'warm shadow-compare: no nextest Summary line found in warm verify '
+                'output — unparseable alarm suppressed '
+                '(legitimately test-free or non-nextest run)'
+            )
+        return
+
+    # Dedup: don't fire again while an open/pending alarm already exists.
+    if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    short_sha = merge_commit[:8]
+    summary = (
+        f'Warm/cold shadow-compare INERT on {short_sha}: '
+        f'verify output format could not be parsed ({reported} tests ran, 0 parsed)'
+    )
+    detail = (
+        f'Commit: {merge_commit}\n'
+        f'Tests reported by nextest Summary: {reported}\n'
+        f'Tests parsed by parse_per_test_results: 0\n'
+        '\n'
+        'The warm verify ran tests successfully but the per-test parser produced '
+        'an empty result map.  The warm/cold shadow-compare detective is INERT '
+        'for this landing — divergence detection is disabled.\n'
+        '\n'
+        'This is a fail-closed alarm: a format mismatch between the verify output '
+        'and _NEXTEST_TEST_LINE_RE (or _LIBTEST_TEST_LINE_RE) is silently '
+        'disabling the shadow compare.  Fix the per-test parser to match the '
+        'actual verify command output format.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL),
+        task_id=_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
+        agent_role='orchestrator-warm-cold-shadow-unparseable',
+        severity='critical',
+        level=2,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Fix the per-test result parser (_NEXTEST_TEST_LINE_RE or '
+            '_LIBTEST_TEST_LINE_RE in merge_queue.py) to match the actual verify '
+            'command output format so the shadow-compare detective can resume.'
         ),
     )
     escalation_queue.submit(esc)

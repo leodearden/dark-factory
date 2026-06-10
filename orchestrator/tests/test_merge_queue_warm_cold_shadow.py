@@ -19,10 +19,13 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (  # noqa: E402
     _WARM_COLD_SHADOW_SENTINEL,
+    _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
     ShadowCompareDiff,
     ShadowCompareState,
+    _alarm_warm_shadow_unparseable,
     _load_shadow_compare_state,
     _maybe_schedule_shadow_compare,
+    _nextest_reported_test_count,
     _run_shadow_compare,
     _save_shadow_compare_state,
     _shadow_compare_due,
@@ -1612,3 +1615,272 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # None is passed — SMW accepts it (None-safe)
         call_kwargs = mock_smw_cls.call_args[1]
         assert call_kwargs.get('escalation_queue') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-5: _alarm_warm_shadow_unparseable
+# ---------------------------------------------------------------------------
+
+# Output that has a Summary reporting tests ran but parse_per_test_results would
+# return {} (simulated by passing this output to _alarm_warm_shadow_unparseable
+# directly — the function inspects only the Summary count, not the per-test map).
+_OUTPUT_WITH_TESTS_RAN = (
+    "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+)
+
+# Output with no Summary line (legitimately test-free merge)
+_OUTPUT_NO_TESTS = "Building crate foo...\nFinished\n"
+
+
+class TestAlarmWarmShadowUnparseable:
+    """Unit tests for _alarm_warm_shadow_unparseable(queue, merge_commit, test_output).
+
+    The function is the fail-closed alarm: when the warm verify shows tests RAN
+    (Summary line with N > 0) but the per-test parser produced an empty map,
+    it submits a born-at-L2 critical escalation.
+    """
+
+    def test_alarm_fires_when_tests_ran_but_no_parseable_results(self) -> None:
+        """Summary N > 0 → escalation submitted exactly once."""
+        q = _make_escalation_queue(has_open=False)
+        _alarm_warm_shadow_unparseable(q, "abcdef123456", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_called_once()
+
+    def test_escalation_severity_critical_born_at_l2(self) -> None:
+        """Severity must be 'critical' (in BORN_AT_L2_SEVERITIES)."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.severity == 'critical'
+        assert esc.severity in BORN_AT_L2_SEVERITIES
+
+    def test_escalation_level_2(self) -> None:
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.level == 2
+
+    def test_escalation_agent_role_starts_with_orchestrator(self) -> None:
+        """agent_role must carry 'orchestrator-' prefix to prevent downgrade."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.agent_role.startswith('orchestrator-')
+
+    def test_escalation_category_risk_identified(self) -> None:
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "deadbeef", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.category == 'risk_identified'
+
+    def test_summary_names_commit_sha(self) -> None:
+        """Escalation summary must reference the commit short-sha."""
+        q = _make_escalation_queue()
+        commit = "cafebabe1234"
+        _alarm_warm_shadow_unparseable(q, commit, _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert commit[:8] in esc.summary
+
+    def test_detail_mentions_shadow_compare_inert(self) -> None:
+        """Detail must name the specific contract: INERT + shadow-compare."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha123", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        # Exact contract: detail must state the detective is INERT and name
+        # shadow-compare so on-call engineers know what is disabled.
+        assert 'INERT' in esc.detail
+        assert 'shadow-compare' in esc.detail.lower()
+
+    def test_task_id_is_unparseable_sentinel(self) -> None:
+        """task_id must be _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL, distinct from divergence."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        esc = q.submit.call_args[0][0]
+        assert esc.task_id == _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL
+        assert esc.task_id != _WARM_COLD_SHADOW_SENTINEL  # independent dedup key
+
+    def test_no_alarm_when_no_summary_line(self) -> None:
+        """Output with no Summary line (no evidence tests ran) → no alarm (no false positive)."""
+        q = _make_escalation_queue()
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_NO_TESTS)
+        q.submit.assert_not_called()
+
+    def test_no_alarm_when_summary_reports_zero_tests(self) -> None:
+        """Summary reporting 0 tests (test-free merge) → no alarm."""
+        q = _make_escalation_queue()
+        output = "Summary [   0.01s] 0 tests run: 0 passed, 0 failed, 0 skipped\n"
+        _alarm_warm_shadow_unparseable(q, "sha", output)
+        q.submit.assert_not_called()
+
+    def test_none_escalation_queue_is_noop(self) -> None:
+        """None queue must not raise."""
+        _alarm_warm_shadow_unparseable(None, "sha", _OUTPUT_WITH_TESTS_RAN)
+
+    def test_dedup_no_second_submit_when_open_exists(self) -> None:
+        """When has_open_l1 returns True for the unparseable sentinel, no re-submit."""
+        q = _make_escalation_queue(has_open=True)
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_not_called()
+
+    def test_dedup_submits_when_no_open(self) -> None:
+        """When has_open_l1 returns False, alarm is submitted."""
+        q = _make_escalation_queue(has_open=False)
+        _alarm_warm_shadow_unparseable(q, "sha", _OUTPUT_WITH_TESTS_RAN)
+        q.submit.assert_called_once()
+
+    def test_unparseable_sentinel_distinct_from_divergence_sentinel(self) -> None:
+        """The two sentinels are different strings (independent dedup)."""
+        assert _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL != _WARM_COLD_SHADOW_SENTINEL
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-3: _nextest_reported_test_count
+# ---------------------------------------------------------------------------
+
+
+class TestNextestReportedTestCount:
+    """Unit tests for _nextest_reported_test_count(output) -> int | None.
+
+    Must sum the N from every 'Summary [..] N tests run:' line found in the
+    output (multi-pass aggregation), or return None when no Summary line present.
+    """
+
+    def test_single_summary_returns_count(self) -> None:
+        """Single Summary line: returns the test count."""
+        output = (
+            "Some build output\n"
+            "------------\n"
+            "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+        )
+        assert _nextest_reported_test_count(output) == 250
+
+    def test_multi_pass_sums_both_summaries(self) -> None:
+        """Two Summary lines (debug + release): returns the SUM.
+
+        The release pass runs exactly 1 test, so nextest emits the SINGULAR
+        noun 'test' (not 'tests').  The regex must accept both forms.
+        """
+        output = (
+            "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+            "Summary [   0.20s] 1 test run: 1 passed, 0 failed, 0 skipped\n"
+        )
+        assert _nextest_reported_test_count(output) == 251
+
+    def test_singular_test_word_matches(self) -> None:
+        """cargo-nextest emits '1 test run:' (singular) when N == 1; must match."""
+        output = "Summary [   0.05s] 1 test run: 1 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 1
+
+    def test_indented_summary_matches(self) -> None:
+        """Summary lines with leading whitespace (nextest may indent) must match."""
+        output = "   Summary [   1.00s] 7 tests run: 7 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 7
+
+    def test_no_summary_returns_none(self) -> None:
+        """Build noise with no Summary line: returns None."""
+        output = "Building...\nFinished\n"
+        assert _nextest_reported_test_count(output) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        """Empty input: returns None."""
+        assert _nextest_reported_test_count("") is None
+
+    def test_zero_tests_summary_returns_zero(self) -> None:
+        """Summary line reporting 0 tests: returns 0 (not None)."""
+        output = "Summary [   0.01s] 0 tests run: 0 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 0
+
+    def test_summary_with_padding_in_brackets(self) -> None:
+        """Summary lines with time-padding in brackets: still parsed."""
+        output = "Summary [   5.001s] 3 tests run: 3 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 3
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-1: parse_per_test_results with real nextest counter (N/M)
+# ---------------------------------------------------------------------------
+
+# Realistic reify multi-pass nextest sample WITH parenthesized progress counters.
+# Real cargo-nextest 0.9.136 inserts a padded '(  N/M)' token between the timing
+# bracket and the package::binary id.  This sample covers:
+#   - debug pass: 3 tests (PASS, FAIL, PASS) with counter  X/250
+#   - release pass: 1 test (PASS) with counter  1/  1
+# Clean expected keys: 'pkg::bin test_path' (counter stripped, no '(' or '/').
+_NEXTEST_REIFY_COUNTER_SAMPLE = """\
+    Compiling reify-core v0.1.0
+       Finished test [unoptimized + debuginfo] target(s) in 3.52s
+        Starting 3 tests across 2 binaries
+
+        PASS [   0.130s] (  1/250) reify-cli::cli_affine_eval eval_x
+        FAIL [   0.200s] (  2/250) reify-core::some_crate test_b
+        PASS [   0.003s] (  3/250) reify-core::some_crate test_c
+
+------------
+Summary [   1.25s] 3 tests run: 2 passed, 1 failed, 0 skipped
+
+        Starting 1 tests across 1 binaries
+
+        PASS [   0.200s] (  1/  1) reify-cli::release_tests release_test_a
+
+------------
+Summary [   0.20s] 1 tests run: 1 passed, 0 failed, 0 skipped
+"""
+
+
+class TestParsePerTestResultsWithCounter:
+    """Task 1723: nextest N/M progress counter between timing and crate must be stripped.
+
+    Real cargo-nextest 0.9.136 output inserts a parenthesized progress counter
+    such as '(  1/250)' between the timing bracket and the package::binary id.
+    The counter is run-specific (differs warm vs cold), so it MUST be stripped
+    from the key to produce stable 'pkg::bin test_path' keys for shadow compare.
+    """
+
+    def test_pass_line_produces_clean_key(self) -> None:
+        """PASS line with counter must yield key 'pkg::bin test_path' (no counter)."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-cli::cli_affine_eval eval_x") is True, (
+            "PASS line with counter must produce stable key 'pkg::bin test'; "
+            f"got keys: {sorted(result)}"
+        )
+
+    def test_fail_line_produces_clean_key(self) -> None:
+        """FAIL line with counter must yield clean key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-core::some_crate test_b") is False, (
+            f"FAIL line with counter must produce 'reify-core::some_crate test_b'; "
+            f"got keys: {sorted(result)}"
+        )
+
+    def test_release_pass_present(self) -> None:
+        """Release-pass test (counter  1/  1) must produce clean key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-cli::release_tests release_test_a") is True, (
+            f"Release pass test must appear with clean key; got keys: {sorted(result)}"
+        )
+
+    def test_no_key_contains_open_paren(self) -> None:
+        """Counter open-paren must not bleed into any key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        bad = [k for k in result if '(' in k]
+        assert not bad, f"Keys contain '(' (counter not stripped): {bad}"
+
+    def test_no_key_contains_counter_slash(self) -> None:
+        """Counter 'N/M' slash must not appear in any key (Rust paths use '::')."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        bad = [k for k in result if '/' in k]
+        assert not bad, f"Keys contain '/' (counter fragment not stripped): {bad}"
+
+    def test_four_distinct_test_results(self) -> None:
+        """All 4 tests across both passes must be present in the map."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert len(result) == 4, (
+            f"Expected 4 distinct test results, got {len(result)}: {sorted(result)}"
+        )
+
+    def test_backward_compat_no_counter_format_unchanged(self) -> None:
+        """Old no-counter format (_NEXTEST_SAMPLE) must still parse correctly."""
+        result = parse_per_test_results(_NEXTEST_SAMPLE)
+        assert result["reify-core some::mod::test_a"] is True
+        assert result["reify-eval other::test_b"] is False
+        assert result["reify-eval some::other::test_c"] is True
