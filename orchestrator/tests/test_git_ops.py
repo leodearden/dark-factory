@@ -5507,3 +5507,110 @@ class TestStackTrainBranchesConflictEject:
         assert (xc_wt / 'fileA.txt').exists(), (
             'xc must contain fileA from anchor xa after re-linking'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1715 — TestRecoverRedMain
+# Tests for GitOps.recover_red_main: enforce-safe CAS recovery ref-move.
+# Mirrors the advance_main mark-ordering tests (task 1678) for the recovery
+# path: main_gate_mark_command fires immediately before update-ref so that
+# reify's reference-transaction hook records the move as SANCTIONED.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRecoverRedMain:
+    """Tests for GitOps.recover_red_main — enforce-safe CAS recovery ref-move."""
+
+    async def _two_main_shas(self, repo: Path) -> tuple[str, str]:
+        """Return (target_sha, expected_main).
+
+        Makes one extra commit on main; the pre-commit HEAD is the 'good'
+        target to restore to, the new HEAD simulates the 'bad merge' to undo.
+        """
+        _, old, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        (repo / '_bad_merge.txt').write_text('simulated bad merge\n')
+        await _run(['git', 'add', '_bad_merge.txt'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'Simulate bad merge on main'], cwd=repo)
+        _, new, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        return old.strip(), new.strip()
+
+    async def test_recover_mark_before_update_ref(self, git_repo: Path):
+        """main_gate_mark_command fires immediately before the CAS update-ref call."""
+        mark_cmd = 'echo recover-mark-test'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+
+        mark_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd == ['sh', '-c', mark_cmd]
+        ]
+        update_ref_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd[:2] == ['git', 'update-ref'] and 'refs/heads/main' in cmd
+        ]
+        assert len(mark_indices) >= 1, f'No mark call; commands: {[c for c, _ in recorded]}'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+
+        mark_idx = mark_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+
+        assert mark_idx == update_ref_idx - 1, (
+            f'mark must be IMMEDIATELY before update-ref; '
+            f'mark_idx={mark_idx}, update_ref_idx={update_ref_idx}, '
+            f'intervening: {[c for c, _ in recorded[mark_idx + 1:update_ref_idx]]}'
+        )
+        assert recorded[mark_idx][1] == ops.project_root, (
+            f'mark must run with cwd=project_root; got {recorded[mark_idx][1]}'
+        )
+
+        # CAS: update-ref must include expected_main as old-value
+        update_ref_cmd = recorded[update_ref_idx][0]
+        assert target_sha in update_ref_cmd, (
+            f'target_sha not in update-ref args: {update_ref_cmd}'
+        )
+        assert expected_main in update_ref_cmd, (
+            f'expected_main (CAS old-value) not in update-ref args: {update_ref_cmd}'
+        )
+
+    async def test_recover_no_mark_when_unset(self, git_repo: Path):
+        """With default GitConfig (main_gate_mark_command=None), no sh -c call is recorded."""
+        ops = GitOps(
+            GitConfig(main_branch='main', branch_prefix='task/', push_after_advance=False),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+        assert not any(c[:2] == ['sh', '-c'] for c in recorded), (
+            f'Unexpected sh -c call with feature off; recorded: {recorded}'
+        )
