@@ -3115,6 +3115,24 @@ class MergeOutcome:
 
 
 @dataclass
+class SoloVerifyResult:
+    """Result of verifying a single train member's un-stacked delta in isolation.
+
+    Returned by :func:`reverify_member_solo`.  ``passed=True`` means the
+    member's own delta passes the post-merge verify in a fresh solo worktree;
+    ``passed=False`` means it failed (or the solo worktree could not be created
+    / the rebase conflicted — treated as a failer by the attribution logic).
+
+    ``merge_sha`` is the rebased tip SHA of the solo branch (used by
+    ``advance_main`` when the member passes and needs to land); None on failure.
+    """
+    member_id: str
+    passed: bool
+    merge_sha: str | None
+    reason: str = ''
+
+
+@dataclass
 class SpeculativeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine.
 
@@ -3167,6 +3185,90 @@ class _TrainMergeHost(Protocol):
     def halt_for_wip(self, reason: str) -> None: ...
     def unhalt_wip(self, reason: str | None = None) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
+
+
+async def reverify_member_solo(
+    git_ops: GitOps,
+    member_id: str,
+    solo_wt: Path,
+    solo_branch: str,
+    tip_sha: str,
+    config: 'OrchestratorConfig',
+    task_files: list[str] | None,
+    module_configs: list['ModuleConfig'],
+    event_store: 'EventStore | None' = None,
+) -> SoloVerifyResult:
+    """Run post-merge verification on a single train member's un-stacked solo branch.
+
+    Wraps :func:`_run_post_merge_verify` (which provides disk-guard, ENOSPC
+    prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
+    Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
+    attempts do not count against the tip's existing timeout budgets.
+
+    Returns a :class:`SoloVerifyResult`:
+      - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
+      - ``passed=False`` when it returns a :class:`MergeOutcome`.
+
+    The solo worktree is always cleaned up (``git_ops.cleanup_merge_worktree``)
+    in a ``finally`` block.  :func:`_run_post_merge_verify` already cleans up
+    on failure paths — the ``finally`` is a defensive belt-and-braces guard so
+    that no solo worktree leaks even if the caller forgets to remove it.
+
+    Args:
+        git_ops:        GitOps instance for the current repo.
+        member_id:      The member's task id (used for logging and the result).
+        solo_wt:        Path to the isolated solo worktree (from
+                        :meth:`~GitOps.materialize_member_solo`).
+        solo_branch:    Name of the temporary solo branch (e.g. ``_solo-b2``).
+        tip_sha:        Rebased tip SHA of the solo branch (the "merge SHA"
+                        for the verify run and for the returned result).
+        config:         OrchestratorConfig carrying verify command / disk limits.
+        task_files:     Task-scoped files list for scoped verify (may be None).
+        module_configs: Module-level configs for multi-module projects.
+        event_store:    Optional EventStore for telemetry (may be None).
+
+    Returns:
+        :class:`SoloVerifyResult` with passed/failed verdict and reason.
+    """
+    req = MergeRequest(
+        task_id=member_id,
+        branch=solo_branch,
+        worktree=solo_wt,
+        pre_rebased=True,
+        task_files=task_files,
+        module_configs=module_configs,
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+    try:
+        outcome = await _run_post_merge_verify(
+            git_ops, req, solo_wt,
+            timeouts={},
+            enospc_retries={},
+            max_timeouts=3,
+            max_enospc=3,
+            event_store=event_store,
+            merge_sha=tip_sha,
+        )
+        if outcome is None:
+            return SoloVerifyResult(
+                member_id=member_id,
+                passed=True,
+                merge_sha=tip_sha,
+                reason='',
+            )
+        return SoloVerifyResult(
+            member_id=member_id,
+            passed=False,
+            merge_sha=None,
+            reason=outcome.reason,
+        )
+    finally:
+        # Defensive cleanup: _run_post_merge_verify already cleans up on
+        # failure, but call again to guard against the pass path (where it
+        # does NOT remove the worktree) and any unexpected exception.
+        await git_ops.cleanup_merge_worktree(solo_wt)
 
 
 async def _do_train_merge(
