@@ -3036,3 +3036,89 @@ class TestTrainThroughputStats:
             f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['verifies_per_landed_task_delta']}"
         )
         assert result['improved'] is True
+
+    async def test_cas_retry_rates(self, tmp_path):
+        """CAS-retry rates: train vs baseline, delta, train excluded from baseline.
+
+        One train_merged(members=['10','11']), one train cas_retry row,
+        two solo done rows, two solo cas_retry rows.
+
+        Asserts:
+        - train_cas_retry_rate == 0.5   (1 train retry / 2 tasks_landed_via_trains)
+        - baseline_cas_retry_rate == 1.0 (2 solo retries / 2 baseline_solo_landed)
+        - cas_retry_rate_delta == 0.5    (baseline - train)
+        - train retry rows excluded from baseline retry count
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        in_window = now - timedelta(hours=1)
+
+        events = [
+            # train landed with 2 members
+            dict(
+                event_type='train_merged',
+                timestamp=in_window,
+                run_id='run-train-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'aaa', 'base_sha': 'bbb'},
+            ),
+            # one train cas_retry row (has train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-train-retry',
+                task_id='10',
+                data={'outcome': 'cas_retry', 'train_id': 't1',
+                      'member_task_ids': ['10', '11']},
+            ),
+            # two solo done rows (no train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-20',
+                task_id='20',
+                data={'outcome': 'done'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-21',
+                task_id='21',
+                data={'outcome': 'done'},
+            ),
+            # two solo cas_retry rows (no train_id) — must NOT bleed into train rate
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-retry-20',
+                task_id='20',
+                data={'outcome': 'cas_retry'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-retry-21',
+                task_id='21',
+                data={'outcome': 'cas_retry'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'cas_retry.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn, hours=24, now=now)
+
+        assert result['tasks_landed_via_trains'] == 2
+        assert result['baseline_solo_landed'] == 2
+        assert result['train_cas_retry_rate'] == 0.5, (
+            f"expected 1 train retry / 2 tasks_landed = 0.5, got: {result['train_cas_retry_rate']}"
+        )
+        assert result['baseline_cas_retry_rate'] == 1.0, (
+            f"expected 2 solo retries / 2 solo_landed = 1.0, got: {result['baseline_cas_retry_rate']}"
+        )
+        assert result['cas_retry_rate_delta'] == 0.5, (
+            f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['cas_retry_rate_delta']}"
+        )
