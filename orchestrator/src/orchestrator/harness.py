@@ -298,6 +298,63 @@ class HarnessReport:
         return '\n'.join(lines)
 
 
+def build_train_callback_factory(scheduler: Any) -> 'TrainCallbackFactory':
+    """Build a per-train callback factory that captures the live scheduler.
+
+    Returns a factory function ``factory(train_id) -> TrainCallbacks`` whose
+    closures mirror :func:`workflow._status_check` / :func:`workflow._mark_member_done`
+    (workflow.py:744-787) but are rooted at the harness scheduler and hardened
+    to tolerate non-task members (e.g. MCP-submitted branches like
+    'cargo-run-prebuilt-fix') without raising.
+
+    The factory is module-level (not a Harness method) so unit tests can drive
+    it with a FakeScheduler without constructing a full Harness.
+    """
+    from orchestrator.merge_queue import TrainCallbacks, TrainCallbackFactory  # noqa: F401
+
+    def factory(train_id: str) -> TrainCallbacks:
+        async def status_check(ids: list[str]) -> dict[str, str]:
+            statuses, err = await scheduler.get_statuses(ids)
+            if err is not None:
+                logger.warning(
+                    'train %s: status_check get_statuses error — returning partial (will park): %s',
+                    train_id, err,
+                )
+                return statuses or {}
+            # Synthesize 'merge-deferred' for ids the scheduler does not know about
+            # (non-task members such as MCP-submitted branches).  The worker pre-check
+            # (merge_queue.py:3508) parks the train if any member status != 'merge-deferred';
+            # synthesising it here lets a mixed task/non-task train pass the gate.
+            # Synthesis only fires when get_statuses succeeded (err is None) to prevent
+            # advancing a train on a lie when the backend is down.
+            return {mid: statuses.get(mid, _TRAIN_MEMBER_READY_STATUS) for mid in ids}
+
+        async def mark_member_done(mid: str, sha: str) -> None:
+            statuses, err = await scheduler.get_statuses([mid])
+            if err is None and mid not in statuses:
+                # (err is None and mid not in result) is the unambiguous "no scheduler
+                # task" signal: get_statuses silently omits unknown ids (scheduler.py:
+                # 1402-1423), so this is NOT a transient error.  Log and return — a
+                # raise here would hit the worker's post-advance partial-flip handler
+                # (merge_queue.py:3742-3766) and falsely trigger TRAIN_PARTIAL_FLIP.
+                logger.info(
+                    'train %s: member %s has no scheduler task — mark_member_done no-op',
+                    train_id, mid,
+                )
+                return
+            await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
+
+        return TrainCallbacks(status_check=status_check, mark_member_done=mark_member_done)
+
+    return factory
+
+
+# Status synthesised for non-task train members (MCP-submitted branches with no
+# scheduler task).  Must match the value the worker pre-check accepts exactly;
+# see SpeculativeMergeWorker._do_train_merge (merge_queue.py:3508).
+_TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
+
+
 class Harness:
     """Top-level orchestration loop."""
 
