@@ -6971,9 +6971,11 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
 
 # Matches cargo-nextest Summary footer lines, e.g.:
 #   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
-# Capture group: (1) total test count N from 'N tests run:'
+#   Summary [   0.13s]   1 test run: 1 passed, 0 failed, 0 skipped   (N==1 → singular)
+#   (leading whitespace tolerated: nextest may indent the Summary footer)
+# Capture group: (1) total test count N from 'N tests run:' / 'N test run:'
 _NEXTEST_SUMMARY_LINE_RE = re.compile(
-    r'^Summary\s+\[[^\]]*\]\s+(\d+)\s+tests\s+run:',
+    r'^\s*Summary\s+\[[^\]]*\]\s+(\d+)\s+tests?\s+run:',
     re.MULTILINE,
 )
 
@@ -7326,10 +7328,23 @@ def _alarm_warm_shadow_unparseable(
         return
 
     # Discriminate: did tests actually run in this output?
+    # NOTE: _nextest_reported_test_count is nextest-only (reads cargo-nextest
+    # "Summary [..] N tests run:" footers).  A libtest-format verify run whose
+    # per-test parse fails will not match here, so the alarm is suppressed.
+    # Warm verify is expected to use cargo-nextest; libtest is not a supported
+    # warm-verify format and would fall through as reported=None (no false alarm).
     reported = _nextest_reported_test_count(test_output)
     if reported is None or reported == 0:
         # Legitimately test-free merge (no nextest pass, or zero tests reported).
         # No alarm — would be a false positive.
+        if reported is None:
+            # Leave a low-severity breadcrumb so suppressed alarms are diagnosable
+            # in the field even when no escalation is raised.
+            logger.debug(
+                'warm shadow-compare: no nextest Summary line found in warm verify '
+                'output — unparseable alarm suppressed '
+                '(legitimately test-free or non-nextest run)'
+            )
         return
 
     # Dedup: don't fire again while an open/pending alarm already exists.

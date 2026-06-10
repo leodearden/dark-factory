@@ -1682,15 +1682,14 @@ class TestAlarmWarmShadowUnparseable:
         assert commit[:8] in esc.summary
 
     def test_detail_mentions_shadow_compare_inert(self) -> None:
-        """Detail must describe the shadow-compare being inert / parser failure."""
+        """Detail must name the specific contract: INERT + shadow-compare."""
         q = _make_escalation_queue()
         _alarm_warm_shadow_unparseable(q, "sha123", _OUTPUT_WITH_TESTS_RAN)
         esc = q.submit.call_args[0][0]
-        detail_lower = esc.detail.lower()
-        # Must state the parser couldn't read the format or the detective is inert
-        assert any(kw in detail_lower for kw in (
-            'shadow', 'inert', 'parser', 'parse', 'format', 'unparseable',
-        ))
+        # Exact contract: detail must state the detective is INERT and name
+        # shadow-compare so on-call engineers know what is disabled.
+        assert 'INERT' in esc.detail
+        assert 'shadow-compare' in esc.detail.lower()
 
     def test_task_id_is_unparseable_sentinel(self) -> None:
         """task_id must be _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL, distinct from divergence."""
@@ -1756,12 +1755,26 @@ class TestNextestReportedTestCount:
         assert _nextest_reported_test_count(output) == 250
 
     def test_multi_pass_sums_both_summaries(self) -> None:
-        """Two Summary lines (debug + release): returns the SUM."""
+        """Two Summary lines (debug + release): returns the SUM.
+
+        The release pass runs exactly 1 test, so nextest emits the SINGULAR
+        noun 'test' (not 'tests').  The regex must accept both forms.
+        """
         output = (
             "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
-            "Summary [   0.20s] 1 tests run: 1 passed, 0 failed, 0 skipped\n"
+            "Summary [   0.20s] 1 test run: 1 passed, 0 failed, 0 skipped\n"
         )
         assert _nextest_reported_test_count(output) == 251
+
+    def test_singular_test_word_matches(self) -> None:
+        """cargo-nextest emits '1 test run:' (singular) when N == 1; must match."""
+        output = "Summary [   0.05s] 1 test run: 1 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 1
+
+    def test_indented_summary_matches(self) -> None:
+        """Summary lines with leading whitespace (nextest may indent) must match."""
+        output = "   Summary [   1.00s] 7 tests run: 7 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 7
 
     def test_no_summary_returns_none(self) -> None:
         """Build noise with no Summary line: returns None."""
