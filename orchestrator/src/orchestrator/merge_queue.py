@@ -5149,6 +5149,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # Build candidate list: single MergeRequests in the normal lane whose
         # futures are still live (not done and not cancelled).
+        #
+        # STRUCTURAL EXCLUSIONS (no new MergeRequest field needed):
+        #  · GroupMergeRequest: a pre-existing or re-formed train — excluded by
+        #    isinstance check; it stays in the buffer untouched and its future is
+        #    never resolved here (idempotency guarantee).
+        #  · req.result.done() / req.result.cancelled(): an absorbed request has
+        #    its future resolved ('superseded') — excluded; a detached/cancelled
+        #    waiter has its future cancelled — excluded AND never receives
+        #    set_result (so it stays cancelled, not overwritten with 'superseded').
+        #  · In-flight / verifying request: lives in self._inflight_req or is
+        #    carried by a SpeculativeItem in self._verify_item — structurally
+        #    absent from self._lane_buffers, so it is excluded without any
+        #    explicit filter.  No buffer scan of _inflight_req/_verify_item is
+        #    required or performed.
         candidates = [
             req for req in self._lane_buffers['normal']
             if not isinstance(req, GroupMergeRequest)
