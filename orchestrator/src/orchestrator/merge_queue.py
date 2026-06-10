@@ -6380,3 +6380,63 @@ def enforce_merge_liveness_margin(
             f'(currently {assessment.merge_ahead_bound}).'
         )
     return assessment
+
+
+# ---------------------------------------------------------------------------
+# Persistent warm merge-verify worktree — serial-lane startup guard
+# ---------------------------------------------------------------------------
+
+
+class PersistentWorktreeConfigError(Exception):
+    """Raised by :func:`enforce_persistent_worktree_serial_lane` when the
+    persistent warm merge-verify worktree is enabled but the merge-ahead bound
+    is not 1, which would risk concurrent cargo invocations on a single shared
+    ``target/`` directory.
+
+    The exception message names the bad bound so the operator knows what to
+    change (lower merge_ahead_bound back to 1 or disable
+    ``git.persistent_merge_worktree``).
+    """
+
+
+def enforce_persistent_worktree_serial_lane(
+    config: 'OrchestratorConfig',
+    *,
+    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+) -> None:
+    """Fail-closed startup guard for the persistent warm merge-verify worktree.
+
+    The warm worktree feature is SERIAL-LANE-ONLY (PRD §10 invariant 3): a
+    single shared ``target/`` directory is only safe when exactly one verify
+    attempt runs at a time.  Raising the merge-ahead bound above 1 while the
+    knob is on would allow concurrent ``cargo`` invocations inside one
+    ``target/`` — undefined behaviour / data corruption.
+
+    This guard is called immediately after :func:`enforce_merge_liveness_margin`
+    in :meth:`Harness._start_merge_worker` so that any misconfiguration is
+    caught at startup (fail-closed) rather than at the first concurrent verify.
+
+    Args:
+        config: Live per-project orchestrator config.
+        merge_ahead_bound: The effective merge-ahead bound (defaults to the
+            module-level :data:`_MERGE_AHEAD_BOUND`).
+
+    Returns:
+        ``None`` when the configuration is safe (knob off OR bound == 1).
+
+    Raises:
+        :exc:`PersistentWorktreeConfigError`: When
+            ``config.git.persistent_merge_worktree is True`` and
+            ``merge_ahead_bound != 1``.
+    """
+    if config.git.persistent_merge_worktree and merge_ahead_bound != 1:
+        raise PersistentWorktreeConfigError(
+            f'enforce_persistent_worktree_serial_lane: startup refused — '
+            f'git.persistent_merge_worktree is enabled but merge_ahead_bound '
+            f'is {merge_ahead_bound} (must be 1). The persistent warm '
+            f'_merge-verify worktree is serial-lane-only (PRD §10 invariant 3): '
+            f'a shared target/ is unsafe under concurrent verify attempts. '
+            f'Lower merge_ahead_bound to 1 or disable '
+            f'git.persistent_merge_worktree.'
+        )
+    return None
