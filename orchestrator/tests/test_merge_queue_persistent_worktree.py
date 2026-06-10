@@ -388,3 +388,118 @@ def _is_registered_worktree(wt_path: Path, repo: Path) -> bool:
         check=True,
     )
     return str(wt_path.resolve()) in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Step 17 — _safety_valve_due predicate + safety_valve_every_n integration
+# ---------------------------------------------------------------------------
+
+
+class TestSafetyValveDue:
+    """Unit tests for the _safety_valve_due predicate.
+
+    Step 17 (RED): predicate absent today — ImportError expected.
+    """
+
+    def test_every_n_zero_always_false(self):
+        """every_n=0 (disabled) → always False regardless of attempt_count."""
+        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+
+        for attempt in range(0, 20):
+            assert _safety_valve_due(attempt, 0) is False, (
+                f'every_n=0 must be disabled; attempt={attempt}'
+            )
+
+    def test_every_n_negative_always_false(self):
+        """every_n<0 → always False (guard against invalid config)."""
+        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+
+        for attempt in range(0, 10):
+            assert _safety_valve_due(attempt, -1) is False
+
+    def test_every_n_3_due_on_multiples(self):
+        """every_n=3 → True exactly at attempt_count 3, 6, 9; False otherwise."""
+        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+
+        due_at = {3, 6, 9}
+        for attempt in range(0, 12):
+            expected = attempt in due_at
+            assert _safety_valve_due(attempt, 3) is expected, (
+                f'every_n=3, attempt={attempt}: expected {expected}'
+            )
+
+    def test_attempt_zero_never_due(self):
+        """attempt_count=0 must never trigger the valve (first attempt is 1-based)."""
+        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+
+        for every_n in [1, 2, 3, 5]:
+            assert _safety_valve_due(0, every_n) is False, (
+                f'attempt=0 must not be due; every_n={every_n}'
+            )
+
+    def test_every_n_1_due_at_every_positive_attempt(self):
+        """every_n=1 → True for every positive attempt (cold on every land)."""
+        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+
+        assert _safety_valve_due(0, 1) is False  # attempt 0 never due
+        for attempt in range(1, 6):
+            assert _safety_valve_due(attempt, 1) is True, (
+                f'every_n=1, attempt={attempt}: must be due'
+            )
+
+
+class TestSafetyValveIntegration:
+    """Integration: safety_valve_every_n=1 bypasses warm swap → cold ephemeral path.
+
+    Step 17 (RED): counter and predicate not wired in _verify_and_advance yet.
+    """
+
+    @pytest.mark.asyncio
+    async def test_safety_valve_every_n_1_uses_ephemeral(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """With safety_valve_every_n=1 and knob ON, every verify uses ephemeral (cold)."""
+        cfg_git = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            persistent_merge_worktree=True,
+            persistent_merge_worktree_safety_valve_every_n=1,
+        )
+        cfg = OrchestratorConfig(project_root=git_repo, git=cfg_git)
+
+        wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
+        req = _make_merge_request('valve-test', 'valve-test', wt, cfg)
+
+        captured_merge_wt: list[Path] = []
+
+        async def _fake_run_post_merge_verify(git_ops_arg, req_arg, merge_wt_arg, **kwargs):
+            captured_merge_wt.append(merge_wt_arg)
+            return None  # PASS
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            side_effect=_fake_run_post_merge_verify,
+        ):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        await worker.stop()
+        await worker_task
+
+        assert outcome.status == 'done', f'Expected done; got: {outcome}'
+
+        # With safety_valve_every_n=1, the FIRST verifying attempt (count=1)
+        # is due → must bypass the warm swap and use the ephemeral path.
+        assert len(captured_merge_wt) == 1
+        warm_path = git_ops.persistent_merge_worktree_path
+        assert captured_merge_wt[0].resolve() != warm_path.resolve(), (
+            f'safety_valve_every_n=1: first attempt must use ephemeral, not warm; '
+            f'got: {captured_merge_wt[0]}'
+        )
