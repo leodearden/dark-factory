@@ -19,6 +19,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (  # noqa: E402
     _WARM_COLD_SHADOW_SENTINEL,
+    _nextest_reported_test_count,
     ShadowCompareDiff,
     ShadowCompareState,
     _load_shadow_compare_state,
@@ -1612,6 +1613,55 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # None is passed — SMW accepts it (None-safe)
         call_kwargs = mock_smw_cls.call_args[1]
         assert call_kwargs.get('escalation_queue') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-3: _nextest_reported_test_count
+# ---------------------------------------------------------------------------
+
+
+class TestNextestReportedTestCount:
+    """Unit tests for _nextest_reported_test_count(output) -> int | None.
+
+    Must sum the N from every 'Summary [..] N tests run:' line found in the
+    output (multi-pass aggregation), or return None when no Summary line present.
+    """
+
+    def test_single_summary_returns_count(self) -> None:
+        """Single Summary line: returns the test count."""
+        output = (
+            "Some build output\n"
+            "------------\n"
+            "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+        )
+        assert _nextest_reported_test_count(output) == 250
+
+    def test_multi_pass_sums_both_summaries(self) -> None:
+        """Two Summary lines (debug + release): returns the SUM."""
+        output = (
+            "Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped\n"
+            "Summary [   0.20s] 1 tests run: 1 passed, 0 failed, 0 skipped\n"
+        )
+        assert _nextest_reported_test_count(output) == 251
+
+    def test_no_summary_returns_none(self) -> None:
+        """Build noise with no Summary line: returns None."""
+        output = "Building...\nFinished\n"
+        assert _nextest_reported_test_count(output) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        """Empty input: returns None."""
+        assert _nextest_reported_test_count("") is None
+
+    def test_zero_tests_summary_returns_zero(self) -> None:
+        """Summary line reporting 0 tests: returns 0 (not None)."""
+        output = "Summary [   0.01s] 0 tests run: 0 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 0
+
+    def test_summary_with_padding_in_brackets(self) -> None:
+        """Summary lines with time-padding in brackets: still parsed."""
+        output = "Summary [   5.001s] 3 tests run: 3 passed, 0 failed, 0 skipped\n"
+        assert _nextest_reported_test_count(output) == 3
 
 
 # ---------------------------------------------------------------------------
