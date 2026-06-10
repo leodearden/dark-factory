@@ -104,3 +104,31 @@ class _RecordingEventStore:
     def events_of(self, event_type: Any) -> list[tuple[Any, str | None, dict[str, Any]]]:
         """Return all recorded events matching *event_type*."""
         return [e for e in self.events if e[0] == event_type]
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (RED): TestThroughputHarness — verify that pool.dispatch emits
+# runner-tagged merge_verify events via run_backlog_window.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestThroughputHarness:
+    async def test_window_emits_runner_tagged_verify_events(self):
+        """run_backlog_window returns WindowRun with 4 completed verifies, each
+        tagged with a runner name from the pool (local or laptop)."""
+        rec = _RecordingEventStore()
+        local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
+        laptop_fake = _FakeRunner('laptop', is_local=False, service_secs=1.0)
+        pool = VerifyRunnerPool([local_fake, laptop_fake], event_store=rec, task_id='1702')
+
+        run = await run_backlog_window(
+            pool, rec, n_merges=4, k=2,
+            service_secs={'local': 1.0, 'laptop': 1.0},
+        )
+
+        assert run.completed == 4
+        verify_events = rec.events_of(EventType.merge_verify)
+        assert len(verify_events) == 4
+        for _et, _tid, data in verify_events:
+            assert data['runner'] in {'local', 'laptop'}
