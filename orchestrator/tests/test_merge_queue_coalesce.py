@@ -1610,3 +1610,144 @@ class TestOneStrikeRecording:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ─── δ Amendment: observability + robustness ─────────────────────────────────
+
+@pytest.mark.asyncio
+class TestSuppressionObservability:
+    """amend(1720): exclusion gate suppresses near-train (2 candidates, 1 excluded).
+
+    When there are exactly 2 structural candidates and the predicate excludes
+    one of them, eligible drops below 2 and the pass returns False without
+    forming a train.  Both candidate futures must remain unresolved; no
+    train_coalesced event is emitted.
+
+    This tests the <2-eligible return path that was previously untested.
+    """
+
+    async def test_two_candidates_one_excluded_no_train(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """2 stackable singles, 1 excluded by predicate → no train, both futures unresolved."""
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'sup1', 'file_sup1.py', 'sup1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'sup2', 'file_sup2.py', 'sup2 = 2\n')
+
+        db_path = tmp_path / 'es_supp.db'
+        es = EventStore(db_path=db_path, run_id='run-supp-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        # Predicate excludes sup1 — only sup2 eligible, which is < 2 → no train.
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+            merge_ready_predicate=lambda req: 'test_risky' if req.task_id == 'sup1' else None,
+        )
+
+        req1 = _make_req('sup1', 'task/sup1', wt1, coalesce_config)
+        req2 = _make_req('sup2', 'task/sup2', wt2, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        # pass returns False — insufficient eligible candidates
+        assert result is False, (
+            'pass must return False when exclusion gate drops eligible below 2'
+        )
+
+        # No train formed in the buffer
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 0, f'no train must form; found {len(trains)}'
+
+        # Both futures remain unresolved
+        assert not req1.result.done(), 'excluded req1 future must remain unresolved'
+        assert not req2.result.done(), 'eligible-but-insufficient req2 future must remain unresolved'
+
+        # No train_coalesced event emitted
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 0, f'no train_coalesced event must be emitted; got {events}'
+
+
+# ─── δ Amendment: design coherence — error outcome also marks one-strike ──────
+
+@pytest.mark.asyncio
+class TestOneStrikeOnErrorOutcome:
+    """amend(1720): 'error' outcome on coalesce train also marks members one-strike.
+
+    The recording trigger was changed from ``outcome.status == 'blocked'`` to
+    ``outcome.status in _COALESCE_RISKY_TERMINAL_STATES`` so both 'blocked'
+    (verify failure) and 'error' (infra/git error) drive the one-strike marker,
+    aligning with the exclusion predicate's _COALESCE_RISKY_TERMINAL_STATES check.
+    """
+
+    async def test_error_outcome_marks_members_one_strike(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """Coalesce-prefixed train derail with 'error' → members marked one-strike."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        db_path = tmp_path / 'es_osr_err.db'
+        es = EventStore(db_path=db_path, run_id='run-osr-err-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='e2',
+            branch='task/e2',
+            worktree=tmp_path / 'wt-e2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='coalesce-tipm-errtest',
+            member_task_ids=['e1', 'e2'],
+            tip_branch='task/e2',
+            tip_task_id='e2',
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+
+        # Patch _do_train_merge to return 'error' (infra/git failure).
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('error', reason='git push failed')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        assert worker._coalesce_derailed_task_ids == {'e1', 'e2'}, (
+            f'coalesce train members must be marked one-strike on error derail; '
+            f'got {worker._coalesce_derailed_task_ids}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task

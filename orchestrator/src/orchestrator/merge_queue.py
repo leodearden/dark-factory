@@ -5395,7 +5395,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         eligible: list[MergeRequest] = []
         exclusions: list[dict[str, str]] = []
         for _c in candidates:
-            _reason = predicate(_c)
+            try:
+                _reason = predicate(_c)
+            except Exception:  # noqa: BLE001
+                # An injected predicate raised — degrade gracefully: log the
+                # error and treat the candidate as eligible so a buggy closure
+                # does not kill the merger loop.  The default predicate is
+                # fire-safe (latest_merge_finalized swallows its own errors).
+                logger.exception(
+                    'Coalesce predicate raised for request_id=%s task_id=%s '
+                    'branch=%s; treating as eligible (safe-degrade)',
+                    _c.request_id, _c.task_id, _c.branch,
+                )
+                _reason = None
             if _reason:
                 exclusions.append({'request_id': _c.request_id, 'reason': _reason})
                 logger.info(
@@ -5406,6 +5418,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 eligible.append(_c)
         candidates = eligible
         if len(candidates) < 2:
+            # The exclusion gate reduced eligible candidates below the 2-member
+            # minimum needed to form a train.  Log so the decision is auditable
+            # even though no event is emitted (a train_coalesced event only fires
+            # when a train actually forms).  The excluded tasks will merge solo.
+            if exclusions:
+                logger.info(
+                    'Coalesce near-train suppressed: exclusion gate left only %d '
+                    'eligible candidate(s) (need ≥2); tasks will merge solo. '
+                    'exclusions=%r',
+                    len(candidates),
+                    exclusions,
+                )
             return False
 
         # ── Step-6: core pass body ─────────────────────────────────────────────
@@ -5655,11 +5679,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 req.train_id, spec_base[:12],
                             )
                         outcome = await _do_train_merge(self, req)
-                        # δ/1720: if a coalesce-formed train derailed, mark all
-                        # its members one-strike so they are excluded from the
-                        # next coalescing pass (leaving them to merge solo).
+                        # δ/1720: if a coalesce-formed train derailed with a
+                        # risky terminal outcome, mark all its members one-strike
+                        # so they are excluded from the next coalescing pass and
+                        # left to merge solo.  We use _COALESCE_RISKY_TERMINAL_STATES
+                        # (frozenset{'blocked','error'}) to align the recording
+                        # trigger with the exclusion predicate — both 'blocked'
+                        # (verify failure) and 'error' (unexpected git/infra error)
+                        # are deterministic enough to warrant solo-merge.
+                        # 'conflict' and 'wip_halted' are intentionally excluded:
+                        # a conflict may resolve after the partner task lands, and
+                        # wip_halted is policy-driven rather than a task failure.
                         if (
-                            outcome.status == 'blocked'
+                            outcome.status in _COALESCE_RISKY_TERMINAL_STATES
                             and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
                         ):
                             self._mark_coalesce_derailed(req.member_task_ids)
