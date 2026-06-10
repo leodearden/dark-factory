@@ -5397,3 +5397,89 @@ class TestStackTrainBranchesHappyPath:
         assert (tip_wt / 'fileA.txt').exists(), 'tip must contain fileA (from anchor)'
         assert (tip_wt / 'fileB.txt').exists(), 'tip must contain fileB (from B)'
         assert (tip_wt / 'fileC.txt').exists(), 'tip must contain fileC (own commit)'
+
+
+# ---------------------------------------------------------------------------
+# step-5: conflict-eject + re-link + clean-abort
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStackTrainBranchesConflictEject:
+    """Conflict-eject: member with conflicting edits is ejected; branch left clean.
+
+    Currently RED: step-4 always returns ejected=[] (no conflict detection).
+    """
+
+    async def test_tail_conflict_eject(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """TAIL conflict: C edits the same line as A → C ejected, A+B survive.
+
+        Setup:
+          - anchor A: writes foo.txt with "version: alpha\n"
+          - member B: writes bar.txt (different file, clean)
+          - member C: writes foo.txt with "version: gamma\n" (conflicts with A)
+
+        Expected:
+          - survivors == ['A', 'B']
+          - ejected  == ['C']
+          - task/C branch left clean (git status exits 0, no rebase in progress)
+        """
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        main_ref = 'main'
+
+        await _make_member(git_ops, 'ta', main_ref, 'foo.txt', 'version: alpha\n')
+        await _make_member(git_ops, 'tb', main_ref, 'bar.txt', 'bar content\n')
+        # C conflicts with A on foo.txt
+        await _make_member(git_ops, 'tc', main_ref, 'foo.txt', 'version: gamma\n')
+
+        result = await git_ops.stack_train_branches(['ta', 'tb', 'tc'])
+
+        assert result.survivors == ['ta', 'tb'], f'got survivors={result.survivors}'
+        assert result.ejected == ['tc'], f'got ejected={result.ejected}'
+
+        # task/tc branch must be in a clean state
+        tc_wt = git_ops.worktree_base / 'tc'
+        rc, _, _ = await _run(['git', 'status'], cwd=tc_wt)
+        assert rc == 0, 'ejected member worktree must be in a clean git state'
+
+    async def test_middle_conflict_relink(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """MIDDLE conflict / re-link: B conflicts on A; C (clean) re-links onto A.
+
+        Setup:
+          - anchor A: writes foo.txt with "version: alpha\n"
+          - member B: writes foo.txt with "version: beta\n" (conflicts with A)
+          - member C: writes baz.txt (different file, clean)
+
+        Expected:
+          - survivors == ['A', 'C']   (C re-linked onto A, not the dropped B)
+          - ejected  == ['B']
+          - task/B branch left clean
+          - tip worktree (C) contains foo.txt (from A) and baz.txt (own commit)
+        """
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        main_ref = 'main'
+
+        await _make_member(git_ops, 'ma', main_ref, 'foo.txt', 'version: alpha\n')
+        # B conflicts with A on foo.txt
+        await _make_member(git_ops, 'mb', main_ref, 'foo.txt', 'version: beta\n')
+        await _make_member(git_ops, 'mc', main_ref, 'baz.txt', 'baz content\n')
+
+        result = await git_ops.stack_train_branches(['ma', 'mb', 'mc'])
+
+        assert result.survivors == ['ma', 'mc'], f'got survivors={result.survivors}'
+        assert result.ejected == ['mb'], f'got ejected={result.ejected}'
+
+        # task/mb branch must be in a clean state
+        mb_wt = git_ops.worktree_base / 'mb'
+        rc, _, _ = await _run(['git', 'status'], cwd=mb_wt)
+        assert rc == 0, 'ejected member B worktree must be in a clean git state'
+
+        # tip worktree (C) must have foo.txt (from A, since C re-linked onto A)
+        # and its own baz.txt
+        mc_wt = git_ops.worktree_base / 'mc'
+        assert (mc_wt / 'foo.txt').exists(), 'tip C must contain foo.txt from anchor A'
+        assert (mc_wt / 'baz.txt').exists(), 'tip C must contain its own baz.txt'
