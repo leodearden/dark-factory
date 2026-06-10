@@ -188,10 +188,11 @@ more often than _heartbeat_interval_s, without adding measurable overhead."""
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
 
-MUST remain False until γ3 lands BOTH:
-  1. The workflow.py 'superseded' consumer handler (so the workflow.py:3963-4071
-     single-task merge consumer has a branch for 'superseded' outcomes instead of
-     falling through to _mark_blocked with an empty reason).
+MUST remain False until the sole remaining γ3 precondition lands:
+  1. ✓ DONE (task/1717): The workflow.py 'superseded' consumer handler — the
+     single-task merge consumer in ``_submit_to_merge_queue`` now parks
+     'superseded' outcomes as merge-deferred via ``_handle_superseded`` instead
+     of falling through to ``_mark_blocked`` with an empty reason.
   2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
      branch slot in InFlightMergeRegistry for the chained request without tripping
      the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
