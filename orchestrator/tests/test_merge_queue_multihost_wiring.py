@@ -6,8 +6,13 @@ Covers:
     + cold-shadow guard (step-7 RED / step-8 GREEN)
   - _run_drift_check + _maybe_run_drift_check + land-hook integration
     (step-9 RED / step-10 GREEN)
+  - Drift-task GC-safety (strong-reference tracking)
+    (step-13 RED / step-14 GREEN)
+  - Drift-task stop() cancellation + worktree cleanup
+    (step-15 RED / step-16 GREEN)
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -599,3 +604,94 @@ class TestDriftLandHookIntegration:
         assert hasattr(worker, '_runner_quarantine')
         assert worker._drift_land_count == 0
         assert worker._runner_quarantine == set()
+
+
+# ---------------------------------------------------------------------------
+# step-13: Drift-task GC-safety (strong-reference tracking) — RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftCheckTaskGCSafety:
+    """Drift-check tasks tracked with strong refs (step-13 RED / step-14 GREEN).
+
+    asyncio keeps only a WEAK reference to running tasks; without a strong ref
+    in the worker, the drift detective can be GC'd mid-run and a
+    remote-PASS / local-FAIL divergence goes undetected.
+    """
+
+    def _make_worker_with_tasks(self, config):
+        """_make_worker extended with _drift_check_tasks (additive)."""
+        worker = MagicMock()
+        worker._drift_land_count = 0
+        worker._runner_quarantine = set()
+        worker._drift_check_tasks = set()
+        worker._escalation_queue = MagicMock()
+        worker._event_store = MagicMock()
+        return worker
+
+    async def test_worker_init_has_drift_check_tasks_attr(self):
+        """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        assert hasattr(worker, '_drift_check_tasks'), (
+            'SpeculativeMergeWorker must have _drift_check_tasks after __init__'
+        )
+        assert isinstance(worker._drift_check_tasks, set)
+        assert worker._drift_check_tasks == set()
+
+    async def test_task_tracked_while_in_flight_and_discarded_on_completion(
+        self, tmp_path
+    ):
+        """(b+c) Task is in _drift_check_tasks while in-flight; done-callback clears it."""
+        from orchestrator.merge_queue import _maybe_run_drift_check
+
+        config = _make_config(
+            verify_runners=[_make_runner_cfg('laptop')],
+            drift_every_n=1,
+        )
+        req = _make_merge_request(config, worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        worker = self._make_worker_with_tasks(config)
+
+        gate = asyncio.Event()
+        # Capture the asyncio.Task ref from inside the coroutine for cleanup
+        task_holder: list = []
+
+        async def gated_run(*_args, **_kwargs):
+            task_holder.append(asyncio.current_task())
+            try:
+                await gate.wait()
+            finally:
+                pass
+
+        try:
+            # Do NOT patch asyncio.create_task — a real asyncio.Task is created.
+            with patch('orchestrator.merge_queue._run_drift_check', side_effect=gated_run):
+                await _maybe_run_drift_check(worker, git_ops, req, 'sha1')
+
+            # Yield so the scheduler starts the task and it reaches gate.wait()
+            await asyncio.sleep(0)
+
+            # (b) While in-flight: task must be strongly referenced in the set
+            assert len(worker._drift_check_tasks) == 1, (
+                'drift-check task not in _drift_check_tasks while in-flight '
+                '— event loop may GC the detective mid-run'
+            )
+
+            # Release the gate, wait for task to complete
+            gate.set()
+            await asyncio.sleep(0)  # task runs to end
+            await asyncio.sleep(0)  # flush done-callback
+
+            # (c) After completion: done-callback must have discarded the task
+            assert len(worker._drift_check_tasks) == 0, (
+                'done-callback did not discard task from _drift_check_tasks after completion'
+            )
+        finally:
+            gate.set()  # always unblock the coroutine even if assertions failed
+            if task_holder:
+                await asyncio.gather(*task_holder, return_exceptions=True)
+            await asyncio.sleep(0)
