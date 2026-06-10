@@ -17226,6 +17226,146 @@ class TestEnforceMergeLivenessMargin:
 
 
 # ---------------------------------------------------------------------------
+# TestCheckMergeLivenessMarginPerHost — task-1726 step-1
+# ---------------------------------------------------------------------------
+
+
+class TestCheckMergeLivenessMarginPerHost:
+    """Per-host bound: check_merge_liveness_margin uses ceil(K/num_hosts) * timeout.
+
+    All cases use production defaults (liveness=10800, safety_factor=0.75,
+    threshold=8100) and cold=7200 (bare OrchestratorConfig / shipped defaults.yaml).
+    RED on current code: num_hosts is an unexpected kwarg (TypeError) and
+    result.num_hosts does not exist (AttributeError).
+    """
+
+    def test_k2_num_hosts2_per_host1_safe(self, tmp_path: Path):
+        """K=2, num_hosts=2 → per_host=ceil(2/2)=1 → worst_case=7200 < 8100 → safe=True.
+
+        The crash-loop scenario: raw K=2 would give worst_case=14400 (not safe),
+        but per-host division floors back to 1.
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(project_root=tmp_path, merge_verify_cold_command_timeout_secs=7200.0)
+        result = check_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=2)
+
+        assert result.worst_case_secs == 7200.0, (
+            f'Expected worst_case_secs==7200.0 (per_host=1 * 7200); got {result.worst_case_secs}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for K=2/num_hosts=2 (per_host=1, 7200 < 8100); got safe={result.safe!r}'
+        )
+        assert result.num_hosts == 2, (
+            f'Expected num_hosts==2 on assessment; got {result.num_hosts!r}'
+        )
+
+    def test_k2_num_hosts1_per_host2_unsafe(self, tmp_path: Path):
+        """K=2, num_hosts=1 → per_host=ceil(2/1)=2 → worst_case=14400 ≥ 8100 → safe=False.
+
+        Per-host division disabled (single-host case): behavior unchanged from today.
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(project_root=tmp_path, merge_verify_cold_command_timeout_secs=7200.0)
+        result = check_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=1)
+
+        assert result.worst_case_secs == 14400.0, (
+            f'Expected worst_case_secs==14400.0 (per_host=2 * 7200); got {result.worst_case_secs}'
+        )
+        assert result.safe is False, (
+            f'Expected safe=False for K=2/num_hosts=1 (per_host=2, 14400 ≥ 8100); got safe={result.safe!r}'
+        )
+
+    def test_k3_num_hosts2_per_host_ceil_unsafe(self, tmp_path: Path):
+        """K=3, num_hosts=2 → per_host=ceil(3/2)=ceil(1.5)=2 → worst_case=14400 ≥ 8100 → safe=False.
+
+        Proves CEIL not floor: floor(1.5)=1 would give worst_case=7200 (safe=True),
+        but ceil(1.5)=2 correctly gives worst_case=14400 (safe=False).
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(project_root=tmp_path, merge_verify_cold_command_timeout_secs=7200.0)
+        result = check_merge_liveness_margin(cfg, merge_ahead_bound=3, num_hosts=2)
+
+        assert result.worst_case_secs == 14400.0, (
+            f'Expected worst_case_secs==14400.0 (per_host=ceil(3/2)=2 * 7200); got {result.worst_case_secs}'
+        )
+        assert result.safe is False, (
+            f'Expected safe=False for K=3/num_hosts=2 (per_host=2, 14400 ≥ 8100); got safe={result.safe!r}'
+        )
+
+    def test_num_hosts_surfaced_on_assessment(self, tmp_path: Path):
+        """num_hosts is present on the returned MergeLivenessAssessment."""
+        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+
+        cfg = OrchestratorConfig(project_root=tmp_path, merge_verify_cold_command_timeout_secs=7200.0)
+        result = check_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=2)
+
+        assert result.num_hosts == 2, (
+            f'Expected num_hosts==2 surfaced on assessment; got {result.num_hosts!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestEnforceMergeLivenessMarginPerHost — task-1726 step-3
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceMergeLivenessMarginPerHost:
+    """Per-host num_hosts passthrough in enforce_merge_liveness_margin (task-1726 step-3).
+
+    RED on current code: num_hosts is an unexpected kwarg (TypeError).
+    """
+
+    def test_k2_num_hosts2_does_not_raise(self, tmp_path: Path):
+        """K=2, num_hosts=2 → per_host=1 → worst_case=7200 < 8100 → no raise, returns safe assessment.
+
+        The crash-loop fix at the wrapper level.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessAssessment,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
+        result = enforce_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=2)
+
+        assert isinstance(result, MergeLivenessAssessment), (
+            f'Expected MergeLivenessAssessment, got {type(result)!r}'
+        )
+        assert result.safe is True, (
+            f'Expected safe=True for K=2/num_hosts=2; got safe={result.safe!r}'
+        )
+        assert result.worst_case_secs == 7200.0, (
+            f'Expected worst_case_secs==7200.0 (per_host=1 * 7200); got {result.worst_case_secs}'
+        )
+        assert result.num_hosts == 2, (
+            f'Expected num_hosts==2 on assessment; got {result.num_hosts!r}'
+        )
+
+    def test_k2_num_hosts1_raises(self, tmp_path: Path):
+        """K=2, num_hosts=1 → per_host=2 → worst_case=14400 ≥ 8100 → raises MergeLivenessConfigError.
+
+        Backward-compat: per-host division disabled for single-host → same fail-closed as today.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            MergeLivenessConfigError,
+            enforce_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
+        with pytest.raises(MergeLivenessConfigError):
+            enforce_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=1)
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculationDepthParameter — task-1698 step-3/4
 # ---------------------------------------------------------------------------
 

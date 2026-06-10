@@ -3333,12 +3333,12 @@ Output JSON matching the schema. Every task must appear in the output.
         )
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
-        # Sizes the liveness guard (merge_ahead_bound), the serial-lane bound
-        # (num_hosts), and the worker's speculation cap (speculation_depth).
-        # All three knobs derive from ONE expression so they cannot drift apart
-        # as verify_runners grows.  num_hosts=K makes the per-host serial-lane
-        # bound ceil(K/num_hosts)=ceil(K/K)=1, so each of the 1+N hosts runs at
-        # most one in-flight merge-verify at a time.
+        # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
+        # serial-lane bound (num_hosts), and the worker's speculation cap
+        # (speculation_depth).  All three knobs derive from ONE expression so
+        # they cannot drift apart as verify_runners grows.  num_hosts=K makes
+        # the per-host bound ceil(K/num_hosts)=ceil(K/K)=1, so each of the K
+        # hosts runs at most one in-flight merge-verify at a time.
         #
         # NOTE: K was previously pinned to _MERGE_AHEAD_BOUND (=1).  Wired from
         # config.verify_runners by task 1716 (Lever C operator-enable path).
@@ -3347,13 +3347,27 @@ Output JSON matching the schema. Every task must appear in the output.
         _k: int = 1 + len(self.config.enabled_verify_runners)
 
         # Fail-CLOSED on an over-budget liveness verdict: if the configured
-        # bound×timeout exceeds the safe threshold, refuse to start the merge
-        # worker and propagate MergeLivenessConfigError to the caller.
+        # per-host bound × timeout exceeds the safe threshold, refuse to start
+        # the merge worker and propagate MergeLivenessConfigError to the caller.
+        # num_hosts=_k: with K runners across K distinct hosts, per-host bound =
+        # ceil(K/K)=1 → worst_case = 1 * timeout → safe even with K > 1.
+        #
+        # INVARIANT: num_hosts=_k is valid only if:
+        #   (a) each of the K verify runners runs on a SEPARATE host, and
+        #   (b) the SpeculativeMergeWorker dispatches all K verifies concurrently
+        #       (one per runner, none co-located or serialized on the same host).
+        # If two runners share a host, the Kth worktree can queue ~2×timeout and
+        # be prematurely reaped mid-verify — the exact race INFLIGHT_MERGE_
+        # WORKTREE_LIVENESS_SECS was added to close (esc-1674-34).
+        # Validate at operator-enable time: confirm that local _merge-* worktrees
+        # do NOT linger while remote verify is in flight (see task 1726
+        # physical-model note).  If lingering IS observed, reduce num_hosts here.
+        #
         # Any OTHER exception (e.g. config resolution failure in a mock or
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
         # preserving the original crash-loop protection for unrelated errors.
         try:
-            enforce_merge_liveness_margin(self.config, merge_ahead_bound=_k)
+            enforce_merge_liveness_margin(self.config, merge_ahead_bound=_k, num_hosts=_k)
         except MergeLivenessConfigError:
             raise  # fail-closed: over-budget verdict → refuse startup
         except Exception as e:
