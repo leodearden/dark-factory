@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -123,10 +124,11 @@ async def test_superseded_outcome_parks_as_merge_deferred(
         f'Expected MERGE_DEFERRED, got {outcome!r}'
     )
     # (b) set_task_status was called with 'merge-deferred' and NEVER with 'done'.
-    wf.scheduler.set_task_status.assert_any_await('99', 'merge-deferred')
+    set_task_status_mock = cast(AsyncMock, wf.scheduler.set_task_status)
+    set_task_status_mock.assert_any_await('99', 'merge-deferred')
     assert not any(
         call.args == ('99', 'done')
-        for call in wf.scheduler.set_task_status.await_args_list
+        for call in set_task_status_mock.await_args_list
     ), 'set_task_status must never be called with "done" on a superseded outcome'
     # (c) _mark_blocked must NOT be called — no failure path, no escalation.
     f.mark_blocked.assert_not_awaited()

@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry, SoloVerifyResult
+    from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.usage_gate import UsageGate
 
 
@@ -661,7 +661,7 @@ class TaskWorkflow:
             return trigger_outcome
         return WorkflowOutcome.MERGE_DEFERRED
 
-    async def _handle_superseded(self, result: 'MergeOutcome') -> WorkflowOutcome:
+    async def _handle_superseded(self, result: MergeOutcome) -> WorkflowOutcome:
         """Park a single-task workflow whose merge was absorbed by a coalesced train or γ2 chain.
 
         Mirrors the PARK sequence of :meth:`_enter_merge_deferred` without the
