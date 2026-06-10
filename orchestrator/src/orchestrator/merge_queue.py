@@ -7018,6 +7018,7 @@ def enforce_merge_liveness_margin(
     config: OrchestratorConfig,
     *,
     merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    num_hosts: int = 1,
     max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
     liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     safety_factor: float = 0.75,
@@ -7031,7 +7032,12 @@ def enforce_merge_liveness_margin(
 
     Args:
         config: Live per-project orchestrator config.
-        merge_ahead_bound: Override for :data:`_MERGE_AHEAD_BOUND`.
+        merge_ahead_bound: Raw verify pool size K.  Forwarded verbatim to
+            :func:`check_merge_liveness_margin`; the per-host division
+            ``ceil(K/num_hosts)`` is applied there.
+        num_hosts: Number of hosts across which the K runners are distributed
+            (default 1 → behaviour byte-identical to pre-multi-host code).
+            Forwarded verbatim to :func:`check_merge_liveness_margin`.
         max_verify_timeouts: Override for
             :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`.
         liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
@@ -7048,6 +7054,7 @@ def enforce_merge_liveness_margin(
     assessment = check_merge_liveness_margin(
         config,
         merge_ahead_bound=merge_ahead_bound,
+        num_hosts=num_hosts,
         max_verify_timeouts=max_verify_timeouts,
         liveness_secs=liveness_secs,
         safety_factor=safety_factor,
@@ -7061,7 +7068,7 @@ def enforce_merge_liveness_margin(
             f'factor={safety_factor:.2f}, liveness={assessment.liveness_secs:.0f}s). '
             f'Reduce merge_verify_cold_command_timeout_secs (currently '
             f'{assessment.timeout_secs:.0f}s) or lower merge_ahead_bound '
-            f'(currently {assessment.merge_ahead_bound}).'
+            f'(currently {assessment.merge_ahead_bound}, num_hosts={num_hosts}).'
         )
     return assessment
 
