@@ -86,7 +86,7 @@ def _make_merge_request(
     worktree: Path,
     config: OrchestratorConfig,
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
