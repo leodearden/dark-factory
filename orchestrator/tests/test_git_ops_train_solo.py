@@ -235,3 +235,96 @@ class TestMaterializeMemberSolo:
         # No dangling _solo-* branches
         leftover_branches = await _branch_names(git_ops, '_solo-*')
         assert not leftover_branches, f'Dangling _solo- branches left: {leftover_branches}'
+
+    async def test_delete_solo_branch_removes_branch_and_worktree(
+        self, tmp_path: Path,
+    ) -> None:
+        """TEARDOWN test: delete_solo_branch removes both branch and worktree.
+
+        After a successful materialize_member_solo:
+        - The _solo-<id> branch is present (documents the leak: cleanup_merge_worktree alone
+          does NOT remove it).
+        - cleanup_merge_worktree removes the worktree path but NOT the branch.
+        - After calling delete_solo_branch('_solo-b2'), BOTH the branch and the
+          worktree entry are gone.
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        (repo / 'README.md').write_text('initial\n')
+        await _commit_all(repo, 'initial')
+
+        git_ops = _make_git_ops(repo)
+        await _add_stacked_branch(git_ops, 'b1', 'main', writes={'a.txt': 'b1 content\n'})
+        await _add_stacked_branch(git_ops, 'b2', 'task/b1', writes={'b.txt': 'b2 content\n'})
+
+        # Materialize the solo worktree — should succeed
+        wt = await git_ops.materialize_member_solo('b2', predecessor_ref='task/b1')
+        assert wt is not None, 'materialize_member_solo should succeed'
+
+        # The _solo-b2 branch must exist (documents the leak)
+        branches_before = await _branch_names(git_ops, '_solo-b2')
+        assert branches_before, '_solo-b2 branch should exist after materialize'
+
+        # The _solo-b2 worktree must be listed
+        wt_names_before = await _worktree_names(git_ops)
+        assert '_solo-b2' in wt_names_before, '_solo-b2 worktree should be listed'
+
+        # cleanup_merge_worktree removes the directory (worktree entry de-registered)
+        await git_ops.cleanup_merge_worktree(wt.path)
+
+        # Now call the NEW delete_solo_branch — RED because it does not exist yet
+        await git_ops.delete_solo_branch('_solo-b2')
+
+        # After delete_solo_branch, the branch must be gone
+        branches_after = await _branch_names(git_ops, '_solo-b2')
+        assert not branches_after, f'_solo-b2 branch still present: {branches_after}'
+
+        # And no worktree entry for _solo-b2 should remain
+        wt_names_after = await _worktree_names(git_ops)
+        assert '_solo-b2' not in wt_names_after, (
+            f'_solo-b2 worktree entry still listed: {wt_names_after}'
+        )
+
+    async def test_rerun_collision_second_call_succeeds(
+        self, tmp_path: Path,
+    ) -> None:
+        """RE-RUN COLLISION: a second materialize_member_solo call without teardown must succeed.
+
+        Without defensive pre-clean in materialize_member_solo, the leaked _solo-b2
+        branch/worktree from the first call causes `git worktree add -b _solo-b2` to fail
+        on the second call → returns None → member mis-classified as 'unstackable'.
+
+        After step-16 adds the idempotent pre-clean, the second call must succeed and
+        produce the correct un-stacked diff (only b2's own delta).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        (repo / 'README.md').write_text('initial\n')
+        await _commit_all(repo, 'initial')
+
+        git_ops = _make_git_ops(repo)
+        await _add_stacked_branch(git_ops, 'b1', 'main', writes={'a.txt': 'b1 content\n'})
+        await _add_stacked_branch(git_ops, 'b2', 'task/b1', writes={'b.txt': 'b2 content\n'})
+
+        # First call — succeeds, leaves _solo-b2 branch+worktree (no teardown)
+        first = await git_ops.materialize_member_solo('b2', predecessor_ref='task/b1')
+        assert first is not None, 'first call should succeed'
+
+        # Second call WITHOUT any teardown — must also succeed (not return None)
+        second = await git_ops.materialize_member_solo('b2', predecessor_ref='task/b1')
+        assert second is not None, (
+            'second call must succeed even with stale _solo-b2 from first call'
+        )
+        assert isinstance(second, WorktreeInfo)
+
+        # The un-stacked diff must still be correct (only b2's own delta)
+        solo_files = await _diff_files_vs_main(git_ops, '_solo-b2')
+        assert 'b.txt' in solo_files, 'b2 solo must contain b.txt'
+        assert 'a.txt' not in solo_files, 'b2 solo must NOT contain a.txt'
+
+        # Cleanup
+        await git_ops.cleanup_merge_worktree(second.path)
