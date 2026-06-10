@@ -857,7 +857,8 @@ class TaskWorkflow:
         task_id (bare, same as ``branch_name = self.task_id`` in run()).
         """
         all_tasks: list[dict] = await self.scheduler.get_tasks()
-        candidates: list[dict] = []
+        # Quick filters that require no git I/O.
+        pre_filtered: list[dict] = []
         for task in all_tasks:
             task_id: str = str(task.get('id', ''))
             # Exclude self.
@@ -871,13 +872,16 @@ class TaskWorkflow:
             metadata: dict = task.get('metadata') or {}
             if metadata.get('train'):
                 continue
-            # Branch-existence gate: the branch must be resolvable so the
-            # diff-range computation downstream has a real ref to diff against.
-            sha = await self.git_ops.resolve_branch_sha(task_id)
-            if sha is None:
-                continue
-            candidates.append(task)
-        return candidates
+            pre_filtered.append(task)
+        if not pre_filtered:
+            return []
+        # Branch-existence gate: fan out resolve_branch_sha concurrently
+        # instead of one serial subprocess per candidate.
+        _pre_ids = [str(t.get('id', '')) for t in pre_filtered]
+        _shas = await asyncio.gather(*[
+            self.git_ops.resolve_branch_sha(tid) for tid in _pre_ids
+        ])
+        return [t for t, sha in zip(pre_filtered, _shas) if sha is not None]
 
     async def _maybe_form_train(self) -> bool:
         """β former: try to form a merge train for this task (PRD §7 β).
@@ -920,13 +924,27 @@ class TaskWorkflow:
         if not candidates:
             return False
 
+        # TOCTOU NOTE: Between _train_candidates() and the update_task writes
+        # below, another anchor's former (running concurrently for a different
+        # task) may assign trains to the same candidates.  The append=True
+        # recursive merge is last-write-wins on the 'train' key, so a member
+        # could end up carrying a train id whose members list disagrees with
+        # its own.  Full closure via a compare-and-set or serialised-formation
+        # lock is deferred to γ/ε (the former is off-by-default so this window
+        # is safe to ship).
+
         # --- Selection ---
-        # Fetch BASE-coordinate line ranges for self and every candidate.
-        candidate_ids: list[str] = [c['id'] for c in candidates]
-        ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {}
-        ranges_by_id[self.task_id] = await self.git_ops.get_changed_line_ranges(self.task_id)
-        for cid in candidate_ids:
-            ranges_by_id[cid] = await self.git_ops.get_changed_line_ranges(cid)
+        # Coerce candidate ids to str so all member ids are string-typed,
+        # consistent with self.task_id, regardless of the store's id type.
+        candidate_ids: list[str] = [str(c['id']) for c in candidates]
+        # Fan out line-range fetches concurrently (one git subprocess each).
+        _all_range_ids = [self.task_id] + candidate_ids
+        _range_results = await asyncio.gather(*[
+            self.git_ops.get_changed_line_ranges(cid) for cid in _all_range_ids
+        ])
+        ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {
+            cid: r for cid, r in zip(_all_range_ids, _range_results)
+        }
 
         selected = _select_train_members(
             self.task_id, candidate_ids, ranges_by_id,
