@@ -2036,12 +2036,11 @@ def create_mcp_server(
                 meaningful when page_size is provided.
         """
         # Input validation — early-exit before touching the interceptor.
-        if page_size is not None:
-            if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
-                return {
-                    'error': 'page_size must be a positive integer',
-                    'error_type': 'ValidationError',
-                }
+        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
+            return {
+                'error': 'page_size must be a positive integer',
+                'error_type': 'ValidationError',
+            }
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             return {
                 'error': 'offset must be a non-negative integer',
