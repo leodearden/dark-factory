@@ -8,7 +8,9 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
@@ -20,12 +22,77 @@ from shared.usage_gate import AccountState, UsageGate
 if TYPE_CHECKING:
     from orchestrator.harness import Harness
 
+_log = logging.getLogger(__name__)
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
     name for name, v in inspect.getmembers(BaseModel) if isinstance(v, property)
 )
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
+
+
+def drain_async_mock_coroutines() -> int:
+    """Close all orphaned AsyncMock._execute_mock_call coroutines in the GC graph.
+
+    Task 1714 / esc-1702-13 — fix for order-dependent orchestrator test failures.
+
+    ROOT CAUSE: Calling an AsyncMock without awaiting the returned coroutine
+    produces a ``_execute_mock_call`` coroutine (cr_code.co_name ==
+    ``"_execute_mock_call"``, state CORO_CREATED).  When that orphan is held in
+    a reference cycle (common in mock object graphs) it survives ref-count
+    reclamation and is only finalized by a gc.collect() that may run during an
+    arbitrary *later* test.  CPython then emits
+    ``RuntimeWarning("coroutine '...' was never awaited")`` (or pytest's
+    PytestUnraisableExceptionWarning wrapper).  orchestrator/pyproject.toml
+    promotes BOTH to hard errors via ``filterwarnings``, failing whichever test
+    the GC ran during — producing order-dependent suite failures.
+
+    FIX: .close() on a CORO_CREATED coroutine finalizes it WITHOUT emitting the
+    warning (verified under warnings.simplefilter("error") on CPython 3.13.9).
+    Walking gc.get_objects() and closing every CORO_CREATED ``_execute_mock_call``
+    coroutine before the test boundary ensures each test's orphans are reclaimed
+    at its OWN boundary and cannot be promoted into a sibling.
+
+    SAFETY NET preserved: only AsyncMock's internal ``_execute_mock_call``
+    coroutines are closed; a genuinely forgotten ``await`` on product code yields
+    a coroutine with a different co_name and still trips filterwarnings=error.
+    Product coroutines are intentionally NOT reclaimed here, so a missing
+    ``await`` in production code will still raise under filterwarnings=error.
+
+    PERFORMANCE NOTE: ``gc.get_objects()`` materialises every live Python object
+    (O(total live objects)) on every call.  The teardown ``gc.collect()`` is
+    skipped when ``closed == 0`` to avoid a full-generation collection on the
+    common no-orphan path.  If profiling shows the walk itself is a bottleneck
+    across the full suite, consider a pytest opt-in marker for tests that use
+    AsyncMock to scope the walk — the current unconditional path is a safe
+    default.
+
+    DIAGNOSTIC: a DEBUG-level log is emitted for each test that leaks AsyncMock
+    orphans, so tests that routinely call AsyncMock without awaiting can be
+    identified and fixed at source rather than being masked indefinitely.
+
+    Returns the number of coroutines closed (useful for assertions in tests).
+    """
+    closed = 0
+    for obj in gc.get_objects():
+        if (
+            inspect.iscoroutine(obj)
+            and getattr(getattr(obj, 'cr_code', None), 'co_name', None)
+            == '_execute_mock_call'
+            and inspect.getcoroutinestate(obj) == inspect.CORO_CREATED
+        ):
+            obj.close()
+            closed += 1
+    if closed:
+        _log.debug(
+            'drain_async_mock_coroutines: closed %d orphaned AsyncMock '
+            '_execute_mock_call coroutine(s) — consider auditing un-awaited '
+            'AsyncMock calls in the preceding test',
+            closed,
+        )
+        gc.collect()
+    return closed
 
 
 def _init_harness_state_for_test(h: Harness) -> None:
