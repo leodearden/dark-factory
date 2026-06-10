@@ -570,3 +570,68 @@ class TestMaybeFormTrainFormation:
         ids_updated = {c.args[0] for c in fix.scheduler.update_task.call_args_list}
         assert '200' in ids_updated  # anchor always included
         assert len(ids_updated) == 2
+
+
+# ---------------------------------------------------------------------------
+# step-17: _maybe_defer_as_train_member — routing helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeDeferAsTrainMember:
+    """Unit tests for _maybe_defer_as_train_member() routing helper."""
+
+    @pytest.mark.asyncio
+    async def test_already_train_member_routes_to_merge_deferred(self):
+        """If self._train is already set, call _enter_merge_deferred and return its outcome."""
+        fix = _make(
+            task_id='200',
+            metadata={'train': {'id': 'train-abc', 'order': 0, 'members': ['200', '201']}},
+        )
+        expected = WorkflowOutcome.MERGE_DEFERRED
+
+        with patch.object(fix.wf, '_maybe_form_train', new_callable=AsyncMock) as mock_form, \
+             patch.object(fix.wf, '_enter_merge_deferred', new_callable=AsyncMock,
+                          return_value=expected) as mock_defer:
+            result = await fix.wf._maybe_defer_as_train_member()
+
+        assert result is expected
+        mock_defer.assert_called_once()
+        # _maybe_form_train should NOT have been called (self._train already set).
+        mock_form.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_former_forms_train_then_routes_to_merge_deferred(self):
+        """_train None + _maybe_form_train returns True → _enter_merge_deferred called."""
+        fix = _make(task_id='200')
+        expected = WorkflowOutcome.MERGE_DEFERRED
+
+        async def _form_and_set_train():
+            # Simulate the former setting self._train.
+            fix.wf.task.setdefault('metadata', {})['train'] = {
+                'id': 'train-200-abc', 'order': 0, 'members': ['200', '201'],
+            }
+            return True
+
+        with patch.object(fix.wf, '_maybe_form_train', side_effect=_form_and_set_train) as mock_form, \
+             patch.object(fix.wf, '_enter_merge_deferred', new_callable=AsyncMock,
+                          return_value=expected) as mock_defer:
+            result = await fix.wf._maybe_defer_as_train_member()
+
+        assert result is expected
+        mock_form.assert_called_once()
+        mock_defer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_former_returns_false_returns_none(self):
+        """_train None + _maybe_form_train returns False → returns None (solo merge)."""
+        fix = _make(task_id='200')
+
+        with patch.object(fix.wf, '_maybe_form_train', new_callable=AsyncMock,
+                          return_value=False) as mock_form, \
+             patch.object(fix.wf, '_enter_merge_deferred', new_callable=AsyncMock) as mock_defer:
+            result = await fix.wf._maybe_defer_as_train_member()
+
+        assert result is None
+        mock_form.assert_called_once()
+        # _enter_merge_deferred must NOT have been called.
+        mock_defer.assert_not_called()
