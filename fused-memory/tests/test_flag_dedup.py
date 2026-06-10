@@ -5473,3 +5473,74 @@ class TestIsValidMarkerTaskId:
             f'{tid!r} must be rejected (non-hex char "g" at position 35)'
         )
 
+
+# ---------------------------------------------------------------------------
+# task-1725 step-1 — RED: filter_terminal_metadata_flags basic tests
+# ---------------------------------------------------------------------------
+
+
+class TestFilterTerminalMetadataFlags:
+    """RED tests for async filter_terminal_metadata_flags(taskmaster, project_root, flags).
+
+    A stale_metadata/task_metadata_stale flag for a terminal (cancelled or done)
+    task must be DROPPED before dedup_flags sees it.  Non-metadata flags for
+    terminal tasks must pass through unchanged (scope guard).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_stale_metadata_flag_is_dropped(self):
+        """stale_metadata flag for a CANCELLED task is DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'stale_metadata flag for a cancelled task must be dropped '
+            '(task 1703 is cancelled — no execution-time need for cleaned metadata)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_active_task_stale_metadata_flag_is_kept(self):
+        """stale_metadata flag for an ACTIVE (pending) task is KEPT."""
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'stale_metadata flag for an active (pending) task must be kept '
+            '(task may still have execution-time need for metadata)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_metadata_flag_for_cancelled_task_is_kept(self):
+        """Non-metadata flag (orphaned_knowledge) for a cancelled task is KEPT (scope guard).
+
+        filter_terminal_metadata_flags targets ONLY stale_metadata-type flags;
+        other flag types for terminal tasks must pass through untouched.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+        project_root = '/proj'
+
+        flag = {'task_id': '1703', 'flag_type': 'orphaned_knowledge'}
+        result = await filter_terminal_metadata_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'orphaned_knowledge flag for a cancelled task must NOT be dropped; '
+            'filter_terminal_metadata_flags only suppresses stale_metadata-type flags'
+        )
+        # get_task must NOT be called for non-metadata flags (out of scope)
+        taskmaster.get_task.assert_not_called()
+
