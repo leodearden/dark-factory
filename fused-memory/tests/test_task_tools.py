@@ -1171,3 +1171,65 @@ async def test_remove_dependency_qualified_not_ticket_rejected_and_forwarded(
     task_interceptor.remove_dependency.assert_awaited_once()
     _, kwargs = task_interceptor.remove_dependency.call_args
     assert kwargs['depends_on'] == 'dark_factory:13'
+
+
+# ---------------------------------------------------------------------------
+# get_tasks pagination (task 1727)
+# ---------------------------------------------------------------------------
+
+_FIVE_TASKS = [
+    {'id': str(i), 'title': f'task {i}', 'status': 'pending'} for i in range(1, 6)
+]
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_pagination_slices_and_reports_metadata(
+    mcp_server_with_tasks, task_interceptor
+):
+    """get_tasks with page_size slices the task list and attaches a pagination envelope.
+
+    Provenance stamps (project_id, project_root) must survive pagination.
+    Three sub-scenarios in one fixture setup:
+      (a) first page  → tasks 1-2, has_more=True
+      (b) last page   → task 5 only, has_more=False
+      (c) beyond end  → empty list, returned=0, has_more=False
+    """
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+
+    # (a) First page: offset=0, page_size=2
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': 2, 'offset': 0},
+    )
+    assert result.get('tasks') == _FIVE_TASKS[:2], f'Expected first 2 tasks, got: {result.get("tasks")}'
+    assert result.get('pagination') == {
+        'total': 5,
+        'offset': 0,
+        'page_size': 2,
+        'returned': 2,
+        'has_more': True,
+    }, f'Unexpected pagination dict: {result.get("pagination")}'
+    # Provenance stamps must survive pagination
+    assert result.get('project_id') == 'dark_factory'
+    assert result.get('project_root') == '/home/leo/src/dark-factory'
+
+    # (b) Last item: offset=4, page_size=2 → only task 5
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    result2 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': 2, 'offset': 4},
+    )
+    assert result2.get('tasks') == _FIVE_TASKS[4:], f'Expected last task, got: {result2.get("tasks")}'
+    assert result2['pagination']['returned'] == 1
+    assert result2['pagination']['has_more'] is False
+    assert result2['pagination']['total'] == 5
+
+    # (c) Past end: offset=10
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_FIVE_TASKS)})
+    result3 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'page_size': 2, 'offset': 10},
+    )
+    assert result3.get('tasks') == [], f'Expected empty list, got: {result3.get("tasks")}'
+    assert result3['pagination']['returned'] == 0
+    assert result3['pagination']['has_more'] is False
