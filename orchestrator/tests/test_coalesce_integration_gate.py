@@ -89,24 +89,29 @@ def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
 
 @pytest.mark.asyncio
 class TestScenario1:
-    """step-1 (RED): 3 disjoint stackable singles coalesce into one train end-to-end.
+    """step-2 (GREEN): 3 disjoint stackable singles coalesce into one train end-to-end.
 
     Three disjoint-file singles are pre-enqueued before the worker starts.
     The coalescing pass fires on the first merger iteration.  A gated-verify
     blocks the train's first run_scoped_verification call.
 
-    Assertions (step-1):
+    Assertions (step-1, extended by step-2):
       (a) exactly one GroupMergeRequest dispatched, train_id starts with 'coalesce-'
       (b) all 3 waiter futures resolve MergeOutcome(status='superseded',
           superseded_by=train_id) BEFORE verify starts (α-consumer input contract)
       (c) a single train_coalesced event names member_task_ids + absorbed_request_ids
       (d) the train entry is visible in worker.snapshot() while gated (verifying state)
       (e) after gate_release all 3 member files appear on main
+      (f) FakeScheduler.provenance has kind='merged' + shared SHA for all 3 members (β)
+      (g) _handle_superseded parks status='merge-deferred', never 'done' (α consumer)
+      (h) MCP member is merge_status-observable via event-store tier: the member
+          entered via enqueue_merge_request has a merge_finalized record with
+          state='superseded' + superseded_by=train_id; the train has a train_merged event.
 
-    RED: FakeScheduler.statuses is empty → build_train_callback_factory's
-    mark_member_done no-op guard fires (member absent from scheduler) →
-    scheduler.mark_done is never called → all_done never fires → timeout.
-    step-2 fixes this by pre-seeding scheduler.statuses for the 3 members.
+    GREEN (step-2): scheduler.statuses pre-seeded for ig1/ig2/ig3 so that
+    mark_member_done's existence check passes and mark_done is called.
+    req1 enters via enqueue_merge_request (not bare queue.put) so that _on_finalized
+    is registered and emits the durable merge_finalized record on superseded resolution.
     """
 
     async def test_three_singles_coalesce_end_to_end(
@@ -116,11 +121,17 @@ class TestScenario1:
         tmp_path: Path,
     ):
         import contextlib
-        from unittest.mock import patch
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+            enqueue_merge_request,
+        )
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
         # 3 disjoint-file branches (each touches a unique file → line-stackable).
         # Branch names are BARE (no 'task/' prefix): create_worktree('ig1') creates
@@ -135,9 +146,14 @@ class TestScenario1:
 
         # Use the REAL build_train_callback_factory backed by FakeScheduler.
         scheduler = FakeScheduler()
+        # GREEN (step-2): pre-seed scheduler.statuses for ig1/ig2/ig3 so that
+        # mark_member_done's get_statuses existence check sees the members and
+        # does NOT no-op.  Without this, get_statuses returns {} (no known ids)
+        # and mark_done is never called → all_done never fires → timeout.
+        for mid in ('ig1', 'ig2', 'ig3'):
+            scheduler.statuses[mid] = ['merge-deferred']
+
         # Wrap scheduler.mark_done to count calls and fire all_done when complete.
-        # RED: scheduler.statuses is empty → mark_member_done existence check no-ops →
-        # mark_done wrapper is never reached → all_done never fires → timeout below.
         mark_done_calls: list[str] = []
         all_done = asyncio.Event()
         _real_mark_done = scheduler.mark_done
@@ -162,7 +178,11 @@ class TestScenario1:
         req1 = _make_req('ig1', 'ig1', wt1, coalesce_config)
         req2 = _make_req('ig2', 'ig2', wt2, coalesce_config)
         req3 = _make_req('ig3', 'ig3', wt3, coalesce_config)
-        await queue.put(req1)
+        # (h) ε surface: req1 enters via enqueue_merge_request so _on_finalized is
+        # registered.  When req1.result is resolved 'superseded' by the coalescing
+        # pass, the callback fires and writes a merge_finalized record to the event
+        # store (state='superseded', superseded_by=train_id).
+        await enqueue_merge_request(queue, req1, es)
         await queue.put(req2)
         await queue.put(req3)
 
@@ -253,6 +273,84 @@ class TestScenario1:
         assert 'file_ig1.py' in main_files, 'file_ig1.py must be on main after train lands'
         assert 'file_ig2.py' in main_files, 'file_ig2.py must be on main after train lands'
         assert 'file_ig3.py' in main_files, 'file_ig3.py must be on main after train lands'
+
+        # (f) β merged provenance: FakeScheduler.provenance has kind='merged' for all 3
+        # members, and all 3 share the same merge SHA (the train's advance commit).
+        for mid in ('ig1', 'ig2', 'ig3'):
+            prov = scheduler.provenance.get(mid, {})
+            assert prov.get('kind') == 'merged', (
+                f'{mid}: expected kind="merged" in scheduler.provenance; got {prov!r}'
+            )
+        merge_shas = {scheduler.provenance[mid]['commit'] for mid in ('ig1', 'ig2', 'ig3')}
+        assert len(merge_shas) == 1, (
+            f'All 3 members must share one merge SHA; got {merge_shas!r}'
+        )
+        merged_sha = next(iter(merge_shas))
+
+        # (g) α workflow consumer: _handle_superseded parks as merge-deferred, never done.
+        # Mirror the _Fixture pattern from test_workflow_merge_superseded: build a minimal
+        # TaskWorkflow backed by a mock scheduler and drive _handle_superseded directly.
+        _asgn = MagicMock()
+        _asgn.task_id = 'probe-alpha'
+        _asgn.task = {
+            'id': 'probe-alpha', 'title': 'Probe', 'description': 'α probe',
+            'metadata': {},
+        }
+        _asgn.modules = []  # empty → _resolve_module_configs returns [] safely
+
+        _sched_probe = MagicMock()
+        _sched_probe.set_task_status = AsyncMock()
+
+        _wf_probe = TaskWorkflow(
+            assignment=_asgn,
+            config=coalesce_config,
+            git_ops=git_ops,
+            scheduler=_sched_probe,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+        )
+        _wf_probe.event_store = None  # None-safe: skip event emission
+
+        alpha_result = await _wf_probe._handle_superseded(
+            MergeOutcome('superseded', superseded_by=train_id)
+        )
+        assert alpha_result == WorkflowOutcome.MERGE_DEFERRED, (
+            f'α consumer: expected MERGE_DEFERRED, got {alpha_result!r}'
+        )
+        _sched_probe.set_task_status.assert_any_await('probe-alpha', 'merge-deferred')
+        assert not any(
+            call.args == ('probe-alpha', 'done')
+            for call in _sched_probe.set_task_status.await_args_list
+        ), 'α consumer: set_task_status must never be called with "done" on superseded outcome'
+
+        # (h) ε surface: req1 (entered via enqueue_merge_request) is merge_status-observable.
+        # _on_finalized fires when req1.result resolves; it writes a merge_finalized row
+        # with state='superseded' and superseded_by=train_id to the event store.
+        # Give the done_callback a moment to fire — it runs synchronously on the event
+        # loop after set_result, but asyncio may not have drained it yet.
+        await asyncio.sleep(0)
+        finalized_member = es.latest_merge_finalized(request_id=req1.request_id)
+        assert finalized_member is not None, (
+            'ε surface: req1 entered via enqueue_merge_request must have a '
+            'merge_finalized record after its future is resolved superseded'
+        )
+        assert finalized_member['state'] == 'superseded', (
+            f'ε surface: member merge_finalized state must be "superseded"; '
+            f'got {finalized_member["state"]!r}'
+        )
+        assert finalized_member['superseded_by'] == train_id, (
+            f'ε surface: superseded_by must be {train_id!r}; '
+            f'got {finalized_member["superseded_by"]!r}'
+        )
+        # 'Follow the train': the train's train_merged event confirms it landed done.
+        train_merged_events = _events_of_type(db_path, 'train_merged')
+        assert len(train_merged_events) == 1, (
+            f'ε surface: expected 1 train_merged event; got {len(train_merged_events)}'
+        )
+        assert train_merged_events[0]['data'].get('merge_commit_sha') == merged_sha, (
+            f'ε surface: train_merged event must carry the same SHA as merged provenance; '
+            f'got {train_merged_events[0]["data"].get("merge_commit_sha")!r}'
+        )
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
