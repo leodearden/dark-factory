@@ -408,3 +408,199 @@ class TestCoreFormation:
         assert set(data.get('absorbed_request_ids', [])) == {
             req1.request_id, req2.request_id, req3.request_id,
         }, f'absorbed_request_ids mismatch: {data.get("absorbed_request_ids")}'
+
+
+# ─── Step 7 ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestExclusionIdempotency:
+    """step-7 (RED): in-flight, detached, and GroupMergeRequest exclusion rules."""
+
+    async def test_inflight_request_never_absorbed(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(a) IN-FLIGHT NEVER ABSORBED.
+
+        A request that lives in _inflight_req (not in _lane_buffers) must never
+        be touched by the pass — its future remains unresolved and its task_id
+        does not appear in the train's member_task_ids.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+
+        # Three disjoint-file branches so all are line-stackable.
+        wt0 = await _make_branch_with_file(git_ops, 'in0', 'inflight.py', 'x = 0\n')
+        wt1 = await _make_branch_with_file(git_ops, 'in1', 'file_x.py', 'x = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'in2', 'file_y.py', 'y = 2\n')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req0 = _make_req('in0', 'task/in0', wt0, coalesce_config)
+        req1 = _make_req('in1', 'task/in1', wt1, coalesce_config)
+        req2 = _make_req('in2', 'task/in2', wt2, coalesce_config)
+
+        # Simulate req0 being in-flight (currently merging/verifying).
+        # It is NOT in the lane buffer — that is the structural invariant.
+        worker._inflight_req = req0
+
+        # Only req1 and req2 are in the buffer.
+        worker._lane_buffers['normal'].extend([req1, req2])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        # Pass should succeed (req1+req2 form a train).
+        assert result is True, 'pass must coalesce req1+req2 into a train'
+
+        # req0's future must still be unresolved — the pass must not touch it.
+        assert not req0.result.done(), (
+            'in-flight request future must remain unresolved after the pass'
+        )
+
+        # req0's task_id must not appear in the formed train's member_task_ids.
+        buf = list(worker._lane_buffers['normal'])
+        assert len(buf) == 1 and isinstance(buf[0], GroupMergeRequest)
+        group_req = buf[0]
+        assert 'in0' not in group_req.member_task_ids, (
+            f'in-flight task must not be absorbed: member_task_ids={group_req.member_task_ids}'
+        )
+
+    async def test_cancelled_waiter_skipped_no_set_result(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(b) DETACHED WAITER SKIPPED WITHOUT set_result.
+
+        A request whose future is already cancelled must not be absorbed and
+        set_result must never be called on it — it stays cancelled (CancelledError),
+        not overwritten with 'superseded'.  It also remains in the buffer.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'c1', 'alpha.py', 'a = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'c2', 'beta.py', 'b = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'c3', 'gamma.py', 'g = 3\n')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('c1', 'task/c1', wt1, coalesce_config)
+        req2 = _make_req('c2', 'task/c2', wt2, coalesce_config)
+        req3 = _make_req('c3', 'task/c3', wt3, coalesce_config)
+
+        # Cancel req3 to simulate a detached waiter.
+        req3.result.cancel()
+        assert req3.result.cancelled(), 'precondition: req3 future is cancelled'
+
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must coalesce the 2 live singles'
+
+        # req3's future must NOT have been overwritten — it stays cancelled.
+        assert req3.result.cancelled(), (
+            'cancelled future must remain cancelled — set_result must not be called'
+        )
+
+        # req3 must still be in the buffer (it was not absorbed).
+        buf = list(worker._lane_buffers['normal'])
+        task_ids_in_buf = [
+            r.task_id for r in buf if not isinstance(r, GroupMergeRequest)
+        ]
+        assert 'c3' in task_ids_in_buf, (
+            f'cancelled request must remain in the buffer; buf task_ids={task_ids_in_buf}'
+        )
+
+        # Sanity: req3 is not in the formed train's member_task_ids.
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 1
+        assert 'c3' not in trains[0].member_task_ids
+
+    async def test_group_merge_request_in_buffer_not_reabsorbed(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(c) IDEMPOTENCY.
+
+        A GroupMergeRequest already sitting in the normal buffer must never be
+        selected as a candidate — it is not re-absorbed.  Its future must remain
+        unresolved after the pass.
+        """
+        from orchestrator.merge_queue import (
+            GroupMergeRequest, SpeculativeMergeWorker, TrainCallbacks,
+        )
+
+        wt1 = await _make_branch_with_file(git_ops, 'g1', 'one.py', 'n = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'g2', 'two.py', 'n = 2\n')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('g1', 'task/g1', wt1, coalesce_config)
+        req2 = _make_req('g2', 'task/g2', wt2, coalesce_config)
+
+        # A pre-existing GroupMergeRequest sitting in the buffer (e.g. formed by
+        # the β-former or a prior coalescing pass iteration).
+        existing_group_future = asyncio.get_running_loop().create_future()
+        existing_group = GroupMergeRequest(
+            task_id='gx',
+            branch='task/gx',
+            worktree=tmp_path / 'wt-gx',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=existing_group_future,
+            train_id='train-existing',
+            member_task_ids=['ga', 'gx'],
+            tip_branch='task/gx',
+            tip_task_id='gx',
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+
+        # Put the existing group first, then the 2 singles.
+        worker._lane_buffers['normal'].extend([existing_group, req1, req2])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        # (c1) The existing GroupMergeRequest's future must be unresolved.
+        assert not existing_group_future.done(), (
+            'pre-existing GroupMergeRequest future must not be resolved by the pass'
+        )
+
+        # (c2) The existing GroupMergeRequest must still be in the buffer.
+        buf = list(worker._lane_buffers['normal'])
+        group_reqs = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        group_train_ids = {gr.train_id for gr in group_reqs}
+        assert 'train-existing' in group_train_ids, (
+            f'pre-existing GroupMergeRequest must remain in buffer; '
+            f'found train_ids: {group_train_ids}'
+        )
+
+        # (c3) The existing group was not in any newly formed train's member_task_ids.
+        new_groups = [gr for gr in group_reqs if gr.train_id != 'train-existing']
+        for ng in new_groups:
+            assert 'gx' not in ng.member_task_ids, (
+                f'pre-existing GroupMergeRequest task_id must not appear in new train: '
+                f'{ng.member_task_ids}'
+            )
