@@ -549,6 +549,148 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
+# 5b. Train throughput stats
+# ---------------------------------------------------------------------------
+
+# All-zeros default dict for train_throughput_stats (returned when db is None
+# or when an exception occurs inside the query).
+_TRAIN_THROUGHPUT_DEFAULT: dict = {
+    'trains_landed': 0,
+    'tasks_landed_via_trains': 0,
+    'train_verifies_per_landed_task': 0.0,
+    'baseline_solo_landed': 0,
+    'baseline_verifies_per_landed_task': 0.0,
+    'verifies_per_landed_task_delta': 0.0,
+    'train_cas_retry_rate': 0.0,
+    'baseline_cas_retry_rate': 0.0,
+    'cas_retry_rate_delta': 0.0,
+    'improved': False,
+}
+
+
+async def train_throughput_stats(
+    db: aiosqlite.Connection | None,
+    *,
+    hours: int = 24,
+    now: datetime | None = None,
+) -> dict:
+    """Throughput amortisation metrics derived from the events table.
+
+    Reads train_merged + merge_attempt rows in the look-back window and computes:
+    - trains_landed: count of train_merged events
+    - tasks_landed_via_trains: Σ len(member_task_ids) over train_merged rows
+    - train_verifies_per_landed_task: trains_landed / tasks_landed_via_trains
+      (one union verify per landed train; 0.0 when no trains)
+    - baseline_solo_landed: count of merge_attempt(outcome='done', train_id IS NULL)
+    - baseline_verifies_per_landed_task: 1.0 when any solo landed, else 0.0
+    - verifies_per_landed_task_delta: baseline − train (positive = amortisation win)
+    - train_cas_retry_rate: train cas_retry count / tasks_landed_via_trains
+    - baseline_cas_retry_rate: solo cas_retry count / baseline_solo_landed
+    - cas_retry_rate_delta: baseline − train
+    - improved: True when verifies_per_landed_task_delta > 0
+
+    Returns the all-zeros default when db is None or on exception.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp. When None, uses datetime.now(UTC).
+    """
+    if db is None:
+        return dict(_TRAIN_THROUGHPUT_DEFAULT)
+
+    async def _query(conn: aiosqlite.Connection) -> dict:
+        since = _cutoff_iso(hours, now=now)
+        # --- train_merged rows ---
+        train_merged_rows = await conn.execute_fetchall(
+            "SELECT data FROM events "
+            "WHERE event_type = 'train_merged' AND timestamp >= ?",
+            (since,),
+        )
+        trains_landed = len(train_merged_rows)
+        tasks_landed_via_trains = 0
+        for row in train_merged_rows:
+            try:
+                import json as _json
+                data = _json.loads(row['data'] or '{}')
+                members = data.get('member_task_ids') or []
+                tasks_landed_via_trains += len(members)
+            except Exception:
+                pass
+
+        train_verifies_per_landed_task = (
+            trains_landed / tasks_landed_via_trains
+            if tasks_landed_via_trains > 0
+            else 0.0
+        )
+
+        # --- baseline solo merge_attempt(outcome='done', train_id IS NULL) ---
+        solo_rows = await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'done' "
+            "  AND json_extract(data, '$.train_id') IS NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        )
+        baseline_solo_landed = solo_rows[0]['cnt'] if solo_rows else 0
+        baseline_verifies_per_landed_task = 1.0 if baseline_solo_landed > 0 else 0.0
+
+        verifies_per_landed_task_delta = (
+            baseline_verifies_per_landed_task - train_verifies_per_landed_task
+        )
+
+        # --- CAS-retry rates ---
+        train_retry_rows = await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'cas_retry' "
+            "  AND json_extract(data, '$.train_id') IS NOT NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        )
+        train_retries = train_retry_rows[0]['cnt'] if train_retry_rows else 0
+        train_cas_retry_rate = (
+            train_retries / tasks_landed_via_trains
+            if tasks_landed_via_trains > 0
+            else 0.0
+        )
+
+        solo_retry_rows = await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'cas_retry' "
+            "  AND json_extract(data, '$.train_id') IS NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        )
+        solo_retries = solo_retry_rows[0]['cnt'] if solo_retry_rows else 0
+        baseline_cas_retry_rate = (
+            solo_retries / baseline_solo_landed
+            if baseline_solo_landed > 0
+            else 0.0
+        )
+
+        cas_retry_rate_delta = baseline_cas_retry_rate - train_cas_retry_rate
+        improved = verifies_per_landed_task_delta > 0
+
+        return {
+            'trains_landed': trains_landed,
+            'tasks_landed_via_trains': tasks_landed_via_trains,
+            'train_verifies_per_landed_task': train_verifies_per_landed_task,
+            'baseline_solo_landed': baseline_solo_landed,
+            'baseline_verifies_per_landed_task': baseline_verifies_per_landed_task,
+            'verifies_per_landed_task_delta': verifies_per_landed_task_delta,
+            'train_cas_retry_rate': train_cas_retry_rate,
+            'baseline_cas_retry_rate': baseline_cas_retry_rate,
+            'cas_retry_rate_delta': cas_retry_rate_delta,
+            'improved': improved,
+        }
+
+    return await with_db(db, _query, dict(_TRAIN_THROUGHPUT_DEFAULT))
+
+
+# ---------------------------------------------------------------------------
 # 6. Active queued merges
 # ---------------------------------------------------------------------------
 
