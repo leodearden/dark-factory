@@ -1110,6 +1110,135 @@ def compute_content_fingerprint_signature(
 
 
 # --------------------------------------------------------------------------- #
+# Terminal-metadata guard helpers (task-1725)
+# --------------------------------------------------------------------------- #
+
+#: Flag types that assert a task has stale / left-over metadata blobs.
+#: Both spellings are included to be robust against LLM naming drift.
+STALE_METADATA_FLAG_TYPES: frozenset[str] = frozenset({
+    'stale_metadata',
+    'task_metadata_stale',
+})
+
+#: Task statuses that represent terminal states with no further execution need.
+#: A task in one of these states will never re-execute, so its metadata blobs
+#: have no execution-time consumer and stale_metadata flags for it are noise.
+TERMINAL_STATUSES: frozenset[str] = frozenset({
+    'cancelled',
+    'done',
+})
+
+
+def _extract_terminal_status(result: object) -> str:
+    """Extract task status from a get_task result, mirroring task_interceptor._extract_status.
+
+    Checks top-level ``status`` first, then ``data['status']``, else returns
+    ``'unknown'``.  Returns ``'unknown'`` for any non-dict input.
+
+    This is a local copy of the extraction logic to honour the no-import-inversion
+    convention (reconciliation must not import from middleware).
+    """
+    if not isinstance(result, dict):
+        return 'unknown'
+    status = result.get('status')
+    if isinstance(status, str) and status:
+        return status
+    data = result.get('data')
+    if isinstance(data, dict):
+        nested = data.get('status')
+        if isinstance(nested, str) and nested:
+            return nested
+    return 'unknown'
+
+
+async def filter_terminal_metadata_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop stale_metadata flags for tasks that are in a terminal state.
+
+    For each flag whose ``flag_type`` is in ``STALE_METADATA_FLAG_TYPES`` and
+    that carries a ``task_id``, calls ``taskmaster.get_task(task_id,
+    project_root)`` and DROPS the flag iff the extracted status is in
+    ``TERMINAL_STATUSES`` (``'cancelled'`` or ``'done'``).
+
+    **Fail-safe direction**: this filter DROPS flags, so it drops ONLY on
+    positively-confirmed terminal status.  get_task errors, non-dict results,
+    ``'unknown'`` status, or any non-terminal status => KEEP the flag.  This
+    is the conservative default: a transient get_task failure costs at most one
+    extra dedup cycle and self-heals next cycle.
+
+    Non-stale-metadata flags and stale-metadata flags without a ``task_id``
+    are passed through unchanged without any get_task call.
+
+    Degrades to a no-op pass-through when ``taskmaster`` or ``project_root`` is
+    falsy (mirrors filter_false_absence_flags).
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method, typically ``self.taskmaster`` in MemoryConsolidator.
+        project_root: Project root path passed through to get_task.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        Filtered list with stale_metadata flags for terminal tasks removed.
+    """
+    if not taskmaster or not project_root:
+        return list(flags)
+
+    # Split flags into those requiring a get_task lookup and pass-throughs.
+    check_positions: list[int] = []
+    check_task_ids: list[Any] = []
+
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if flag_type in STALE_METADATA_FLAG_TYPES and flag.get('task_id') is not None:
+            check_positions.append(i)
+            check_task_ids.append(flag.get('task_id'))
+
+    if not check_positions:
+        return list(flags)
+
+    async def _safe_get_task(task_id: Any) -> Any:
+        try:
+            return await taskmaster.get_task(task_id, project_root)
+        except Exception as exc:
+            logger.debug(
+                'reconciliation.terminal_metadata_filter_get_task_error task_id=%s error=%s',
+                task_id, exc,
+            )
+            return None  # KEEP flag on error (fail-safe)
+
+    lookup_results: list[Any] = await asyncio.gather(
+        *[_safe_get_task(tid) for tid in check_task_ids]
+    )
+    results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in results_by_pos:
+            kept.append(flag)
+            continue
+
+        result = results_by_pos[i]
+        status = _extract_terminal_status(result)
+        task_id = flag.get('task_id')
+        flag_type = flag.get('flag_type')
+
+        if status in TERMINAL_STATUSES:
+            logger.info(
+                'reconciliation.terminal_metadata_flag_dropped task_id=%s status=%s',
+                task_id, status,
+            )
+            # drop: task is terminal; metadata blobs have no execution-time consumer
+        else:
+            kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # Absence guard helpers
 # --------------------------------------------------------------------------- #
 
