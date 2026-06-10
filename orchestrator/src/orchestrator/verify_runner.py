@@ -615,6 +615,7 @@ class RemoteRunner:
         cwd: str | Path,
         *,
         config_path: str | None = None,
+        main_branch: str | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
@@ -623,11 +624,25 @@ class RemoteRunner:
         self._git_remote = git_remote
         self._cwd = cwd
         self._config_path = config_path
+        self._main_branch = main_branch
         self._run = run if run is not None else _default_subprocess_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
         # Optional test-instrumentation hook: tests may assign a list to this
         # attribute so they can inspect all subprocess argv lists after the fact.
         self._calls: list[list[str]] = []
+        # Reserved for future deduplication of the best-effort main-branch push.
+        # When runner instances are long-lived (cached across calls), this
+        # attribute can be used to skip the push when main has not advanced
+        # since the last successful push to this remote.
+        #
+        # NOTE on current production behaviour: _build_remote_runners creates
+        # fresh RemoteRunner instances on each _run_post_merge_verify /
+        # _run_drift_check call, so this attribute is always None at dispatch
+        # time and deduplication never fires.  The main push is already cheap
+        # (git sends only a thin packfile when remote objects are present), so
+        # the per-call round-trip is acceptable at current merge cadences.
+        # Filed as a follow-up: cache runners and wire deduplication.
+        self._last_pushed_main_sha: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
@@ -662,7 +677,33 @@ class RemoteRunner:
         request_id = self._id_factory()
         ref = f'refs/merge-verify/{request_id}'
 
-        # Step 1: push the merge sha to the remote
+        # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
+        # has a fresh view of main.  This also makes the subsequent merge-sha push
+        # thin (objects already present on the remote).  A non-zero rc or OSError
+        # is logged at WARNING and swallowed — a non-fast-forward must not abort
+        # the verify.  The merge-sha push that follows is the load-bearing transport.
+        if self._main_branch:
+            try:
+                main_rc, _, main_stderr = await self._run(
+                    ['git', 'push', self._git_remote,
+                     f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                    cwd=self._cwd,
+                )
+                if main_rc != 0:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        'RemoteRunner %r: best-effort main push of %r to %r failed '
+                        '(rc=%d): %s — continuing with merge-sha push',
+                        self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+                    )
+            except OSError as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    'RemoteRunner %r: best-effort main push failed with OSError: %s — continuing',
+                    self.name, exc,
+                )
+
+        # Step 1: push the merge sha to the remote (load-bearing transport)
         try:
             push_rc, _push_out, push_stderr = await self._run(
                 ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],

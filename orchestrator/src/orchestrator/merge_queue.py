@@ -34,6 +34,7 @@ from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
+    _derive_task_files_from_git,
     _resolve_verify_timeout,
     run_scoped_verification,
     run_verification,
@@ -41,7 +42,9 @@ from orchestrator.verify import (
 )
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
+    DriftDetector,
     LocalRunner,
+    RemoteRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
     is_unscoped_gate_failure,
@@ -52,6 +55,38 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _build_remote_runners(
+    config: OrchestratorConfig,
+    cwd: str | Path,
+    *,
+    quarantine: set[str] | None = None,
+) -> list[RemoteRunner]:
+    """Build the list of RemoteRunner instances from operator config (Lever C).
+
+    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
+    since it needs call-specific arguments (worktree path, module configs, etc.).
+
+    Filters out disabled runners (enabled=False) and any runner whose name is in
+    the quarantine set (in-memory worker-level quarantine from DriftDetector).
+    quarantine=None is treated as an empty set (no quarantine).
+
+    _build_verify_runners passes main_branch=config.git.main_branch so the
+    remote host receives a freshness push before the merge-sha transport.
+    """
+    return [
+        RemoteRunner(
+            name=r.name,
+            ssh_host=r.ssh_host,
+            git_remote=r.git_remote,
+            cwd=cwd,
+            config_path=r.config_path,
+            main_branch=config.git.main_branch,
+        )
+        for r in config.enabled_verify_runners
+        if quarantine is None or r.name not in quarantine
+    ]
 
 
 @dataclass
@@ -621,6 +656,7 @@ async def _run_post_merge_verify(
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
+    quarantine: set[str] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -655,19 +691,31 @@ async def _run_post_merge_verify(
     # Build the spec (carried for forward-compat with γ/δ remote runners;
     # the LocalRunner does not use it to drive execution).
     task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
+
+    # Mechanism 5b (dispatching-host scope derivation): when Lever C is on and
+    # task_files was not supplied, derive the scope on the DISPATCHING host
+    # (which has a fresh main) before building the spec.  This ships a faithful
+    # non-None task_files in the spec so the remote's run_scoped_verification
+    # never calls _derive_task_files_from_git against its own possibly-stale main.
+    # Gated on enabled_verify_runners so the local-only path is byte-identical
+    # when Lever C is off (zero behaviour change, trivially revertible).
+    if task_files_tuple is None and req.config.enabled_verify_runners:
+        derived = await _derive_task_files_from_git(merge_wt, req.config)
+        if derived:
+            task_files_tuple = tuple(derived)
+
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # Construct a per-call pool with a single LocalRunner.  The verify callables
-    # are the merge_queue module globals resolved at call time so that existing
-    # test patches on 'orchestrator.merge_queue.run_scoped_verification' and
-    # '_run_unscoped_typechecks' keep intercepting after the routing change.
+    # Construct a per-call pool.  When Lever C is on (enabled_verify_runners
+    # non-empty), include remote runners after the LocalRunner trust anchor.
+    # _run_cold_shadow_verify stays LOCAL-ONLY (see design decision: cold trust-anchor).
     pool = VerifyRunnerPool(
         [LocalRunner(
             merge_wt, req.config, req.module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
             task_id=req.task_id,
-        )],
+        ), *_build_remote_runners(req.config, merge_wt, quarantine=quarantine)],
         event_store=event_store,
         task_id=req.task_id,
     )
@@ -4521,6 +4569,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Only incremented when not item.skip_verify; never reset so the counter
         # covers the full worker lifetime (cross-submission).
         self._verify_attempt_count: int = 0
+        # Lever C drift detective: land counter and in-memory quarantine set.
+        # _drift_land_count increments on every 'done' land; _runner_quarantine
+        # is the set of remote runner names that have been quarantined by
+        # DriftDetector.check in _run_drift_check.  Both are additive across
+        # submissions; the dedup'd L1 escalation in DriftDetector is the
+        # durable cross-restart protection.  None-safe: initialised here so
+        # bare-worker tests that don't set up remotes stay green.
+        #
+        # RESTART RE-TRUST WINDOW: _runner_quarantine resets to empty on worker
+        # restart.  A remote that diverged (remote PASS / local FAIL) becomes
+        # re-eligible immediately after restart.  The dedup'd L1 blocking
+        # escalation (submitted by DriftDetector before quarantine) is the
+        # cross-restart guard: an open verify_drift_divergence L1 escalation
+        # halts the merge queue across restart via the normal EscalationQueue
+        # gate, so the re-trusted remote's verdict is never authoritative for
+        # real merges until the escalation is resolved.  Rely on that coupling
+        # rather than persisting the quarantine set (operational simplicity
+        # tradeoff accepted; see plan.json §Mechanism-4 design notes).
+        self._drift_land_count: int = 0
+        self._runner_quarantine: set[str] = set()
+        # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
+        # reference to running tasks, so without a strong ref here the drift
+        # detective can be GC'd mid-run and a remote-PASS / local-FAIL
+        # divergence would go undetected — defeating the safety control.
+        # Mirrors the _shadow_compare_tasks pattern (see :func:`_maybe_schedule_shadow_compare`).
+        self._drift_check_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
@@ -4948,6 +5022,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+
+        # Cancel in-flight drift-check detective tasks so their finally blocks run
+        # (i.e. _run_drift_check's cleanup_merge_worktree call executes during
+        # CancelledError unwinding rather than leaking the throwaway verify worktree).
+        # Take a snapshot before iterating: the done-callback mutates the set.
+        for _dt in list(self._drift_check_tasks):
+            if not _dt.done():
+                _dt.cancel()
+                with contextlib.suppress(BaseException):
+                    await _dt
 
     # ------------------------------------------------------------------
     # Event helpers
@@ -6105,6 +6189,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     event_store=self._event_store,
                     merge_sha=merge_commit,
                     on_result=_warm_capture.append if _is_warm_path else None,
+                    quarantine=self._runner_quarantine,
                 ))
                 while True:
                     done, _ = await asyncio.wait(
@@ -6274,6 +6359,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await _maybe_schedule_shadow_compare(
                         self, self._git_ops, req, merge_commit,
                         _warm_results, self._escalation_queue, self._event_store,
+                    )
+                    # Lever C drift detective: cadence-gated multi-host parity
+                    # check.  Returns IMMEDIATELY when cadence not met or no
+                    # enabled runners; spawns asyncio.create_task off the serial
+                    # lane when due.  Worker quarantine propagates into subsequent
+                    # _run_post_merge_verify dispatches via _runner_quarantine.
+                    await _maybe_run_drift_check(
+                        self, self._git_ops, req, merge_commit,
                     )
                 return True
 
@@ -7130,6 +7223,11 @@ async def _run_cold_shadow_verify(
             tuple(req.task_files) if req.task_files is not None else None
         )
         spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
+        # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
+        # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
+        # (b) reintroduce remote scope-derivation concerns into the very control whose
+        # purpose is to BE the local ground truth.  See design decision in plan.json.
         pool = VerifyRunnerPool(
             [LocalRunner(
                 wt, req.config, req.module_configs, task_files_tuple,
@@ -7329,6 +7427,141 @@ async def _maybe_schedule_shadow_compare(
 
     t.add_done_callback(_discard_task)
     worker._shadow_compare_tasks.add(t)
+
+
+async def _run_drift_check(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+    quarantine_set: set[str],
+) -> None:
+    """Drift detective control: run DriftDetector.check in a throwaway worktree.
+
+    Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
+    off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
+    Creates a throwaway verify worktree, builds a 2-host pool (local trust-anchor
+    + eligible remote from config), runs :meth:`~orchestrator.verify_runner.DriftDetector.check`,
+    and propagates any quarantined remote name into *quarantine_set* (the worker-
+    level shared set consulted by ``_run_post_merge_verify``).
+
+    Exceptions are caught and logged so this detective control never crashes the
+    worker.  ``cleanup_merge_worktree`` is called in a ``finally`` block.
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just landed (config, task_files, …).
+        merge_commit: The just-landed merge commit SHA.
+        escalation_queue: Live escalation queue (None-safe: passed to DriftDetector).
+        event_store: Optional event store (None-safe: passed to DriftDetector).
+        quarantine_set: Worker-level mutable set; quarantined remote names are
+            added here so subsequent ``_run_post_merge_verify`` dispatches
+            skip the diverged remote (in-memory protection until restart).
+    """
+    # wt is initialised before the try so the finally guard (`if wt is not None`)
+    # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
+    # creation inside the try ensures the docstring contract ("Exceptions are caught
+    # and logged") holds for all failure modes — disk-full / git errors included.
+    wt = None
+    try:
+        wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+        task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
+        # Derive task_files on the dispatching host (fresh main) when not supplied
+        # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
+        if task_files_tuple is None and req.config.enabled_verify_runners:
+            derived = await _derive_task_files_from_git(wt, req.config)
+            if derived:
+                task_files_tuple = tuple(derived)
+        spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        pool = VerifyRunnerPool(
+            [LocalRunner(
+                wt, req.config, req.module_configs, task_files_tuple,
+                run_scoped=run_scoped_verification,
+                run_unscoped=_run_unscoped_typechecks,
+                task_id=req.task_id,
+            ), *_build_remote_runners(req.config, wt, quarantine=quarantine_set)],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
+        # Cadence is already enforced upstream in _maybe_run_drift_check
+        # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
+        # never called on this path, so omitting every_n_lands here keeps a
+        # single source of truth and avoids a dead duplicate cadence value.
+        detector = DriftDetector(
+            pool,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+            task_id=req.task_id,
+        )
+        # Capture the eligible remote BEFORE check() so we can propagate its
+        # name even after the pool quarantines it (eligible_remote() returns
+        # None after quarantine).
+        eligible_before = pool.eligible_remote()
+        result = await detector.check(merge_commit, spec)
+        if result.quarantined and eligible_before is not None:
+            quarantine_set.add(eligible_before.name)
+    except Exception:
+        logger.warning(
+            'Drift check failed for task %s / commit %s; ignoring (detective control)',
+            req.task_id, merge_commit,
+            exc_info=True,
+        )
+    finally:
+        if wt is not None:
+            await git_ops.cleanup_merge_worktree(wt)
+
+
+async def _maybe_run_drift_check(
+    worker: SpeculativeMergeWorker,
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+) -> None:
+    """Cadence gate + off-serial-lane spawn for the Lever C drift detective.
+
+    Called from :meth:`SpeculativeMergeWorker._verify_and_advance` on every
+    successful ('done') land, immediately after ``_maybe_schedule_shadow_compare``.
+    Returns **immediately** — spawns a background task when cadence is met,
+    otherwise is a no-op.
+
+    Cadence: every ``config.verify_drift_check_every_n_lands`` successful lands.
+    No-op when ``config.enabled_verify_runners`` is empty (Lever C off).
+
+    State is tracked in worker-level attrs ``_drift_land_count`` (incremented
+    here) and ``_runner_quarantine`` (propagated from :func:`_run_drift_check`).
+
+    Args:
+        worker: Live :class:`SpeculativeMergeWorker` instance.
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just landed.
+        merge_commit: The just-landed merge commit SHA.
+    """
+    if not req.config.enabled_verify_runners:
+        return
+    every_n = req.config.verify_drift_check_every_n_lands
+    worker._drift_land_count += 1
+    if worker._drift_land_count % every_n == 0:
+        _coro = _run_drift_check(
+            git_ops, req, merge_commit,
+            worker._escalation_queue, worker._event_store,
+            worker._runner_quarantine,
+        )
+        _task = asyncio.create_task(_coro)
+        if not isinstance(_task, asyncio.Task):
+            # create_task was intercepted (e.g. by a test mock) and did not
+            # schedule _coro.  Close it here to prevent
+            # "coroutine was never awaited" RuntimeWarning from leaking into
+            # unrelated tests (pyproject.toml converts those warnings to errors).
+            _coro.close()
+        else:
+            # Hold a strong reference so the event loop cannot GC the drift
+            # detective mid-run (asyncio keeps only a weak ref to Tasks).
+            # Mirrors the _shadow_compare_tasks pattern at :func:`_maybe_schedule_shadow_compare`.
+            worker._drift_check_tasks.add(_task)
+            _task.add_done_callback(
+                lambda t: worker._drift_check_tasks.discard(t)
+            )
 
 
 async def _acquire_warm_verify_worktree(

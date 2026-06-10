@@ -3232,23 +3232,25 @@ Output JSON matching the schema. Every task must appear in the output.
         its note_merge method as the merge worker's on_merge_landed callback.
         """
         from orchestrator.merge_queue import (
-            _MERGE_AHEAD_BOUND,
             MergeLivenessConfigError,
             SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
 
-        # K = number of verify runners — sizes both the liveness guard
-        # (merge_ahead_bound) and the worker's speculation cap (speculation_depth).
-        # Both knobs are derived from this ONE variable so they cannot drift apart
-        # if K is ever raised.
+        # K = 1 (local trust-anchor) + number of enabled remote verify runners.
+        # Sizes the liveness guard (merge_ahead_bound), the serial-lane bound
+        # (num_hosts), and the worker's speculation cap (speculation_depth).
+        # All three knobs derive from ONE expression so they cannot drift apart
+        # as verify_runners grows.  num_hosts=K makes the per-host serial-lane
+        # bound ceil(K/num_hosts)=ceil(K/K)=1, so each of the 1+N hosts runs at
+        # most one in-flight merge-verify at a time.
         #
-        # NOTE: K is intentionally pinned to _MERGE_AHEAD_BOUND (=1) here until
-        # task η (per-host warm worktree) provides the per-host parallel capacity
-        # that makes K>1 safe in production.  The deeper K>1 code-paths are
-        # exercised by tests; wiring K from config is a follow-up task.
-        _k: int = _MERGE_AHEAD_BOUND
+        # NOTE: K was previously pinned to _MERGE_AHEAD_BOUND (=1).  Wired from
+        # config.verify_runners by task 1716 (Lever C operator-enable path).
+        # DO NOT flip reify's orchestrator.yaml verify_runners on until the
+        # verdict-parity report is green (PRD D6 gate; see task 1716 analysis).
+        _k: int = 1 + len(self.config.enabled_verify_runners)
 
         # Fail-CLOSED on an over-budget liveness verdict: if the configured
         # bound×timeout exceeds the safe threshold, refuse to start the merge
@@ -3266,7 +3268,11 @@ Output JSON matching the schema. Every task must appear in the output.
         # Fail-CLOSED: persistent warm worktree is serial-lane-only (PRD §10
         # invariant 3).  If the knob is on and _k > 1, refuse startup rather
         # than risk concurrent cargo on a shared target/.
-        enforce_persistent_worktree_serial_lane(self.config, merge_ahead_bound=_k)
+        # num_hosts=_k: each of the K hosts gets its own serial lane so
+        # per-host lane bound = ceil(K/num_hosts) = 1.
+        enforce_persistent_worktree_serial_lane(
+            self.config, merge_ahead_bound=_k, num_hosts=_k,
+        )
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 
