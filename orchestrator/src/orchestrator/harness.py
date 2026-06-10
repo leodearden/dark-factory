@@ -3346,28 +3346,28 @@ Output JSON matching the schema. Every task must appear in the output.
         # verdict-parity report is green (PRD D6 gate; see task 1716 analysis).
         _k: int = 1 + len(self.config.enabled_verify_runners)
 
-        # Fail-CLOSED on an over-budget liveness verdict: if the configured
-        # per-host bound × timeout exceeds the safe threshold, refuse to start
-        # the merge worker and propagate MergeLivenessConfigError to the caller.
-        # num_hosts=_k: with K runners across K distinct hosts, per-host bound =
-        # ceil(K/K)=1 → worst_case = 1 * timeout → safe even with K > 1.
+        # Fail-CLOSED on an over-budget liveness verdict: refuse to start the merge
+        # worker and propagate MergeLivenessConfigError to the caller.
         #
-        # INVARIANT: num_hosts=_k is valid only if:
-        #   (a) each of the K verify runners runs on a SEPARATE host, and
-        #   (b) the SpeculativeMergeWorker dispatches all K verifies concurrently
-        #       (one per runner, none co-located or serialized on the same host).
-        # If two runners share a host, the Kth worktree can queue ~2×timeout and
-        # be prematurely reaped mid-verify — the exact race INFLIGHT_MERGE_
-        # WORKTREE_LIVENESS_SECS was added to close (esc-1674-34).
-        # Validate at operator-enable time: confirm that local _merge-* worktrees
-        # do NOT linger while remote verify is in flight (see task 1726
-        # physical-model note).  If lingering IS observed, reduce num_hosts here.
+        # Physical model (task 1729 / α owner-heartbeat, task 1728):
+        # The α heartbeat touches every owned _merge-* worktree's mtime every
+        # _HEARTBEAT_POLL_S seconds.  A live worker's worktrees therefore never
+        # age past ~1 poll period regardless of K, cold timeout, prefer-remote
+        # routing, or queue depth.  The reaper's worst-case frozen age is
+        # _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE (event-loop-stall budget),
+        # NOT bound × timeout.  K drops out of the formula because the *model*
+        # changed, not because the guard weakened.
+        #
+        # Intentional asymmetry: enforce_persistent_worktree_serial_lane below
+        # still receives num_hosts=_k (per-host serial-lane bound is genuinely
+        # per-host; that guard's model did not change).  Only the liveness guard
+        # drops _k: the two guards describe independent physical constraints.
         #
         # Any OTHER exception (e.g. config resolution failure in a mock or
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
         # preserving the original crash-loop protection for unrelated errors.
         try:
-            enforce_merge_liveness_margin(self.config, merge_ahead_bound=_k, num_hosts=_k)
+            enforce_merge_liveness_margin(self.config)
         except MergeLivenessConfigError:
             raise  # fail-closed: over-budget verdict → refuse startup
         except Exception as e:
