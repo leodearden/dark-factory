@@ -65,7 +65,6 @@ def _make(
     config.max_consecutive_merge_thrash = 3
     config.merge_train_former_enabled = former_enabled
     config.merge_train_max_members = max_members
-    config.main_branch = 'main'
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
@@ -280,3 +279,88 @@ class TestSelectTrainMembers:
         }
         result = fn('200', ['201'], ranges_by_id, max_members=3)
         assert result[0] == '200'
+
+
+# ---------------------------------------------------------------------------
+# step-11: _train_candidates — async candidate discovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestTrainCandidates:
+    """Unit tests for TaskWorkflow._train_candidates()."""
+
+    def _make_task(
+        self,
+        id: str,
+        status: str = 'in-progress',
+        metadata: dict | None = None,
+    ) -> dict:
+        return {'id': id, 'status': status, 'metadata': metadata or {}}
+
+    @pytest.mark.asyncio
+    async def test_excludes_self(self):
+        """_train_candidates never includes self (same task_id)."""
+        fix = _make(
+            task_id='200',
+            get_tasks_return=[
+                self._make_task('200'),  # self — must be excluded
+                self._make_task('201'),  # eligible
+            ],
+        )
+        result = await fix.wf._train_candidates()
+        ids = [t['id'] for t in result]
+        assert '200' not in ids
+        assert '201' in ids
+
+    @pytest.mark.asyncio
+    async def test_excludes_non_in_progress_statuses(self):
+        """Only in-progress tasks are candidates; done/blocked/merge-deferred excluded."""
+        fix = _make(
+            task_id='200',
+            get_tasks_return=[
+                self._make_task('201', status='done'),
+                self._make_task('202', status='blocked'),
+                self._make_task('203', status='merge-deferred'),
+                self._make_task('204', status='in-progress'),  # the only eligible one
+            ],
+        )
+        result = await fix.wf._train_candidates()
+        ids = [t['id'] for t in result]
+        assert ids == ['204']
+
+    @pytest.mark.asyncio
+    async def test_excludes_already_train_member(self):
+        """Tasks already carrying metadata.train are excluded."""
+        fix = _make(
+            task_id='200',
+            get_tasks_return=[
+                self._make_task(
+                    '201',
+                    metadata={'train': {'id': 'train-x', 'order': 0, 'members': ['201']}},
+                ),
+                self._make_task('202'),  # no train metadata → eligible
+            ],
+        )
+        result = await fix.wf._train_candidates()
+        ids = [t['id'] for t in result]
+        assert '201' not in ids
+        assert '202' in ids
+
+    @pytest.mark.asyncio
+    async def test_excludes_unresolvable_branch(self):
+        """Candidates whose branch doesn't resolve (resolve_branch_sha→None) are excluded."""
+        fix = _make(
+            task_id='200',
+            get_tasks_return=[
+                self._make_task('201'),  # branch resolves
+                self._make_task('210'),  # branch does NOT resolve
+            ],
+        )
+        # Task 210's branch is dead / not yet pushed.
+        fix.git_ops.resolve_branch_sha = AsyncMock(
+            side_effect=lambda branch: None if branch == '210' else 'abc123'
+        )
+        result = await fix.wf._train_candidates()
+        ids = [t['id'] for t in result]
+        assert '201' in ids
+        assert '210' not in ids
