@@ -912,6 +912,8 @@ def create_server(
         }
         if outcome.failure_diagnostic is not None:
             result['failure_diagnostic'] = outcome.failure_diagnostic
+        if outcome.superseded_by is not None:
+            result['superseded_by'] = outcome.superseded_by
         return result
 
     @mcp.tool()
