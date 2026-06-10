@@ -4653,6 +4653,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # _acquire_next_request can drain remaining lane-buffer items before
         # returning None.  Cleared by stop() on full reset.
         self._shutdown_signaled: bool = False
+        # γ/1719 debounce signature — frozenset of candidate request_ids from
+        # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
+        # attempts).  Short-circuits when the waiting set is unchanged.
+        self._last_coalesce_signature: frozenset[str] | None = None
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
@@ -5119,6 +5123,216 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return True
 
     # ------------------------------------------------------------------
+    # Retroactive coalescing pass (γ/1719)
+    # ------------------------------------------------------------------
+
+    async def _maybe_coalesce_waiting_singles(self) -> bool:
+        """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
+
+        Called from _merger_loop at the pre-dequeue point when the pipeline is
+        idle (spec_base is None and prefetched is None) so a train is never
+        enqueued behind an unverified speculative merge commit (pipeline-ordering
+        contract, :5239 warning comment).
+
+        Returns True when a GroupMergeRequest was formed and appended to
+        _lane_buffers['normal']; False in all no-op / guard-exit cases.
+
+        Config is read from the first candidate MergeRequest's .config field
+        (OrchestratorConfig), mirroring the pattern in _do_train_merge (req.config).
+        """
+        # Guard: factory required to build callbacks.
+        if self._train_callback_factory is None:
+            return False
+
+        # Drain any newly arrived items so the candidate list is current.
+        self._drain_queue_into_lanes()
+
+        # Build candidate list: single MergeRequests in the normal lane whose
+        # futures are still live (not done and not cancelled).
+        #
+        # STRUCTURAL EXCLUSIONS (no new MergeRequest field needed):
+        #  · GroupMergeRequest: a pre-existing or re-formed train — excluded by
+        #    isinstance check; it stays in the buffer untouched and its future is
+        #    never resolved here (idempotency guarantee).
+        #  · req.result.done() / req.result.cancelled(): an absorbed request has
+        #    its future resolved ('superseded') — excluded; a detached/cancelled
+        #    waiter has its future cancelled — excluded AND never receives
+        #    set_result (so it stays cancelled, not overwritten with 'superseded').
+        #  · In-flight / verifying request: lives in self._inflight_req or is
+        #    carried by a SpeculativeItem in self._verify_item — structurally
+        #    absent from self._lane_buffers, so it is excluded without any
+        #    explicit filter.  No buffer scan of _inflight_req/_verify_item is
+        #    required or performed.
+        candidates = [
+            req for req in self._lane_buffers['normal']
+            if not isinstance(req, GroupMergeRequest)
+            and not req.result.done()
+            and not req.result.cancelled()
+        ]
+
+        # Guard: need at least 2 candidates to form a train.
+        if len(candidates) < 2:
+            return False
+
+        # Read OrchestratorConfig from the first candidate (all requests in the
+        # queue share the same config since the worker is per-project).
+        orch_config = candidates[0].config
+
+        # Guard: feature knob (OFF by default — fold-the-decision norm).
+        if not orch_config.merge_train_coalesce_enabled:
+            return False
+        # Guard: max_members ≥ 2 (the ge=2 Pydantic constraint should catch this,
+        # but guard defensively so the invariant is local to this method).
+        if orch_config.merge_train_max_members < 2:
+            return False
+
+        # ── Step-12: debounce ──────────────────────────────────────────────────
+        # Compute the candidate-set signature.  Short-circuit on an unchanged set
+        # so a steady stream of waiting singles does not re-run get_changed_line_ranges
+        # + stack_train_branches every merger tick.  Setting the signature BEFORE the
+        # selection/stack work means both the no-viable-train AND the successful-coalesce
+        # paths record the attempt — a composition change re-arms (new request_id in set
+        # → different frozenset → inequality → re-runs).
+        sig: frozenset[str] = frozenset(c.request_id for c in candidates)
+        if sig == self._last_coalesce_signature:
+            return False
+        self._last_coalesce_signature = sig
+
+        # ── Step-6: core pass body ─────────────────────────────────────────────
+        # SELECTION: fan out line-range fetches concurrently (one git subprocess
+        # per candidate), then delegate to the greedy mutually-stackable selector.
+        # Function-local import avoids a load-time circular import: workflow.py
+        # imports merge_queue only lazily, so merge_queue→workflow is safe here.
+        from orchestrator.workflow import _select_train_members  # noqa: PLC0415
+
+        anchor = candidates[0]
+        other_ids = [c.task_id for c in candidates[1:]]
+        all_ids = [c.task_id for c in candidates]
+
+        range_results = await asyncio.gather(*[
+            self._git_ops.get_changed_line_ranges(task_id) for task_id in all_ids
+        ])
+        ranges_by_id: dict[str, dict] = {
+            tid: r for tid, r in zip(all_ids, range_results, strict=True)
+        }
+
+        selected = _select_train_members(
+            anchor.task_id, other_ids, ranges_by_id,
+            orch_config.merge_train_max_members,
+        )
+        if len(selected) < 2:
+            # Signature already recorded above; no further work needed.
+            return False
+
+        # STACK: rebase successors onto the previous survivor's branch.  Rebase
+        # conflicts or missing worktrees produce ejected members that stay solo.
+        stack_result = await self._git_ops.stack_train_branches(selected)
+        survivors: list[str] = stack_result.survivors
+        ejected: list[str] = stack_result.ejected
+
+        if len(survivors) < 2:
+            # Abort cleanly: sig already recorded; no buffer mutation, no future
+            # resolution, no event emitted.  Non-selected and ejected members
+            # remain in _lane_buffers with unresolved futures (they may yet join a
+            # future train when a new stackable partner arrives and re-arms the sig).
+            return False
+
+        # BUILD GroupMergeRequest from the tip (last survivor) request.
+        req_by_task_id: dict[str, MergeRequest] = {c.task_id: c for c in candidates}
+        tip_id = survivors[-1]
+        tip_req = req_by_task_id[tip_id]
+        survivor_reqs = [req_by_task_id[sid] for sid in survivors]
+
+        # Union scope: if workspace-wide verify, use tip's scope (no per-module
+        # constraint); otherwise union task_files + module_configs across survivors.
+        if orch_config.merge_verify_workspace:
+            union_task_files = tip_req.task_files
+            union_module_configs = tip_req.module_configs
+        else:
+            # task_files=None means "all files"; any None in the set wins.
+            if any(r.task_files is None for r in survivor_reqs):
+                union_task_files = None
+            else:
+                _seen_files: set[str] = set()
+                union_task_files = []
+                for sr in survivor_reqs:
+                    for f in (sr.task_files or []):
+                        if f not in _seen_files:
+                            _seen_files.add(f)
+                            union_task_files.append(f)
+            # module_configs: deduplicate by mc.prefix (semantic identity),
+            # matching workflow._union_train_scope.  Using id(mc) would retain
+            # duplicate configs for equal-but-distinct objects and produce
+            # redundant verify-scope entries.
+            union_module_configs = []
+            _seen_mc: set[str] = set()
+            for sr in survivor_reqs:
+                for mc in sr.module_configs:
+                    if mc.prefix not in _seen_mc:
+                        _seen_mc.add(mc.prefix)
+                        union_module_configs.append(mc)
+
+        train_id = f'coalesce-{tip_id}-{uuid.uuid4().hex[:8]}'
+        callbacks = self._train_callback_factory(train_id)  # type: ignore[misc]
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+
+        group_req = GroupMergeRequest(
+            task_id=tip_req.task_id,
+            branch=tip_req.branch,
+            worktree=tip_req.worktree,
+            pre_rebased=False,
+            task_files=union_task_files,
+            module_configs=union_module_configs,
+            config=tip_req.config,
+            result=future,
+            train_id=train_id,
+            member_task_ids=list(survivors),
+            tip_branch=tip_req.branch,
+            tip_task_id=tip_id,
+            status_check=callbacks.status_check,
+            mark_member_done=callbacks.mark_member_done,
+        )
+
+        # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
+        # non-survivor + ejected solos, then append the new train at the tail.
+        survivor_set = set(survivors)
+        new_buffer: collections.deque[MergeRequest] = collections.deque()
+        for buf_req in self._lane_buffers['normal']:
+            # Keep GroupMergeRequests and non-survivor singles intact.
+            if isinstance(buf_req, GroupMergeRequest) or buf_req.task_id not in survivor_set:
+                new_buffer.append(buf_req)
+        new_buffer.append(group_req)
+        self._lane_buffers['normal'] = new_buffer
+
+        # RESOLVE absorbed futures: park each absorbed workflow as merge-deferred.
+        # The existing workflow._handle_superseded consumer (α/1717) transitions
+        # the task; mark_member_done flips it done after the train lands.
+        # Detached/cancelled requests were filtered from candidates in step 1, so
+        # no set_result is ever called on a cancelled future here.
+        for s_req in survivor_reqs:
+            if not s_req.result.done():
+                s_req.result.set_result(
+                    MergeOutcome('superseded', superseded_by=train_id)
+                )
+
+        # EMIT train_coalesced lifecycle event.
+        _emit_train_event(
+            self._event_store,
+            EventType.train_coalesced,
+            task_id=tip_id,
+            train_id=train_id,
+            member_task_ids=list(survivors),
+            data={
+                'absorbed_request_ids': [r.request_id for r in survivor_reqs],
+                'tip_task_id': tip_id,
+                'ejected': ejected,
+                'size': len(survivors),
+            },
+        )
+
+        return True
+
+    # ------------------------------------------------------------------
     # Merger coroutine
     # ------------------------------------------------------------------
 
@@ -5148,6 +5362,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
+                # γ/1719 retroactive coalescing pass — design decisions summary:
+                # • DD1: runs at the pre-dequeue point, gated on a clean pipeline
+                #   (spec_base=None and prefetched=None) so a train is never enqueued
+                #   behind an unverified speculative merge commit (:5239 warning).
+                # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
+                #   done/cancelled futures); no new MergeRequest field required.
+                # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
+                #   unchanged waiting set on every tick.  NOTE: the signature is set
+                #   before the stack attempt, so a transient stack/worktree error
+                #   (survivors<2 due to env issue, not a deterministic rebase conflict)
+                #   permanently skips the set until the candidate composition changes.
+                #   Low priority given feature ships OFF; tracked for δ/ζ follow-up.
+                # • DD6 (timing): absorbed members park merge-deferred asynchronously;
+                #   _do_train_merge's status pre-check may return TRAIN_INCOMPLETE on a
+                #   prematurely-dequeued train — same retryable 'blocked' the β/δ path
+                #   uses; full retry is left to δ/ζ.  Feature is OFF by default.
+                # When merge_train_coalesce_enabled=False (default) the call has
+                # near-zero overhead: it drains the queue (already done at acquire
+                # time), builds the candidate list, reads the knob, and returns False.
+                if spec_base is None and prefetched is None:
+                    await self._maybe_coalesce_waiting_singles()
+
                 # Get next request: use pre-fetched (speculative) item if available,
                 # otherwise acquire from the lane-priority pick system.
                 if prefetched is not None:
