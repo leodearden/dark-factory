@@ -14,12 +14,18 @@ import pytest
 # Step-1: cadence predicate _shadow_compare_due
 # ---------------------------------------------------------------------------
 
+from unittest.mock import MagicMock
+
+from escalation.models import BORN_AT_L2_SEVERITIES
+
 from orchestrator.merge_queue import (  # noqa: E402
     ShadowCompareState,
     ShadowCompareDiff,
+    _WARM_COLD_SHADOW_SENTINEL,
     _load_shadow_compare_state,
     _save_shadow_compare_state,
     _shadow_compare_due,
+    _submit_shadow_divergence_escalation,
     diff_per_test_results,
     parse_per_test_results,
 )
@@ -411,3 +417,136 @@ class TestDiffPerTestResults:
             only_warm=[], only_cold=["t_extra"]
         )
         assert diff2.has_divergence is True
+
+
+# ---------------------------------------------------------------------------
+# Step-9: _submit_shadow_divergence_escalation
+# ---------------------------------------------------------------------------
+
+def _make_escalation_queue(*, has_open: bool = False) -> MagicMock:
+    """Return a MagicMock escalation_queue with standard API stubs."""
+    q = MagicMock()
+    q.make_id = MagicMock(return_value='esc-shadow-1')
+    q.has_open_l1 = MagicMock(return_value=has_open)
+    q.get_by_task = MagicMock(return_value=None)
+    q.submit = MagicMock()
+    return q
+
+
+def _make_diverging_diff() -> ShadowCompareDiff:
+    return ShadowCompareDiff(
+        diverging={"reify-core bad::test": (True, False)},
+        warm_pass_cold_fail=["reify-core bad::test"],
+        warm_fail_cold_pass=[],
+        only_warm=[],
+        only_cold=[],
+    )
+
+
+class TestSubmitShadowDivergenceEscalation:
+    """Unit tests for _submit_shadow_divergence_escalation."""
+
+    def test_none_escalation_queue_is_noop(self) -> None:
+        # Must not raise with None queue
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(
+            None, "abc1234567", diff,
+            {"t": True}, {"t": False}
+        )
+
+    def test_submits_escalation_on_divergence(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(
+            q, "deadbeef1234", diff,
+            {"reify-core bad::test": True},
+            {"reify-core bad::test": False},
+        )
+        q.submit.assert_called_once()
+
+    def test_escalation_severity_critical_born_at_l2(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "deadbeef", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        assert esc.severity == 'critical'
+        assert esc.severity in BORN_AT_L2_SEVERITIES
+
+    def test_escalation_level_2(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "deadbeef", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        assert esc.level == 2
+
+    def test_escalation_agent_role_is_orchestrator_sentinel(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "deadbeef", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        # Must carry orchestrator- prefix so it is NOT downgraded
+        assert esc.agent_role == 'orchestrator-warm-cold-shadow'
+        assert esc.agent_role.startswith('orchestrator-')
+
+    def test_escalation_category(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "deadbeef", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        assert esc.category == 'risk_identified'
+
+    def test_escalation_task_id_is_sentinel(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "deadbeef", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        assert esc.task_id == _WARM_COLD_SHADOW_SENTINEL
+        assert esc.task_id == '__warm_cold_shadow__'
+
+    def test_summary_names_commit_and_diverging_count(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        commit = "abcdef123456"
+        _submit_shadow_divergence_escalation(q, commit, diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        assert commit[:8] in esc.summary
+        assert '1' in esc.summary  # 1 diverging test
+
+    def test_detail_contains_diverging_test_id(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(
+            q, "sha123",
+            diff,
+            {"reify-core bad::test": True},
+            {"reify-core bad::test": False},
+        )
+        esc = q.submit.call_args[0][0]
+        assert "reify-core bad::test" in esc.detail
+
+    def test_detail_mentions_warm_already_landed(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "sha", diff, {}, {})
+        esc = q.submit.call_args[0][0]
+        # Must explicitly state that warm merge has already landed
+        detail_lower = esc.detail.lower()
+        assert any(kw in detail_lower for kw in ('already landed', 'already applied', 'shadow'))
+
+    def test_dedup_no_second_submit_when_open_escalation_exists(self) -> None:
+        q = _make_escalation_queue(has_open=True)
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "sha", diff, {}, {})
+        q.submit.assert_not_called()
+
+    def test_dedup_submits_when_no_open_escalation(self) -> None:
+        q = _make_escalation_queue(has_open=False)
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "sha", diff, {}, {})
+        q.submit.assert_called_once()
+
+    def test_make_id_called_with_sentinel(self) -> None:
+        q = _make_escalation_queue()
+        diff = _make_diverging_diff()
+        _submit_shadow_divergence_escalation(q, "sha", diff, {}, {})
+        q.make_id.assert_called_once_with(_WARM_COLD_SHADOW_SENTINEL)
