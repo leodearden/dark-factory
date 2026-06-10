@@ -2895,3 +2895,73 @@ class TestResolveActive:
 
         assert result['approximate'] is True
         assert result['entries'] == []
+
+
+# ---------------------------------------------------------------------------
+# TestTrainThroughputStats — step-6 RED / step-7+ GREEN
+# ---------------------------------------------------------------------------
+
+_TRAIN_THROUGHPUT_DEFAULT_KEYS = {
+    'trains_landed',
+    'tasks_landed_via_trains',
+    'train_verifies_per_landed_task',
+    'baseline_solo_landed',
+    'baseline_verifies_per_landed_task',
+    'verifies_per_landed_task_delta',
+    'train_cas_retry_rate',
+    'baseline_cas_retry_rate',
+    'cas_retry_rate_delta',
+    'improved',
+}
+
+
+@pytest.mark.asyncio
+class TestTrainThroughputStats:
+    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> dict.
+
+    step-6: default contract (None / empty DB → all-zeros).
+    step-8: verifies-per-landed-task counting.
+    step-10: CAS-retry rate.
+    step-12: aggregator wiring.
+    """
+
+    async def test_none_db_returns_all_zeros_default(self):
+        """train_throughput_stats(None) returns the all-zeros default dict."""
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        result = await train_throughput_stats(None)
+
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS, (
+            f"expected keys {_TRAIN_THROUGHPUT_DEFAULT_KEYS}, got: {set(result.keys())}"
+        )
+        assert result['trains_landed'] == 0
+        assert result['tasks_landed_via_trains'] == 0
+        assert result['train_verifies_per_landed_task'] == 0.0
+        assert result['baseline_solo_landed'] == 0
+        assert result['baseline_verifies_per_landed_task'] == 0.0
+        assert result['verifies_per_landed_task_delta'] == 0.0
+        assert result['train_cas_retry_rate'] == 0.0
+        assert result['baseline_cas_retry_rate'] == 0.0
+        assert result['cas_retry_rate_delta'] == 0.0
+        assert result['improved'] is False
+
+    async def test_empty_db_returns_all_zeros_default(self, tmp_path):
+        """train_throughput_stats(db) on an empty events table returns the all-zeros default."""
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        db_path = _make_db(tmp_path, 'empty.db', [])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn)
+
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS
+        assert result['trains_landed'] == 0
+        assert result['tasks_landed_via_trains'] == 0
+        assert result['train_verifies_per_landed_task'] == 0.0
+        assert result['baseline_solo_landed'] == 0
+        assert result['baseline_verifies_per_landed_task'] == 0.0
+        assert result['verifies_per_landed_task_delta'] == 0.0
+        assert result['train_cas_retry_rate'] == 0.0
+        assert result['baseline_cas_retry_rate'] == 0.0
+        assert result['cas_retry_rate_delta'] == 0.0
+        assert result['improved'] is False
