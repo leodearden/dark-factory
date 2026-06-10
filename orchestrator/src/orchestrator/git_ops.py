@@ -89,6 +89,11 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'|^Merge task/{tid} into '
 )
 
+# Fixed name for the persistent warm merge-verify worktree (task 1692).
+# Lives at <worktree_base>/_merge-verify.  Excluded from prune and
+# find_inflight enumeration (see _iter_merge_worktrees).
+PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -1444,7 +1449,18 @@ class GitOps:
         return merge_wt, pre_merge_sha.strip()
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
-        """Remove a temporary merge worktree."""
+        """Remove a temporary merge worktree.
+
+        **Persistent-worktree exemption**: if *merge_wt* resolves to
+        :attr:`persistent_merge_worktree_path`, this method is a **no-op**
+        (the warm worktree survives across attempts and across verify failures,
+        so ``target/`` warmth is preserved).  The ephemeral removal path is
+        unchanged for all other ``_merge-*`` worktrees.
+        """
+        if merge_wt.resolve() == self.persistent_merge_worktree_path.resolve():
+            logger.debug('persistent merge worktree retained: %s', merge_wt)
+            return
+
         rc, _, err = await _run(
             ['git', 'worktree', 'remove', str(merge_wt), '--force'],
             cwd=self.project_root,
@@ -1453,6 +1469,98 @@ class GitOps:
             logger.warning(f'Failed to remove merge worktree {merge_wt}: {err}')
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
+
+    @property
+    def persistent_merge_worktree_path(self) -> Path:
+        """Fixed path for the persistent warm merge-verify worktree.
+
+        Always ``<worktree_base>/_merge-verify``.  The path is independent of
+        the ``git.persistent_merge_worktree`` knob — the property always
+        returns the canonical location so callers can compare against it even
+        when the feature is off.
+        """
+        return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
+        """Create or reset-in-place the persistent warm merge-verify worktree.
+
+        **Create-once path** (worktree not yet registered):
+            ``git worktree add --detach <fixed_path> <merge_commit>``
+
+        **Reset-in-place path** (worktree already registered):
+            ``git reset --hard <merge_commit>`` followed by
+            ``git clean -xfd -e <dir>`` for each dir in
+            ``config.reap_build_artifact_dirs`` — so the source tree is
+            bit-identical to a fresh checkout of *merge_commit* while
+            build-artifact dirs (e.g. ``target/``) are retained (PRD §10
+            invariant 1: source bit-identical to fresh checkout; build-cache
+            dirs retained for warmth).
+
+        Returns the fixed path (:attr:`persistent_merge_worktree_path`).
+        Raises :exc:`RuntimeError` on git failure (mirrors
+        :meth:`_create_merge_worktree`).
+        """
+        warm_path = self.persistent_merge_worktree_path
+
+        if not await self._is_registered_worktree(warm_path):
+            # Create-once branch — self-heal a stale unregistered directory first.
+            # A previous run may have left the directory on disk without a git
+            # worktree registration (e.g. worktree metadata pruned after a crash).
+            # `git worktree add` refuses a non-empty directory, permanently
+            # wedging the warm path until manual cleanup.  Removing the orphaned
+            # directory here mirrors the stale-directory removal in create_worktree
+            # and makes the create-once path self-healing.
+            if warm_path.exists():
+                logger.warning(
+                    'Persistent merge worktree path %s exists on disk but is not '
+                    'a registered git worktree; removing stale directory to allow '
+                    'fresh creation (self-heal)',
+                    warm_path,
+                )
+                shutil.rmtree(warm_path)
+            warm_path.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to create persistent merge worktree at {warm_path}: {err}'
+                )
+            logger.info(
+                'Created persistent merge worktree at %s (HEAD=%s)',
+                warm_path, merge_commit[:8],
+            )
+        else:
+            # Reset-in-place branch (added in step-6)
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=warm_path,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to reset persistent merge worktree {warm_path} '
+                    f'to {merge_commit}: {err}'
+                )
+            # Single invocation excluding ALL artifact dirs at once — every
+            # configured build-output dir (e.g. build AND dist) survives in
+            # one pass.  A per-dir loop would call ``git clean -xfd -e build``
+            # (deleting dist/) then ``git clean -xfd -e dist`` (deleting
+            # build/), so with >1 dir NONE survive (step-19 regression).
+            clean_cmd = ['git', 'clean', '-xfd']
+            for artifact_dir in self.config.reap_build_artifact_dirs:
+                clean_cmd += ['-e', artifact_dir]
+            rc, _, err = await _run(clean_cmd, cwd=warm_path)
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to clean persistent merge worktree {warm_path}: {err}'
+                )
+            logger.info(
+                'Reset persistent merge worktree %s to HEAD=%s',
+                warm_path, merge_commit[:8],
+            )
+
+        return warm_path
 
     async def _iter_merge_worktrees(self):
         """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
@@ -1466,6 +1574,12 @@ class GitOps:
         *wt_path* is the raw path from porcelain output (used for git commands).
         *wt_resolved* is the resolved path (used for identity comparisons such
         as the ``keep`` exclusion in :meth:`prune_stale_merge_worktrees`).
+
+        **Persistent-worktree exemption**: the fixed
+        :data:`PERSISTENT_MERGE_WORKTREE_NAME` (``_merge-verify``) is always
+        skipped so that both :meth:`prune_stale_merge_worktrees` (PRD §10
+        invariant 4) and :meth:`find_inflight_merge_worktree` never touch or
+        return the warm worktree.
         """
         rc, out, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'],
@@ -1485,6 +1599,10 @@ class GitOps:
             if wt_resolved.parent != self.worktree_base:
                 continue
             if not wt_resolved.name.startswith('_merge-'):
+                continue
+            # Exempt the persistent warm merge-verify worktree — prune and
+            # find_inflight must never touch it (invariant 4).
+            if wt_resolved.name == PERSISTENT_MERGE_WORKTREE_NAME:
                 continue
             yield wt_path, wt_resolved
 
@@ -1507,6 +1625,11 @@ class GitOps:
         prefixed that way).  Enumerates via :meth:`_iter_merge_worktrees`
         (``git worktree list --porcelain``), so a half-created directory git
         doesn't track is never removed.
+
+        The persistent warm merge-verify worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) is always exempted via
+        :meth:`_iter_merge_worktrees` — it is never removed by prune
+        (PRD §10 invariant 4).
         """
         removed: list[str] = []
         keep_resolved = keep.resolve() if keep else None

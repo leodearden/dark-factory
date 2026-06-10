@@ -441,6 +441,32 @@ class GitConfig(BaseModel):
             'main_gate_mark_command.  None (default) => feature off (no-op).'
         ),
     )
+    persistent_merge_worktree: bool = Field(
+        default=False,
+        description=(
+            'When True, the post-merge verify step reuses a FIXED worktree '
+            'at <worktree_dir>/_merge-verify instead of a fresh ephemeral '
+            '_merge-<uuid>.  The worktree is reset-in-place to the merge '
+            'commit (git reset --hard) and scrubbed of untracked files except '
+            'build-artifact dirs (git clean -xfd -e <dir> for each dir in '
+            'reap_build_artifact_dirs), retaining target/ warmth across '
+            'attempts.  Default False → byte-identical to prior behaviour '
+            '(trivially revertible).  Requires _MERGE_AHEAD_BOUND=1 '
+            '(serial lane); startup raises PersistentWorktreeConfigError '
+            'otherwise.'
+        ),
+    )
+    persistent_merge_worktree_safety_valve_every_n: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'When >0 and persistent_merge_worktree is on, every Nth verifying '
+            'serial attempt runs a from-scratch cold verify in a throwaway '
+            'ephemeral worktree (target NOT retained); its pass/fail flows '
+            'through the existing verify gate (a cold failure on the serial '
+            'lane is the alarm).  0 disables the safety valve.'
+        ),
+    )
 
 
 # --- Per-module overrides ---

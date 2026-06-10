@@ -3236,6 +3236,7 @@ Output JSON matching the schema. Every task must appear in the output.
             MergeLivenessConfigError,
             SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
+            enforce_persistent_worktree_serial_lane,
         )
 
         # K = number of verify runners — sizes both the liveness guard
@@ -3261,6 +3262,11 @@ Output JSON matching the schema. Every task must appear in the output.
             raise  # fail-closed: over-budget verdict → refuse startup
         except Exception as e:
             logger.warning('enforce_merge_liveness_margin failed (non-fatal): %s', e)
+
+        # Fail-CLOSED: persistent warm worktree is serial-lane-only (PRD §10
+        # invariant 3).  If the knob is on and _k > 1, refuse startup rather
+        # than risk concurrent cargo on a shared target/.
+        enforce_persistent_worktree_serial_lane(self.config, merge_ahead_bound=_k)
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 

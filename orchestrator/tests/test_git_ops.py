@@ -4385,3 +4385,371 @@ class TestReclaimWorktreeBuildArtifacts:
         assert removed == [], (
             f'expected [] for non-existent path, got {removed}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1692 — persistent warm merge-verify worktree
+# ---------------------------------------------------------------------------
+
+
+async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) -> str:
+    """Helper: create a feature branch, commit a file, merge to main, return merge_commit."""
+    wt_info = await git_ops.create_worktree(branch_name)
+    (wt_info.path / filename).write_text(f'{branch_name} = True\n')
+    await git_ops.commit(wt_info.path, f'Add {filename}')
+    result = await git_ops.merge_to_main(wt_info.path, branch_name)
+    assert result.success and result.merge_commit
+    return result.merge_commit
+
+
+def test_git_config_persistent_merge_worktree_knobs():
+    """GitConfig knobs for the persistent warm merge-verify worktree feature.
+
+    Step 1 (RED): these fields do not yet exist — test must fail before impl.
+    """
+    # Defaults: feature off
+    cfg_default = GitConfig()
+    assert cfg_default.persistent_merge_worktree is False, (
+        'persistent_merge_worktree must default to False (feature off)'
+    )
+    assert cfg_default.persistent_merge_worktree_safety_valve_every_n == 0, (
+        'safety_valve_every_n must default to 0 (disabled)'
+    )
+
+    # Round-trip True
+    cfg_on = GitConfig(persistent_merge_worktree=True)
+    assert cfg_on.persistent_merge_worktree is True, (
+        'persistent_merge_worktree=True must round-trip'
+    )
+    # safety_valve_every_n independent
+    assert cfg_on.persistent_merge_worktree_safety_valve_every_n == 0
+
+    # safety_valve_every_n set explicitly
+    cfg_valve = GitConfig(
+        persistent_merge_worktree=True,
+        persistent_merge_worktree_safety_valve_every_n=5,
+    )
+    assert cfg_valve.persistent_merge_worktree is True
+    assert cfg_valve.persistent_merge_worktree_safety_valve_every_n == 5
+
+    # safety_valve_every_n >= 0 enforced (0 means disabled)
+    import pydantic
+    with pytest.raises((pydantic.ValidationError, ValueError)):
+        GitConfig(persistent_merge_worktree_safety_valve_every_n=-1)
+
+
+@pytest.mark.asyncio
+class TestPersistentMergeWorktree:
+    """Integration tests for reset_persistent_merge_worktree and its exemptions.
+
+    Steps 3–10 of task 1692.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 3 — create-once path
+    # ------------------------------------------------------------------
+
+    async def test_persistent_merge_worktree_path_property(
+        self, git_ops: GitOps,
+    ):
+        """persistent_merge_worktree_path == worktree_base / '_merge-verify'."""
+        assert git_ops.persistent_merge_worktree_path == (
+            git_ops.worktree_base / '_merge-verify'
+        )
+
+    async def test_reset_persistent_merge_worktree_create_once(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_merge_worktree creates worktree on first call.
+
+        Step 3 (RED): method/property absent today — test must fail before impl.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-create-1', 'warm_create.py',
+        )
+
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+
+        # Returns the fixed path
+        assert warm_path == git_ops.persistent_merge_worktree_path
+        assert warm_path.exists()
+
+        # Path is a registered git worktree
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered_paths = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(warm_path) in registered_paths, (
+            f'_merge-verify not in registered worktrees: {registered_paths}'
+        )
+
+        # HEAD of warm worktree == merge_commit
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path,
+        )
+        assert head_sha.strip() == merge_commit.strip(), (
+            f'warm worktree HEAD {head_sha.strip()!r} != merge_commit {merge_commit.strip()!r}'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5 — reset-in-place on an EXISTING warm worktree
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_merge_worktree_reset_in_place(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_merge_worktree resets in-place on a second call.
+
+        Verifies:
+        - Still the same single registered path after reset.
+        - HEAD updated to the new merge_commit B.
+        - Tracked source reflects B (not A).
+        - target/cache.bin STILL EXISTS (target/ retained → warm).
+        - stray.txt was removed (git clean -xfd cleaned except target/).
+
+        Step 5 (RED): reset-in-place branch not yet implemented.
+        """
+        # --- First reset: create at merge_commit A ---
+        merge_commit_a = await _get_merge_commit(
+            git_ops, 'warm-reset-a', 'warm_a.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit_a)
+        assert warm_path.exists()
+
+        # Simulate a warm build: write a build artifact and a stray file
+        target_dir = warm_path / 'target'
+        target_dir.mkdir()
+        cache_bin = target_dir / 'cache.bin'
+        cache_bin.write_bytes(b'\xde\xad\xbe\xef')
+        stray_txt = warm_path / 'stray.txt'
+        stray_txt.write_text('stray untracked\n')
+
+        # --- Second reset: create a different merge_commit B ---
+        merge_commit_b = await _get_merge_commit(
+            git_ops, 'warm-reset-b', 'warm_b.py',
+        )
+        warm_path_b = await git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        # Same single registered path
+        assert warm_path_b == git_ops.persistent_merge_worktree_path
+        assert warm_path_b == warm_path, 'path must not change on second call'
+
+        # Only one _merge-verify worktree registered
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        merge_verify_paths = [p for p in registered if p.endswith('_merge-verify')]
+        assert len(merge_verify_paths) == 1, (
+            f'expected exactly 1 _merge-verify registration, got {merge_verify_paths}'
+        )
+
+        # HEAD == merge_commit_b (not A)
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path_b,
+        )
+        assert head_sha.strip() == merge_commit_b.strip(), (
+            f'HEAD should be B={merge_commit_b[:8]}, got {head_sha.strip()[:8]}'
+        )
+
+        # Source reflects B: warm_b.py present, warm_a.py absent
+        assert (warm_path_b / 'warm_b.py').exists(), (
+            'warm_b.py (B commit) should be present in warm worktree'
+        )
+        assert not (warm_path_b / 'warm_a.py').exists(), (
+            'warm_a.py (A commit) should NOT be present after reset to B'
+        )
+
+        # target/cache.bin STILL EXISTS (target/ retained → warm)
+        assert cache_bin.exists(), (
+            'target/cache.bin must be retained (warm build artifact)'
+        )
+
+        # stray.txt removed (git clean -xfd removed it)
+        assert not stray_txt.exists(), (
+            'stray.txt must be cleaned by git clean -xfd'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 7 — cleanup_merge_worktree is a no-op on the fixed path
+    # ------------------------------------------------------------------
+
+    async def test_cleanup_merge_worktree_noop_on_persistent_path(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree is a no-op on _merge-verify (warm survives).
+
+        Step 7 (RED): cleanup removes the fixed path today — must fail before
+        the no-op guard is added in step-8.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-cleanup-1', 'warm_cleanup.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Call cleanup on the fixed path — must be a no-op
+        await git_ops.cleanup_merge_worktree(warm_path)
+
+        # Warm worktree still registered and still on disk
+        assert warm_path.exists(), 'warm worktree must survive cleanup_merge_worktree'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            'warm worktree must still be registered after cleanup call'
+        )
+
+    async def test_cleanup_merge_worktree_removes_ephemeral(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree DOES remove an ephemeral _merge-<uuid> worktree.
+
+        Step 7 (RED, control): the ephemeral path must still be removed.
+        """
+        # Use the internal helper to create a fresh ephemeral merge worktree
+        merge_wt, _ = await git_ops._create_merge_worktree()
+        assert merge_wt.exists()
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # Ephemeral worktree is gone
+        assert not merge_wt.exists(), (
+            'ephemeral _merge-<uuid> must be removed by cleanup_merge_worktree'
+        )
+        assert not await git_ops._is_registered_worktree(merge_wt), (
+            'ephemeral _merge-<uuid> must be unregistered after cleanup'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 9 — _iter_merge_worktrees exempts _merge-verify
+    # ------------------------------------------------------------------
+
+    async def test_prune_skips_persistent_worktree(self, git_ops: GitOps):
+        """prune_stale_merge_worktrees removes ephemeral but NOT _merge-verify.
+
+        Step 9 (RED): prune force-removes _merge-verify today.
+        """
+        # Register the warm worktree
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-prune-1', 'warm_prune.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Also create an ephemeral _merge-<uuid> worktree
+        ephemeral_wt, _ = await git_ops._create_merge_worktree()
+        assert ephemeral_wt.exists()
+
+        # Prune: must remove ephemeral, NOT warm
+        removed = await git_ops.prune_stale_merge_worktrees()
+
+        assert any(
+            '_merge-' in r and not r.endswith('_merge-verify')
+            for r in removed
+        ), f'ephemeral worktree must appear in removed list: {removed}'
+        assert not any(
+            r.endswith('_merge-verify') for r in removed
+        ), f'_merge-verify must NOT appear in removed list: {removed}'
+
+        # Warm worktree still on disk and registered
+        assert warm_path.exists(), '_merge-verify must survive prune'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_merge-verify must still be registered after prune'
+        )
+
+        # Ephemeral is gone
+        assert not ephemeral_wt.exists(), (
+            'ephemeral _merge-<uuid> must be gone after prune'
+        )
+
+    async def test_find_inflight_never_returns_persistent_path(
+        self, git_ops: GitOps,
+    ):
+        """find_inflight_merge_worktree never returns _merge-verify.
+
+        Step 9 (RED): _iter_merge_worktrees doesn't yet skip _merge-verify.
+        """
+        # Register the warm worktree at some merge commit
+        merge_commit = await _get_merge_commit(
+            git_ops, 'warm-inflight-1', 'warm_inflight.py',
+        )
+        warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # find_inflight_merge_worktree(any branch) must never return warm_path
+        result = await git_ops.find_inflight_merge_worktree('warm-inflight-1')
+        assert result != warm_path, (
+            'find_inflight_merge_worktree must never return _merge-verify'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 19 — multi-dir reap_build_artifact_dirs regression
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_merge_worktree_multi_artifact_dirs(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Multi-dir reap_build_artifact_dirs: ALL configured dirs retained.
+
+        Regression test for step-19: the buggy per-dir git-clean loop calls
+        ``git clean -xfd -e build`` (which removes dist/) then
+        ``git clean -xfd -e dist`` (which removes build/) — with >1 dir NONE
+        survive, defeating the warm-cache purpose.
+
+        With the fix (step-20: single invocation with all -e flags) both dirs
+        must be retained after the reset-in-place.
+        """
+        cfg = git_config.model_copy(
+            update={'reap_build_artifact_dirs': ['build', 'dist']}
+        )
+        multi_ops = GitOps(cfg, git_repo)
+
+        # Create warm worktree at merge_commit_a
+        merge_commit_a = await _get_merge_commit(
+            multi_ops, 'multi-dir-a', 'multi_a.py',
+        )
+        warm_path = await multi_ops.reset_persistent_merge_worktree(merge_commit_a)
+        assert warm_path.exists()
+
+        # Simulate warm build artifacts in BOTH configured dirs + a stray file
+        build_dir = warm_path / 'build'
+        dist_dir = warm_path / 'dist'
+        build_dir.mkdir()
+        dist_dir.mkdir()
+        build_cache = build_dir / 'cache.bin'
+        dist_out = dist_dir / 'out.bin'
+        build_cache.write_bytes(b'\xca\xfe\xba\xbe')
+        dist_out.write_bytes(b'\xfe\xed\xfa\xce')
+        stray_txt = warm_path / 'stray.txt'
+        stray_txt.write_text('stray untracked\n')
+
+        # Create a second merge_commit_b and reset in place
+        merge_commit_b = await _get_merge_commit(
+            multi_ops, 'multi-dir-b', 'multi_b.py',
+        )
+        await multi_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        # BOTH configured build-artifact dirs must survive (warm retained)
+        assert build_cache.exists(), (
+            'build/cache.bin must be retained (build/ is a configured artifact dir)'
+        )
+        assert dist_out.exists(), (
+            'dist/out.bin must be retained (dist/ is a configured artifact dir)'
+        )
+
+        # Stray untracked file must be cleaned
+        assert not stray_txt.exists(), (
+            'stray.txt must be cleaned by git clean -xfd'
+        )

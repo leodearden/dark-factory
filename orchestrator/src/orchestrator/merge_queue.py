@@ -3852,6 +3852,11 @@ class MergeWorker(_WipHaltMixin):
         # consecutive tip-advance equivalence failure; popped on a clean 'done'
         # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
         self._generation_chain_counts: dict[str, int] = {}
+        # Persistent warm merge-verify worktree: counts verifying attempts so
+        # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
+        # Only incremented when not skip_verify; never reset so the counter
+        # covers the full worker lifetime (cross-submission).
+        self._verify_attempt_count: int = 0
         # Per-lane halt: each event is set (running) by default
         self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
         for ln in MERGE_LANES:
@@ -4077,6 +4082,24 @@ class MergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: skipping re-verification '
                 f'(pre-rebased, main unchanged)'
             )
+        # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
+        # Parity with SpeculativeMergeWorker._verify_and_advance: increment the
+        # per-worker verify counter and compute the safety-valve predicate so
+        # every Nth verifying attempt runs a from-scratch cold verify in a
+        # throwaway worktree (PRD §10 invariant 6).
+        # merge_result.merge_commit is non-None (asserted at line 4044 above).
+        if not skip_verify:
+            self._verify_attempt_count += 1
+            _due = _safety_valve_due(
+                self._verify_attempt_count,
+                req.config.git.persistent_merge_worktree_safety_valve_every_n,
+            )
+            merge_wt = await _acquire_warm_verify_worktree(
+                self._git_ops, req, merge_wt,
+                merge_result.merge_commit,  # non-None; assert at 4044 above
+                safety_valve_due=_due,
+            )
+            assert merge_wt is not None  # input was non-None; warm or unchanged
         if not skip_verify:
             out = await _run_post_merge_verify(
                 self._git_ops, req, merge_wt,
@@ -4284,6 +4307,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Separate from enqueued_at so verify_in_progress can report pure verify
         # time rather than total queue-wait time (useful for triage of stuck verifies).
         self._verify_started_at: float | None = None
+        # Persistent warm merge-verify worktree: counts verifying attempts so
+        # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
+        # Only incremented when not item.skip_verify; never reset so the counter
+        # covers the full worker lifetime (cross-submission).
+        self._verify_attempt_count: int = 0
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
@@ -5811,6 +5839,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         assert merge_commit is not None
         merge_commit = merge_commit.strip()
 
+        # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
+        # When the knob is ON and the safety valve isn't due, swap the
+        # ephemeral merge_wt for the fixed _merge-verify path BEFORE the
+        # verify-start log so the log shows worktree=_merge-verify (the
+        # user-observable persistence signal) and verify, advance_main, and
+        # all cleanup_merge_worktree calls use the warm path.
+        # PRD §10 invariant 6: every Nth verifying attempt bypasses the swap
+        # and runs a cold verify in the throwaway ephemeral worktree.
+        if not item.skip_verify:
+            self._verify_attempt_count += 1
+            _due = _safety_valve_due(
+                self._verify_attempt_count,
+                req.config.git.persistent_merge_worktree_safety_valve_every_n,
+            )
+            merge_wt = await _acquire_warm_verify_worktree(
+                self._git_ops, req, merge_wt, merge_commit,
+                safety_valve_due=_due,
+            )
+            assert merge_wt is not None  # input was non-None; warm or unchanged
+
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
             self._verify_phase = 'verifying'
@@ -6380,3 +6428,131 @@ def enforce_merge_liveness_margin(
             f'(currently {assessment.merge_ahead_bound}).'
         )
     return assessment
+
+
+# ---------------------------------------------------------------------------
+# Persistent warm merge-verify worktree — serial-lane startup guard
+# ---------------------------------------------------------------------------
+
+
+class PersistentWorktreeConfigError(Exception):
+    """Raised by :func:`enforce_persistent_worktree_serial_lane` when the
+    persistent warm merge-verify worktree is enabled but the merge-ahead bound
+    is not 1, which would risk concurrent cargo invocations on a single shared
+    ``target/`` directory.
+
+    The exception message names the bad bound so the operator knows what to
+    change (lower merge_ahead_bound back to 1 or disable
+    ``git.persistent_merge_worktree``).
+    """
+
+
+def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
+    """Return True when the periodic cold-verify safety valve should fire.
+
+    The safety valve (PRD §10 invariant 6) bypasses the warm-worktree swap on
+    every Nth verifying serial attempt so that a true from-scratch cold verify
+    runs in a throwaway ephemeral worktree (target NOT retained).  A cold
+    failure on the serial lane surfaces through the existing verify-failure
+    escalation path.
+
+    Args:
+        attempt_count: The 1-based count of verifying attempts on this worker
+            (incremented in ``_verify_and_advance`` before calling this).
+        every_n: From ``config.git.persistent_merge_worktree_safety_valve_every_n``.
+            0 or negative → disabled (always returns False).
+
+    Returns:
+        True when the valve is enabled (``every_n > 0``) and
+        ``attempt_count`` is a positive multiple of ``every_n``.
+    """
+    return every_n > 0 and attempt_count > 0 and attempt_count % every_n == 0
+
+
+async def _acquire_warm_verify_worktree(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_wt: Path | None,
+    merge_commit: str,
+    *,
+    safety_valve_due: bool,
+) -> Path | None:
+    """Swap the ephemeral merge worktree for the persistent warm worktree.
+
+    Called at the top of ``_verify_and_advance`` (and ``MergeWorker._process``)
+    when the persistent warm merge-verify worktree feature is enabled.  Resets
+    the fixed ``_merge-verify`` worktree to *merge_commit* (retaining
+    ``target/``), cleans up the now-redundant ephemeral *merge_wt*, and returns
+    the warm path so that the verify, advance_main, and cleanup_merge_worktree
+    calls all run on the stable fixed path.
+
+    When the knob is OFF or the safety valve is due (PRD §10 invariant 6),
+    *merge_wt* is returned unchanged so the caller proceeds with the original
+    ephemeral worktree — byte-identical to today's behaviour.
+
+    Args:
+        git_ops: Live :class:`GitOps` instance.
+        req: The :class:`MergeRequest` being processed (provides config).
+        merge_wt: The ephemeral merge worktree path produced by
+            ``merge_to_main``, or ``None`` if unavailable.
+        merge_commit: The SHA of the merge commit to check out in the warm wt.
+        safety_valve_due: ``True`` on the Nth verifying attempt (PRD §10
+            invariant 6): bypass the swap and run a cold verify in the
+            throwaway ephemeral worktree instead.
+
+    Returns:
+        The warm ``_merge-verify`` path when the swap is performed, or the
+        original *merge_wt* when the knob is off / safety valve is due.
+    """
+    if not req.config.git.persistent_merge_worktree or safety_valve_due:
+        return merge_wt
+
+    warm = await git_ops.reset_persistent_merge_worktree(merge_commit)
+    # The merge commit is already a reachable git object; the ephemeral worktree
+    # is no longer needed — drop it immediately to free the worktree slot.
+    if merge_wt is not None and merge_wt.resolve() != warm.resolve():
+        await git_ops.cleanup_merge_worktree(merge_wt)
+    return warm
+
+
+def enforce_persistent_worktree_serial_lane(
+    config: OrchestratorConfig,
+    *,
+    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+) -> None:
+    """Fail-closed startup guard for the persistent warm merge-verify worktree.
+
+    The warm worktree feature is SERIAL-LANE-ONLY (PRD §10 invariant 3): a
+    single shared ``target/`` directory is only safe when exactly one verify
+    attempt runs at a time.  Raising the merge-ahead bound above 1 while the
+    knob is on would allow concurrent ``cargo`` invocations inside one
+    ``target/`` — undefined behaviour / data corruption.
+
+    This guard is called immediately after :func:`enforce_merge_liveness_margin`
+    in :meth:`Harness._start_merge_worker` so that any misconfiguration is
+    caught at startup (fail-closed) rather than at the first concurrent verify.
+
+    Args:
+        config: Live per-project orchestrator config.
+        merge_ahead_bound: The effective merge-ahead bound (defaults to the
+            module-level :data:`_MERGE_AHEAD_BOUND`).
+
+    Returns:
+        ``None`` when the configuration is safe (knob off OR bound == 1).
+
+    Raises:
+        :exc:`PersistentWorktreeConfigError`: When
+            ``config.git.persistent_merge_worktree is True`` and
+            ``merge_ahead_bound != 1``.
+    """
+    if config.git.persistent_merge_worktree and merge_ahead_bound != 1:
+        raise PersistentWorktreeConfigError(
+            f'enforce_persistent_worktree_serial_lane: startup refused — '
+            f'git.persistent_merge_worktree is enabled but merge_ahead_bound '
+            f'is {merge_ahead_bound} (must be 1). The persistent warm '
+            f'_merge-verify worktree is serial-lane-only (PRD §10 invariant 3): '
+            f'a shared target/ is unsafe under concurrent verify attempts. '
+            f'Lower merge_ahead_bound to 1 or disable '
+            f'git.persistent_merge_worktree.'
+        )
+    return None
