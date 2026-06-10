@@ -16,9 +16,11 @@ import pytest
 
 from orchestrator.merge_queue import (  # noqa: E402
     ShadowCompareState,
+    ShadowCompareDiff,
     _load_shadow_compare_state,
     _save_shadow_compare_state,
     _shadow_compare_due,
+    diff_per_test_results,
     parse_per_test_results,
 )
 
@@ -307,3 +309,105 @@ class TestParsePerTestResults:
         output = "        FAIL [0.1s] c1 t1\n        FAIL [0.2s] c2 t2\n"
         result = parse_per_test_results(output)
         assert result == {"c1 t1": False, "c2 t2": False}
+
+
+# ---------------------------------------------------------------------------
+# Step-7: diff_per_test_results + ShadowCompareDiff
+# ---------------------------------------------------------------------------
+
+
+class TestDiffPerTestResults:
+    """Unit tests for diff_per_test_results and ShadowCompareDiff."""
+
+    # (c) Identical maps → has_divergence is False, all buckets empty
+    def test_identical_maps_no_divergence(self) -> None:
+        warm = {"t1": True, "t2": False, "t3": True}
+        cold = {"t1": True, "t2": False, "t3": True}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is False
+        assert diff.diverging == {}
+        assert diff.warm_pass_cold_fail == []
+        assert diff.warm_fail_cold_pass == []
+        assert diff.only_warm == []
+        assert diff.only_cold == []
+
+    # (d) warm=pass/cold=fail → appears in warm_pass_cold_fail + diverging
+    def test_warm_pass_cold_fail_named(self) -> None:
+        warm = {"reify-core bad::test": True}
+        cold = {"reify-core bad::test": False}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "reify-core bad::test" in diff.warm_pass_cold_fail
+        assert "reify-core bad::test" in diff.diverging
+        assert diff.diverging["reify-core bad::test"] == (True, False)
+
+    def test_warm_fail_cold_pass(self) -> None:
+        warm = {"reify-core flaky::test": False}
+        cold = {"reify-core flaky::test": True}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "reify-core flaky::test" in diff.warm_fail_cold_pass
+        assert diff.diverging["reify-core flaky::test"] == (False, True)
+
+    # Test only present in warm → only_warm (divergence)
+    def test_only_warm(self) -> None:
+        warm = {"t-warm": True}
+        cold: dict[str, bool] = {}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "t-warm" in diff.only_warm
+        assert diff.warm_pass_cold_fail == []
+        assert diff.warm_fail_cold_pass == []
+
+    # Test only in cold → only_cold (divergence)
+    def test_only_cold(self) -> None:
+        warm: dict[str, bool] = {}
+        cold = {"t-cold": False}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "t-cold" in diff.only_cold
+
+    # Test passing in both → NOT a divergence
+    def test_both_pass_no_divergence(self) -> None:
+        warm = {"t1": True}
+        cold = {"t1": True}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is False
+        assert "t1" not in diff.diverging
+        assert diff.warm_pass_cold_fail == []
+
+    # Multiple divergences in one call
+    def test_multiple_divergences(self) -> None:
+        warm = {"t_flip": True, "t_agree": True, "t_only_warm": False}
+        cold = {"t_flip": False, "t_agree": True, "t_only_cold": True}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "t_flip" in diff.warm_pass_cold_fail
+        assert "t_only_warm" in diff.only_warm
+        assert "t_only_cold" in diff.only_cold
+        assert "t_agree" not in diff.diverging
+
+    def test_empty_maps_no_divergence(self) -> None:
+        diff = diff_per_test_results({}, {})
+        assert diff.has_divergence is False
+
+    def test_has_divergence_false_iff_all_buckets_empty(self) -> None:
+        diff = ShadowCompareDiff(
+            diverging={}, warm_pass_cold_fail=[], warm_fail_cold_pass=[],
+            only_warm=[], only_cold=[]
+        )
+        assert diff.has_divergence is False
+
+    def test_has_divergence_true_if_any_bucket_nonempty(self) -> None:
+        # diverging nonempty
+        diff = ShadowCompareDiff(
+            diverging={"t": (True, False)}, warm_pass_cold_fail=["t"],
+            warm_fail_cold_pass=[], only_warm=[], only_cold=[]
+        )
+        assert diff.has_divergence is True
+        # only_cold nonempty
+        diff2 = ShadowCompareDiff(
+            diverging={}, warm_pass_cold_fail=[], warm_fail_cold_pass=[],
+            only_warm=[], only_cold=["t_extra"]
+        )
+        assert diff2.has_divergence is True
