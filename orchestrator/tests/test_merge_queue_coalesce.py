@@ -808,3 +808,164 @@ class TestPartialStackability:
         # No train_coalesced event emitted.
         events = _events_of_type(db_path, 'train_coalesced')
         assert len(events) == 0, f'no event must be emitted; got {len(events)}'
+
+
+# ─── Step 11 ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestDebounce:
+    """step-11 (RED): signature-based deduplication prevents redundant stacking."""
+
+    async def test_unchanged_set_skipped_on_second_call(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """Unchanged waiting set: 2nd call skips get_changed_line_ranges entirely.
+
+        Two non-stackable singles are placed in the buffer (no train forms on the
+        first call).  The signature is recorded.  The second call with the same
+        buffer composition must short-circuit BEFORE calling get_changed_line_ranges.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('db1', 'task/db1', tmp_path / 'wt-db1', coalesce_config)
+        req2 = _make_req('db2', 'task/db2', tmp_path / 'wt-db2', coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2])
+
+        # Spy on get_changed_line_ranges (non-stackable: both touch the same file).
+        call_count = 0
+
+        async def _mock_gcr(task_id: str):
+            nonlocal call_count
+            call_count += 1
+            return {'shared_file.py': [(1, 5)]}  # both overlap → no train
+
+        async def _mock_stb(member_ids: list):
+            from orchestrator.git_ops import TrainStackResult
+            return TrainStackResult(survivors=list(member_ids), ejected=[])
+
+        with patch.object(git_ops, 'get_changed_line_ranges', side_effect=_mock_gcr), \
+             patch.object(git_ops, 'stack_train_branches', side_effect=_mock_stb):
+
+            # First call: runs the selection (2 get_changed_line_ranges invocations).
+            result1 = await worker._maybe_coalesce_waiting_singles()
+            calls_after_first = call_count
+
+            # Second call: same buffer composition → must short-circuit, 0 new calls.
+            result2 = await worker._maybe_coalesce_waiting_singles()
+            calls_after_second = call_count
+
+        assert result1 is False, 'first call: no train (non-stackable pair)'
+        assert result2 is False, 'second call: still no train'
+        assert calls_after_first == 2, (
+            f'first call must fetch ranges for both tasks; got {calls_after_first} calls'
+        )
+        assert calls_after_second == calls_after_first, (
+            f'second call must short-circuit — 0 new get_changed_line_ranges calls; '
+            f'got {calls_after_second - calls_after_first} extra'
+        )
+
+    async def test_new_request_rearms_debounce(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """Adding a new request re-arms the debounce (different signature → re-runs)."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('ra1', 'task/ra1', tmp_path / 'wt-ra1', coalesce_config)
+        req2 = _make_req('ra2', 'task/ra2', tmp_path / 'wt-ra2', coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2])
+
+        call_count = 0
+
+        async def _mock_gcr(task_id: str):
+            nonlocal call_count
+            call_count += 1
+            return {'same_file.py': [(1, 5)]}  # non-stackable pair
+
+        async def _mock_stb(member_ids: list):
+            from orchestrator.git_ops import TrainStackResult
+            return TrainStackResult(survivors=list(member_ids), ejected=[])
+
+        with patch.object(git_ops, 'get_changed_line_ranges', side_effect=_mock_gcr), \
+             patch.object(git_ops, 'stack_train_branches', side_effect=_mock_stb):
+
+            # First call with [req1, req2]: records signature.
+            await worker._maybe_coalesce_waiting_singles()
+            calls_after_first = call_count
+
+            # Second call SAME set: short-circuits.
+            await worker._maybe_coalesce_waiting_singles()
+            assert call_count == calls_after_first, 'same set must short-circuit'
+
+            # Add a new request — different signature → must re-run.
+            req3 = _make_req('ra3', 'task/ra3', tmp_path / 'wt-ra3', coalesce_config)
+            worker._lane_buffers['normal'].append(req3)
+
+            await worker._maybe_coalesce_waiting_singles()
+            assert call_count > calls_after_first, (
+                'new request must re-arm the debounce; get_changed_line_ranges must '
+                'be called again'
+            )
+
+    async def test_successful_coalesce_updates_signature(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """After a successful coalesce the signature reflects the NEW composition.
+
+        A subsequent call with an unchanged remaining set (just the GroupMergeRequest)
+        is a no-op (only 0 regular-candidate singles → guard < 2 fires before
+        the debounce check even matters).  The important property is that
+        _last_coalesce_signature was set to the pre-coalesce candidate set, so a
+        caller that somehow re-invokes without any new singles sees no extra stacking.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'sc1', 'aa.py', 'x = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'sc2', 'bb.py', 'y = 2\n')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('sc1', 'task/sc1', wt1, coalesce_config)
+        req2 = _make_req('sc2', 'task/sc2', wt2, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2])
+
+        # First call: successful coalesce (real git: disjoint files → stackable).
+        result = await worker._maybe_coalesce_waiting_singles()
+        assert result is True, 'precondition: first call must succeed'
+
+        # After the coalesce the buffer holds a GroupMergeRequest; the absorbed
+        # singles' futures are resolved (done=True) → 0 regular candidates.
+        # A second call must return False immediately (guard < 2) and must NOT
+        # have stale state that causes incorrect behaviour.
+        sig_after_coalesce = worker._last_coalesce_signature
+
+        result2 = await worker._maybe_coalesce_waiting_singles()
+        assert result2 is False, 'second call with no candidates must return False'
+
+        # Signature must have been set during the first call (non-None after a
+        # successful coalesce).
+        assert sig_after_coalesce is not None, '_last_coalesce_signature must be set'
+        assert 'sc1' in {r for r in sig_after_coalesce} or len(sig_after_coalesce) == 2, (
+            'signature must capture the pre-coalesce request_ids of both singles'
+        )
