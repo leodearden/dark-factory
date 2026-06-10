@@ -3276,6 +3276,7 @@ Output JSON matching the schema. Every task must appear in the output.
             speculation_depth=_k,
             event_store=self.event_store,
             on_merge_landed=self._service_restart_coordinator.note_merge,
+            escalation_queue=self._escalation_queue,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',

@@ -599,6 +599,7 @@ async def _run_post_merge_verify(
     max_enospc: int,
     event_store: EventStore | None = None,
     merge_sha: str = '',
+    on_result: Callable[[VerifyResult], None] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -611,6 +612,13 @@ async def _run_post_merge_verify(
     ``MergeWorker`` calls this bare (exceptions reach ``_process``);
     ``SpeculativeMergeWorker`` wraps the call in its existing ``try/except``
     that maps a raised verify to a ``'Verification error: ...'`` outcome.
+
+    Args:
+        on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
+            BEFORE the pass/fail branch — additive, default ``None`` keeps
+            :class:`MergeWorker` call sites byte-identical.  Used by
+            :class:`SpeculativeMergeWorker` to capture warm per-test results
+            for PRD §10 invariant 6(b) shadow compare.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -670,6 +678,13 @@ async def _run_post_merge_verify(
                 req.task_id, len(pruned),
             )
             verify = await pool.dispatch(merge_sha, spec, attempt=1)
+
+    # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
+    # called with the FINAL VerifyResult (after any ENOSPC retry) so the
+    # warm per-test results are always the last-observed verify for this commit.
+    # Default None keeps MergeWorker call sites byte-identical.
+    if on_result is not None:
+        on_result(verify)
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
@@ -4229,6 +4244,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         event_store: EventStore | None = None,
         on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
         speculation_depth: int = _MERGE_AHEAD_BOUND,
+        escalation_queue: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4241,6 +4257,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # and merger-ahead bound track runner count as a single knob (PRD D4).
         # Default = _MERGE_AHEAD_BOUND (1) → byte-identical to prior behaviour.
         self._speculation_depth: int = speculation_depth
+        # PRD §10 invariant 6(b): born-at-L2 shadow compare escalation queue.
+        # None-safe so bare-worker/bare-harness tests stay green without wiring.
+        self._escalation_queue: Any = escalation_queue
+        # Tracks in-flight shadow compare asyncio.Tasks (single-in-flight guard).
+        self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Persisted cadence state path — under project_root/data/orchestrator/
+        # so it survives orchestrator restarts and lives next to other data files.
+        self._shadow_state_path: Path = (
+            git_ops.project_root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+        )
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -5863,12 +5889,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             assert merge_wt is not None  # input was non-None; warm or unchanged
 
         # ── Step 4: verify ────────────────────────────────────────────
+        # PRD §10 invariant 6(b): warm per-test results captured here for the
+        # same-candidate shadow compare scheduled in the 'done' block below.
+        # Initialised empty so the shadow compare scheduler sees {} if the warm
+        # path was not taken (skip_verify, safety-valve, or knob off) and
+        # short-circuits without scheduling a cold leg.
+        _warm_results: dict[str, bool] = {}
         if not item.skip_verify:
             self._verify_phase = 'verifying'
             self._verify_started_at = time.time()  # wall-clock verify start for triage
             logger.info(
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
+            )
+            # Capture the VerifyResult via on_result callback on the genuine warm
+            # path (persistent_merge_worktree on, safety valve not due) to provide
+            # per-test results to the shadow compare scheduler.
+            _warm_capture: list[VerifyResult] = []
+            _is_warm_path = (
+                req.config.git.persistent_merge_worktree
+                and not _due
             )
             try:
                 # Wrap _run_post_merge_verify in an abort-poll loop so that a
@@ -5884,6 +5924,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     event_store=self._event_store,
                     merge_sha=merge_commit,
+                    on_result=_warm_capture.append if _is_warm_path else None,
                 ))
                 while True:
                     done, _ = await asyncio.wait(
@@ -5936,6 +5977,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                     f'passed=True)'
                 )
+                # Parse per-test results from the warm verify for shadow compare.
+                # Only populated when _is_warm_path and on_result captured a result.
+                if _warm_capture:
+                    _warm_results = parse_per_test_results(_warm_capture[0].test_output)
             elif out.verify_skipped:
                 # Disk guard fired — run_scoped_verification was never called;
                 # log 'skipped' rather than 'passed=False' to avoid misleading
@@ -6018,21 +6063,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # status == 'done' to preserve that semantics; outcome.merge_sha
                 # carries the advanced SHA that the old inline code passed.
                 # MergeWorker deliberately has no such hook.
-                if (
-                    outcome.status == 'done'
-                    and outcome.merge_sha is not None
-                    and self._on_merge_landed is not None
-                ):
-                    try:
-                        await self._on_merge_landed(
-                            req.task_id, item.base_sha, outcome.merge_sha
-                        )
-                    except Exception:
-                        logger.warning(
-                            'on_merge_landed hook raised for task %s; ignoring (fail-open)',
-                            req.task_id,
-                            exc_info=True,
-                        )
+                if outcome.status == 'done':
+                    if (
+                        outcome.merge_sha is not None
+                        and self._on_merge_landed is not None
+                    ):
+                        try:
+                            await self._on_merge_landed(
+                                req.task_id, item.base_sha, outcome.merge_sha
+                            )
+                        except Exception:
+                            logger.warning(
+                                'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                                req.task_id,
+                                exc_info=True,
+                            )
+                    # PRD §10 invariant 6(b): schedule shadow compare on the
+                    # same-candidate merge commit — off the serial lane.
+                    # _maybe_schedule_shadow_compare returns IMMEDIATELY (spawns a
+                    # task); _warm_results empty → no-op inside the scheduler.
+                    await _maybe_schedule_shadow_compare(
+                        self, self._git_ops, req, merge_commit,
+                        _warm_results, self._escalation_queue, self._event_store,
+                    )
                 return True
 
             if result == 'rebased_pending_reverify':
