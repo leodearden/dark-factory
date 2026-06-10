@@ -20,6 +20,10 @@ from orchestrator.git_ops import (
     _run,
     scrub_task_dir_from_tree,
 )
+try:
+    from orchestrator.git_ops import TrainStackResult  # added in step-4
+except ImportError:
+    TrainStackResult = None  # type: ignore[assignment,misc]
 
 
 @pytest.fixture
@@ -5318,3 +5322,78 @@ class TestRebaseOntoArbitraryRef:
         # More reliably: check that git status exits 0 (clean state).
         rc2, _, _ = await _run(['git', 'status'], cwd=feature_wt)
         assert rc2 == 0, 'worktree should be in a clean state after failed rebase'
+
+
+# ---------------------------------------------------------------------------
+# step-3: stack_train_branches happy path (all members survive)
+# ---------------------------------------------------------------------------
+
+
+async def _make_member(
+    git_ops: GitOps,
+    name: str,
+    base_ref: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create branch task/<name> off base_ref, write filename, commit.
+
+    Returns the worktree path (git_ops.worktree_base/<name>).
+    This mirrors the make_stacked_member helper in test_atomic_train_merge.py
+    but writes independent files so members are stackable without conflicts.
+    """
+    full_branch = f'{git_ops.config.branch_prefix}{name}'
+    wt_path = git_ops.worktree_base / name
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(wt_path), base_ref],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_path)
+    (wt_path / filename).write_text(content)
+    await _run(['git', 'add', '-A'], cwd=wt_path)
+    await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=wt_path)
+    return wt_path
+
+
+@pytest.mark.asyncio
+class TestStackTrainBranchesHappyPath:
+    """stack_train_branches happy path: anchor + two non-conflicting members.
+
+    Currently RED: TrainStackResult and stack_train_branches do not exist.
+    """
+
+    async def test_all_members_survive_stackable_edits(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Three branches off main each editing a different file.
+
+        Expected: TrainStackResult(survivors=['A','B','C'], ejected=[])
+        and the tip worktree (C) contains fileA, fileB, and fileC.
+        """
+        assert TrainStackResult is not None, (
+            'TrainStackResult must be importable from orchestrator.git_ops'
+        )
+
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        main_ref = 'main'
+
+        # Anchor: edits fileA
+        await _make_member(git_ops, 'A', main_ref, 'fileA.txt', 'content A\n')
+        # Member B: edits fileB (independent of A)
+        await _make_member(git_ops, 'B', main_ref, 'fileB.txt', 'content B\n')
+        # Member C: edits fileC (independent of A and B)
+        await _make_member(git_ops, 'C', main_ref, 'fileC.txt', 'content C\n')
+
+        result = await git_ops.stack_train_branches(['A', 'B', 'C'])
+
+        assert isinstance(result, TrainStackResult)
+        assert result.survivors == ['A', 'B', 'C']
+        assert result.ejected == []
+
+        # The tip worktree (C) must carry all three files.
+        tip_wt = git_ops.worktree_base / 'C'
+        assert (tip_wt / 'fileA.txt').exists(), 'tip must contain fileA (from anchor)'
+        assert (tip_wt / 'fileB.txt').exists(), 'tip must contain fileB (from B)'
+        assert (tip_wt / 'fileC.txt').exists(), 'tip must contain fileC (own commit)'
