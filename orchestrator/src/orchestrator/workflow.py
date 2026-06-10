@@ -693,6 +693,7 @@ class TaskWorkflow:
         """
         from orchestrator.merge_queue import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
+            TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
             register_and_enqueue_merge_request,
@@ -821,6 +822,14 @@ class TaskWorkflow:
                 self.task_id, train_id, result.reason,
             )
             return None  # caller (_enter_merge_deferred) returns MERGE_DEFERRED
+        # Attribution trigger: train union-verify red with a non-interaction-exempt
+        # failure category → re-verify each member as a single (δ).  The prefix is
+        # tagged in _do_train_merge ONLY on interaction-candidate verify-red outcomes
+        # (failure_category set AND not main-health-red), so rebase-conflict,
+        # main-health-red, transient-infra, unscoped-pyright, and wip-halt keep
+        # their existing routing unchanged.
+        if result.reason and result.reason.startswith(TRAIN_VERIFY_FAILED_REASON_PREFIX):
+            return await self._attribute_train_failure(result, train_id, members)
         # Orphan-halt probe: _map_advance_failure halted the merge queue (one of the
         # four halt-inducing statuses: wip_halted, done_wip_recovery,
         # wip_recovery_no_advance, unmerged_state) and halt_owner_esc_id is None,
@@ -5068,6 +5077,35 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         return category, summary, detail
+
+    async def _attribute_train_failure(
+        self,
+        result: object,
+        train_id: str,
+        members: list[dict],
+    ) -> WorkflowOutcome:
+        """Re-verify each train member as a solo to attribute a union-verify failure.
+
+        Called from ``_maybe_enqueue_group_merge`` when the result carries a
+        ``TRAIN_VERIFY_FAILED_REASON_PREFIX`` tag — meaning the train's post-merge
+        verification failed with an interaction-candidate failure category.
+
+        Design (δ):
+        - For each member root→tip, un-stack its own delta onto current main via
+          ``git_ops.materialize_member_solo``, then verify-only via
+          ``merge_queue.reverify_member_solo`` (never advance).
+        - Partition into passers / failers.
+        - All pass → genuine cross-member INTERACTION: escalate the train, land nothing.
+        - Some fail → land each passer via ``advance_main``; block each failer.
+
+        This stub delegates to ``_mark_blocked`` so the suite stays green while
+        steps 10/12/14 add the real per-member logic.
+        """
+        # Real implementation added in steps 10, 12, 14.
+        return await self._mark_blocked(
+            f'Train {train_id!r} union verify failed — per-member attribution pending',
+            escalate_to_human=True,
+        )
 
     async def _escalate_train_halt(
         self, result, train_id: str,
