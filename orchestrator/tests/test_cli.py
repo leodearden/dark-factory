@@ -959,3 +959,76 @@ def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
     assert r.stderr.strip() != '', (
         f'expected non-empty stderr for {bad_case!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1699 step-7 — verify-merge subcommand wiring: acquire_host_verify_worktree
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
+    """verify-merge must call acquire_host_verify_worktree, NOT _create_merge_worktree.
+
+    Step-7 (RED): the subcommand currently calls _create_merge_worktree;
+    _create_merge_worktree.assert_not_called() fails until step-8 swaps it.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+
+    # --- Build mock GitOps instance ---
+    mock_git_ops = MagicMock()
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    # _create_merge_worktree is a spy: return a valid 2-tuple so the old code
+    # path doesn't crash today, but we assert it's NOT called after step-8.
+    mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, sha))
+
+    # Patch GitOps class so instantiation returns our mock
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Config with persistent_merge_worktree=True ---
+    from orchestrator.config import GitConfig, OrchestratorConfig
+    git_cfg = GitConfig(persistent_merge_worktree=True)
+    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Patch verify_runner helpers ---
+    known_json = '{"passed": true, "results": []}'
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.spec_from_json',
+        lambda s: MagicMock(),
+    )
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.result_to_json',
+        lambda r: known_json,
+    )
+
+    # --- Dummy config file to satisfy click.Path(exists=True) ---
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, (
+        f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    )
+    assert known_json in r.output, (
+        f'stdout must contain the known JSON; got: {r.output!r}'
+    )
+
+    # Core assertion: acquire_host_verify_worktree called; _create_merge_worktree NOT
+    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
+    mock_git_ops._create_merge_worktree.assert_not_called()
