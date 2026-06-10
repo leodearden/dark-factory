@@ -5223,3 +5223,98 @@ class TestGetChangedLineRanges:
             result = await ops.get_changed_line_ranges('task/789')
 
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# step-1: rebase_onto_main generalized with optional onto= kwarg
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRebaseOntoArbitraryRef:
+    """rebase_onto_main(worktree, onto=<ref>) rebases onto an arbitrary ref.
+
+    Currently RED: rebase_onto_main has no `onto` kwarg — calling it with
+    onto=... raises TypeError.
+    """
+
+    async def _make_branch(
+        self,
+        git_ops: GitOps,
+        name: str,
+        base_ref: str,
+        filename: str,
+        content: str,
+    ) -> Path:
+        """Create branch task/<name> off base_ref, write a file, commit."""
+        full_branch = f'{git_ops.config.branch_prefix}{name}'
+        wt_path = git_ops.worktree_base / name
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+        await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(wt_path), base_ref],
+            cwd=git_ops.project_root,
+        )
+        await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_path)
+        await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_path)
+        (wt_path / filename).write_text(content)
+        await _run(['git', 'add', '-A'], cwd=wt_path)
+        await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=wt_path)
+        return wt_path
+
+    async def test_onto_sibling_branch_clean_returns_true(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Rebasing a feature (edits fileB) onto a base branch (edits fileA)
+        returns True and the feature worktree now contains fileA.
+        """
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        base_wt = await self._make_branch(
+            git_ops, 'base-rb', 'main', 'fileA.txt', 'content A\n',
+        )
+        feature_wt = await self._make_branch(
+            git_ops, 'feature-rb', 'main', 'fileB.txt', 'content B\n',
+        )
+        base_branch = f'{git_ops.config.branch_prefix}base-rb'
+
+        result = await git_ops.rebase_onto_main(feature_wt, onto=base_branch)
+
+        assert result is True
+        # After rebasing onto the base branch, fileA should now be in the
+        # feature worktree (it was introduced by the base branch).
+        assert (feature_wt / 'fileA.txt').exists(), (
+            'fileA.txt should be present after rebasing onto the base branch'
+        )
+
+    async def test_onto_sibling_branch_conflict_returns_false_and_clean(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Rebasing a feature that conflicts (same lines as base) returns False
+        and leaves the worktree clean (no .git/rebase-merge directory).
+        """
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        # base edits shared.txt with one value
+        base_wt = await self._make_branch(
+            git_ops, 'base-conf', 'main', 'shared.txt', 'version: alpha\n',
+        )
+        # feature also edits shared.txt with a different value → conflict
+        feature_wt = await self._make_branch(
+            git_ops, 'feature-conf', 'main', 'shared.txt', 'version: beta\n',
+        )
+        base_branch = f'{git_ops.config.branch_prefix}base-conf'
+
+        result = await git_ops.rebase_onto_main(feature_wt, onto=base_branch)
+
+        assert result is False
+        # Worktree must be clean — no rebase in progress
+        rebase_dir = feature_wt / '.git'
+        # For worktrees, the .git is a file pointing to the main .git/worktrees/<name>
+        # The rebase state is kept under .git/worktrees/<name>/rebase-merge or
+        # directly in the worktree's gitdir.  Check via git status instead.
+        rc, out, _ = await _run(
+            ['git', 'rebase', '--show-current-patch'],
+            cwd=feature_wt,
+        )
+        # If rebase is NOT in progress, git exits non-zero with a message.
+        # More reliably: check that git status exits 0 (clean state).
+        rc2, _, _ = await _run(['git', 'status'], cwd=feature_wt)
+        assert rc2 == 0, 'worktree should be in a clean state after failed rebase'
