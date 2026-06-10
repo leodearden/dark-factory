@@ -603,7 +603,7 @@ async def train_throughput_stats(
         since = _cutoff_iso(hours, now=now)
         # --- train_merged rows ---
         train_merged_rows = list(await conn.execute_fetchall(
-            "SELECT data FROM events "
+            "SELECT data, timestamp FROM events "
             "WHERE event_type = 'train_merged' AND timestamp >= ?",
             (since,),
         ))
@@ -611,12 +611,24 @@ async def train_throughput_stats(
         tasks_landed_via_trains = 0
         for row in train_merged_rows:
             try:
-                import json as _json
-                data = _json.loads(row['data'] or '{}')
+                data = json.loads(row['data'] or '{}')
                 members = data.get('member_task_ids') or []
+                if not isinstance(members, list):
+                    logger.warning(
+                        "train_throughput_stats: member_task_ids is not a list "
+                        "(got %s) at timestamp=%s; skipping row",
+                        type(members).__name__,
+                        row['timestamp'],
+                    )
+                    continue
                 tasks_landed_via_trains += len(members)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "train_throughput_stats: failed to parse train_merged data "
+                    "at timestamp=%s: %s; skipping row",
+                    row['timestamp'],
+                    exc,
+                )
 
         train_verifies_per_landed_task = (
             trains_landed / tasks_landed_via_trains
@@ -672,7 +684,14 @@ async def train_throughput_stats(
         )
 
         cas_retry_rate_delta = baseline_cas_retry_rate - train_cas_retry_rate
-        improved = verifies_per_landed_task_delta > 0
+        # Only report improved=True when there is a real baseline to compare against.
+        # A window with trains but no solo merges has no baseline and should not
+        # report improved=False as a false regression signal.
+        improved = (
+            baseline_solo_landed > 0
+            and trains_landed > 0
+            and verifies_per_landed_task_delta > 0
+        )
 
         return {
             'trains_landed': trains_landed,

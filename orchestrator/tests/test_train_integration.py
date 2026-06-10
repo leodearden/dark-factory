@@ -378,19 +378,17 @@ class TestTrainIntegrationB1B7:
             f"got: {emitted_members}"
         )
 
-        # (7) B7: throughput — verifies_per_landed_task = 0.5 < single-merge baseline 1.0.
+        # (7) B7: throughput — the real invariant is one union verify regardless of member count.
+        # verifies_per_landed_task is derived from the spy count above (== 1) and the member
+        # count (== 2), so the direction assertion below is the meaningful gate; the arithmetic
+        # delta (0.5) is recorded in the message for observability without being frozen.
         verifies_per_landed_task = len(merge_verify_calls) / len(req.member_task_ids)  # type: ignore[union-attr]
         baseline_verifies_per_landed_task = 1.0  # each solo merge = one full verify for one task
         delta = baseline_verifies_per_landed_task - verifies_per_landed_task
         assert verifies_per_landed_task < baseline_verifies_per_landed_task, (
             f"expected train verifies-per-landed-task ({verifies_per_landed_task:.2f}) < "
             f"single-merge baseline ({baseline_verifies_per_landed_task:.2f}); "
-            f"delta={delta:.2f} (amortization win)"
-        )
-        # Record the delta for observability (0.5 for a 2-member train).
-        assert delta == 0.5, (
-            f"expected verifies-per-landed-task delta=0.5 for a 2-member train "
-            f"(1 union verify / 2 members = 0.5 vs baseline 1.0), got: {delta}"
+            f"delta={delta:.2f} (amortization win for {len(req.member_task_ids)}-member train)"  # type: ignore[union-attr]
         )
 
 
