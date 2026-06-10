@@ -193,6 +193,10 @@ class EventType(StrEnum):
     train_member_deferred = 'train_member_deferred'
     train_merged = 'train_merged'
     train_derailed = 'train_derailed'
+    # Retroactive coalescing pass (γ/1719): waiting singles merged into one train.
+    # data keys: train_id, absorbed_request_ids, member_task_ids, tip_task_id,
+    # ejected (stacking-conflict ejects), size.
+    train_coalesced = 'train_coalesced'
 
     # Service lifecycle — emitted when the post-merge staleness hook triggers
     # a restart of a backing service (e.g. fused-memory.service after a merge

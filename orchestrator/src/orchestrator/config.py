@@ -948,6 +948,10 @@ class OrchestratorConfig(BaseSettings):
     # and route members to merge-deferred with no stacking (γ) in place, which
     # would strand members indefinitely.  Projects opt in once γ,δ,ε land.
     merge_train_former_enabled: bool = Field(default=False)
+    # Retroactive coalescing pass (γ/1719).  OFF by default — human-flips after
+    # soak (fold-the-decision norm).  Requires merge_train_max_members >= 2.
+    # When False (default) the merger loop is byte-identical to pre-γ behaviour.
+    merge_train_coalesce_enabled: bool = Field(default=False)
     # Maximum members per train (inclusive of the anchor).  Defaults to 3 per
     # the s(N) go/no-go gate resolved GO at N=3 (reify esc-4455-16;
     # s(3)=0.962 ≫ 1/3, true coupling-failure rate 0/104 at N≥3).  ge=2
