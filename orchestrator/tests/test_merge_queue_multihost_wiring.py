@@ -153,3 +153,212 @@ class TestBuildRemoteRunners:
         ])
         result = self._call(config, quarantine=set())
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Helpers for _run_post_merge_verify / _run_cold_shadow_verify tests
+# ---------------------------------------------------------------------------
+
+
+def _make_pass_result(**kw):
+    return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok', **kw)
+
+
+def _make_merge_request(config, *, task_files=None, worktree=None):
+    """Build a MergeRequest for use in _run_post_merge_verify tests."""
+    import asyncio
+    from pathlib import Path
+    from orchestrator.merge_queue import MergeRequest
+
+    try:
+        future = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        import concurrent.futures
+        future = concurrent.futures.Future()
+
+    return MergeRequest(
+        task_id='task-42',
+        branch='task/42',
+        worktree=worktree or Path('/repo/task-42'),
+        pre_rebased=False,
+        task_files=task_files,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+
+def _make_git_ops_mock():
+    """Build a minimal async mock for GitOps."""
+    mock = MagicMock()
+    mock.get_main_sha = AsyncMock(return_value='main-sha')
+    mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)  # plenty of disk
+    mock.cleanup_merge_worktree = AsyncMock()
+    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    return mock
+
+
+# ---------------------------------------------------------------------------
+# step-7: _run_post_merge_verify pool wiring + scope derivation + cold-shadow guard — RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyPoolWiring:
+    """_run_post_merge_verify builds a multi-runner pool when verify_runners are configured."""
+
+    async def test_pool_includes_remote_runner(self, tmp_path):
+        """With an enabled verify_runner, the pool dispatches to the remote."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+
+        class FakeEventStore:
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+                emitted.append({'event_type': event_type, 'data': data or {}})
+
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=FakeEventStore(),
+                merge_sha='abc123',
+            )
+
+        assert outcome is None  # verify passed
+        merge_verify_events = [e for e in emitted if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify']
+        assert len(merge_verify_events) >= 1
+        assert merge_verify_events[0]['data']['runner'] == 'laptop'
+
+    async def test_dispatching_host_derives_task_files_when_enabled_runners(self, tmp_path):
+        """With enabled runner + task_files=None, derivation runs on dispatching host."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = _make_merge_request(config, task_files=None, worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        spec_calls = []
+        orig_build_spec = None
+
+        import orchestrator.verify_runner as _vr
+        orig_build = _vr.build_merge_verify_spec
+
+        def spy_build_spec(config, module_configs, task_files, **kw):
+            spec_calls.append(task_files)
+            return orig_build(config, module_configs, task_files, **kw)
+
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
+             patch('orchestrator.merge_queue.build_merge_verify_spec', side_effect=spy_build_spec), \
+             patch('orchestrator.merge_queue._derive_task_files_from_git',
+                   new=AsyncMock(return_value=['src/x.py'])):
+            await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='abc123',
+            )
+
+        assert len(spec_calls) >= 1
+        assert spec_calls[0] == ('src/x.py',)
+
+    async def test_gate_no_derivation_when_no_enabled_runners(self, tmp_path):
+        """With no enabled runners + task_files=None, _run_post_merge_verify does NOT
+        proactively call _derive_task_files_from_git (Lever C gate — byte-identical path)."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config(verify_runners=[])  # Lever C off
+        req = _make_merge_request(config, task_files=None, worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        spec_calls = []
+        import orchestrator.verify_runner as _vr
+        orig_build = _vr.build_merge_verify_spec
+
+        def spy_build_spec(conf, module_configs, task_files, **kw):
+            spec_calls.append(task_files)
+            return orig_build(conf, module_configs, task_files, **kw)
+
+        # Track proactive calls to _derive_task_files_from_git from _run_post_merge_verify.
+        # We patch run_scoped_verification so the local runner doesn't actually run verify
+        # (which would also call _derive internally), isolating the upstream derivation.
+        derive_mock = AsyncMock(return_value=['src/x.py'])
+
+        with patch('orchestrator.merge_queue.build_merge_verify_spec', side_effect=spy_build_spec), \
+             patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_pass_result())), \
+             patch('orchestrator.merge_queue._derive_task_files_from_git',
+                   new=derive_mock):
+            await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='abc123',
+            )
+
+        # The proactive derivation must NOT have been called when Lever C is off
+        derive_mock.assert_not_called()
+        # spec must have received task_files=None (byte-identical local-only path)
+        assert spec_calls[0] is None
+
+
+@pytest.mark.asyncio
+class TestColdShadowVerifyLocalOnly:
+    """_run_cold_shadow_verify stays local-only even when verify_runners are configured."""
+
+    async def test_cold_shadow_does_not_call_build_remote_runners(self, tmp_path):
+        """_run_cold_shadow_verify never calls _build_remote_runners (trust-anchor guard)."""
+        from orchestrator.merge_queue import _run_cold_shadow_verify
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        build_remote_spy = MagicMock(return_value=[])
+
+        with patch('orchestrator.merge_queue._build_remote_runners', build_remote_spy), \
+             patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_pass_result())):
+            await _run_cold_shadow_verify(git_ops, req, 'abc123', None)
+
+        build_remote_spy.assert_not_called()
+
+    async def test_cold_shadow_runs_on_local_runner(self, tmp_path):
+        """_run_cold_shadow_verify uses a LocalRunner (not remote) even with verify_runners set."""
+        from orchestrator.merge_queue import _run_cold_shadow_verify
+        from orchestrator.verify_runner import LocalRunner
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = _make_merge_request(config, task_files=None, worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        local_runner_instances = []
+        orig_local_runner = LocalRunner
+
+        class SpyLocalRunner(orig_local_runner):
+            def __init__(self, *args, **kwargs):
+                local_runner_instances.append(self)
+                super().__init__(*args, **kwargs)
+
+        with patch('orchestrator.merge_queue.LocalRunner', SpyLocalRunner), \
+             patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_pass_result())):
+            await _run_cold_shadow_verify(git_ops, req, 'abc123', None)
+
+        assert len(local_runner_instances) >= 1
+        assert all(r.is_local for r in local_runner_instances)
