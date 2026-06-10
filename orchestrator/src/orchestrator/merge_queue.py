@@ -6399,6 +6399,52 @@ class PersistentWorktreeConfigError(Exception):
     """
 
 
+async def _acquire_warm_verify_worktree(
+    git_ops: 'GitOps',
+    req: 'MergeRequest',
+    merge_wt: 'Path | None',
+    merge_commit: str,
+    *,
+    safety_valve_due: bool,
+) -> 'Path | None':
+    """Swap the ephemeral merge worktree for the persistent warm worktree.
+
+    Called at the top of ``_verify_and_advance`` (and ``MergeWorker._process``)
+    when the persistent warm merge-verify worktree feature is enabled.  Resets
+    the fixed ``_merge-verify`` worktree to *merge_commit* (retaining
+    ``target/``), cleans up the now-redundant ephemeral *merge_wt*, and returns
+    the warm path so that the verify, advance_main, and cleanup_merge_worktree
+    calls all run on the stable fixed path.
+
+    When the knob is OFF or the safety valve is due (PRD §10 invariant 6),
+    *merge_wt* is returned unchanged so the caller proceeds with the original
+    ephemeral worktree — byte-identical to today's behaviour.
+
+    Args:
+        git_ops: Live :class:`GitOps` instance.
+        req: The :class:`MergeRequest` being processed (provides config).
+        merge_wt: The ephemeral merge worktree path produced by
+            ``merge_to_main``, or ``None`` if unavailable.
+        merge_commit: The SHA of the merge commit to check out in the warm wt.
+        safety_valve_due: ``True`` on the Nth verifying attempt (PRD §10
+            invariant 6): bypass the swap and run a cold verify in the
+            throwaway ephemeral worktree instead.
+
+    Returns:
+        The warm ``_merge-verify`` path when the swap is performed, or the
+        original *merge_wt* when the knob is off / safety valve is due.
+    """
+    if not req.config.git.persistent_merge_worktree or safety_valve_due:
+        return merge_wt
+
+    warm = await git_ops.reset_persistent_merge_worktree(merge_commit)
+    # The merge commit is already a reachable git object; the ephemeral worktree
+    # is no longer needed — drop it immediately to free the worktree slot.
+    if merge_wt is not None and merge_wt.resolve() != warm.resolve():
+        await git_ops.cleanup_merge_worktree(merge_wt)
+    return warm
+
+
 def enforce_persistent_worktree_serial_lane(
     config: 'OrchestratorConfig',
     *,
